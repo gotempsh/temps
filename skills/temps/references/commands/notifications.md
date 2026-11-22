@@ -56,6 +56,13 @@ Add a new notification provider
 | `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
 | `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications update`
 
@@ -85,6 +92,13 @@ Update a notification provider
 | `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications enable`
 

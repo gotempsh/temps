@@ -43,6 +43,11 @@ Create a new email provider
 | `--api-key <key>` | Scaleway API key | - | No |
 | `--project-id <id>` | Scaleway project ID | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-access-key-file <path>` | Read the AWS secret access key from a file (- reads stdin) instead of --secret-access-key | - | No |
+| `--secret-access-key-stdin` | Read the AWS secret access key from stdin instead of --secret-access-key | - | No |
+| `--api-key-file <path>` | Read the Scaleway API key from a file (- reads stdin) instead of --api-key | - | No |
+| `--api-key-stdin` | Read the Scaleway API key from stdin instead of --api-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `email-providers show`
 

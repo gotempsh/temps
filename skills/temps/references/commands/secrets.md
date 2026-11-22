@@ -11,8 +11,8 @@ Manage agent secrets. env-type: reference as ${TEMPS_SECRET:name} in MCP config.
 **Subcommands:**
 
 - `list` (`ls`) - List all secrets (values are masked)
-- `create` (`add`) - Create or update a secret (upsert by name)
-- `update` - Update an existing secret (alias for create — upserts)
+- `create` (`add`) - Create or update a secret (upsert by name). Prefer --value-file or --value-stdin, which keep the value out of shell history
+- `update` - Update an existing secret (alias for create — upserts). The value must be re-supplied: the server never returns it
 - `delete` (`rm`) - Delete a secret
 
 ### `secrets list` (alias: `ls`)
@@ -27,31 +27,39 @@ List all secrets (values are masked)
 
 ### `secrets create` (alias: `add`)
 
-Create or update a secret (upsert by name)
+Create or update a secret (upsert by name). Prefer --value-file or --value-stdin, which keep the value out of shell history
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Secret name | - | Yes |
-| `-v, --value <value>` | Secret value. Prefix with @ to read from file (e.g. @./creds.json) | - | Yes |
+| `-v, --value <value>` | Secret value on the command line (visible in shell history and `ps`). `-v @path` reading a file is deprecated: use --value-file | - | No |
 | `-t, --type <type>` | Secret type: "env" (default) or "file" | `env` | No |
 | `-m, --mount-path <path>` | Absolute path inside sandbox where file-type secret is written (required for --type file) | - | No |
 | `-d, --description <description>` | Human-readable description | - | No |
+| `--value-file <path>` | Read the secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the secret value from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `secrets update`
 
-Update an existing secret (alias for create — upserts)
+Update an existing secret (alias for create — upserts). The value must be re-supplied: the server never returns it
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Secret name | - | Yes |
-| `-v, --value <value>` | New value. Prefix with @ to read from file | - | No |
+| `-v, --value <value>` | New value on the command line (visible in shell history). `-v @path` is deprecated: use --value-file | - | No |
 | `-t, --type <type>` | Secret type: "env" or "file" | - | No |
 | `-m, --mount-path <path>` | New mount path (file type only) | - | No |
 | `-d, --description <description>` | New description | - | No |
+| `--value-file <path>` | Read the new secret value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the new secret value from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `secrets delete` (alias: `rm`)
 

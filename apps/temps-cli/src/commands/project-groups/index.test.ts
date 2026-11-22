@@ -347,8 +347,36 @@ describe('vars', () => {
       ['project-groups', 'vars', 'set', 'shop', 'API_KEY', 'x', '--value-stdin'],
       routes
     )
-    expect(run.error?.message).toContain('not both')
+    expect(run.error?.message).toBe('Pass the value for API_KEY from only one source, got <value> and --value-stdin')
     expect(run.requests).toEqual([])
+  })
+
+  test('--value-file sends the file content minus one final newline, as --value-stdin always has', async () => {
+    const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const path = join(await mkdtemp(join(tmpdir(), 'temps-group-var-')), 'key.pem')
+    await writeFile(path, 's3cr3t-test-value\n')
+    await chmod(path, 0o600)
+    const run = await runWithApi(
+      registerProjectGroupsCommands,
+      ['project-groups', 'vars', 'set', 'shop', 'API_KEY', '--secret', '--value-file', path, '--json'],
+      routes
+    )
+    const sent = run.bodies.find((b) => b.request === 'POST /project-groups/9/env-vars')?.body as Record<string, unknown>
+    expect(sent.value).toBe('s3cr3t-test-value')
+    expect(run.stderr).not.toContain('s3cr3t-test-value')
+  })
+
+  test('--value-stdin reads a pipe through the shared helper', async () => {
+    const run = await runWithApi(
+      registerProjectGroupsCommands,
+      ['project-groups', 'vars', 'set', 'shop', 'API_KEY', '--secret', '--value-stdin', '--json'],
+      routes,
+      { stdin: 'line one\nline two\r\n' }
+    )
+    const sent = run.bodies.find((b) => b.request === 'POST /project-groups/9/env-vars')?.body as Record<string, unknown>
+    expect(sent.value).toBe('line one\nline two')
   })
 
   test('a missing value without a terminal is an error, not an empty variable', async () => {

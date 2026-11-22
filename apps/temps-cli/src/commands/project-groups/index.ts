@@ -58,6 +58,7 @@ import { promptConfirm, promptPassword, promptText } from '../../ui/prompts.js'
 import { setQuietMode, withSpinner } from '../../ui/spinner.js'
 import { parsePositiveInt, report, waitForInstantiation, waitTimeoutMs } from '../instantiations/index.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
+import { resolveValueSource, trimOneTrailingNewline } from '../../lib/value-source.js'
 
 const CLI = 'bunx @temps-sdk/cli'
 
@@ -299,29 +300,31 @@ export function caseHint(key: string): string | undefined {
 
 /** A value piped on stdin, minus the one line break `echo` or a file adds. */
 export function stripFinalNewline(value: string): string {
-  return value.replace(/\r?\n$/, '')
-}
-
-async function readStdin(): Promise<string> {
-  const chunks: Buffer[] = []
-  for await (const chunk of process.stdin) chunks.push(Buffer.from(chunk))
-  return stripFinalNewline(Buffer.concat(chunks).toString('utf8'))
+  return trimOneTrailingNewline(value)
 }
 
 /**
- * The value for `vars set`: the argument, stdin with --value-stdin, or a
- * hidden prompt, so a secret never has to be typed on the command line where
- * shell history and `ps` can see it. Without a terminal to prompt on, a
- * missing value is an error rather than an empty variable.
+ * The value for `vars set`: the argument, --value-file, stdin with
+ * --value-stdin, or a hidden prompt, so a secret never has to be typed on the
+ * command line where shell history and `ps` can see it. Without a terminal to
+ * prompt on, a missing value is an error rather than an empty variable.
+ *
+ * Unlike `environments vars set`, this command has always dropped the one
+ * final newline from a piped value; that is kept for compatibility, and
+ * applies to --value-file too so the two sources agree.
  */
-async function resolveValue(key: string, value: string | undefined, options: { valueStdin?: boolean }): Promise<string> {
-  if (value !== undefined) {
-    if (options.valueStdin) throw new Error('Pass the value as an argument or with --value-stdin, not both')
-    return value
-  }
-  if (options.valueStdin) return readStdin()
+async function resolveValue(
+  key: string,
+  value: string | undefined,
+  options: { valueStdin?: boolean; valueFile?: string }
+): Promise<string> {
+  const resolved = await resolveValueSource(
+    { inline: value, file: options.valueFile, stdin: options.valueStdin === true, trimTrailingNewline: value === undefined },
+    { subject: `the value for ${key}`, flags: { inline: '<value>', file: '--value-file', stdin: '--value-stdin' } }
+  )
+  if (resolved) return resolved.value
   if (!process.stdin.isTTY) {
-    throw new Error(`No value for ${key}: pass it as an argument, or pipe it with --value-stdin`)
+    throw new Error(`No value for ${key}: pass it as an argument, with --value-file <path>, or pipe it with --value-stdin`)
   }
   return promptPassword({ message: `Value for ${key} (hidden)` })
 }
@@ -502,11 +505,12 @@ export function registerProjectGroupsCommands(program: Command): void {
     .command('set <group> <key> [value]')
     .description(
       "Create or update a shared variable; a service's own variable still wins. " +
-        'Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)'
+        'Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)'
     )
     .option('-e, --environment <slug>', 'Only this environment (e.g. production); default: all')
     .option('--secret', 'Write-only: the value can never be read back')
-    .option('--value-stdin', 'Read the value from stdin, e.g. `cat key.pem | ... vars set shop TLS_KEY --secret --value-stdin`')
+    .option('--value-file <path>', 'Read the value from a file (- reads stdin), minus one final newline')
+    .option('--value-stdin', 'Read the value from stdin, minus one final newline, e.g. `cat key.pem | ... vars set shop TLS_KEY --secret --value-stdin`')
     .option('--preview', 'Also send an all-environments variable to preview deployments (off by default)')
     .option('--no-preview', 'Do not send it to preview deployments')
     .option('--json', 'Output in JSON format')
@@ -896,14 +900,15 @@ async function varsSetAction(
   ref: string,
   key: string,
   valueArg: string | undefined,
-  options: { environment?: string; secret?: boolean; preview?: boolean; valueStdin?: boolean } & JsonOption
+  options: { environment?: string; secret?: boolean; preview?: boolean; valueStdin?: boolean; valueFile?: string } & JsonOption
 ): Promise<void> {
-  await requireAuth()
-  await setupClient()
   const scope = normalizeScope(options.environment)
   const hint = caseHint(key)
   if (hint) warning(hint)
+  // Read the value before authenticating, so a bad source fails fast.
   const value = await resolveValue(key, valueArg, options)
+  await requireAuth()
+  await setupClient()
   const result = await withSpinner(`Saving ${key}...`, async () => {
     const group = await resolveGroup(ref)
     const existing = findVariable(

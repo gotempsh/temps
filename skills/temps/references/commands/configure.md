@@ -19,6 +19,9 @@ Configure CLI settings (AWS-style wizard)
 | `--disable-colors` | Disable colored output in config | - | No |
 | `-i, --interactive` | Force interactive mode even in non-TTY | - | No |
 | `-y, --no-interactive` | Non-interactive mode (uses defaults for unspecified options) | - | No |
+| `--api-token-file <path>` | Read the API token from a file (- reads stdin) instead of --api-token | - | No |
+| `--api-token-stdin` | Read the API token from stdin instead of --api-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 **Subcommands:**
 

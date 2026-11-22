@@ -34,6 +34,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 interface AddOptions {
   provider?: string
@@ -101,7 +102,7 @@ interface IdForceOptions {
 
 interface UpdateTokenOptions {
   id: string
-  token: string
+  token?: string
 }
 
 export function registerProvidersCommands(program: Command): void {
@@ -117,7 +118,7 @@ export function registerProvidersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listProviders)
 
-  providers
+  const addCommand = providers
     .command('add')
     .description('Add a new Git provider')
     .option('-p, --provider <provider>', 'Provider type (github, gitlab, bitbucket, gitea, generic)')
@@ -130,6 +131,10 @@ export function registerProvidersCommands(program: Command): void {
     .option('--token-username <username>', 'HTTP Basic username for the token (generic; default x-access-token)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
+  addCredentialSources(addCommand, [
+    { flag: 'token', what: 'the access token' },
+    { flag: 'password', what: 'the Bitbucket app password' },
+  ])
 
   providers
     .command('remove')
@@ -177,7 +182,7 @@ export function registerProvidersCommands(program: Command): void {
   // Git-specific commands
   const git = providers.command('git').description('Manage Git providers')
 
-  git
+  const connectCommand = git
     .command('connect')
     .description('Connect a Git provider (github, gitlab, bitbucket, gitea, generic)')
     .requiredOption('-p, --provider <provider>', 'Provider type (github, gitlab, bitbucket, gitea, generic)')
@@ -190,6 +195,10 @@ export function registerProvidersCommands(program: Command): void {
     .option('--token-username <username>', 'HTTP Basic username for the token (generic; default x-access-token)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(connectGitProvider)
+  addCredentialSources(connectCommand, [
+    { flag: 'token', what: 'the access token' },
+    { flag: 'password', what: 'the Bitbucket app password' },
+  ])
 
   git
     .command('repos')
@@ -260,12 +269,13 @@ export function registerProvidersCommands(program: Command): void {
     .requiredOption('--id <id>', 'Connection ID')
     .action(syncConnectionAction)
 
-  connections
+  const updateTokenCommand = connections
     .command('update-token')
     .description('Update access token for a Git connection')
     .requiredOption('--id <id>', 'Connection ID')
-    .requiredOption('-t, --token <token>', 'New access token')
+    .option('-t, --token <token>', 'New access token (prefer --token-file or --token-stdin, which keep it out of shell history)')
     .action(updateTokenAction)
+  addCredentialSources(updateTokenCommand, [{ flag: 'token', what: 'the new access token' }])
 
   connections
     .command('validate')
@@ -1070,6 +1080,10 @@ async function syncConnectionAction(options: IdOptions): Promise<void> {
 }
 
 async function updateTokenAction(options: UpdateTokenOptions): Promise<void> {
+  if (!options.token) {
+    throw new Error('Missing the new access token: pass --token-file <path>, --token-stdin, or -t/--token')
+  }
+  const token = options.token
   await requireAuth()
   await setupClient()
 
@@ -1083,7 +1097,7 @@ async function updateTokenAction(options: UpdateTokenOptions): Promise<void> {
     const { data, error } = await updateConnectionToken({
       client,
       path: { connection_id: id },
-      body: { access_token: options.token },
+      body: { access_token: token },
     })
     if (error) {
       throw new Error(getErrorMessage(error))

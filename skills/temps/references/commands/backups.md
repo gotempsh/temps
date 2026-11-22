@@ -140,6 +140,9 @@ Create an S3 source
 | `--secret-key <key>` | Secret access key | - | No |
 | `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources show`
 
@@ -168,6 +171,9 @@ Update an S3 source
 | `--access-key <key>` | New access key ID | - | No |
 | `--secret-key <key>` | New secret access key | - | No |
 | `--prefix <prefix>` | New bucket path/prefix | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources remove` (alias: `rm`)
 

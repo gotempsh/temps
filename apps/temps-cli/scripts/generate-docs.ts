@@ -147,7 +147,7 @@ export function generateMarkdown(
         if (format === 'mdx') {
           escapedDesc = escapeForMdx(escapedDesc)
         }
-        md += `| \`${opt.flags}\` | ${escapedDesc} | ${defaultVal} | ${required} |\n`
+        md += `| \`${opt.flags.replace(/\|/g, '\\|')}\` | ${escapedDesc} | ${defaultVal} | ${required} |\n`
       }
       md += '\n'
     }

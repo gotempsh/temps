@@ -27,6 +27,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm, promptNumber, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 const SEVERITIES = ['debug', 'info', 'warning', 'error', 'critical', 'emergency'] as const
 
@@ -407,7 +408,7 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listProviders)
 
-  notifications
+  const addCommand = notifications
     .command('add')
     .description('Add a new notification provider')
     .option('-t, --type <type>', 'Provider type (slack, email, webhook, telegram)')
@@ -429,8 +430,13 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--topic-id <id>', 'Forum topic ID (for telegram, optional)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
+  addCredentialSources(addCommand, [
+    { flag: 'webhook-url', what: 'the Slack webhook URL' },
+    { flag: 'password', what: 'the SMTP password' },
+    { flag: 'bot-token', what: 'the Telegram bot token' },
+  ])
 
-  notifications
+  const updateCommand = notifications
     .command('update')
     .description('Update a notification provider')
     .requiredOption('--id <id>', 'Provider ID')
@@ -454,6 +460,11 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(updateProvider)
+  addCredentialSources(updateCommand, [
+    { flag: 'webhook-url', what: 'the Slack webhook URL' },
+    { flag: 'password', what: 'the SMTP password' },
+    { flag: 'bot-token', what: 'the Telegram bot token' },
+  ])
 
   notifications
     .command('enable')
