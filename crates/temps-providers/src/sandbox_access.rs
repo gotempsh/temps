@@ -1155,6 +1155,7 @@ mod tests {
 
     // ---- against a real server -------------------------------------------
 
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, Mount, WaitFor},
         runners::AsyncRunner,
@@ -1199,6 +1200,7 @@ mod tests {
             .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "admin-secret")
+            .with_test_labels()
             .start()
             .await
             .expect("the PostgreSQL test container starts");
@@ -1319,6 +1321,7 @@ mod tests {
             .with_mount(Mount::tmpfs_mount("/var/lib/postgresql"))
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "admin-secret")
+            .with_test_labels()
             .start()
             .await
             .expect("the PostgreSQL test container starts");

@@ -667,6 +667,7 @@ fn memory_usage_handles_cache_larger_than_usage() {
 
 mod health_probe_exec_tests {
     use super::*;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
     #[tokio::test]
@@ -685,6 +686,7 @@ mod health_probe_exec_tests {
         }
         let container = GenericImage::new("alpine", "3.21")
             .with_cmd(["sleep", "300"])
+            .with_test_labels()
             .start()
             .await?;
         let runtime = DockerRuntime::new(
@@ -726,6 +728,7 @@ mod health_probe_exec_tests {
         // so keep it separate from the subsequent timeout assertion.
         let missing_command_container = GenericImage::new("alpine", "3.21")
             .with_cmd(["sleep", "300"])
+            .with_test_labels()
             .start()
             .await?;
         match runtime

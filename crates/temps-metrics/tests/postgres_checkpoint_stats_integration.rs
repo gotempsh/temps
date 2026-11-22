@@ -27,6 +27,7 @@
 use std::time::Duration;
 
 use temps_metrics::{Collector, CollectorConfig, PostgresCollector, SourceKind};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -46,6 +47,7 @@ async fn boot_postgres(tag: &str) -> Option<(String, ContainerAsync<GenericImage
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_test_labels()
         .start()
         .await
     {

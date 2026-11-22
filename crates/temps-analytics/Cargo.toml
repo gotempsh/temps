@@ -48,6 +48,7 @@ moka = { workspace = true }
 tower-http = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true }

@@ -1727,6 +1727,7 @@ mod tests {
     }
 
     use super::*;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -1830,6 +1831,7 @@ mod tests {
             .with_wait_for(WaitFor::message_on_stderr("ready for connections"))
             .with_env_var("MARIADB_ROOT_PASSWORD", "test")
             .with_env_var("MARIADB_DATABASE", "app")
+            .with_test_labels()
             .start()
             .await
         {

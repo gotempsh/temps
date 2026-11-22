@@ -2361,6 +2361,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "conquer-once"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5d008a441c0f269f36ca13712528069a86a3e60dffee1d98b976eb3b0b2160b4"
+dependencies = [
+ "conquer-util",
+]
+
+[[package]]
+name = "conquer-util"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e763eef8846b13b380f37dfecda401770b0ca4e56e95170237bd7c25c7db3582"
+
+[[package]]
 name = "console"
 version = "0.16.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2638,7 +2653,7 @@ dependencies = [
  "mio",
  "parking_lot 0.12.5",
  "rustix",
- "signal-hook",
+ "signal-hook 0.3.18",
  "signal-hook-mio",
  "winapi",
 ]
@@ -11240,6 +11255,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "signal-hook"
+version = "0.4.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "49f7447afd772ca79ad17ae0a3972a6b0df0cb4b80990fd82707593e9e012a74"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
 name = "signal-hook-mio"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -11247,7 +11272,7 @@ checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
 dependencies = [
  "libc",
  "mio",
- "signal-hook",
+ "signal-hook 0.3.18",
 ]
 
 [[package]]
@@ -12501,6 +12526,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -12525,6 +12551,7 @@ dependencies = [
  "temps-clickhouse",
  "temps-core",
  "temps-database",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -12736,6 +12763,7 @@ dependencies = [
  "temps-migrations",
  "temps-monitoring",
  "temps-providers",
+ "temps-test-containers",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-env",
@@ -13153,6 +13181,7 @@ dependencies = [
  "sqlx 0.8.6",
  "temps-core",
  "temps-migrations",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -13200,6 +13229,7 @@ dependencies = [
  "temps-presets",
  "temps-routes",
  "temps-runtime-health",
+ "temps-test-containers",
  "temps-workload",
  "temps-workload-docker",
  "testcontainers",
@@ -13360,6 +13390,7 @@ dependencies = [
  "temps-migrations",
  "temps-node-dns",
  "temps-projects",
+ "temps-test-containers",
  "temps-workload",
  "temps-workload-netpol",
  "testcontainers",
@@ -13422,6 +13453,7 @@ dependencies = [
  "temps-geo",
  "temps-monitoring",
  "temps-notifications",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "time",
@@ -13514,6 +13546,7 @@ dependencies = [
  "temps-database",
  "temps-dns",
  "temps-entities",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14241,6 +14274,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14312,6 +14346,7 @@ dependencies = [
  "temps-core",
  "temps-database",
  "temps-entities",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14330,6 +14365,7 @@ dependencies = [
  "sea-orm-migration 1.1.20",
  "sqlx 0.8.6",
  "temps-entities",
+ "temps-test-containers",
  "testcontainers",
  "tokio",
  "tracing",
@@ -14422,6 +14458,7 @@ dependencies = [
  "tempfile",
  "temps-entities",
  "temps-migrations",
+ "temps-test-containers",
  "temps-wireguard",
  "testcontainers",
  "thiserror 2.0.21",
@@ -14564,6 +14601,7 @@ dependencies = [
  "temps-database",
  "temps-entities",
  "temps-migrations",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -14846,6 +14884,7 @@ dependencies = [
  "temps-query-postgres",
  "temps-query-redis",
  "temps-query-s3",
+ "temps-test-containers",
  "temps-workload",
  "temps-workload-docker",
  "temps-workload-plane",
@@ -14973,6 +15012,7 @@ dependencies = [
  "mongodb",
  "serde_json",
  "temps-query",
+ "temps-test-containers",
  "testcontainers",
  "tokio",
  "tracing",
@@ -14987,6 +15027,7 @@ dependencies = [
  "rustls",
  "serde_json",
  "temps-query",
+ "temps-test-containers",
  "testcontainers",
  "tokio",
  "tokio-postgres",
@@ -15004,6 +15045,7 @@ dependencies = [
  "redis",
  "serde_json",
  "temps-query",
+ "temps-test-containers",
  "testcontainers",
  "tokio",
  "tracing",
@@ -15113,6 +15155,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "temps-test-containers",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -15292,6 +15335,16 @@ dependencies = [
  "tokio",
  "tracing",
  "utoipa",
+]
+
+[[package]]
+name = "temps-test-containers"
+version = "0.1.0-beta.58"
+dependencies = [
+ "bollard",
+ "libc",
+ "testcontainers",
+ "tokio",
 ]
 
 [[package]]
@@ -15547,6 +15600,7 @@ dependencies = [
  "async-trait",
  "bollard",
  "bytes",
+ "conquer-once",
  "docker_credential",
  "either",
  "etcetera 0.11.0",
@@ -15562,6 +15616,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "signal-hook 0.4.6",
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",

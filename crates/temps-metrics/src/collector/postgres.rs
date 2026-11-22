@@ -948,6 +948,7 @@ mod tests {
     /// standby, so this checks the exact query against a real server.
     #[tokio::test]
     async fn replication_lag_columns_decode_as_f64() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{
             core::{ContainerPort, WaitFor},
             runners::AsyncRunner,
@@ -960,6 +961,7 @@ mod tests {
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {

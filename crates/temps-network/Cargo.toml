@@ -44,6 +44,7 @@ nix = { workspace = true, features = ["net", "sched", "fs"] }
 libc = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 base64 = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = { workspace = true }

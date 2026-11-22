@@ -70,6 +70,7 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 sea-orm-migration = { workspace = true }

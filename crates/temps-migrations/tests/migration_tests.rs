@@ -12,6 +12,7 @@
 )]
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -87,6 +88,7 @@ async fn test_bunny_delivery_downgrade_preserves_active_profiles() -> anyhow::Re
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -249,6 +251,7 @@ async fn test_service_project_identity_migration_defaults_down_and_reup() -> any
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -408,6 +411,7 @@ async fn test_source_built_service_release_migration_relaxes_identity_constraint
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -582,6 +586,7 @@ async fn test_instantiation_claim_token_migration_is_nullable_and_reversible() -
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -687,6 +692,7 @@ async fn test_managed_monitor_migrations_never_demote_ambiguous_ownership() -> a
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -879,6 +885,7 @@ async fn test_managed_monitor_migration_down_restores_state_from_previous_up_imp
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -992,6 +999,7 @@ async fn test_legacy_monitor_reconciliation_merges_duplicates_and_preserves_hist
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -1411,6 +1419,7 @@ async fn test_legacy_monitor_reconciliation_rewrites_compressed_status_checks() 
             "timescaledb.max_tuples_decompressed_per_dml_transaction=1",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -1604,6 +1613,7 @@ async fn test_preview_inclusion_default_migration_up_and_down() -> anyhow::Resul
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -1710,6 +1720,7 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -1780,6 +1791,7 @@ async fn test_snapshot_digest_index_migration_up_and_down() -> anyhow::Result<()
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -1906,6 +1918,7 @@ async fn test_analytics_ingest_keys_migration_up_and_down() -> anyhow::Result<()
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -2128,6 +2141,7 @@ async fn test_migration_up() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2187,6 +2201,7 @@ async fn test_secure_sns_migration_upgrades_applied_global_suppression_schema() 
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -2420,6 +2435,7 @@ async fn test_migration_down() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2488,6 +2504,7 @@ async fn test_migration_status() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2546,6 +2563,7 @@ async fn test_pgvector_extension() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2650,6 +2668,7 @@ async fn test_table_constraints() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -2958,6 +2977,7 @@ async fn test_compute_network_migration() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -3104,6 +3124,7 @@ async fn test_dns_service_endpoints_migration() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -3388,6 +3409,7 @@ async fn test_visitor_dedup_migration_repoints_session_replay_sessions() -> anyh
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -3700,6 +3722,7 @@ async fn test_observe_correlation_migration_handles_compressed_proxy_logs() -> a
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -3925,6 +3948,7 @@ async fn test_observe_correlation_migration_is_idempotent() -> anyhow::Result<()
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -3992,6 +4016,7 @@ async fn test_observe_correlation_migration_survives_concurrent_retention() -> a
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -4175,6 +4200,7 @@ async fn test_mfa_pending_migration_revokes_ambiguous_sessions_and_defaults_clos
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4299,6 +4325,7 @@ async fn test_feature_flags_migration_is_reversible() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4405,6 +4432,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4512,6 +4540,7 @@ async fn test_ai_workspace_migration_chain_up_down_and_reapply() -> anyhow::Resu
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4753,6 +4782,7 @@ async fn test_control_plane_overlay_allocation_migration_is_reversible() -> anyh
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4881,6 +4911,7 @@ async fn test_cloud_backup_mirror_states_migration_is_reversible() -> anyhow::Re
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4933,6 +4964,7 @@ async fn test_control_plane_setup_generation_migration_is_reversible() -> anyhow
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -4980,6 +5012,7 @@ async fn test_managed_by_cloud_s3_source_migration_is_reversible() -> anyhow::Re
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5029,6 +5062,7 @@ async fn test_cloud_telemetry_fidelity_migration_is_reversible() -> anyhow::Resu
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5081,6 +5115,7 @@ async fn test_cloud_telemetry_backfills_migration_is_reversible() -> anyhow::Res
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5130,6 +5165,7 @@ async fn test_constrain_cloud_telemetry_fidelity_migration_is_reversible() -> an
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5177,6 +5213,7 @@ async fn test_cloud_span_outbox_migration_is_reversible() -> anyhow::Result<()> 
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5224,6 +5261,7 @@ async fn test_cloud_telemetry_write_mode_migration_is_reversible() -> anyhow::Re
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5273,6 +5311,7 @@ async fn test_telemetry_write_ledger_migration_is_reversible() -> anyhow::Result
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5326,6 +5365,7 @@ async fn test_cloud_telemetry_bulk_jobs_migration_is_reversible() -> anyhow::Res
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5381,6 +5421,7 @@ async fn test_session_token_s3_source_migration_is_reversible() -> anyhow::Resul
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5433,6 +5474,7 @@ async fn test_generalize_cloud_telemetry_outbox_migration_is_reversible() -> any
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5507,6 +5549,7 @@ async fn test_signal_group_write_intervals_migration_is_reversible() -> anyhow::
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5556,6 +5599,7 @@ async fn test_cloud_analytics_write_mode_migration_is_reversible() -> anyhow::Re
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5605,6 +5649,7 @@ async fn test_outbox_payload_columns_migration_is_reversible() -> anyhow::Result
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5659,6 +5704,7 @@ async fn test_lifecycle_reconcile_failed_at_migration_is_reversible() -> anyhow:
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5706,6 +5752,7 @@ async fn test_lifecycle_reconcile_generation_migration_is_reversible() -> anyhow
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5754,6 +5801,7 @@ async fn test_continuous_archive_source_migration_is_reversible() -> anyhow::Res
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5804,6 +5852,7 @@ async fn test_trace_summary_create_and_upgrade_reconciliation() -> anyhow::Resul
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -5921,6 +5970,7 @@ macro_rules! start_pg_container {
                 "timescaledb.max_background_workers=0",
             ])
             .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+            .with_test_labels()
             .start()
             .await
         {
@@ -6809,6 +6859,7 @@ async fn test_node_mesh_migrations_down_and_reup() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -6927,6 +6978,7 @@ async fn test_compute_pool_default_change_keeps_existing_pool() -> anyhow::Resul
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
         .expect("Failed to start TimescaleDB container");
@@ -7050,6 +7102,7 @@ async fn test_drop_webhook_response_body_migration_up_and_down() -> anyhow::Resu
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -7148,6 +7201,7 @@ async fn test_project_deployment_counters_migration_up_and_down() -> anyhow::Res
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {
@@ -7233,6 +7287,7 @@ async fn test_git_oauth_reauthorization_migration() -> anyhow::Result<()> {
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
         .start()
         .await
     {

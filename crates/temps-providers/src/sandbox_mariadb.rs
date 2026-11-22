@@ -518,6 +518,7 @@ mod tests {
 
     // ---- against a real server -------------------------------------------
 
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, Mount},
         runners::AsyncRunner,
@@ -557,6 +558,7 @@ mod tests {
             // Data in memory: fast, and independent of the Docker disk.
             .with_mount(Mount::tmpfs_mount("/var/lib/mysql"))
             .with_env_var("MARIADB_ROOT_PASSWORD", "rootpassword")
+            .with_test_labels()
             .start()
             .await
             .expect("the MariaDB test container starts");

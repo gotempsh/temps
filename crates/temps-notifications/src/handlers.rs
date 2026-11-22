@@ -2460,6 +2460,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::notification_providers;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::ContainerPort, runners::AsyncRunner, ContainerAsync, GenericImage};
 
     use tower::ServiceExt;
@@ -2895,6 +2896,7 @@ mod tests {
             let mailpit_container = GenericImage::new("axllent/mailpit", "latest")
                 .with_exposed_port(ContainerPort::Tcp(1025)) // SMTP port
                 .with_exposed_port(ContainerPort::Tcp(8025)) // Web UI port
+                .with_test_labels()
                 .start()
                 .await?;
 

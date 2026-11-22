@@ -558,6 +558,7 @@ mod tests {
 
     // ---- against a real server -------------------------------------------
 
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, Mount},
         runners::AsyncRunner,
@@ -580,6 +581,7 @@ mod tests {
             .with_mount(Mount::tmpfs_mount("/data/db"))
             .with_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
             .with_env_var("MONGO_INITDB_ROOT_PASSWORD", "adminpassword")
+            .with_test_labels()
             .start()
             .await
             .expect("the MongoDB test container starts");

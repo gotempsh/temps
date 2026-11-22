@@ -2057,6 +2057,7 @@ mod tests {
         assert_eq!(names.len(), REFERENCE_INDEXES.len());
     }
     use std::sync::atomic::{AtomicU32, Ordering};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     #[test]
@@ -2391,6 +2392,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -2452,6 +2454,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -2561,6 +2564,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {

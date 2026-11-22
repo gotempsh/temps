@@ -24,6 +24,7 @@ utoipa = { workspace = true, features = ["uuid"] }
 uuid = { workspace = true, features = ["serde"] }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 tempfile = { workspace = true }
 bollard = { workspace = true }
 testcontainers = { workspace = true }

@@ -30,6 +30,7 @@ tracing = { workspace = true }
 async-trait = { workspace = true }
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 testcontainers = { workspace = true }
 
 [lints]

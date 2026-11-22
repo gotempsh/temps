@@ -2549,6 +2549,7 @@ impl temps_query::QuerySchemaProvider for PostgresSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{ContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -3168,6 +3169,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -3257,6 +3259,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -3526,6 +3529,7 @@ mod tests {
             .with_env_var("POSTGRES_DB", "postgres")
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {

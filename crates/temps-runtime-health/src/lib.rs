@@ -234,6 +234,7 @@ mod docker_tests {
         net::{IpAddr, Ipv4Addr},
         sync::Arc,
     };
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -300,6 +301,7 @@ mod docker_tests {
             .with_mapped_port(requested_port, 8080.tcp())
             .with_container_name(format!("temps-runtime-probe-{}", Uuid::new_v4()))
             .with_cmd(["-c", "mkdir -p /tmp/site; printf ready > /tmp/site/index.html; httpd -f -p 8080 -h /tmp/site & echo runtime-probe-fixture-ready; exec sleep 120"])
+            .with_test_labels()
             .start().await.unwrap();
         let container_id = fixture.id().to_string();
         let host = fixture

@@ -59,6 +59,7 @@ use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
 
@@ -196,6 +197,7 @@ impl SharedContainer {
             // that to become ready under contention -- give it real headroom
             // instead of racing the default.
             .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await?;
 
@@ -1028,6 +1030,7 @@ impl TestDatabase {
             // that to become ready under contention -- give it real headroom
             // instead of racing the default.
             .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await?;
 

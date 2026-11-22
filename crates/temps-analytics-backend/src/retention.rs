@@ -253,6 +253,7 @@ mod tests {
     /// pre-existing Docker resource is modified, and Drop removes the container.
     #[tokio::test]
     async fn clickhouse_ttl_upgrade_drift_restart_and_scoped_deletion() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{
             core::{wait::HttpWaitStrategy, ContainerPort, Mount, WaitFor},
             runners::AsyncRunner,
@@ -284,6 +285,7 @@ mod tests {
             .with_env_var("CLICKHOUSE_PASSWORD", "test")
             .with_mount(Mount::tmpfs_mount("/var/lib/clickhouse"))
             .with_mount(Mount::tmpfs_mount("/var/log/clickhouse-server"))
+            .with_test_labels()
             .start()
             .await
             .expect("start isolated ClickHouse");

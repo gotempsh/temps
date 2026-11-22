@@ -75,6 +75,7 @@ urlencoding = { workspace = true }
 docker-tests = []
 
 [dev-dependencies]
+temps-test-containers = { path = "../temps-test-containers" }
 sea-orm = { workspace = true, features = ["mock"] }
 sea-orm-migration = { workspace = true }
 testcontainers = { workspace = true }

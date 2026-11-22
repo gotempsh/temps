@@ -37,6 +37,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database};
     use sea_orm_migration::MigratorTrait;
     use temps_migrations::Migrator;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
     /// Retry a container connection attempt with exponential backoff.
@@ -107,6 +108,7 @@ mod tests {
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -146,6 +148,7 @@ mod tests {
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {
@@ -724,6 +727,7 @@ mod tests {
             .with_env_var("POSTGRES_USER", "postgres")
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {

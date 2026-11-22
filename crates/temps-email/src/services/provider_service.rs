@@ -2008,6 +2008,7 @@ mod tests {
 
     impl LocalStackTestEnv {
         async fn new() -> anyhow::Result<Self> {
+            use temps_test_containers::TestContainerExt;
             use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
             // Start LocalStack container with SES service
@@ -2015,6 +2016,7 @@ mod tests {
                 .with_env_var("SERVICES", "ses")
                 .with_env_var("DEBUG", "1")
                 .with_env_var("LOCALSTACK_HOST", "localhost.localstack.cloud")
+                .with_test_labels()
                 .start()
                 .await?;
 

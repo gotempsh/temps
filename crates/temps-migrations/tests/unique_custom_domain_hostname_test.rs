@@ -13,6 +13,7 @@
 use sea_orm::{ConnectionTrait, Database, DatabaseTransaction, Statement, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::{Migrator, UniqueCustomDomainHostnameMigration};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 async fn insert_domain(
@@ -117,6 +118,7 @@ async fn existing_duplicates_keep_one_winner_and_lose_nothing() -> anyhow::Resul
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(std::time::Duration::from_secs(120))
+        .with_test_labels()
         .start()
         .await
     {

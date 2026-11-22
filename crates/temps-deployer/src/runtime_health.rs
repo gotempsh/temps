@@ -370,6 +370,7 @@ mod tests {
     use super::*;
     use crate::{PortMapping, Protocol, ResourceLimits, RestartPolicy};
     use temps_runtime_health::Probe;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -515,6 +516,7 @@ mod tests {
         let second = GenericImage::new("busybox", "1.37")
             .with_entrypoint("sleep")
             .with_cmd(["120"])
+            .with_test_labels()
             .start()
             .await?;
         let mut second_request = request.clone();

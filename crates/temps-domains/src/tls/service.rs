@@ -3320,6 +3320,7 @@ mod tests {
     // ============================================================================
 
     use crate::tls::providers::LetsEncryptProvider;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
     /// Test HTTP-01 challenge flow with Pebble ACME server
@@ -3343,6 +3344,7 @@ mod tests {
         let container = GenericImage::new("letsencrypt/pebble", "latest")
             .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
             .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .with_test_labels()
             .start()
             .await
             .expect("Failed to start Pebble container");
@@ -3431,6 +3433,7 @@ mod tests {
         let container = GenericImage::new("letsencrypt/pebble", "latest")
             .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
             .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .with_test_labels()
             .start()
             .await
             .expect("Failed to start Pebble container");
@@ -3517,6 +3520,7 @@ mod tests {
         let container = GenericImage::new("letsencrypt/pebble", "latest")
             .with_env_var("PEBBLE_VA_ALWAYS_VALID", "1")
             .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            .with_test_labels()
             .start()
             .await
             .expect("Failed to start Pebble container");
