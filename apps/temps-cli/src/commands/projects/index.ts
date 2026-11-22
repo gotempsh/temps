@@ -158,7 +158,7 @@ export function registerProjectsCommands(program: Command): void {
 
   projects
     .command('container-security')
-    .description('Show or change which Linux capabilities the project\'s containers get back (only NET_BIND_SERVICE can be allowed)')
+    .description('Show or change which Linux capabilities the project\'s deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)')
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--allow <capabilities...>', 'Allow these capabilities, e.g. NET_BIND_SERVICE (asks for confirmation)')
     .option('--remove <capabilities...>', 'Stop allowing these capabilities')

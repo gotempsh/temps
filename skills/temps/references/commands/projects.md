@@ -21,7 +21,7 @@ Manage services: each one deployable app (the console calls these Services). To 
 - `git` - Update git repository settings
 - `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
-- `container-security` - Show or change which Linux capabilities the project's containers get back (only NET_BIND_SERVICE can be allowed)
+- `container-security` - Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a service
 
@@ -252,7 +252,7 @@ Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, 
 
 ### `projects container-security`
 
-Show or change which Linux capabilities the project's containers get back (only NET_BIND_SERVICE can be allowed)
+Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
 
 **Options:**
 

@@ -4,7 +4,7 @@
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
-import { getContainerSecurity, getProjectBySlug, updateContainerSecurity } from '../../api/sdk.gen.js'
+import { getContainerSecurity, getProject, getProjectBySlug, updateContainerSecurity } from '../../api/sdk.gen.js'
 import type { ContainerCapability, ContainerSecurityResponse } from '../../api/types.gen.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -76,7 +76,10 @@ export async function projectContainerSecurityAction(options: ContainerSecurityO
   const remove = (options.remove ?? []).map(normalizeCapability)
   const resolved = await requireProjectSlug(options.project)
   const project = await withSpinner('Fetching project...', async () => {
-    const { data, error } = await getProjectBySlug({ client, path: { slug: resolved.slug } })
+    // `--project` takes a slug or an ID: an all-digit value is the ID.
+    const { data, error } = /^\d+$/.test(resolved.slug)
+      ? await getProject({ client, path: { id: Number(resolved.slug) } })
+      : await getProjectBySlug({ client, path: { slug: resolved.slug } })
     if (error || !data) throw new Error(getErrorMessage(error) ?? `Project "${resolved.slug}" not found`)
     return data
   })
