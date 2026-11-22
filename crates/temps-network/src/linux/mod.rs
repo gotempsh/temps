@@ -16,6 +16,7 @@ use tracing::{debug, info};
 
 pub mod bridge;
 pub mod firewall;
+pub mod inspect;
 pub mod route;
 pub mod sysctl;
 pub mod vxlan;
