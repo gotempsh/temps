@@ -175,6 +175,12 @@ pub enum SensitiveAction {
     PublishEnvironmentHosts {
         connector_id: Option<i32>,
     },
+    /// Add Linux capabilities back to a project's containers (container
+    /// security): it weakens the hardening every project container gets.
+    /// Removing them is not sensitive and is never challenged.
+    AllowContainerCapabilities {
+        project_id: i32,
+    },
 }
 
 impl SensitiveAction {
@@ -225,6 +231,7 @@ impl SensitiveAction {
             Self::DeleteTailscaleService { .. } => "delete_tailscale_service",
             Self::ChangeTailnetPrincipals { .. } => "change_tailnet_principals",
             Self::PublishEnvironmentHosts { .. } => "publish_environment_hosts",
+            Self::AllowContainerCapabilities { .. } => "allow_container_capabilities",
         }
     }
 }

@@ -195,6 +195,9 @@ pub const HUMAN_CONSENT_OPERATIONS: &[&str] = &[
     "create_access_bundle_general",
     "create_internal_access_grant",
     "create_internal_access_sandbox_grant",
+    // Allowing a Linux capability weakens a project's container hardening;
+    // the handler asks for this only when the change widens it.
+    "update_container_security",
 ];
 
 /// Whether `operation_id` is one of [`HUMAN_CONSENT_OPERATIONS`].

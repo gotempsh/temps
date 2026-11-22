@@ -91,6 +91,12 @@ impl TempsPlugin for ProjectsPlugin {
             let operations_service = Arc::new(OperationsService::new(db.clone()));
             context.register_service(operations_service);
 
+            // Which Linux capabilities a project's containers get back
+            let container_security_service = Arc::new(
+                crate::services::container_security::ContainerSecurityService::new(db.clone()),
+            );
+            context.register_service(container_security_service);
+
             // Where apps send telemetry, for the framework-agnostic setup
             let ingest_setup_service =
                 Arc::new(crate::services::IngestSetupService::new(db.clone()));
@@ -146,6 +152,15 @@ impl TempsPlugin for ProjectsPlugin {
             config_service: config_service.clone(),
             project_access_checker: project_access_checker.clone(),
         });
+        let container_security_state = Arc::new(
+            crate::handlers::container_security::ContainerSecurityAppState {
+                container_security_service: context
+                    .require_service::<crate::services::container_security::ContainerSecurityService>(),
+                audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
+                sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+            },
+        );
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             external_service_manager,
@@ -174,6 +189,10 @@ impl TempsPlugin for ProjectsPlugin {
             .merge(
                 crate::handlers::ingest_setup::configure_ingest_setup_routes()
                     .with_state(ingest_setup_state),
+            )
+            .merge(
+                crate::handlers::container_security::configure_container_security_routes()
+                    .with_state(container_security_state),
             );
         Some(PluginRoutes::new(routes))
     }

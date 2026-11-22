@@ -344,6 +344,20 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
     page: PROTECTION,
     keywords: ['ai', 'summaries', 'alerts'],
   },
+  {
+    anchor: 'container-security',
+    title: 'Container security',
+    page: PROTECTION,
+    keywords: [
+      'linux capabilities',
+      'cap_add',
+      'net_bind_service',
+      'setcap',
+      'port 80',
+      'privileged port',
+      'operation not permitted',
+    ],
+  },
 
   // Telemetry
   {

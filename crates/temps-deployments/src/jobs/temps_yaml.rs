@@ -147,6 +147,7 @@ pub(crate) mod test_support {
             cloud_telemetry_attribute_allowlist: Vec::new(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            allowed_capabilities: Vec::new(),
         }
     }
 }

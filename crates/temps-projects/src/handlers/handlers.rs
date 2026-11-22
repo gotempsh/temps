@@ -511,6 +511,8 @@ async fn canonical_template_app_url(
     paths(
         super::compose_security::get_compose_security,
         super::compose_security::update_compose_security,
+        super::container_security::get_container_security,
+        super::container_security::update_container_security,
         create_project,
         get_cloudflare_project_capability,
         inspect_drop_archive,

@@ -20,3 +20,4 @@ pub use project::*;
 pub use types::{EnvVarEnvironment, EnvVarWithEnvironments};
 
 pub mod compose_security;
+pub mod container_security;

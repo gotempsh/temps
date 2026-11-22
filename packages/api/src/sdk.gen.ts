@@ -1317,6 +1317,7 @@ import type {
   GetActivityGraphErrors,
   GetActivityGraphResponses,
   GetActivityStatusData,
+  GetActivityStatusErrors,
   GetActivityStatusResponses,
   GetAdminGateData,
   GetAdminGateErrors,
@@ -1549,6 +1550,9 @@ import type {
   GetContainerMetricsData,
   GetContainerMetricsErrors,
   GetContainerMetricsResponses,
+  GetContainerSecurityData,
+  GetContainerSecurityErrors,
+  GetContainerSecurityResponses,
   GetConversationData,
   GetConversationDetailData,
   GetConversationDetailErrors,
@@ -3931,6 +3935,7 @@ import type {
   RotateStatusPageUrlErrors,
   RotateStatusPageUrlResponses,
   RunActivityReportData,
+  RunActivityReportErrors,
   RunActivityReportResponses,
   RunAiProviderPreflightData,
   RunAiProviderPreflightErrors,
@@ -3966,6 +3971,7 @@ import type {
   SandboxIssueRuntimeEnvironmentErrors,
   SandboxIssueRuntimeEnvironmentResponses,
   SaveActivitySettingsData,
+  SaveActivitySettingsErrors,
   SaveActivitySettingsResponses,
   SaveAgentTokenData,
   SaveAgentTokenErrors,
@@ -4408,6 +4414,9 @@ import type {
   UpdateConnectionTokenData,
   UpdateConnectionTokenErrors,
   UpdateConnectionTokenResponses,
+  UpdateContainerSecurityData,
+  UpdateContainerSecurityErrors,
+  UpdateContainerSecurityResponses,
   UpdateCronMonitorData,
   UpdateCronMonitorErrors,
   UpdateCronMonitorResponses,
@@ -22145,6 +22154,44 @@ export const updateComposeSecurity = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const getContainerSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<GetContainerSecurityData, ThrowOnError>,
+): RequestResult<
+  GetContainerSecurityResponses,
+  GetContainerSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetContainerSecurityResponses,
+    GetContainerSecurityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{id}/container-security",
+    ...options,
+  });
+
+export const updateContainerSecurity = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateContainerSecurityData, ThrowOnError>,
+): RequestResult<
+  UpdateContainerSecurityResponses,
+  UpdateContainerSecurityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateContainerSecurityResponses,
+    UpdateContainerSecurityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{id}/container-security",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const getProjectDeployments = <ThrowOnError extends boolean = false>(
   options: Options<GetProjectDeploymentsData, ThrowOnError>,
 ): RequestResult<
@@ -23351,10 +23398,14 @@ export const silenceAlarm = <ThrowOnError extends boolean = false>(
 
 export const getActivityStatus = <ThrowOnError extends boolean = false>(
   options: Options<GetActivityStatusData, ThrowOnError>,
-): RequestResult<GetActivityStatusResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetActivityStatusResponses,
+  GetActivityStatusErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).get<
     GetActivityStatusResponses,
-    unknown,
+    GetActivityStatusErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -23364,10 +23415,14 @@ export const getActivityStatus = <ThrowOnError extends boolean = false>(
 
 export const saveActivitySettings = <ThrowOnError extends boolean = false>(
   options: Options<SaveActivitySettingsData, ThrowOnError>,
-): RequestResult<SaveActivitySettingsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  SaveActivitySettingsResponses,
+  SaveActivitySettingsErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).put<
     SaveActivitySettingsResponses,
-    unknown,
+    SaveActivitySettingsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -23423,10 +23478,14 @@ export const previewActivityReport = <ThrowOnError extends boolean = false>(
 
 export const runActivityReport = <ThrowOnError extends boolean = false>(
   options: Options<RunActivityReportData, ThrowOnError>,
-): RequestResult<RunActivityReportResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  RunActivityReportResponses,
+  RunActivityReportErrors,
+  ThrowOnError
+> =>
   (options.client ?? client).post<
     RunActivityReportResponses,
-    unknown,
+    RunActivityReportErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],

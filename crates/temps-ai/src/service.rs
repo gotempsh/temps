@@ -165,6 +165,61 @@ pub enum CredentialVerificationDiagnostic {
     OperationFailed,
 }
 
+/// Why a provider refused or failed a request, classified from the gateway's
+/// own error so a caller can tell the operator what to fix without quoting the
+/// provider's reply (which can echo the prompt or, on a credential failure,
+/// the key).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderFailureKind {
+    /// The provider rejected the configured credentials (HTTP 401/403).
+    Authentication,
+    /// The model is unknown to the provider, or no configured key serves it.
+    ModelNotFound,
+    /// The model is excluded by the AI Gateway's allowed-models policy.
+    ModelNotAllowed,
+    /// The provider or the AI Gateway rate-limited the request.
+    RateLimited,
+    /// The AI Gateway budget for the scope is spent.
+    BudgetExceeded,
+    /// The provider did not answer in time.
+    Timeout,
+    /// The provider answered with a body that could not be read.
+    MalformedResponse,
+    /// The provider could not be reached (connection, DNS, or a blocked URL).
+    Unreachable,
+    /// The provider key or its configuration cannot serve this request.
+    Misconfigured,
+    /// The provider refused the request for another reason (other HTTP 4xx).
+    Rejected,
+    /// The provider failed (HTTP 5xx).
+    ProviderError,
+}
+
+impl ProviderFailureKind {
+    /// Stable snake_case identifier for API bodies and logs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication",
+            Self::ModelNotFound => "model_not_found",
+            Self::ModelNotAllowed => "model_not_allowed",
+            Self::RateLimited => "rate_limited",
+            Self::BudgetExceeded => "budget_exceeded",
+            Self::Timeout => "timeout",
+            Self::MalformedResponse => "malformed_response",
+            Self::Unreachable => "unreachable",
+            Self::Misconfigured => "misconfigured",
+            Self::Rejected => "rejected",
+            Self::ProviderError => "provider_error",
+        }
+    }
+}
+
+impl std::fmt::Display for ProviderFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Why an AI call could not be completed. All variants are non-fatal — callers
 /// fall back to non-AI behaviour.
 #[derive(Debug, thiserror::Error)]
@@ -179,6 +234,20 @@ pub enum AiError {
     /// The provider/gateway returned an error.
     #[error("AI provider error for '{purpose}': {reason}")]
     Provider { purpose: String, reason: String },
+    /// The provider or the AI Gateway refused or failed the request for a
+    /// classified reason. `reason` is for logs only: it can quote the
+    /// provider's reply, so never show it to users.
+    #[error("AI provider request '{purpose}' for model '{model}' failed ({kind}): {reason}")]
+    ProviderFailed {
+        purpose: String,
+        model: String,
+        kind: ProviderFailureKind,
+        /// The provider's HTTP status, when it answered.
+        status: Option<u16>,
+        /// Seconds the gateway asked the caller to wait, when known.
+        retry_after_secs: Option<u64>,
+        reason: String,
+    },
     /// The provider's reply stream ended before the provider said it was
     /// finished: the connection dropped, a transport error or timeout hit
     /// mid-reply, or the body closed without a terminal chunk (`finish_reason`

@@ -394,6 +394,10 @@ impl WorkloadPlane {
                 volumes: volume_binds(spec, security),
             },
             long_running: matches!(spec.lifetime, Lifetime::LongRunning { .. }),
+            // The project's allow-listed opt-in; admission refused it for
+            // every kind but a deployment, and the driver honours it only
+            // for the deployment profiles.
+            capabilities: spec.process.capabilities.clone(),
         }
     }
 

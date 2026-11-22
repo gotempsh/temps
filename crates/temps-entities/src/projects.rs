@@ -285,6 +285,29 @@ pub struct Model {
     /// ownership marker: never serialized in API responses.
     #[serde(skip_serializing)]
     pub instantiation_token: Option<String>,
+    /// Container security: the Linux capabilities this project's containers
+    /// get back after `cap_drop: ALL`, as Docker names (`NET_BIND_SERVICE`).
+    /// Empty (the default for every existing and new project) is fully
+    /// hardened. A CHECK constraint limits it to the allow-list in
+    /// `temps_workload::ContainerCapability`; read it through
+    /// [`Model::container_capabilities`], never directly. Changed only by
+    /// `PUT /projects/{id}/container-security`, which is audited.
+    #[sea_orm(default_value = "{}")]
+    #[serde(default)]
+    pub allowed_capabilities: Vec<String>,
+}
+
+impl Model {
+    /// The project's allowed capabilities as typed values, sorted. A stored
+    /// value this build does not know (written by a newer version before a
+    /// downgrade) is dropped, never passed on: unknown fails closed.
+    pub fn container_capabilities(&self) -> Vec<temps_workload::ContainerCapability> {
+        // The CHECK constraint keeps unknown values out; only a downgrade
+        // under a newer schema can leave one, and it is dropped here.
+        let (kept, _dropped) =
+            temps_workload::ContainerCapability::from_stored(&self.allowed_capabilities);
+        kept.into_iter().collect()
+    }
 }
 
 /// The ownership token stored in [`Model::instantiation_token`] for the

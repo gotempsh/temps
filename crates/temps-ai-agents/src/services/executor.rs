@@ -4986,6 +4986,7 @@ pub(crate) mod tests {
             service_template: None,
             cross_project_trace_sharing: true,
             serves_own_temps_api: false,
+            allowed_capabilities: Vec::new(),
         }
     }
 

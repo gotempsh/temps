@@ -1078,6 +1078,7 @@ mod tests {
                 security: SecurityProfile::Trusted,
                 attachments: Attachments::default(),
                 long_running: false,
+                capabilities: Vec::new(),
             },
         }
     }

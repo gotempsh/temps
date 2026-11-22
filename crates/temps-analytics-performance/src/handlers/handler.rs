@@ -1054,6 +1054,7 @@ mod tests {
             analytics_identity_mode: Default::default(),
             instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
+            allowed_capabilities: Vec::new(),
         }
     }
 

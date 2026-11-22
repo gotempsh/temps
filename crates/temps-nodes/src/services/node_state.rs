@@ -451,6 +451,14 @@ impl AgentApiDriver {
             project_slug: self.project_slug.clone(),
             control_plane_grants_socket: self.control_plane_grants_socket
                 && spec.security == SecurityProfile::HostPrivileged,
+            // Admission gave capabilities to deployment replicas only; the
+            // agent's deployer adds them to the hardened host config.
+            allowed_capabilities: match spec.security {
+                SecurityProfile::Trusted | SecurityProfile::HostPrivileged => {
+                    spec.capabilities.clone()
+                }
+                SecurityProfile::Data | SecurityProfile::Untrusted => Vec::new(),
+            },
         })
     }
 }
@@ -989,6 +997,7 @@ mod tests {
             }),
             labels: BTreeMap::from([("sh.temps.project_id".into(), "4".into())]),
             security: SecurityProfile::Trusted,
+            capabilities: Vec::new(),
         }
     }
 

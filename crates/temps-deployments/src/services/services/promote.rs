@@ -368,6 +368,9 @@ impl DeploymentService {
             // it would be placed anywhere and started without its socket.
             let mut deploy_builder =
                 crate::jobs::DeployImageJobBuilder::new(project.slug.clone(), caller)
+                    // The project's container security opt-in, as it is now:
+                    // a rollback or promotion starts containers too.
+                    .allowed_capabilities(project.container_capabilities())
                     // ADR 045: the same audit sink an ordinary deploy uses, so a
                     // rollback/promotion that mounts the socket is recorded rather
                     // than only logged.

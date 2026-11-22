@@ -209,6 +209,11 @@ pub struct InstanceTemplate {
     pub labels: BTreeMap<String, String>,
     pub security: SecurityProfile,
     pub attachments: Attachments,
+    /// Capabilities added back to the hardened set (a deployment's
+    /// project opt-in). Absent from older control planes, which never
+    /// granted any: they deserialize as fully hardened.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<crate::ContainerCapability>,
     /// A long-running instance (a deployment replica): a stop is reported
     /// as `Running = False / Stopped`, not as a finished attempt, and a
     /// container removed after it ran is never recreated. Absent from
@@ -238,6 +243,7 @@ impl InstanceTemplate {
             log_rotation: self.log_rotation,
             labels: self.labels,
             security: self.security,
+            capabilities: self.capabilities,
         }
     }
 }

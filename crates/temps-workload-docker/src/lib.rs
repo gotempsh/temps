@@ -48,10 +48,10 @@ pub use shape::{diff as shape_diff, ContainerShape, ShapeDifference, ShapeField}
 pub use volume::DockerVolumeProvider;
 
 use temps_workload::{
-    Artifact, ArtifactKinds, AttachmentKind, Attachments, DriverCapabilities, DriverError,
-    InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus, Isolation,
-    LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream, PortProtocol,
-    PreparedArtifact, RestartPolicy, RuntimeDriver, SecurityProfile, VolumeKinds,
+    Artifact, ArtifactKinds, AttachmentKind, Attachments, ContainerCapability, DriverCapabilities,
+    DriverError, InstanceHandle, InstanceSpec, InstanceState, InstanceStats, InstanceStatus,
+    Isolation, LimitSupport, ListedInstance, LogLine, LogQuery, LogRotation, LogStream,
+    PortProtocol, PreparedArtifact, RestartPolicy, RuntimeDriver, SecurityProfile, VolumeKinds,
 };
 
 /// The driver's name in handles, capabilities and errors.
@@ -66,9 +66,35 @@ pub const DEFAULT_PIDS_LIMIT: i64 = 512;
 /// process are not optional. Binds are collected rather than assigned, so
 /// adding one can never drop another (the secrets mount in particular).
 pub fn hardened_host_config(binds: Vec<String>) -> HostConfig {
+    hardened_host_config_with_capabilities(binds, &[])
+}
+
+/// [`hardened_host_config`], with a project's allow-listed capabilities
+/// added back after `cap_drop: ALL`.
+///
+/// Only [`ContainerCapability`] values are representable, so nothing a
+/// request carries can widen this past the allow-list. Everything else
+/// stays: `cap_drop: ALL`, `no-new-privileges`, the PID limit and init.
+/// The capability enters the bounding set, which is what the kernel's
+/// exec check for a `setcap` entrypoint needs; with `no-new-privileges`
+/// the process is still not granted it.
+pub fn hardened_host_config_with_capabilities(
+    binds: Vec<String>,
+    capabilities: &[ContainerCapability],
+) -> HostConfig {
+    let mut cap_add: Vec<String> = capabilities
+        .iter()
+        .map(|capability| capability.as_str().to_string())
+        .collect();
+    cap_add.sort();
+    cap_add.dedup();
     HostConfig {
         // Drop every Linux capability.
         cap_drop: Some(vec!["ALL".to_string()]),
+        // Then add back only what the project explicitly allowed. `None`
+        // (not an empty list) by default, so the request is byte-for-byte
+        // the one every unconfigured project has always sent.
+        cap_add: (!cap_add.is_empty()).then_some(cap_add),
         // No privilege escalation through setuid/setgid binaries.
         security_opt: Some(vec!["no-new-privileges:true".to_string()]),
         // No fork bombs.
@@ -136,10 +162,16 @@ pub fn container_create_body(
         .chain(attach.volumes.iter().cloned())
         .collect();
     // `Data` (databases) is the control-plane database host config; every
-    // other profile starts from the hardened one.
+    // other profile starts from the hardened one. Capabilities are honoured
+    // only for deployments (`Trusted`, and `HostPrivileged` for an ADR-045
+    // project); admission refuses them for every other kind, and a
+    // sandbox or function that somehow carried one still gets none.
     let mut hardened = match spec.security {
         SecurityProfile::Data => data_host_config(binds),
-        _ => hardened_host_config(binds),
+        SecurityProfile::Trusted | SecurityProfile::HostPrivileged => {
+            hardened_host_config_with_capabilities(binds, &spec.capabilities)
+        }
+        SecurityProfile::Untrusted => hardened_host_config(binds),
     };
     if let Some(pids) = spec.limits.pids {
         hardened.pids_limit = Some(pids);
@@ -976,6 +1008,7 @@ mod tests {
             }),
             labels: BTreeMap::from([("sh.temps.deploy_id".into(), "31".into())]),
             security: SecurityProfile::Trusted,
+            capabilities: vec![],
         }
     }
 
@@ -1021,6 +1054,57 @@ mod tests {
             .unwrap()[0];
         assert_eq!(binding.host_ip.as_deref(), Some("127.0.0.1"));
         assert_eq!(binding.host_port, None, "Docker picks the port");
+    }
+
+    #[test]
+    fn the_default_body_adds_no_capability() {
+        let body = container_create_body(&spec(), &attach(), vec![]);
+        let host = body.host_config.unwrap();
+        assert_eq!(host.cap_add, None);
+        assert_eq!(host.privileged, None);
+        assert_eq!(hardened_host_config(vec![]).cap_add, None);
+    }
+
+    #[test]
+    fn an_allowed_capability_is_added_and_every_other_hardening_stays() {
+        let mut s = spec();
+        s.capabilities = vec![
+            ContainerCapability::NetBindService,
+            ContainerCapability::NetBindService,
+        ];
+        for security in [SecurityProfile::Trusted, SecurityProfile::HostPrivileged] {
+            s.security = security;
+            let host = container_create_body(&s, &attach(), vec![])
+                .host_config
+                .unwrap();
+            assert_eq!(
+                host.cap_add,
+                Some(vec!["NET_BIND_SERVICE".into()]),
+                "{security:?}"
+            );
+            assert_eq!(host.cap_drop, Some(vec!["ALL".into()]));
+            assert_eq!(
+                host.security_opt,
+                Some(vec!["no-new-privileges:true".into()]),
+                "no-new-privileges is kept"
+            );
+            assert_eq!(host.pids_limit, Some(DEFAULT_PIDS_LIMIT));
+            assert_eq!(host.init, Some(true));
+            assert_eq!(host.privileged, None);
+        }
+    }
+
+    #[test]
+    fn capabilities_are_ignored_for_sandboxes_and_databases() {
+        let mut s = spec();
+        s.capabilities = vec![ContainerCapability::NetBindService];
+        for security in [SecurityProfile::Untrusted, SecurityProfile::Data] {
+            s.security = security;
+            let host = container_create_body(&s, &attach(), vec![])
+                .host_config
+                .unwrap();
+            assert_eq!(host.cap_add, None, "{security:?}");
+        }
     }
 
     #[test]

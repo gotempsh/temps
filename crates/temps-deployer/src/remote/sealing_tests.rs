@@ -115,6 +115,7 @@ fn deploy_request(values: bool) -> DeployRequest {
         labels: HashMap::new(),
         project_slug: None,
         control_plane_grants_socket: false,
+        allowed_capabilities: Vec::new(),
     }
 }
 

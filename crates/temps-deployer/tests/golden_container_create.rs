@@ -71,6 +71,7 @@ fn request(container_name: &str) -> DeployRequest {
         ]),
         project_slug: Some("shop".to_string()),
         control_plane_grants_socket: false,
+        allowed_capabilities: Vec::new(),
     }
 }
 

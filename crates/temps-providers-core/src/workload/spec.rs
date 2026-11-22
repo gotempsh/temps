@@ -1023,6 +1023,7 @@ pub fn database_instance(
         }),
         labels,
         security: spec.security.unwrap_or(SecurityProfile::Data),
+        capabilities: Vec::new(),
     };
     Ok(DatabaseInstance {
         spec: instance,

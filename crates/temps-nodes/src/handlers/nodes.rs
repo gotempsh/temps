@@ -7502,6 +7502,7 @@ mod tests {
                     labels: Default::default(),
                     project_slug: None,
                     control_plane_grants_socket: false,
+                    allowed_capabilities: Vec::new(),
                 })
                 .await
                 .expect_err("nothing listens there, so the deploy cannot succeed")

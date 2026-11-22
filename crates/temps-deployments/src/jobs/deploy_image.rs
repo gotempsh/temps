@@ -7,6 +7,7 @@
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
 use super::node_image::{copy_node_built_image, NodeImageCopy};
+use crate::services::entrypoint_capability::{detect_exec_eperm, EntrypointCapabilityFailure};
 use crate::workflow::JobResult;
 use crate::workflow::WorkflowCancellationProvider;
 use crate::workflow::WorkflowContext;
@@ -580,6 +581,10 @@ pub struct DeploymentJobConfig {
     /// outside this crate construct a config that claims control-plane
     /// authorization it was never given.
     pub(crate) control_plane_grants_socket: bool,
+    /// Linux capabilities the project allowed back on top of the hardened
+    /// host config (`projects.allowed_capabilities`). Empty, the default,
+    /// keeps every replica fully hardened.
+    pub allowed_capabilities: Vec<temps_workload::ContainerCapability>,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
     /// (linked-service container names are replaced with their internal
@@ -665,6 +670,7 @@ impl Default for DeploymentJobConfig {
             target_labels: None,
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
             remote_environment_variables: None,
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
@@ -1167,6 +1173,18 @@ fn container_crash_loop_message(info: &temps_deployer::ContainerInfo, restarts: 
     message
 }
 
+/// `message`, annotated with the entrypoint capability finding when there
+/// is one.
+fn annotated(finding: Option<EntrypointCapabilityFailure>, message: String) -> String {
+    match finding {
+        Some(finding) => finding.annotate(message),
+        None => message,
+    }
+}
+
+/// Bound on reading the entrypoint's file capabilities after a failure.
+const FILE_CAPABILITIES_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// What the readiness probe has observed so far.
 #[derive(Debug, Default)]
 struct ReadinessProbeState {
@@ -1250,8 +1268,8 @@ impl ReadinessProbeState {
     }
 }
 
-/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
-/// per candidate. The deployment startup deadline bounds every external call.
+/// The non-HTTP probe without its exit-code observer, as the probe tests drive it.
+#[cfg(test)]
 async fn wait_for_non_http_probe(
     deployer: &dyn ContainerDeployer,
     container_id: &str,
@@ -1259,6 +1277,35 @@ async fn wait_for_non_http_probe(
     address: Option<&str>,
     budget: Duration,
     job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+) -> Result<(), WorkflowError> {
+    let mut observed_exit_code = None;
+    wait_for_non_http_probe_observing(
+        deployer,
+        container_id,
+        health,
+        address,
+        budget,
+        job_log,
+        &mut observed_exit_code,
+    )
+    .await
+}
+
+/// Wait for a `process`, `tcp` or `exec` probe to pass. When an exit or a
+/// crash loop fails it, the exit code of that inspection is recorded in
+/// `observed_exit_code`: a later inspection can see another attempt (a
+/// restarted container reports `Running` with exit code 0).
+///
+/// Control-plane polling only: one in-flight probe and at most 4 KiB of output
+/// per candidate. The deployment startup deadline bounds every external call.
+async fn wait_for_non_http_probe_observing(
+    deployer: &dyn ContainerDeployer,
+    container_id: &str,
+    health: &temps_core::repo_config::HealthCheckConfig,
+    address: Option<&str>,
+    budget: Duration,
+    job_log: Option<(&DeployImageJob, &WorkflowContext)>,
+    observed_exit_code: &mut Option<i32>,
 ) -> Result<(), WorkflowError> {
     health.validate().map_err(|reason| {
         WorkflowError::JobValidationFailed(format!(
@@ -1297,6 +1344,7 @@ async fn wait_for_non_http_probe(
             info.status,
             DeployerContainerStatus::Exited | DeployerContainerStatus::Dead
         ) {
+            *observed_exit_code = info.exit_code;
             return Err(WorkflowError::JobExecutionFailed(
                 container_exit_failure_message(
                     &info,
@@ -1309,6 +1357,7 @@ async fn wait_for_non_http_probe(
             ));
         }
         if restarts >= CRASH_LOOP_RESTART_THRESHOLD {
+            *observed_exit_code = info.exit_code;
             return Err(WorkflowError::JobExecutionFailed(
                 container_crash_loop_message(&info, restarts),
             ));
@@ -1453,21 +1502,67 @@ async fn wait_for_non_http_probe(
 }
 
 impl DeployImageJob {
+    /// Write the container's startup log excerpt to the job log and, when
+    /// the kernel refused to exec its entrypoint because the binary carries
+    /// file capabilities Temps drops, one line explaining that and both
+    /// fixes. Returns that finding so the caller annotates the failure
+    /// reason with it.
+    ///
     /// Runtime output belongs only in authorized job logs, never in the
-    /// persisted failure reason forwarded to notifications and webhooks.
-    async fn write_startup_log_excerpt(
+    /// persisted failure reason forwarded to notifications and webhooks: the
+    /// annotation carries only capability names Temps read or inferred.
+    async fn diagnose_startup_failure(
         &self,
         context: &WorkflowContext,
         deployer: &dyn ContainerDeployer,
         container_id: &str,
-    ) {
-        if let Ok(logs) = deployer.get_container_logs(container_id).await {
-            if let Some(excerpt) = log_excerpt(&logs) {
-                let _ = self
-                    .log(context, format!("Container startup log excerpt: {excerpt}"))
-                    .await;
-            }
+        exit_code: Option<i32>,
+    ) -> Option<EntrypointCapabilityFailure> {
+        let logs = deployer.get_container_logs(container_id).await.ok()?;
+        if let Some(excerpt) = log_excerpt(&logs) {
+            let _ = self
+                .log(context, format!("Container startup log excerpt: {excerpt}"))
+                .await;
         }
+        let binary = detect_exec_eperm(exit_code, &logs)?;
+        let probe = match tokio::time::timeout(
+            FILE_CAPABILITIES_PROBE_TIMEOUT,
+            deployer.file_capabilities(container_id, &binary),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err(format!(
+                "timed out after {}s",
+                FILE_CAPABILITIES_PROBE_TIMEOUT.as_secs()
+            )),
+        };
+        if let Err(reason) = &probe {
+            tracing::warn!(
+                container_id,
+                binary = %binary,
+                %reason,
+                "Could not read the entrypoint's file capabilities; inferring NET_BIND_SERVICE"
+            );
+        }
+        let failure = EntrypointCapabilityFailure::from_probe(binary, probe)?;
+        if failure.already_allowed(&self.config.allowed_capabilities) {
+            let _ = self
+                .log(
+                    context,
+                    format!(
+                        "⚠️ The image's entrypoint {} needs {}, which this project already allows, yet the runtime refused to start it. If it ran on a worker node, update that node's agent so it applies the project's container security setting.",
+                        failure.binary,
+                        failure.required.join(", ")
+                    ),
+                )
+                .await;
+            return None;
+        }
+        let _ = self
+            .log(context, format!("❌ {}", failure.log_line()))
+            .await;
+        Some(failure)
     }
 
     /// `pub(crate)`, not `pub`: the only production constructor is
@@ -5052,6 +5147,18 @@ impl DeployImageJobBuilder {
     ) -> Self {
         self.config.volume_mounts = mounts;
         self.config.volume_pin = pin;
+        self
+    }
+
+    /// The project's container security opt-in: the allow-listed Linux
+    /// capabilities its replicas get back after `cap_drop: ALL`. Every
+    /// deploy path that starts a project's containers passes the
+    /// project's own setting here (`projects::Model::container_capabilities`).
+    pub fn allowed_capabilities(
+        mut self,
+        capabilities: Vec<temps_workload::ContainerCapability>,
+    ) -> Self {
+        self.config.allowed_capabilities = capabilities;
         self
     }
 
