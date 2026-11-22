@@ -69,33 +69,10 @@ impl DockerSandboxProvider {
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         config.validate_allow_docker(super::SandboxBackend::Docker)?;
-        let capacity = self.capacity().await?;
-        let cpu_limit = capacity.cpu_limit(
-            config.run_id,
-            config.cpu_limit,
-            self.config.default_cpu_limit,
-        )?;
-        let memory_limit_mb = capacity.memory_limit(
-            config.run_id,
-            config.memory_limit_mb,
-            self.config.default_memory_limit_mb,
-        )?;
         let (container_name, home_volume_name) = Self::sandbox_names(&config);
-        let _access_operation = self
-            .service_access
-            .as_ref()
-            .map(|mounts| mounts.operation(&container_name))
-            .transpose()?;
-        let egress_policy =
-            config
-                .egress_policy
-                .normalized()
-                .map_err(|error| AgentError::Validation {
-                    message: format!("sandbox '{container_name}': {error}"),
-                })?;
-        // Before anything is replaced or created: a workspace the daemon
-        // cannot mount fails the create outright, with the previous sandbox
-        // (if any) still in place.
+        // Before anything is asked of the daemon or replaced: a workspace the
+        // daemon cannot mount fails the create outright, with the previous
+        // sandbox (if any) still in place.
         let workspace = self
             .daemon_mounts
             .resolve(&config.host_work_dir)
@@ -108,6 +85,29 @@ impl DockerSandboxProvider {
                     config.host_work_dir.display()
                 ),
             })?;
+        let capacity = self.capacity().await?;
+        let cpu_limit = capacity.cpu_limit(
+            config.run_id,
+            config.cpu_limit,
+            self.config.default_cpu_limit,
+        )?;
+        let memory_limit_mb = capacity.memory_limit(
+            config.run_id,
+            config.memory_limit_mb,
+            self.config.default_memory_limit_mb,
+        )?;
+        let _access_operation = self
+            .service_access
+            .as_ref()
+            .map(|mounts| mounts.operation(&container_name))
+            .transpose()?;
+        let egress_policy =
+            config
+                .egress_policy
+                .normalized()
+                .map_err(|error| AgentError::Validation {
+                    message: format!("sandbox '{container_name}': {error}"),
+                })?;
         // Held until the container exists: from here on this sandbox's
         // network may be in use although no container carries its name.
         // A create never overlaps a reap of the same name: wait it out.
