@@ -50,6 +50,12 @@ import type {
   RepositoryResponse,
 } from '@/api/client/types.gen'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
+import {
+  authorizationRejectedMessage,
+  displayedHealthStatus,
+  GITLAB_OAUTH_SETUP_PATH,
+  providerSupportsReauthorization,
+} from '@/components/git/reauthorization'
 import { Badge } from '@/components/ui/badge'
 import { Input } from '@/components/ui/input'
 import {
@@ -277,7 +283,10 @@ export default function GitConnectionDetail() {
         toast.error(
           `Connection "${data.account_name}" is ${data.health_status}`,
           {
-            description: data.health_message ?? undefined,
+            description:
+              authorizationRejectedMessage(data, provider) ??
+              data.health_message ??
+              undefined,
           }
         )
       refreshConnection()
@@ -292,7 +301,7 @@ export default function GitConnectionDetail() {
   useEffect(() => {
     if (!provider || !connection) return
     setBreadcrumbs([
-      { label: 'Git Providers', href: '/git-providers' },
+      { label: 'Git providers', href: '/git-providers' },
       { label: provider.name, href: `/git-providers/${provider.id}` },
       { label: connection.account_name },
     ])
@@ -373,7 +382,7 @@ export default function GitConnectionDetail() {
       <PageState
         variant="failed"
         icon={AlertTriangle}
-        title="Git Connection Not Found"
+        title="Git connection not found"
         description="This connection doesn't exist under this provider, or was deleted."
         action={backAction}
       />
@@ -676,6 +685,7 @@ export default function GitConnectionDetail() {
           )}
           <ConnectionProblems
             connection={connection}
+            provider={provider}
             providerId={provider.id}
           />
           {connection.last_sync_error && !connection.syncing && (
@@ -747,10 +757,11 @@ function LastSyncedValue({ connection }: { connection: ConnectionResponse }) {
 }
 
 function HealthValue({ connection }: { connection: ConnectionResponse }) {
+  const status = displayedHealthStatus(connection)
   const label =
-    connection.health_status === 'healthy'
+    status === 'healthy'
       ? 'Healthy'
-      : connection.health_status === 'unhealthy'
+      : status === 'unhealthy'
         ? 'Unhealthy'
         : 'Not checked'
   return (
@@ -761,10 +772,10 @@ function HealthValue({ connection }: { connection: ConnectionResponse }) {
           : 'No health check has run yet'
       }
       className={
-        connection.health_status === 'unhealthy'
+        status === 'unhealthy'
           ? 'text-destructive'
-          : connection.health_status === 'healthy'
-            ? 'text-emerald-600 dark:text-emerald-400'
+          : status === 'healthy'
+            ? 'text-emerald-700 dark:text-emerald-400'
             : undefined
       }
     >
@@ -782,20 +793,51 @@ function HealthValue({ connection }: { connection: ConnectionResponse }) {
 /** States that stop this connection from working, each with the way out. */
 function ConnectionProblems({
   connection,
+  provider,
   providerId,
 }: {
   connection: ConnectionResponse
+  provider: ProviderResponse
   providerId: number
 }) {
+  const authorizationRejected = authorizationRejectedMessage(
+    connection,
+    provider
+  )
   if (!connection.is_active)
     return (
       <Callout tone="warning" title="This connection is inactive">
-        Projects can&apos;t deploy from it and its repositories won&apos;t sync. Activate
-        it from the{' '}
+        Services can&apos;t deploy from it and its repositories won&apos;t sync.
+        Activate it from the{' '}
         <Link to={`/git-providers/${providerId}`} className="underline">
           provider&apos;s connections
         </Link>
         .
+      </Callout>
+    )
+  if (authorizationRejected)
+    return (
+      <Callout tone="error" title={authorizationRejected}>
+        {providerSupportsReauthorization(provider) ? (
+          <>
+            Syncing and deployments fail until the connection is reauthorized.
+            The user who connected it can use Reauthorize on the{' '}
+            <Link to={`/git-providers/${providerId}`} className="underline">
+              provider&apos;s connections
+            </Link>
+            .
+          </>
+        ) : (
+          <>
+            Syncing and deployments fail until the account is connected again.
+            This provider&apos;s authentication method has no Reauthorize
+            action, so{' '}
+            <Link to={GITLAB_OAUTH_SETUP_PATH} className="underline">
+              add a GitLab OAuth provider
+            </Link>{' '}
+            and connect the account through it.
+          </>
+        )}
       </Callout>
     )
   if (connection.is_expired)

@@ -6,14 +6,17 @@
 //! Downloads repository source code using git provider manager
 
 use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_git::GitProviderManagerTrait;
-use temps_logs::{LogLevel, LogService};
 
 /// Process-wide debug toggle: when set, deployment temp directories under
 /// `/tmp/temps-deployments` are left on disk instead of being removed, so an
@@ -29,6 +32,10 @@ use temps_logs::{LogLevel, LogService};
 /// in a single deployment's log.
 fn keep_deployment_temp_files() -> bool {
     static WARNED: std::sync::Once = std::sync::Once::new();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_DEPLOYMENT_KEEP_TEMP_FILES debug toggle (docs/reference/environment-variables.md)"
+    )]
     let keep = std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok();
     if keep {
         WARNED.call_once(|| {
@@ -441,8 +448,11 @@ impl DownloadRepoJob {
     }
 
     /// Create temporary directory for repository
-    /// Uses deployment ID + timestamp to guarantee uniqueness across concurrent deployments
-    /// and across reinstalls with reused deployment IDs
+    /// Uses deployment ID + timestamp + a random suffix. ID + timestamp alone
+    /// is not unique: two processes that share `/tmp` -- a reinstall reusing
+    /// deployment IDs, or parallel test processes that all deploy ID 1 --
+    /// can start a download in the same second and then clone into, and
+    /// remove, each other's directory.
     fn create_temp_dir(&self, context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
         use std::time::SystemTime;
 
@@ -450,10 +460,13 @@ impl DownloadRepoJob {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| WorkflowError::Other(format!("Failed to get unix timestamp: {}", e)))?
             .as_secs();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
 
         let temp_dir = std::path::PathBuf::from(DEPLOYMENT_TEMP_ROOT).join(format!(
-            "deployment-{}-{}",
-            context.deployment_id, unix_epoch
+            "deployment-{}-{}-{}",
+            context.deployment_id,
+            unix_epoch,
+            &nonce[..12]
         ));
         std::fs::create_dir_all(&temp_dir).map_err(WorkflowError::IoError)?;
         Ok(temp_dir)
@@ -563,41 +576,47 @@ impl DownloadRepoJob {
             )
             .await?;
         } else {
-            // For tags and branches, use shallow clone with branch filter
-            let branch_arg = self
-                .tag_ref
-                .as_ref()
-                .or(self.branch_ref.as_ref())
-                .cloned()
-                .unwrap_or_else(|| "master".to_string());
+            // No commit was supplied: the ref is a branch, a tag or a commit
+            // id (a template or group repository may pin any of the three, and
+            // the field that carries it is called `branch`). `get_checkout_ref`
+            // returns the explicit tag first, then the branch.
+            let reference = self.get_checkout_ref(context);
 
-            self.log(context, format!("Cloning with branch: {}", branch_arg))
+            self.log(context, format!("Cloning ref: {}", reference))
                 .await?;
 
-            let git_url_owned = git_url.to_string();
-            let repo_dir_owned = repo_dir.to_path_buf();
-            let branch_arg_clone = branch_arg.clone();
-            tokio::task::spawn_blocking(move || {
-                temps_git::services::git_ops::clone_repo(
-                    &git_url_owned,
-                    &repo_dir_owned,
-                    Some(&branch_arg_clone),
-                )
-            })
+            // The whole fetch is bounded: a stalled remote must fail the job
+            // with a clear error rather than hang the deployment.
+            const CLONE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+            let cloned = tokio::time::timeout(
+                CLONE_TIMEOUT,
+                temps_git::services::git_ops::clone_ref(git_url, repo_dir, None, &reference),
+            )
             .await
-            .map_err(|e| {
-                WorkflowError::JobExecutionFailed(format!("Git clone task failed: {}", e))
+            .map_err(|_| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Git clone of {}/{} at '{}' timed out after {}s",
+                    self.repo_owner,
+                    self.repo_name,
+                    reference,
+                    CLONE_TIMEOUT.as_secs()
+                ))
             })?
             .map_err(|e| {
                 WorkflowError::JobExecutionFailed(format!(
-                    "Failed to clone public repository: {}",
-                    e
+                    "Failed to clone public repository {}/{} at '{}': {}",
+                    self.repo_owner, self.repo_name, reference, e
                 ))
             })?;
 
             self.log(
                 context,
-                format!("Successfully cloned at ref: {}", branch_arg),
+                format!(
+                    "Successfully cloned {} '{}' at commit {}",
+                    cloned.kind.as_str(),
+                    reference,
+                    cloned.commit_sha
+                ),
             )
             .await?;
         }
@@ -776,8 +795,9 @@ impl DownloadRepoJob {
         // download — which can take minutes on a slow link for a large repo —
         // shows steady movement in the deployment log instead of appearing stuck.
         let archive_path = temp_dir.join("source.tar.gz");
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<temps_git::ArchiveProgress>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<temps_git::ArchiveProgress>(
+            temps_git::ARCHIVE_PROGRESS_CHANNEL_CAPACITY,
+        );
         let progress_logger = {
             let log_writer = context.log_writer.clone();
             let log_id = self.log_id.clone();
@@ -1981,6 +2001,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: now,
             updated_at: now,
         }
@@ -2289,6 +2311,224 @@ mod tests {
         let db = Arc::try_unwrap(db).expect("job released the connection");
         let log = statements(db).join("\n");
         assert!(log.contains(&sha), "{log:?}");
+    }
+
+    /// A bare origin built with the git CLI and addressed over `file://`:
+    /// `main` (two commits), a branch `stable` one commit behind `main`, an
+    /// annotated tag `v1.0.0` and a lightweight tag `v0.9`. Each commit holds
+    /// a different `version.txt`, so the checked-out content proves the ref.
+    struct PublicOrigin {
+        _dir: tempfile::TempDir,
+        url: String,
+        first: String,
+        second: String,
+        main_tip: String,
+    }
+
+    fn public_origin() -> Option<PublicOrigin> {
+        let dir = tempfile::tempdir().ok()?;
+        let work = dir.path().join("work");
+        std::fs::create_dir_all(&work).ok()?;
+        let git = |args: &[&str]| -> Option<String> {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Example Author",
+                    "-c",
+                    "user.email=author@example.com",
+                    "-c",
+                    "init.defaultBranch=main",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "tag.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(&work)
+                .output()
+                .ok()
+                .filter(|output| output.status.success())?;
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        };
+        let commit = |content: &str| -> Option<String> {
+            std::fs::write(work.join("version.txt"), content).ok()?;
+            git(&["add", "version.txt"])?;
+            git(&["commit", "-q", "-m", content])?;
+            git(&["rev-parse", "HEAD"])
+        };
+        git(&["init", "-q"])?;
+        let first = commit("first")?;
+        git(&["tag", "v0.9"])?;
+        let second = commit("second")?;
+        git(&["tag", "-a", "-m", "release 1.0.0", "v1.0.0"])?;
+        git(&["branch", "stable", &first])?;
+        let main_tip = commit("third")?;
+
+        let bare = dir.path().join("origin.git");
+        git(&[
+            "clone",
+            "-q",
+            "--bare",
+            &work.display().to_string(),
+            &bare.display().to_string(),
+        ])?;
+        Some(PublicOrigin {
+            url: format!("file://{}", bare.display()),
+            _dir: dir,
+            first,
+            second,
+            main_tip,
+        })
+    }
+
+    /// Run the public clone for `job` and return the checked-out `HEAD` and
+    /// `version.txt`, or the job's error.
+    async fn clone_public(
+        origin: &PublicOrigin,
+        job: DownloadRepoJob,
+    ) -> Result<(String, String), String> {
+        let context =
+            crate::test_utils::create_test_context("wf-public-ref".to_string(), 910_001, 1, 1);
+        let target = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let repo_dir = target.path().join("repository");
+        std::fs::create_dir_all(&repo_dir).map_err(|e| e.to_string())?;
+        job.clone_public_repository(&context, &origin.url, &repo_dir)
+            .await
+            .map_err(|e| e.to_string())?;
+        let head = temps_git::services::git_ops::read_head_commit(&repo_dir)
+            .map_err(|e| e.to_string())?
+            .ok_or("no .git in the checkout")?
+            .sha;
+        let version =
+            std::fs::read_to_string(repo_dir.join("version.txt")).map_err(|e| e.to_string())?;
+        Ok((head, version))
+    }
+
+    fn public_job() -> DownloadRepoJob {
+        DownloadRepoJob::new_public(
+            "download_repo".to_string(),
+            "example".to_string(),
+            "service".to_string(),
+            "file:///placeholder".to_string(),
+            Arc::new(MockGitProviderManager),
+        )
+    }
+
+    #[tokio::test]
+    async fn public_clone_checks_out_a_branch_without_a_commit() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        for (branch, sha, version) in [
+            ("main", &origin.main_tip, "third"),
+            ("stable", &origin.first, "first"),
+        ] {
+            let (head, content) =
+                clone_public(&origin, public_job().with_branch_ref(branch.to_string()))
+                    .await
+                    .unwrap_or_else(|e| panic!("branch {branch}: {e}"));
+            assert_eq!(&head, sha, "branch {branch}");
+            assert_eq!(content, version, "branch {branch}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_clone_checks_out_a_tag_given_as_the_branch() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        // Group repositories and templates pin a tag in the branch field; a
+        // branch-only fetch failed these with "reference 'refs/remotes/origin/
+        // <ref>' not found".
+        for (tag, sha, version) in [
+            ("v1.0.0", &origin.second, "second"), // annotated
+            ("v0.9", &origin.first, "first"),     // lightweight
+        ] {
+            let (head, content) =
+                clone_public(&origin, public_job().with_branch_ref(tag.to_string()))
+                    .await
+                    .unwrap_or_else(|e| panic!("tag {tag}: {e}"));
+            assert_eq!(&head, sha, "tag {tag}");
+            assert_eq!(content, version, "tag {tag}");
+        }
+    }
+
+    #[tokio::test]
+    async fn public_clone_checks_out_the_tag_parameter_not_the_branch_tip() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        let job = public_job()
+            .with_branch_ref("main".to_string())
+            .with_tag_ref("v1.0.0".to_string());
+        let (head, content) = clone_public(&origin, job).await.expect("tag checkout");
+        assert_eq!(head, origin.second);
+        assert_eq!(content, "second");
+    }
+
+    #[tokio::test]
+    async fn public_clone_checks_out_a_commit_given_as_the_branch() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        for reference in [
+            origin.first.clone(),
+            origin.first[..7].to_string(),
+            origin.second[..12].to_string(),
+        ] {
+            let (head, content) =
+                clone_public(&origin, public_job().with_branch_ref(reference.clone()))
+                    .await
+                    .unwrap_or_else(|e| panic!("commit {reference}: {e}"));
+            assert!(
+                head.starts_with(&reference),
+                "commit {reference} checked out {head}"
+            );
+            assert_eq!(
+                content,
+                if head == origin.first {
+                    "first"
+                } else {
+                    "second"
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn public_clone_still_checks_out_an_explicit_commit() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        let job = public_job()
+            .with_branch_ref("main".to_string())
+            .with_tag_ref("v0.9".to_string())
+            .with_commit_sha(origin.second.clone());
+        let (head, content) = clone_public(&origin, job).await.expect("commit checkout");
+        assert_eq!(head, origin.second);
+        assert_eq!(content, "second");
+    }
+
+    #[tokio::test]
+    async fn public_clone_of_a_missing_ref_names_the_repository_and_the_ref() {
+        let Some(origin) = public_origin() else {
+            println!("git CLI unavailable; skipping");
+            return;
+        };
+        let error = clone_public(&origin, public_job().with_branch_ref("v9.9.9".to_string()))
+            .await
+            .expect_err("a ref that does not exist must fail");
+        assert!(error.contains("example/service"), "{error}");
+        assert!(error.contains("v9.9.9"), "{error}");
+        assert!(
+            error.contains("not a branch, tag or commit"),
+            "the error must say what was looked for: {error}"
+        );
     }
 
     fn nested_checkout() -> tempfile::TempDir {

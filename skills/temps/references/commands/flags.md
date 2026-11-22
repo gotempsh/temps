@@ -14,6 +14,9 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `get` - Show a feature flag and its per-environment values
 - `create` - Create a feature flag
 - `update` - Update a flag definition (default value, description, visibility)
+- `rules` - Targeting rules: serve a different value to some users, or to a percentage of them
+- `evaluate` (`eval`) - Show what a user would get, and why, in one environment
+- `reshuffle` - Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
 - `set` - Set a flag value in one environment
 - `clear` - Clear a flag override so the environment inherits the default
 - `disable` - Kill switch: serve the default in this environment, ignoring any override
@@ -40,6 +43,8 @@ List feature flags
 
 Show a feature flag and its per-environment values
 
+**Usage:** `flags get <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -50,6 +55,8 @@ Show a feature flag and its per-environment values
 ### `flags create`
 
 Create a feature flag
+
+**Usage:** `flags create <key> [options]`
 
 **Options:**
 
@@ -66,6 +73,8 @@ Create a feature flag
 
 Update a flag definition (default value, description, visibility)
 
+**Usage:** `flags update <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -75,11 +84,95 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
+| `--variants <json\|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `flags rules`
+
+Targeting rules: serve a different value to some users, or to a percentage of them
+
+**Subcommands:**
+
+- `list` (`ls`) - Show the ordered rules of a flag in one environment
+- `set` - Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+- `clear` - Remove every rule of a flag in one environment
+
+#### `flags rules list` (alias: `ls`)
+
+Show the ordered rules of a flag in one environment
+
+**Usage:** `flags rules list <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output the rules as JSON (the format `rules set` reads) | - | No |
+
+#### `flags rules set`
+
+Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+
+**Usage:** `flags rules set <key> <rules> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `flags rules clear`
+
+Remove every rule of a flag in one environment
+
+**Usage:** `flags rules clear <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags evaluate` (alias: `eval`)
+
+Show what a user would get, and why, in one environment
+
+**Usage:** `flags evaluate <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `-s, --subject <key>` | Bucketing subject, e.g. a user id | - | No |
+| `-a, --attr <name=value>` | Targeting attribute (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags reshuffle`
+
+Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
+
+**Usage:** `flags reshuffle <key> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-y, --yes` | Skip the confirmation | - | No |
 
 ### `flags set`
 
 Set a flag value in one environment
+
+**Usage:** `flags set <key> <value> [options]`
 
 **Options:**
 
@@ -93,6 +186,8 @@ Set a flag value in one environment
 
 Clear a flag override so the environment inherits the default
 
+**Usage:** `flags clear <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -103,6 +198,8 @@ Clear a flag override so the environment inherits the default
 ### `flags disable`
 
 Kill switch: serve the default in this environment, ignoring any override
+
+**Usage:** `flags disable <key> [options]`
 
 **Options:**
 
@@ -115,6 +212,8 @@ Kill switch: serve the default in this environment, ignoring any override
 
 Re-enable a flag in this environment after a kill switch
 
+**Usage:** `flags enable <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -126,6 +225,8 @@ Re-enable a flag in this environment after a kill switch
 
 Restore an archived flag
 
+**Usage:** `flags restore <key> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -135,6 +236,8 @@ Restore an archived flag
 ### `flags archive`
 
 Archive a flag (callers fall back to their own default)
+
+**Usage:** `flags archive <key> [options]`
 
 **Options:**
 

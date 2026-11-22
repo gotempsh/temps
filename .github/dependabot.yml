@@ -25,6 +25,13 @@ updates:
         update-types:
           - "version-update:semver-minor"
           - "version-update:semver-major"
+      # tokio 1.54 panics on the zero-capacity BufStream that pingora-core 0.9.0
+      # builds for every connection (see the note on tokio in Cargo.toml). Patch
+      # bumps within 1.53 are still allowed. Revisit with the next pingora release.
+      - dependency-name: "tokio"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
       # sea-orm 2.0 (major) is still pre-release and pulls sqlx 0.9; hold on 1.1.
       - dependency-name: "sea-orm"
         update-types:

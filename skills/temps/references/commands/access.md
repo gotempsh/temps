@@ -29,6 +29,8 @@ List the teams granted access to a project
 
 Grant a team access to a project
 
+**Usage:** `access grant <team> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -40,6 +42,8 @@ Grant a team access to a project
 ### `access revoke`
 
 Revoke a team's access to a project
+
+**Usage:** `access revoke <team> [options]`
 
 **Options:**
 

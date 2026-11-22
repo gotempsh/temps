@@ -149,7 +149,7 @@ test('Retry DNS providers restores the configured provider and clears the lookup
     route.fulfill({ json: domain })
   )
   await page.route(/\/api\/domains\/42\/order$/, (route) =>
-    route.fulfill({ json: order })
+    route.fulfill({ json: { order, reason: null } })
   )
   const renewalHistory: ListRenewalAttemptsResponse = {
     attempts: [],
@@ -161,17 +161,9 @@ test('Retry DNS providers restores the configured provider and clears the lookup
     /\/api\/domains\/app\.example\.test\/renewal-attempts(?:\?.*)?$/,
     (route) => route.fulfill({ json: renewalHistory })
   )
-  const assignmentPath = '/api/projects/custom-domains/by-host/app.example.test'
   await page.route(
     /\/api\/projects\/custom-domains\/by-host\/app\.example\.test$/,
-    (route) =>
-      route.fulfill({
-        status: 404,
-        json: {
-          title: 'Not Found',
-          detail: 'The fixture domain has no project assignment',
-        },
-      })
+    (route) => route.fulfill({ json: { custom_domain: null } })
   )
   let requests = 0
   let recover = false
@@ -234,7 +226,7 @@ test('Retry DNS providers restores the configured provider and clears the lookup
         !(
           failure.startsWith('503 ') &&
           /\/api\/dns-providers(?:\?.*)?$/.test(failure)
-        ) && !(failure.startsWith('404 ') && failure.endsWith(assignmentPath))
+        )
     )
   ).toEqual([])
   expect(consoleErrors).toEqual([])

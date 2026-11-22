@@ -107,6 +107,10 @@ impl ExternalPlugin for IndexNowPlugin {
             .build()
     }
 
+    #[allow(
+        clippy::expect_used,
+        reason = "the plugin SDK's router() cannot return an error; a plugin that cannot open its store at startup has nothing to serve and must exit"
+    )]
     fn router(&self, ctx: PluginContext) -> axum::Router {
         let store = ctx.data_dir().to_path_buf();
 

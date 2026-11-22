@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
-use temps_core::external_plugin::PluginManifest;
 use temps_core::JobQueue;
+use temps_plugin_protocol::PluginManifest;
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info};
@@ -32,8 +32,9 @@ use crate::repository::{self, RepositoryError};
 /// Service that manages the external plugin lifecycle and provides data
 /// to the handler layer.
 pub struct ExternalPluginsService {
-    manager: Arc<ExternalPluginManager>,
-    db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) manager: Arc<ExternalPluginManager>,
+    pub(crate) db: Arc<sea_orm::DatabaseConnection>,
+    pub(crate) ai_tools: Arc<temps_ai_api_tools::PluginToolsRegistry>,
     /// Cached manifests from discovery — refreshed on reload.
     manifests: RwLock<Vec<PluginManifest>>,
     /// Event listener that delivers platform events to subscribing plugins
@@ -44,7 +45,8 @@ pub struct ExternalPluginsService {
     /// are reflected without restarting the server.
     proxy_router: Arc<RwLock<Router>>,
     /// Serializes discovery, reload, and install/promotion lifecycles.
-    lifecycle: tokio::sync::Mutex<()>,
+    pub(crate) lifecycle: Arc<tokio::sync::Mutex<()>>,
+    pub(crate) ai_recovery: crate::ai_tools::ConsentRecovery,
     /// Serializes every read/compare/write mutation of the persisted registry
     /// trust state. Catalogue requests can overlap on the network, but they
     /// must be committed in a single monotonic order with installations.
@@ -53,7 +55,10 @@ pub struct ExternalPluginsService {
     install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
-    closing: AtomicBool,
+    pub(crate) watch_host: std::sync::OnceLock<crate::watches::WatchHost>,
+    pub(crate) closing: Arc<AtomicBool>,
+    /// Compiles plugins on a worker node when this process has no Docker.
+    remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
 }
 
 #[derive(Debug, Error)]
@@ -273,6 +278,13 @@ impl ExternalPluginsService {
         Ok(())
     }
 
+    pub(crate) async fn active_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::install::ActiveSource>, ExternalPluginsError> {
+        Ok(crate::install::active_source(&self.manager.config().plugins_dir, name).await?)
+    }
+
     pub(crate) async fn repository_source(
         &self,
         name: &str,
@@ -382,7 +394,13 @@ impl ExternalPluginsService {
         )
         .await?;
         let output = selected._temporary.path().join("plugin");
-        repository::build_with_progress(&selected.source, &output, progress).await?;
+        repository::build_with_progress(
+            &selected.source,
+            &output,
+            progress,
+            self.remote_builder.as_deref(),
+        )
+        .await?;
         if let Some(progress) = progress {
             progress.complete_current().await;
         }
@@ -411,9 +429,63 @@ impl ExternalPluginsService {
             &output,
         )
         .await?;
+        let actor_id = self
+            .promote_operator_candidate(
+                &candidate,
+                crate::manager::repository_actor_source(
+                    &selected.source.repository,
+                    selected.source.path.as_deref(),
+                ),
+                progress,
+            )
+            .await?;
+        Ok(RepositoryInstallOutcome {
+            name: candidate.name,
+            version: candidate.version,
+            platform,
+            sha256,
+            source_commit: selected.source.commit,
+            actor_id,
+        })
+    }
+    pub(crate) async fn install_file(
+        &self,
+        receipt: &crate::install::LocalFileReceipt,
+        path: &std::path::Path,
+    ) -> Result<(), ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        validate_plugin_name(&receipt.plugin_name)?;
+        let dir = &self.manager.config().plugins_dir;
+        let source = crate::install::active_source(dir, &receipt.plugin_name).await?;
+        if !matches!(source, None | Some(crate::install::ActiveSource::File(_))) {
+            return Err(repository::RepositoryError::SourceConflict {
+                name: receipt.plugin_name.clone(),
+                repository: "local file".into(),
+            }
+            .into());
+        }
+        let candidate = PluginInstaller::prepare_file(dir, receipt, path).await?;
+        self.promote_operator_candidate(&candidate, receipt.actor_source(), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn promote_operator_candidate(
+        &self,
+        candidate: &crate::install::InstallCandidate,
+        source_identity: String,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<String, ExternalPluginsError> {
         if let Some(progress) = progress {
             progress.advance(Stage::StartingPlugin).await;
         }
+        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         let pending = match self
             .manager
             .prepare_candidate(
@@ -421,10 +493,7 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::repository_actor_source(
-                    &selected.source.repository,
-                    selected.source.path.as_deref(),
-                ),
+                source_identity,
             )
             .await
         {
@@ -434,15 +503,14 @@ impl ExternalPluginsService {
                     plugin = %candidate.name,
                     version = %candidate.version,
                     reason = %reason,
-                    "Repository plugin candidate failed startup verification"
+                    "Plugin candidate failed startup verification"
                 );
-                let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-                if let Err(error) = installer.discard(&candidate).await {
-                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected repository candidate");
+                if let Err(error) = installer.discard(candidate).await {
+                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected plugin candidate");
                 }
                 return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name,
-                    version: candidate.version,
+                    name: candidate.name.clone(),
+                    version: candidate.version.clone(),
                     reason,
                 });
             }
@@ -452,6 +520,7 @@ impl ExternalPluginsService {
                 Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
                 Err(reason) => {
                     self.manager.discard_candidate(pending).await;
+                    let _ = installer.discard(candidate).await;
                     return Err(ExternalPluginsError::CandidateRejected {
                         name: candidate.name.clone(),
                         version: candidate.version.clone(),
@@ -462,53 +531,74 @@ impl ExternalPluginsService {
         if let Some(progress) = progress {
             progress.advance(Stage::PromotingPlugin).await;
         }
-        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        let activation_rollback = match installer.capture_activation(&candidate).await {
+        let activation_rollback = match installer.capture_activation(candidate).await {
             Ok(rollback) => rollback,
             Err(error) => {
                 self.manager.discard_candidate(pending).await;
+                let _ = installer.discard(candidate).await;
                 return Err(error.into());
             }
         };
-        if let Err(error) = installer.activate(&candidate).await {
+        if let Err(error) = installer.activate(candidate).await {
             self.manager.discard_candidate(pending).await;
-            let _ = installer.discard(&candidate).await;
+            let _ = installer.discard(candidate).await;
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
-        let actor_id = candidate_actor_id;
-        Ok(RepositoryInstallOutcome {
-            name: candidate.name,
-            version: candidate.version,
-            platform,
-            sha256,
-            source_commit: selected.source.commit,
-            actor_id,
-        })
+        Ok(candidate_actor_id)
     }
+
+    async fn commit_candidate_actor(
+        &self,
+        installer: &PluginInstaller,
+        candidate: &crate::install::InstallCandidate,
+        actor_id: &str,
+        source_identity: &str,
+        rollback: crate::install::ActivationRollback,
+    ) -> Result<(), crate::grants::GrantError> {
+        let grants = crate::grants::PluginGrantService::new(self.db.clone());
+        let result = grants
+            .commit_actor(
+                &candidate.name,
+                actor_id,
+                &candidate.sha256,
+                source_identity,
+            )
+            .await;
+        match &result {
+            Ok(()) => {}
+            Err(crate::grants::GrantError::ActivationUnconfirmed { .. }) => {
+                // Keep the verified receipt and release for reconciliation on reload.
+                self.ai_tools
+                    .publish(self.ai_tools.snapshot().without_plugin(&candidate.name));
+            }
+            Err(_) => {
+                // Preparation is provisional. A rolled-back transaction leaves the
+                // previous actor and its grants intact, including on first install.
+                if let Err(error) = installer.rollback_candidate(candidate, rollback).await {
+                    tracing::error!(plugin = %candidate.name, %error, "Failed to restore the previous plugin activation");
+                }
+            }
+        }
+        result
+    }
+
     /// Install the bridge plugins use to call the platform's own HTTP API.
     ///
     /// The console builds its router *after* plugins start (the router
@@ -545,12 +635,25 @@ impl ExternalPluginsService {
             event_listener: RwLock::new(None),
             queue,
             proxy_router: Arc::new(RwLock::new(Router::new())),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
+            watch_host: Default::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            remote_builder: None,
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
         }
+    }
+
+    /// Let installs compile on a worker node when this process has no Docker.
+    pub fn with_remote_builder(
+        mut self,
+        builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
+    ) -> Self {
+        self.remote_builder = builder;
+        self
     }
 
     /// Spawn a background task that runs initial plugin discovery + start,
@@ -594,6 +697,7 @@ impl ExternalPluginsService {
                 let mut cached = self.manifests.write().await;
                 *cached = manifests;
             }
+            self.rebuild_ai_tools().await;
         });
     }
 
@@ -629,19 +733,25 @@ impl ExternalPluginsService {
         // Build the initial proxy router
         let proxy_router = Self::build_proxy_router_from(&manager, &manifests).await;
 
-        Self {
+        let service = Self {
             manager,
             db,
             manifests: RwLock::new(manifests),
             event_listener: RwLock::new(event_listener),
             queue,
             proxy_router: Arc::new(RwLock::new(proxy_router)),
-            lifecycle: tokio::sync::Mutex::new(()),
+            lifecycle: Arc::new(tokio::sync::Mutex::new(())),
+            ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
-            closing: AtomicBool::new(false),
-        }
+            watch_host: Default::default(),
+            closing: Arc::new(AtomicBool::new(false)),
+            remote_builder: None,
+            ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
+        };
+        service.rebuild_ai_tools().await;
+        service
     }
 
     /// Get a snapshot of the current plugin manifests.
@@ -700,6 +810,8 @@ impl ExternalPluginsService {
             }
         }
 
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         // Reload all plugins via manager (shutdown + re-discover + re-start)
         let result = self.manager.reload_all().await;
         let new_manifests = &result.manifests;
@@ -735,6 +847,7 @@ impl ExternalPluginsService {
             *manifests = new_manifests.clone();
         }
 
+        self.rebuild_ai_tools().await;
         Ok(result)
     }
 
@@ -841,13 +954,14 @@ impl ExternalPluginsService {
 
         // Source identity is bidirectional: signed registry installs must not
         // silently replace an administrator-selected repository release.
-        if crate::install::repository_source(
-            &self.manager.config().plugins_dir,
-            &selected.identity.name,
-        )
-        .await?
-        .is_some()
-        {
+        if !matches!(
+            crate::install::active_source(
+                &self.manager.config().plugins_dir,
+                &selected.identity.name
+            )
+            .await?,
+            None | Some(crate::install::ActiveSource::Registry)
+        ) {
             return Err(repository::RepositoryError::SourceConflict {
                 name: selected.identity.name.clone(),
                 repository: "signed registry".to_string(),
@@ -927,28 +1041,21 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                &candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
         let actor_id = candidate_actor_id;
@@ -982,12 +1089,32 @@ impl ExternalPluginsService {
         if self.closing.load(Ordering::Acquire) {
             return Err(ExternalPluginsError::ShuttingDown);
         }
-        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
-            return Err(ExternalPluginsError::NotInstalled {
-                name: name.to_string(),
-            });
+        let active_path = self
+            .manager
+            .config()
+            .plugins_dir
+            .join(name)
+            .join("active.json");
+        match tokio::fs::symlink_metadata(&active_path).await {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(ExternalPluginsError::NotInstalled { name: name.into() });
+            }
+            Err(error) => {
+                return Err(ExternalPluginsError::Install(InstallError::Io {
+                    plugin: name.into(),
+                    path: active_path.display().to_string(),
+                    reason: error.to_string(),
+                }))
+            }
         }
-        self.manager.shutdown_plugin(name).await;
+        // Invalidate before the cancellable write: a lost acknowledgement can
+        // mean revocation committed. Recovery reloads authoritative consent.
+        self.ai_tools
+            .publish(self.ai_tools.snapshot().without_plugin(name));
+        self.schedule_consent_recovery();
+        // Persist revocation before removing the installation. A database failure
+        // leaves the installation intact so reinstall cannot inherit stale consent.
         crate::grants::PluginGrantService::new(self.db.clone())
             .revoke_actor(name)
             .await
@@ -999,6 +1126,13 @@ impl ExternalPluginsService {
                 })
             })?;
 
+        if !PluginInstaller::deactivate(&self.manager.config().plugins_dir, name).await? {
+            return Err(ExternalPluginsError::NotInstalled {
+                name: name.to_string(),
+            });
+        }
+        self.manager.shutdown_plugin(name).await;
+
         self.refresh_runtime_surfaces().await;
         Ok(())
     }
@@ -1006,7 +1140,16 @@ impl ExternalPluginsService {
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
+        self.manager.watch_ready.notify_one();
+        self.ai_recovery.cancel();
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         let _lifecycle = self.lifecycle.lock().await;
+        self.ai_recovery.cancel();
+        // A lifecycle operation already holding the lock may have published
+        // after the early revocation. Revoke its snapshot before stopping.
+        self.ai_tools
+            .publish(temps_ai_api_tools::PluginToolsIndex::default());
         let mut listener = self.event_listener.write().await;
         if let Some(l) = listener.take() {
             l.stop().await;
@@ -1103,6 +1246,7 @@ impl ExternalPluginsService {
         *self.proxy_router.write().await = router;
         *self.event_listener.write().await = listener;
         *self.manifests.write().await = manifests;
+        self.rebuild_ai_tools().await;
     }
 
     /// Start event listener if any plugins subscribe to events.
@@ -1483,20 +1627,27 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod watch_pool;
+
+    #[cfg(unix)]
     fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
-        let manifest = PluginManifest::builder(name, version).build();
-        let hello = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Hello(
-            temps_core::external_plugin::PluginHello {
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+        protocol_fixture_manifest(PluginManifest::builder(name, version).build())
+    }
+
+    #[cfg(unix)]
+    fn protocol_fixture_manifest(manifest: PluginManifest) -> Vec<u8> {
+        let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
+            temps_plugin_protocol::PluginHello {
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 manifest: Box::new(manifest),
             },
         ))
         .expect("serialize fixture hello");
-        let ready = serde_json::to_string(&temps_core::external_plugin::HandshakeMessage::Ready(
-            temps_core::external_plugin::PluginReady {
+        let ready = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Ready(
+            temps_plugin_protocol::PluginReady {
                 ready: true,
                 has_ui: false,
-                protocol_version: temps_core::external_plugin::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
+                protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,
                 openapi: None,
             },
         ))
@@ -2211,6 +2362,44 @@ except Exception:
     }
 
     #[tokio::test]
+    async fn failed_uninstall_revocation_preserves_installation_until_retry() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
+        let temp = tempfile::tempdir().unwrap();
+        let config = ExternalPluginConfig::new(
+            temp.path().to_path_buf(),
+            "postgres://localhost/test".into(),
+        );
+        let active = config.plugins_dir.join("reports/active.json");
+        std::fs::create_dir_all(active.parent().unwrap()).unwrap();
+        std::fs::write(&active, b"fixture active selection").unwrap();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("revocation unavailable".into())])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .append_query_results([Vec::<temps_entities::external_plugin_actors::Model>::new()])
+            .into_connection();
+        let service = ExternalPluginsService::new_empty(config, None, Arc::new(db));
+        let before = service.ai_tools.snapshot();
+        assert!(service.uninstall_plugin("reports").await.is_err());
+        assert!(
+            active.is_file(),
+            "a failed revocation must not remove the active installation"
+        );
+        assert!(
+            !Arc::ptr_eq(&before, &service.ai_tools.snapshot()),
+            "an uncertain revocation must invalidate the prior AI snapshot"
+        );
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(
+            !active.exists(),
+            "deactivation follows durable revocation on retry"
+        );
+        assert!(!Arc::ptr_eq(&before, &service.ai_tools.snapshot()));
+    }
+
+    #[tokio::test]
     #[cfg(unix)]
     async fn protocol_v2_install_activates_and_promotes_verified_binary() {
         if !std::path::Path::new("/usr/bin/python3").exists() {
@@ -2233,12 +2422,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;
@@ -2323,12 +2510,10 @@ except Exception:
         .with_registry(registry);
         config.sockets_dir = temp.path().join("sockets");
         std::fs::create_dir_all(&config.sockets_dir).expect("fixture socket directory");
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping protocol fixture: Docker unavailable: {error}");
                 return;
@@ -2472,5 +2657,287 @@ except Exception:
             !plugins_dir.exists(),
             "a rejected queued install must not create plugin state"
         );
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_reload_preserves_the_process_and_actor_when_a_different_file_is_active() {
+        use crate::install::{LocalFileReceipt, LocalFileSource};
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping single plugin reload fixture: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let name = "reload-fixture";
+        let version = "1.0.0";
+        let mut config =
+            ExternalPluginConfig::new(root.path().into(), "postgres://localhost/test".into());
+        config.sockets_dir = root.path().join("sockets");
+        std::fs::create_dir_all(&config.sockets_dir).unwrap();
+        let service =
+            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
+        let binary = root.path().join("upload");
+        let mut bytes = protocol_v2_fixture(name, version);
+        std::fs::write(&binary, &bytes).unwrap();
+        let mut receipt = LocalFileReceipt {
+            source: LocalFileSource::File,
+            plugin_name: name.into(),
+            version: version.into(),
+            platform: platform_target().unwrap(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        service.install_file(&receipt, &binary).await.unwrap();
+        let original = service.manager.socket_path_for(name).await.unwrap();
+
+        // The new receipt and actor have committed, while the original process remains live.
+        bytes.extend_from_slice(b"\n# replacement release\n");
+        std::fs::write(&binary, &bytes).unwrap();
+        receipt.sha256 = hex::encode(Sha256::digest(&bytes));
+        let candidate = PluginInstaller::prepare_file(&config.plugins_dir, &receipt, &binary)
+            .await
+            .unwrap();
+        PluginInstaller::new(config.registry.clone())
+            .unwrap()
+            .activate(&candidate)
+            .await
+            .unwrap();
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let source = receipt.actor_source();
+        let actor = grants.prepare_actor(name, &source).await.unwrap().actor.id;
+        grants
+            .commit_actor(name, &actor, &receipt.sha256, &source)
+            .await
+            .unwrap();
+
+        let error = service.manager.reload_plugin(name).await.unwrap_err();
+        assert!(error.contains("different release"), "{error}");
+        assert_eq!(
+            service.manager.socket_path_for(name).await.as_ref(),
+            Some(&original)
+        );
+        assert!(original.exists());
+        let settings = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(settings.actor_id, actor);
+        assert_eq!(settings.installation_revision, receipt.sha256);
+
+        service.reload_plugins().await.unwrap();
+        service.manager.reload_plugin(name).await.unwrap();
+        let socket = service.manager.socket_path_for(name).await.unwrap();
+        tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("replacement socket accepts connections");
+        let pid = std::fs::read_to_string(config.pids_dir.join(format!("{name}.pid")))
+            .expect("replacement PID file");
+        assert!(pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
+        let reloaded = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(reloaded.actor_id, actor);
+        assert_eq!(reloaded.installation_revision, receipt.sha256);
+        service.shutdown_all().await;
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsRegistry,
+            ProjectSelectorScope,
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let signing = SigningKey::from_bytes(&[63; 32]);
+        let spec = serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{"description":"List reports"},"responses":{"200":{"description":"ok"}}}}}});
+        let original = String::from_utf8(protocol_v2_fixture("reports", "1.0.0")).unwrap();
+        let (setup, worker) = original
+            .split_once("connection, _ = server.accept()\n")
+            .unwrap();
+        let setup = setup.replace(
+            "args = dict",
+            &format!(
+                "READY = json.dumps(dict(json.loads(READY), openapi=json.loads({})))\nargs = dict",
+                serde_json::to_string(&spec.to_string()).unwrap()
+            ),
+        );
+        let worker = worker.replace("websocket_key = headers[\"sec-websocket-key\"]", r#"if "sec-websocket-key" not in headers:
+    body = json.dumps({"reports": [], "user_id": headers.get("x-temps-user-id")}).encode()
+    connection.sendall(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+    connection.close()
+    return
+websocket_key = headers["sec-websocket-key"]"#);
+        let worker = worker
+            .lines()
+            .map(|line| format!("    {line}\n"))
+            .collect::<String>();
+        let binary = format!("{setup}import threading\ndef respond(connection):\n{worker}\nwhile True:\n    connection, _ = server.accept()\n    threading.Thread(target=respond, args=(connection,), daemon=True).start()\n").into_bytes();
+        let url = serve_artifact_once(binary.clone()).await;
+        let registry_config = crate::catalog::RegistryConfig::local(
+            url.clone(),
+            "fixture-key",
+            signing.verifying_key().to_bytes(),
+        );
+        let mut config =
+            ExternalPluginConfig::new(temp.path().into(), "postgres://localhost/test".into())
+                .with_registry(registry_config);
+        // Keep Unix sockets short on every platform.
+        let sockets = tempfile::tempdir_in("/tmp").unwrap();
+        config.sockets_dir = sockets.path().into();
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping installed plugin AI tools test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let service = ExternalPluginsService::new_empty(config, None, database.connection_arc());
+        service
+            .install_selected(selected_plugin(
+                url, &binary, "reports", "1.0.0", 1, &signing,
+            ))
+            .await
+            .unwrap();
+        let settings = service.plugin_ai_tools("reports").await.unwrap();
+        assert!(!settings.enabled);
+        assert_eq!(settings.tools.len(), 1);
+        let registry: Arc<PluginToolsRegistry> = service.ai_tools.clone();
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        let spec = serde_json::from_value(spec).unwrap();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(
+                crate::plugin::DynamicPluginRouter {
+                    inner: service.proxy_router(),
+                }
+                .router(),
+                &spec,
+                vec![],
+            ),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        let user = serde_json::from_value(serde_json::json!({"id":42,"name":"Reader","email":"reader@example.test","email_verified":true,"must_change_password":false,"mfa_enabled":false,"created_at":chrono::Utc::now(),"updated_at":chrono::Utc::now()})).unwrap();
+        let scope = ApiCallScope {
+            auth: temps_auth::context::AuthContext::new_session(
+                user,
+                temps_auth::permissions::Role::Admin,
+            ),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        assert!(!handle.get().unwrap().search("plugin.reports", &scope)[0].enabled);
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    installation_revision: settings.installation_revision.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        // The actor commit can be durable while the previous verified process
+        // still serves requests. Consent for B must never expose A's schema.
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let other_digest = "ab".repeat(32);
+        grants
+            .commit_binary_hash("reports", &other_digest)
+            .await
+            .unwrap();
+        let other = service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    installation_revision: other_digest,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(other.enabled);
+        assert!(other.tools.is_empty());
+        service.rebuild_ai_tools().await;
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+
+        // Reload reconciles the installed binary and requires its own approval.
+        service.reload_plugins().await.unwrap();
+        let reloaded = service.plugin_ai_tools("reports").await.unwrap();
+        assert_eq!(
+            reloaded.installation_revision,
+            settings.installation_revision
+        );
+        assert!(!reloaded.enabled);
+        assert_eq!(reloaded.tools.len(), 1);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: reloaded.actor_id,
+                    installation_revision: reloaded.installation_revision,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        let result = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(result.body["user_id"], "42");
+        service.reload_plugins().await.unwrap();
+        assert!(service.plugin_ai_tools("reports").await.unwrap().enabled);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id,
+                    installation_revision: settings.installation_revision,
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+        service.uninstall_plugin("reports").await.unwrap();
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        service.shutdown_all().await;
     }
 }

@@ -6,7 +6,8 @@
 //! This module provides a lightweight envelope parser that uses the official
 //! relay-event-schema types for parsing Sentry events, transactions, sessions, etc.
 //!
-//! The Sentry envelope format is a simple text-based protocol:
+//! Headers are newline-delimited JSON; length-delimited payloads may contain
+//! arbitrary binary data or newlines. Lengths always count bytes:
 //! ```text
 //! {envelope_header}\n
 //! {item_header}\n
@@ -22,7 +23,7 @@ use relay_event_schema::protocol::{
 };
 use relay_protocol::{Annotated, FromValue};
 use serde::{Deserialize, Serialize};
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -45,6 +46,8 @@ pub enum EnvelopeError {
     HeaderIoFailed(#[source] serde_json::Error),
     #[error("failed to write payload")]
     PayloadIoFailed(#[source] std::io::Error),
+    #[error("envelope exceeds the 10 MiB body, 8 KiB header, or 1000 item limit")]
+    LimitExceeded,
     #[error("Invalid item payload: {0}")]
     InvalidPayload(String),
 }
@@ -57,6 +60,9 @@ pub struct EnvelopeHeaders {
     /// the case for session metrics.
     #[serde(skip_serializing_if = "Option::is_none")]
     event_id: Option<EventId>,
+
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
 
     /// Data retention in days for the items of this envelope.
     ///
@@ -186,14 +192,27 @@ pub struct ItemHeader {
     #[serde(rename = "type")]
     pub ty: ItemType,
 
-    #[serde(default)]
+    #[serde(default, deserialize_with = "optional_length")]
     pub length: Option<usize>,
+    pub content_type: Option<String>,
+    pub item_count: Option<usize>,
+    /// Retain extension headers (filename, attachment_type, etc.).
+    #[serde(flatten)]
+    pub other: BTreeMap<String, serde_json::Value>,
+}
+
+fn optional_length<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<usize>, D::Error> {
+    usize::deserialize(d).map(Some)
 }
 
 /// Represents an item in a Sentry envelope
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
-pub enum EnvelopeItem {
+pub enum EnvelopeItem<'a> {
+    /// Structured log batch, decoded by the native log adapter.
+    Log(&'a [u8]),
+    /// Unknown/unsupported payloads remain byte-exact and are never reported stored.
+    Unsupported(&'a [u8]),
     /// Error event
     Event(Annotated<Event>),
 
@@ -260,69 +279,95 @@ pub fn peek_envelope_dsn(data: &[u8]) -> Option<String> {
 
 #[derive(Debug)]
 /// A parsed Sentry envelope
-pub struct Envelope {
+pub struct Envelope<'a> {
     header: EnvelopeHeaders,
-    items: Vec<EnvelopeItem>,
+    items: Vec<EnvelopeItem<'a>>,
+    item_headers: Vec<ItemHeader>,
+    item_payloads: Vec<&'a [u8]>,
 }
 
-impl Envelope {
+impl<'a> Envelope<'a> {
     /// Parse an envelope from bytes
-    pub fn from_slice(data: &[u8]) -> Result<Self, EnvelopeError> {
-        let mut lines = Vec::new();
+    pub fn from_slice(data: &'a [u8]) -> Result<Self, EnvelopeError> {
+        Self::parse(data, true)
+    }
 
-        // Split by newlines
-        let text = String::from_utf8_lossy(data);
-        for line in text.lines() {
-            lines.push(line);
+    /// Frame every item, but decode only items handled by the active native
+    /// adapters. Unsupported payload schemas must not block otherwise valid
+    /// errors/logs (or allocate Relay objects that will immediately be dropped).
+    pub(crate) fn parse_for_ingestion(data: &'a [u8]) -> Result<Self, EnvelopeError> {
+        Self::parse(data, false)
+    }
+
+    fn parse(data: &'a [u8], decode_legacy: bool) -> Result<Self, EnvelopeError> {
+        if data.len() > 10 * 1024 * 1024 {
+            return Err(EnvelopeError::LimitExceeded);
         }
-
-        if lines.is_empty() {
-            return Err(EnvelopeError::InvalidHeader("Empty envelope".to_string()));
+        if data.is_empty() {
+            return Err(EnvelopeError::MissingHeader);
         }
-
-        // Parse envelope header (first line)
-        let header: EnvelopeHeaders = serde_json::from_str(lines[0])
-            .map_err(|e| EnvelopeError::InvalidHeader(format!("Failed to parse header: {}", e)))?;
-
+        let (header_bytes, mut offset) = read_line(data, 0);
+        if header_bytes.len() > MAX_ENVELOPE_HEADER_PEEK_BYTES {
+            return Err(EnvelopeError::LimitExceeded);
+        }
+        let header: EnvelopeHeaders = serde_json::from_slice(header_bytes)
+            .map_err(|_| EnvelopeError::InvalidHeader("invalid JSON object".into()))?;
         let mut items = Vec::new();
-        let mut i = 1;
-
-        // Parse items
-        while i < lines.len() {
-            if lines[i].trim().is_empty() {
-                i += 1;
-                continue;
+        let mut item_headers = Vec::new();
+        let mut item_payloads = Vec::new();
+        while offset < data.len() {
+            if items.len() >= 1000 {
+                return Err(EnvelopeError::LimitExceeded);
             }
-
-            // Parse item header
-            let item_header: ItemHeader = match serde_json::from_str(lines[i]) {
-                Ok(h) => h,
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to parse item header at line {}: {}. Skipping.",
-                        i,
-                        e
-                    );
-                    i += 1;
-                    continue;
+            let (header_bytes, payload_offset) = read_line(data, offset);
+            if header_bytes.len() > MAX_ENVELOPE_HEADER_PEEK_BYTES {
+                return Err(EnvelopeError::LimitExceeded);
+            }
+            let mut item_header: ItemHeader =
+                serde_json::from_slice(header_bytes).map_err(EnvelopeError::InvalidItemHeader)?;
+            // Keep the actual future type name as well as the bounded enum used
+            // for dispatch/diagnostics. Never use untrusted names as metric labels.
+            if item_header.ty == ItemType::Unknown {
+                let raw: serde_json::Value = serde_json::from_slice(header_bytes)
+                    .map_err(EnvelopeError::InvalidItemHeader)?;
+                if let Some(ty) = raw.get("type") {
+                    item_header.other.insert("type".into(), ty.clone());
+                }
+            }
+            if payload_offset == data.len() && !data.ends_with(b"\n") {
+                return Err(EnvelopeError::UnexpectedEof);
+            }
+            let payload = match item_header.length {
+                Some(length) => {
+                    let end = payload_offset
+                        .checked_add(length)
+                        .filter(|end| *end <= data.len())
+                        .ok_or(EnvelopeError::UnexpectedEof)?;
+                    offset = end;
+                    if end < data.len() {
+                        if data[end] != b'\n' {
+                            return Err(EnvelopeError::MissingNewline);
+                        }
+                        offset += 1;
+                    }
+                    &data[payload_offset..end]
+                }
+                None => {
+                    let (payload, next) = read_line(data, payload_offset);
+                    offset = next;
+                    payload
                 }
             };
-
-            i += 1;
-
-            // Get item payload
-            if i >= lines.len() {
-                tracing::warn!("Item header without payload at line {}. Skipping.", i - 1);
-                break;
+            if !decode_legacy && !matches!(&item_header.ty, ItemType::Event | ItemType::Log) {
+                items.push(EnvelopeItem::Unsupported(payload));
+                item_headers.push(item_header);
+                item_payloads.push(payload);
+                continue;
             }
-
-            let payload = lines[i];
-            i += 1;
-
             // Parse item based on type
             let item = match &item_header.ty {
                 ItemType::Event => {
-                    let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
+                    let val: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse event: {}", e))
                     })?;
                     let mut event = Event::from_value(val.into());
@@ -330,7 +375,7 @@ impl Envelope {
                     Some(EnvelopeItem::Event(event))
                 }
                 ItemType::Transaction => {
-                    let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
+                    let val: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse transaction: {}", e))
                     })?;
                     let mut transaction = Event::from_value(val.into());
@@ -338,13 +383,13 @@ impl Envelope {
                     Some(EnvelopeItem::Transaction(transaction))
                 }
                 ItemType::Session => {
-                    let session = SessionUpdate::parse(payload.as_bytes()).map_err(|e| {
+                    let session = SessionUpdate::parse(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse session: {}", e))
                     })?;
                     Some(EnvelopeItem::Session(session))
                 }
                 ItemType::ClientReport => {
-                    let report = ClientReport::parse(payload.as_bytes()).map_err(|e| {
+                    let report = ClientReport::parse(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!(
                             "Failed to parse client report: {}",
                             e
@@ -353,14 +398,14 @@ impl Envelope {
                     Some(EnvelopeItem::ClientReport(report))
                 }
                 ItemType::Span => {
-                    let val: serde_json::Value = serde_json::from_str(payload).map_err(|e| {
+                    let val: serde_json::Value = serde_json::from_slice(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!("Failed to parse span: {}", e))
                     })?;
                     let span = Span::from_value(val.into());
                     Some(EnvelopeItem::Span(span))
                 }
                 ItemType::Sessions => {
-                    let aggregates = SessionAggregates::parse(payload.as_bytes()).map_err(|e| {
+                    let aggregates = SessionAggregates::parse(payload).map_err(|e| {
                         EnvelopeError::InvalidPayload(format!(
                             "Failed to parse session aggregates: {}",
                             e
@@ -368,7 +413,8 @@ impl Envelope {
                     })?;
                     Some(EnvelopeItem::SessionAggregates(aggregates))
                 }
-                // Unimplemented item types - skip them
+                ItemType::Log => Some(EnvelopeItem::Log(payload)),
+                // Preserve unsupported types for bounded dispatch outcomes.
                 ItemType::Security
                 | ItemType::Attachment
                 | ItemType::FormData
@@ -383,32 +429,60 @@ impl Envelope {
                 | ItemType::ReplayRecording
                 | ItemType::ReplayVideo
                 | ItemType::CheckIn
-                | ItemType::Log
                 | ItemType::TraceMetric
                 | ItemType::UserReportV2
                 | ItemType::ProfileChunk
-                | ItemType::Unknown => {
-                    tracing::debug!("Skipping unimplemented item type: {}", item_header.ty);
-                    None
-                }
+                | ItemType::Unknown => Some(EnvelopeItem::Unsupported(payload)),
             };
 
             if let Some(item) = item {
                 items.push(item);
+                item_headers.push(item_header);
+                item_payloads.push(payload);
             }
         }
 
-        Ok(Envelope { header, items })
+        Ok(Envelope {
+            header,
+            items,
+            item_headers,
+            item_payloads,
+        })
+    }
+
+    pub fn items_with_headers(&self) -> impl Iterator<Item = (&ItemHeader, &EnvelopeItem<'a>)> {
+        self.item_headers.iter().zip(self.items.iter())
+    }
+
+    /// Borrow original wire payloads without copying or normalizing unknown fields.
+    pub fn items_with_payloads(
+        &self,
+    ) -> impl Iterator<Item = (&ItemHeader, &EnvelopeItem<'a>, &'a [u8])> {
+        self.items_with_headers()
+            .zip(self.item_payloads.iter())
+            .map(|((header, item), payload)| (header, item, *payload))
     }
 
     /// Get the envelope header
+    pub fn event_id(&self) -> Option<String> {
+        self.header.event_id.map(|id| id.to_string())
+    }
+
     pub fn header(&self) -> &EnvelopeHeaders {
         &self.header
     }
 
     /// Iterate over envelope items
-    pub fn items(&self) -> impl Iterator<Item = &EnvelopeItem> {
+    pub fn items(&self) -> impl Iterator<Item = &EnvelopeItem<'a>> {
         self.items.iter()
+    }
+}
+
+/// Read a UNIX-delimited line without interpreting payload bytes as text.
+fn read_line(data: &[u8], offset: usize) -> (&[u8], usize) {
+    match data[offset..].iter().position(|b| *b == b'\n') {
+        Some(length) => (&data[offset..offset + length], offset + length + 1),
+        None => (&data[offset..], data.len()),
     }
 }
 
@@ -425,6 +499,119 @@ fn apply_envelope_event_id(event: &mut Annotated<Event>, event_id: Option<EventI
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn active_dispatch_does_not_validate_unsupported_payload_schemas() {
+        let data = b"{}\n{\"type\":\"session\",\"length\":3}\n\xff\x00\n\n{\"type\":\"event\"}\n{\"event_id\":\"11111111111111111111111111111111\",\"level\":\"error\"}";
+        let envelope = Envelope::parse_for_ingestion(data).unwrap();
+        assert_eq!(envelope.items().count(), 2);
+        assert!(matches!(
+            envelope.items().next(),
+            Some(EnvelopeItem::Unsupported(_))
+        ));
+        assert!(Envelope::from_slice(data).is_err());
+    }
+
+    #[test]
+    fn byte_framing_preserves_binary_multiline_headers_and_following_error() {
+        let payload = b"\xff\x00first\nsecond\r\n";
+        let mut data = format!("{{\"event_id\":\"11111111111111111111111111111111\"}}\n{{\"type\":\"attachment\",\"length\":{},\"filename\":\"synthetic.bin\",\"attachment_type\":\"event.attachment\"}}\n", payload.len()).into_bytes();
+        data.extend_from_slice(payload);
+        data.extend_from_slice(
+            b"\n{\"type\":\"event\"}\n{\"message\":\"Synthetic error\",\"level\":\"error\"}",
+        );
+        data.extend_from_slice(b"\n{\"type\":\"log\",\"item_count\":0,\"content_type\":\"application/vnd.sentry.items.log+json\"}\n{\"items\":[]}");
+        let envelope = Envelope::from_slice(&data).unwrap();
+        let items: Vec<_> = envelope.items_with_headers().collect();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0].0.other["filename"], "synthetic.bin");
+        assert!(matches!(items[0].1, EnvelopeItem::Unsupported(bytes) if *bytes == payload));
+        assert!(matches!(items[1].1, EnvelopeItem::Event(_)));
+        assert!(matches!(items[2].1, EnvelopeItem::Log(bytes) if *bytes == b"{\"items\":[]}"));
+    }
+
+    #[test]
+    fn length_is_bytes_not_characters_and_allows_multiline_json() {
+        let payload = "{\n\"message\":\"Synthetic ☃\",\n\"level\":\"error\"\n}";
+        let data = format!(
+            "{{}}\n{{\"type\":\"event\",\"length\":{}}}\n{}",
+            payload.len(),
+            payload
+        );
+        assert_eq!(
+            Envelope::from_slice(data.as_bytes())
+                .unwrap()
+                .items()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn implicit_payload_preserves_carriage_return_and_accepts_eof() {
+        for data in [
+            b"{}\n{\"type\":\"future\"}\nabc\r\n".as_slice(),
+            b"{}\n{\"type\":\"future\"}\nabc\r",
+        ] {
+            let envelope = Envelope::from_slice(data).unwrap();
+            let (header, item) = envelope.items_with_headers().next().unwrap();
+            assert_eq!(header.other["type"], "future");
+            assert!(matches!(item, EnvelopeItem::Unsupported(bytes) if *bytes == b"abc\r"));
+        }
+    }
+
+    #[test]
+    fn empty_envelopes_and_explicit_zero_length_payloads() {
+        for data in [b"{}".as_slice(), b"{}\n"] {
+            assert_eq!(Envelope::from_slice(data).unwrap().items().count(), 0);
+        }
+        for suffix in ["", "\n", "\n{\"type\":\"future\",\"length\":0}\n"] {
+            let data = format!("{{}}\n{{\"type\":\"attachment\",\"length\":0}}\n{suffix}");
+            assert!(Envelope::from_slice(data.as_bytes()).is_ok(), "{suffix:?}");
+        }
+    }
+
+    #[test]
+    fn malformed_frames_are_rejected_without_resynchronizing_into_payloads() {
+        for data in [
+            "",
+            "[]",
+            "{}\n\n",
+            "{}\nnot-json\n{}",
+            "{}\n{\"type\":\"attachment\",\"length\":null}\nx",
+            "{}\n{\"type\":\"attachment\",\"length\":-1}\nx",
+            "{}\n{\"type\":\"attachment\",\"length\":1.5}\nx",
+            "{}\n{\"type\":\"attachment\",\"length\":999999999999999999999999999}\nx",
+            "{}\n{\"type\":\"attachment\",\"length\":4}\nabc",
+            "{}\n{\"type\":\"attachment\",\"length\":1}\nab",
+            "{}\n{\"type\":\"attachment\",\"length\":1}\na\r\n",
+            "{}\n{\"type\":\"attachment\",\"length\":0}",
+        ] {
+            assert!(Envelope::from_slice(data.as_bytes()).is_err(), "{data:?}");
+        }
+        assert!(Envelope::from_slice(b"{}\n{\"type\":\"event\"}\n\xff").is_err());
+    }
+
+    #[test]
+    fn byte_header_and_item_limits_apply_to_unknown_items_too() {
+        assert!(matches!(
+            Envelope::from_slice(&vec![b'x'; 10 * 1024 * 1024 + 1]),
+            Err(EnvelopeError::LimitExceeded)
+        ));
+        let data = format!("{{\"padding\":\"{}\"}}", "x".repeat(8192));
+        assert!(matches!(
+            Envelope::from_slice(data.as_bytes()),
+            Err(EnvelopeError::LimitExceeded)
+        ));
+        let data = format!(
+            "{{}}\n{}",
+            "{\"type\":\"future\",\"length\":0}\n\n".repeat(1001)
+        );
+        assert!(matches!(
+            Envelope::from_slice(data.as_bytes()),
+            Err(EnvelopeError::LimitExceeded)
+        ));
+    }
 
     #[test]
     fn peek_reads_dsn_from_envelope_header() {
@@ -553,16 +740,31 @@ mod tests {
 
     #[test]
     fn parse_event_with_stacktrace() {
-        let event_json = include_str!("../../resources/stacktrace_event.json");
-        let event_value: serde_json::Value = serde_json::from_str(event_json).unwrap();
-        let event_value = Event::from_value(event_value.into());
-        let _event = event_value
+        let envelope = Envelope::from_slice(br#"{}
+{"type":"event"}
+{"exception":{"values":[{"type":"SyntheticError","value":"Synthetic failure","stacktrace":{"frames":[{"filename":"app:///application.js","function":"syntheticOperation","lineno":7,"in_app":true}]}}]}}
+"#).unwrap();
+        let EnvelopeItem::Event(event) = envelope.items().next().unwrap() else {
+            panic!("expected error event");
+        };
+        let event = event.value().unwrap();
+        let exception = event.exceptions.value().unwrap().values.value().unwrap()[0]
             .value()
-            .unwrap_or_else(|| panic!("Should parse event"));
-        println!("{}", event_value.to_json_pretty().unwrap());
-        // let stacktrace = event.stacktrace.value();
-        // assert!(stacktrace.is_some(), "Should parse stacktrace");
-        // let stacktrace = stacktrace.unwrap();
-        // println!("Stacktrace: {:?}", stacktrace);
+            .unwrap();
+        let frame = exception
+            .stacktrace
+            .value()
+            .unwrap()
+            .frames
+            .value()
+            .unwrap()[0]
+            .value()
+            .unwrap();
+        assert_eq!(
+            frame.filename.value().map(|path| path.as_str()),
+            Some("app:///application.js")
+        );
+        assert_eq!(frame.function.as_str(), Some("syntheticOperation"));
+        assert_eq!(frame.lineno.value(), Some(&7));
     }
 }

@@ -18,10 +18,14 @@ use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
 use std::io::{self, Write};
-use std::net::Ipv4Addr;
+mod eager_dns;
+mod generated_hostname;
+use eager_dns::issuance_contact;
+use generated_hostname::{embedded_ipv4_from_zone, generated_domain_for, is_loopback_zone};
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
+use temps_config::AppSettings;
+use temps_core::{url_validation::validate_ipv4, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -71,11 +75,20 @@ pub enum OutputFormat {
     Json,
 }
 
+/// Who terminates TLS for this installation. Skipping eager provisioning via
+/// `--skip-ssl` remains independent: auto mode can still issue on demand.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum TlsMode {
+    #[default]
+    Auto,
+    External,
+}
+
 #[derive(Args)]
 pub struct SetupCommand {
-    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -85,6 +98,11 @@ pub struct SetupCommand {
     #[arg(long)]
     pub admin_email: Option<String>,
 
+    /// Default admin and ACME contact for this run. Overrides a saved ACME contact.
+    /// --admin-email and --letsencrypt-email override their respective defaults.
+    #[arg(long)]
+    pub email: Option<String>,
+
     /// Admin user display name (default: "Admin")
     #[arg(long, default_value = "Admin")]
     pub admin_name: String,
@@ -93,6 +111,10 @@ pub struct SetupCommand {
     /// For automation, provide a secure password to avoid interactive prompts
     #[arg(long, env = "TEMPS_ADMIN_PASSWORD")]
     pub admin_password: Option<String>,
+
+    /// Read the admin password from a file instead of passing it on the command line
+    #[arg(long, conflicts_with = "admin_password")]
+    pub admin_password_file: Option<PathBuf>,
 
     /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
     /// When omitted, defaults to a sslip.io domain generated from the
@@ -181,6 +203,11 @@ pub struct SetupCommand {
     #[arg(long, default_value = "false")]
     pub skip_ssl: bool,
 
+    /// TLS owner: auto keeps certificate provisioning/on-demand TLS; external
+    /// serves HTTP behind a tunnel or reverse proxy and disables on-demand TLS
+    #[arg(long, value_enum, default_value = "auto")]
+    pub tls_mode: TlsMode,
+
     /// Skip DNS A record creation (useful when managing DNS externally)
     #[arg(long, default_value = "false")]
     pub skip_dns_records: bool,
@@ -237,7 +264,7 @@ pub struct SetupCommand {
     /// and (like the sslip.io domain default above) skip SSL/DNS-provider
     /// setup even if --wildcard-domain is explicitly given. Zero prompts
     /// required. Use this for unattended/scripted installs.
-    #[arg(long, default_value = "false")]
+    #[arg(long, visible_alias = "yes", default_value = "false")]
     pub auto: bool,
 }
 
@@ -312,10 +339,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
     Ok(())
 }
 
-/// Result type indicating whether the user was created or password was reset
+/// Only a newly created administrator has a credential to return.
 pub enum AdminUserResult {
     Created(users::Model, String),
-    PasswordReset(users::Model, String),
+    Existing(users::Model),
 }
 
 async fn create_admin_user(
@@ -326,18 +353,6 @@ async fn create_admin_user(
 ) -> anyhow::Result<AdminUserResult> {
     let email_lower = email.to_lowercase();
 
-    // Use provided password or generate a secure one
-    let password = provided_password
-        .map(|p| p.to_string())
-        .unwrap_or_else(generate_secure_password);
-
-    // Hash password with Argon2
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(password.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
-        .to_string();
-
     // Check if user exists
     let existing_user = users::Entity::find()
         .filter(users::Column::Email.eq(&email_lower))
@@ -345,12 +360,6 @@ async fn create_admin_user(
         .await?;
 
     if let Some(existing) = existing_user {
-        // User exists - reset password
-        let mut user_update: users::ActiveModel = existing.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.updated_at = Set(chrono::Utc::now());
-        let updated_user = user_update.update(conn).await?;
-
         // Ensure user has admin role
         let admin_role = roles::Entity::find()
             .filter(roles::Column::Name.eq("admin"))
@@ -366,26 +375,28 @@ async fn create_admin_user(
 
         // Check if user already has admin role
         let has_admin_role = user_roles::Entity::find()
-            .filter(user_roles::Column::UserId.eq(updated_user.id))
+            .filter(user_roles::Column::UserId.eq(existing.id))
             .filter(user_roles::Column::RoleId.eq(admin_role.id))
             .one(conn)
             .await?;
 
         if has_admin_role.is_none() {
-            // Assign admin role
-            let user_role = user_roles::ActiveModel {
-                user_id: Set(updated_user.id),
-                role_id: Set(admin_role.id),
-                created_at: Set(chrono::Utc::now()),
-                updated_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
-            user_role.insert(conn).await?;
+            anyhow::bail!("Setup found existing user {} without the admin role. Supply the existing administrator's email.", existing.id);
         }
-
-        debug!("Reset password for admin user: {}", email_lower);
-        return Ok(AdminUserResult::PasswordReset(updated_user, password));
+        return Ok(AdminUserResult::Existing(existing));
     }
+
+    // Use provided password or generate a secure one
+    let password = provided_password
+        .map(|p| p.to_string())
+        .unwrap_or_else(generate_secure_password);
+
+    // Hash password with Argon2
+    let argon2 = Argon2::default();
+    let password_hash = argon2
+        .hash_password(password.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
+        .to_string();
 
     // Create new user
     let new_user = users::ActiveModel {
@@ -406,12 +417,14 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    let user = new_user.insert(conn).await?;
+    use sea_orm::TransactionTrait;
+    let txn = conn.begin().await?;
+    let user = new_user.insert(&txn).await?;
 
     // Get admin role
     let admin_role = roles::Entity::find()
         .filter(roles::Column::Name.eq("admin"))
-        .one(conn)
+        .one(&txn)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -430,7 +443,8 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    user_role.insert(conn).await?;
+    user_role.insert(&txn).await?;
+    txn.commit().await?;
 
     debug!("Created admin user: {}", email_lower);
     Ok(AdminUserResult::Created(user, password))
@@ -484,7 +498,6 @@ async fn create_dns_provider(
 
 /// Result of git provider creation
 pub struct GitProviderCreationResult {
-    #[allow(dead_code)] // Provider is available for future use (e.g., repository sync)
     pub provider: git_providers::Model,
     pub connection: git_provider_connections::Model,
 }
@@ -595,7 +608,7 @@ async fn create_git_provider(
 }
 
 async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
-    let provider = CloudflareDnsProvider::new(token.to_string());
+    let provider = CloudflareDnsProvider::new(token.to_string())?;
     match provider.test_api_access().await {
         Ok(true) => Ok(true),
         Ok(false) => Err(anyhow::anyhow!(
@@ -777,28 +790,33 @@ async fn detect_public_ip() -> anyhow::Result<String> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    // Try multiple services
-    let services = vec![
-        ("https://api.ipify.org?format=json", "ip"),
-        ("https://ipinfo.io/json", "ip"),
-        ("https://api.myip.com", "ip"),
-    ];
+    #[derive(serde::Deserialize)]
+    struct EchoResponse {
+        ip: std::net::IpAddr,
+    }
 
-    for (url, field) in services {
-        match client.get(url).send().await {
-            Ok(response) => {
-                if let Ok(json) = response.json::<serde_json::Value>().await {
-                    if let Some(ip) = json.get(field).and_then(|v| v.as_str()) {
-                        // Validate it looks like an IP address
-                        if ip.parse::<std::net::IpAddr>().is_ok() {
-                            return Ok(ip.to_string());
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Failed to get IP from {}: {}", url, e);
+    // A proxy or private
+    // exit address is not an origin for the installer to publish in DNS.
+    for url in [
+        "https://api.ipify.org?format=json",
+        "https://ipinfo.io/json",
+        "https://api.myip.com",
+    ] {
+        let response = match client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                debug!(%url, %error, "Public IP lookup failed");
                 continue;
+            }
+        };
+        if let Ok(echo) = response.json::<EchoResponse>().await {
+            if is_public_setup_origin(echo.ip) {
+                return Ok(echo.ip.to_string());
             }
         }
     }
@@ -806,6 +824,14 @@ async fn detect_public_ip() -> anyhow::Result<String> {
     Err(anyhow::anyhow!(
         "Unable to auto-detect public IP. Please provide --server-ip manually."
     ))
+}
+
+fn is_public_setup_origin(address: std::net::IpAddr) -> bool {
+    let public = match address {
+        std::net::IpAddr::V4(ip) => validate_ipv4(&ip),
+        std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+    };
+    public.is_ok() && temps_core::known_proxies::known_proxy(address).is_none()
 }
 
 /// Detect the primary private/LAN IP address as a fallback when public IP detection fails.
@@ -849,7 +875,6 @@ fn print_warning(message: &str) {
     println!("{} {}", "⚠️ ".bright_yellow(), message.bright_yellow());
 }
 
-#[allow(dead_code)]
 fn print_error(message: &str) {
     println!("{} {}", "❌".bright_red(), message.bright_red());
 }
@@ -1072,7 +1097,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     println!(
         "   {} {}",
         "📍".bright_yellow(),
-        "GeoLite2-City.mmdb is required to run the application".bright_white()
+        "GeoLite2-City.mmdb is needed for geolocation".bright_white()
     );
     println!(
         "{}",
@@ -1113,7 +1138,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     );
     println!();
     println!(
-        "   {} Setup can continue, but {} will fail without this file.",
+        "   {} Setup can continue; {} runs without geolocation until this file is provided.",
         "ℹ️ ".bright_blue(),
         "temps serve".bright_cyan()
     );
@@ -1283,8 +1308,8 @@ async fn import_external_certificate(
         domain_update.expiration_time = Set(Some(expiration_time));
         domain_update.status = Set("active".to_string());
         domain_update.last_renewed = Set(Some(Utc::now()));
-        domain_update.last_error = Set(None);
-        domain_update.last_error_type = Set(None);
+        // An imported certificate ends any failed ACME or on-demand streak.
+        domain_update.clear_certificate_failure();
         domain_update.verification_method = Set("manual".to_string());
         domain_update.updated_at = Set(Utc::now());
 
@@ -1317,6 +1342,7 @@ async fn update_app_settings(
     preview_domain: &str,
     external_url: Option<&str>,
     letsencrypt_email: Option<&str>,
+    tls_mode: TlsMode,
 ) -> anyhow::Result<()> {
     use chrono::Utc;
 
@@ -1348,7 +1374,7 @@ async fn update_app_settings(
         }
     }
 
-    configure_on_demand_tls(&mut app_settings, preview_domain);
+    configure_on_demand_tls(&mut app_settings, preview_domain, tls_mode);
 
     // Mark setup as complete so the web onboarding wizard knows to skip
     // itself — prevents the "Configure Base Domain" wall from appearing
@@ -1356,10 +1382,14 @@ async fn update_app_settings(
     app_settings.setup_complete = true;
 
     let now = Utc::now();
-    let settings_json = existing
+    let mut settings_json = existing
         .as_ref()
         .map(|r| app_settings.to_json_merged(&r.data))
         .unwrap_or_else(|| app_settings.to_json());
+    // Bootstrap-owned metadata is kept outside the mutable AppSettings API.
+    // Its merged writes preserve this decision; both proxy entry points load
+    // it once at startup, so external TLS adds no request-time settings reads.
+    settings_json["external_tls"] = serde_json::json!(tls_mode == TlsMode::External);
 
     if let Some(existing_model) = existing {
         // Update existing settings. Merge, don't replace — re-running `temps
@@ -1447,24 +1477,30 @@ fn normalize_acme_contact_email(email: &str) -> Option<String> {
     Some(normalized)
 }
 
-/// Configure on-demand HTTP-01 TLS only when certificate issuance can work.
+/// Enable on-demand HTTP-01 TLS whenever the preview domain is a public zone.
 ///
-/// A public zone without an ACME contact is not a partially configured state:
-/// every issuance is guaranteed to fail. Keep the feature disabled until setup
-/// has persisted a contact, and clear stale state when setup is re-run in local
-/// mode or without one.
-fn configure_on_demand_tls(app_settings: &mut AppSettings, preview_domain: &str) {
+/// Setup turns it on for every install that can be reached by Let's Encrypt and
+/// records the zone, so stable environment URLs not covered by a wildcard
+/// certificate get HTTPS without a further step. A loopback or private zone is
+/// not reachable for the HTTP-01 challenge, so setup clears any stale state when
+/// it is re-run in local mode.
+///
+/// The ACME contact email is deliberately not a precondition: it can be set
+/// after setup (`letsencrypt.email`) and is resolved on every issuance, so the
+/// feature starts working without a restart. Until then issuance fails with a
+/// clear "no ACME contact email configured" error, and the proxy warns at boot.
+fn configure_on_demand_tls(
+    app_settings: &mut AppSettings,
+    preview_domain: &str,
+    tls_mode: TlsMode,
+) {
     let zone = preview_domain.trim();
-    let has_acme_contact = app_settings
-        .letsencrypt
-        .email
-        .as_deref()
-        .and_then(normalize_acme_contact_email)
-        .is_some();
-    let sslip_ip_is_public =
-        sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
-    let can_issue =
-        !zone.is_empty() && !is_loopback_zone(zone) && sslip_ip_is_public && has_acme_contact;
+    let sslip_ip_is_public = embedded_ipv4_from_zone(zone, "sslip.io")
+        .is_none_or(|address| validate_ipv4(&address).is_ok());
+    let can_issue = tls_mode == TlsMode::Auto
+        && !zone.is_empty()
+        && !is_loopback_zone(zone)
+        && sslip_ip_is_public;
 
     app_settings.on_demand_tls.enabled = can_issue;
     app_settings.on_demand_tls.zone = can_issue.then(|| zone.to_ascii_lowercase());
@@ -1476,82 +1512,71 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
     wildcard_domain.trim_start_matches("*.").to_string()
 }
 
-/// True if `zone` is a loopback zone (`127.0.0.1.sslip.io`, `localhost`, …) —
-/// local mode, where Let's Encrypt cannot reach the box for the HTTP-01
-/// challenge, so on-demand TLS would never fire. This is the only condition
-/// that gates ADR-018 §6 on-demand-TLS auto-enablement; any other (non-empty,
-/// non-loopback) base domain qualifies, regardless of whether it is sslip.io.
-/// Build the wildcard-DNS base domain for `ip`, using the **dashed** spelling.
-///
-/// Wildcard-DNS services (sslip.io and friends) locate the target address by
-/// scanning the hostname for four numeric components joined by a *single*
-/// separator style, taking the leftmost match — and that match is not anchored
-/// to the base domain. With a dotted base, any generated label ending in a
-/// number donates it to the front of the IP and the name resolves elsewhere:
-///
-/// ```text
-/// observability-starter-1.127.0.0.1.sslip.io  ->  1.127.0.0
-/// pr-42.127.0.0.1.sslip.io                    ->  42.127.0.0
-/// ```
-///
-/// Deployment slugs are `{project}-{n}` and preview environments are
-/// `pr-{number}`, so on a dotted base that is *every* generated hostname. The
-/// dashed spelling makes the separator styles disagree (`1.127-0-0` mixes a dot
-/// and dashes, so it is rejected) and the real `127-0-0-1` wins.
-///
-/// The published installer emits the same dashed form and passes it via
-/// `--wildcard-domain`; this covers `temps setup --auto` generating its own.
-///
-/// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
-/// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
-fn sslip_domain_for(ip: &str) -> anyhow::Result<String> {
-    let address = ip.parse::<Ipv4Addr>().map_err(|error| {
-        anyhow::anyhow!(
-            "Cannot generate a sslip.io domain from server IP '{ip}': {error}. \
-             Automatic domains currently require IPv4; provide --server-ip with a valid IPv4 \
-             address or use an explicit --wildcard-domain."
-        )
-    })?;
-    Ok(format!(
-        "{}.sslip.io",
-        address.to_string().replace('.', "-")
-    ))
-}
-
-fn sslip_ipv4_from_zone(zone: &str) -> Option<Ipv4Addr> {
-    let encoded = zone
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .strip_suffix(".sslip.io")?
-        .to_string();
-
-    encoded
-        .parse()
-        .ok()
-        .or_else(|| encoded.replace('-', ".").parse().ok())
-}
-
-fn is_loopback_zone(zone: &str) -> bool {
-    let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
-    z == "localhost"
-        || z.ends_with(".localhost")
-        || z.starts_with("127.0.0.1")
-        || z.contains("127-0-0-1")
-        // `localho.st` is a real public DNS name that resolves to 127.0.0.1 --
-        // used throughout this codebase as the local/loopback dev domain
-        // (see doctor.rs's "default - configure a real domain for
-        // production" warning and the proxy's SameSite-safe cookie tests)
-        // specifically so browsers treat it as a normal internet host. It is
-        // still loopback for ACME purposes: Let's Encrypt's HTTP-01/on-demand
-        // validators cannot reach a box whose public DNS answer is its own
-        // loopback address, so issuance can never succeed and on-demand TLS
-        // must stay off here exactly as it does for `localhost`/`127.0.0.1`.
-        || z == "localho.st"
-        || z.ends_with(".localho.st")
-}
-
 impl SetupCommand {
+    fn resolve_installation_inputs(&mut self) -> anyhow::Result<()> {
+        if let Some(email) = &self.email {
+            self.admin_email.get_or_insert_with(|| email.clone());
+            self.letsencrypt_email.get_or_insert_with(|| email.clone());
+        }
+        if let Some(path) = &self.admin_password_file {
+            let password = fs::read_to_string(path).map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot read admin password file '{}': {}",
+                    path.display(),
+                    error
+                )
+            })?;
+            let password = password.trim_end_matches(['\r', '\n']);
+            if password.chars().count() < 8 || password.chars().any(char::is_control) {
+                anyhow::bail!(
+                    "Admin password file must contain one password of at least 8 characters without control characters"
+                );
+            }
+            self.admin_password = Some(password.to_string());
+        }
+        if self.tls_mode == TlsMode::External {
+            if self.wildcard_domain.is_none() || self.external_url.is_none() {
+                anyhow::bail!("--tls-mode external requires --wildcard-domain and --external-url; configure the public hostname separately from the HTTP origin");
+            }
+            if self.wildcard_domain_cert.is_some() || self.wildcard_domain_key.is_some() {
+                anyhow::bail!("--tls-mode external cannot import a certificate; TLS is managed by the reverse proxy");
+            }
+            let domain = self.wildcard_domain.as_deref().unwrap_or_default();
+            let domain = domain.strip_prefix("*.").ok_or_else(|| {
+                anyhow::anyhow!(
+                    "--wildcard-domain must start with *. (for example *.apps.example.com)"
+                )
+            })?;
+            if domain.is_empty()
+                || domain.len() > 253
+                || !domain.split('.').all(|label| {
+                    !label.is_empty()
+                        && label.len() <= 63
+                        && !label.starts_with('-')
+                        && !label.ends_with('-')
+                        && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+                })
+            {
+                anyhow::bail!("--wildcard-domain must be a hostname such as *.apps.example.com");
+            }
+            let external_url = self.external_url.as_deref().unwrap_or_default();
+            let url = url::Url::parse(external_url)
+                .map_err(|error| anyhow::anyhow!("Invalid --external-url: {}", error))?;
+            if !matches!(url.scheme(), "http" | "https")
+                || url.host_str().is_none()
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || !matches!(url.path(), "" | "/")
+                || url.query().is_some()
+                || url.fragment().is_some()
+            {
+                anyhow::bail!("--external-url must be an HTTP or HTTPS origin URL with a hostname and no credentials, path, query or fragment");
+            }
+            self.skip_ssl = true;
+        }
+        Ok(())
+    }
+
     fn apply_auto_defaults(&mut self) {
         self.non_interactive = true;
         self.skip_ssl = true;
@@ -1599,6 +1624,13 @@ impl SetupCommand {
     }
 
     pub fn execute(mut self) -> anyhow::Result<()> {
+        // Setup provisions the database it is given, never a discovered one.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
+        self.resolve_installation_inputs()?;
         print_header();
 
         debug!("Starting Temps setup");
@@ -1643,8 +1675,10 @@ impl SetupCommand {
 
         // Setup encryption key
         let encryption_key = setup_encryption_key(&data_dir)?;
-        let encryption_service = EncryptionService::new(&encryption_key)
-            .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?;
+        let encryption_service = std::sync::Arc::new(
+            EncryptionService::new(&encryption_key)
+                .map_err(|e| anyhow::anyhow!("Failed to create encryption service: {}", e))?,
+        );
 
         print_success("Encryption key configured");
 
@@ -1682,7 +1716,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");
@@ -1787,16 +1821,17 @@ impl SetupCommand {
                     }
                 }
             };
-            let sslip_domain = sslip_domain_for(&ip)?;
+            let suffix = "sslip.io";
+            let sslip_domain = generated_domain_for(&ip, suffix)?;
             print_success(&format!(
-                "No --wildcard-domain given — defaulting to sslip.io: {}",
+                "No --wildcard-domain given — using the generated domain {}",
                 format!("*.{sslip_domain}").bright_cyan()
             ));
-            print_warning(
-                "The generated hostname uses the third-party sslip.io DNS service and is \
-                 intended for quick-start use. Configure your own wildcard domain for production.",
-            );
-            if sslip_ipv4_from_zone(&sslip_domain)
+            print_warning(&format!(
+                "The generated hostname uses the {suffix} DNS service and is \
+                 intended for quick-start use. Configure your own wildcard domain for production."
+            ));
+            if embedded_ipv4_from_zone(&sslip_domain, suffix)
                 .is_some_and(|address| validate_ipv4(&address).is_err())
             {
                 print_warning(
@@ -1816,7 +1851,7 @@ impl SetupCommand {
 
         // Initialize roles (admin, user)
         print_section("Initializing Roles");
-        let user_service = UserService::new(db.clone());
+        let user_service = UserService::new(db.clone(), encryption_service.clone());
         rt.block_on(user_service.initialize_roles())
             .map_err(|e| anyhow::anyhow!("Failed to initialize roles: {}", e))?;
         print_success("Default roles initialized (admin, user)");
@@ -1825,7 +1860,7 @@ impl SetupCommand {
         // resources (e.g., GitHub App installations) that reference user_id=0
         rt.block_on(ensure_system_user(db.as_ref()))?;
 
-        // Create admin user (or reset password if user exists)
+        // Create the bootstrap administrator on the first run.
         print_section("Admin User Setup");
         let (user, password) = match rt.block_on(create_admin_user(
             db.as_ref(),
@@ -1837,9 +1872,9 @@ impl SetupCommand {
                 print_success("Admin user created");
                 (user, password)
             }
-            AdminUserResult::PasswordReset(user, password) => {
-                print_success("Admin user password reset");
-                (user, password)
+            AdminUserResult::Existing(user) => {
+                print_success("Existing administrator retained");
+                (user, String::new())
             }
         };
 
@@ -2134,7 +2169,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2190,6 +2225,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2260,7 +2296,7 @@ impl SetupCommand {
 
                 let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
                 print_section("DNS A Record Setup");
                 let wildcard_record_name = if subdomain_prefix.is_empty() {
@@ -2316,6 +2352,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2352,7 +2389,7 @@ impl SetupCommand {
         print_step(1, 8, "Verifying Cloudflare zone and detecting server IP");
         let cf_provider = CloudflareDnsProvider::new(cloudflare_token_for_dns.clone().ok_or_else(|| {
                     anyhow::anyhow!("DNS A record creation requires Cloudflare provider. Use --skip-dns-records to skip.")
-                })?);
+                })?)?;
 
         // Extract base domain from wildcard (e.g., "*.app.example.com" -> "example.com")
         let base_domain = wildcard_domain
@@ -2455,21 +2492,28 @@ impl SetupCommand {
 
         // Set Let's Encrypt environment based on --letsencrypt-staging flag
         if self.letsencrypt_staging {
-            std::env::set_var("LETSENCRYPT_MODE", "staging");
             print_substep(&format!(
                 "{} Using Let's Encrypt staging environment",
                 "ℹ".bright_blue()
             ));
         }
 
-        let encryption_service_arc = std::sync::Arc::new(encryption_service);
+        let encryption_service_arc = encryption_service.clone();
         let repository: std::sync::Arc<dyn temps_domains::tls::CertificateRepository> =
             std::sync::Arc::new(DefaultCertificateRepository::new(
                 db.clone(),
                 encryption_service_arc.clone(),
             ));
         let cert_provider: std::sync::Arc<dyn temps_domains::tls::CertificateProvider> =
-            std::sync::Arc::new(LetsEncryptProvider::new(repository.clone()));
+            std::sync::Arc::new(
+                LetsEncryptProvider::new(repository.clone()).with_environment(
+                    if self.letsencrypt_staging {
+                        "staging"
+                    } else {
+                        "production"
+                    },
+                ),
+            );
         let domain_service = DomainService::new(
             db.clone(),
             cert_provider,
@@ -2512,11 +2556,11 @@ impl SetupCommand {
         };
         println!();
 
-        // Check if domain already has a valid certificate. "active_renewal_failed"
-        // still has a usable cert (only its last renewal failed), so it counts too.
-        if temps_entities::domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
-            && domain.certificate.is_some()
-        {
+        let Some(acme_email) = issuance_contact(
+            DomainService::can_reuse_serving_certificate(&domain),
+            self.letsencrypt_email.as_deref(),
+        )?
+        else {
             println!(
                 "   {} Domain '{}' already has a valid certificate!",
                 "🎉".bright_green(),
@@ -2532,6 +2576,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2550,13 +2595,13 @@ impl SetupCommand {
                 self.admin_password.is_some(),
                 &self.output_format,
             );
-        }
+        };
 
         // Step 4: Request DNS-01 challenge from Let's Encrypt
         print_step(4, 8, "Requesting Let's Encrypt DNS-01 challenge");
         print_spinner_step("Contacting Let's Encrypt ACME server");
         let challenge_data =
-            rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))?;
+            rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email))?;
         print_spinner_done();
 
         if challenge_data.status == "completed" {
@@ -2574,6 +2619,7 @@ impl SetupCommand {
                 &preview_domain,
                 self.external_url.as_deref(),
                 self.letsencrypt_email.as_deref(),
+                self.tls_mode,
             ))?;
             print_success(&format!(
                 "Preview domain set to: {}",
@@ -2763,8 +2809,7 @@ impl SetupCommand {
                 }
 
                 // Request a new challenge (this creates a new ACME order)
-                match rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))
-                {
+                match rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email)) {
                     Ok(new_challenge) => {
                         if new_challenge.status == "completed" {
                             // Certificate was issued immediately (unlikely but possible)
@@ -2863,7 +2908,7 @@ impl SetupCommand {
                 "Requesting certificate issuance (attempt {}/{})",
                 attempt, max_retries
             ));
-            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, &admin_email)) {
+            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, acme_email)) {
                 Ok(completed_domain) => {
                     print_spinner_done();
                     // Success means a cert is being served. "active_renewal_failed" also
@@ -3021,6 +3066,7 @@ impl SetupCommand {
             &preview_domain,
             self.external_url.as_deref(),
             self.letsencrypt_email.as_deref(),
+            self.tls_mode,
         ))?;
         print_success(&format!(
             "Preview domain set to: {}",
@@ -3182,6 +3228,119 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[tokio::test]
+    async fn setup_rerun_preserves_admin_password() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let encryption = EncryptionService::new_from_password("test");
+        UserService::new(test_db.db.clone(), std::sync::Arc::new(encryption))
+            .initialize_roles()
+            .await
+            .unwrap();
+        let email = "admin@example.com";
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "ALTER TABLE user_roles ADD CONSTRAINT reject_test_assignment CHECK (FALSE) NOT VALID",
+        )
+        .await
+        .unwrap();
+        assert!(create_admin_user(db, email, "Admin", None).await.is_err());
+        assert!(users::Entity::find()
+            .filter(users::Column::Email.eq(email))
+            .one(db)
+            .await
+            .unwrap()
+            .is_none());
+        db.execute_unprepared("ALTER TABLE user_roles DROP CONSTRAINT reject_test_assignment")
+            .await
+            .unwrap();
+        let AdminUserResult::Created(first, _) =
+            create_admin_user(db, email, "Admin", None).await.unwrap()
+        else {
+            panic!("expected a fresh administrator")
+        };
+        for supplied in [None, Some("different-password")] {
+            let AdminUserResult::Existing(existing) =
+                create_admin_user(db, email, "Admin", supplied)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected the original administrator")
+            };
+            assert_eq!(existing.password_hash, first.password_hash);
+            assert_eq!(existing.updated_at, first.updated_at);
+        }
+    }
+
+    /// Importing a certificate over a domain whose ACME or on-demand attempts
+    /// failed leaves no trace of that failure: the console would otherwise
+    /// show a stale cause next to a working certificate, and the next
+    /// on-demand failure would start high on the backoff ladder.
+    #[tokio::test]
+    async fn importing_a_certificate_clears_the_previous_failure() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let now = chrono::Utc::now();
+        domains::ActiveModel {
+            domain: Set("imported.example.com".to_string()),
+            status: Set("on_demand_failed".to_string()),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            last_error: Set(Some("connection refused".to_string())),
+            last_error_type: Set(Some("challenge_mismatch".to_string())),
+            failure_cause: Set(Some("unreachable".to_string())),
+            on_demand_backoff_until: Set(Some(now + chrono::Duration::hours(4))),
+            on_demand_failure_streak: Set(4),
+            on_demand_last_failure_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("failed domain inserted");
+        let encryption = EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("test key");
+
+        let imported = import_external_certificate(
+            db,
+            &encryption,
+            "imported.example.com",
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            now + chrono::Duration::days(90),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.status, "active");
+        assert_eq!(imported.verification_method, "manual");
+        assert_eq!(imported.last_error, None);
+        assert_eq!(imported.last_error_type, None);
+        assert_eq!(imported.failure_cause, None);
+        assert_eq!(imported.on_demand_backoff_until, None);
+        assert_eq!(imported.on_demand_failure_streak, 0);
+        assert_eq!(imported.on_demand_last_failure_at, None);
+    }
+
     fn parse_setup(extra_args: &[&str]) -> Box<SetupCommand> {
         let mut args = vec!["temps", "setup", "--database-url", "postgres://example"];
         args.extend_from_slice(extra_args);
@@ -3190,6 +3349,78 @@ mod tests {
             panic!("expected setup command");
         };
         command
+    }
+
+    #[test]
+    fn public_detection_rejects_private_and_reserved_echo_results() {
+        for address in [
+            "127.0.0.1",
+            "192.168.1.1",
+            "203.0.113.10",
+            "2001:db8::1",
+            "::1",
+        ] {
+            assert!(
+                !is_public_setup_origin(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn eager_dns_uses_the_resolved_contact_and_explains_a_missing_one() {
+        let mut cmd = parse_setup(&[
+            "--email",
+            "certs@example.com",
+            "--admin-email",
+            "admin@example.com",
+        ]);
+        cmd.resolve_installation_inputs().unwrap();
+        cmd.resolve_acme_contact("admin@example.com", Some("old@example.com"))
+            .unwrap();
+        assert_eq!(
+            issuance_contact(false, cmd.letsencrypt_email.as_deref()).unwrap(),
+            Some("certs@example.com")
+        );
+        let mut unset = parse_setup(&[]);
+        unset.resolve_acme_contact("admin@localhost", None).unwrap();
+        assert!(issuance_contact(false, unset.letsencrypt_email.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("--letsencrypt-email"));
+    }
+
+    #[test]
+    fn unattended_email_flags_override_saved_contacts() {
+        let mut setup = parse_setup(&["--yes", "--email", "owner@example.com"]);
+        assert!(setup.auto);
+        setup.resolve_installation_inputs().unwrap();
+        setup.apply_auto_defaults();
+        assert!(setup.non_interactive);
+        let admin = setup.admin_email.clone().unwrap();
+        setup
+            .resolve_acme_contact(&admin, Some("previous@example.com"))
+            .unwrap();
+        assert_eq!(admin, "owner@example.com");
+        assert_eq!(
+            setup.letsencrypt_email.as_deref(),
+            Some("owner@example.com")
+        );
+
+        let mut separate = parse_setup(&[
+            "--email",
+            "owner@example.com",
+            "--admin-email",
+            "admin@example.com",
+            "--letsencrypt-email",
+            "certs@example.com",
+        ]);
+        separate.resolve_installation_inputs().unwrap();
+        assert_eq!(separate.admin_email.as_deref(), Some("admin@example.com"));
+        assert_eq!(
+            separate.letsencrypt_email.as_deref(),
+            Some("certs@example.com")
+        );
     }
 
     #[test]
@@ -3275,6 +3506,21 @@ mod tests {
         assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
     }
 
+    #[test]
+    fn generated_domain_validates_the_dns_suffix() {
+        let address = "203.0.113.10";
+        assert_eq!(
+            generated_domain_for(address, "example.com").unwrap(),
+            "203-0-113-10.example.com"
+        );
+        for suffix in ["", "https://example.com", "*.example.com", "a..example.com"] {
+            assert!(generated_domain_for(address, suffix).is_err());
+        }
+        let mut settings = AppSettings::default();
+        configure_on_demand_tls(&mut settings, "192-168-1-1.sslip.io", TlsMode::Auto);
+        assert!(!settings.on_demand_tls.enabled);
+    }
+
     /// Pins the dashed spelling. Reverting this to the dotted form still
     /// compiles and passes every other check, while silently making every
     /// generated app hostname on a quick-start install resolve to a third
@@ -3282,22 +3528,23 @@ mod tests {
     #[test]
     fn sslip_domain_uses_the_dashed_ip_spelling() {
         assert_eq!(
-            sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain"),
+            generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain"),
             "127-0-0-1.sslip.io"
         );
         assert_eq!(
-            sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain"),
+            generated_domain_for("203.0.113.42", "sslip.io").expect("IPv4 should produce a domain"),
             "203-0-113-42.sslip.io"
         );
         // The generated base must stay loopback-detectable, or `temps setup`
         // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
         assert!(is_loopback_zone(
-            &sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain")
+            &generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain")
         ));
         assert!(!is_loopback_zone(
-            &sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain")
+            &generated_domain_for("203.0.113.42", "sslip.io")
+                .expect("IPv4 should produce a domain")
         ));
-        assert!(sslip_domain_for("2001:db8::1")
+        assert!(generated_domain_for("2001:db8::1", "sslip.io")
             .expect_err("IPv6 should require an explicit wildcard domain")
             .to_string()
             .contains("currently require IPv4"));
@@ -3415,33 +3662,228 @@ mod tests {
     }
 
     #[test]
-    fn on_demand_tls_requires_a_public_zone_and_acme_contact() {
+    fn on_demand_tls_is_enabled_for_a_public_zone_without_waiting_for_a_contact() {
         let mut settings = AppSettings::default();
+        assert!(settings.letsencrypt.email.is_none());
 
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("not-an-email".to_string());
-        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
-        assert!(!settings.on_demand_tls.enabled);
-        assert_eq!(settings.on_demand_tls.zone, None);
-
-        settings.letsencrypt.email = Some("certs@example.com".to_string());
-        configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ");
+        configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ", TlsMode::Auto);
         assert!(settings.on_demand_tls.enabled);
         assert_eq!(
             settings.on_demand_tls.zone.as_deref(),
             Some("1-1-1-1.sslip.io")
         );
 
-        configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io");
+        settings.letsencrypt.email = Some("certs@example.com".to_string());
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::Auto);
+        assert!(settings.on_demand_tls.enabled);
+        assert_eq!(
+            settings.on_demand_tls.zone.as_deref(),
+            Some("apps.example.com")
+        );
+
+        configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io", TlsMode::Auto);
         assert!(!settings.on_demand_tls.enabled);
         assert_eq!(settings.on_demand_tls.zone, None);
 
-        configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io");
+        configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io", TlsMode::Auto);
         assert!(!settings.on_demand_tls.enabled);
         assert_eq!(settings.on_demand_tls.zone, None);
+
+        configure_on_demand_tls(&mut settings, "localhost", TlsMode::Auto);
+        assert!(!settings.on_demand_tls.enabled);
+    }
+
+    #[test]
+    fn external_tls_clears_existing_on_demand_issuance() {
+        let mut settings = AppSettings {
+            console_force_https: Some(true),
+            ..Default::default()
+        };
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::Auto);
+        assert!(settings.on_demand_tls.enabled);
+        configure_on_demand_tls(&mut settings, "apps.example.com", TlsMode::External);
+        let stored = AppSettings::from_json(settings.to_json());
+        assert!(!stored.on_demand_tls.enabled);
+        assert_eq!(stored.on_demand_tls.zone, None);
+        // The installation-wide origin gate suppresses redirects in external
+        // mode without erasing the operator's preference for a later auto run.
+        assert_eq!(stored.console_force_https, Some(true));
+    }
+
+    #[test]
+    fn external_tls_preserves_custom_domain_and_public_https_url() {
+        let mut command = parse_setup(&[
+            "--tls-mode",
+            "external",
+            "--wildcard-domain",
+            "*.apps.example.com",
+            "--external-url",
+            "https://manager.example.com",
+            "--skip-dns-records",
+            "--admin-email",
+            "admin@example.com",
+        ]);
+        command.resolve_installation_inputs().unwrap();
+        assert!(command.skip_ssl);
+        assert!(command.skip_dns_records);
+        assert!(command.server_ip.is_none());
+        assert!(command.dns_provider.is_none());
+        assert_eq!(
+            command.wildcard_domain.as_deref(),
+            Some("*.apps.example.com")
+        );
+        assert_eq!(
+            command.external_url.as_deref(),
+            Some("https://manager.example.com")
+        );
+    }
+
+    #[test]
+    fn skip_ssl_keeps_on_demand_tls_separate_from_external_mode() {
+        let command = parse_setup(&["--skip-ssl"]);
+        assert_eq!(command.tls_mode, TlsMode::Auto);
+    }
+
+    #[test]
+    fn external_tls_rejects_incomplete_configuration_before_setup() {
+        let mut command = parse_setup(&["--tls-mode", "external"]);
+        assert!(command
+            .resolve_installation_inputs()
+            .unwrap_err()
+            .to_string()
+            .contains("requires --wildcard-domain and --external-url"));
+    }
+
+    #[test]
+    fn admin_password_file_preserves_spaces_and_removes_line_ending() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        fs::write(&path, " test password with spaces \r\n").unwrap();
+        let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+        command.resolve_installation_inputs().unwrap();
+        assert_eq!(
+            command.admin_password.as_deref(),
+            Some(" test password with spaces ")
+        );
+        fs::write(&path, "").unwrap();
+        assert!(command.resolve_installation_inputs().is_err());
+    }
+
+    #[test]
+    fn external_tls_rejects_domains_without_a_wildcard_prefix() {
+        for domain in ["apps.example.com", "*apps.example.com", "*."] {
+            let mut command = parse_setup(&[
+                "--tls-mode",
+                "external",
+                "--wildcard-domain",
+                domain,
+                "--external-url",
+                "https://manager.example.com",
+            ]);
+            assert!(command.resolve_installation_inputs().is_err(), "{domain}");
+            assert!(!command.skip_ssl);
+        }
+    }
+
+    #[tokio::test]
+    async fn setup_persists_external_tls_and_clears_it_when_returning_to_auto() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        for (mode, enabled) in [(TlsMode::External, true), (TlsMode::Auto, false)] {
+            let now = chrono::Utc::now();
+            let row = settings::Model {
+                id: 1,
+                data: serde_json::json!({
+                    "external_tls": !enabled,
+                    "admin_gate": {"enabled": true},
+                }),
+                created_at: now,
+                updated_at: now,
+            };
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[row.clone()], [row]])
+                .into_connection();
+            update_app_settings(
+                &db,
+                "apps.example.com",
+                Some("https://manager.example.com"),
+                None,
+                mode,
+            )
+            .await
+            .expect("save TLS settings");
+            let writes = db.into_transaction_log();
+            let update = writes
+                .iter()
+                .flat_map(|transaction| transaction.statements())
+                .find(|statement| statement.sql.starts_with("UPDATE "))
+                .expect("settings update");
+            let saved = update
+                .values
+                .as_ref()
+                .expect("bound settings values")
+                .0
+                .iter()
+                .find_map(|value| match value {
+                    sea_orm::sea_query::Value::Json(Some(data)) => Some(data.as_ref()),
+                    _ => None,
+                })
+                .expect("bound settings JSON");
+            assert_eq!(saved["external_tls"], serde_json::json!(enabled));
+            assert_eq!(saved["admin_gate"]["enabled"], serde_json::json!(true));
+        }
+    }
+
+    #[test]
+    fn admin_password_file_requires_eight_unicode_characters() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        for (password, accepted) in [("éééé", false), ("🐙🐙", false), ("éééééééé", true)]
+        {
+            fs::write(&path, password).unwrap();
+            let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+            assert_eq!(command.resolve_installation_inputs().is_ok(), accepted);
+        }
+    }
+
+    #[test]
+    fn external_tls_rejects_imported_certs_and_invalid_origins() {
+        for extra in [
+            vec!["--wildcard-domain-cert", "/unused/cert.pem"],
+            vec!["--external-url", "ftp://manager.example.com"],
+            vec![
+                "--external-url",
+                "https://user:password@manager.example.com",
+            ],
+            vec!["--external-url", "https://manager.example.com/subpath"],
+            vec!["--wildcard-domain", "*.invalid..example.com"],
+        ] {
+            let mut args = vec![
+                "--tls-mode",
+                "external",
+                "--wildcard-domain",
+                "*.apps.example.com",
+                "--external-url",
+                "https://manager.example.com",
+            ];
+            // Replace rather than repeat a clap argument.
+            if let Some(index) = args.iter().position(|arg| *arg == extra[0]) {
+                args[index + 1] = extra[1];
+            } else {
+                args.extend(extra);
+            }
+            let mut command = parse_setup(&args);
+            assert!(command.resolve_installation_inputs().is_err());
+        }
+    }
+
+    #[test]
+    fn password_file_rejects_multiline_and_missing_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("admin-password");
+        let mut command = parse_setup(&["--admin-password-file", path.to_str().unwrap()]);
+        assert!(command.resolve_installation_inputs().is_err());
+        fs::write(&path, "first password\nsecond password").unwrap();
+        assert!(command.resolve_installation_inputs().is_err());
     }
 
     #[test]

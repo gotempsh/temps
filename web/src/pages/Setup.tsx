@@ -3,6 +3,7 @@
 
 import { useEffect } from 'react'
 import { Link, useNavigate } from 'react-router'
+import { toast } from 'sonner'
 import {
   ArrowRight,
   Bell,
@@ -90,7 +91,7 @@ function buildRecommendations(
     })
   }
 
-  if (!s.externalUrlSet) {
+  if (!s.externalUrlSet && !s.unreadable.externalUrl) {
     recs.push({
       key: 'external-url',
       icon: Globe,
@@ -102,7 +103,11 @@ function buildRecommendations(
     })
   }
 
-  if (s.wildcardDomainReady && !s.dnsProviderConnected) {
+  if (
+    s.wildcardDomainReady &&
+    !s.dnsProviderConnected &&
+    !s.unreadable.dnsProviders
+  ) {
     recs.push({
       key: 'dns-auto',
       icon: ShieldCheck,
@@ -132,8 +137,14 @@ function buildRecommendations(
 export function Setup() {
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { items, completedCount, totalCount, allDone, isLoaded } =
-    useGettingStarted()
+  const {
+    items,
+    completedCount,
+    totalCount,
+    allDone,
+    isLoaded,
+    markHarnessCompleted,
+  } = useGettingStarted()
   const signals = useActivationSignals()
 
   useEffect(() => {
@@ -193,6 +204,24 @@ export function Setup() {
               totalCount={totalCount}
               pct={pct}
               onContinue={() => goToStep(nextStep)}
+              onMarkCompleted={
+                nextStep.key === 'ai'
+                  ? () => {
+                      try {
+                        markHarnessCompleted()
+                        toast.success(
+                          'Harness setup marked as completed in this browser.'
+                        )
+                      } catch (error) {
+                        toast.error(
+                          error instanceof Error
+                            ? error.message
+                            : 'Could not save checklist progress.'
+                        )
+                      }
+                    }
+                  : undefined
+              }
             />
           )}
 
@@ -307,7 +336,7 @@ export function Setup() {
                           className={cn(
                             'flex size-8 shrink-0 items-center justify-center rounded-lg',
                             rec.tone === 'warning'
-                              ? 'bg-amber-500/10 text-amber-500'
+                              ? 'bg-amber-500/10 text-amber-700 dark:text-amber-500'
                               : 'bg-primary/10 text-primary'
                           )}
                         >
@@ -353,12 +382,15 @@ function NextStepHero({
   totalCount,
   pct,
   onContinue,
+  onMarkCompleted,
 }: {
   step: GettingStartedItem
   completedCount: number
   totalCount: number
   pct: number
   onContinue: () => void
+  /** Only for a step Temps cannot check itself (the AI harness). */
+  onMarkCompleted?: () => void
 }) {
   const Icon = STEP_ICONS[step.key] ?? Sparkles
   return (
@@ -388,10 +420,21 @@ function NextStepHero({
                 </p>
               </div>
             </div>
-            <Button size="lg" className="shrink-0" onClick={onContinue}>
-              {step.cta}
-              <ArrowRight className="h-4 w-4 ml-1.5" />
-            </Button>
+            <div className="flex shrink-0 flex-col-reverse gap-2 sm:flex-row sm:items-center">
+              {onMarkCompleted && (
+                <Button
+                  variant="ghost"
+                  title="Save this checklist acknowledgment for your account in this browser"
+                  onClick={onMarkCompleted}
+                >
+                  Mark as completed
+                </Button>
+              )}
+              <Button size="lg" onClick={onContinue}>
+                {step.cta}
+                <ArrowRight className="h-4 w-4 ml-1.5" />
+              </Button>
+            </div>
           </div>
 
           <div className="mt-5 flex items-center gap-3">

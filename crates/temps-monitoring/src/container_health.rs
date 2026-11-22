@@ -24,7 +24,7 @@ use temps_metrics::store::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-/// Resolves the Docker runtime for a worker node.
+/// Resolves the runtime for a persisted placement: None is local, Some is a worker.
 ///
 /// Implementations live outside this crate so monitoring does not depend on
 /// deployment orchestration or worker credential storage.
@@ -32,16 +32,27 @@ use tracing::{debug, error, info, warn};
 pub trait ContainerRuntimeResolver: Send + Sync {
     async fn resolve_runtime(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
     ) -> Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError>;
 }
 
-/// Context retained when a worker runtime cannot be constructed.
+/// Context retained when a local or worker runtime cannot be constructed.
 #[derive(Debug, Clone, Error)]
-#[error("Failed to resolve container runtime for worker node {node_id}: {reason}")]
+#[error("Failed to resolve container runtime for placement {node_id:?}: {reason}")]
 pub struct ContainerRuntimeResolutionError {
-    pub node_id: i32,
+    pub node_id: Option<i32>,
     pub reason: String,
+}
+
+/// Bytes since the previous sample of a cumulative counter. A counter that
+/// went backwards was reset (the container restarted), so the new value is
+/// all that has accumulated since.
+fn counter_delta(previous: u64, current: u64) -> u64 {
+    if current >= previous {
+        current - previous
+    } else {
+        current
+    }
 }
 
 /// Cached state for a container between health checks
@@ -56,7 +67,7 @@ struct ContainerState {
 }
 
 type RuntimeCache =
-    HashMap<i32, Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError>>;
+    HashMap<Option<i32>, Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError>>;
 
 /// A per-container write the poll loop retries every cycle while it fails.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -101,7 +112,7 @@ struct HealthLogState {
     /// Temps fault: WARN when it is first seen, quiet while it stays down.
     exited: KeyedFailureLatch<i32>,
     /// Worker nodes whose runtime could not be resolved, keyed by node ID.
-    unresolved_nodes: KeyedFailureLatch<i32>,
+    unresolved_nodes: KeyedFailureLatch<Option<i32>>,
     /// Writing container metrics to the metrics store.
     metrics_writes: FailureLatch,
 }
@@ -329,17 +340,20 @@ impl Default for ContainerHealthConfig {
 /// Polls Docker for container state and fires alarms via AlarmService.
 pub struct ContainerHealthMonitor {
     db: Arc<DatabaseConnection>,
-    deployer: Arc<dyn ContainerDeployer>,
     alarm_service: Arc<AlarmService>,
     config: ContainerHealthConfig,
     /// Optional metrics store. When set, container resource metrics are written
     /// after each poll cycle in addition to the alarm-firing logic.
     metrics_store: Option<Arc<dyn MetricsStore>>,
-    /// Node-aware runtime lookup. Remote containers are skipped when this is
-    /// absent or resolution fails; they must never fall back to local Docker.
-    runtime_resolver: Option<Arc<dyn ContainerRuntimeResolver>>,
+    /// Placement-aware lookup is required even when this process has no Docker.
+    /// Failed worker resolution must never fall back to a local runtime.
+    runtime_resolver: Arc<dyn ContainerRuntimeResolver>,
     /// Cached restart counts and network stats keyed by deployment_container.id
     container_states: tokio::sync::RwLock<HashMap<i32, ContainerState>>,
+    /// Last observed cumulative block I/O (read, written) keyed by
+    /// deployment_container.id, for the delta gauges. Kept apart from
+    /// `container_states` because not every runtime reports it.
+    block_io_baselines: tokio::sync::RwLock<HashMap<i32, (u64, u64)>>,
     /// Consecutive high-resource checks keyed by (container_db_id, alarm_type_str)
     resource_counters: tokio::sync::RwLock<HashMap<(i32, &'static str), u32>>,
     /// Log-on-transition state for conditions re-observed every poll.
@@ -349,18 +363,18 @@ pub struct ContainerHealthMonitor {
 impl ContainerHealthMonitor {
     pub fn new(
         db: Arc<DatabaseConnection>,
-        deployer: Arc<dyn ContainerDeployer>,
+        runtime_resolver: Arc<dyn ContainerRuntimeResolver>,
         alarm_service: Arc<AlarmService>,
         config: ContainerHealthConfig,
     ) -> Self {
         Self {
             db,
-            deployer,
             alarm_service,
             config,
             metrics_store: None,
-            runtime_resolver: None,
+            runtime_resolver,
             container_states: tokio::sync::RwLock::new(HashMap::new()),
+            block_io_baselines: tokio::sync::RwLock::new(HashMap::new()),
             resource_counters: tokio::sync::RwLock::new(HashMap::new()),
             log_state: HealthLogState::default(),
         }
@@ -376,31 +390,16 @@ impl ContainerHealthMonitor {
         self
     }
 
-    /// Attach the node-aware runtime resolver used for worker containers.
-    pub fn with_runtime_resolver(mut self, resolver: Arc<dyn ContainerRuntimeResolver>) -> Self {
-        self.runtime_resolver = Some(resolver);
-        self
-    }
-
     async fn runtime_for_node(
         &self,
         node_id: Option<i32>,
-        remote_runtimes: &mut RuntimeCache,
+        runtimes: &mut RuntimeCache,
     ) -> Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError> {
-        let Some(node_id) = node_id else {
-            return Ok(self.deployer.clone());
-        };
-        if let Some(cached) = remote_runtimes.get(&node_id) {
+        if let Some(cached) = runtimes.get(&node_id) {
             return cached.clone();
         }
-        let resolved = match &self.runtime_resolver {
-            Some(resolver) => resolver.resolve_runtime(node_id).await,
-            None => Err(ContainerRuntimeResolutionError {
-                node_id,
-                reason: "no worker runtime resolver is registered".to_string(),
-            }),
-        };
-        remote_runtimes.insert(node_id, resolved.clone());
+        let resolved = self.runtime_resolver.resolve_runtime(node_id).await;
+        runtimes.insert(node_id, resolved.clone());
         resolved
     }
 
@@ -452,9 +451,9 @@ impl ContainerHealthMonitor {
             .await
             .map_err(|e| format!("Failed to query deployment_containers: {}", e))?;
 
-        let active_nodes: std::collections::HashSet<i32> = containers
+        let active_nodes: std::collections::HashSet<Option<i32>> = containers
             .iter()
-            .filter_map(|container| container.node_id)
+            .map(|container| container.node_id)
             .collect();
         self.log_state
             .unresolved_nodes
@@ -471,6 +470,10 @@ impl ContainerHealthMonitor {
         {
             let mut states = self.container_states.write().await;
             states.retain(|id, _| active_ids.contains(id));
+        }
+        {
+            let mut baselines = self.block_io_baselines.write().await;
+            baselines.retain(|id, _| active_ids.contains(id));
         }
         {
             let mut counters = self.resource_counters.write().await;
@@ -518,16 +521,16 @@ impl ContainerHealthMonitor {
                         .await
                     {
                         Ok(deployer) => {
-                            if let Some(node_id) = container.node_id {
-                                if let Some(failures) =
-                                    self.log_state.unresolved_nodes.record_success(&node_id)
-                                {
-                                    info!(
-                                        node_id,
-                                        previous_failures = failures,
-                                        "Worker container runtime resolves again; resuming its health checks"
-                                    );
-                                }
+                            if let Some(failures) = self
+                                .log_state
+                                .unresolved_nodes
+                                .record_success(&container.node_id)
+                            {
+                                info!(
+                                    node_id = container.node_id,
+                                    previous_failures = failures,
+                                    "Container runtime resolves again; resuming its health checks"
+                                );
                             }
                             deployer
                         }
@@ -546,14 +549,14 @@ impl ContainerHealthMonitor {
                                     deployment_id = container.deployment_id,
                                     consecutive_failures = outcome.consecutive(),
                                     error = %resolution_error,
-                                    "Skipping worker container health checks because the node's runtime could not be resolved"
+                                    "Skipping container health checks because the node's runtime could not be resolved"
                                 );
                             } else {
                                 debug!(
                                     node_id = container.node_id,
                                     container_id = container.id,
                                     error = %resolution_error,
-                                    "Skipping worker container health check because its runtime could not be resolved"
+                                    "Skipping container health check because its runtime could not be resolved"
                                 );
                             }
                             continue;
@@ -758,10 +761,25 @@ impl ContainerHealthMonitor {
         container: &deployment_containers::Model,
         info: &temps_deployer::ContainerInfo,
     ) -> Result<(), DbErr> {
+        let Some(container_port) = container.container_port else {
+            if at_db_precision(container.started_at) != at_db_precision(info.started_at)
+                || container.cpu_limit_cores != info.cpu_limit_cores
+            {
+                deployment_containers::Entity::update(deployment_containers::ActiveModel {
+                    id: Set(container.id),
+                    started_at: Set(info.started_at),
+                    cpu_limit_cores: Set(info.cpu_limit_cores),
+                    ..Default::default()
+                })
+                .exec(self.db.as_ref())
+                .await?;
+            }
+            return Ok(());
+        };
         // A successful runtime inspection is authoritative. If the expected
         // TCP binding is absent, clear the recorded host port so the proxy
         // cannot keep dialing a port that Docker may have reassigned.
-        let host_port = published_tcp_host_port(container.container_port, &info.ports);
+        let host_port = published_tcp_host_port(container_port, &info.ports);
         // Every published port, from the same inspection as `host_port`.
         // This also backfills rows written before `port_bindings` existed, so
         // a public route added to an already-running Compose service gets a
@@ -904,7 +922,7 @@ impl ContainerHealthMonitor {
                 let intentional = exit_is_intentional(container, info);
                 self.persist_exit_info(container, info, intentional).await;
 
-                // A user-initiated stop (`stop_container`/`stop_all_containers`)
+                // A user-initiated stop (`stop_container`)
                 // and a failed deployment retained for log inspection are both
                 // stopped on purpose — an exit there is expected, not a crash.
                 if intentional {
@@ -1077,11 +1095,13 @@ impl ContainerHealthMonitor {
             txn.rollback().await?;
             return Ok(false);
         }
-        txn.execute(Statement::from_string(
-            DatabaseBackend::Postgres,
-            "SELECT pg_notify('route_table_changes', '')".to_string(),
-        ))
-        .await?;
+        if container.container_port.is_some() {
+            txn.execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT pg_notify('route_table_changes', '')".to_string(),
+            ))
+            .await?;
+        }
         txn.commit().await?;
         info!(
             container_id = container.id,
@@ -1391,6 +1411,8 @@ impl ContainerHealthMonitor {
     /// - `container.memory_percent` (Gauge, when limit is known)
     /// - `container.network_rx_bytes_delta` (Gauge — bytes received since last poll)
     /// - `container.network_tx_bytes_delta` (Gauge — bytes transmitted since last poll)
+    /// - `container.block_read_bytes_delta` / `container.block_write_bytes_delta`
+    ///   (Gauge — block I/O since last poll, only for runtimes that report it)
     ///
     /// Network metrics are emitted as **deltas** (bytes since the previous poll)
     /// rather than raw cumulative counters.  This keeps TimescaleDB rollups
@@ -1445,7 +1467,7 @@ impl ContainerHealthMonitor {
             // CPU usage relative to the CPU the container may use — its limit
             // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
-            // against — see `container_default_seeds()` in the evaluator.
+            // against — see `container_default_seeds()` in temps-alarms.
             make_point(
                 "container.cpu_utilization_percent",
                 stats.cpu_utilization_percent(),
@@ -1511,6 +1533,34 @@ impl ContainerHealthMonitor {
             net_tx_delta,
             MetricKind::Gauge,
         ));
+
+        // Block I/O is reported by some runtimes only (Docker, microVMs): a
+        // runtime that does not report it writes no point, so a chart shows
+        // "no data" instead of a flat zero.
+        if let (Some(read), Some(written)) = (stats.block_read_bytes, stats.block_write_bytes) {
+            let (read_delta, write_delta) = {
+                let mut baselines = self.block_io_baselines.write().await;
+                let previous = baselines.insert(container_id, (read, written));
+                match previous {
+                    Some((previous_read, previous_written)) => (
+                        counter_delta(previous_read, read),
+                        counter_delta(previous_written, written),
+                    ),
+                    // No prior sample: the baseline is 0, as for network.
+                    None => (read, written),
+                }
+            };
+            points.push(make_point(
+                "container.block_read_bytes_delta",
+                read_delta as f64,
+                MetricKind::Gauge,
+            ));
+            points.push(make_point(
+                "container.block_write_bytes_delta",
+                write_delta as f64,
+                MetricKind::Gauge,
+            ));
+        }
 
         match store.write_batch(points).await {
             Ok(_) => {
@@ -1606,6 +1656,14 @@ impl ContainerHealthMonitor {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_counter_delta_is_the_growth_and_a_reset_counts_from_zero() {
+        assert_eq!(counter_delta(100, 150), 50);
+        assert_eq!(counter_delta(100, 100), 0);
+        // The container restarted: the counter began again at 0.
+        assert_eq!(counter_delta(1_000_000, 42), 42);
+    }
+
     use super::*;
     use crate::alarm_service::AlarmService;
     use async_trait::async_trait;
@@ -1661,7 +1719,6 @@ mod tests {
         fail_info: AtomicBool,
     }
 
-    #[allow(dead_code)]
     impl MockDeployer {
         fn new(restart_count: i64, status: ContainerStatus) -> Self {
             Self {
@@ -1686,6 +1743,8 @@ mod tests {
                     memory_percent: Some(19.5),
                     network_rx_bytes: 0,
                     network_tx_bytes: 0,
+                    block_read_bytes: None,
+                    block_write_bytes: None,
                     timestamp: chrono::Utc::now(),
                     ..Default::default()
                 }),
@@ -1700,14 +1759,6 @@ mod tests {
             self.info.lock().await.restart_count = Some(count);
         }
 
-        async fn set_status(&self, status: ContainerStatus) {
-            self.info.lock().await.status = status;
-        }
-
-        async fn set_cpu_percent(&self, percent: f64) {
-            self.stats.lock().await.cpu_percent = percent;
-        }
-
         /// Set the raw Docker CPU percentage together with the CPU the
         /// container is allowed to use (limit if any, plus the host's cores).
         async fn set_cpu(&self, percent: f64, limit_cores: Option<f64>, online_cpus: u32) {
@@ -1715,10 +1766,6 @@ mod tests {
             stats.cpu_percent = percent;
             stats.cpu_limit_cores = limit_cores;
             stats.online_cpus = Some(online_cpus);
-        }
-
-        async fn set_memory_percent(&self, percent: f64) {
-            self.stats.lock().await.memory_percent = Some(percent);
         }
 
         fn block_container_info(&self) {
@@ -1732,6 +1779,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for MockDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<temps_deployer::ExecResult, temps_deployer::DeployerError> {
+            Err(temps_deployer::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: DeployRequest,
@@ -1783,6 +1842,33 @@ mod tests {
         }
     }
 
+    struct LocalTestRuntime(Arc<dyn ContainerDeployer>);
+
+    #[async_trait]
+    impl ContainerRuntimeResolver for LocalTestRuntime {
+        async fn resolve_runtime(
+            &self,
+            node_id: Option<i32>,
+        ) -> Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError> {
+            match node_id {
+                None => Ok(self.0.clone()),
+                Some(_) => Err(ContainerRuntimeResolutionError {
+                    node_id,
+                    reason: "no worker runtime is installed".to_string(),
+                }),
+            }
+        }
+    }
+
+    fn monitor_with_local_runtime(
+        db: Arc<DatabaseConnection>,
+        local: Arc<dyn ContainerDeployer>,
+        alarms: Arc<AlarmService>,
+        config: ContainerHealthConfig,
+    ) -> ContainerHealthMonitor {
+        ContainerHealthMonitor::new(db, Arc::new(LocalTestRuntime(local)), alarms, config)
+    }
+
     struct MockRuntimeResolver {
         runtimes: HashMap<i32, Arc<dyn ContainerDeployer>>,
         failed_nodes: std::collections::HashSet<i32>,
@@ -1793,12 +1879,18 @@ mod tests {
     impl ContainerRuntimeResolver for MockRuntimeResolver {
         async fn resolve_runtime(
             &self,
-            node_id: i32,
+            node_id: Option<i32>,
         ) -> Result<Arc<dyn ContainerDeployer>, ContainerRuntimeResolutionError> {
+            let Some(node_id) = node_id else {
+                return Err(ContainerRuntimeResolutionError {
+                    node_id: None,
+                    reason: "no local runtime is installed".to_string(),
+                });
+            };
             *self.calls.lock().await.entry(node_id).or_default() += 1;
             if self.failed_nodes.contains(&node_id) {
                 return Err(ContainerRuntimeResolutionError {
-                    node_id,
+                    node_id: Some(node_id),
                     reason: "worker is unreachable".to_string(),
                 });
             }
@@ -1806,7 +1898,7 @@ mod tests {
                 .get(&node_id)
                 .cloned()
                 .ok_or_else(|| ContainerRuntimeResolutionError {
-                    node_id,
+                    node_id: Some(node_id),
                     reason: "worker is not configured in the test resolver".to_string(),
                 })
         }
@@ -1870,7 +1962,10 @@ mod tests {
             deployment_id: 10,
             container_id: "abc123".to_string(),
             container_name: "test-container".to_string(),
-            container_port: 3000,
+            container_port: Some(3000),
+            health_state: "unknown".to_string(),
+            health_checked_at: None,
+            health_detail: None,
             host_port: Some(8080),
             image_name: Some("test-image:latest".to_string()),
             status: Some("running".to_string()),
@@ -1920,6 +2015,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
         }
     }
 
@@ -1942,7 +2039,7 @@ mod tests {
             worker_check_timeout_ms: 25,
             ..ContainerHealthConfig::default()
         };
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             healthy_local.clone(),
             make_alarm_service(db),
@@ -1996,7 +2093,7 @@ mod tests {
     async fn terminal_worker_container_processes_exit_without_requesting_stats() {
         let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             deployer.clone(),
             make_alarm_service(db),
@@ -2029,11 +2126,10 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let monitor = ContainerHealthMonitor::new(
             db.clone(),
-            local.clone(),
+            resolver.clone(),
             make_alarm_service(db),
             ContainerHealthConfig::default(),
-        )
-        .with_runtime_resolver(resolver.clone());
+        );
         let mut cache = RuntimeCache::new();
 
         let first = monitor.runtime_for_node(Some(7), &mut cache).await.unwrap();
@@ -2050,7 +2146,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_worker_resolution_is_cached_without_blocking_other_nodes() {
-        let local = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
         let healthy_worker = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
         let resolver = Arc::new(MockRuntimeResolver {
             runtimes: HashMap::from([(8, healthy_worker.clone() as Arc<dyn ContainerDeployer>)]),
@@ -2060,11 +2155,10 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let monitor = ContainerHealthMonitor::new(
             db.clone(),
-            local,
+            resolver.clone(),
             make_alarm_service(db),
             ContainerHealthConfig::default(),
-        )
-        .with_runtime_resolver(resolver.clone());
+        );
         let mut cache = RuntimeCache::new();
 
         assert!(monitor.runtime_for_node(Some(7), &mut cache).await.is_err());
@@ -2076,6 +2170,93 @@ mod tests {
         assert_eq!(calls.get(&7), Some(&1));
         assert_eq!(calls.get(&8), Some(&1));
         assert_eq!(healthy_worker.info_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn docker_free_monitor_discovers_remote_work_after_an_empty_cycle() {
+        let worker = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let resolver = Arc::new(MockRuntimeResolver {
+            runtimes: HashMap::from([(7, worker.clone() as Arc<dyn ContainerDeployer>)]),
+            failed_nodes: std::collections::HashSet::new(),
+            calls: tokio::sync::Mutex::new(HashMap::new()),
+        });
+        let mut container = make_container_model(1);
+        container.node_id = Some(7);
+        container.container_port = None;
+        container.host_port = None;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<deployment_containers::Model>::new()])
+                .append_query_results([[container]])
+                .append_query_results([[make_deployment_model()]])
+                .into_connection(),
+        );
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            resolver.clone(),
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+
+        monitor.check_all_containers().await.unwrap();
+        assert!(resolver.calls.lock().await.is_empty());
+        monitor.check_all_containers().await.unwrap();
+        assert_eq!(resolver.calls.lock().await.get(&7), Some(&1));
+        assert_eq!(worker.info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(worker.stats_calls.load(Ordering::Relaxed), 1);
+        drop(monitor);
+        let queries = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(!queries.contains("UPDATE"));
+        assert!(!queries.contains("pg_notify"));
+    }
+
+    #[tokio::test]
+    async fn unavailable_local_placement_never_selects_a_remote_worker() {
+        let worker = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let resolver = Arc::new(MockRuntimeResolver {
+            runtimes: HashMap::from([(7, worker.clone() as Arc<dyn ContainerDeployer>)]),
+            failed_nodes: std::collections::HashSet::new(),
+            calls: tokio::sync::Mutex::new(HashMap::new()),
+        });
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let monitor = ContainerHealthMonitor::new(
+            db.clone(),
+            resolver.clone(),
+            make_alarm_service(db),
+            ContainerHealthConfig::default(),
+        );
+        let mut cache = RuntimeCache::new();
+        let error = monitor
+            .runtime_for_node(None, &mut cache)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.node_id, None);
+        assert!(cache.contains_key(&None));
+        assert!(resolver.calls.lock().await.is_empty());
+        let runtime = monitor.runtime_for_node(Some(7), &mut cache).await.unwrap();
+        runtime.get_container_info("abc123").await.unwrap();
+        assert_eq!(worker.info_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn single_host_resolution_is_cached_and_worker_failure_never_falls_back() {
+        let local = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let monitor = monitor_with_local_runtime(
+            db.clone(),
+            local.clone(),
+            make_alarm_service(db),
+            ContainerHealthConfig::default(),
+        );
+        let mut cache = RuntimeCache::new();
+        let first = monitor.runtime_for_node(None, &mut cache).await.unwrap();
+        let second = monitor.runtime_for_node(None, &mut cache).await.unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(monitor.runtime_for_node(Some(7), &mut cache).await.is_err());
+        assert!(monitor.runtime_for_node(Some(7), &mut cache).await.is_err());
+        assert_eq!(local.info_calls.load(Ordering::Relaxed), 0);
+        assert_eq!(cache.len(), 2);
     }
 
     #[tokio::test]
@@ -2100,7 +2281,7 @@ mod tests {
             protocol: temps_deployer::Protocol::Tcp,
             host_ip: None,
         }];
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             deployer,
             make_alarm_service(db.clone()),
@@ -2146,7 +2327,7 @@ mod tests {
                 ])
                 .into_connection(),
         );
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
             make_alarm_service(db.clone()),
@@ -2186,7 +2367,7 @@ mod tests {
                 }])
                 .into_connection(),
         );
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
             make_alarm_service(db.clone()),
@@ -2225,7 +2406,7 @@ mod tests {
                 .append_query_errors([DbErr::Custom("connection reset".to_string())])
                 .into_connection(),
         );
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
             make_alarm_service(db.clone()),
@@ -2262,7 +2443,7 @@ mod tests {
                 .append_exec_results([exec_ok(), exec_ok(), exec_ok()])
                 .into_connection(),
         );
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
             make_alarm_service(db.clone()),
@@ -2326,7 +2507,7 @@ mod tests {
             let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
             let mut info = deployer.get_container_info("abc123").await.unwrap();
             info.ports = ports;
-            let monitor = ContainerHealthMonitor::new(
+            let monitor = monitor_with_local_runtime(
                 db.clone(),
                 deployer,
                 make_alarm_service(db.clone()),
@@ -2357,15 +2538,15 @@ mod tests {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
         deployer.fail_container_info();
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
-            deployer,
+            deployer.clone(),
             make_alarm_service(db.clone()),
             ContainerHealthConfig::default(),
         );
 
         assert!(monitor
-            .check_container(&container, &deployment, monitor.deployer.as_ref())
+            .check_container(&container, &deployment, deployer.as_ref())
             .await
             .is_err());
         drop(monitor);
@@ -2413,7 +2594,7 @@ mod tests {
         // already correct, but a public route added later for another port
         // has no backend until the reconciler records every published port.
         let mut container = make_container_model(1);
-        container.container_port = 3000;
+        container.container_port = Some(3000);
         container.host_port = Some(32001);
         container.port_bindings = None;
         let mut updated = container.clone();
@@ -2449,7 +2630,7 @@ mod tests {
                 host_ip: None,
             })
             .collect();
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             deployer,
             make_alarm_service(db.clone()),
@@ -2482,7 +2663,7 @@ mod tests {
         );
         let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
         let info = deployer.get_container_info("abc123").await.unwrap();
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             deployer,
             make_alarm_service(db.clone()),
@@ -2537,7 +2718,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2592,7 +2773,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2628,7 +2809,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2690,7 +2871,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2729,7 +2910,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2770,7 +2951,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2798,7 +2979,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer.clone(),
             alarm_service,
@@ -2844,7 +3025,7 @@ mod tests {
     fn make_monitor(deployer: Arc<MockDeployer>) -> ContainerHealthMonitor {
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let alarm_service = make_alarm_service(db.clone());
-        ContainerHealthMonitor::new(
+        monitor_with_local_runtime(
             db,
             deployer,
             alarm_service,
@@ -2924,7 +3105,7 @@ mod tests {
             ..ContainerHealthConfig::default()
         };
 
-        let monitor = ContainerHealthMonitor::new(db, deployer.clone(), alarm_service, config);
+        let monitor = monitor_with_local_runtime(db, deployer.clone(), alarm_service, config);
 
         // Breach 1: should NOT fire alarm
         monitor
@@ -2969,7 +3150,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer,
             alarm_service,
@@ -3004,7 +3185,7 @@ mod tests {
         let db = Arc::new(db);
         let alarm_service = make_alarm_service(db.clone());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db,
             deployer,
             alarm_service,
@@ -3064,7 +3245,7 @@ mod tests {
     // forever.
 
     struct ExitFixture {
-        _database: temps_database::test_utils::TestDatabase,
+        _database: temps_test_utils::TestDatabase,
         db: Arc<sea_orm::DatabaseConnection>,
         environment_id: i32,
     }
@@ -3075,12 +3256,10 @@ mod tests {
             environments, preset::Preset, projects, upstream_config::UpstreamList,
         };
 
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping container exit alarm test: Docker runtime unavailable");
                 return None;
@@ -3171,7 +3350,7 @@ mod tests {
                 deployment_id: Set(deployment.id),
                 container_id: Set(format!("{}-container", deployment.slug)),
                 container_name: Set(deployment.slug.clone()),
-                container_port: Set(3000),
+                container_port: Set(Some(3000)),
                 status: Set(Some(status.to_string())),
                 created_at: Set(chrono::Utc::now()),
                 deployed_at: Set(chrono::Utc::now()),
@@ -3206,7 +3385,7 @@ mod tests {
                 info.exit_code = Some(1);
                 info.exit_reason = Some("Exit code 1".to_string());
             }
-            let monitor = ContainerHealthMonitor::new(
+            let monitor = monitor_with_local_runtime(
                 self.db.clone(),
                 deployer,
                 make_alarm_service(self.db.clone()),
@@ -3397,7 +3576,7 @@ mod tests {
         let mut stale_snapshot = stopped.clone();
         stale_snapshot.status = Some("exited".to_string());
 
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             fixture.db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Running)),
             make_alarm_service(fixture.db.clone()),
@@ -3437,7 +3616,7 @@ mod tests {
                 .append_query_errors([DbErr::Custom("connection reset".to_string())])
                 .into_connection(),
         );
-        let monitor = ContainerHealthMonitor::new(
+        let monitor = monitor_with_local_runtime(
             db.clone(),
             Arc::new(MockDeployer::new(0, ContainerStatus::Exited)),
             make_alarm_service(db),
@@ -3572,5 +3751,70 @@ mod tests {
             .await;
 
         assert_eq!(fixture.alarms().await.len(), 1);
+    }
+    #[tokio::test]
+    async fn health_probe_portless_runtime_skips_port_lookup_and_route_notification() {
+        let mut container = make_container_model(1);
+        container.container_port = None;
+        container.host_port = None;
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let mut info = deployer.get_container_info("worker").await.unwrap();
+        info.started_at = container.started_at;
+        info.cpu_limit_cores = container.cpu_limit_cores;
+        // Published side ports must never turn a portless worker into a route.
+        info.ports = vec![temps_deployer::PortMapping {
+            container_port: 9000,
+            host_port: 31000,
+            protocol: temps_deployer::Protocol::Tcp,
+            host_ip: None,
+        }];
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let monitor = monitor_with_local_runtime(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        monitor
+            .persist_runtime_info(&container, &info)
+            .await
+            .unwrap();
+        drop(monitor);
+        let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+        assert!(
+            transactions.is_empty(),
+            "portless worker must not look up bindings, update ports, or notify routes"
+        );
+    }
+    #[tokio::test]
+    async fn health_probe_portless_runtime_keeps_metrics_metadata_without_notifying_routes() {
+        let mut container = make_container_model(1);
+        container.container_port = None;
+        container.host_port = None;
+        let mut updated = container.clone();
+        updated.cpu_limit_cores = Some(0.5);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[updated]])
+                .into_connection(),
+        );
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        let mut info = deployer.get_container_info("worker").await.unwrap();
+        info.cpu_limit_cores = Some(0.5);
+        let monitor = monitor_with_local_runtime(
+            db.clone(),
+            deployer,
+            make_alarm_service(db.clone()),
+            ContainerHealthConfig::default(),
+        );
+        monitor
+            .persist_runtime_info(&container, &info)
+            .await
+            .unwrap();
+        drop(monitor);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("cpu_limit_cores"));
+        assert!(!sql.contains("pg_notify"));
+        assert!(!sql.contains("SET \"host_port\""));
     }
 }

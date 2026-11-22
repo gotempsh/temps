@@ -77,7 +77,7 @@ export function ExternalUrlStep({
       </div>
 
       {domain && domain.status === 'valid' && (
-        <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+        <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <AlertDescription>
             <strong>Domain verified!</strong> Your SSL certificate has been
@@ -105,7 +105,7 @@ export function ExternalUrlStep({
         </div>
 
         <div className="space-y-2">
-          <Label htmlFor="previewDomain">Preview Domain</Label>
+          <Label htmlFor="previewDomain">Preview domain</Label>
           <div className="relative">
             <Globe className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
             <Input
@@ -134,9 +134,9 @@ export function ExternalUrlStep({
                   </code>
                 </li>
                 <li>
-                  • Project deployments:{' '}
+                  • Service deployments:{' '}
                   <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
-                    project-name.{baseDomain}
+                    service-name.{baseDomain}
                   </code>
                 </li>
                 <li>
@@ -162,7 +162,7 @@ export function ExternalUrlStep({
               Saving...
             </>
           ) : (
-            'Save & Continue'
+            'Save & continue'
           )}
         </Button>
       </div>

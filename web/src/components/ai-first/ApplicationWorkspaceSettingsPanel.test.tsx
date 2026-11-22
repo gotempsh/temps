@@ -1,13 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
 import { renderToStaticMarkup as renderMarkup } from 'react-dom/server'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
+import axe from 'axe-core'
 import type { ReactNode } from 'react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 
 import type { ApplicationWorkspaceResponse } from '@/api/client'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { installBrowserWindow } from '@/test/dom'
 import {
   ApplicationWorkspaceSettingsPanel,
   workspaceResourceFingerprint,
@@ -129,6 +139,121 @@ describe('ApplicationWorkspaceSettingsPanel', () => {
     expect(html).toContain('Try again')
     expect(html.indexOf('Workspace could not start')).toBeLessThan(
       html.indexOf('Lifecycle')
+    )
+  })
+})
+
+describe('ApplicationWorkspaceSettingsPanel keyboard and assistive access', () => {
+  installBrowserWindow()
+  afterEach(cleanup)
+
+  async function renderPanel() {
+    const view = render(
+      <QueryClientProvider client={new QueryClient()}>
+        <MemoryRouter>
+          <ApplicationWorkspaceSettingsPanel
+            layout="page"
+            applicationPublicId="app_example"
+            initialWorkspace={workspace}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    // Let the panel's status query settle inside act().
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20))
+    })
+    return view
+  }
+
+  test('saving a workspace sends only edited CPU and memory overrides', async () => {
+    const updates: Array<{ cpu_limit?: number; memory_limit_mb?: number }> = []
+    const api = mockApi({
+      'PATCH /ai/applications/app_example/workspace': async (request) => {
+        updates.push(await request.json())
+        return jsonResponse(workspace)
+      },
+    })
+    try {
+      const view = await renderPanel()
+      fireEvent.change(view.getByLabelText('CPU cores'), {
+        target: { value: '1.5' },
+      })
+      fireEvent.click(view.getByRole('button', { name: 'Save and apply' }))
+      await waitFor(() => expect(updates).toHaveLength(1))
+      expect(updates[0].cpu_limit).toBe(1.5)
+      expect(updates[0]).not.toHaveProperty('memory_limit_mb')
+    } finally {
+      api.restore()
+    }
+  })
+
+  test('no command is a bare scroll container that keyboard users cannot reach', () => {
+    const html = renderToStaticMarkup(
+      <MemoryRouter>
+        <ApplicationWorkspaceSettingsPanel
+          layout="page"
+          applicationPublicId="app_example"
+          initialWorkspace={workspace}
+        />
+      </MemoryRouter>
+    )
+    // A <code> that scrolls itself holds nothing focusable (axe
+    // scrollable-region-focusable); the scrolling lives on a ScrollRegion.
+    expect(html).not.toMatch(/<code[^>]*overflow-(x-)?(auto|scroll)/)
+  })
+
+  test('a command that overflows becomes a named, focusable region', async () => {
+    const scrollWidth = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      'scrollWidth'
+    )
+    Object.defineProperty(HTMLElement.prototype, 'scrollWidth', {
+      configurable: true,
+      get: () => 900,
+    })
+    try {
+      const view = await renderPanel()
+      const regions = Array.from(
+        view.container.querySelectorAll<HTMLElement>('[role="region"]')
+      )
+      const names = regions.map((region) => region.getAttribute('aria-label'))
+      expect(names).toContain('Interactive shell command, scrollable')
+      expect(names).toContain('Claude Code upgrade command, scrollable')
+      for (const region of regions) {
+        expect(region.getAttribute('tabindex')).toBe('0')
+      }
+    } finally {
+      if (scrollWidth) {
+        Object.defineProperty(HTMLElement.prototype, 'scrollWidth', scrollWidth)
+      } else {
+        Reflect.deleteProperty(HTMLElement.prototype, 'scrollWidth')
+      }
+    }
+  })
+
+  test('a command that fits adds no extra tab stop', async () => {
+    const view = await renderPanel()
+    expect(view.container.querySelector('[role="region"]')).toBeNull()
+  })
+
+  test('the panel has no unnamed controls or invalid ARIA', async () => {
+    const view = await renderPanel()
+    const result = await axe.run(view.container, {
+      runOnly: {
+        type: 'rule',
+        values: [
+          'button-name',
+          'label',
+          'aria-allowed-attr',
+          'aria-prohibited-attr',
+          'aria-valid-attr-value',
+          'nested-interactive',
+        ],
+      },
+    })
+    expect(result.violations.map((v) => `${v.id}: ${v.nodes.length}`)).toEqual(
+      []
     )
   })
 })

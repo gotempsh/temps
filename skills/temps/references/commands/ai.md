@@ -10,11 +10,34 @@ AI assistant status for a project
 
 **Subcommands:**
 
+- `provider` - Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
 - `readiness` - Show which AI prerequisites this project meets, and how to fix the rest
+
+### `ai provider`
+
+Manage the AI CLIs (Claude Code, Codex) Temps runs on this server
+
+**Subcommands:**
+
+- `login` - Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+#### `ai provider login`
+
+Sign an AI CLI in to your subscription. Prints a link to open, then asks for the code (Claude) or shows a device code (Codex)
+
+**Usage:** `ai provider login <provider-id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Print the final sign-in state as JSON | - | No |
 
 ### `ai readiness`
 
 Show which AI prerequisites this project meets, and how to fix the rest
+
+**Usage:** `ai readiness [project] [options]`
 
 **Options:**
 

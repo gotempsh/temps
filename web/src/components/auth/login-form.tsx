@@ -103,7 +103,7 @@ export function providerButtonLabel(provider: OidcProviderOption): string {
 }
 
 interface LoginFormProps {
-  onSubmit: (data: LoginFormData) => Promise<void>
+  onSubmit: (data: LoginFormData) => void | Promise<void>
   isLoading?: boolean
   oidcProviders?: OidcProviderOption[]
   /**

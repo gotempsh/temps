@@ -20,8 +20,10 @@
 //! a streaming `put` on that trait.
 
 use crate::static_deployer::{
-    storage_relative_path, validate_storage_identifiers, FileInfo, StaticDeployError,
-    StaticDeployRequest, StaticDeployResult, StaticDeployer, StaticDeploymentInfo,
+    classify_source_entry, ensure_something_published, storage_relative_path,
+    validate_storage_identifiers, FileInfo, SkippedEntries, SourceEntryDisposition,
+    StaticDeployError, StaticDeployRequest, StaticDeployResult, StaticDeployer,
+    StaticDeploymentInfo,
 };
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use async_trait::async_trait;
@@ -29,7 +31,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use chrono::Utc;
 use std::path::{Path, PathBuf};
-use temps_core::static_files::{validate_static_artifact_path, MAX_STATIC_PATH_COMPONENTS};
+use temps_core::static_files::MAX_STATIC_PATH_COMPONENTS;
 use temps_file_store::s3_client::build_s3_client;
 use temps_file_store::s3_config::S3StorageConfig;
 use tokio::fs;
@@ -46,6 +48,7 @@ struct UploadStats {
     entry_count: u32,
     file_count: u32,
     total_size: u64,
+    skipped: SkippedEntries,
 }
 
 type UploadFuture<'a> =
@@ -204,12 +207,12 @@ impl S3StaticDeployer {
                         ),
                     });
                 }
-                validate_static_artifact_path(relative_path).map_err(|error| {
-                    StaticDeployError::InvalidPath(format!(
-                        "Static deployment source entry '{}' is not publishable: {error}",
-                        relative_path.display()
-                    ))
-                })?;
+                // Skipped entries are never uploaded, followed or descended
+                // into, mirroring `FilesystemStaticDeployer::copy_dir_recursive`.
+                if classify_source_entry(relative_path)? == SourceEntryDisposition::Skip {
+                    stats.skipped.record(relative_path);
+                    continue;
+                }
 
                 let metadata = fs::symlink_metadata(&source_path).await?;
 
@@ -513,12 +516,21 @@ impl StaticDeployer for S3StaticDeployer {
                 .await;
             return Err(error);
         }
+        if let Err(error) = ensure_something_published(&request, stats.file_count, &stats.skipped) {
+            self.remove_partial_deployment_best_effort(&storage_path)
+                .await;
+            return Err(error);
+        }
+
+        stats.skipped.warn(&request, "s3");
 
         Ok(StaticDeployResult {
             storage_path,
             file_count: stats.file_count,
             total_size_bytes: stats.total_size,
             deployed_at: Utc::now(),
+            skipped_count: stats.skipped.count(),
+            skipped_paths: stats.skipped.sample().to_vec(),
         })
     }
 
@@ -701,6 +713,63 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, StaticDeployError::SourceNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn upload_walk_skips_sensitive_entries_without_any_network_call() {
+        // Only sensitive entries: nothing is uploaded, so the walk must finish
+        // without touching the (unreachable) endpoint and report each skip.
+        let deployer = S3StaticDeployer::new(sample_config());
+        let temp_dir = tempfile::tempdir().unwrap();
+        std::fs::write(temp_dir.path().join(".nojekyll"), b"").unwrap();
+        std::fs::write(temp_dir.path().join(".env"), b"SECRET=1").unwrap();
+        std::fs::create_dir_all(temp_dir.path().join(".git/objects")).unwrap();
+        std::fs::write(temp_dir.path().join(".git/objects/blob"), b"x").unwrap();
+        let mut stats = UploadStats::default();
+
+        deployer
+            .upload_dir_recursive(
+                temp_dir.path(),
+                temp_dir.path(),
+                "projects/docs-site/production/2026/09/18/deploy-1",
+                &mut stats,
+            )
+            .await
+            .expect("sensitive entries must be skipped, not fatal");
+
+        assert_eq!(stats.file_count, 0);
+        assert_eq!(stats.skipped.count(), 3);
+        let mut sample = stats.skipped.sample().to_vec();
+        sample.sort();
+        assert_eq!(sample, vec![".env", ".git", ".nojekyll"]);
+    }
+
+    #[tokio::test]
+    async fn upload_walk_still_fails_on_a_symbolic_link_with_an_ordinary_name() {
+        #[cfg(unix)]
+        {
+            let deployer = S3StaticDeployer::new(sample_config());
+            let temp_dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("target.txt"), b"x").unwrap();
+            std::os::unix::fs::symlink(
+                outside.path().join("target.txt"),
+                temp_dir.path().join("linked.txt"),
+            )
+            .unwrap();
+            let mut stats = UploadStats::default();
+
+            let error = deployer
+                .upload_dir_recursive(
+                    temp_dir.path(),
+                    temp_dir.path(),
+                    "projects/docs-site/production/2026/09/18/deploy-1",
+                    &mut stats,
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, StaticDeployError::InvalidPath(_)));
+        }
     }
 
     #[tokio::test]

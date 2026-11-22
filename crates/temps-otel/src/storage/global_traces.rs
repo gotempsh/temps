@@ -138,6 +138,7 @@ impl GlobalTraceRow {
         let start_time = DateTime::from_timestamp_millis(self.start_ms)
             .ok_or_else(|| invalid("Invalid trace timestamp"))?;
         Ok(SpanRecord {
+            ingest_identity: None,
             project_id: self.project_id,
             deployment_id: None,
             trace_id: self.trace_id,

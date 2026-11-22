@@ -21,6 +21,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`sandbox logs`](#sandbox-logs)
 - [`sandbox domain`](#sandbox-domain)
 - [`sandbox password`](#sandbox-password)
+- [`sandbox preview-access`](#sandbox-preview-access)
+- [`sandbox egress`](#sandbox-egress)
 - [`sandbox fs`](#sandbox-fs)
 - [`sandbox snapshots`](#sandbox-snapshots)
 - [`sandbox snapshot`](#sandbox-snapshot)
@@ -46,6 +48,8 @@ Manage standalone sandboxes (/v1/sandbox API)
 - `logs` - Stream logs from a detached job (SSE)
 - `domain` - Resolve the preview URL for a port inside a sandbox
 - `password` - Generate, rotate, or clear the preview-URL password for a sandbox
+- `preview-access` - Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+- `egress` - Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
 - `fs` - Filesystem operations inside a sandbox
 - `snapshots` - Manage sandbox snapshots (ADR-037)
 - `snapshot` - Take a snapshot of a sandbox
@@ -78,10 +82,16 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
+| `--egress-allow <host\|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
-| `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
+| `--node <name\|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
+| `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
+| `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
+| `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `sandbox list` (alias: `ls`)
 
@@ -127,6 +137,8 @@ List nodes with their sandbox placement state (the default)
 
 Show a node's placement state and every live sandbox on it, from all users (name, id, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes show <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -139,6 +151,8 @@ Show a node's placement state and every live sandbox on it, from all users (name
 
 Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, or 'control-plane'). Admin only
 
+**Usage:** `sandbox nodes set <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -149,6 +163,8 @@ Allow exactly these nodes to run new sandboxes, replacing the list (names, ids, 
 
 Add nodes to the list allowed to run new sandboxes. Admin only
 
+**Usage:** `sandbox nodes allow <nodes...> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -158,6 +174,8 @@ Add nodes to the list allowed to run new sandboxes. Admin only
 #### `sandbox nodes deny`
 
 Stop nodes from taking new sandboxes (existing ones keep running). Admin only
+
+**Usage:** `sandbox nodes deny <nodes...> [options]`
 
 **Options:**
 
@@ -189,6 +207,8 @@ Stop every node from taking new sandboxes (existing ones keep running). Admin on
 
 Destroy every sandbox on a worker node, from all users, so the node can be removed. Works on a node that is offline for good. Admin only
 
+**Usage:** `sandbox nodes evict <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -200,6 +220,8 @@ Destroy every sandbox on a worker node, from all users, so the node can be remov
 
 Show details for a sandbox
 
+**Usage:** `sandbox show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -209,6 +231,8 @@ Show details for a sandbox
 ### `sandbox rm` (alias: `stop`, `destroy`)
 
 Remove a sandbox permanently (aliases: stop, destroy)
+
+**Usage:** `sandbox rm <id> [options]`
 
 **Options:**
 
@@ -220,17 +244,25 @@ Remove a sandbox permanently (aliases: stop, destroy)
 
 Pause a running sandbox (non-destructive — resume later with `sandbox resume`)
 
+**Usage:** `sandbox pause <id>`
+
 ### `sandbox resume`
 
 Resume a paused sandbox
+
+**Usage:** `sandbox resume <id>`
 
 ### `sandbox restart`
 
 Restart a running sandbox (preserves filesystem)
 
+**Usage:** `sandbox restart <id>`
+
 ### `sandbox clone`
 
 Clone a git repo or extract a tarball into a running sandbox
+
+**Usage:** `sandbox clone <id> [options]`
 
 **Options:**
 
@@ -243,10 +275,15 @@ Clone a git repo or extract a tarball into a running sandbox
 | `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | No |
 | `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | No |
 | `--tarball-url <url>` | Tarball URL to download and extract | - | No |
+| `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
+| `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `sandbox shell` (alias: `attach`)
 
 Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave the program running; `exit` ends it. Reattach with the same --tab
+
+**Usage:** `sandbox shell <id> [options]`
 
 **Options:**
 
@@ -259,6 +296,8 @@ Open an interactive terminal in a sandbox. Detach with Ctrl-P Ctrl-Q to leave th
 
 Extend a sandbox's idle timeout
 
+**Usage:** `sandbox extend <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -268,6 +307,8 @@ Extend a sandbox's idle timeout
 ### `sandbox exec`
 
 Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
+
+**Usage:** `sandbox exec <id> [args...] [options]`
 
 **Options:**
 
@@ -281,9 +322,13 @@ Run a command inside a sandbox. Use `--` to pass flags: `exec ID -- ls -la`
 
 Stream logs from a detached job (SSE)
 
+**Usage:** `sandbox logs <id> <jobId>`
+
 ### `sandbox domain`
 
 Resolve the preview URL for a port inside a sandbox
+
+**Usage:** `sandbox domain <id> [options]`
 
 **Options:**
 
@@ -295,6 +340,8 @@ Resolve the preview URL for a port inside a sandbox
 
 Generate, rotate, or clear the preview-URL password for a sandbox
 
+**Usage:** `sandbox password <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -302,6 +349,36 @@ Generate, rotate, or clear the preview-URL password for a sandbox
 | `--rotate` | Generate a new random password and set it (default when no flag is given) | - | No |
 | `--length <n>` | Length of the generated password (8..=256, default 24) | - | No |
 | `--clear` | Remove the preview password — preview URLs become open again | - | No |
+
+### `sandbox preview-access`
+
+Show or set who may open the preview URLs: Temps login (default), the preview password, or anyone, optionally from listed networks only
+
+**Usage:** `sandbox preview-access <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
+| `--allow-ip <ip\|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
+| `--json` | Output as JSON | - | No |
+
+### `sandbox egress`
+
+Show or set where the sandbox may connect to: the internet, nothing, or only listed hosts and CIDRs. Private, loopback and metadata addresses are always refused
+
+**Usage:** `sandbox egress <id> [options]`
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--internet` | Remove the restriction | - | No |
+| `--deny-all` | Allow no outbound traffic at all | - | No |
+| `--allow <host\|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`
 
@@ -318,6 +395,8 @@ Filesystem operations inside a sandbox
 
 Read a file from the sandbox
 
+**Usage:** `sandbox fs read <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -328,6 +407,8 @@ Read a file from the sandbox
 #### `sandbox fs write`
 
 Write a file to the sandbox
+
+**Usage:** `sandbox fs write <id> [options]`
 
 **Options:**
 
@@ -342,6 +423,8 @@ Write a file to the sandbox
 
 Stat a path inside the sandbox
 
+**Usage:** `sandbox fs stat <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -352,6 +435,8 @@ Stat a path inside the sandbox
 #### `sandbox fs mkdir`
 
 Create a directory inside the sandbox (mkdir -p)
+
+**Usage:** `sandbox fs mkdir <id> [options]`
 
 **Options:**
 
@@ -388,6 +473,8 @@ List your snapshots
 
 Show details for a snapshot
 
+**Usage:** `sandbox snapshots show <snapId> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -397,6 +484,8 @@ Show details for a snapshot
 #### `sandbox snapshots delete` (alias: `rm`)
 
 Delete a snapshot permanently
+
+**Usage:** `sandbox snapshots delete <snapId> [options]`
 
 **Options:**
 
@@ -417,6 +506,8 @@ Show snapshot storage usage and quota
 ### `sandbox snapshot`
 
 Take a snapshot of a sandbox
+
+**Usage:** `sandbox snapshot <id> [options]`
 
 **Options:**
 

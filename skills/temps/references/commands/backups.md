@@ -140,6 +140,9 @@ Create an S3 source
 | `--secret-key <key>` | Secret access key | - | No |
 | `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources show`
 
@@ -168,6 +171,9 @@ Update an S3 source
 | `--access-key <key>` | New access key ID | - | No |
 | `--secret-key <key>` | New secret access key | - | No |
 | `--prefix <prefix>` | New bucket path/prefix | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources remove` (alias: `rm`)
 
@@ -260,3 +266,4 @@ Run a backup for an external service
 | `--id <id>` | External service ID | - | Yes |
 | `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
 | `-t, --type <type>` | Backup type (e.g., full, incremental) | - | No |
+| `--confirm-restart` | Allow the backup to restart the database (PostgreSQL with WAL archiving off restarts once to turn it on) | - | No |

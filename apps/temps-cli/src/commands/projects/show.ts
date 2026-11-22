@@ -4,11 +4,13 @@
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { newline, header, icons, json, keyValue, info, colors, formatDate } from '../../ui/output.js'
+import { newline, header, icons, json, info, colors, formatDate, warning } from '../../ui/output.js'
 import { detailsTable, statusBadge } from '../../ui/table.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { getProject, getProjectBySlug } from '../../api/sdk.gen.js'
-import type { DockerSocketCapability } from '../../api/types.gen.js'
+import type { DockerSocketCapability, ProjectGroupResponse } from '../../api/types.gen.js'
+import { describeMembership } from '../project-groups/index.js'
+import { loadMembership } from './group.js'
 
 /**
  * Where this project holds host Docker access (ADR 045), in one line.
@@ -91,8 +93,19 @@ export async function show(options: ShowOptions): Promise<void> {
     throw new Error(`Project "${projectIdOrName}" not found`)
   }
 
+  // The project (group) is extra context: failing to load it must not hide
+  // the service itself, but it is said, not skipped.
+  let group: ProjectGroupResponse | null = null
+  let groupError: string | undefined
+  try {
+    group = await loadMembership(project.id)
+  } catch (err) {
+    groupError = getErrorMessage(err)
+  }
+
   if (options.json) {
-    json(project)
+    if (groupError) warning(`Could not load the service's project: ${groupError}`)
+    json(groupError ? project : { ...project, project_group: group })
     return
   }
 
@@ -105,6 +118,7 @@ export async function show(options: ShowOptions): Promise<void> {
     ID: project.id,
     Name: project.name,
     Slug: project.slug,
+    Project: groupError ? `unknown (${groupError})` : describeMembership(group),
     Directory: project.directory,
     'Main Branch': project.main_branch,
     Repository: project.repo_name ? `${project.repo_owner}/${project.repo_name}` : 'Not connected',

@@ -14,6 +14,7 @@ import {
 } from '../../api/sdk.gen.js'
 import type { IpAccessControlResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
+import { registerProjectIpAccessCommands } from './project.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
@@ -70,7 +71,7 @@ export function registerIpAccessCommands(program: Command): void {
   const ipAccess = program
     .command('ip-access')
     .alias('ipa')
-    .description('Manage IP access control rules')
+    .description('Manage instance-wide IP access control rules, and per-project lists (ip-access project)')
 
   ipAccess
     .command('list')
@@ -120,6 +121,8 @@ export function registerIpAccessCommands(program: Command): void {
     .option('--ip <ip>', 'IP address to check')
     .option('--json', 'Output in JSON format')
     .action(checkIpAction)
+
+  registerProjectIpAccessCommands(ipAccess)
 }
 
 async function listIpAccessAction(options: ListOptions): Promise<void> {

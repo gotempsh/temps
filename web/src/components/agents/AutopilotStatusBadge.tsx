@@ -36,7 +36,7 @@ export function AutopilotStatusBadge({ status }: AutopilotStatusBadgeProps) {
     return (
       <Badge
         className={cn(
-          'bg-blue-500/10 text-blue-400 border-blue-500/20 hover:bg-blue-500/20'
+          'bg-blue-500/10 text-blue-600 dark:text-blue-400 border-blue-500/20 hover:bg-blue-500/20'
         )}
       >
         analyzed
@@ -48,7 +48,7 @@ export function AutopilotStatusBadge({ status }: AutopilotStatusBadgeProps) {
     return (
       <Badge
         className={cn(
-          'bg-purple-500/10 text-purple-400 border-purple-500/20 hover:bg-purple-500/20'
+          'bg-purple-500/10 text-purple-600 dark:text-purple-400 border-purple-500/20 hover:bg-purple-500/20'
         )}
       >
         fix ready
@@ -60,7 +60,7 @@ export function AutopilotStatusBadge({ status }: AutopilotStatusBadgeProps) {
     return (
       <Badge
         className={cn(
-          'bg-green-500/10 text-green-500 border-green-500/20 hover:bg-green-500/20'
+          'bg-green-500/10 text-green-700 dark:text-green-500 border-green-500/20 hover:bg-green-500/20'
         )}
       >
         completed
@@ -72,7 +72,7 @@ export function AutopilotStatusBadge({ status }: AutopilotStatusBadgeProps) {
     return (
       <Badge
         className={cn(
-          'bg-yellow-500/10 text-yellow-500 border-yellow-500/20 hover:bg-yellow-500/20'
+          'bg-yellow-500/10 text-yellow-700 dark:text-yellow-500 border-yellow-500/20 hover:bg-yellow-500/20'
         )}
       >
         no fix
@@ -88,7 +88,7 @@ export function AutopilotStatusBadge({ status }: AutopilotStatusBadgeProps) {
     return (
       <Badge
         className={cn(
-          'bg-orange-500/10 text-orange-500 border-orange-500/20 hover:bg-orange-500/20'
+          'bg-orange-500/10 text-orange-700 dark:text-orange-500 border-orange-500/20 hover:bg-orange-500/20'
         )}
       >
         cancelled

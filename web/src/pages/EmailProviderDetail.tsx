@@ -19,18 +19,8 @@ import {
   deleteEmailProvider,
   problemMessage,
 } from '@/components/email/sharedUtils'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   EmailProviderLogo,
   getEmailProviderLabel,
@@ -119,7 +109,7 @@ function providerFacts(
   ]
   if (provider.provider_type === 'ses') {
     facts.push({
-      label: 'SNS Topic ARN',
+      label: 'SNS topic ARN',
       value: provider.sns_topic_arn ? (
         <span className="break-all font-mono text-xs">
           {provider.sns_topic_arn}
@@ -188,6 +178,7 @@ export function EmailProviderDetail() {
 
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isTestDialogOpen, setIsTestDialogOpen] = useState(false)
+  const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
 
   const {
     data: provider,
@@ -221,7 +212,6 @@ export function EmailProviderDetail() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Providers', href: '/email?tab=providers' },
       { label: provider?.name ?? 'Provider' },
     ])
   }, [setBreadcrumbs, provider?.name])
@@ -231,20 +221,22 @@ export function EmailProviderDetail() {
   const deleteMutation = useMutation({
     mutationFn: () => deleteEmailProvider(id!),
     onSuccess: () => {
+      setIsDeleteDialogOpen(false)
       toast.success('Email provider deleted')
       queryClient.invalidateQueries({ queryKey: ['email-providers'] })
-      navigate('/email?tab=providers')
+      navigate('/email')
     },
     onError: (err: Error) => {
+      setIsDeleteDialogOpen(false)
       toast.error('Failed to delete provider', { description: err.message })
     },
   })
 
   const backAction = (
     <Button variant="ghost" size="sm" asChild>
-      <Link to="/email?tab=providers">
+      <Link to="/email">
         <ArrowLeft className="mr-2 size-4" />
-        Back to providers
+        Back to email
       </Link>
     </Button>
   )
@@ -302,44 +294,21 @@ export function EmailProviderDetail() {
         verdict={<Status tone={verdict.tone} label={verdict.label} />}
         actions={
           <>
-            {backAction}
             <Button variant="outline" onClick={() => setIsTestDialogOpen(true)}>
               <Send className="mr-2 size-4" />
-              Send Test Email
+              Send test email
             </Button>
             <Button variant="outline" onClick={() => setIsEditDialogOpen(true)}>
               Edit
             </Button>
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  variant="outline"
-                  className="text-destructive hover:text-destructive"
-                >
-                  <Trash2 className="mr-2 size-4" />
-                  Delete
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Delete {provider.name}?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    This will permanently delete the provider and its stored
-                    credentials from Temps. Domains still assigned to this
-                    provider will be unable to send email until reassigned.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={() => deleteMutation.mutate()}
-                    className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  >
-                    Delete provider
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
+            <Button
+              variant="outline"
+              className="text-destructive hover:text-destructive"
+              onClick={() => setIsDeleteDialogOpen(true)}
+            >
+              <Trash2 className="mr-2 size-4" />
+              Delete
+            </Button>
           </>
         }
         facts={providerFacts(provider, domains?.length)}
@@ -432,6 +401,16 @@ export function EmailProviderDetail() {
         onOpenChange={setIsTestDialogOpen}
         providerId={provider.id}
         onSuccess={() => {}}
+      />
+      <ConfirmDeleteDialog
+        open={isDeleteDialogOpen}
+        onOpenChange={setIsDeleteDialogOpen}
+        resourceType="email provider"
+        resourceName={provider.name}
+        consequences="This permanently deletes the provider and its stored credentials from Temps. Domains still assigned to this provider will be unable to send email until reassigned."
+        confirmLabel="Delete provider"
+        isPending={deleteMutation.isPending}
+        onConfirm={() => deleteMutation.mutate()}
       />
     </>
   )

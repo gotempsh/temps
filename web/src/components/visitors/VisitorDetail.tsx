@@ -10,6 +10,8 @@ import {
   getVisitorSessionsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { VisitorJourney } from './VisitorJourney'
+import { VisitorIdentityPanel } from './VisitorIdentityPanel'
+import { traitSources } from '@/lib/visitor-identity'
 import { buildEnrichPayload, isPayloadTooLargeError } from './enrich-payload'
 import { problemDetail } from '@/lib/api-problem'
 import { ProjectResponse } from '@/api/client/types.gen'
@@ -50,6 +52,17 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import { Label } from '@/components/ui/label'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
+import {
+  ExcludeTrafficDialog,
+  type ExcludeTrafficTarget,
+} from '@/components/analytics/ExcludeTrafficDialog'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
 import { format } from 'date-fns'
@@ -69,15 +82,23 @@ import {
   PlayCircle,
   Plus,
   Share2,
+  ShieldOff,
   Smartphone,
   Users as UserIcon,
 } from 'lucide-react'
 import * as React from 'react'
+import { PageHeader } from '@temps-sdk/ds'
+import {
+  useListBack,
+  type ListReturnState,
+} from '@/components/table/list-navigation'
 import { useNavigate, useSearchParams } from 'react-router'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 
 interface VisitorDetailProps {
   project: ProjectResponse
   visitorId: number
+  listState?: ListReturnState | null
 }
 
 // Helper function to parse user agent for browser/OS/device info
@@ -158,7 +179,7 @@ function BrowserDeviceInfo({
         <CardHeader className="pb-3">
           <CardDescription className="flex items-center gap-1.5">
             <Monitor className="h-4 w-4" />
-            Operating System
+            Operating system
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -186,8 +207,16 @@ function BrowserDeviceInfo({
   )
 }
 
-export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
+export function VisitorDetail({
+  project,
+  visitorId,
+  listState,
+}: VisitorDetailProps) {
   const navigate = useNavigate()
+  const handleBack = useListBack(
+    `/projects/${project.slug}/analytics/visitors`,
+    listState
+  )
   const queryClient = useQueryClient()
   const [searchParams, setSearchParams] = useSearchParams()
   const [page, setPage] = React.useState(1)
@@ -201,6 +230,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
   const [enrichJsonError, setEnrichJsonError] = React.useState<string | null>(
     null
   )
+  const [excludeTarget, setExcludeTarget] =
+    React.useState<ExcludeTrafficTarget | null>(null)
 
   // Get the active tab from URL or default to 'journey'
   const activeTab = searchParams.get('tab') || 'journey'
@@ -224,6 +255,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
       },
     }),
   })
+  // Who set each custom_data key, when identify or enrichment recorded it.
+  const sources = traitSources(visitorDetails?.trait_sources)
 
   const {
     data: sessions,
@@ -390,36 +423,126 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex items-center gap-4">
-        <Button
-          aria-label="Back"
-          variant="ghost"
-          size="icon"
-          onClick={() =>
-            navigate(`/projects/${project.slug}/analytics/visitors`)
-          }
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
-        <div className="flex-1">
-          <h2 className="text-2xl font-semibold flex items-center gap-2">
-            {visitorDetails?.is_crawler ? (
-              <Bug className="h-6 w-6" />
-            ) : (
-              <UserIcon className="h-6 w-6" />
+      <PageHeader
+        headingLevel="h2"
+        title="Visitor details"
+        description={
+          <span className="break-all font-mono text-xs">
+            {visitorDetails?.visitor_id || `Visitor ${visitorId}`}
+          </span>
+        }
+        actions={
+          <>
+            <Button variant="ghost" size="sm" onClick={handleBack}>
+              <ArrowLeft className="mr-2 size-4" aria-hidden="true" />
+              Back to visitors
+            </Button>
+            {visitorDetails && (
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    aria-label="Exclude from analytics"
+                  >
+                    <ShieldOff className="h-4 w-4 sm:mr-2" />
+                    <span className="hidden sm:inline">
+                      Exclude from analytics
+                    </span>
+                  </Button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-72">
+                  <DropdownMenuLabel>
+                    Leave this traffic out of analytics
+                  </DropdownMenuLabel>
+                  {visitorDetails.ip_address ? (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'ip',
+                          value: visitorDetails.ip_address ?? '',
+                        })
+                      }
+                    >
+                      This IP ({visitorDetails.ip_address})
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      This IP (not recorded for this visitor)
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.asn_number != null ? (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'asn',
+                          value: String(visitorDetails.asn_number),
+                          detail: visitorDetails.asn_org ?? undefined,
+                        })
+                      }
+                    >
+                      <span className="truncate">
+                        Network AS{visitorDetails.asn_number}
+                        {visitorDetails.asn_org
+                          ? ` (${visitorDetails.asn_org})`
+                          : ''}
+                      </span>
+                    </DropdownMenuItem>
+                  ) : (
+                    <DropdownMenuItem disabled>
+                      Network (unknown: no ASN database data)
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.first_referrer_hostname && (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'referrer',
+                          value: visitorDetails.first_referrer_hostname ?? '',
+                        })
+                      }
+                    >
+                      <span className="truncate">
+                        Referrer {visitorDetails.first_referrer_hostname}
+                      </span>
+                    </DropdownMenuItem>
+                  )}
+                  {visitorDetails.country_code && (
+                    <DropdownMenuItem
+                      onSelect={() =>
+                        setExcludeTarget({
+                          kind: 'country',
+                          value: visitorDetails.country_code ?? '',
+                          detail: visitorDetails.country ?? undefined,
+                        })
+                      }
+                    >
+                      Country{' '}
+                      {visitorDetails.country ?? visitorDetails.country_code}
+                    </DropdownMenuItem>
+                  )}
+                </DropdownMenuContent>
+              </DropdownMenu>
             )}
-            Visitor Details
-          </h2>
-          <p className="text-muted-foreground">ID: {visitorId}</p>
-        </div>
-        {visitorDetails && (
-          <Button variant="outline" size="sm" onClick={handleOpenEnrichDialog}>
-            <Pencil className="h-4 w-4 mr-2" />
-            Enrich Visitor
-          </Button>
-        )}
-      </div>
+            {visitorDetails && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleOpenEnrichDialog}
+              >
+                <Pencil className="h-4 w-4 mr-2" />
+                Enrich visitor
+              </Button>
+            )}
+          </>
+        }
+      />
+      <ExcludeTrafficDialog
+        projectId={project.id}
+        projectSlug={project.slug}
+        target={excludeTarget}
+        onClose={() => setExcludeTarget(null)}
+      />
 
       {/* Visitor Info Section - Independent error handling */}
       {isLoadingDetails ? (
@@ -467,6 +590,17 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                     {visitorDetails.city}
                   </div>
                 )}
+                {visitorDetails?.asn_number != null && (
+                  <div
+                    className="text-xs text-muted-foreground mt-1 truncate"
+                    title={visitorDetails.asn_org ?? undefined}
+                  >
+                    AS{visitorDetails.asn_number}
+                    {visitorDetails.asn_org
+                      ? ` · ${visitorDetails.asn_org}`
+                      : ''}
+                  </div>
+                )}
               </CardContent>
             </Card>
 
@@ -498,7 +632,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               <CardHeader className="pb-3">
                 <CardDescription className="flex items-center gap-1.5">
                   <Calendar className="h-4 w-4" />
-                  First Seen
+                  First seen
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -518,7 +652,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               <CardHeader className="pb-3">
                 <CardDescription className="flex items-center gap-1.5">
                   <Clock className="h-4 w-4" />
-                  Last Activity
+                  Last activity
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -542,7 +676,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                   ) : (
                     <UserIcon className="h-4 w-4" />
                   )}
-                  Visitor Type
+                  Visitor type
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -551,7 +685,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                   className="text-base px-3 py-1"
                 >
                   {visitorDetails?.is_crawler
-                    ? visitorDetails.crawler_name || 'Crawler'
+                    ? crawlerLabel(visitorDetails.crawler_name, 'Crawler')
                     : 'Human Visitor'}
                 </Badge>
               </CardContent>
@@ -565,7 +699,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <Card>
             <CardHeader className="pb-3">
               <div className="flex items-center justify-between">
-                <CardTitle className="text-base">User Agent</CardTitle>
+                <CardTitle className="text-base">User agent</CardTitle>
                 <CopyButton
                   value={visitorDetails?.user_agent || ''}
                   className="h-8 w-8 p-0 hover:bg-accent hover:text-accent-foreground rounded-md"
@@ -579,12 +713,17 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             </CardContent>
           </Card>
 
+          <VisitorIdentityPanel
+            project={project}
+            visitor={visitorDetails ?? {}}
+          />
+
           {/* Custom Data Section */}
           {visitorDetails?.custom_data &&
             Object.keys(visitorDetails.custom_data).length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Custom Data</CardTitle>
+                  <CardTitle>Custom data</CardTitle>
                   <CardDescription>
                     Additional visitor information
                   </CardDescription>
@@ -602,10 +741,20 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                           {key
                             .replace(/_/g, ' ')
                             .replace(/\b\w/g, (l) => l.toUpperCase())}
+                          {sources[key] && (
+                            <span className="block text-xs font-normal">
+                              {sources[key] === 'server'
+                                ? 'from backend'
+                                : 'from browser'}
+                            </span>
+                          )}
                         </div>
                         <div className="flex-1 text-sm">
                           {typeof value === 'object' && value !== null ? (
-                            <pre className="bg-muted rounded p-2 overflow-x-auto">
+                            <pre
+                              tabIndex={0}
+                              className="bg-muted rounded p-2 overflow-x-auto"
+                            >
                               <HighlightedCode
                                 code={JSON.stringify(value, null, 2)}
                                 language="json"
@@ -631,12 +780,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
         className="space-y-4"
       >
         <TabsList className="grid w-full max-w-2xl grid-cols-3">
-          <TabsTrigger value="journey" className="flex items-center gap-2">
-            <Activity className="h-4 w-4" />
+          <TabsTrigger value="journey" icon={Activity}>
             Journey
           </TabsTrigger>
-          <TabsTrigger value="sessions" className="flex items-center gap-2">
-            <Clock className="h-4 w-4" />
+          <TabsTrigger value="sessions" icon={Clock}>
             Sessions
             {sessions && (
               <Badge variant="secondary" className="ml-1">
@@ -644,9 +791,8 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               </Badge>
             )}
           </TabsTrigger>
-          <TabsTrigger value="replays" className="flex items-center gap-2">
-            <PlayCircle className="h-4 w-4" />
-            Session Replays
+          <TabsTrigger value="replays" icon={PlayCircle}>
+            Session replays
             {sessionReplays && (
               <Badge variant="secondary" className="ml-1">
                 {sessionReplays.sessions?.length || 0}
@@ -739,10 +885,10 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
                             Events
                           </TableHead>
                           <TableHead className="min-w-[200px]">
-                            Entry Page
+                            Entry page
                           </TableHead>
                           <TableHead className="min-w-[200px]">
-                            Exit Page
+                            Exit page
                           </TableHead>
                           <TableHead className="w-[100px] text-center">
                             Bounce
@@ -900,7 +1046,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
             <CardHeader>
               <div className="flex items-center justify-between">
                 <div>
-                  <CardTitle>Session Replays</CardTitle>
+                  <CardTitle>Session replays</CardTitle>
                   <CardDescription>
                     {sessionReplays
                       ? `${sessionReplays.sessions?.length || 0} replays available`
@@ -1007,7 +1153,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
           <DialogHeader>
             <DialogTitle className="flex items-center gap-2">
               <Pencil className="h-5 w-5" />
-              Enrich Visitor Data
+              Enrich visitor data
             </DialogTitle>
             <DialogDescription>
               Edit the custom data for this visitor as a JSON object. Saving
@@ -1073,7 +1219,7 @@ export function VisitorDetail({ project, visitorId }: VisitorDetailProps) {
               ) : (
                 <>
                   <Plus className="h-4 w-4 mr-2" />
-                  Enrich Visitor
+                  Enrich visitor
                 </>
               )}
             </Button>

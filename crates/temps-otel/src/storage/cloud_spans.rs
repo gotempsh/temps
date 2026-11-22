@@ -266,6 +266,7 @@ impl CloudSpanRow {
     fn into_span(self, project_id: i32) -> SpanRecord {
         let start_time = self.ts;
         SpanRecord {
+            ingest_identity: None,
             project_id,
             trace_id: self.trace_id,
             span_id: self.span_id,

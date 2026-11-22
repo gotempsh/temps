@@ -73,6 +73,7 @@ function render(props: Partial<OperationsTrayPanelProps> = {}) {
       <OperationsTrayPanel
         running={section()}
         recent={section()}
+        waiting={section()}
         localOperations={[]}
         runningCount={0}
         onNavigate={noop}
@@ -100,6 +101,7 @@ describe('OperationsTrayPanel', () => {
         errorMessage: 'Database timeout',
       }),
       recent: section({ isError: true, errorMessage: 'Database timeout' }),
+      waiting: section({ isError: true }),
     })
     expect(html).toContain('load operations')
     expect(html).toContain('Database timeout')
@@ -279,4 +281,61 @@ describe('OperationsTrayPanel', () => {
     expect(html).not.toContain(OPERATIONS_EMPTY_MESSAGE)
     expect(html).toContain('1 running')
   })
+})
+
+test('review-only tray shows an actionable review without a running indicator', () => {
+  const html = render({
+    waiting: section({
+      operations: [
+        entry({
+          id: 'autofix:8',
+          kind: 'autofix',
+          status: 'waiting',
+          title: 'Autofix run #8',
+          link: '/projects/shop/agents/8',
+        }),
+      ],
+    }),
+  })
+  expect(html).toContain('aria-label="Needs review"')
+  expect(html).toContain('href="/projects/shop/agents/8"')
+  expect(html).not.toContain('aria-label="Running"')
+  expect(html).not.toContain('1 running')
+  expect(html).not.toContain(OPERATIONS_EMPTY_MESSAGE)
+})
+
+test('review fetch failure offers retry while running work remains visible', () => {
+  const html = render({
+    waiting: section({ isError: true, errorMessage: 'Review feed timeout' }),
+    running: section({ operations: [entry()] }),
+    runningCount: 1,
+  })
+  expect(html).toContain('Review feed timeout')
+  expect(html).toContain('Retry')
+  expect(html).toContain('Rollback to deployment #41')
+  expect(html).not.toContain(OPERATIONS_EMPTY_MESSAGE)
+})
+
+test('cached review stays actionable when all background refreshes fail', () => {
+  const html = render({
+    running: section({ isError: true }),
+    recent: section({ isError: true }),
+    waiting: section({
+      isError: true,
+      errorMessage: 'Review refresh failed',
+      operations: [
+        entry({
+          id: 'autofix:8',
+          kind: 'autofix',
+          status: 'waiting',
+          title: 'Autofix run #8',
+          link: '/projects/shop/agents/8',
+        }),
+      ],
+    }),
+  })
+  expect(html).toContain('Review refresh failed')
+  expect(html).toContain('Retry')
+  expect(html).toContain('href="/projects/shop/agents/8"')
+  expect(html).not.toContain(OPERATIONS_EMPTY_MESSAGE)
 })

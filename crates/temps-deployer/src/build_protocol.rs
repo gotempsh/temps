@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Component, Path};
 
 use crate::BuildResult;
@@ -28,6 +29,15 @@ pub const BUILD_PROTOCOL_VERSION: u16 = 1;
 /// silently building without them.
 pub const BUILD_PROTOCOL_VERSION_BUILD_ARGS: u16 = 2;
 pub const MAX_BUILD_SPEC_BYTES: usize = 256 * 1024;
+/// The route a worker build is sent to, and what a sealed spec is bound to.
+pub const BUILD_PATH: &str = "/agent/images/build";
+/// The multipart field holding a spec encrypted to the node's key (see
+/// [`temps_core::sealed_request`]). Used when the spec holds build-argument
+/// values. An agent that predates it refuses the build, because it expects a
+/// plain `spec` field first, so it can never build without them.
+pub const SEALED_BUILD_SPEC_FIELD: &str = "sealed_spec";
+/// Largest sealed spec a worker reads: a full spec after encryption and base64.
+pub const MAX_SEALED_BUILD_SPEC_BYTES: usize = MAX_BUILD_SPEC_BYTES * 2;
 pub const MAX_BUILD_CONTEXT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_BUILD_CONTEXT_ENTRIES: usize = 100_000;
 pub const MAX_BUILD_EVENT_BYTES: usize = 64 * 1024;
@@ -41,11 +51,43 @@ pub const MAX_BUILD_ARG_VALUE_BYTES: usize = 32 * 1024;
 /// for the rest of the spec (and JSON escaping) under [`MAX_BUILD_SPEC_BYTES`].
 pub const MAX_BUILD_ARGS_BYTES: usize = 128 * 1024;
 
+/// Operator settings persisted on each node. These are control-plane operations,
+/// independent of the proxy request path. Existing agents keep their fixed limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
+pub struct BuildLimits {
+    pub concurrency: u16,
+    pub queue_wait_seconds: u32,
+    pub build_timeout_seconds: u32,
+}
+
+impl Default for BuildLimits {
+    fn default() -> Self {
+        Self {
+            concurrency: 1,
+            queue_wait_seconds: 300,
+            build_timeout_seconds: 1800,
+        }
+    }
+}
+
+impl BuildLimits {
+    pub fn validate(&self) -> Result<(), String> {
+        if !(1..=32).contains(&self.concurrency)
+            || !(1..=1800).contains(&self.queue_wait_seconds)
+            || !(1..=14400).contains(&self.build_timeout_seconds)
+        {
+            return Err("Builder limits require concurrency 1–32, queue wait 1–1800 seconds and build timeout 1–14400 seconds".into());
+        }
+        Ok(())
+    }
+}
+
 /// Paths are relative to the root of the tar archive.
 ///
 /// Deliberately not `Debug`: [`BuildSpec::build_args`] holds variable values,
 /// and a stray `{:?}` must not be able to put them in a log.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct BuildSpec {
     pub version: u16,
     pub image_name: String,
@@ -63,12 +105,31 @@ pub struct BuildSpec {
     /// `docker build --build-arg` would be (protocol v2). The control plane
     /// decides which values may leave it -- never one marked secret or a
     /// platform credential -- and sends only names the Dockerfile declares.
-    /// They travel inside this spec over the node's authenticated build
-    /// channel and are held in memory on both sides; neither side writes
-    /// them to disk or to a log.
+    /// A spec holding them is encrypted to the node's key
+    /// ([`SEALED_BUILD_SPEC_FIELD`]). They are held in memory on both sides;
+    /// neither side writes them to disk or to a log.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub build_args: BTreeMap<String, String>,
+    /// Labels for the built image, `sh.temps.image.*` keys only: which install,
+    /// project and deployment built it, so housekeeping can recognise the
+    /// image once the database rows naming it are gone. Not values a build
+    /// reads. Optional on the wire: an agent that predates it ignores the
+    /// field and builds an unlabelled image, as before.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
 }
+
+/// Prefix every image label a worker build accepts must start with. Its own
+/// namespace, not `sh.temps.*` at large: containers inherit their image's
+/// labels, and a container's `sh.temps.*` labels are Temps' container config
+/// (`sh.temps.project_id`, `sh.temps.managed`), which an image must never set.
+pub const IMAGE_LABEL_PREFIX: &str = "sh.temps.image.";
+
+/// Most labels one worker build accepts.
+pub const MAX_IMAGE_LABELS: usize = 16;
+
+/// Longest label key or value a worker build accepts.
+pub const MAX_IMAGE_LABEL_LEN: usize = 256;
 
 /// BuildKit's predefined build argument that prefixes every cache mount ID.
 pub const CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
@@ -147,6 +208,7 @@ impl BuildSpec {
         {
             return Err("Image name must be 1–256 characters without whitespace".to_string());
         }
+        self.validate_labels()?;
         validate_archive_path(Path::new(&self.dockerfile))?;
         if self
             .platform
@@ -164,6 +226,37 @@ impl BuildSpec {
                 "Worker build cache namespace must be 1-{MAX_CACHE_NAMESPACE_LEN} ASCII letters, \
                  digits, '-', '_' or '.'"
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_labels(&self) -> Result<(), String> {
+        if self.labels.len() > MAX_IMAGE_LABELS {
+            return Err(format!(
+                "Worker builds accept at most {MAX_IMAGE_LABELS} image labels, got {}",
+                self.labels.len()
+            ));
+        }
+        for (key, value) in &self.labels {
+            let key_ok = key.starts_with(IMAGE_LABEL_PREFIX)
+                && key.len() <= MAX_IMAGE_LABEL_LEN
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'));
+            if !key_ok {
+                return Err(format!(
+                    "Worker build image label '{}' must start with '{IMAGE_LABEL_PREFIX}' and use \
+                     only ASCII letters, digits, '.', '_' or '-' (at most {MAX_IMAGE_LABEL_LEN} \
+                     characters)",
+                    key.escape_debug()
+                ));
+            }
+            if value.len() > MAX_IMAGE_LABEL_LEN || value.chars().any(char::is_control) {
+                return Err(format!(
+                    "Worker build image label '{key}' has a value longer than \
+                     {MAX_IMAGE_LABEL_LEN} bytes or containing control characters"
+                ));
+            }
         }
         Ok(())
     }
@@ -230,84 +323,378 @@ impl BuildSpec {
 /// only adds a name: callers use the result to decide which values a build
 /// reads, where an extra name is harmless and a missing one is not.
 pub fn dockerfile_build_arg_names(contents: &str) -> Option<BTreeSet<String>> {
-    let contents = contents.trim_start_matches('\u{feff}');
-    let escape = dockerfile_escape_character(contents);
     let mut names = BTreeSet::new();
-    let mut lines = contents.lines();
-    while let Some(line) = lines.next() {
-        if line.trim_start().starts_with('#') {
-            continue;
-        }
-        let mut instruction = String::new();
-        let mut current = line;
-        while let Some(continued) = strip_line_continuation(current, escape) {
-            instruction.push_str(continued);
-            // Docker drops comment and empty lines inside a continuation.
-            let next = lines
-                .by_ref()
-                .find(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'));
-            current = next.unwrap_or_default();
-        }
-        instruction.push_str(current);
-        let mut words = instruction.split_whitespace();
-        let Some(keyword) = words.next() else {
-            continue;
-        };
-        let declares = keyword.eq_ignore_ascii_case("ARG")
-            || (keyword.eq_ignore_ascii_case("ONBUILD")
-                && words
-                    .next()
-                    .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
-        if !declares {
-            continue;
-        }
-        let mut declared_any = false;
-        for word in words {
-            // `NAME=default`; a quoted default containing spaces only adds
-            // spurious names, never hides one.
-            let name = word.split('=').next().unwrap_or_default();
-            if name.is_empty() || name.contains('$') {
-                return None;
-            }
-            names.insert(name.to_string());
-            declared_any = true;
-        }
-        if !declared_any {
-            return None;
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        if let Some(declared) = declared_arg_names(&instruction) {
+            names.extend(declared?);
         }
     }
     Some(names)
 }
 
-/// `line` without its line continuation, or `None` when it does not end with
-/// one. Docker's rule: the escape character, preceded by any character other
-/// than the escape character, with only blanks after it. An escaped escape
-/// (`\\`) at the end of a line therefore does not continue it.
-fn strip_line_continuation(line: &str, escape: char) -> Option<&str> {
-    let body = line.trim_end_matches([' ', '\t']).strip_suffix(escape)?;
-    match body.chars().next_back() {
-        Some(previous) if previous != escape => Some(body),
-        _ => None,
+/// The `ARG` names whose values Docker keeps in the metadata of the image a
+/// Dockerfile produces: those declared in its final stage and in the chain of
+/// stages that stage is built `FROM`. `None` when that cannot be determined.
+///
+/// A build argument declared here is recorded in the image history, while one
+/// declared only in a stage reached through `COPY --from` is not, so callers
+/// use the result to decide which secret values must not be passed. That
+/// makes a missing name a leak, so unlike [`dockerfile_build_arg_names`] this
+/// reads heredoc bodies as the data they are (a `FROM` line inside
+/// `RUN <<EOF` must not look like a new stage and hide a final-stage `ARG`),
+/// and every doubt widens the result or returns `None`:
+///
+/// - `FROM $BASE` may name any earlier stage, as may a base name with quotes or
+///   escapes in it (`FROM "build"`), which Docker removes first. All of them
+///   count.
+/// - `ARG $NAME` and an unterminated heredoc return `None`, as does a
+///   Dockerfile with no `FROM`.
+///
+/// A global `ARG`, declared before the first `FROM`, is only visible to `FROM`
+/// lines and does not reach the image unless a stage declares it again.
+/// `ONBUILD ARG` counts for the stage it is written in, since building `FROM`
+/// that stage runs it. An `ONBUILD ARG` inside an external base image cannot
+/// be seen from here.
+pub fn dockerfile_final_image_arg_names(contents: &str) -> Option<BTreeSet<String>> {
+    struct Stage {
+        name: Option<String>,
+        base: String,
+        args: BTreeSet<String>,
+    }
+    let mut stages: Vec<Stage> = Vec::new();
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        if !instructions.skip_heredocs(&instruction) {
+            return None;
+        }
+        let mut words = instruction.split_whitespace();
+        if words
+            .next()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case("FROM"))
+        {
+            let mut operands = words.filter(|word| !word.starts_with("--"));
+            let base = operands.next()?.to_ascii_lowercase();
+            let name = match (operands.next(), operands.next()) {
+                (Some(keyword), Some(name)) if keyword.eq_ignore_ascii_case("AS") => {
+                    Some(name.to_ascii_lowercase())
+                }
+                _ => None,
+            };
+            stages.push(Stage {
+                name,
+                base,
+                args: BTreeSet::new(),
+            });
+        } else if let (Some(stage), Some(declared)) =
+            (stages.last_mut(), declared_arg_names(&instruction))
+        {
+            stage.args.extend(declared?);
+        }
+    }
+
+    let mut names = BTreeSet::new();
+    let mut pending = vec![stages.len().checked_sub(1)?];
+    let mut visited = BTreeSet::new();
+    while let Some(index) = pending.pop() {
+        if !visited.insert(index) {
+            continue;
+        }
+        let stage = &stages[index];
+        names.extend(stage.args.iter().cloned());
+        if stage.base.contains(['$', '"', '\'', instructions.escape]) {
+            pending.extend(0..index);
+        } else if let Some(parent) = stages[..index]
+            .iter()
+            .rposition(|earlier| earlier.name.as_deref() == Some(stage.base.as_str()))
+        {
+            pending.push(parent);
+        }
+    }
+    Some(names)
+}
+
+/// The secret ids a Dockerfile's `RUN --mount=type=secret` instructions ask
+/// for, in any stage: a secret mount never reaches the image, wherever it is.
+///
+/// BuildKit names the secret after `source` (or `src`), then `id`, then the
+/// basename of the target path. A name holding a variable reference cannot be
+/// read and is left out, as is anything after an unterminated heredoc.
+pub fn dockerfile_secret_mount_ids(contents: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    let mut instructions = DockerfileInstructions::new(contents);
+    while let Some(instruction) = instructions.next_instruction() {
+        let terminated = instructions.skip_heredocs(&instruction);
+        let (mut keyword, mut rest) = split_first_word(&instruction);
+        if keyword.eq_ignore_ascii_case("ONBUILD") {
+            (keyword, rest) = split_first_word(rest);
+        }
+        if keyword.eq_ignore_ascii_case("RUN") {
+            let flags = instruction_flags(rest, instructions.escape);
+            ids.extend(flags.iter().filter_map(|flag| secret_mount_id(flag)));
+        }
+        if !terminated {
+            break;
+        }
+    }
+    ids
+}
+
+fn split_first_word(line: &str) -> (&str, &str) {
+    let line = line.trim_start();
+    line.split_at(line.find(char::is_whitespace).unwrap_or(line.len()))
+}
+
+/// The leading `--flags` of an instruction's arguments, as BuildKit's
+/// `extractBuilderFlags` reads them: quotes and escapes are removed and a quoted
+/// space does not end a flag. They stop at the first word that is not a flag,
+/// or at a bare `--`.
+fn instruction_flags(mut arguments: &str, escape: char) -> Vec<String> {
+    let mut flags = Vec::new();
+    loop {
+        arguments = arguments.trim_start();
+        if !arguments.starts_with("--") {
+            return flags;
+        }
+        let mut flag = String::new();
+        let mut quote = None;
+        let mut chars = arguments.chars();
+        while let Some(ch) = chars.next() {
+            match quote {
+                None if ch.is_whitespace() => break,
+                None if ch == '"' || ch == '\'' => quote = Some(ch),
+                Some(open) if ch == open => quote = None,
+                _ if ch == escape => flag.extend(chars.next()),
+                _ => flag.push(ch),
+            }
+        }
+        if flag == "--" {
+            return flags;
+        }
+        flags.push(flag);
+        arguments = chars.as_str();
     }
 }
 
-/// The escape character set by a `# escape=` parser directive, which Docker
-/// only honours among the comment lines at the very top of the file.
+/// The fields of a `--mount` value, which BuildKit reads as a CSV record once
+/// the flag itself has been unquoted.
+fn mount_fields(mount: &str) -> Vec<String> {
+    let mut fields = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut chars = mount.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' if quoted && chars.peek() == Some(&'"') => {
+                chars.next();
+                field.push('"');
+            }
+            '"' if quoted => quoted = false,
+            '"' if field.is_empty() => quoted = true,
+            ',' if !quoted => fields.push(std::mem::take(&mut field)),
+            _ => field.push(ch),
+        }
+    }
+    fields.push(field);
+    fields
+}
+
+/// The secret id of one unquoted `RUN` flag, when it is a
+/// `--mount=type=secret` flag.
+fn secret_mount_id(flag: &str) -> Option<String> {
+    let fields = mount_fields(flag.strip_prefix("--mount=")?);
+    let mut is_secret = false;
+    let mut source = None;
+    let mut id = None;
+    let mut target = None;
+    for field in &fields {
+        let Some((key, value)) = field.split_once('=') else {
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "type" => is_secret = value.eq_ignore_ascii_case("secret"),
+            "source" | "src" => source = Some(value),
+            "id" => id = Some(value),
+            "target" | "dst" | "destination" => target = Some(value),
+            _ => {}
+        }
+    }
+    let named = [source, id]
+        .into_iter()
+        .flatten()
+        .find(|name| !name.is_empty());
+    let id = named.or_else(|| target?.rsplit('/').next())?;
+    (is_secret && !id.is_empty() && !id.contains('$')).then(|| id.to_string())
+}
+
+/// The names one instruction declares with `ARG` or `ONBUILD ARG`: `None` when
+/// it is another instruction, `Some(None)` when a declaration cannot be read
+/// because it is empty or names a variable reference.
+fn declared_arg_names(instruction: &str) -> Option<Option<Vec<String>>> {
+    let mut words = instruction.split_whitespace();
+    let keyword = words.next()?;
+    let declares = keyword.eq_ignore_ascii_case("ARG")
+        || (keyword.eq_ignore_ascii_case("ONBUILD")
+            && words
+                .next()
+                .is_some_and(|word| word.eq_ignore_ascii_case("ARG")));
+    if !declares {
+        return None;
+    }
+    let mut names = Vec::new();
+    for word in words {
+        // `NAME=default`; a quoted default containing spaces only adds
+        // spurious names, never hides one.
+        let name = word.split('=').next().unwrap_or_default();
+        if name.is_empty() || name.contains('$') {
+            return Some(None);
+        }
+        names.push(name.to_string());
+    }
+    Some((!names.is_empty()).then_some(names))
+}
+
+/// A Dockerfile's instructions, with continued lines joined the way Docker
+/// joins them: the lines are concatenated with nothing in between, and comment
+/// and empty lines inside a continuation are skipped.
+struct DockerfileInstructions<'a> {
+    lines: std::str::Lines<'a>,
+    escape: char,
+}
+
+impl<'a> DockerfileInstructions<'a> {
+    fn new(contents: &'a str) -> Self {
+        let contents = contents.trim_start_matches('\u{feff}');
+        Self {
+            lines: contents.lines(),
+            escape: dockerfile_escape_character(contents),
+        }
+    }
+
+    fn next_instruction(&mut self) -> Option<String> {
+        let line = self
+            .lines
+            .by_ref()
+            .find(|line| !line.trim_start().starts_with('#'))?;
+        let mut instruction = String::new();
+        let mut current = line;
+        while let Some(continued) = strip_line_continuation(current, self.escape) {
+            instruction.push_str(continued);
+            // Docker drops comment and empty lines inside a continuation.
+            let next = self
+                .lines
+                .by_ref()
+                .find(|next| !next.trim().is_empty() && !next.trim_start().starts_with('#'));
+            current = next.unwrap_or_default();
+        }
+        instruction.push_str(current);
+        Some(instruction)
+    }
+
+    /// Consume the heredoc bodies `instruction` opens, as Docker does for
+    /// `RUN`, `COPY` and `ADD`. `false` when one never ends, which means the
+    /// rest of the file was consumed: either the Dockerfile is broken, or this
+    /// was not a heredoc and later instructions were lost, so nothing derived
+    /// from it can be trusted.
+    fn skip_heredocs(&mut self, instruction: &str) -> bool {
+        let mut words = instruction.split_whitespace().peekable();
+        if words
+            .peek()
+            .is_some_and(|word| word.eq_ignore_ascii_case("ONBUILD"))
+        {
+            words.next();
+        }
+        let opens_heredocs = words.next().is_some_and(|keyword| {
+            ["RUN", "COPY", "ADD"]
+                .iter()
+                .any(|name| keyword.eq_ignore_ascii_case(name))
+        });
+        if !opens_heredocs {
+            return true;
+        }
+        for word in words {
+            let Some((terminator, strip_tabs)) = heredoc_terminator(word) else {
+                continue;
+            };
+            let found = self.lines.by_ref().any(|line| {
+                let line = line.trim_end_matches('\r');
+                let line = if strip_tabs {
+                    line.trim_start_matches('\t')
+                } else {
+                    line
+                };
+                line == terminator
+            });
+            if !found {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// The terminator of a word that opens a heredoc (`<<EOF`, `<<-EOF`,
+/// `3<<"EOF"`), and whether its body's leading tabs are stripped.
+fn heredoc_terminator(word: &str) -> Option<(&str, bool)> {
+    let rest = word
+        .trim_start_matches(|character: char| character.is_ascii_digit())
+        .strip_prefix("<<")?;
+    let (rest, strip_tabs) = match rest.strip_prefix('-') {
+        Some(rest) => (rest, true),
+        None => (rest, false),
+    };
+    let terminator = rest.trim_matches(['"', '\'']);
+    (!terminator.is_empty() && !terminator.contains('<')).then_some((terminator, strip_tabs))
+}
+
+/// `line` without its line continuation, or `None` when it does not end with
+/// one. Docker's rule: the escape character with only blanks after it, either
+/// alone on the line or preceded by any character other than the escape
+/// character. An escaped escape (`\\`) at the end of a line therefore does not
+/// continue it.
+fn strip_line_continuation(line: &str, escape: char) -> Option<&str> {
+    let body = line
+        .trim_end_matches('\r')
+        .trim_end_matches([' ', '\t'])
+        .strip_suffix(escape)?;
+    (!body.ends_with(escape)).then_some(body)
+}
+
+/// The escape character set by a `# escape=` parser directive. Docker reads
+/// directives only from the top of the file, and stops at the first line that
+/// is not a well-formed directive it knows, even if that line is a comment:
+/// an `escape` after it is an ordinary comment.
 fn dockerfile_escape_character(contents: &str) -> char {
     for line in contents.lines() {
-        let Some(directive) = line.trim().strip_prefix('#') else {
+        let Some((key, value)) = parser_directive(line) else {
             break;
         };
-        let Some((key, value)) = directive.split_once('=') else {
-            break;
-        };
-        if key.trim().eq_ignore_ascii_case("escape") {
-            if let Some(character @ ('\\' | '`')) = value.trim().chars().next() {
+        if key.eq_ignore_ascii_case("escape") {
+            if let Some(character @ ('\\' | '`')) = value.chars().next() {
                 return character;
             }
+        } else if !["syntax", "check"]
+            .iter()
+            .any(|known| key.eq_ignore_ascii_case(known))
+        {
+            break;
         }
     }
     '\\'
+}
+
+/// The key and value of a line shaped like a parser directive:
+/// `# key = value`, where the key is a letter followed by letters and digits
+/// and the value is not empty.
+fn parser_directive(line: &str) -> Option<(&str, &str)> {
+    let (key, value) = line.trim().strip_prefix('#')?.split_once('=')?;
+    let (key, value) = (key.trim(), value.trim());
+    let well_formed = key.starts_with(|character: char| character.is_ascii_alphabetic())
+        && key
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric())
+        && !value.is_empty();
+    well_formed.then_some((key, value))
 }
 
 /// Reject paths that could escape the extracted context on any supported OS.
@@ -432,6 +819,113 @@ pub enum BuildFailureKind {
     Worker,
 }
 
+pub fn safe_extract_context(
+    archive: &std::path::Path,
+    destination: &std::path::Path,
+) -> Result<(), String> {
+    let file = std::fs::File::open(archive)
+        .map_err(|error| format!("Cannot open uploaded build context: {error}"))?;
+    let mut archive = tar::Archive::new(file);
+    let entries = archive
+        .entries()
+        .map_err(|error| format!("Cannot read build context archive: {error}"))?;
+    let mut total_size = 0_u64;
+    let mut count = 0_usize;
+    for entry in entries {
+        count += 1;
+        if count > MAX_BUILD_CONTEXT_ENTRIES {
+            return Err(format!(
+                "Build context exceeds the {MAX_BUILD_CONTEXT_ENTRIES}-entry limit"
+            ));
+        }
+        let mut entry = entry.map_err(|error| format!("Invalid build context entry: {error}"))?;
+        let path = entry
+            .path()
+            .map_err(|error| format!("Invalid build context path: {error}"))?
+            .into_owned();
+        validate_archive_path(&path)?;
+        if path.components().any(|part| part.as_os_str() == ".git") {
+            return Err("Build context must not contain a .git directory".to_string());
+        }
+        let output = destination.join(&path);
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            std::fs::create_dir_all(&output).map_err(|error| {
+                format!(
+                    "Cannot create build context directory '{}': {error}",
+                    path.display()
+                )
+            })?;
+        } else if kind.is_file() {
+            let size = entry
+                .header()
+                .size()
+                .map_err(|error| format!("Invalid build context entry size: {error}"))?;
+            total_size = total_size
+                .checked_add(size)
+                .ok_or_else(|| "Build context size overflowed".to_string())?;
+            if total_size > MAX_BUILD_CONTEXT_BYTES {
+                return Err(format!(
+                    "Extracted build context exceeds the {MAX_BUILD_CONTEXT_BYTES}-byte limit"
+                ));
+            }
+            if let Some(parent) = output.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| {
+                    format!(
+                        "Cannot create build context parent '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            }
+            let mut target = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&output)
+                .map_err(|error| {
+                    format!(
+                        "Cannot create build context file '{}': {error}",
+                        path.display()
+                    )
+                })?;
+            std::io::copy(&mut entry, &mut target).map_err(|error| {
+                format!(
+                    "Cannot extract build context file '{}': {error}",
+                    path.display()
+                )
+            })?;
+            target.flush().map_err(|error| {
+                format!(
+                    "Cannot flush build context file '{}': {error}",
+                    path.display()
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = entry
+                    .header()
+                    .mode()
+                    .map_err(|error| format!("Invalid mode for '{}': {error}", path.display()))?;
+                // Preserve executable source scripts, but never setuid/setgid.
+                target
+                    .set_permissions(std::fs::Permissions::from_mode(mode & 0o777))
+                    .map_err(|error| {
+                        format!(
+                            "Cannot set source permissions for '{}': {error}",
+                            path.display()
+                        )
+                    })?;
+            }
+        } else {
+            return Err(format!(
+                "Build context entry '{}' is not a regular file or directory",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -445,6 +939,7 @@ mod tests {
             platform: Some("linux/amd64".to_string()),
             cache_namespace: None,
             build_args: BTreeMap::new(),
+            labels: BTreeMap::new(),
         };
         assert!(spec.validate().is_ok());
         for path in ["../Dockerfile", "/etc/passwd", "a\\..\\b", "C:foo"] {
@@ -461,6 +956,47 @@ mod tests {
     }
 
     #[test]
+    fn build_spec_labels_are_temps_scoped_and_bounded() {
+        let mut spec = BuildSpec {
+            version: BUILD_PROTOCOL_VERSION,
+            image_name: "app:latest".to_string(),
+            dockerfile: "Dockerfile".to_string(),
+            platform: None,
+            cache_namespace: None,
+            build_args: BTreeMap::new(),
+            labels: BTreeMap::from([("sh.temps.image.project_id".to_string(), "7".to_string())]),
+        };
+        // Labels need no newer protocol: an older agent just ignores them.
+        assert!(spec.validate().is_ok());
+        let json = serde_json::to_value(&spec).expect("serialize");
+        assert_eq!(json["labels"]["sh.temps.image.project_id"], "7");
+
+        spec.labels = BTreeMap::from([("maintainer".to_string(), "x".to_string())]);
+        assert!(spec.validate().is_err(), "a non-Temps label key is refused");
+        spec.labels = BTreeMap::from([("sh.temps.managed".to_string(), "true".to_string())]);
+        assert!(
+            spec.validate().is_err(),
+            "a container-config label is refused on an image"
+        );
+        spec.labels = BTreeMap::from([("sh.temps.image.x".to_string(), "a\nb".to_string())]);
+        assert!(spec.validate().is_err(), "a control character is refused");
+        spec.labels = (0..=MAX_IMAGE_LABELS)
+            .map(|index| (format!("sh.temps.image.l{index}"), "v".to_string()))
+            .collect();
+        assert!(spec.validate().is_err(), "too many labels are refused");
+
+        // A spec from an older control plane carries no labels at all.
+        let legacy: BuildSpec = serde_json::from_value(serde_json::json!({
+            "version": BUILD_PROTOCOL_VERSION,
+            "image_name": "app:latest",
+            "dockerfile": "Dockerfile",
+            "platform": null,
+        }))
+        .expect("deserialize a spec without labels");
+        assert!(legacy.labels.is_empty());
+    }
+
+    #[test]
     fn build_spec_build_args_need_v2_and_are_bounded() {
         let mut spec = BuildSpec {
             version: BUILD_PROTOCOL_VERSION,
@@ -472,6 +1008,7 @@ mod tests {
                 "VITE_API_URL".to_string(),
                 "https://api.example.test".to_string(),
             )]),
+            labels: BTreeMap::new(),
         };
         // v1 has no field for values: a v1 spec carrying them is malformed.
         assert!(spec.validate().is_err());
@@ -600,6 +1137,261 @@ mod tests {
         assert_eq!(names("ARG\n"), None);
     }
 
+    fn final_image_args(contents: &str) -> Option<Vec<String>> {
+        dockerfile_final_image_arg_names(contents).map(|names| names.into_iter().collect())
+    }
+
+    #[test]
+    fn final_image_args_cover_a_single_stage() {
+        assert_eq!(
+            final_image_args("FROM alpine\nARG TOKEN\nRUN echo hi\n"),
+            Some(vec!["TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_exclude_stages_only_copied_from() {
+        // The documented safe pattern: the value is used in an earlier stage
+        // and only the result is copied.
+        assert_eq!(
+            final_image_args(
+                "FROM node AS build\nARG TOKEN\nRUN build\nFROM nginx\nCOPY --from=build /a /b\n"
+            ),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn final_image_args_follow_the_chain_of_from_stages() {
+        assert_eq!(
+            final_image_args(
+                "FROM alpine AS Base\nARG ROOT\nFROM base AS middle\nARG MIDDLE\n\
+                 FROM alpine AS other\nARG UNRELATED\nFROM --platform=linux/amd64 MIDDLE\nARG LAST\n"
+            ),
+            Some(vec![
+                "LAST".to_string(),
+                "MIDDLE".to_string(),
+                "ROOT".to_string()
+            ])
+        );
+    }
+
+    #[test]
+    fn final_image_args_use_the_nearest_stage_of_a_repeated_name() {
+        assert_eq!(
+            final_image_args("FROM a AS x\nARG FIRST\nFROM b AS x\nARG SECOND\nFROM x\n"),
+            Some(vec!["SECOND".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_treat_a_variable_base_as_any_earlier_stage() {
+        assert_eq!(
+            final_image_args(
+                "ARG BASE=one\nFROM a AS one\nARG FIRST\nFROM b AS two\nARG SECOND\nFROM $BASE\n"
+            ),
+            Some(vec!["FIRST".to_string(), "SECOND".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_ignore_global_args_until_a_stage_declares_them() {
+        assert_eq!(
+            final_image_args("ARG VERSION\nFROM alpine:$VERSION\n"),
+            Some(vec![])
+        );
+        assert_eq!(
+            final_image_args("ARG VERSION\nFROM alpine:$VERSION\nARG VERSION\n"),
+            Some(vec!["VERSION".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_are_not_hidden_by_a_heredoc_that_looks_like_a_stage() {
+        // Without heredoc handling the `from` line reads as a new final stage,
+        // and the real final-stage ARG would be passed.
+        let contents = "FROM alpine\nARG TOKEN\nRUN <<EOF\nfrom somewhere\nEOF\n";
+        assert_eq!(final_image_args(contents), Some(vec!["TOKEN".to_string()]));
+        let contents = "FROM alpine\nARG TOKEN\nCOPY <<-\"END\" /f\n\tFROM other\n\tEND\n";
+        assert_eq!(final_image_args(contents), Some(vec!["TOKEN".to_string()]));
+    }
+
+    #[test]
+    fn final_image_args_read_continued_lines() {
+        assert_eq!(
+            final_image_args("FROM a AS build\nARG EARLY\nFROM \\\n  a\nARG TO\\\nKEN\n"),
+            Some(vec!["TOKEN".to_string()])
+        );
+    }
+
+    #[test]
+    fn final_image_args_fail_closed_when_unreadable() {
+        for contents in [
+            "FROM alpine\nARG $NAME\n",
+            "FROM alpine\nARG\n",
+            "FROM alpine\nRUN <<EOF\nnever ends\n",
+            "RUN nothing\n",
+            "",
+        ] {
+            assert_eq!(final_image_args(contents), None, "{contents:?}");
+        }
+    }
+
+    #[test]
+    fn secret_mount_ids_are_read_from_every_stage() {
+        let contents = "FROM a AS build\n\
+            RUN --mount=type=secret,id=API_KEY,env=API_KEY --network=none make\n\
+            FROM b\n\
+            RUN --mount=type=secret,target=/run/keys/SIGNING_KEY sign\n\
+            ONBUILD RUN --mount=type=secret,id=LATER x\n";
+        assert_eq!(
+            dockerfile_secret_mount_ids(contents)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["API_KEY", "LATER", "SIGNING_KEY"]
+        );
+    }
+
+    /// Lines read differently from how they look. A name missed here is a secret
+    /// left in the image, so these match what BuildKit does with each one.
+    #[test]
+    fn final_image_args_are_read_line_by_line_as_docker_reads_them() {
+        for dockerfile in [
+            "FROM a\nARG \\\n\\\nTOKEN\n",
+            "FROM a\nARG \\\n\\  \t\nTOKEN\n",
+            "FROM a\nARG \\\n\\\n\\\nTOKEN\n",
+            "FROM a\nARG \\\n   \\\nTOKEN\n",
+            "FROM a\r\nARG \\\r\n\\\r\nTOKEN\r\n",
+            "FROM a\nARG \\\r\r\nTOKEN\n",
+            "\\\nFROM a\nARG TOKEN\n",
+            "# escape=`\nFROM a\nARG `\n`\nTOKEN\n",
+            "# syntax=x\n# check=skip=all\n# escape=`\nFROM a\nARG `\nTOKEN\n",
+            // Each of these ends the directives, so the escape stays a backslash.
+            "# foo=bar\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# a b=c\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# 1a=c\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# foo=\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# escape=\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "# note\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+            "\n# escape=`\nFROM a\nARG \\\nTOKEN\n",
+        ] {
+            let names = dockerfile_final_image_arg_names(dockerfile);
+            assert_eq!(
+                names.as_ref().map(|names| names.contains("TOKEN")),
+                Some(true),
+                "{dockerfile:?} gave {names:?}"
+            );
+        }
+        // An escaped escape does not continue the line, alone or after text.
+        for dockerfile in [
+            "FROM a\nARG A=b\\\\\nENV TOKEN=c\n",
+            "FROM a\nARG A\n\\\\\n",
+        ] {
+            let names = dockerfile_final_image_arg_names(dockerfile);
+            assert_eq!(
+                names.as_ref().map(|names| names.contains("TOKEN")),
+                Some(false),
+                "{dockerfile:?} gave {names:?}"
+            );
+        }
+    }
+
+    /// Docker unquotes a base name before looking for a stage called that, and
+    /// which stage it means is not worth working out when a miss leaks a secret.
+    #[test]
+    fn a_base_name_with_quotes_or_escapes_may_be_any_earlier_stage() {
+        for base in ["\"build\"", "'build'", "bu\\ild"] {
+            let dockerfile = format!("FROM a AS build\nARG TOKEN\nFROM {base}\nARG OTHER\n");
+            let names = dockerfile_final_image_arg_names(&dockerfile);
+            assert_eq!(
+                names.map(|names| names.into_iter().collect::<Vec<_>>()),
+                Some(vec!["OTHER".to_string(), "TOKEN".to_string()]),
+                "{base}"
+            );
+        }
+        let backtick = "# escape=`\nFROM a AS build\nARG TOKEN\nFROM bu`ild\n";
+        assert!(
+            dockerfile_final_image_arg_names(backtick).is_some_and(|names| names.contains("TOKEN"))
+        );
+    }
+
+    /// The order BuildKit's `dispatchSecret` uses, since a mount read differently
+    /// here is a required secret that never gets served.
+    #[test]
+    fn secret_mount_id_follows_buildkit_precedence() {
+        let id_of = |mount: &str| {
+            let contents = format!("FROM a\nRUN --mount={mount} make\n");
+            dockerfile_secret_mount_ids(&contents)
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        for (mount, expected) in [
+            ("type=secret,source=API_KEY,required=true", "API_KEY"),
+            ("type=secret,src=API_KEY", "API_KEY"),
+            (
+                "type=secret,source=API_KEY,target=/run/secrets/key",
+                "API_KEY",
+            ),
+            ("type=secret,id=API_KEY,target=/run/secrets/key", "API_KEY"),
+            ("type=secret,source=,id=API_KEY", "API_KEY"),
+            ("type=secret,id=,target=/run/secrets/API_KEY", "API_KEY"),
+            ("TYPE=secret,SOURCE=API_KEY", "API_KEY"),
+        ] {
+            assert_eq!(id_of(mount), vec![expected], "{mount}");
+        }
+        // Quoted the ways BuildKit accepts, which it removes before reading the
+        // fields, first from the flag and then as CSV.
+        for mount in [
+            r#"type=secret,id="API_KEY",required=true"#,
+            r#""type=secret,id=API_KEY,required=true""#,
+            r#"'type=secret,id=API_KEY'"#,
+            r#"type=secret,source='API_KEY'"#,
+            r#"type=secret,id=API_"KEY""#,
+            r#"type=secret,id=API\_KEY"#,
+            r#"'type=secret,"id=API_KEY",required=true'"#,
+        ] {
+            assert_eq!(id_of(mount), vec!["API_KEY"], "{mount}");
+        }
+        assert_eq!(
+            id_of(r#""type=secret,target=/run/my dir/API_KEY""#),
+            vec!["API_KEY"]
+        );
+        assert!(id_of("type=secret,source=$DYNAMIC,id=API_KEY").is_empty());
+        assert!(id_of("type=bind,source=API_KEY,target=/key").is_empty());
+    }
+
+    /// `RUN` flags end at the first word that is not one, or at a bare `--`, and
+    /// a quoted space does not end a word.
+    #[test]
+    fn secret_mount_ids_stop_where_the_flags_stop() {
+        let ids = |line: &str| {
+            dockerfile_secret_mount_ids(&format!("FROM a\n{line}\n"))
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            ids(r#"RUN --network="none" --mount=type=secret,id=A make"#),
+            vec!["A"]
+        );
+        assert_eq!(
+            ids(r#"RUN --mount="type=secret,target=/a b/B" --mount=type=secret,id=C make"#),
+            vec!["B", "C"]
+        );
+        assert!(ids("RUN -- --mount=type=secret,id=AFTER_END make").is_empty());
+        assert!(ids("RUN make --mount=type=secret,id=AN_ARGUMENT").is_empty());
+    }
+
+    #[test]
+    fn secret_mount_ids_ignore_everything_else() {
+        let contents = "FROM a\n\
+            RUN --mount=type=cache,id=cache,target=/c make\n\
+            RUN --mount=type=secret,id=$DYNAMIC make\n\
+            RUN echo --mount=type=secret,id=NOT_A_FLAG\n\
+            COPY --mount=type=secret,id=NOT_RUN a b\n\
+            RUN <<EOF\nRUN --mount=type=secret,id=IN_HEREDOC x\nEOF\n";
+        assert!(dockerfile_secret_mount_ids(contents).is_empty());
+    }
+
     #[test]
     fn build_spec_cache_namespace_is_optional_and_constrained() {
         // An older control plane sends no namespace; an older agent ignores it.
@@ -690,5 +1482,45 @@ mod tests {
             serde_json::from_slice::<BuildEvent>(&encoded).expect("deserialize event"),
             BuildEvent::Failure(_)
         ));
+    }
+}
+
+#[cfg(test)]
+mod build_limit_tests {
+    use super::BuildLimits;
+    #[test]
+    fn builder_limits_reject_zero_and_values_beyond_resource_bounds() {
+        assert!(BuildLimits::default().validate().is_ok());
+        for concurrency in [0, 33, u16::MAX] {
+            assert!(BuildLimits {
+                concurrency,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for queue_wait_seconds in [0, 1801, u32::MAX] {
+            assert!(BuildLimits {
+                queue_wait_seconds,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        for build_timeout_seconds in [0, 14401, u32::MAX] {
+            assert!(BuildLimits {
+                build_timeout_seconds,
+                ..Default::default()
+            }
+            .validate()
+            .is_err());
+        }
+        assert!(BuildLimits {
+            concurrency: 32,
+            queue_wait_seconds: 1800,
+            build_timeout_seconds: 14400
+        }
+        .validate()
+        .is_ok());
     }
 }

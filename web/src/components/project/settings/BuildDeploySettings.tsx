@@ -5,8 +5,10 @@ import { ProjectResponse } from '@/api/client'
 import { BuildSettings } from './GitSettings'
 import { DeployDefaultsCard } from './DeployDefaultsCard'
 import { DeploymentSourceCard } from './DeploymentSourceCard'
+import { HostingCard } from './HostingCard'
 import { EnvironmentPortOverrideCard } from './EnvironmentPortOverrideCard'
 import { ImageRetentionCard } from './ImageRetentionCard'
+import { LogIngestionCard } from './LogIngestionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
 import { ServiceTemplateRuntimeCard } from './ServiceTemplateRuntimeCard'
 
@@ -41,7 +43,10 @@ export function BuildDeploySettings({
     <div className="space-y-6">
       {active === 'source' && (
         <div className="space-y-6">
-          <DeploymentSourceCard project={project} refetch={refetch} />
+          <HostingCard project={project} refetch={refetch} />
+          {project.hosting !== 'external' && (
+            <DeploymentSourceCard project={project} refetch={refetch} />
+          )}
         </div>
       )}
 
@@ -60,6 +65,7 @@ export function BuildDeploySettings({
           <DeployDefaultsCard project={project} refetch={refetch} />
           <EnvironmentPortOverrideCard project={project} />
           <ImageRetentionCard project={project} refetch={refetch} />
+          <LogIngestionCard project={project} refetch={refetch} />
         </div>
       )}
 

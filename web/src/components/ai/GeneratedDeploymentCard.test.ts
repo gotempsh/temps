@@ -6,6 +6,9 @@ import type { DeploymentResponse } from '@/api/client'
 import {
   deploymentPollingInterval,
   deploymentReference,
+  deploymentStatusPresentation,
+  deploymentUrlNote,
+  isActiveDeploymentStatus,
   matchingDeployment,
 } from './deployment-card-state'
 
@@ -114,5 +117,51 @@ describe('deployment action presentation', () => {
       )
     ).toBe(false)
     expect(deploymentPollingInterval('proposed', null, null)).toBe(false)
+  })
+})
+
+describe('deployment status presentation', () => {
+  const label = (status: string) => deploymentStatusPresentation(status).label
+
+  test('a deployment a newer one replaced or stopped is finished, not queued', () => {
+    expect(label('superseded')).toBe('Replaced')
+    expect(label('stopped')).toBe('Stopped')
+    expect(isActiveDeploymentStatus('superseded')).toBe(false)
+    expect(isActiveDeploymentStatus('stopped')).toBe(false)
+  })
+
+  test('only a deployment that has not started reads Queued', () => {
+    expect(label('pending')).toBe('Queued')
+    for (const status of [
+      'creating',
+      'running',
+      'in_progress',
+      'built',
+      'ready',
+      'deploying',
+    ]) {
+      expect(label(status)).toBe('Deploying')
+      expect(isActiveDeploymentStatus(status)).toBe(true)
+    }
+  })
+
+  test('every successful state reads Ready', () => {
+    for (const status of ['completed', 'deployed', 'success']) {
+      expect(label(status)).toBe('Ready')
+    }
+  })
+
+  test('an unknown state is shown as the server named it', () => {
+    expect(label('rolling_back')).toBe('Rolling back')
+    expect(label('')).toBe('Unknown')
+  })
+
+  test('the URL of a deployment that is not serving is not promised as coming', () => {
+    expect(deploymentUrlNote('pending')).toBe('once live')
+    expect(deploymentUrlNote('running')).toBe('once live')
+    expect(deploymentUrlNote('stopped')).toBe('not serving')
+    expect(deploymentUrlNote('superseded')).toBe('not serving')
+    expect(deploymentUrlNote('failed')).toBe('not serving')
+    expect(deploymentUrlNote('completed')).toBeNull()
   })
 })

@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -164,19 +164,13 @@ impl Tabs {
             return Ok((existing, true));
         }
 
-        // Default env — replicates the shape session_manager gives the
-        // sandbox. Caller can override via the OPEN payload (tests on
-        // macOS need a minimal PATH + their own HOME).
-        let env = req.env.clone().unwrap_or_else(|| {
-            vec![
-                ("TERM".into(), "xterm-256color".into()),
-                (
-                    "PATH".into(),
-                    "/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into(),
-                ),
-                ("HOME".into(), std::env::var("HOME").unwrap_or_else(|_| "/home/temps".into())),
-            ]
-        });
+        // Caller can override via the OPEN payload (tests on macOS need a
+        // minimal PATH + their own HOME); otherwise the shell gets the
+        // sandbox's own environment, see `default_shell_env`.
+        let env = req
+            .env
+            .clone()
+            .unwrap_or_else(|| default_shell_env(std::env::vars()));
         let cwd = req.cwd.as_deref().unwrap_or("/workspace");
         let pty = spawn_pty(&req.cmd, cwd, &env, req.cols.max(1), req.rows.max(1))?;
         let Pty {
@@ -443,12 +437,71 @@ async fn send_error(
     let _ = write_json_frame(&mut *writer.lock().await, OP_ERROR, &payload).await;
 }
 
+/// How long the startup probe waits for an existing socket to accept.
+const LIVE_AGENT_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a startup connection attempt says about the socket path.
+#[derive(Debug, PartialEq, Eq)]
+enum SocketProbe {
+    /// A listener accepted: another agent is running.
+    Live,
+    /// Nothing answers (no file, or the connection was refused): stale.
+    Stale,
+    /// The connection neither completed nor failed within the deadline, or
+    /// the kernel said it would block: a listener exists but is not
+    /// accepting, so the socket is not provably stale.
+    Busy,
+}
+
+/// Classify a connection attempt to an existing socket, bounded by
+/// `deadline` so a listener that stopped accepting cannot hold startup.
+async fn probe_socket<F>(connect: F, deadline: Duration) -> SocketProbe
+where
+    F: std::future::Future<Output = io::Result<()>>,
+{
+    match tokio::time::timeout(deadline, connect).await {
+        Ok(Ok(())) => SocketProbe::Live,
+        Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => SocketProbe::Busy,
+        Ok(Err(_)) => SocketProbe::Stale,
+        Err(_) => SocketProbe::Busy,
+    }
+}
+
 /// Top-level: bind the Unix socket and accept forever. Returns only on bind
 /// error or explicit shutdown (SIGTERM from docker-init).
 pub async fn run(socket_path: &str) -> io::Result<()> {
-    // Clean stale socket from a previous run. Safe because the agent is
-    // the only process that binds here; if another instance is actually
-    // running, `bind` below will fail with EADDRINUSE which we surface.
+    // Refuse to displace a live agent. Removing the socket file and binding
+    // a new one would succeed even with another instance running, silently
+    // orphaning every tab it owns — a second `temps-pty-agent` started by a
+    // careless bootstrap must be a no-op, not an outage. Only a socket that
+    // nothing answers on is stale and safe to clear.
+    let probe = probe_socket(
+        async { UnixStream::connect(socket_path).await.map(drop) },
+        LIVE_AGENT_PROBE_TIMEOUT,
+    )
+    .await;
+    match probe {
+        SocketProbe::Stale => {}
+        SocketProbe::Live => {
+            return Err(io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("a temps-pty-agent is already listening on {socket_path}"),
+            ));
+        }
+        SocketProbe::Busy => {
+            // Something owns the socket but is not accepting right now (a
+            // full backlog, a stopped process). It is not provably stale, so
+            // it must not be displaced.
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "the socket {socket_path} did not accept a probe connection within {}s; \
+                     refusing to displace what may be a live temps-pty-agent",
+                    LIVE_AGENT_PROBE_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+    }
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)?;
     // 0600 — only the `temps` user should be able to connect. docker exec
@@ -470,13 +523,187 @@ pub async fn run(socket_path: &str) -> io::Result<()> {
     }
 }
 
-// PermissionsExt import sugar so the single use above reads clean.
-#[allow(unused_imports)]
-use std::os::unix::fs::PermissionsExt;
+/// `PATH` every terminal shell gets: the sandbox user's tool directories
+/// first, then the system ones. Pinned rather than inherited because the
+/// agent's own `PATH` can be the minimal one its supervisor started with.
+const SHELL_PATH: &str = "/home/temps/.local/bin:/home/temps/.bun/bin:/home/temps/.opencode/bin:/usr/local/bun/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// Variables the shell maintains itself; inheriting the agent's copies
+/// would start every tab with the agent's working directory and depth.
+const SHELL_OWNED_VARS: [&str; 4] = ["PWD", "OLDPWD", "SHLVL", "_"];
+
+/// Environment for a tab opened without an explicit `env`.
+///
+/// Starts from the agent's own environment, which is the sandbox
+/// container's: the egress proxy (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`
+/// and their lowercase forms) and the variables the sandbox owner set.
+/// Dropping those leaves a terminal where `curl`, `git clone` and
+/// `npm install` cannot reach the internet, because a managed sandbox
+/// network only routes outbound traffic through the proxy. `TERM` and
+/// `PATH` are then pinned, and `HOME` defaults to the sandbox user's.
+fn default_shell_env(
+    inherited: impl IntoIterator<Item = (String, String)>,
+) -> Vec<(String, String)> {
+    let mut env: Vec<(String, String)> = inherited
+        .into_iter()
+        .filter(|(key, _)| {
+            key != "TERM"
+                && key != "PATH"
+                && key != "GIT_TERMINAL_PROMPT"
+                && !SHELL_OWNED_VARS.contains(&key.as_str())
+        })
+        .collect();
+    if !env
+        .iter()
+        .any(|(key, value)| key == "HOME" && !value.is_empty())
+    {
+        env.retain(|(key, _)| key != "HOME");
+        env.push(("HOME".into(), "/home/temps".into()));
+    }
+    env.push(("TERM".into(), "xterm-256color".into()));
+    env.push(("PATH".into(), SHELL_PATH.into()));
+    // Also cover restored images whose baked environment predates this default.
+    env.push(("GIT_TERMINAL_PROMPT".into(), "0".into()));
+    env
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_git_never_prompts_even_when_inherited_environment_enables_it() {
+        for inherited in [vec![], vec![("GIT_TERMINAL_PROMPT".into(), "1".into())]] {
+            let env = default_shell_env(inherited);
+            let values: Vec<_> = env
+                .iter()
+                .filter(|(key, _)| key == "GIT_TERMINAL_PROMPT")
+                .collect();
+            assert_eq!(values.len(), 1);
+            assert_eq!(values[0].1, "0");
+        }
+    }
+
+    #[tokio::test]
+    async fn run_refuses_to_displace_a_live_agent() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let _live = tokio::net::UnixListener::bind(&path).expect("bind");
+
+        let err = run(&path.to_string_lossy())
+            .await
+            .expect_err("a second agent must not start");
+        assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
+        // The live listener's socket file must be untouched.
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_completes_is_busy_not_a_hang() {
+        let started = std::time::Instant::now();
+        let probe = probe_socket(
+            std::future::pending::<io::Result<()>>(),
+            Duration::from_millis(50),
+        )
+        .await;
+        assert_eq!(probe, SocketProbe::Busy);
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn probe_classifies_accept_refusal_and_would_block() {
+        let d = Duration::from_secs(5);
+        assert_eq!(probe_socket(async { Ok(()) }, d).await, SocketProbe::Live);
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::ConnectionRefused] {
+            assert_eq!(
+                probe_socket(async move { Err(io::Error::from(kind)) }, d).await,
+                SocketProbe::Stale,
+                "{kind:?}"
+            );
+        }
+        assert_eq!(
+            probe_socket(async { Err(io::Error::from(io::ErrorKind::WouldBlock)) }, d).await,
+            SocketProbe::Busy
+        );
+    }
+
+    #[tokio::test]
+    async fn probe_treats_a_dead_agents_leftover_socket_as_stale() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        // Bind then drop: the file remains but nothing listens on it.
+        drop(std::os::unix::net::UnixListener::bind(&path).expect("bind"));
+        assert!(path.exists());
+
+        // Other tests in this process spawn children, and a child forked
+        // just before `exec` still holds a copy of the closed listener's fd
+        // (CLOEXEC only takes effect at exec), so the socket keeps answering
+        // until that window closes. Wait it out rather than assume the close
+        // is instantaneous.
+        let mut probe = SocketProbe::Live;
+        for _ in 0..100 {
+            probe = probe_socket(
+                async { UnixStream::connect(&path).await.map(drop) },
+                LIVE_AGENT_PROBE_TIMEOUT,
+            )
+            .await;
+            if probe == SocketProbe::Stale {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(probe, SocketProbe::Stale);
+    }
+
+    /// A listener that never accepts, with its backlog full: on Linux a
+    /// blocking `connect(2)` to it waits for the peer forever. Startup must
+    /// still return, and must leave the occupied socket alone.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn run_does_not_hang_on_a_listener_with_a_full_backlog() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("agent.sock");
+        let wedged = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        // Shrink the backlog so the queue fills well inside the test's
+        // file-descriptor budget (std's default is the system maximum).
+        // SAFETY: `listen` on a descriptor `wedged` owns for this whole test.
+        let rc = unsafe { libc::listen(std::os::fd::AsRawFd::as_raw_fd(&wedged), 1) };
+        assert_eq!(rc, 0, "listen: {}", io::Error::last_os_error());
+
+        // Fill the accept queue; the kernel pushes back once it is full.
+        let mut held = Vec::new();
+        let mut saturated = false;
+        for _ in 0..64 {
+            match tokio::time::timeout(Duration::from_millis(200), UnixStream::connect(&path)).await
+            {
+                Ok(Ok(stream)) => held.push(stream),
+                Ok(Err(e)) if e.kind() == io::ErrorKind::WouldBlock => {
+                    saturated = true;
+                    break;
+                }
+                Ok(Err(e)) => panic!(
+                    "unexpected connect error after {} connects: {e}",
+                    held.len()
+                ),
+                Err(_) => {
+                    saturated = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saturated,
+            "the accept queue never filled after {} connects",
+            held.len()
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(20), run(&path.to_string_lossy()))
+            .await
+            .expect("startup must not hang on a listener that stopped accepting");
+        let err = result.expect_err("a wedged listener must not be displaced");
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert!(path.exists(), "the occupied socket file must be untouched");
+    }
 
     #[test]
     fn ring_push_and_tail_under_capacity() {
@@ -494,5 +721,64 @@ mod tests {
         let tail = r.tail(10);
         assert_eq!(tail.len(), 10);
         assert!(tail.iter().all(|&b| b == b'a'));
+    }
+
+    fn pairs(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn lookup<'a>(env: &'a [(String, String)], key: &str) -> Option<&'a str> {
+        env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn default_shell_env_keeps_the_sandbox_egress_proxy_and_owner_vars() {
+        let env = default_shell_env(pairs(&[
+            ("HTTP_PROXY", "http://temps-sandbox-egress-proxy:3128"),
+            ("https_proxy", "http://temps-sandbox-egress-proxy:3128"),
+            ("NO_PROXY", "localhost,127.0.0.1"),
+            ("DATABASE_URL", "postgres://db/app"),
+            ("HOME", "/home/temps"),
+        ]));
+        assert_eq!(
+            lookup(&env, "HTTP_PROXY"),
+            Some("http://temps-sandbox-egress-proxy:3128")
+        );
+        assert_eq!(
+            lookup(&env, "https_proxy"),
+            Some("http://temps-sandbox-egress-proxy:3128")
+        );
+        assert_eq!(lookup(&env, "NO_PROXY"), Some("localhost,127.0.0.1"));
+        assert_eq!(lookup(&env, "DATABASE_URL"), Some("postgres://db/app"));
+        assert_eq!(lookup(&env, "HOME"), Some("/home/temps"));
+    }
+
+    #[test]
+    fn default_shell_env_pins_term_and_path_over_the_inherited_ones() {
+        let env = default_shell_env(pairs(&[
+            ("PATH", "/usr/bin"),
+            ("TERM", "dumb"),
+            ("PWD", "/"),
+            ("SHLVL", "3"),
+        ]));
+        assert_eq!(lookup(&env, "PATH"), Some(SHELL_PATH));
+        assert_eq!(lookup(&env, "TERM"), Some("xterm-256color"));
+        assert_eq!(env.iter().filter(|(k, _)| k == "PATH").count(), 1);
+        assert_eq!(env.iter().filter(|(k, _)| k == "TERM").count(), 1);
+        assert_eq!(lookup(&env, "PWD"), None);
+        assert_eq!(lookup(&env, "SHLVL"), None);
+    }
+
+    #[test]
+    fn default_shell_env_defaults_a_missing_or_empty_home() {
+        let missing = default_shell_env(Vec::new());
+        assert_eq!(lookup(&missing, "HOME"), Some("/home/temps"));
+
+        let empty = default_shell_env(pairs(&[("HOME", "")]));
+        assert_eq!(lookup(&empty, "HOME"), Some("/home/temps"));
+        assert_eq!(empty.iter().filter(|(k, _)| k == "HOME").count(), 1);
     }
 }

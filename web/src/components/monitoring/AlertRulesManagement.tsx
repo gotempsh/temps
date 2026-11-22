@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   deleteAlertRuleMutation,
   listAlertRulesOptions,
@@ -28,6 +29,7 @@ import {
 } from '@/components/ui/select'
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -41,12 +43,12 @@ import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
-  { value: 'new_issue', label: 'New Issue' },
+  { value: 'new_issue', label: 'New issue' },
   { value: 'regression', label: 'Regression' },
   { value: 'frequency', label: 'Frequency' },
-  { value: 'new_user', label: 'New User Affected' },
-  { value: 'user_count', label: 'User Count' },
-  { value: 'status_change', label: 'Status Change' },
+  { value: 'new_user', label: 'New user affected' },
+  { value: 'user_count', label: 'User count' },
+  { value: 'status_change', label: 'Status change' },
 ] as const
 
 function triggerTypeLabel(type: string): string {
@@ -155,16 +157,23 @@ export function AlertRulesManagement({
     },
   })
 
-  const handleDelete = async (rule: AlertRuleResponse) => {
-    if (!projectId) return
-    await deleteMutation.mutateAsync({
-      path: { project_id: projectId, rule_id: rule.id },
+  const [ruleToDelete, setRuleToDelete] = useState<AlertRuleResponse | null>(
+    null
+  )
+
+  // `mutate`, not `mutateAsync`: a failed delete is reported by the mutation's
+  // error handler and must not also surface as an unhandled rejection.
+  const handleConfirmDelete = () => {
+    if (!projectId || !ruleToDelete) return
+    deleteMutation.mutate({
+      path: { project_id: projectId, rule_id: ruleToDelete.id },
     })
+    setRuleToDelete(null)
   }
 
-  const handleToggleEnabled = async (rule: AlertRuleResponse) => {
+  const handleToggleEnabled = (rule: AlertRuleResponse) => {
     if (!projectId) return
-    await updateMutation.mutateAsync({
+    updateMutation.mutate({
       path: { project_id: projectId, rule_id: rule.id },
       body: { enabled: !rule.enabled },
     })
@@ -180,13 +189,13 @@ export function AlertRulesManagement({
     return (
       <EmptyState
         icon={ShieldAlert}
-        title="No projects found"
-        description="Error alert rules belong to a project. Create one to configure them."
+        title="No services found"
+        description="Error alert rules belong to a service. Create one to configure them."
         action={
           <Button asChild>
             <Link to="/projects/new">
               <Plus className="h-4 w-4 mr-2" />
-              Create project
+              Create service
             </Link>
           </Button>
         }
@@ -196,51 +205,64 @@ export function AlertRulesManagement({
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h3 className="text-lg font-medium">Error Alert Rules</h3>
-          <p className="text-sm text-muted-foreground">
-            Configure rules that trigger notifications when errors match certain
-            conditions. Rules apply to one project
-            {selectedProject && !fixedProjectId ? (
-              <>
-                ; showing{' '}
-                <span className="font-medium text-foreground">
-                  {selectedProject.name}
-                </span>
-              </>
-            ) : null}
-            .
-          </p>
-        </div>
-        <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
-          {showProjectSelector && (
-            <Select
-              value={String(projectId)}
-              onValueChange={(v) => setSelectedProjectId(Number(v))}
-            >
-              <SelectTrigger
-                className="w-full sm:w-[200px]"
-                aria-label="Project"
+      {fixedProjectId ? (
+        <PageHeader
+          title="Error alerts"
+          description="Get notified when this service's errors match a rule: a new issue, a regression, a spike."
+          actions={
+            <CreateActionButton
+              onClick={() => navigateToRule('new')}
+              label="Add rule"
+            />
+          }
+        />
+      ) : (
+        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 className="text-lg font-medium">Error alert rules</h3>
+            <p className="text-sm text-muted-foreground">
+              Configure rules that trigger notifications when errors match
+              certain conditions. Rules apply to one project
+              {selectedProject && !fixedProjectId ? (
+                <>
+                  ; showing{' '}
+                  <span className="font-medium text-foreground">
+                    {selectedProject.name}
+                  </span>
+                </>
+              ) : null}
+              .
+            </p>
+          </div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            {showProjectSelector && (
+              <Select
+                value={String(projectId)}
+                onValueChange={(v) => setSelectedProjectId(Number(v))}
               >
-                <SelectValue placeholder="Select project" />
-              </SelectTrigger>
-              <SelectContent>
-                {projectList!.map((p) => (
-                  <SelectItem key={p.id} value={String(p.id)}>
-                    {p.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          )}
-          <CreateActionButton
-            onClick={() => navigateToRule('new')}
-            disabled={!projectId}
-            label="Add Rule"
-          />
+                <SelectTrigger
+                  className="w-full sm:w-[200px]"
+                  aria-label="Service"
+                >
+                  <SelectValue placeholder="Select service" />
+                </SelectTrigger>
+                <SelectContent>
+                  {projectList!.map((p) => (
+                    <SelectItem key={p.id} value={String(p.id)}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+            <CreateActionButton
+              onClick={() => navigateToRule('new')}
+              disabled={!projectId}
+              label="Add rule"
+            />
+          </div>
         </div>
-      </div>
+      )}
 
       {rulesLoading ? (
         <RulesGridSkeleton />
@@ -252,7 +274,7 @@ export function AlertRulesManagement({
           action={
             <Button onClick={() => navigateToRule('new')}>
               <Plus className="h-4 w-4 mr-2" />
-              Add Rule
+              Add rule
             </Button>
           }
         />
@@ -303,7 +325,7 @@ export function AlertRulesManagement({
                       <DropdownMenuSeparator />
                       <DropdownMenuItem
                         className="text-destructive"
-                        onClick={() => handleDelete(rule)}
+                        onClick={() => setRuleToDelete(rule)}
                       >
                         Delete
                       </DropdownMenuItem>
@@ -332,6 +354,16 @@ export function AlertRulesManagement({
           ))}
         </div>
       )}
+      <ConfirmDeleteDialog
+        open={ruleToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setRuleToDelete(null)
+        }}
+        resourceType="alert rule"
+        resourceName={ruleToDelete?.name ?? ''}
+        consequences="It will stop sending notifications immediately."
+        onConfirm={handleConfirmDelete}
+      />
     </div>
   )
 }

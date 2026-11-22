@@ -2,20 +2,27 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod agent;
+pub mod agent_ingress;
+pub mod agent_labels;
+pub mod agent_launchd;
 pub mod agent_service;
 pub mod api_key;
 mod api_url;
 pub mod backfill;
 pub mod backup;
+mod backup_restore_sql;
 pub mod build;
 pub mod ch_backfill_domains;
 pub mod cloud_telemetry_backfill;
+pub mod data_dir_discovery;
 pub mod deploy;
 pub mod doctor;
 pub mod domain;
 pub mod edge;
 pub mod firecracker;
+pub mod host_preflight;
 pub mod join;
+pub mod mac_worker;
 pub mod microsandbox;
 pub mod migrate;
 pub mod network;
@@ -28,6 +35,25 @@ pub mod serve;
 pub mod services;
 pub mod setup;
 pub mod upgrade;
+
+/// Value parser for boolean flags that can also be set from an environment
+/// variable (`TEMPS_DISABLE_SELF_UPDATE`, `TEMPS_PRE_MIGRATION_BACKUP`).
+///
+/// clap's default for a plain `bool` flag treats every unrecognised
+/// non-empty value as `true`, so `TEMPS_PRE_MIGRATION_BACKUP=disabled` would
+/// silently turn the feature *on*. These settings gate destructive or
+/// safety-critical behaviour, so anything that is not clearly a boolean is
+/// rejected at startup instead. An empty value counts as `false`, which is
+/// what `VAR=` and compose's `${VAR:-}` produce for "not set".
+pub(crate) fn parse_bool_setting(raw: &str) -> Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "0" | "false" | "no" | "off" | "n" | "f" => Ok(false),
+        "1" | "true" | "yes" | "on" | "y" | "t" => Ok(true),
+        _ => Err(format!(
+            "'{raw}' is not a boolean; use true or false (also accepted: 1, 0, yes, no, on, off)"
+        )),
+    }
+}
 
 pub use agent::AgentCommand;
 pub use api_key::ApiKeyCommand;
@@ -51,3 +77,5 @@ pub use serve::ServeCommand;
 pub use services::ServicesCommand;
 pub use setup::SetupCommand;
 pub use upgrade::UpgradeCommand;
+
+pub mod runner;

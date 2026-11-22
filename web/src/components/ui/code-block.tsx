@@ -3,9 +3,12 @@
 
 import { useEffect, useState } from 'react'
 import { Button } from '@/components/ui/button'
-import { Check, Copy, Hash, WrapText } from 'lucide-react'
+import { CopyButton } from '@/components/ui/copy-button'
+import { Hash, WrapText } from 'lucide-react'
 import { cn } from '@/lib/utils'
+import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 import type { HighlighterCore } from 'shiki/core'
+import { withReadableDarkComments } from './code-block-theme'
 
 /**
  * Languages this block can highlight.
@@ -97,7 +100,9 @@ async function getHighlighter(): Promise<HighlighterCore> {
       return createHighlighterCore({
         themes: [
           import('shiki/themes/github-light.mjs'),
-          import('shiki/themes/github-dark.mjs'),
+          import('shiki/themes/github-dark.mjs').then((module) =>
+            withReadableDarkComments(module.default)
+          ),
         ],
         langs: [],
         engine: createJavaScriptRegexEngine({ forgiving: true }),
@@ -139,6 +144,17 @@ async function highlight(
   )
 }
 
+/**
+ * On touch screens (no hover) the untitled block's controls are always
+ * visible, so they leave the corner and take their own row above the code.
+ */
+const TOUCH_TOOLBAR = cn(
+  '[@media(hover:none)]:static [@media(hover:none)]:self-end',
+  '[@media(hover:none)]:mt-2 [@media(hover:none)]:mr-2',
+  '[@media(hover:none)]:bg-transparent [@media(hover:none)]:backdrop-blur-none',
+  '[@media(hover:none)]:opacity-100'
+)
+
 export function CodeBlock({
   code,
   language = 'text',
@@ -149,18 +165,71 @@ export function CodeBlock({
   defaultShowLineNumbers = false,
   disableWrapToggle = false,
 }: CodeBlockProps) {
-  const [copied, setCopied] = useState(false)
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
 
-  const visibleButtonCount =
-    1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
+  // Long unwrapped lines scroll horizontally; make that scroller a tab stop
+  // (only while it overflows) so keyboard users can reach the rest of the line.
+  const { ref: scrollerRef, scrollable } = useScrollableRegion<HTMLDivElement>()
+  const scrollerProps = scrollableRegionProps(scrollable)
 
-  const handleCopy = async () => {
-    await navigator.clipboard.writeText(code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
-  }
+  const controls = (className: string) => (
+    <div className={cn('flex items-center gap-0.5', className)}>
+      <Button
+        size="icon"
+        variant="ghost"
+        className={cn(
+          'size-7 rounded-md',
+          'text-muted-foreground hover:text-foreground',
+          'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+        )}
+        onClick={() => setShowLineNumbers(!showLineNumbers)}
+        title={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
+        aria-label={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
+      >
+        <Hash
+          className={cn(
+            'size-3.5',
+            showLineNumbers && 'text-blue-500 dark:text-blue-400'
+          )}
+        />
+      </Button>
+      {!disableWrapToggle && (
+        <Button
+          size="icon"
+          variant="ghost"
+          className={cn(
+            'size-7 rounded-md',
+            'text-muted-foreground hover:text-foreground',
+            'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+          )}
+          onClick={() => setWrapLines(!wrapLines)}
+          title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+          aria-label={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
+        >
+          <WrapText
+            className={cn(
+              'size-3.5',
+              wrapLines && 'text-blue-500 dark:text-blue-400'
+            )}
+          />
+        </Button>
+      )}
+      {showCopy && (
+        // CopyButton falls back to a selection copy where the Clipboard API
+        // is missing (plain-http instances) and reports a failed copy.
+        <CopyButton
+          value={code}
+          label="Copy"
+          className={cn(
+            'size-7 rounded-md [&>svg]:size-3.5',
+            'text-muted-foreground hover:text-foreground',
+            'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
+          )}
+        />
+      )}
+    </div>
+  )
 
   return (
     // Container, header and type scale are lifted verbatim from the docs site's
@@ -170,36 +239,55 @@ export function CodeBlock({
     // temps.sh/docs or the console.
     <div
       className={cn(
-        'group overflow-hidden rounded-2xl bg-white shadow-md ring-1 ring-zinc-900/[0.075]',
+        'group group/code relative overflow-hidden rounded-2xl bg-white shadow-md ring-1 ring-zinc-900/[0.075]',
         'dark:bg-zinc-900 dark:ring-white/10',
         className
       )}
     >
       {title && (
-        <div className="flex h-9 items-center gap-2 border-b border-zinc-900/[0.075] bg-zinc-900/[0.025] px-4 font-mono text-xs text-muted-foreground dark:border-b-white/5 dark:bg-white/[0.01]">
-          {title}
+        // A titled block carries its controls in the title bar, so the code
+        // starts right under it instead of below an empty toolbar row.
+        <div className="flex h-9 items-center justify-between gap-2 border-b border-zinc-900/[0.075] bg-zinc-900/[0.025] pr-1 pl-4 font-mono text-xs text-muted-foreground dark:border-b-white/5 dark:bg-white/[0.01]">
+          <span className="min-w-0 truncate">{title}</span>
+          {controls('shrink-0')}
         </div>
       )}
       {/* The white/2.5 wash over zinc-900 is what gives the dark panel its
           slightly-lifted tone in the docs; without it the block reads as a
           flat hole in the page. */}
-      <div className="relative min-w-0 dark:bg-white/[0.025]">
+      <div className="flex min-w-0 flex-col dark:bg-white/[0.025]">
+        {/* Untitled blocks look like the docs: the code starts at the top and
+            the controls float in the corner, shown on hover or keyboard
+            focus. They sit on the panel colour so a long line never shows
+            through. Touch screens have no hover, so there the controls stay
+            visible in their own row above the code instead of covering its
+            first line. */}
+        {!title &&
+          controls(
+            cn(
+              'absolute top-2 right-2 z-10 rounded-lg bg-white/90 p-0.5 backdrop-blur-sm dark:bg-zinc-900/90',
+              'opacity-0 transition-opacity group-hover/code:opacity-100 group-focus-within/code:opacity-100',
+              TOUCH_TOOLBAR
+            )
+          )}
         <div
+          ref={scrollerRef}
+          {...scrollerProps}
           className={cn(
-            // w-0 min-w-full max-w-full is the trick: forces this element to
-            // parent width while letting its children overflow horizontally.
-            'w-0 min-w-full max-w-full py-4 pl-4',
-            visibleButtonCount === 3 && 'pr-28',
-            visibleButtonCount === 2 && 'pr-20',
-            visibleButtonCount === 1 && 'pr-12',
-            visibleButtonCount === 0 && 'pr-4',
+            'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring',
+            'min-w-0 w-full px-4 py-4',
+            // Under the touch toolbar row, the code needs less top padding.
+            !title && '[@media(hover:none)]:pt-1',
             wrapLines ? 'overflow-x-hidden' : 'overflow-x-auto'
           )}
         >
           <pre
             className={cn(
-              'm-0 font-mono text-[13px] leading-6 sm:text-xs',
-              wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
+              'm-0 font-mono text-[13px] leading-6',
+              // Wrap at spaces first; split a token only when it alone is too long.
+              wrapLines
+                ? 'whitespace-pre-wrap [overflow-wrap:anywhere]'
+                : 'whitespace-pre'
             )}
           >
             <HighlightedCode
@@ -208,70 +296,6 @@ export function CodeBlock({
               showLineNumbers={showLineNumbers}
             />
           </pre>
-        </div>
-        <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
-          <Button
-            size="icon"
-            variant="ghost"
-            className={cn(
-              'size-7 rounded-md',
-              'text-muted-foreground/70 hover:text-foreground',
-              'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-            )}
-            onClick={() => setShowLineNumbers(!showLineNumbers)}
-            title={showLineNumbers ? 'Hide line numbers' : 'Show line numbers'}
-            aria-label={
-              showLineNumbers ? 'Hide line numbers' : 'Show line numbers'
-            }
-          >
-            <Hash
-              className={cn(
-                'size-3.5',
-                showLineNumbers && 'text-blue-500 dark:text-blue-400'
-              )}
-            />
-          </Button>
-          {!disableWrapToggle && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className={cn(
-                'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
-                'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-              )}
-              onClick={() => setWrapLines(!wrapLines)}
-              title={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
-              aria-label={wrapLines ? 'Disable line wrap' : 'Enable line wrap'}
-            >
-              <WrapText
-                className={cn(
-                  'size-3.5',
-                  wrapLines && 'text-blue-500 dark:text-blue-400'
-                )}
-              />
-            </Button>
-          )}
-          {showCopy && (
-            <Button
-              size="icon"
-              variant="ghost"
-              className={cn(
-                'size-7 rounded-md',
-                'text-muted-foreground/70 hover:text-foreground',
-                'hover:bg-zinc-200/70 dark:hover:bg-zinc-800/60'
-              )}
-              onClick={handleCopy}
-              title={copied ? 'Copied' : 'Copy'}
-              aria-label={copied ? 'Copied' : 'Copy'}
-            >
-              {copied ? (
-                <Check className="size-3.5 text-emerald-600 dark:text-emerald-400" />
-              ) : (
-                <Copy className="size-3.5" />
-              )}
-            </Button>
-          )}
         </div>
       </div>
     </div>

@@ -114,7 +114,7 @@ export function CodeTabs({
                   dark
                     ? isActive
                       ? 'bg-white/10 text-white'
-                      : 'text-zinc-400 hover:text-zinc-100'
+                      : 'text-zinc-600 dark:text-zinc-400 hover:text-zinc-100'
                     : isActive
                       ? 'bg-muted text-foreground'
                       : 'text-muted-foreground hover:text-foreground'

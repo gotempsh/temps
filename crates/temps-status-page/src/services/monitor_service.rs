@@ -2,24 +2,23 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use futures::future::BoxFuture;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
     QueryFilter, QueryOrder, QuerySelect, Set,
 };
+use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::{Job, JobQueue, MonitorCreatedJob, UtcDateTime};
 use temps_entities::{environments, status_checks, status_monitors};
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
+use super::db_retry::with_db_retry;
 use super::types::{
     normalize_check_interval_seconds, validate_check_path, CreateMonitorRequest, MonitorResponse,
-    MonitorStatus, StatusCheckResponse, StatusPageError, UpdateMonitorRequest, UptimeDataPoint,
-    UptimeHistoryResponse, DEFAULT_CHECK_INTERVAL_SECS,
+    MonitorStatus, StatusBucket, StatusCheckResponse, StatusPageError, UpdateMonitorRequest,
+    UptimeDataPoint, UptimeHistoryResponse, DEFAULT_CHECK_INTERVAL_SECS,
 };
 
 const USER_CREATED_MONITOR_BOOTSTRAP_MESSAGE: &str =
@@ -32,6 +31,161 @@ fn monitor_url(public_url: &str, monitor_type: &str, check_path: Option<&str>) -
         Some(path) if !path.is_empty() => format!("{base}{path}"),
         _ if monitor_type == "health" => format!("{base}/health"),
         _ => public_url.to_string(),
+    }
+}
+
+/// Upper bound on the buckets one bucketed-status read may return. Every
+/// bucket of the range is materialised (empty ones as "unknown"), so the
+/// range/interval pair -- not the number of stored checks -- sets the
+/// response size. 2 000 covers a week of 5-minute buckets.
+const MAX_STATUS_BUCKETS: i64 = 2_000;
+
+/// Widest uptime history a caller can ask for.
+const MAX_UPTIME_HISTORY_DAYS: i32 = 366;
+
+/// Most checks one uptime history read loads into memory. Enough for 60 days
+/// at one check a minute.
+const MAX_UPTIME_HISTORY_POINTS: u64 = 100_000;
+
+/// Refuse a backwards or over-wide uptime range before querying it.
+fn validate_uptime_range(
+    monitor_id: i32,
+    start_time: UtcDateTime,
+    end_time: UtcDateTime,
+) -> Result<(), StatusPageError> {
+    if start_time > end_time {
+        return Err(StatusPageError::Validation(format!(
+            "start_time {start_time} is after end_time {end_time} for monitor {monitor_id}"
+        )));
+    }
+    if end_time - start_time > chrono::Duration::days(i64::from(MAX_UPTIME_HISTORY_DAYS)) {
+        return Err(StatusPageError::Validation(format!(
+            "The uptime range for monitor {monitor_id} can't span more than \
+             {MAX_UPTIME_HISTORY_DAYS} days"
+        )));
+    }
+    Ok(())
+}
+
+/// Bucket width in seconds for a bucketed-status `interval`, or `None` for an
+/// unsupported one. All widths divide a day, so they align with
+/// `time_bucket`'s default origin (a UTC midnight).
+fn bucket_step_secs(interval: &str) -> Option<i64> {
+    match interval {
+        "1min" => Some(60),
+        "5min" => Some(300),
+        "hourly" => Some(3_600),
+        "daily" => Some(86_400),
+        _ => None,
+    }
+}
+
+/// Overall status of one bucket. Priority: down > degraded > operational; a
+/// bucket with no checks at all is "unknown", never "operational".
+fn bucket_status(operational: i64, degraded: i64, down: i64) -> &'static str {
+    if down > 0 {
+        "down"
+    } else if degraded > 0 {
+        "degraded"
+    } else if operational > 0 {
+        "operational"
+    } else {
+        "unknown"
+    }
+}
+
+fn unknown_bucket(bucket_start: UtcDateTime) -> StatusBucket {
+    StatusBucket {
+        bucket_start,
+        status: "unknown".to_string(),
+        total_checks: 0,
+        operational_count: 0,
+        degraded_count: 0,
+        down_count: 0,
+        uptime_percentage: None,
+        avg_response_time_ms: None,
+        min_response_time_ms: None,
+        max_response_time_ms: None,
+        p50_response_time_ms: None,
+        p95_response_time_ms: None,
+        p99_response_time_ms: None,
+    }
+}
+
+/// Return one bucket per `step_secs` slot of `[start, end)`, taking the
+/// observed bucket where one exists and an "unknown" placeholder otherwise.
+///
+/// Slots are aligned to the Unix epoch, which is what `time_bucket` produces
+/// for these day-dividing widths. An observed bucket off that grid (it should
+/// not happen) is kept rather than dropped.
+fn fill_status_buckets(
+    observed: Vec<StatusBucket>,
+    start: UtcDateTime,
+    end: UtcDateTime,
+    step_secs: i64,
+) -> Vec<StatusBucket> {
+    let step = step_secs.max(1);
+    let mut by_start: BTreeMap<i64, StatusBucket> = observed
+        .into_iter()
+        .map(|bucket| (bucket.bucket_start.timestamp(), bucket))
+        .collect();
+    let end_secs = end.timestamp();
+    let mut slot = start.timestamp().div_euclid(step) * step;
+    while slot < end_secs {
+        if let Some(bucket_start) = chrono::DateTime::from_timestamp(slot, 0) {
+            by_start
+                .entry(slot)
+                .or_insert_with(|| unknown_bucket(bucket_start));
+        }
+        slot += step;
+    }
+    by_start.into_values().collect()
+}
+
+/// How long one check result keeps vouching for the endpoint.
+///
+/// Twice the configured interval, plus a minute for the scheduler's 15 s
+/// sweep and a probe's own retries (up to ~50 s against a hanging endpoint).
+/// Beyond that, the absence of the next check means Temps was not checking,
+/// and the time is unknown rather than "still up".
+fn coverage_grace_secs(check_interval_seconds: i32) -> i64 {
+    i64::from(normalize_check_interval_seconds(check_interval_seconds)) * 2 + 60
+}
+
+/// Time-weighted breakdown of one monitor's window, in seconds.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct UptimeCoverage {
+    /// Length of the (clamped) window.
+    window_secs: f64,
+    /// Seconds covered by any check result.
+    monitored_secs: f64,
+    /// Seconds covered by an operational check result.
+    up_secs: f64,
+}
+
+impl UptimeCoverage {
+    fn new(window_secs: f64, monitored_secs: f64, up_secs: f64) -> Self {
+        let window_secs = window_secs.max(0.0);
+        let monitored_secs = monitored_secs.clamp(0.0, window_secs);
+        Self {
+            window_secs,
+            monitored_secs,
+            up_secs: up_secs.clamp(0.0, monitored_secs),
+        }
+    }
+
+    /// Share of monitored time that was operational; `None` when nothing was
+    /// monitored, so "no data" is never reported as 100% (or 0%).
+    fn uptime_percentage(&self) -> Option<f64> {
+        (self.monitored_secs > 0.0).then(|| self.up_secs / self.monitored_secs * 100.0)
+    }
+
+    fn downtime_secs(&self) -> f64 {
+        self.monitored_secs - self.up_secs
+    }
+
+    fn unknown_secs(&self) -> f64 {
+        self.window_secs - self.monitored_secs
     }
 }
 
@@ -49,16 +203,22 @@ fn monitor_url(public_url: &str, monitor_type: &str, check_path: Option<&str>) -
 ///   (major_outage, or no check within a day); a monitor merely returning a
 ///   soft client error (degraded/partial_outage) does not paint the project
 ///   red -- see health_check_service.rs for the per-monitor statuses.
+/// - `no_address`: every deployed monitor's environment has no address
+///   anyone can reach (ADR 068 D4), so there is nothing to probe. Neutral,
+///   never `down`; such monitors are left out of the other tallies.
 /// - `degraded`: anything in between.
 fn project_monitor_status(
     monitor_count: i64,
     undeployed_count: i64,
     operational_count: i64,
     major_outage_count: i64,
+    no_address_count: i64,
 ) -> &'static str {
-    let checked = monitor_count - undeployed_count;
+    let checked = monitor_count - undeployed_count - no_address_count;
     if monitor_count == 0 {
         "no_monitors"
+    } else if checked <= 0 && no_address_count > 0 {
+        "no_address"
     } else if checked <= 0 {
         "not_deployed"
     } else if operational_count == checked {
@@ -67,6 +227,36 @@ fn project_monitor_status(
         "down"
     } else {
         "degraded"
+    }
+}
+
+// External failures retain precedence. A private worker is never declared
+// healthy from deployment readiness or an expired observation.
+fn runtime_monitor_status(
+    external: &str,
+    count: i64,
+    healthy: i64,
+    unhealthy: i64,
+) -> Option<&'static str> {
+    if external != "no_address" || count == 0 {
+        return None;
+    }
+    Some(if unhealthy > 0 {
+        "unhealthy"
+    } else if healthy == count {
+        "healthy"
+    } else {
+        "unknown"
+    })
+}
+
+fn worker_failure_detail(reason: &str) -> &'static str {
+    match reason {
+        "http_status_mismatch" => "The worker received an unexpected HTTP status.",
+        "connection_failed" => "The worker could not connect to the container's declared port.",
+        "probe_timeout" => "The worker's container health check timed out.",
+        "not_running" => "The worker reports that the container is not running.",
+        _ => "The worker's container health check failed.",
     }
 }
 
@@ -81,6 +271,14 @@ pub struct MonitorService {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
     job_queue: Option<Arc<dyn JobQueue>>,
+}
+
+/// Cut newest-first rows down to `limit`, saying whether any were left out.
+fn keep_newest_points<T>(rows: &mut Vec<T>, limit: u64) -> bool {
+    let limit = usize::try_from(limit).unwrap_or(usize::MAX);
+    let truncated = rows.len() > limit;
+    rows.truncate(limit);
+    truncated
 }
 
 impl MonitorService {
@@ -155,88 +353,6 @@ impl MonitorService {
             }
         }
         response
-    }
-
-    /// Execute a database operation with retry logic
-    async fn with_retry<F, T, E>(
-        operation_name: &str,
-        mut operation: F,
-    ) -> Result<T, StatusPageError>
-    where
-        F: FnMut() -> BoxFuture<'static, Result<T, E>>,
-        E: Into<sea_orm::DbErr> + std::fmt::Debug,
-    {
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 50;
-
-        let mut last_error = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = INITIAL_DELAY_MS * (2_u64.pow(attempt - 1));
-                debug!(
-                    "Retrying {} (attempt {}/{}), waiting {}ms",
-                    operation_name, attempt, MAX_RETRIES, delay
-                );
-                sleep(Duration::from_millis(delay)).await;
-            }
-
-            match operation().await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        debug!(
-                            "{} succeeded after {} attempts",
-                            operation_name,
-                            attempt + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    let db_err: sea_orm::DbErr = e.into();
-
-                    // Check if it's a transient error that we should retry
-                    let should_retry = match &db_err {
-                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
-                        sea_orm::DbErr::Query(runtime_err) => {
-                            let err_str = runtime_err.to_string();
-                            err_str.contains("deadlock")
-                                || err_str.contains("timeout")
-                                || err_str.contains("connection")
-                        }
-                        _ => false,
-                    };
-
-                    if should_retry && attempt < MAX_RETRIES {
-                        warn!(
-                            "{} failed (attempt {}), will retry: {:?}",
-                            operation_name,
-                            attempt + 1,
-                            db_err
-                        );
-                        last_error = Some(db_err);
-                        continue;
-                    }
-
-                    // Non-retryable error or final attempt
-                    error!(
-                        "{} failed after {} attempts: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        db_err
-                    );
-                    return Err(StatusPageError::Database(db_err));
-                }
-            }
-        }
-
-        // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "{} failed after all retry attempts",
-                operation_name
-            ))
-        })))
     }
 
     /// Create a default monitor for an environment if it doesn't exist
@@ -593,6 +709,15 @@ impl MonitorService {
         &self,
         project_ids: &[i32],
     ) -> Result<Vec<super::types::ProjectMonitorHealth>, StatusPageError> {
+        self.get_projects_monitor_health_for_environment(project_ids, None)
+            .await
+    }
+
+    pub async fn get_projects_monitor_health_for_environment(
+        &self,
+        project_ids: &[i32],
+        environment_id: Option<i32>,
+    ) -> Result<Vec<super::types::ProjectMonitorHealth>, StatusPageError> {
         use sea_orm::FromQueryResult;
 
         if project_ids.is_empty() {
@@ -620,6 +745,11 @@ impl MonitorService {
             .map(|(i, _)| format!("${}", i + 1))
             .collect();
         let placeholders_str = placeholders.join(", ");
+        let environment_filter = if environment_id.is_some() {
+            format!("e.id = ${}", project_ids.len() + 1)
+        } else {
+            "e.name = 'production'".to_string()
+        };
 
         #[derive(FromQueryResult)]
         struct ProjectHealth {
@@ -628,6 +758,11 @@ impl MonitorService {
             undeployed_count: i64,
             operational_count: i64,
             major_outage_count: i64,
+            no_address_count: i64,
+            runtime_count: i64,
+            runtime_healthy: i64,
+            runtime_unhealthy: i64,
+            runtime_reason: Option<String>,
         }
 
         // Single query: for each project, get latest check status of production monitors.
@@ -660,10 +795,18 @@ impl MonitorService {
                 COUNT(*) FILTER (
                     WHERE e.current_deployment_id IS NOT NULL
                       AND (lc.status = 'major_outage' OR lc.status IS NULL)
-                ) as major_outage_count
+                ) as major_outage_count,
+                COUNT(lc.status) FILTER (
+                    WHERE e.current_deployment_id IS NOT NULL AND lc.status = 'no_address'
+                ) as no_address_count,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker) AS runtime_count,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'healthy') AS runtime_healthy,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'unhealthy') AS runtime_unhealthy,
+                MIN(rh.reason) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'unhealthy') AS runtime_reason
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
-                AND e.name = 'production'
+                AND e.project_id = sm.project_id
+                AND {environment_filter}
                 AND e.deleted_at IS NULL
             LEFT JOIN LATERAL (
                 SELECT sc.status
@@ -673,6 +816,40 @@ impl MonitorService {
                 ORDER BY sc.checked_at DESC
                 LIMIT 1
             ) lc ON true
+            LEFT JOIN LATERAL (
+                SELECT
+                    EXISTS (SELECT 1 FROM deployment_containers c
+                        WHERE c.deployment_id = e.current_deployment_id
+                          AND c.deleted_at IS NULL AND c.node_id IS NOT NULL) AS has_worker,
+                    CASE WHEN h.enabled AND NOT h.paused AND NOT e.sleeping
+                        AND h.valid_until > NOW() AND h.revision_id = r.id
+                        AND r.configuration->>'unavailable_reason' IS NULL
+                        AND EXISTS (SELECT 1 FROM runtime_health_assignments a
+                            WHERE a.revision_id = r.id AND a.retired_at IS NULL)
+                        AND NOT EXISTS (SELECT 1 FROM deployment_containers c
+                            WHERE c.deployment_id = d.id AND c.deleted_at IS NULL
+                              AND NOT EXISTS (SELECT 1 FROM runtime_health_assignments a
+                                WHERE a.container_record_id = c.id AND a.revision_id = r.id AND a.retired_at IS NULL))
+                        AND NOT EXISTS (
+                            SELECT 1 FROM runtime_health_assignments a
+                            JOIN deployment_containers c ON c.id = a.container_record_id
+                            WHERE a.revision_id = r.id AND a.retired_at IS NULL
+                              AND (a.valid_until IS NULL OR a.valid_until <= NOW()
+                                OR a.lease_until IS NULL OR a.lease_until <= NOW()
+                                OR a.observed_at > h.accounted_at
+                                OR c.deleted_at IS NOT NULL OR c.status = 'stopped'
+                                OR c.node_id IS DISTINCT FROM a.node_id))
+                        THEN h.state ELSE 'unknown' END AS state,
+                    (SELECT MIN(a.reason) FROM runtime_health_assignments a
+                        WHERE a.revision_id = r.id AND a.retired_at IS NULL
+                          AND a.state = 'unhealthy' AND a.valid_until > NOW()
+                          AND a.lease_until > NOW()) AS reason
+                FROM deployments d
+                LEFT JOIN runtime_health_revisions r ON r.deployment_id = d.id
+                    AND r.environment_id = e.id AND r.project_id = e.project_id
+                LEFT JOIN runtime_health_environments h ON h.environment_id = e.id
+                WHERE d.id = e.current_deployment_id AND d.state IN ('completed', 'deployed')
+            ) rh ON lc.status = 'no_address'
             WHERE sm.project_id IN ({placeholders})
               AND sm.is_active = true
             GROUP BY sm.project_id
@@ -681,7 +858,10 @@ impl MonitorService {
         );
 
         let db_backend = sea_orm::DatabaseBackend::Postgres;
-        let values: Vec<sea_orm::Value> = project_ids.iter().map(|&id| id.into()).collect();
+        let mut values: Vec<sea_orm::Value> = project_ids.iter().map(|&id| id.into()).collect();
+        if let Some(id) = environment_id {
+            values.push(id.into());
+        }
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
 
         let results = status_monitors::Entity::find()
@@ -699,6 +879,7 @@ impl MonitorService {
                 r.undeployed_count,
                 r.operational_count,
                 r.major_outage_count,
+                r.no_address_count,
             );
 
             health_map.insert(
@@ -706,6 +887,18 @@ impl MonitorService {
                 super::types::ProjectMonitorHealth {
                     project_id: r.project_id,
                     status: status.to_string(),
+                    runtime_status: runtime_monitor_status(
+                        status,
+                        r.runtime_count,
+                        r.runtime_healthy,
+                        r.runtime_unhealthy,
+                    )
+                    .map(str::to_string),
+                    runtime_reason: r
+                        .runtime_reason
+                        .as_deref()
+                        .map(worker_failure_detail)
+                        .map(str::to_string),
                 },
             );
         }
@@ -719,6 +912,8 @@ impl MonitorService {
                     .unwrap_or(super::types::ProjectMonitorHealth {
                         project_id: id,
                         status: "no_monitors".to_string(),
+                        runtime_status: None,
+                        runtime_reason: None,
                     })
             })
             .collect();
@@ -808,7 +1003,7 @@ impl MonitorService {
 
         let db = self.db.clone();
 
-        let result = Self::with_retry(&format!("record_check for monitor {}", monitor_id), || {
+        let result = with_db_retry(&format!("record_check for monitor {}", monitor_id), || {
             let check = check.clone();
             let db = db.clone();
             Box::pin(async move { check.insert(db.as_ref()).await })
@@ -839,45 +1034,42 @@ impl MonitorService {
         days: Option<i32>,
     ) -> Result<UptimeHistoryResponse, StatusPageError> {
         let days = days.unwrap_or(60);
-        let start_date = Utc::now() - chrono::Duration::days(days as i64);
-
-        let checks = status_checks::Entity::find()
-            .filter(status_checks::Column::MonitorId.eq(monitor_id))
-            .filter(status_checks::Column::CheckedAt.gte(start_date))
-            .order_by_asc(status_checks::Column::CheckedAt)
-            .all(self.db.as_ref())
-            .await?;
-
-        let uptime_data = checks
-            .into_iter()
-            .map(|check| UptimeDataPoint {
-                timestamp: check.checked_at,
-                status: check.status,
-                response_time_ms: check.response_time_ms,
-                error_message: check.error_message,
-            })
-            .collect();
-
-        Ok(UptimeHistoryResponse {
-            monitor_id,
-            uptime_data,
-        })
+        if !(1..=MAX_UPTIME_HISTORY_DAYS).contains(&days) {
+            return Err(StatusPageError::Validation(format!(
+                "days must be between 1 and {MAX_UPTIME_HISTORY_DAYS} for monitor {monitor_id}, \
+                 got {days}"
+            )));
+        }
+        let end_time = Utc::now();
+        let start_time = end_time - chrono::Duration::days(i64::from(days));
+        self.get_uptime_history_range(monitor_id, start_time, end_time)
+            .await
     }
 
     /// Get uptime history for a monitor within a specific time range
+    ///
+    /// Bounded twice, because this loads rows into memory: the range can't span
+    /// more than [`MAX_UPTIME_HISTORY_DAYS`], and at most
+    /// [`MAX_UPTIME_HISTORY_POINTS`] of the newest checks in it are returned, with
+    /// `truncated` set when that left older ones out.
     pub async fn get_uptime_history_range(
         &self,
         monitor_id: i32,
         start_time: UtcDateTime,
         end_time: UtcDateTime,
     ) -> Result<UptimeHistoryResponse, StatusPageError> {
-        let checks = status_checks::Entity::find()
+        validate_uptime_range(monitor_id, start_time, end_time)?;
+
+        let mut checks = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_time))
             .filter(status_checks::Column::CheckedAt.lte(end_time))
-            .order_by_asc(status_checks::Column::CheckedAt)
+            .order_by_desc(status_checks::Column::CheckedAt)
+            .limit(MAX_UPTIME_HISTORY_POINTS + 1)
             .all(self.db.as_ref())
             .await?;
+        let truncated = keep_newest_points(&mut checks, MAX_UPTIME_HISTORY_POINTS);
+        checks.reverse();
 
         let uptime_data = checks
             .into_iter()
@@ -892,57 +1084,125 @@ impl MonitorService {
         Ok(UptimeHistoryResponse {
             monitor_id,
             uptime_data,
+            truncated,
         })
     }
 
-    /// Calculate uptime percentage for a monitor
+    /// Time-weighted uptime for `monitor` over `[start_time, end_time)`.
+    ///
+    /// Each check result vouches for the endpoint from the moment it was
+    /// taken until the next check, but never for longer than
+    /// [`coverage_grace_secs`]. Time no check vouches for -- the Temps server
+    /// or its scheduler was down, the deployment was paused, the monitor did
+    /// not exist yet -- is *unknown*, and is reported separately instead of
+    /// being silently folded into "up". Counting check rows instead (the old
+    /// `operational / total`) made a three-hour hole with no rows look like
+    /// 100% uptime, because the missing checks were never in the denominator.
+    ///
+    /// The window is clamped to the monitor's creation time and to now, so a
+    /// freshly created monitor (or a range ending in the future) does not
+    /// report the time before it existed as unknown.
+    ///
+    /// Aggregated in SQL with one window function, so memory stays constant
+    /// regardless of how many checks the window holds.
+    async fn uptime_coverage(
+        &self,
+        monitor: &status_monitors::Model,
+        start_time: UtcDateTime,
+        end_time: UtcDateTime,
+    ) -> Result<UptimeCoverage, StatusPageError> {
+        let start = start_time.max(monitor.created_at);
+        let end = end_time.min(Utc::now());
+        if end <= start {
+            return Ok(UptimeCoverage::default());
+        }
+        let window_secs = (end - start).num_milliseconds() as f64 / 1000.0;
+        let grace_secs = coverage_grace_secs(monitor.check_interval_seconds) as f64;
+
+        #[derive(FromQueryResult)]
+        struct CoverageRow {
+            up_secs: f64,
+            monitored_secs: f64,
+        }
+
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row (and a retired background-worker marker), which say nothing
+        // about whether the endpoint answered. The lower bound reaches back one
+        // grace period so the check taken just before `start` covers the start
+        // of the window.
+        let row = CoverageRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            r#"
+            WITH checks AS (
+                SELECT
+                    status,
+                    checked_at,
+                    LEAD(checked_at) OVER (ORDER BY checked_at) AS next_at
+                FROM status_checks
+                WHERE monitor_id = $1
+                  AND checked_at >= $2 - make_interval(secs => $4)
+                  AND checked_at < $3
+                  AND status != 'unknown'
+                  -- ADR 068: nobody could reach the environment, so nothing
+                  -- was monitored; neither up nor down.
+                  AND status != 'no_address'
+            ),
+            spans AS (
+                SELECT
+                    status,
+                    EXTRACT(EPOCH FROM (
+                        LEAST(COALESCE(next_at, $3), checked_at + make_interval(secs => $4), $3)
+                        - GREATEST(checked_at, $2)
+                    ))::float8 AS secs
+                FROM checks
+            )
+            SELECT
+                COALESCE(SUM(secs) FILTER (WHERE secs > 0 AND status = 'operational'), 0)::float8 AS up_secs,
+                COALESCE(SUM(secs) FILTER (WHERE secs > 0), 0)::float8 AS monitored_secs
+            FROM spans
+            "#,
+            vec![
+                monitor.id.into(),
+                start.into(),
+                end.into(),
+                grace_secs.into(),
+            ],
+        ))
+        .one(self.db.as_ref())
+        .await?;
+
+        let (up_secs, monitored_secs) = row
+            .map(|r| (r.up_secs, r.monitored_secs))
+            .unwrap_or((0.0, 0.0));
+        Ok(UptimeCoverage::new(window_secs, monitored_secs, up_secs))
+    }
+
+    async fn find_monitor_model(
+        &self,
+        monitor_id: i32,
+    ) -> Result<status_monitors::Model, StatusPageError> {
+        status_monitors::Entity::find_by_id(monitor_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(StatusPageError::NotFound)
+    }
+
+    /// Time-weighted uptime percentage for a monitor over the last `days`
+    /// (default 30). `None` when no check covered any of that time.
     pub async fn calculate_uptime(
         &self,
         monitor_id: i32,
         days: Option<i32>,
-    ) -> Result<f64, StatusPageError> {
+    ) -> Result<Option<f64>, StatusPageError> {
         let days = days.unwrap_or(30);
-        let start_date = Utc::now() - chrono::Duration::days(days as i64);
-
-        #[derive(FromQueryResult)]
-        struct UptimeStats {
-            total_checks: i64,
-            successful_checks: i64,
-        }
-
-        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
-        // row ("Monitor created - awaiting first health check") from the
-        // denominator -- without it, a monitor with a 100% real pass rate
-        // still reports <100% uptime for as long as that placeholder row
-        // stays within the window, since it counts toward total_checks but
-        // never toward successful_checks.
-        let stats = status_checks::Entity::find()
-            .filter(status_checks::Column::MonitorId.eq(monitor_id))
-            .filter(status_checks::Column::CheckedAt.gte(start_date))
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                r#"
-                SELECT
-                    COUNT(*) as total_checks,
-                    COUNT(*) FILTER (WHERE status = 'operational') as successful_checks
-                FROM status_checks
-                WHERE monitor_id = $1 AND checked_at >= $2 AND status != 'unknown'
-                "#,
-                vec![monitor_id.into(), start_date.into()],
-            ))
-            .into_model::<UptimeStats>()
-            .one(self.db.as_ref())
-            .await?;
-
-        if let Some(stats) = stats {
-            if stats.total_checks > 0 {
-                return Ok((stats.successful_checks as f64 / stats.total_checks as f64) * 100.0);
-            }
-        }
-
-        Ok(100.0) // Default to 100% if no checks
+        let monitor = self.find_monitor_model(monitor_id).await?;
+        let end = Utc::now();
+        let start = end - chrono::Duration::days(days as i64);
+        Ok(self
+            .uptime_coverage(&monitor, start, end)
+            .await?
+            .uptime_percentage())
     }
-
     /// Get monitor status with uptime and performance metrics
     pub async fn get_monitor_status(
         &self,
@@ -1005,7 +1265,12 @@ impl MonitorService {
         Ok(result.and_then(|r| r.avg_time.map(|t| t as i32)))
     }
 
-    /// Get bucketed status data by querying raw status_checks table with dynamic bucketing
+    /// Get bucketed status data by querying raw status_checks table with dynamic bucketing.
+    ///
+    /// Every bucket of `[start_time, end_time)` is returned. A bucket no check
+    /// landed in comes back as `"unknown"` with zero checks -- skipping it (as
+    /// a plain `GROUP BY` does) let the remaining buckets stretch across the
+    /// timeline, so hours without any check rendered as solid green.
     pub async fn get_bucketed_status(
         &self,
         monitor_id: i32,
@@ -1030,17 +1295,23 @@ impl MonitorService {
             p99_response_time_ms: Option<f64>,     // PERCENTILE_CONT returns DOUBLE PRECISION
         }
 
-        let bucket_interval = match interval {
-            "1min" => "1 minute",
-            "5min" => "5 minutes",
-            "hourly" => "1 hour",
-            "daily" => "1 day",
-            _ => {
-                return Err(StatusPageError::Validation(
-                    "Invalid interval. Must be '5min', 'hourly', or 'daily'".to_string(),
-                ))
-            }
+        let Some(step_secs) = bucket_step_secs(interval) else {
+            return Err(StatusPageError::Validation(format!(
+                "Invalid interval '{interval}' for monitor {monitor_id}. Must be '1min', '5min', 'hourly', or 'daily'"
+            )));
         };
+        if end_time <= start_time {
+            return Err(StatusPageError::Validation(format!(
+                "start_time ({start_time}) must be before end_time ({end_time}) for monitor {monitor_id}"
+            )));
+        }
+        let span_secs = (end_time - start_time).num_seconds();
+        let bucket_count = temps_core::time_window::bucket_count(span_secs, step_secs);
+        if bucket_count > MAX_STATUS_BUCKETS {
+            return Err(StatusPageError::Validation(format!(
+                "A {interval} interval over {span_secs}s yields {bucket_count} buckets for monitor {monitor_id}, above the {MAX_STATUS_BUCKETS}-bucket limit. Use a coarser interval or a shorter range"
+            )));
+        }
 
         let query = format!(
             r#"
@@ -1058,7 +1329,7 @@ impl MonitorService {
                 p99_response_time_ms
             FROM (
                 SELECT
-                    time_bucket('{}', checked_at) AS bucket,
+                    time_bucket(make_interval(secs => {step_secs}), checked_at) AS bucket,
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as operational_count,
                     -- health_check_service.rs writes 'partial_outage'/'major_outage' for
@@ -1078,13 +1349,13 @@ impl MonitorService {
                   AND checked_at >= $2
                   AND checked_at < $3
                   -- excludes create_monitor's synthetic bootstrap row -- see
-                  -- get_current_status_for_timeframe's identical comment.
+                  -- uptime_coverage's identical comment.
                   AND status != 'unknown'
+                  AND status != 'no_address'
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
-            "#,
-            bucket_interval
+            "#
         );
 
         let results = status_checks::Entity::find()
@@ -1097,161 +1368,50 @@ impl MonitorService {
             .all(self.db.as_ref())
             .await?;
 
-        let buckets = results
+        let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
+        let observed = results
             .into_iter()
-            .map(|r| {
-                let decimal_to_f64 =
-                    |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
-
-                // Determine overall status for this bucket
-                // Priority: down > degraded > operational
-                let status = if r.down_count > 0 {
-                    "down".to_string()
-                } else if r.degraded_count > 0 {
-                    "degraded".to_string()
-                } else if r.operational_count > 0 {
-                    "operational".to_string()
-                } else {
-                    "unknown".to_string()
-                };
-
-                super::types::StatusBucket {
-                    bucket_start: r.bucket,
-                    status,
-                    total_checks: r.total_checks,
-                    operational_count: r.operational_count,
-                    degraded_count: r.degraded_count,
-                    down_count: r.down_count,
-                    uptime_percentage: if r.total_checks > 0 {
-                        (r.operational_count as f64 / r.total_checks as f64) * 100.0
-                    } else {
-                        0.0
-                    },
-                    avg_response_time_ms: r.avg_response_time_ms.and_then(decimal_to_f64),
-                    min_response_time_ms: r.min_response_time_ms.map(|v| v as f64),
-                    max_response_time_ms: r.max_response_time_ms.map(|v| v as f64),
-                    p50_response_time_ms: r.p50_response_time_ms,
-                    p95_response_time_ms: r.p95_response_time_ms,
-                    p99_response_time_ms: r.p99_response_time_ms,
-                }
+            .map(|r| super::types::StatusBucket {
+                bucket_start: r.bucket,
+                status: bucket_status(r.operational_count, r.degraded_count, r.down_count)
+                    .to_string(),
+                total_checks: r.total_checks,
+                operational_count: r.operational_count,
+                degraded_count: r.degraded_count,
+                down_count: r.down_count,
+                uptime_percentage: (r.total_checks > 0)
+                    .then(|| (r.operational_count as f64 / r.total_checks as f64) * 100.0),
+                avg_response_time_ms: r.avg_response_time_ms.and_then(decimal_to_f64),
+                min_response_time_ms: r.min_response_time_ms.map(|v| v as f64),
+                max_response_time_ms: r.max_response_time_ms.map(|v| v as f64),
+                p50_response_time_ms: r.p50_response_time_ms,
+                p95_response_time_ms: r.p95_response_time_ms,
+                p99_response_time_ms: r.p99_response_time_ms,
             })
             .collect();
 
         Ok(super::types::StatusBucketedResponse {
             monitor_id,
             interval: interval.to_string(),
-            buckets,
+            buckets: fill_status_buckets(observed, start_time, end_time, step_secs),
         })
     }
 
-    /// Get current status and uptime metrics for a monitor (defaults to 24h)
+    /// Get current status and uptime metrics for a monitor over the last 24h.
     pub async fn get_current_status(
         &self,
         monitor_id: i32,
     ) -> Result<super::types::CurrentStatusResponse, StatusPageError> {
-        // Default to 24 hours
-        self.get_current_status_for_timeframe(monitor_id, "24h")
-            .await
-    }
-
-    /// Get current status for a specific timeframe
-    async fn get_current_status_for_timeframe(
-        &self,
-        monitor_id: i32,
-        timeframe: &str,
-    ) -> Result<super::types::CurrentStatusResponse, StatusPageError> {
-        use sea_orm::prelude::Decimal;
-
-        #[derive(FromQueryResult)]
-        struct UptimeStats {
-            uptime: Option<f64>,
-            avg_response_time: Option<Decimal>,
-            last_check_status: Option<String>,
-            last_check_at: Option<UtcDateTime>,
-        }
-
-        // Determine interval based on timeframe
-        let interval = match timeframe {
-            "24h" => "24 hours",
-            "7d" => "7 days",
-            "30d" => "30 days",
-            _ => "24 hours", // Default
-        };
-
-        // Query to calculate uptime percentage and current status.
-        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
-        // row from both the uptime denominator and the "latest status" pick --
-        // without it, a monitor with a 100% real pass rate still reports
-        // <100% uptime for as long as that placeholder row stays in the window.
-        let query = format!(
-            r#"
-            WITH recent_checks AS (
-                SELECT
-                    status,
-                    response_time_ms,
-                    checked_at,
-                    ROW_NUMBER() OVER (ORDER BY checked_at DESC) as rn
-                FROM status_checks
-                WHERE monitor_id = $1
-                    AND checked_at >= NOW() - INTERVAL '{}'
-                    AND status != 'unknown'
-            ),
-            stats AS (
-                SELECT
-                    (COUNT(*) FILTER (WHERE status = 'operational')::float /
-                     NULLIF(COUNT(*), 0)::float * 100) as uptime,
-                    AVG(response_time_ms) as avg_response_time
-                FROM recent_checks
-            ),
-            latest AS (
-                SELECT status, checked_at
-                FROM recent_checks
-                WHERE rn = 1
-            )
-            SELECT
-                COALESCE(s.uptime, 0) as uptime,
-                s.avg_response_time,
-                l.status as last_check_status,
-                l.checked_at as last_check_at
-            FROM stats s
-            CROSS JOIN latest l
-            "#,
-            interval
-        );
-
-        let result = status_checks::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                &query,
-                vec![monitor_id.into()],
-            ))
-            .into_model::<UptimeStats>()
-            .one(self.db.as_ref())
-            .await?;
-
-        let stats = result.unwrap_or(UptimeStats {
-            uptime: Some(0.0),
-            avg_response_time: None,
-            last_check_status: None,
-            last_check_at: None,
-        });
-
-        let current_status = stats
-            .last_check_status
-            .unwrap_or_else(|| "unknown".to_string());
-
-        let decimal_to_f64 = |d: Decimal| -> Option<f64> { d.to_string().parse::<f64>().ok() };
-
-        Ok(super::types::CurrentStatusResponse {
+        let end_time = Utc::now();
+        self.get_current_status_with_timeframes(
             monitor_id,
-            current_status,
-            uptime_percentage: stats.uptime.unwrap_or(0.0),
-            avg_response_time_ms: stats.avg_response_time.and_then(decimal_to_f64),
-            last_check_at: stats.last_check_at,
-        })
+            end_time - chrono::Duration::hours(24),
+            end_time,
+        )
+        .await
     }
 
-    /// Get current status with custom time range or specific timeframe
+    /// Get current status and uptime metrics for a custom time range.
     pub async fn get_current_status_with_timeframes(
         &self,
         monitor_id: i32,
@@ -1261,18 +1421,16 @@ impl MonitorService {
         use sea_orm::prelude::Decimal;
 
         #[derive(FromQueryResult)]
-        struct UptimeStats {
-            uptime: Option<f64>,
+        struct LatestStats {
             avg_response_time: Option<Decimal>,
             last_check_status: Option<String>,
             last_check_at: Option<UtcDateTime>,
         }
 
-        // If custom time range provided, use it.
-        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
-        // row from both the uptime denominator and the "latest status" pick --
-        // see get_current_status_for_timeframe's identical comment.
+        let monitor = self.find_monitor_model(monitor_id).await?;
 
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row from the "latest status" pick -- see uptime_coverage's comment.
         let query = r#"
             WITH recent_checks AS (
                 SELECT
@@ -1287,10 +1445,7 @@ impl MonitorService {
                     AND status != 'unknown'
             ),
             stats AS (
-                SELECT
-                    (COUNT(*) FILTER (WHERE status = 'operational')::float /
-                        NULLIF(COUNT(*), 0)::float * 100) as uptime,
-                    AVG(response_time_ms) as avg_response_time
+                SELECT AVG(response_time_ms) as avg_response_time
                 FROM recent_checks
             ),
             latest AS (
@@ -1299,7 +1454,6 @@ impl MonitorService {
                 WHERE rn = 1
             )
             SELECT
-                COALESCE(s.uptime, 0) as uptime,
                 s.avg_response_time,
                 l.status as last_check_status,
                 l.checked_at as last_check_at
@@ -1307,22 +1461,20 @@ impl MonitorService {
             CROSS JOIN latest l
         "#;
 
-        let result = status_checks::Entity::find()
-            .from_raw_sql(sea_orm::Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                query,
-                vec![monitor_id.into(), start_time.into(), end_time.into()],
-            ))
-            .into_model::<UptimeStats>()
-            .one(self.db.as_ref())
-            .await?;
-
-        let stats = result.unwrap_or(UptimeStats {
-            uptime: Some(0.0),
+        let stats = LatestStats::find_by_statement(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            query,
+            vec![monitor_id.into(), start_time.into(), end_time.into()],
+        ))
+        .one(self.db.as_ref())
+        .await?
+        .unwrap_or(LatestStats {
             avg_response_time: None,
             last_check_status: None,
             last_check_at: None,
         });
+
+        let coverage = self.uptime_coverage(&monitor, start_time, end_time).await?;
 
         let current_status = stats
             .last_check_status
@@ -1333,9 +1485,12 @@ impl MonitorService {
         Ok(super::types::CurrentStatusResponse {
             monitor_id,
             current_status,
-            uptime_percentage: stats.uptime.unwrap_or(0.0),
+            uptime_percentage: coverage.uptime_percentage(),
             avg_response_time_ms: stats.avg_response_time.and_then(decimal_to_f64),
             last_check_at: stats.last_check_at,
+            monitored_seconds: coverage.monitored_secs.round() as i64,
+            downtime_seconds: coverage.downtime_secs().round() as i64,
+            unknown_seconds: coverage.unknown_secs().round() as i64,
         })
     }
 }
@@ -1343,9 +1498,51 @@ impl MonitorService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_range_with_more_checks_than_fit_says_so_and_keeps_the_newest() {
+        let mut rows = vec![3, 2, 1];
+        assert!(keep_newest_points(&mut rows, 2));
+        assert_eq!(rows, vec![3, 2]);
+        assert!(!keep_newest_points(&mut rows, 2));
+        assert_eq!(rows, vec![3, 2]);
+    }
+
+    #[test]
+    fn uptime_range_refuses_backwards_and_over_wide_ranges() {
+        let end = Utc::now();
+        let widest = chrono::Duration::days(i64::from(MAX_UPTIME_HISTORY_DAYS));
+
+        assert!(validate_uptime_range(7, end - widest, end).is_ok());
+        assert!(validate_uptime_range(7, end, end).is_ok());
+
+        let backwards = validate_uptime_range(7, end, end - chrono::Duration::seconds(1));
+        assert!(
+            matches!(backwards, Err(StatusPageError::Validation(m)) if m.contains("monitor 7"))
+        );
+        let too_wide = validate_uptime_range(7, end - widest - chrono::Duration::days(1), end);
+        assert!(matches!(too_wide, Err(StatusPageError::Validation(m)) if m.contains("monitor 7")));
+    }
+
+    #[tokio::test]
+    async fn uptime_history_refuses_days_out_of_range_without_panicking() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        // No query results are configured: these must be refused before any
+        // date arithmetic or database call.
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        for days in [i32::MAX, i32::MIN, -1, 0, MAX_UPTIME_HISTORY_DAYS + 1] {
+            let result = service.get_uptime_history(7, Some(days)).await;
+            assert!(
+                matches!(result, Err(StatusPageError::Validation(ref m)) if m.contains(&days.to_string())),
+                "days={days}"
+            );
+        }
+    }
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests
@@ -1411,6 +1608,12 @@ mod tests {
             is_active: true,
             is_managed: true,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: now,
             updated_at: now,
         }
@@ -2243,6 +2446,286 @@ mod tests {
         assert_eq!(monitor1.id, monitor2.id);
     }
 
+    // --- gaps and failed checks ------------------------------------------
+
+    fn ts(secs: i64) -> UtcDateTime {
+        chrono::DateTime::from_timestamp(secs, 0).unwrap()
+    }
+
+    fn observed_bucket(start: i64, operational: i64, down: i64) -> StatusBucket {
+        StatusBucket {
+            status: bucket_status(operational, 0, down).to_string(),
+            total_checks: operational + down,
+            operational_count: operational,
+            down_count: down,
+            uptime_percentage: Some(operational as f64 / (operational + down) as f64 * 100.0),
+            ..unknown_bucket(ts(start))
+        }
+    }
+
+    #[test]
+    fn bucket_without_checks_is_unknown_not_operational() {
+        assert_eq!(bucket_status(0, 0, 0), "unknown");
+        assert_eq!(bucket_status(5, 0, 0), "operational");
+        assert_eq!(bucket_status(5, 1, 0), "degraded");
+        assert_eq!(bucket_status(5, 1, 1), "down");
+    }
+
+    #[test]
+    fn fill_status_buckets_materialises_a_three_hour_gap() {
+        // 24 hourly slots starting at an hour boundary; hours 10..13 have no rows.
+        let start = 1_760_000_400; // divisible by 3600
+        let observed: Vec<_> = (0..24)
+            .filter(|h| !(10..13).contains(h))
+            .map(|h| observed_bucket(start + h * 3_600, 60, 0))
+            .collect();
+        assert_eq!(observed.len(), 21);
+
+        let filled = fill_status_buckets(observed, ts(start), ts(start + 24 * 3_600), 3_600);
+
+        assert_eq!(filled.len(), 24, "every hour of the range is returned");
+        for (h, bucket) in filled.iter().enumerate() {
+            assert_eq!(bucket.bucket_start, ts(start + h as i64 * 3_600));
+            if (10..13).contains(&h) {
+                assert_eq!(bucket.status, "unknown", "hour {h}");
+                assert_eq!(bucket.total_checks, 0);
+                assert_eq!(bucket.uptime_percentage, None);
+            } else {
+                assert_eq!(bucket.status, "operational", "hour {h}");
+            }
+        }
+    }
+
+    #[test]
+    fn fill_status_buckets_aligns_an_unaligned_range_and_handles_no_data() {
+        // 10:37 -> 12:05 covers the 10:00, 11:00 and 12:00 slots.
+        let hour = 1_760_000_400;
+        let filled = fill_status_buckets(
+            Vec::new(),
+            ts(hour + 37 * 60),
+            ts(hour + 2 * 3_600 + 5 * 60),
+            3_600,
+        );
+        let starts: Vec<_> = filled.iter().map(|b| b.bucket_start).collect();
+        assert_eq!(starts, vec![ts(hour), ts(hour + 3_600), ts(hour + 7_200)]);
+        assert!(filled.iter().all(|b| b.status == "unknown"));
+    }
+
+    #[test]
+    fn uptime_coverage_excludes_unknown_time_and_never_reports_no_data_as_up() {
+        let none = UptimeCoverage::new(86_400.0, 0.0, 0.0);
+        assert_eq!(none.uptime_percentage(), None);
+        assert_eq!(none.unknown_secs(), 86_400.0);
+
+        let gap = UptimeCoverage::new(86_400.0, 75_600.0, 75_600.0);
+        assert_eq!(gap.uptime_percentage(), Some(100.0));
+        assert_eq!(gap.unknown_secs(), 10_800.0);
+
+        let outage = UptimeCoverage::new(86_400.0, 86_400.0, 75_600.0);
+        assert_eq!(outage.uptime_percentage(), Some(87.5));
+        assert_eq!(outage.downtime_secs(), 10_800.0);
+    }
+
+    #[test]
+    fn coverage_grace_scales_with_the_check_interval() {
+        assert_eq!(coverage_grace_secs(60), 180);
+        assert_eq!(coverage_grace_secs(300), 660);
+        // Garbage intervals use the scheduler's normalised value.
+        assert_eq!(
+            coverage_grace_secs(0),
+            i64::from(DEFAULT_CHECK_INTERVAL_SECS) * 2 + 60
+        );
+    }
+
+    /// A monitor whose row says it was created `created_at`, so the window
+    /// under test is not clamped away. Returns the monitor id.
+    async fn create_backdated_monitor(
+        db: &Arc<DatabaseConnection>,
+        created_at: UtcDateTime,
+    ) -> i32 {
+        let project = create_test_project(db).await;
+        let environment = create_test_environment(db, project.id).await;
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("Gap test monitor".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        status_monitors::Entity::update_many()
+            .col_expr(status_monitors::Column::CreatedAt, Expr::value(created_at))
+            .filter(status_monitors::Column::Id.eq(monitor.id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        monitor.id
+    }
+
+    /// One check per minute over `[start, start + 24h)`; minutes for which
+    /// `status_at` returns `None` get no row at all.
+    async fn insert_minutely_checks(
+        db: &Arc<DatabaseConnection>,
+        monitor_id: i32,
+        start: UtcDateTime,
+        status_at: impl Fn(i64) -> Option<&'static str>,
+    ) {
+        let rows: Vec<_> = (0..1_440)
+            .filter_map(|minute| {
+                status_at(minute).map(|status| status_checks::ActiveModel {
+                    monitor_id: Set(monitor_id),
+                    status: Set(status.to_string()),
+                    response_time_ms: Set(Some(42)),
+                    checked_at: Set(start + chrono::Duration::minutes(minute)),
+                    ..Default::default()
+                })
+            })
+            .collect();
+        for chunk in rows.chunks(500) {
+            status_checks::Entity::insert_many(chunk.to_vec())
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+        }
+    }
+
+    /// An hour-aligned 24h window that ended before now, so nothing clamps it.
+    fn past_day_window() -> (UtcDateTime, UtcDateTime) {
+        let now = Utc::now().timestamp();
+        let end = ts(now.div_euclid(3_600) * 3_600 - 3_600);
+        (end - chrono::Duration::hours(24), end)
+    }
+
+    const GAP_MINUTES: std::ops::Range<i64> = 600..780; // hours 10, 11, 12
+
+    #[tokio::test]
+    async fn three_hours_without_checks_is_unknown_not_uptime() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_day_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        // Temps itself was down for three hours: no rows at all.
+        insert_minutely_checks(&db, monitor_id, start, |m| {
+            (!GAP_MINUTES.contains(&m)).then_some("operational")
+        })
+        .await;
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        // The last check before the gap (minute 599) vouches for one grace
+        // period (180s) instead of its usual 60s, so 120s of the three-hour
+        // hole count as monitored and the rest is unknown.
+        assert_eq!(status.unknown_seconds, 3 * 3_600 - 120);
+        assert_eq!(status.monitored_seconds, 86_400 - status.unknown_seconds);
+        assert_eq!(status.downtime_seconds, 0);
+        assert_eq!(status.uptime_percentage, Some(100.0));
+
+        let buckets = service
+            .get_bucketed_status(monitor_id, "hourly", start, end)
+            .await
+            .unwrap()
+            .buckets;
+        assert_eq!(buckets.len(), 24, "gap hours must not be dropped");
+        for (hour, bucket) in buckets.iter().enumerate() {
+            let expected = if (10..13).contains(&hour) {
+                "unknown"
+            } else {
+                "operational"
+            };
+            assert_eq!(bucket.status, expected, "hour {hour}");
+        }
+        assert_eq!(buckets[11].total_checks, 0);
+    }
+
+    #[tokio::test]
+    async fn three_hours_of_failed_checks_count_as_downtime() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_day_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        // Temps was up and probing, the site was not: connection refused /
+        // timeouts / 5xx are all persisted as major_outage.
+        insert_minutely_checks(&db, monitor_id, start, |m| {
+            Some(if GAP_MINUTES.contains(&m) {
+                "major_outage"
+            } else {
+                "operational"
+            })
+        })
+        .await;
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.unknown_seconds, 0);
+        assert_eq!(status.downtime_seconds, 3 * 3_600);
+        assert_eq!(status.uptime_percentage, Some(87.5));
+
+        let buckets = service
+            .get_bucketed_status(monitor_id, "hourly", start, end)
+            .await
+            .unwrap()
+            .buckets;
+        assert_eq!(buckets.len(), 24);
+        assert_eq!(buckets[10].status, "down");
+        assert_eq!(buckets[10].down_count, 60);
+        assert_eq!(buckets[10].uptime_percentage, Some(0.0));
+        assert_eq!(buckets[9].status, "operational");
+    }
+
+    #[tokio::test]
+    async fn monitor_with_no_checks_reports_no_uptime_and_unknown_buckets() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_day_window();
+        let monitor_id = create_backdated_monitor(&db, start).await;
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.uptime_percentage, None);
+        assert_eq!(status.unknown_seconds, 86_400);
+        assert_eq!(
+            service
+                .calculate_uptime(monitor_id, Some(30))
+                .await
+                .unwrap(),
+            None
+        );
+
+        let buckets = service
+            .get_bucketed_status(monitor_id, "hourly", start, end)
+            .await
+            .unwrap()
+            .buckets;
+        assert_eq!(buckets.len(), 24);
+        assert!(buckets.iter().all(|b| b.status == "unknown"));
+    }
+
+    #[tokio::test]
+    async fn bucketed_status_rejects_ranges_with_too_many_buckets() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let end = Utc::now();
+        let err = service
+            .get_bucketed_status(7, "1min", end - chrono::Duration::days(7), end)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StatusPageError::Validation(ref m) if m.contains("monitor 7")));
+    }
+
     #[tokio::test]
     async fn test_get_current_status() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
@@ -2267,7 +2750,7 @@ mod tests {
         let status = service.get_current_status(monitor.id).await.unwrap();
         assert_eq!(status.monitor_id, monitor.id);
         assert_eq!(status.current_status, "unknown");
-        assert_eq!(status.uptime_percentage, 0.0);
+        assert_eq!(status.uptime_percentage, None);
     }
 
     #[tokio::test]
@@ -2453,34 +2936,66 @@ mod tests {
     fn never_deployed_project_is_not_deployed_rather_than_down() {
         // One managed production monitor, environment never deployed: the
         // checker skips it, so there is no check row at all.
-        assert_eq!(project_monitor_status(1, 1, 0, 0), "not_deployed");
+        assert_eq!(project_monitor_status(1, 1, 0, 0, 0), "not_deployed");
     }
 
     #[test]
     fn project_without_monitors_is_no_monitors() {
-        assert_eq!(project_monitor_status(0, 0, 0, 0), "no_monitors");
+        assert_eq!(project_monitor_status(0, 0, 0, 0, 0), "no_monitors");
     }
 
     #[test]
     fn deployed_project_with_all_checks_passing_is_operational() {
-        assert_eq!(project_monitor_status(1, 0, 1, 0), "operational");
+        assert_eq!(project_monitor_status(1, 0, 1, 0, 0), "operational");
     }
 
     #[test]
     fn deployed_project_with_all_checks_failing_is_down() {
-        assert_eq!(project_monitor_status(2, 0, 0, 2), "down");
+        assert_eq!(project_monitor_status(2, 0, 0, 2, 0), "down");
     }
 
     /// An undeployed monitor alongside a healthy deployed one must not drag
     /// the project to "degraded".
     #[test]
     fn undeployed_monitors_do_not_count_against_deployed_ones() {
-        assert_eq!(project_monitor_status(2, 1, 1, 0), "operational");
-        assert_eq!(project_monitor_status(2, 1, 0, 1), "down");
+        assert_eq!(project_monitor_status(2, 1, 1, 0, 0), "operational");
+        assert_eq!(project_monitor_status(2, 1, 0, 1, 0), "down");
     }
 
     #[test]
     fn mixed_results_are_degraded() {
-        assert_eq!(project_monitor_status(3, 0, 1, 1), "degraded");
+        assert_eq!(project_monitor_status(3, 0, 1, 1, 0), "degraded");
+    }
+
+    /// ADR 068 D4: a monitor with nothing to probe is grey, never down, and
+    /// never drags a checked one down.
+    #[test]
+    fn no_address_is_neutral() {
+        assert_eq!(project_monitor_status(1, 0, 0, 0, 1), "no_address");
+        assert_eq!(project_monitor_status(2, 1, 0, 0, 1), "no_address");
+        assert_eq!(project_monitor_status(2, 0, 1, 0, 1), "operational");
+        assert_eq!(project_monitor_status(2, 0, 0, 1, 1), "down");
+    }
+}
+
+#[cfg(test)]
+mod worker_runtime_status_tests {
+    use super::runtime_monitor_status;
+    #[test]
+    fn only_fresh_worker_health_answers_when_external_uptime_has_no_address() {
+        assert_eq!(
+            runtime_monitor_status("no_address", 1, 1, 0),
+            Some("healthy")
+        );
+        assert_eq!(
+            runtime_monitor_status("no_address", 2, 1, 1),
+            Some("unhealthy")
+        );
+        assert_eq!(
+            runtime_monitor_status("no_address", 2, 1, 0),
+            Some("unknown")
+        );
+        assert_eq!(runtime_monitor_status("down", 1, 1, 0), None);
+        assert_eq!(runtime_monitor_status("no_address", 0, 0, 0), None);
     }
 }

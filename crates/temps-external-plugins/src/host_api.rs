@@ -20,7 +20,7 @@
 //!   `permission_guard!` runs, against the real acting user, and its audit
 //!   log is written where every other write is logged.
 //! - **No new credential.** Identity arrives as an actor token the platform
-//!   itself minted (see [`temps_core::external_plugin::actor`]), not as an
+//!   itself minted (see [`crate::actor`]), not as an
 //!   API key the plugin holds.
 //!
 //! ## Why this injects `AuthContext` rather than replaying a session
@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::actor::{verify_plugin_actor_token, ActorPrincipal};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -46,12 +47,11 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::{Permission, Role};
 use temps_auth::UserService;
-use temps_core::external_plugin::actor::{verify_plugin_actor_token, ActorPrincipal};
-use temps_core::external_plugin::channel::{
+use temps_core::CookieCrypto;
+use temps_plugin_protocol::channel::{
     ApiCall, ApiCallResult, CallBody, ChannelError, ChannelErrorCode, JsonBody, MultipartPart,
     PartContent, VerifiedPluginApiCaller, MAX_CALL_BODY_BYTES,
 };
-use temps_core::CookieCrypto;
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
@@ -264,13 +264,32 @@ impl RouterHostApi {
                     (Some(role), None)
                 };
 
+                // Same owner ceiling `ApiKeyService::validate_api_key` applies:
+                // a key never exceeds what its owner holds right now.
+                let owner_role = temps_auth::current_owner_role(self.db.as_ref(), user_id)
+                    .await
+                    .map_err(|e| {
+                        ChannelError::new(
+                            ChannelErrorCode::Internal,
+                            format!(
+                                "Failed to resolve the current role of user {user_id} while \
+                                 redeeming an actor token for API key {key_id} for plugin \
+                                 '{plugin}': {e}"
+                            ),
+                        )
+                    })?;
+                let (role, permissions) =
+                    temps_auth::cap_api_key_grant(role, permissions, &owner_role);
+
                 Ok(AuthContext::new_api_key(
                     user,
                     role,
                     permissions,
                     key.name,
                     key.id,
-                ))
+                ).with_api_key_scope(temps_auth::context::ApiKeyScope::from_ids(key.project_id, key.environment_id)
+                    .map_err(|error| ChannelError::new(ChannelErrorCode::Unauthenticated,
+                        format!("API key {key_id} has an invalid resource scope for plugin '{plugin}': {error}")))?))
             }
         }
     }
@@ -496,11 +515,11 @@ impl HostApiBridge for RouterHostApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{encode_plugin_actor_token, PLUGIN_ACTOR_TOKEN_TTL};
     use chrono::{Duration as ChronoDuration, Utc};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_auth::context::AuthSource;
-    use temps_core::external_plugin::actor::{encode_plugin_actor_token, PLUGIN_ACTOR_TOKEN_TTL};
-    use temps_core::external_plugin::channel::{ActorToken, BinaryPayload, HttpMethod};
+    use temps_plugin_protocol::channel::{ActorToken, BinaryPayload, HttpMethod};
 
     const TEST_PLUGIN: &str = "security-test-plugin";
 
@@ -544,12 +563,15 @@ mod tests {
             mfa_pending: false,
             step_up_expires_at: None,
             mfa_pending_origin: None,
+            mfa_failed_attempts: 0,
         }
     }
 
     fn api_key(expires_at: Option<chrono::DateTime<Utc>>) -> temps_entities::api_keys::Model {
         let now = Utc::now();
         temps_entities::api_keys::Model {
+            project_id: None,
+            environment_id: None,
             id: 9,
             name: "restricted-plugin-key".to_string(),
             key_hash: "hash".to_string(),
@@ -571,7 +593,13 @@ mod tests {
         crypto: Arc<CookieCrypto>,
     ) -> (RouterHostApi, Arc<DatabaseConnection>) {
         let db = Arc::new(db);
-        let users = Arc::new(UserService::new(db.clone()));
+        let users = Arc::new(UserService::new(
+            db.clone(),
+            Arc::new(
+                temps_core::EncryptionService::new(&"7a".repeat(32))
+                    .expect("fixed test key must be valid"),
+            ),
+        ));
         (
             RouterHostApi::new(Router::new(), db.clone(), crypto, users),
             db,
@@ -772,12 +800,21 @@ mod tests {
         }
     }
 
+    /// Result row for the owner's current admin-grant count.
+    fn owner_admin_grants(count: i64) -> std::collections::BTreeMap<String, sea_orm::Value> {
+        std::collections::BTreeMap::from([(
+            "num_items".to_string(),
+            sea_orm::Value::BigInt(Some(count)),
+        )])
+    }
+
     #[tokio::test]
     async fn valid_restricted_api_key_reconstructs_narrowed_permissions() {
         let crypto = crypto();
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![user()]])
             .append_query_results([vec![api_key(None)]])
+            .append_query_results([vec![owner_admin_grants(0)]])
             .into_connection();
         let (api, db) = api_with_database(db, crypto.clone());
         let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
@@ -799,6 +836,30 @@ mod tests {
         drop(api);
         let sql = transaction_sql(db);
         assert!(sql.contains("\"api_keys\".\"is_active\" ="), "{sql}");
+    }
+
+    #[tokio::test]
+    async fn admin_api_key_is_capped_once_its_owner_is_no_longer_admin() {
+        let crypto = crypto();
+        let mut key = api_key(None);
+        key.role_type = "admin".to_string();
+        key.permissions = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![user()]])
+            .append_query_results([vec![key]])
+            .append_query_results([vec![owner_admin_grants(0)]])
+            .into_connection();
+        let (api, _db) = api_with_database(db, crypto.clone());
+        let call = actor_call(crypto.as_ref(), ActorPrincipal::ApiKey { key_id: 9 });
+
+        let auth = api
+            .resolve_actor(TEST_PLUGIN, &call)
+            .await
+            .expect("the key still resolves to its owner");
+
+        assert_eq!(auth.user_id_opt(), Some(42));
+        assert_ne!(auth.effective_role, Role::Admin);
+        assert!(!auth.has_permission(&Permission::UsersWrite));
     }
 
     #[tokio::test]

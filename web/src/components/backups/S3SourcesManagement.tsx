@@ -4,28 +4,26 @@
 'use client'
 
 import { Checkbox } from '@/components/ui/checkbox'
+import {
+  S3EndpointPreviewLine,
+  S3PathStyleField,
+} from '@/components/backups/S3EndpointHints'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteS3SourceMutation,
   listS3SourcesOptions,
+  listS3SourcesQueryKey,
   runBackupForSourceMutation,
   updateS3SourceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { S3SourceResponse } from '@/api/client/types.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Dialog,
   DialogContent,
@@ -39,7 +37,10 @@ import { Label } from '@/components/ui/label'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { setDefaultS3Source, testS3SourceConnection } from '@/lib/s3-sources'
 import { cn } from '@/lib/utils'
-import { shouldShowS3SourceHeaderAction } from '@/lib/s3-source-presentation'
+import {
+  shouldShowS3SourceHeaderAction,
+  type WorkerCredentialsPolicy,
+} from '@/lib/s3-source-presentation'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   CheckCircle2,
@@ -73,6 +74,7 @@ interface NewS3Source {
   secret_key: string
   endpoint?: string
   force_path_style?: boolean
+  worker_credentials?: WorkerCredentialsPolicy
 }
 
 interface S3SourceFormProps {
@@ -106,7 +108,7 @@ function S3SourceForm({
     <>
       <div className="grid gap-4 py-4">
         <div className="grid gap-2">
-          <Label htmlFor="name">Source Name</Label>
+          <Label htmlFor="name">Source name</Label>
           <Input
             id="name"
             placeholder="Backup Storage"
@@ -115,7 +117,7 @@ function S3SourceForm({
           />
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="bucket">Bucket Name</Label>
+          <Label htmlFor="bucket">Bucket name</Label>
           <Input
             id="bucket"
             placeholder="my-backups"
@@ -154,29 +156,48 @@ function S3SourceForm({
               setFormData({ ...formData, endpoint: e.target.value })
             }
           />
+          <S3EndpointPreviewLine endpoint={formData.endpoint} />
+        </div>
+        <div className="grid gap-2">
+          <S3PathStyleField
+            id="forcePathStyle"
+            endpoint={formData.endpoint}
+            checked={formData.force_path_style || false}
+            onCheckedChange={(checked) =>
+              setFormData({ ...formData, force_path_style: checked })
+            }
+          />
         </div>
         <div className="grid gap-2">
           <Label
-            htmlFor="forcePathStyle"
-            className="flex items-center space-x-2"
+            htmlFor="allowFullWorkerCredentials"
+            className="flex items-start space-x-2"
           >
             <Checkbox
-              id="forcePathStyle"
-              checked={formData.force_path_style || false}
+              id="allowFullWorkerCredentials"
+              checked={formData.worker_credentials === 'allow_full'}
               onCheckedChange={(checked) =>
-                setFormData({ ...formData, force_path_style: checked === true })
+                setFormData({
+                  ...formData,
+                  worker_credentials:
+                    checked === true ? 'allow_full' : 'scoped',
+                })
               }
             />
             <div>
-              <span>Force Path Style</span>
+              <span>Allow full credentials on worker nodes</span>
               <p className="text-xs text-muted-foreground">
-                Enable for RustFS/MinIO compatibility
+                Worker nodes get a credential limited to one service&rsquo;s
+                prefix for each backup or restore. If this store cannot mint
+                one, the job is refused. Allowing full credentials sends this
+                source&rsquo;s own key instead, so a worker node could read
+                and delete every backup in the bucket.
               </p>
             </div>
           </Label>
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="accessKeyId">Access Key ID</Label>
+          <Label htmlFor="accessKeyId">Access key ID</Label>
           <Input
             id="accessKeyId"
             type="password"
@@ -188,7 +209,7 @@ function S3SourceForm({
           />
         </div>
         <div className="grid gap-2">
-          <Label htmlFor="secretKey">Secret Key</Label>
+          <Label htmlFor="secretKey">Secret key</Label>
           <Input
             id="secretKey"
             type="password"
@@ -330,6 +351,7 @@ export function S3SourcesManagement() {
       secret_key: '',
       endpoint: source.endpoint || undefined,
       force_path_style: source.force_path_style || undefined,
+      worker_credentials: source.worker_credentials,
     })
     setIsEditDialogOpen(true)
   }
@@ -352,26 +374,31 @@ export function S3SourcesManagement() {
         title="Backups"
         description="Configure where backups and WAL archives are stored"
         actions={
-          shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
-            <CreateActionButton
-              to="/backups/s3-sources/new"
-              label="Add S3 Source"
-              className="w-full sm:w-auto"
+          <>
+            <RefreshButton
+              queryKeys={[queryKeyPrefix(listS3SourcesQueryKey)]}
             />
-          ) : null
+            {shouldShowS3SourceHeaderAction(isLoading, sources.length) ? (
+              <CreateActionButton
+                to="/backups/s3-sources/new"
+                label="Add S3 source"
+                className="w-full sm:w-auto"
+              />
+            ) : null}
+          </>
         }
       />
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit S3 Source</DialogTitle>
+            <DialogTitle>Edit S3 source</DialogTitle>
           </DialogHeader>
           <S3SourceForm
             source={selectedSource || {}}
             onSubmit={handleUpdateSource}
             isSubmitting={updateMutation.isPending}
-            submitLabel="Save Changes"
+            submitLabel="Save"
           />
         </DialogContent>
       </Dialog>
@@ -461,7 +488,7 @@ export function S3SourcesManagement() {
             <Button asChild>
               <Link to="/backups/s3-sources/new">
                 <Plus className="mr-2 h-4 w-4" />
-                Add S3 Source
+                Add S3 source
               </Link>
             </Button>
           }
@@ -514,7 +541,7 @@ export function S3SourcesManagement() {
                           {isManagedByCloud && (
                             <Badge
                               variant="outline"
-                              className="gap-1 border-sky-400/40 text-sky-600 dark:text-sky-300"
+                              className="gap-1 border-sky-400/40 text-sky-700 dark:text-sky-300"
                             >
                               <Cloud className="size-3 fill-current" />
                               Managed by Temps Cloud
@@ -620,51 +647,18 @@ export function S3SourcesManagement() {
         </div>
       )}
 
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={sourceToDelete !== null}
         onOpenChange={(open) => {
-          if (!open && !deleteMutation.isPending) {
-            setSourceToDelete(null)
-          }
+          if (!open) setSourceToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete S3 source?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This will remove
-              {sourceToDelete ? (
-                <>
-                  {' '}
-                  <span className="font-medium text-foreground">
-                    {sourceToDelete.name}
-                  </span>{' '}
-                  (<code>{sourceToDelete.bucket_name}</code>)
-                </>
-              ) : null}{' '}
-              from Temps. Backup schedules pointing at this source will fail on
-              their next run, and services that rely on it for WAL archiving
-              will stop shipping new data until reconfigured. Objects already in
-              the bucket will not be deleted. This action cannot be undone.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={deleteMutation.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              onClick={(e) => {
-                e.preventDefault()
-                confirmDeleteSource()
-              }}
-              disabled={deleteMutation.isPending}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-            >
-              {deleteMutation.isPending ? 'Deleting...' : 'Delete source'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="S3 source"
+        resourceName={sourceToDelete?.name ?? ''}
+        confirmLabel="Delete source"
+        consequences={`Removes it (bucket ${sourceToDelete?.bucket_name ?? ''}) from Temps. Backup schedules pointing at this source will fail on their next run, and services that rely on it for WAL archiving will stop shipping new data until reconfigured. Objects already in the bucket will not be deleted.`}
+        isPending={deleteMutation.isPending}
+        onConfirm={confirmDeleteSource}
+      />
     </div>
   )
 }

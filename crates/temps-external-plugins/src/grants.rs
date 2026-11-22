@@ -6,7 +6,7 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::external_plugin::channel::{PluginActorInfo, PluginHostPermission};
+use temps_plugin_protocol::channel::{PluginActorInfo, PluginHostPermission};
 use thiserror::Error;
 
 pub const MAX_PROMPT_BYTES: u32 = 65_536;
@@ -38,12 +38,18 @@ pub struct PluginGrants {
 
 #[derive(Debug, Error)]
 pub enum GrantError {
+    #[error(
+        "AI consent was saved for plugin '{plugin_name}', but publishing tools failed: {source}"
+    )]
+    AiToolsPublication { plugin_name: String, source: DbErr },
     #[error("Plugin actor for '{plugin_name}' was not found or is inactive")]
     NotFound { plugin_name: String },
     #[error("Invalid grant configuration for plugin '{plugin_name}': {reason}")]
     Invalid { plugin_name: String, reason: String },
     #[error("Plugin actor for '{plugin_name}' changed while grants were being approved")]
     ActorChanged { plugin_name: String },
+    #[error("Could not confirm the activation of plugin '{plugin_name}' after losing its commit acknowledgement: {source}")]
+    ActivationUnconfirmed { plugin_name: String, source: DbErr },
     #[error("Database operation '{operation}' failed for plugin '{plugin_name}': {source}")]
     Database {
         plugin_name: String,
@@ -114,7 +120,9 @@ impl PluginGrantService {
         let id = uuid::Uuid::new_v4();
         // A reinstallation never inherits the previous actor's authority.
         // Active, authenticated upgrades retain the actor but cannot expand
-        // its grants; source-conflict checks happen before activation.
+        // its grants; source-conflict checks happen before activation. Startup
+        // also reconciles a verified binary activated before a crash: AI consent
+        // belongs to that binary, even if activation's database commit was lost.
         let transaction = self
             .db
             .begin()
@@ -149,7 +157,7 @@ impl PluginGrantService {
                 source,
             })?;
         transaction.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO NOTHING",
+            "INSERT INTO external_plugin_actors (id, plugin_name, binary_sha256, source_identity, active) VALUES ($1,$2,$3,$4,TRUE) ON CONFLICT (plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW()",
             [id.into(), plugin_name.into(), sha256.into(), source_identity.into()])).await
             .map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "ensure actor", source })?;
         let bound_id: String = transaction
@@ -191,7 +199,7 @@ impl PluginGrantService {
             .db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
-                "UPDATE external_plugin_actors SET binary_sha256=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
+                "UPDATE external_plugin_actors SET ai_tools_enabled=CASE WHEN binary_sha256 IS DISTINCT FROM $2 THEN FALSE ELSE ai_tools_enabled END,binary_sha256=$2,updated_at=NOW() WHERE plugin_name=$1 AND active=TRUE",
                 [plugin_name.into(), sha256.into()],
             ))
             .await
@@ -243,7 +251,7 @@ impl PluginGrantService {
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "rotate activated actor", source })?;
         let result = transaction.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
-            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
+            "INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active) VALUES($1::uuid,$2,$3,$4,TRUE) ON CONFLICT(plugin_name) DO UPDATE SET ai_tools_enabled=CASE WHEN external_plugin_actors.binary_sha256 IS DISTINCT FROM EXCLUDED.binary_sha256 THEN FALSE ELSE external_plugin_actors.ai_tools_enabled END,binary_sha256=EXCLUDED.binary_sha256,updated_at=NOW() WHERE external_plugin_actors.id=EXCLUDED.id AND external_plugin_actors.source_identity=EXCLUDED.source_identity",
             [actor_id.into(), plugin_name.into(), sha256.into(), source_identity.into()],
         )).await.map_err(|source| GrantError::Database { plugin_name: plugin_name.into(), operation: "commit activated actor", source })?;
         if result.rows_affected() != 1 {
@@ -251,15 +259,65 @@ impl PluginGrantService {
                 plugin_name: plugin_name.into(),
             });
         }
-        transaction
-            .commit()
+        match transaction.commit().await {
+            Ok(()) => Ok(()),
+            Err(source) => {
+                self.reconcile_actor_commit(plugin_name, actor_id, sha256, source_identity, source)
+                    .await
+            }
+        }
+    }
+
+    /// A lost COMMIT reply can mean that the write is already durable. Take the
+    /// writer's advisory lock on a fresh connection before inspecting its result.
+    async fn reconcile_actor_commit(
+        &self,
+        plugin_name: &str,
+        actor_id: &str,
+        sha256: &str,
+        source_identity: &str,
+        commit_error: DbErr,
+    ) -> Result<(), GrantError> {
+        tracing::warn!(plugin = plugin_name, error = %commit_error, "Checking plugin identity after an unacknowledged commit");
+        let readback = async {
+            let txn = self
+                .db
+                .begin_with_config(Some(sea_orm::IsolationLevel::ReadCommitted), None)
+                .await?;
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [plugin_name.into()],
+            ))
+            .await?;
+            let row = txn.query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT 1 FROM external_plugin_actors WHERE plugin_name=$1 AND id=$2::uuid AND binary_sha256=$3 AND source_identity=$4 AND active=TRUE",
+                [plugin_name.into(), actor_id.into(), sha256.into(), source_identity.into()],
+            )).await?;
+            txn.rollback().await?;
+            Ok::<bool, DbErr>(row.is_some())
+        };
+        let confirmed = tokio::time::timeout(std::time::Duration::from_secs(10), readback)
             .await
-            .map_err(|source| GrantError::Database {
+            .unwrap_or_else(|_| {
+                Err(DbErr::Custom(
+                    "timed out reading the committed actor identity".into(),
+                ))
+            })
+            .map_err(|source| GrantError::ActivationUnconfirmed {
                 plugin_name: plugin_name.into(),
-                operation: "commit actor activation",
                 source,
             })?;
-        Ok(())
+        if confirmed {
+            Ok(())
+        } else {
+            Err(GrantError::Database {
+                plugin_name: plugin_name.into(),
+                operation: "commit actor activation",
+                source: commit_error,
+            })
+        }
     }
 
     pub async fn get(&self, plugin_name: &str) -> Result<PluginGrants, GrantError> {
@@ -405,6 +463,218 @@ fn parse_permission(value: &str) -> Option<PluginHostPermission> {
 mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
+
+    #[tokio::test]
+    async fn changed_binary_resets_only_ai_consent_and_stale_forms_cannot_enable_it() {
+        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use temps_entities::external_plugin_actors as actors;
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping binary consent test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let db = database.connection_arc();
+        let grants = PluginGrantService::new(db.clone());
+        let candidate = grants
+            .prepare_actor("reports", "fixture-source")
+            .await
+            .unwrap();
+        let id = candidate.actor.id.clone();
+        grants
+            .commit_actor("reports", &id, "binary-one", "fixture-source")
+            .await
+            .unwrap();
+        let actor_id = uuid::Uuid::parse_str(&id).unwrap();
+        for activation in ["binary", "actor", "startup"] {
+            let actor = actors::Entity::find_by_id(actor_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            let old_hash = actor.binary_sha256.clone();
+            let mut active: actors::ActiveModel = actor.into();
+            active.ai_tools_enabled = Set(true);
+            active.update(db.as_ref()).await.unwrap();
+            grants
+                .commit_binary_hash("reports", &old_hash)
+                .await
+                .unwrap();
+            assert!(
+                actors::Entity::find_by_id(actor_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ai_tools_enabled
+            );
+            // Same-binary restart preserves consent and actor identity.
+            let rebound = grants
+                .ensure_actor("reports", &old_hash, "fixture-source")
+                .await
+                .unwrap();
+            assert_eq!(rebound.actor.id, id);
+            assert!(
+                actors::Entity::find_by_id(actor_id)
+                    .one(db.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .ai_tools_enabled
+            );
+            let next_hash = match activation {
+                "actor" => "binary-three",
+                "startup" => "binary-four",
+                _ => "binary-two",
+            };
+            if activation == "startup" {
+                // The installation already selects the new verified binary,
+                // but the previous actor commit did not run before restart.
+                let rebound = grants
+                    .ensure_actor("reports", next_hash, "fixture-source")
+                    .await
+                    .unwrap();
+                assert_eq!(rebound.actor.id, id);
+            } else if activation == "actor" {
+                grants
+                    .commit_actor("reports", &id, next_hash, "fixture-source")
+                    .await
+                    .unwrap();
+            } else {
+                grants
+                    .commit_binary_hash("reports", next_hash)
+                    .await
+                    .unwrap();
+            }
+            let changed = actors::Entity::find_by_id(actor_id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!changed.ai_tools_enabled);
+            assert_eq!(changed.binary_sha256, next_hash);
+            let service = crate::service::ExternalPluginsService::new_empty(
+                crate::manager::ExternalPluginConfig::new(
+                    std::env::temp_dir().join("binary-consent-test"),
+                    "postgres://localhost/test".into(),
+                ),
+                None,
+                db.clone(),
+            );
+            let error = service
+                .update_plugin_ai_tools(
+                    "reports",
+                    crate::ai_tools::UpdatePluginAiTools {
+                        actor_id: id.clone(),
+                        installation_revision: old_hash,
+                        enabled: true,
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(error, GrantError::ActorChanged { .. }));
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_commit_acknowledgement_uses_the_final_active_identity() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping commit reconciliation test: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let db = database.connection_arc();
+        let service = PluginGrantService::new(db.clone());
+        let name = "reports";
+        let actor = uuid::Uuid::new_v4().to_string();
+        service
+            .commit_actor(name, &actor, "previous", "fixture-source")
+            .await
+            .unwrap();
+
+        let writer = db.begin().await.unwrap();
+        writer
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+                [name.into()],
+            ))
+            .await
+            .unwrap();
+        writer
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "UPDATE external_plugin_actors SET binary_sha256='candidate' WHERE plugin_name=$1",
+                [name.into()],
+            ))
+            .await
+            .unwrap();
+
+        let reconcile = |id, digest, source| {
+            service.reconcile_actor_commit(
+                name,
+                id,
+                digest,
+                source,
+                DbErr::Custom("lost commit acknowledgement".into()),
+            )
+        };
+        let mut pending = Box::pin(reconcile(&actor, "candidate", "fixture-source"));
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), &mut pending)
+                .await
+                .is_err()
+        );
+        writer.commit().await.unwrap();
+        pending
+            .await
+            .expect("keep the committed candidate after losing its reply");
+
+        let different = uuid::Uuid::new_v4().to_string();
+        for (id, digest, source) in [
+            (actor.as_str(), "previous", "fixture-source"),
+            (actor.as_str(), "candidate", "different-source"),
+            (different.as_str(), "candidate", "fixture-source"),
+        ] {
+            assert!(matches!(
+                reconcile(id, digest, source).await,
+                Err(GrantError::Database { .. })
+            ));
+        }
+        service.revoke_actor(name).await.unwrap();
+        assert!(matches!(
+            reconcile(&actor, "candidate", "fixture-source").await,
+            Err(GrantError::Database { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unreadable_actor_after_commit_has_an_unknown_outcome() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_errors([DbErr::Custom("unavailable".into())])
+            .into_connection();
+        let result = PluginGrantService::new(Arc::new(db))
+            .reconcile_actor_commit(
+                "reports",
+                &uuid::Uuid::new_v4().to_string(),
+                "candidate",
+                "fixture-source",
+                DbErr::Custom("lost commit acknowledgement".into()),
+            )
+            .await;
+        assert!(
+            matches!(result, Err(GrantError::ActivationUnconfirmed { plugin_name, .. }) if plugin_name=="reports")
+        );
+    }
 
     #[tokio::test]
     async fn commit_binary_hash_requires_one_active_actor() {

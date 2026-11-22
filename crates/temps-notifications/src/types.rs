@@ -163,6 +163,16 @@ impl Default for Notification {
 }
 
 impl Notification {
+    /// Body for text-only providers. Rich notifications supply a readable
+    /// alternative in metadata while keeping HTML in `message` for email.
+    pub fn text_body(&self) -> &str {
+        self.metadata
+            .get("text_body")
+            .filter(|body| !body.trim().is_empty())
+            .map(String::as_str)
+            .unwrap_or(&self.message)
+    }
+
     /// Create a new notification with default values
     pub fn new(title: impl Into<String>, message: impl Into<String>) -> Self {
         Self {

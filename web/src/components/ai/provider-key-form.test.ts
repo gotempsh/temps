@@ -3,9 +3,15 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  canSubmitProviderKeyForm,
+  defaultProviderKeyDisplayName,
   EMPTY_PROVIDER_KEY_FORM,
+  providerKeyFormForProvider,
   providerKeyFormSchema,
+  selectProviderKeyFormProvider,
   providerKeyFormToRequest,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from './provider-key-form'
 import { selfHostedDiscoverySignature } from './self-hosted-provider'
@@ -67,7 +73,7 @@ describe('provider key form', () => {
     expect(issues(selfHosted())).toEqual([])
     expect(issues(selfHosted({ base_url: '' }))[0]).toContain('base_url')
     expect(issues(selfHosted({ discovery: null }))[0]).toContain(
-      'Load the models'
+      'Temps has not listed the models'
     )
     expect(issues(selfHosted({ default_model: 'gpt-5-nano' }))[0]).toContain(
       'Pick a default model'
@@ -78,7 +84,7 @@ describe('provider key form', () => {
     const values = selfHosted()
     expect(
       issues({ ...values, base_url: 'http://10.0.0.6:8000/v1' })[0]
-    ).toContain('Load the models')
+    ).toContain('Temps has not listed the models')
   })
 
   test('only self-hosted requests carry the self-hosted fields', () => {
@@ -105,5 +111,141 @@ describe('provider key form', () => {
       api_key: 'sk-x',
       base_url: undefined,
     })
+  })
+})
+
+describe('provider choice inside the add-key dialog', () => {
+  const openai = { id: 'openai', name: 'OpenAI' }
+  const anthropic = { id: 'anthropic', name: 'Anthropic' }
+  const names = ['OpenAI', 'Anthropic', 'OpenAI-compatible']
+
+  test('submit stays disabled until a provider is chosen', () => {
+    expect(canSubmitProviderKeyForm(EMPTY_PROVIDER_KEY_FORM)).toBe(false)
+    expect(canSubmitProviderKeyForm({ provider: '  ' })).toBe(false)
+    expect(canSubmitProviderKeyForm({ provider: 'openai' })).toBe(true)
+  })
+
+  test('a form without a provider fails validation with the provider message', () => {
+    const found = issues({
+      ...EMPTY_PROVIDER_KEY_FORM,
+      display_name: 'Production',
+      api_key: 'sk-test',
+    })
+    expect(found).toContain('provider: Please select a provider')
+  })
+
+  test('numbers display names only once the provider already has keys', () => {
+    expect(defaultProviderKeyDisplayName('OpenAI', 0)).toBe('OpenAI')
+    expect(defaultProviderKeyDisplayName('OpenAI', 2)).toBe('OpenAI (key 3)')
+  })
+
+  test('the preselected flow fixes the provider and pre-fills the name', () => {
+    expect(providerKeyFormForProvider(openai, 1)).toEqual({
+      ...EMPTY_PROVIDER_KEY_FORM,
+      provider: 'openai',
+      display_name: 'OpenAI (key 2)',
+    })
+  })
+
+  test('choosing a provider pre-fills an empty display name', () => {
+    const next = selectProviderKeyFormProvider(
+      EMPTY_PROVIDER_KEY_FORM,
+      anthropic,
+      0,
+      names
+    )
+    expect(next.provider).toBe('anthropic')
+    expect(next.display_name).toBe('Anthropic')
+  })
+
+  test('switching provider follows a pre-filled name but keeps a typed one', () => {
+    const first = selectProviderKeyFormProvider(
+      EMPTY_PROVIDER_KEY_FORM,
+      openai,
+      0,
+      names
+    )
+    const switched = selectProviderKeyFormProvider(first, anthropic, 1, names)
+    expect(switched.display_name).toBe('Anthropic (key 2)')
+
+    const typed = selectProviderKeyFormProvider(
+      { ...first, display_name: 'Production key' },
+      anthropic,
+      0,
+      names
+    )
+    expect(typed.display_name).toBe('Production key')
+  })
+
+  test('switching provider drops fields that belong to the previous one', () => {
+    const selfHostedForm = selfHosted({ api_key: 'secret' })
+    const next = selectProviderKeyFormProvider(selfHostedForm, openai, 0, names)
+    expect(next.provider).toBe('openai')
+    expect(next.api_key).toBe('')
+    expect(next.base_url).toBe('')
+    expect(next.default_model).toBe('')
+    expect(next.trust_private_address).toBe(false)
+    expect(next.discovery).toBeNull()
+  })
+
+  test('re-choosing the current provider changes nothing', () => {
+    const current = {
+      ...providerKeyFormForProvider(openai, 0),
+      api_key: 'sk-x',
+    }
+    expect(selectProviderKeyFormProvider(current, openai, 0, names)).toBe(
+      current
+    )
+  })
+})
+
+describe('a custom base URL on a vendor provider', () => {
+  const names = ['OpenAI', 'Anthropic', 'OpenAI-compatible']
+  const typed: ProviderKeyFormValues = {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: 'openai',
+    display_name: 'OpenAI',
+    api_key: 'sk-test',
+    base_url: 'https://api.example.com/v1',
+  }
+
+  test('is flagged only for a vendor with a non-blank base URL', () => {
+    expect(vendorHasCustomBaseUrl(typed)).toBe(true)
+    expect(vendorHasCustomBaseUrl({ ...typed, base_url: '   ' })).toBe(false)
+    expect(
+      vendorHasCustomBaseUrl({ ...typed, provider: 'openai_compatible' })
+    ).toBe(false)
+    expect(vendorHasCustomBaseUrl({ ...typed, provider: '' })).toBe(false)
+  })
+
+  test('switching to OpenAI-compatible keeps the key and base URL', () => {
+    const switched = switchToOpenAiCompatible(
+      typed,
+      'OpenAI-compatible',
+      0,
+      names
+    )
+    expect(switched).toEqual({
+      ...EMPTY_PROVIDER_KEY_FORM,
+      provider: 'openai_compatible',
+      display_name: 'OpenAI-compatible',
+      api_key: 'sk-test',
+      base_url: 'https://api.example.com/v1',
+    })
+  })
+
+  test('switching keeps a typed display name and numbers a pre-filled one', () => {
+    expect(
+      switchToOpenAiCompatible(
+        { ...typed, display_name: 'Hosted models' },
+        'OpenAI-compatible',
+        2,
+        names
+      ).display_name
+    ).toBe('Hosted models')
+    expect(
+      switchToOpenAiCompatible(typed, 'OpenAI-compatible', 2, names)
+        .display_name
+    ).toBe('OpenAI-compatible (key 3)')
   })
 })

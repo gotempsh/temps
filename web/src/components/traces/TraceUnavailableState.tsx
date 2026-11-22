@@ -20,7 +20,7 @@ export function TraceUnavailableState({
           <p className="font-medium">Trace data is unavailable</p>
           <p className="mt-1 max-w-md text-sm text-muted-foreground">
             Its spans may have expired under your retention policy or may not
-            have reached this project.
+            have reached this service.
           </p>
           <code className="mt-4 max-w-full break-all rounded bg-muted px-3 py-1.5 text-xs">
             {traceId}

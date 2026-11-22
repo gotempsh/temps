@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@temps-sdk/ds'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
 import { ACTIVATION_SECTION_ANCHOR } from '@/components/observe/CloudTelemetryActivationSection'
@@ -37,8 +40,11 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   getCurrentBulkActivationJobOptions,
   getIngestErrorsOptions,
+  getIngestErrorsQueryKey,
   getPipelineHistoryOptions,
+  getPipelineHistoryQueryKey,
   getPipelineStatsOptions,
+  getPipelineStatsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   BulkActivationJobResponse,
@@ -58,13 +64,13 @@ import {
   AlertCircle,
   AlertTriangle,
   ArrowRight,
-  Activity,
   ChevronDown,
   CheckCircle2,
   Rocket,
 } from 'lucide-react'
 import { type MouseEvent, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
+import { scrollElementToTop } from '@/lib/scroll-to-element'
 
 // ---------------------------------------------------------------------------
 // Trend chart
@@ -163,7 +169,7 @@ function seriesSlotKeys(series: TrendSeriesDef[]): Map<string, string> {
  * `start_time`/`end_time`/`step_seconds` (server-clamped, so this is at most
  * a few hundred rows even for the 7-day preset) pre-seed one slot per step;
  * a bucket the API has no data for then stays `undefined`, which the chart
- * renders as a break in the line via `connectNulls`, instead of a false
+ * renders as a break in the line (`connectNulls={false}`), instead of a false
  * zero.
  *
  * The grid must align to the SAME boundaries the backend's `time_bucket()`
@@ -284,6 +290,9 @@ function TrendPanel({
             xKey="label"
             series={series}
             height={180}
+            // Empty slots are `undefined` (see buildTrendRows): break the
+            // line there. ThresholdLineChart bridges nulls by default.
+            connectNulls={false}
             // Pipeline counts are always integers — recharts' default tick
             // step otherwise picks non-round values (e.g. "93.988...") since
             // ThresholdLineChart doesn't set `allowDecimals={false}`.
@@ -537,7 +546,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
   const target = document.getElementById(ACTIVATION_SECTION_ANCHOR)
   if (!target) return
   event.preventDefault()
-  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  scrollElementToTop(target, { behavior: 'smooth' })
 }
 
 /**
@@ -548,7 +557,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
  * not have to scroll past four charts to discover that an activation is moving
  * them to Cloud right now.
  */
-function ActivationJumpLink({
+export function ActivationJumpLink({
   job,
 }: {
   job: BulkActivationJobResponse | null | undefined
@@ -562,9 +571,9 @@ function ActivationJumpLink({
         {JOB_STATUS_LABELS[job.status].toLowerCase()}
       </AlertTitle>
       <AlertDescription>
-        {job.projects_done} of {job.projects_total} project
+        {job.projects_done} of {job.projects_total} service
         {job.projects_total === 1 ? '' : 's'} switched so far. Spans for those
-        projects are no longer counted in the throughput figures below.{' '}
+        services are no longer counted in the throughput figures below.{' '}
         <a
           href={`#${ACTIVATION_SECTION_ANCHOR}`}
           onClick={scrollToActivation}
@@ -584,11 +593,11 @@ export function OtelPipelineStatusPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'OTel Pipeline Status' },
+      { label: 'OTel pipeline' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('OTel Pipeline Status')
+  usePageTitle('OTel pipeline')
 
   const [range, setRange] = useState<string>('24h')
   const [errorsOpen, setErrorsOpen] = useState(false)
@@ -661,18 +670,27 @@ export function OtelPipelineStatusPage() {
 
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-1">
-        <div className="flex items-center gap-2">
-          <Activity className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-xl font-semibold">OTel Pipeline Status</h1>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Throughput and failures for the OTLP ingest pipeline. The trend charts
-          cover the selected window; the counters below are cumulative since the
-          last server restart. All counters are written to the metrics store
-          every {sampleIntervalSeconds}&nbsp;s and can trigger alarms.
-        </p>
-      </div>
+      <PageHeader
+        title="OTel pipeline"
+        description={
+          <>
+            Throughput and failures for the OTLP ingest pipeline. The trend
+            charts cover the selected window; the counters below are cumulative
+            since the last server restart. All counters are written to the
+            metrics store every {sampleIntervalSeconds}&nbsp;s and can trigger
+            alarms.
+          </>
+        }
+        actions={
+          <RefreshButton
+            queryKeys={[
+              queryKeyPrefix(getPipelineStatsQueryKey),
+              queryKeyPrefix(getPipelineHistoryQueryKey),
+              queryKeyPrefix(getIngestErrorsQueryKey),
+            ]}
+          />
+        }
+      />
 
       <ActivationJumpLink job={activationJob} />
 
@@ -754,7 +772,7 @@ export function OtelPipelineStatusPage() {
           </div>
           <CardDescription>
             Ingest requests turned away since the server started. Non-zero
-            values mean projects are hitting their quotas or rate limits.
+            values mean services are hitting their quotas or rate limits.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -778,7 +796,7 @@ export function OtelPipelineStatusPage() {
               <AlertTriangle className="h-4 w-4 text-amber-500" />
               <AlertTitle>Rejections detected</AlertTitle>
               <AlertDescription className="flex items-center gap-2">
-                Projects are being rate-limited or have exceeded their storage
+                Services are being rate-limited or have exceeded their storage
                 quota. Check the{' '}
                 <Link
                   to="/monitoring/alarms"

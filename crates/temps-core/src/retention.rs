@@ -25,6 +25,54 @@
 //! `deployment_gate_slot`, adapted to a lock-free `ArcSwap` since `resolve`
 //! must stay synchronous).
 
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+            container_logs_days: 30,
+        }
+    }
+}
+
+/// Bounds every `AnalyticsRetentionSettings` window is validated against.
+pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
+pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
+
 /// Which ClickHouse table a retention-days resolution is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetentionTable {
@@ -83,6 +131,22 @@ pub trait RetentionResolver: Send + Sync {
     fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
         table.default_days()
     }
+
+    /// The longest `retention_days` this resolver has stamped, or will stamp
+    /// for any project, on rows of `table` that may still be stored; `None`
+    /// when that is not known.
+    ///
+    /// The stored-IP sweep reads it: a ClickHouse row refers to a PostgreSQL
+    /// IP-address row by id and nothing in PostgreSQL can see that reference,
+    /// so an address must outlive the longest-lived row that points at it.
+    /// `None` is the safe default and makes the sweep delete no addresses
+    /// while this resolver is installed. A resolver that applies different
+    /// windows per project overrides this with an upper bound that covers
+    /// every window it has stamped since the oldest row it can still be
+    /// holding, not just the one it would stamp today.
+    fn max_retention_days(&self, _table: RetentionTable) -> Option<u16> {
+        None
+    }
 }
 
 /// Default [`RetentionResolver`] that returns the ClickHouse table-level
@@ -97,6 +161,10 @@ pub struct FixedRetentionResolver;
 impl RetentionResolver for FixedRetentionResolver {
     fn resolve(&self, _project_id: i32, table: RetentionTable) -> u16 {
         table.default_days()
+    }
+
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        Some(table.default_days())
     }
 }
 
@@ -135,7 +203,7 @@ impl SettingsRetentionResolver {
     }
 
     /// Start from `settings`.
-    pub fn from_settings(settings: &crate::ObservabilityRetentionSettings) -> Self {
+    pub fn from_settings(settings: &ObservabilityRetentionSettings) -> Self {
         let resolver = Self::new();
         resolver.apply(settings);
         resolver
@@ -144,7 +212,7 @@ impl SettingsRetentionResolver {
     /// Load new settings. Values are clamped to the range the settings API
     /// accepts, so a row written from a hand-edited settings row still gets a
     /// sane TTL.
-    pub fn apply(&self, settings: &crate::ObservabilityRetentionSettings) {
+    pub fn apply(&self, settings: &ObservabilityRetentionSettings) {
         use std::sync::atomic::Ordering::Relaxed;
         self.spans
             .store(clamp_retention_days(settings.otel_spans_days), Relaxed);
@@ -174,6 +242,12 @@ impl RetentionResolver for SettingsRetentionResolver {
             RetentionTable::Metrics => self.metrics.load(Relaxed),
             RetentionTable::ProxyLogs => self.proxy_logs.load(Relaxed),
         }
+    }
+
+    /// One window for every project; lowering it is covered by the stored-IP
+    /// hold the settings save records, so the current value is the bound.
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        Some(self.resolve_unscoped(table))
     }
 }
 
@@ -252,6 +326,10 @@ impl RetentionResolver for RetentionResolverSlot {
 
     fn resolve_unscoped(&self, table: RetentionTable) -> u16 {
         self.resolver.load().resolve_unscoped(table)
+    }
+
+    fn max_retention_days(&self, table: RetentionTable) -> Option<u16> {
+        self.resolver.load().max_retention_days(table)
     }
 }
 
@@ -332,12 +410,8 @@ mod tests {
         );
     }
 
-    fn retention(
-        spans: u32,
-        metrics: u32,
-        proxy_logs: u32,
-    ) -> crate::ObservabilityRetentionSettings {
-        crate::ObservabilityRetentionSettings {
+    fn retention(spans: u32, metrics: u32, proxy_logs: u32) -> ObservabilityRetentionSettings {
+        ObservabilityRetentionSettings {
             otel_spans_days: spans,
             otel_metrics_days: metrics,
             proxy_logs_days: proxy_logs,
@@ -357,9 +431,8 @@ mod tests {
         }
         // The settings defaults and the table defaults must agree, or a fresh
         // instance would stamp rows differently from the DDL DEFAULT.
-        let from_default_settings = SettingsRetentionResolver::from_settings(
-            &crate::ObservabilityRetentionSettings::default(),
-        );
+        let from_default_settings =
+            SettingsRetentionResolver::from_settings(&ObservabilityRetentionSettings::default());
         for table in [
             RetentionTable::Spans,
             RetentionTable::Metrics,
@@ -431,5 +504,49 @@ mod tests {
         // The default does not claim the slot: a plugin resolver still wins.
         assert!(slot.set(std::sync::Arc::new(AlwaysSeven)));
         assert_eq!(slot.resolve(1, RetentionTable::Spans), 7);
+    }
+
+    struct PerProject;
+    impl RetentionResolver for PerProject {
+        fn resolve(&self, project_id: i32, _table: RetentionTable) -> u16 {
+            if project_id == 1 {
+                90
+            } else {
+                30
+            }
+        }
+    }
+
+    #[test]
+    fn a_resolver_that_does_not_declare_a_bound_has_none() {
+        assert_eq!(
+            PerProject.max_retention_days(RetentionTable::ProxyLogs),
+            None
+        );
+    }
+
+    #[test]
+    fn the_built_in_resolvers_declare_the_window_they_stamp() {
+        assert_eq!(
+            FixedRetentionResolver.max_retention_days(RetentionTable::ProxyLogs),
+            Some(30)
+        );
+        let settings = SettingsRetentionResolver::new();
+        assert_eq!(
+            settings.max_retention_days(RetentionTable::ProxyLogs),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn the_slot_reports_the_bound_of_the_resolver_it_holds() {
+        let slot = RetentionResolverSlot::new_default();
+        assert_eq!(slot.max_retention_days(RetentionTable::ProxyLogs), Some(30));
+        assert!(slot.set(std::sync::Arc::new(PerProject)));
+        assert_eq!(
+            slot.max_retention_days(RetentionTable::ProxyLogs),
+            None,
+            "a plugin resolver that declares nothing makes the bound unknown"
+        );
     }
 }

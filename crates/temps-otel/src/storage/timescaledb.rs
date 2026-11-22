@@ -14,6 +14,7 @@ use sea_orm::{
     TransactionTrait,
 };
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 use tracing::{debug, error, warn};
 
 use super::{
@@ -296,10 +297,13 @@ impl TimescaleDbStorage {
     /// all nullable so the INSERT is safe on instances that have not yet run
     /// the migration — Postgres will error with "column does not exist" but
     /// the migration is always applied before ingest in production.
-    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
-    /// these tables cannot currently carry a unique key, and why retry safety
-    /// is enforced by the error classification instead.
-    async fn batch_insert_metrics(&self, points: &[MetricPoint]) -> StorageResult<u64> {
+    /// The caller claims optional adapter identities in the native transaction.
+    /// Unidentified OTLP records retain their existing at-least-once semantics.
+    async fn batch_insert_metrics<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        points: &[MetricPoint],
+    ) -> StorageResult<u64> {
         if points.is_empty() {
             return Ok(0);
         }
@@ -419,8 +423,7 @@ impl TimescaleDbStorage {
             ]);
         }
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -431,7 +434,7 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
-    /// # Not idempotent — callers must not retry on an unknown outcome
+    /// # Unidentified writes are not idempotent — no unknown-outcome retries
     ///
     /// This is a plain multi-row `INSERT` with no `ON CONFLICT` clause, so
     /// re-sending the same batch inserts every row a second time. There is no
@@ -702,10 +705,13 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
-    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
-    /// these tables cannot currently carry a unique key, and why retry safety
-    /// is enforced by the error classification instead.
-    async fn batch_insert_logs(&self, records: &[LogRecord]) -> StorageResult<u64> {
+    /// The caller claims optional adapter identities in the native transaction.
+    /// Unidentified OTLP records retain their existing at-least-once semantics.
+    async fn batch_insert_logs<C: ConnectionTrait>(
+        &self,
+        db: &C,
+        records: &[LogRecord],
+    ) -> StorageResult<u64> {
         if records.is_empty() {
             return Ok(0);
         }
@@ -714,7 +720,7 @@ impl TimescaleDbStorage {
             "INSERT INTO otel_log_events (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, timestamp, observed_timestamp,
-                severity, severity_text, body, trace_id, span_id, attributes
+                severity, severity_text, body, trace_id, span_id, attributes, attribute_types
             ) VALUES ",
         );
 
@@ -726,7 +732,7 @@ impl TimescaleDbStorage {
                 sql.push_str(", ");
             }
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -739,9 +745,10 @@ impl TimescaleDbStorage {
                 param_idx + 9,
                 param_idx + 10,
                 param_idx + 11,
-                param_idx + 12
+                param_idx + 12,
+                param_idx + 13
             ));
-            param_idx += 13;
+            param_idx += 14;
 
             let attrs_json = serde_json::to_value(&r.attributes).unwrap_or_default();
 
@@ -759,11 +766,13 @@ impl TimescaleDbStorage {
                 r.trace_id.clone().into(),
                 r.span_id.clone().into(),
                 attrs_json.into(),
+                serde_json::to_value(&r.attribute_types)
+                    .unwrap_or_default()
+                    .into(),
             ]);
         }
 
-        let result = self
-            .db
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 &sql,
@@ -843,12 +852,6 @@ struct DeployRow {
 }
 
 #[derive(Debug, FromQueryResult)]
-#[allow(dead_code)]
-struct QuotaRow {
-    total_bytes: i64,
-}
-
-#[derive(Debug, FromQueryResult)]
 struct P95Row {
     p95: f64,
 }
@@ -868,7 +871,23 @@ impl OtelStorage for TimescaleDbStorage {
         super::global_traces::postgres(self.db.clone(), &query).await
     }
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
-        self.batch_insert_metrics(&points).await
+        if !points.iter().any(|r| r.ingest_identity.is_some()) {
+            return self.batch_insert_metrics(self.db.as_ref(), &points).await;
+        }
+        let tx = self.db.begin().await?;
+        let indices = super::receipts::claim(
+            &tx,
+            "metrics",
+            &points
+                .iter()
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let accepted: Vec<_> = indices.into_iter().map(|i| points[i].clone()).collect();
+        let stored = self.batch_insert_metrics(&tx, &accepted).await?;
+        tx.commit().await?;
+        Ok(stored)
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
@@ -877,6 +896,20 @@ impl OtelStorage for TimescaleDbStorage {
         }
 
         let transaction = self.db.begin().await?;
+        let spans = if spans.iter().any(|r| r.ingest_identity.is_some()) {
+            let indices = super::receipts::claim(
+                &transaction,
+                "spans",
+                &spans
+                    .iter()
+                    .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                    .collect::<Vec<_>>(),
+            )
+            .await?;
+            indices.into_iter().map(|i| spans[i].clone()).collect()
+        } else {
+            spans
+        };
         let result = async {
             let stored = self.batch_insert_spans(&transaction, &spans).await?;
             self.upsert_trace_summaries(&transaction, &spans).await?;
@@ -902,7 +935,23 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
-        self.batch_insert_logs(&records).await
+        if !records.iter().any(|r| r.ingest_identity.is_some()) {
+            return self.batch_insert_logs(self.db.as_ref(), &records).await;
+        }
+        let tx = self.db.begin().await?;
+        let indices = super::receipts::claim(
+            &tx,
+            "logs",
+            &records
+                .iter()
+                .map(|r| (r.project_id, r.ingest_identity.as_ref()))
+                .collect::<Vec<_>>(),
+        )
+        .await?;
+        let accepted: Vec<_> = indices.into_iter().map(|i| records[i].clone()).collect();
+        let stored = self.batch_insert_logs(&tx, &accepted).await?;
+        tx.commit().await?;
+        Ok(stored)
     }
 
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
@@ -1663,9 +1712,34 @@ impl OtelStorage for TimescaleDbStorage {
                 }
             }
         }
+        if let Some(ref wanted) = query.attribute_path {
+            let facet_slot = self
+                .facet_cache
+                .as_ref()
+                .and_then(|c| c.load().get(wanted.key.as_str()).copied());
+            let column = match facet_slot {
+                Some(slot) => crate::services::facet_service::facet_column_name(slot),
+                None => {
+                    values.push(wanted.key.clone().into());
+                    param_idx += 1;
+                    format!("(attributes->>${}::text)", param_idx - 1)
+                }
+            };
+            let [query_prefix, fragment_prefix] = wanted.suffixed();
+            where_clauses.push(format!(
+                "({column} = ${} OR starts_with({column}, ${}) OR starts_with({column}, ${}))",
+                param_idx,
+                param_idx + 1,
+                param_idx + 2
+            ));
+            values.push(wanted.path.clone().into());
+            values.push(query_prefix.into());
+            values.push(fragment_prefix.into());
+            param_idx += 3;
+        }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
         if query.root_only {
@@ -1762,121 +1836,16 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
-        let rebuild_pending = self.trace_summary_rebuild_pending().await?;
+        self.read_trace(project_id, trace_id, None).await
+    }
 
-        // While the durable rebuild marker is pending, the summary table is
-        // explicitly not authoritative. A legacy trace may therefore be
-        // present in the raw hypertable without any summary row, including
-        // outside the normal seven-day direct-link fallback. Prefer
-        // correctness during this bounded maintenance window and scan the
-        // retained raw data for the requested trace. Once reconciliation
-        // completes, the indexed summary-derived window below is restored.
-        if rebuild_pending {
-            let results = self
-                .db
-                .query_all(Statement::from_sql_and_values(
-                    DatabaseBackend::Postgres,
-                    r#"
-                        SELECT project_id, deployment_id, service_name, service_version,
-                               deployment_environment, trace_id, span_id, parent_span_id,
-                               name, kind, start_time, end_time, duration_ms,
-                               status_code, status_message, attributes, events
-                        FROM otel_spans
-                        WHERE project_id = $1 AND trace_id = $2
-                        ORDER BY start_time ASC
-                    "#,
-                    vec![project_id.into(), trace_id.to_string().into()],
-                ))
-                .await?;
-
-            return Ok(results
-                .iter()
-                .filter_map(|row| parse_span_row(row).ok())
-                .collect());
-        }
-
-        // Two-phase lookup. Phase 1: fetch the trace's time window from
-        // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans
-        // bounded to that window so hypertable chunk exclusion prunes the
-        // scan to 1-2 chunks. Without the bound, this query touches every
-        // chunk in the retention window — and on compressed chunks (which
-        // have no B-tree indexes, and no trace_id segmentby since
-        // m20260714_000001) that means decompressing the project's entire
-        // history for one trace.
-        //
-        // The window is padded generously: spans of a trace can start before
-        // the summary's recorded start (late/out-of-order batches update it,
-        // but a reader can race the update) and child spans can outlive the
-        // root. A day of slack is negligible for chunk exclusion (chunks are
-        // 1 day) and safe for any realistic trace duration.
-        let window = self
-            .db
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT start_time, duration_ms FROM otel_trace_summaries
-                 WHERE project_id = $1 AND trace_id = $2",
-                vec![project_id.into(), trace_id.to_string().into()],
-            ))
-            .await?
-            .and_then(|row| {
-                let start: chrono::DateTime<chrono::Utc> = row.try_get("", "start_time").ok()?;
-                let duration_ms: f64 = row.try_get("", "duration_ms").unwrap_or(0.0);
-                let end = start + chrono::Duration::milliseconds(duration_ms.ceil() as i64);
-                Some((
-                    start - chrono::Duration::days(1),
-                    end + chrono::Duration::days(1),
-                ))
-            });
-
-        // No summary row means the trace is invisible in every list view (the
-        // list reads from otel_trace_summaries), so it can only be requested
-        // via a direct link. That happens for (a) an ingest race — the summary
-        // upsert in store_spans runs just after the span insert, (b) a
-        // transient, fail-soft summary upsert failure, or (c) legacy spans
-        // predating the summaries table. (a) and (b) are recent by nature, so
-        // fall back to a scan bounded to the last 7 days — the window in which
-        // chunks are still uncompressed and carry the trace_id B-tree index.
-        // Never scan unbounded: on compressed chunks a trace_id lookup has no
-        // index and no segmentby to seek on, so an unbounded fallback would
-        // decompress the project's entire history for any unknown trace_id
-        // (stale links, cross-project probes, or abuse).
-        let (from, to) = window.unwrap_or_else(|| {
-            let now = chrono::Utc::now();
-            (now - chrono::Duration::days(7), now)
-        });
-
-        let sql = r#"
-            SELECT project_id, deployment_id, service_name, service_version,
-                   deployment_environment, trace_id, span_id, parent_span_id,
-                   name, kind, start_time, end_time, duration_ms,
-                   status_code, status_message, attributes, events
-            FROM otel_spans
-            WHERE project_id = $1 AND trace_id = $2
-              AND start_time >= $3 AND start_time <= $4
-            ORDER BY start_time ASC
-        "#;
-        let values: Vec<sea_orm::Value> = vec![
-            project_id.into(),
-            trace_id.to_string().into(),
-            from.into(),
-            to.into(),
-        ];
-
-        let results = self
-            .db
-            .query_all(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                sql,
-                values,
-            ))
-            .await?;
-
-        let spans = results
-            .iter()
-            .filter_map(|row| parse_span_row(row).ok())
-            .collect();
-
-        Ok(spans)
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        self.read_trace(project_id, trace_id, Some(max_spans)).await
     }
 
     async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
@@ -1895,9 +1864,11 @@ impl OtelStorage for TimescaleDbStorage {
         let min_count_param = param_idx;
         let limit_param = param_idx + 1;
         let offset_param = param_idx + 2;
+        let apdex_param = param_idx + 3;
         values.push((query.min_count as i64).into());
         values.push((limit as i64).into());
         values.push((offset as i64).into());
+        values.push(query.apdex_threshold_ms.unwrap_or(0.0).into());
 
         // The percentiles use `percentile_cont`, which is exact rather than
         // approximate: the window is bounded and the result is grouped, so the
@@ -1921,7 +1892,11 @@ impl OtelStorage for TimescaleDbStorage {
                 percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p50_duration_ms,
                 percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p95_duration_ms,
                 percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p99_duration_ms,
-                MAX(s.start_time) AS last_seen
+                MAX(s.start_time) AS last_seen,
+                -- Apdex counts, in the same pass (ADR 111, D2).
+                COUNT(*) FILTER (WHERE s.duration_ms <= ${apdex_param})::bigint AS satisfied_count,
+                COUNT(*) FILTER (WHERE s.duration_ms > ${apdex_param}
+                    AND s.duration_ms <= ${apdex_param} * 4)::bigint AS tolerating_count
             FROM otel_spans s
             WHERE {where_sql}
             GROUP BY s.project_id, s.service_name, s.name
@@ -1940,7 +1915,10 @@ impl OtelStorage for TimescaleDbStorage {
             ))
             .await?;
 
-        Ok(results.iter().filter_map(parse_span_stats_row).collect())
+        Ok(results
+            .iter()
+            .filter_map(|row| parse_span_stats_row(row, query.apdex_threshold_ms))
+            .collect())
     }
 
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
@@ -2409,16 +2387,43 @@ impl OtelStorage for TimescaleDbStorage {
             param_idx += 1;
         }
 
+        if let Some(filter) = &query.attribute_filter {
+            filter.validate()?;
+            let key_param = param_idx;
+            values.push(filter.key.clone().into());
+            param_idx += 1;
+            if let Some(ty) = filter.ty {
+                where_clauses.push(format!(
+                    "attribute_types->>${key_param}::text = ${param_idx}"
+                ));
+                values.push(ty.as_str().into());
+                param_idx += 1;
+            }
+            let operator = filter.operator.sql();
+            if filter.ty.is_some_and(LogAttributeType::is_numeric) {
+                where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
+            } else {
+                where_clauses.push(format!(
+                    "attributes->>${key_param}::text {operator} ${param_idx}::text"
+                ));
+            }
+            values.push(filter.value.clone().into());
+            param_idx += 1;
+        }
+
         let where_sql = where_clauses.join(" AND ");
 
         let sql = format!(
             r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, timestamp, observed_timestamp,
-                   severity, severity_text, body, trace_id, span_id, attributes
+                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types
             FROM otel_log_events
             WHERE {where_sql}
-            ORDER BY timestamp DESC
+            ORDER BY timestamp DESC,
+                temps_log_numeric(attributes->>'temps.sentry.timestamp') DESC NULLS LAST,
+                temps_log_numeric(attributes->>'sentry.timestamp.sequence') DESC NULLS LAST,
+                id DESC
             LIMIT ${param_idx} OFFSET ${next_param}
             "#,
             next_param = param_idx + 1
@@ -3107,6 +3112,139 @@ impl OtelStorage for TimescaleDbStorage {
 // Inherent helpers backing the trait dispatch above. Kept out of the trait
 // impl so they can be private and unit-tested without going through the
 // OtelStorage trait.
+
+impl TimescaleDbStorage {
+    /// A trace's spans by start time; with `limit`, only the first `limit`.
+    async fn read_trace(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        // An integer, so formatting it into the statement cannot inject.
+        let limit_sql = limit.map(|n| format!(" LIMIT {n}")).unwrap_or_default();
+        let rebuild_pending = self.trace_summary_rebuild_pending().await?;
+
+        // While the durable rebuild marker is pending, the summary table is
+        // explicitly not authoritative. A legacy trace may therefore be
+        // present in the raw hypertable without any summary row, including
+        // outside the normal seven-day direct-link fallback. Prefer
+        // correctness during this bounded maintenance window and scan the
+        // retained raw data for the requested trace. Once reconciliation
+        // completes, the indexed summary-derived window below is restored.
+        if rebuild_pending {
+            let results = self
+                .db
+                .query_all(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    format!(
+                        r#"
+                        SELECT project_id, deployment_id, service_name, service_version,
+                               deployment_environment, trace_id, span_id, parent_span_id,
+                               name, kind, start_time, end_time, duration_ms,
+                               status_code, status_message, attributes, events
+                        FROM otel_spans
+                        WHERE project_id = $1 AND trace_id = $2
+                        ORDER BY start_time ASC{limit_sql}
+                    "#
+                    ),
+                    vec![project_id.into(), trace_id.to_string().into()],
+                ))
+                .await?;
+
+            return Ok(results
+                .iter()
+                .filter_map(|row| parse_span_row(row).ok())
+                .collect());
+        }
+
+        // Two-phase lookup. Phase 1: fetch the trace's time window from
+        // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans
+        // bounded to that window so hypertable chunk exclusion prunes the
+        // scan to 1-2 chunks. Without the bound, this query touches every
+        // chunk in the retention window — and on compressed chunks (which
+        // have no B-tree indexes, and no trace_id segmentby since
+        // m20260714_000001) that means decompressing the project's entire
+        // history for one trace.
+        //
+        // The window is padded generously: spans of a trace can start before
+        // the summary's recorded start (late/out-of-order batches update it,
+        // but a reader can race the update) and child spans can outlive the
+        // root. A day of slack is negligible for chunk exclusion (chunks are
+        // 1 day) and safe for any realistic trace duration.
+        let window = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT start_time, duration_ms FROM otel_trace_summaries
+                 WHERE project_id = $1 AND trace_id = $2",
+                vec![project_id.into(), trace_id.to_string().into()],
+            ))
+            .await?
+            .and_then(|row| {
+                let start: chrono::DateTime<chrono::Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").unwrap_or(0.0);
+                let end = start + chrono::Duration::milliseconds(duration_ms.ceil() as i64);
+                Some((
+                    start - chrono::Duration::days(1),
+                    end + chrono::Duration::days(1),
+                ))
+            });
+
+        // No summary row means the trace is invisible in every list view (the
+        // list reads from otel_trace_summaries), so it can only be requested
+        // via a direct link. That happens for (a) an ingest race — the summary
+        // upsert in store_spans runs just after the span insert, (b) a
+        // transient, fail-soft summary upsert failure, or (c) legacy spans
+        // predating the summaries table. (a) and (b) are recent by nature, so
+        // fall back to a scan bounded to the last 7 days — the window in which
+        // chunks are still uncompressed and carry the trace_id B-tree index.
+        // Never scan unbounded: on compressed chunks a trace_id lookup has no
+        // index and no segmentby to seek on, so an unbounded fallback would
+        // decompress the project's entire history for any unknown trace_id
+        // (stale links, cross-project probes, or abuse).
+        let (from, to) = window.unwrap_or_else(|| {
+            let now = chrono::Utc::now();
+            (now - chrono::Duration::days(7), now)
+        });
+
+        let sql = format!(
+            r#"
+            SELECT project_id, deployment_id, service_name, service_version,
+                   deployment_environment, trace_id, span_id, parent_span_id,
+                   name, kind, start_time, end_time, duration_ms,
+                   status_code, status_message, attributes, events
+            FROM otel_spans
+            WHERE project_id = $1 AND trace_id = $2
+              AND start_time >= $3 AND start_time <= $4
+            ORDER BY start_time ASC{limit_sql}
+        "#
+        );
+        let values: Vec<sea_orm::Value> = vec![
+            project_id.into(),
+            trace_id.to_string().into(),
+            from.into(),
+            to.into(),
+        ];
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                values,
+            ))
+            .await?;
+
+        let spans = results
+            .iter()
+            .filter_map(|row| parse_span_row(row).ok())
+            .collect();
+
+        Ok(spans)
+    }
+}
+
 impl TimescaleDbStorage {
     /// Fallback list query that aggregates spans at read time
     /// (`GROUP BY trace_id`). Used only when the query carries a span-level
@@ -3192,7 +3330,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3395,7 +3533,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("s.name ILIKE ${}", param_idx));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3652,7 +3790,7 @@ impl TimescaleDbStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("ts.root_span_name ILIKE ${param_idx}"));
-            values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+            values.push(format!("%{}%", escape_like(pattern)).into());
             param_idx += 1;
         }
 
@@ -3881,21 +4019,6 @@ fn histogram_quantile(q: f64, bounds: &[f64], bucket_counts: &[u64]) -> Option<f
 
 // ── Like-pattern helpers ────────────────────────────────────────────────────
 
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// PostgreSQL ILIKE uses backslash as the default escape character. We escape:
-/// - `\` → `\\`   (backslash itself, first)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller wraps the result with `%{escaped}%` for a substring match.
-fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// Whether a trace query needs a span-level filter the pre-aggregated
 /// `otel_trace_summaries` table can't satisfy, forcing the slower
 /// `GROUP BY trace_id` fallback over the spans hypertable.
@@ -3972,7 +4095,7 @@ fn build_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<sea_orm::Val
     }
     if let Some(ref pattern) = query.name_pattern {
         where_clauses.push(format!("s.name ILIKE ${param_idx}"));
-        values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+        values.push(format!("%{}%", escape_like(pattern)).into());
         param_idx += 1;
     }
     if let Some(kind) = query.kind {
@@ -4057,7 +4180,10 @@ fn span_stats_order_expr(field: crate::types::SpanStatsSortField) -> &'static st
 /// Returns `None` for a row missing a required column, matching the read paths
 /// elsewhere in this backend: one malformed row is skipped rather than failing
 /// the whole report.
-fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
+fn parse_span_stats_row(
+    row: &sea_orm::QueryResult,
+    apdex_threshold_ms: Option<f64>,
+) -> Option<SpanStats> {
     let project_id: i32 = row.try_get("", "project_id").ok()?;
     let service_name: String = row.try_get("", "service_name").ok()?;
     let span_name: String = row.try_get("", "span_name").ok()?;
@@ -4073,6 +4199,11 @@ fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
     let p95_duration_ms: f64 = row.try_get("", "p95_duration_ms").unwrap_or(0.0);
     let p99_duration_ms: f64 = row.try_get("", "p99_duration_ms").unwrap_or(0.0);
     let last_seen: DateTime<Utc> = row.try_get("", "last_seen").ok()?;
+    let apdex = apdex_threshold_ms.map(|threshold_ms| crate::types::ApdexCounts {
+        threshold_ms,
+        satisfied: row.try_get("", "satisfied_count").unwrap_or(0),
+        tolerating: row.try_get("", "tolerating_count").unwrap_or(0),
+    });
 
     Some(crate::types::build_span_stats(
         crate::types::SpanStatsGroup {
@@ -4094,6 +4225,7 @@ fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
             p99_ms: p99_duration_ms,
         },
         last_seen,
+        apdex,
     ))
 }
 
@@ -4245,6 +4377,7 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
     };
 
     Ok(SpanRecord {
+        ingest_identity: None,
         project_id: row.try_get("", "project_id").unwrap_or(0),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
@@ -4285,6 +4418,11 @@ fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
     };
 
     Ok(LogRecord {
+        ingest_identity: None,
+        attribute_types: serde_json::from_value(
+            row.try_get("", "attribute_types").unwrap_or_default(),
+        )
+        .unwrap_or_default(),
         project_id: row.try_get("", "project_id").unwrap_or(0),
         deployment_id: row.try_get("", "deployment_id").ok(),
         resource: ResourceInfo {
@@ -4390,6 +4528,7 @@ mod tests {
         status: SpanStatusCode,
     ) -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id,
             deployment_id: Some(7),
             resource: ResourceInfo {
@@ -4415,6 +4554,7 @@ mod tests {
 
     fn base_query(project_id: i32) -> TraceQuery {
         TraceQuery {
+            attribute_path: None,
             project_id,
             trace_id: None,
             service_name: None,

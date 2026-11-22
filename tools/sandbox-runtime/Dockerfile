@@ -21,7 +21,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certifi
     && groupmod -n temps node \
     && install -d -m 0700 -o temps -g temps /run/temps-runtime \
     && install -d -o temps -g temps /home/temps/workspace
-RUN npm install --global @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_VERSION} opencode-ai@${OPENCODE_VERSION} \
+# The AI CLIs live in a prefix the sandbox user owns, so `claude update` and
+# `npm install --global <cli>@latest` work without root. The sandbox runs with
+# no-new-privileges, which means sudo can never elevate to fix a root-owned
+# install.
+#  - The prefix is outside /home/temps on purpose: that path is a named volume
+#    that masks whatever the image puts there, so existing sandboxes would keep
+#    a stale copy.
+#  - The CLIs are linked into /usr/local/bin rather than installed there:
+#    the host root-execs temps-sandbox-runtime from that directory, so it has
+#    to stay root-owned or sandbox code could replace it.
+#  - The prefix is chosen through the system npmrc, not an ENV variable, so
+#    every process that runs npm resolves it, including exec'd commands.
+RUN install -d -o temps -g temps /opt/temps-cli \
+    && install -d /usr/local/etc \
+    && printf 'prefix=/opt/temps-cli\n' > /usr/local/etc/npmrc \
+    && npm install --global @openai/codex@${CODEX_VERSION} @anthropic-ai/claude-code@${CLAUDE_VERSION} opencode-ai@${OPENCODE_VERSION} \
+    && chown -R temps:temps /opt/temps-cli \
+    && for cli in claude codex opencode; do ln -s "/opt/temps-cli/bin/$cli" "/usr/local/bin/$cli"; done \
     && npm cache clean --force
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY --from=build /build/temps/tools/sandbox-runtime/target/release/temps-sandbox-runtime /usr/local/bin/temps-sandbox-runtime

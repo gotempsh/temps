@@ -11,7 +11,7 @@
 
 ### One URL, two jobs
 
-`AppSettings.external_url` (`crates/temps-core/src/app_settings.rs:16`) is
+`AppSettings.external_url` (`crates/temps-config/src/app_settings/mod.rs:16`) is
 the only "public" URL Temps knows about. It does two jobs that pull in
 opposite directions:
 
@@ -492,7 +492,7 @@ Resolved during Phase 1:
 
 ## References
 
-- `crates/temps-core/src/app_settings.rs`: `external_url`, `console_hostname()`
+- `crates/temps-config/src/app_settings/mod.rs`: `external_url`, `console_hostname()`
 - `crates/temps-config/src/service.rs`: `get_external_url_or_default`
 - `crates/temps-proxy/src/proxy.rs`: `should_consult_admin_gate`
 - `crates/temps-proxy/src/services.rs`: `/api/_temps`, `/api/otel` console routing

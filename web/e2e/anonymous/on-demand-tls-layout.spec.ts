@@ -69,7 +69,7 @@ for (const width of [360, 768, 1440]) {
     await expect(page.getByText('Issuance will not start yet')).toBeVisible()
     await expect(page.getByLabel('Zone')).toBeVisible()
     await expect(
-      page.getByRole('button', { name: 'Save Changes' })
+      page.getByRole('button', { name: 'Save', exact: true })
     ).toBeVisible()
     await expectNoHorizontalScroll(page, width)
     expect(errors).toEqual([])
@@ -93,7 +93,7 @@ for (const width of [360, 768, 1440]) {
     expect(errors).toEqual([])
   })
 
-  test(`workflows empty state offers project creation at ${width}px`, async ({
+  test(`workflows empty state offers service creation at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 900 })
@@ -106,7 +106,7 @@ for (const width of [360, 768, 1440]) {
       page.getByRole('heading', { name: 'Workflows', level: 1 })
     ).toBeVisible()
     await expect(
-      page.getByRole('link', { name: 'Create project' })
+      page.getByRole('link', { name: 'Create service' })
     ).toBeVisible()
     await expectNoHorizontalScroll(page, width)
     expect(errors).toEqual([])

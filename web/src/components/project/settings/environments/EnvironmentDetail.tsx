@@ -9,15 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogTitle,
-  AlertDialogTrigger,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { SettingsSection } from '@/components/ui/settings-section'
@@ -25,11 +17,16 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Globe, HardDrive, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import { Globe, Loader2, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
+import { EnvironmentIngressCard } from './EnvironmentIngressCard'
+import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
+import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
+import { InternalAccessCard } from '../InternalAccessCard'
+import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 interface EnvironmentDetailProps {
@@ -131,6 +128,7 @@ function SubdomainCard({
 
   return (
     <SettingsSection
+      id="setting-environment-subdomain"
       title="Subdomain"
       icon={Globe}
       description="Rename the auto-managed hostname for this environment. The previous subdomain stops resolving as soon as the change is applied. Custom domains attached to this environment are unaffected."
@@ -181,66 +179,6 @@ function SubdomainCard({
           )}
         </div>
       </form>
-    </SettingsSection>
-  )
-}
-
-function PurgeAssetCacheCard({
-  projectId,
-  environmentId,
-}: {
-  projectId: number
-  environmentId: number
-}) {
-  const [isPurging, setIsPurging] = useState(false)
-  const [showConfirm, setShowConfirm] = useState(false)
-
-  const handlePurge = async () => {
-    setIsPurging(true)
-    try {
-      const response = await fetch(
-        `/api/projects/${projectId}/environments/${environmentId}/asset-cache`,
-        { method: 'DELETE' }
-      )
-      const data = await response.json()
-      const deleted = data?.deleted ?? 0
-      toast.success(`Purged ${deleted} cached asset${deleted !== 1 ? 's' : ''}`)
-    } catch {
-      toast.error('Failed to purge asset cache')
-    } finally {
-      setIsPurging(false)
-      setShowConfirm(false)
-    }
-  }
-
-  return (
-    <SettingsSection
-      title="Asset Cache"
-      icon={HardDrive}
-      description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
-    >
-      <AlertDialog open={showConfirm} onOpenChange={setShowConfirm}>
-        <AlertDialogTrigger asChild>
-          <Button variant="outline" size="sm">
-            <RefreshCw className="h-4 w-4 mr-2" />
-            Purge Asset Cache
-          </Button>
-        </AlertDialogTrigger>
-        <AlertDialogContent>
-          <AlertDialogTitle>Purge Asset Cache</AlertDialogTitle>
-          <AlertDialogDescription>
-            This will delete all cached static assets for this environment.
-            In-flight users with old HTML may see broken pages until they
-            refresh. Orphaned blobs are cleaned up automatically overnight.
-          </AlertDialogDescription>
-          <div className="flex justify-end gap-3 mt-4">
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handlePurge} disabled={isPurging}>
-              {isPurging ? 'Purging...' : 'Purge Cache'}
-            </AlertDialogAction>
-          </div>
-        </AlertDialogContent>
-      </AlertDialog>
     </SettingsSection>
   )
 }
@@ -339,6 +277,34 @@ export function EnvironmentDetail({
         }}
       />
 
+      <ProjectIpAccessCard
+        key={`ip-access:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
+        scopeName={environment.name}
+      />
+
+      <InternalAccessCard
+        key={`internal-access:${environment.id}`}
+        projectId={project.id}
+        projectName={project.name}
+        projectSlug={project.slug}
+        environmentId={environment.id}
+        environmentName={environment.name}
+        environmentSlug={environment.slug}
+      />
+
+      <EnvironmentIngressCard
+        key={`ingress:${environment.id}`}
+        projectId={project.id}
+        environmentId={environment.id}
+      />
+
+      <EnvironmentVolumesCard
+        key={`volumes:${environment.id}`}
+        environmentId={environment.id}
+      />
+
       <SubdomainCard
         key={`${environment.id}:${
           (environment as EnvironmentResponse & { subdomain?: string })
@@ -355,67 +321,48 @@ export function EnvironmentDetail({
       <PurgeAssetCacheCard
         projectId={project.id}
         environmentId={environmentId}
+        environmentName={environment.name}
       />
 
       <SettingsSection
-        title="Danger Zone"
+        id="setting-environment-danger-zone"
+        title="Danger zone"
         icon={Trash2}
-        description="Irreversible and destructive actions"
-        className="border-destructive/50 bg-destructive/5"
+        description="Permanently delete this environment and everything in it. This cannot be undone."
       >
         <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Deleting this environment will remove all configurations,
-            deployments, and data associated with it. This action cannot be
-            undone.
-          </p>
           {isProduction && (
-            <p className="text-sm text-muted-foreground bg-muted p-3 rounded-md border">
-              ℹ️ The production environment cannot be deleted to prevent
-              accidental data loss.
+            <p className="text-sm text-muted-foreground">
+              The production environment cannot be deleted, so its data is never
+              lost by accident.
             </p>
           )}
-          <AlertDialog
+          <Button
+            variant="destructive"
+            disabled={isProduction}
+            className="w-full sm:w-auto"
+            onClick={() => setShowDeleteConfirm(true)}
+          >
+            <Trash2 className="h-4 w-4 mr-2" />
+            Delete environment
+          </Button>
+          <ConfirmDeleteDialog
             open={showDeleteConfirm}
             onOpenChange={setShowDeleteConfirm}
-          >
-            <AlertDialogTrigger asChild>
-              <Button
-                variant="destructive"
-                disabled={isProduction}
-                className="w-full sm:w-auto"
-              >
-                <Trash2 className="h-4 w-4 mr-2" />
-                Delete Environment
-              </Button>
-            </AlertDialogTrigger>
-            <AlertDialogContent>
-              <AlertDialogTitle>Delete Environment</AlertDialogTitle>
-              <AlertDialogDescription>
-                Are you sure you want to delete the &quot;{environment.name}
-                &quot; environment? This action cannot be undone.
-              </AlertDialogDescription>
-              <div className="flex justify-end gap-3 mt-6">
-                <AlertDialogCancel>Cancel</AlertDialogCancel>
-                <AlertDialogAction
-                  onClick={async () => {
-                    await removeEnvironmentMutation.mutateAsync({
-                      path: {
-                        project_id: project.id || 0,
-                        env_id: Number(environmentId),
-                      },
-                    })
-                  }}
-                  className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-                  disabled={removeEnvironmentMutation.isPending}
-                >
-                  {removeEnvironmentMutation.isPending
-                    ? 'Deleting...'
-                    : 'Delete Environment'}
-                </AlertDialogAction>
-              </div>
-            </AlertDialogContent>
-          </AlertDialog>
+            confirmLabel="Delete environment"
+            resourceType="environment"
+            resourceName={environment.name}
+            consequences="All configurations, deployments, and data associated with it are removed."
+            isPending={removeEnvironmentMutation.isPending}
+            onConfirm={() =>
+              removeEnvironmentMutation.mutate({
+                path: {
+                  project_id: project.id || 0,
+                  env_id: Number(environmentId),
+                },
+              })
+            }
+          />
         </div>
       </SettingsSection>
     </div>

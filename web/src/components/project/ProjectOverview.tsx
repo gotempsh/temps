@@ -10,25 +10,41 @@ import type {
 } from '@/api/client'
 import {
   containerMetricsGetHistoryOptions,
+  containerMetricsGetHistoryQueryKey,
   getApiRoutesOptions,
+  getApiRoutesQueryKey,
   getApiTimeseriesOptions,
+  getApiTimeseriesQueryKey,
   getEnvironmentsOptions,
   getErrorDashboardStatsOptions,
+  getErrorDashboardStatsQueryKey,
   getHourlyVisitsOptions,
+  getHourlyVisitsQueryKey,
+  getLastDeploymentQueryKey,
+  getProjectDeploymentsQueryKey,
   getUniqueCountsOptions,
+  getUniqueCountsQueryKey,
   hasAnalyticsEventsOptions,
+  hasAnalyticsEventsQueryKey,
   listContainerHistoryOptions,
+  listContainerHistoryQueryKey,
   listErrorGroupsOptions,
+  listErrorGroupsQueryKey,
   queryTraceSummariesOptions,
+  queryTraceSummariesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
 import { VisitorSparkline } from '@/components/dashboard/VisitorSparkline'
 import { LastDeployment } from '@/components/deployments/LastDeployment'
 import { RecentDeployments } from '@/components/deployments/RecentDeployments'
 import { ProjectFailureBanner } from '@/components/project/ProjectFailureBanner'
+import { ClusterDnsStaleBanner } from '@/components/settings/ClusterDnsCoverage'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix, sameWindow } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
@@ -36,27 +52,34 @@ import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summa
 import { useQueries, useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
-import { useMemo } from 'react'
+import { useMemo, useReducer } from 'react'
 import { Link } from 'react-router'
 import { formatAxisNumber } from '@/lib/chart-axis-ticks'
 import { PROJECT_TOUR_EVENT } from './ProjectTour'
+import { errorRatePoints, errorRateTone } from './error-rate-chart'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface ProjectOverviewProps {
   project: ProjectResponse
   lastDeployment?: DeploymentResponse
+  /** Environment whose health to show; defaults to the first one returned. */
+  environmentId?: number
 }
 
 export function ProjectOverview({
   project,
   lastDeployment,
+  environmentId,
 }: ProjectOverviewProps) {
-  const { startDate, endDate } = useMemo(
-    () => ({
+  // The last 24 hours, moved to now by Refresh.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const { startDate, endDate } = useMemo(() => {
+    void windowMoves
+    return {
       startDate: subDays(new Date(), 1),
       endDate: new Date(),
-    }),
-    []
-  )
+    }
+  }, [windowMoves])
 
   const analyticsCapabilityQuery = useQuery({
     ...hasAnalyticsEventsOptions({ path: { project_id: project.id } }),
@@ -68,18 +91,19 @@ export function ProjectOverview({
     end_date: endDate.toISOString(),
   }
 
-  const visitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'visitors'
-      ),
-    }),
+  const visitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'visitors'
+    ),
+  })
+  const visitorsQuery = useWindowQuery({
+    ...visitorsOptions,
     enabled: analyticsEnabled,
   })
 
-  const pageViewsQuery = useQuery({
+  const pageViewsQuery = useWindowQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
         project.id,
@@ -90,18 +114,19 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const returningVisitorsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'returning_visitors'
-      ),
-    }),
+  const returningVisitorsOptions = getUniqueCountsOptions({
+    ...buildProjectAnalyticsCountRequest(
+      project.id,
+      analyticsWindow,
+      'returning_visitors'
+    ),
+  })
+  const returningVisitorsQuery = useWindowQuery({
+    ...returningVisitorsOptions,
     enabled: analyticsEnabled,
   })
 
-  const hourlyVisitorsQuery = useQuery({
+  const hourlyVisitorsQuery = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: { project_id: project.id },
       query: { ...analyticsWindow, aggregation_level: 'visitors' },
@@ -113,7 +138,7 @@ export function ProjectOverview({
     data: errorStats,
     isPending: isLoadingErrors,
     isError: hasErrorStatsError,
-  } = useQuery({
+  } = useWindowQuery({
     ...getErrorDashboardStatsOptions({
       query: {
         start_time: startDate.toISOString(),
@@ -125,7 +150,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiTrafficQuery = useQuery({
+  const apiTrafficQuery = useWindowQuery({
     ...getApiTimeseriesOptions({
       path: { project_id: project.id },
       query: {
@@ -136,7 +161,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const apiRoutesQuery = useQuery({
+  const apiRoutesQuery = useWindowQuery({
     ...getApiRoutesOptions({
       path: { project_id: project.id },
       query: {
@@ -149,7 +174,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const recentErrorsQuery = useQuery({
+  const recentErrorsQuery = useWindowQuery({
     ...listErrorGroupsOptions({
       path: { project_id: project.id },
       query: {
@@ -164,7 +189,7 @@ export function ProjectOverview({
     enabled: !!project.id,
   })
 
-  const tracesQuery = useQuery({
+  const tracesQuery = useWindowQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
@@ -202,14 +227,47 @@ export function ProjectOverview({
   const recentErrors = recentErrorsQuery.data?.data ?? []
   const visitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
-  const returningVisitorRate =
-    visitors > 0 ? (returningVisitors / visitors) * 100 : 0
+  // A share of one window's visitors, never the new window's returning
+  // visitors over the previous window's visitors while they load.
+  const returningVisitorRate = !sameWindow(
+    [visitorsOptions.queryKey, visitorsQuery],
+    [returningVisitorsOptions.queryKey, returningVisitorsQuery]
+  )
+    ? undefined
+    : visitors > 0
+      ? (returningVisitors / visitors) * 100
+      : 0
 
   return (
     <>
+      <PageHeader
+        title="Overview"
+        actions={
+          <RefreshButton
+            // Every query the cards show; only those on screen refetch.
+            queryKeys={[
+              queryKeyPrefix(getProjectDeploymentsQueryKey),
+              // The latest-deployment card's data comes from the project page.
+              getLastDeploymentQueryKey({ path: { id: project.id } }),
+              queryKeyPrefix(hasAnalyticsEventsQueryKey),
+              queryKeyPrefix(getUniqueCountsQueryKey),
+              queryKeyPrefix(getHourlyVisitsQueryKey),
+              queryKeyPrefix(getErrorDashboardStatsQueryKey),
+              queryKeyPrefix(getApiTimeseriesQueryKey),
+              queryKeyPrefix(getApiRoutesQueryKey),
+              queryKeyPrefix(listErrorGroupsQueryKey),
+              queryKeyPrefix(queryTraceSummariesQueryKey),
+              queryKeyPrefix(listContainerHistoryQueryKey),
+              queryKeyPrefix(containerMetricsGetHistoryQueryKey),
+            ]}
+            onRefresh={moveWindow}
+          />
+        }
+      />
       <ProjectFailureBanner project={project} lastDeployment={lastDeployment} />
+      <ClusterDnsStaleBanner projectId={project.id} />
       <div className="@container/overview">
-        <div className="grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <Card className="@5xl/overview:col-span-3">
             <CardHeader className="flex flex-row items-start justify-between gap-4 pb-2">
               <div className="min-w-0">
@@ -281,23 +339,30 @@ export function ProjectOverview({
                             : 'text-muted-foreground'
                         )}
                       >
-                        {formatPercent(apiTraffic?.overall_error_rate)} overall
+                        {(apiTraffic?.total_requests ?? 0) > 0
+                          ? `${formatPercent(apiTraffic?.overall_error_rate)} overall`
+                          : 'No requests'}
                       </p>
                     </div>
                     <ThresholdLineChart
-                      data={trafficHealthData}
+                      data={errorRatePoints(
+                        trafficHealthData,
+                        apiTraffic?.total_requests
+                      )}
                       xKey="time"
                       series={{
                         dataKey: 'errorRate',
                         label: 'Error rate',
-                        tone: 'poor',
+                        tone: errorRateTone(apiTraffic?.overall_error_rate),
                       }}
                       height={190}
                       yTickFormatter={(value, ctx) =>
                         `${formatAxisNumber(value, ctx.decimals)}%`
                       }
                       tooltipValueFormatter={(value) => `${value.toFixed(1)}%`}
-                      emptyMessage={<CompactEmpty label="No error samples" />}
+                      emptyMessage={
+                        <CompactEmpty label="No requests in this window" />
+                      }
                     />
                   </div>
                 </div>
@@ -330,11 +395,14 @@ export function ProjectOverview({
           />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
-          <EnvironmentHealthCard project={project} />
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
+          <EnvironmentHealthCard
+            project={project}
+            environmentId={environmentId}
+          />
         </div>
 
-        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+        <div className="mt-4 grid grid-cols-1 gap-4 @5xl/overview:grid-cols-5">
           <TopRoutesCard
             projectSlug={project.slug}
             routes={topRoutes}
@@ -372,14 +440,14 @@ export function ProjectOverview({
           className="inline-flex items-center gap-1.5 text-sm text-muted-foreground hover:text-foreground"
         >
           <Sparkles className="size-4 shrink-0" />
-          Take a tour of your project
+          Take a tour of your service
         </button>
       </div>
     </>
   )
 }
 
-function VisitorAnalyticsCard({
+export function VisitorAnalyticsCard({
   projectSlug,
   capabilityPending,
   capabilityError,
@@ -399,7 +467,8 @@ function VisitorAnalyticsCard({
   visitors: number
   pageViews: number
   returningVisitors: number
-  returningRate: number
+  /** Undefined while the two counts are of different windows. */
+  returningRate: number | undefined
   hourlyVisitors: EventTimeline[]
   loading: boolean
   error: boolean
@@ -435,7 +504,7 @@ function VisitorAnalyticsCard({
               <p className="font-medium">Add browser analytics</p>
               <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
                 Track visitors, page views, and returning activity from this
-                project.
+                service.
               </p>
             </div>
             <Button variant="outline" size="sm" asChild>
@@ -448,6 +517,28 @@ function VisitorAnalyticsCard({
           <Skeleton className="h-52 w-full" />
         ) : error ? (
           <SignalError message="Visitor analytics is temporarily unavailable." />
+        ) : visitors === 0 && pageViews === 0 ? (
+          // Set up (events arrived at some point), just quiet right now: a
+          // flat chart and four zeros would say less than this does.
+          <div className="flex flex-col gap-2 rounded-md border border-dashed p-4 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="font-medium">No visitors in the last 24 hours</p>
+              <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
+                Analytics has received events before. If you expected visitors
+                by now, check that the snippet is still installed.
+              </p>
+            </div>
+            <Button
+              variant="outline"
+              size="sm"
+              className="shrink-0 self-start sm:self-auto"
+              asChild
+            >
+              <Link to={`/projects/${projectSlug}/analytics/setup`}>
+                Check setup
+              </Link>
+            </Button>
+          </div>
         ) : (
           <div className="flex flex-col gap-4">
             <VisitorSparkline
@@ -470,7 +561,11 @@ function VisitorAnalyticsCard({
               />
               <AnalyticsValue
                 label="Returning rate"
-                value={`${returningRate.toFixed(0)}%`}
+                value={
+                  returningRate === undefined
+                    ? '—'
+                    : `${returningRate.toFixed(0)}%`
+                }
               />
             </dl>
           </div>
@@ -480,14 +575,23 @@ function VisitorAnalyticsCard({
   )
 }
 
-function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
+function EnvironmentHealthCard({
+  project,
+  environmentId,
+}: {
+  project: ProjectResponse
+  environmentId?: number
+}) {
   const environmentsQuery = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: project.id } }),
     enabled: !!project.id,
   })
   // Same "first environment" convention environment-navigation.ts uses when
   // no environment is explicitly selected in the URL.
-  const environment = environmentsQuery.data?.[0]
+  const environment =
+    (environmentId !== undefined
+      ? environmentsQuery.data?.find((env) => env.id === environmentId)
+      : undefined) ?? environmentsQuery.data?.[0]
 
   const historyQuery = useQuery({
     ...listContainerHistoryOptions({
@@ -538,7 +642,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
     () =>
       sumMetricSeries(memQueries.map((q) => q.data ?? [])).map((point) => ({
         time: format(new Date(point.time), 'HH:mm'),
-        value: point.value / (1024 * 1024),
+        value: point.value == null ? null : point.value / (1024 * 1024),
       })),
     [memQueries]
   )
@@ -553,8 +657,10 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
         q.isError &&
         metricsErrorDetail(q.error).toLowerCase().includes('not enabled')
     )
-  const hasCpuTrend = cpuData.length >= 4
-  const hasMemTrend = memData.length >= 4
+  const cpuSamples = cpuData.filter((p) => p.value != null).length
+  const memSamples = memData.filter((p) => p.value != null).length
+  const hasCpuTrend = cpuSamples >= 4
+  const hasMemTrend = memSamples >= 4
 
   return (
     <Card className="@5xl/overview:col-span-5">
@@ -581,7 +687,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
         {isLoading ? (
           <Skeleton className="h-52 w-full" />
         ) : !environment ? (
-          <SignalError message="No environments found for this project." />
+          <SignalError message="No environments found for this service." />
         ) : notConfigured ? (
           <div className="flex h-52 flex-col items-start justify-center gap-3 rounded-md border border-dashed p-5">
             <div>
@@ -609,6 +715,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   xKey="time"
                   series={{ dataKey: 'value', label: 'CPU', tone: 'neutral' }}
                   height={150}
+                  connectNulls={false}
                   yTickFormatter={(value, ctx) =>
                     `${formatAxisNumber(value, ctx.decimals)}%`
                   }
@@ -616,7 +723,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   emptyMessage={<CompactEmpty label="No CPU samples" />}
                 />
               ) : (
-                <SparseTrendState samples={cpuData.length} label="CPU" />
+                <SparseTrendState samples={cpuSamples} label="CPU" />
               )}
             </div>
             <div className="min-w-0">
@@ -631,6 +738,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                     tone: 'neutral',
                   }}
                   height={150}
+                  connectNulls={false}
                   yTickFormatter={(value, ctx) =>
                     `${formatAxisNumber(value, ctx.decimals)} MB`
                   }
@@ -638,7 +746,7 @@ function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
                   emptyMessage={<CompactEmpty label="No memory samples" />}
                 />
               ) : (
-                <SparseTrendState samples={memData.length} label="memory" />
+                <SparseTrendState samples={memSamples} label="memory" />
               )}
             </div>
           </div>
@@ -702,7 +810,7 @@ function TopRoutesCard({
         ) : routes.length === 0 ? (
           <CompactListEmpty
             title="No paths recorded"
-            detail="Routes appear here as soon as the project receives traffic."
+            detail="Routes appear here as soon as the service receives traffic."
           />
         ) : (
           <div>
@@ -906,14 +1014,20 @@ function SignalError({ message }: { message: string }) {
   )
 }
 
-/** Sums same-timestamp points across containers into one aggregate series. */
+/** Sums same-timestamp points across containers into one aggregate series.
+ *  A bucket no container reported a sample in stays `null` (a gap), rather
+ *  than reading as 0 or vanishing from the axis. */
 function sumMetricSeries(
-  seriesList: { time: string; value: number }[][]
-): { time: string; value: number }[] {
-  const sums = new Map<string, number>()
+  seriesList: { time: string; value?: number | null }[][]
+): { time: string; value: number | null }[] {
+  const sums = new Map<string, number | null>()
   for (const points of seriesList) {
     for (const point of points) {
-      sums.set(point.time, (sums.get(point.time) ?? 0) + point.value)
+      const previous = sums.get(point.time) ?? null
+      sums.set(
+        point.time,
+        point.value == null ? previous : (previous ?? 0) + point.value
+      )
     }
   }
   return Array.from(sums.entries())

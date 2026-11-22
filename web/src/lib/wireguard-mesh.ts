@@ -12,6 +12,7 @@ import type {
   WireguardMeshNodeStatus,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
+import { asRootTemps, shellWord } from '@/lib/worker-join-script'
 
 /** How a worker reaches this control plane when it joins. */
 export type JoinPath = 'private' | 'internet'
@@ -38,7 +39,80 @@ export function joinCommand(
 ): string {
   const address =
     path === 'internet' ? '<worker-public-ip>' : '<worker-private-ip>'
-  return `temps join ${url} ${token ?? '<join-token>'} --private-address ${address}`
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'} --private-address ${address}`
+  )
+}
+
+/**
+ * The join for a worker with no public address (ADR 055): it sends its
+ * WireGuard key over HTTPS and dials this server, so it needs no address.
+ */
+export function outboundJoinCommand(url: string, token: string | null): string {
+  return asRootTemps(
+    `join ${shellWord(url)} ${token ? shellWord(token) : '<join-token>'}`
+  )
+}
+
+/**
+ * Whether to offer the outbound-only join (ADR 055): the worker must reach
+ * the join URL over HTTPS (`temps join` refuses plain HTTP there, because
+ * the answer is what the worker trusts from then on) and dial this server's
+ * mesh endpoint, so both have to be reachable from the internet. Otherwise
+ * the page keeps the joins that need a worker address.
+ */
+export function offersOutboundJoin(
+  mesh: Pick<WireguardMeshStatusResponse, 'control_plane'> | undefined,
+  url: string
+): boolean {
+  const controlPlane = mesh?.control_plane
+  return (
+    joinUrlIsHttps(url) &&
+    joinUrlReachableFromOutside(url) &&
+    !!controlPlane?.endpoint?.trim() &&
+    !controlPlane.endpoint_is_private
+  )
+}
+
+/** Whether `url` is an `https://` URL. */
+export function joinUrlIsHttps(url: string): boolean {
+  try {
+    return new URL(url).protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+/**
+ * How other workers reach a worker that joined outbound only (it publishes
+ * no endpoint): through the mesh hub when one is chosen, otherwise not at
+ * all until one is (ADR 048 D4).
+ */
+export function outboundPeerReach(
+  hub: Pick<WireguardMeshStatusResponse, 'hub'>['hub']
+): { via: string } | { needsHub: true } {
+  const target = hub?.target
+  if (!target || target.kind === 'none') return { needsHub: true }
+  return {
+    via: target.kind === 'control_plane' ? 'this server' : hub.name,
+  }
+}
+
+/**
+ * The UDP port this server accepts the mesh on, as workers dial it: the port
+ * of its published endpoint, which `temps serve --wg-endpoint` may set to a
+ * forwarded port that differs from the listen port. Falls back to the
+ * listen port when there is no endpoint or it cannot be read.
+ */
+export function controlPlaneMeshPort(
+  mesh: Pick<WireguardMeshStatusResponse, 'listen_port' | 'control_plane'>
+): number {
+  const endpoint = mesh.control_plane?.endpoint?.trim()
+  const match = endpoint?.match(/:(\d{1,5})$/)
+  const port = match ? Number(match[1]) : NaN
+  return Number.isInteger(port) && port > 0 && port <= 65535
+    ? port
+    : mesh.listen_port
 }
 
 /** Label and tone for a node's mesh connection. */
@@ -184,7 +258,9 @@ export function pairingProgress(pairing: NodePairingResponse): {
       return {
         label: 'Registering',
         tone: 'ok',
-        hint: 'The node answered and is registering over the mesh.',
+        hint: pairing.node_endpoint
+          ? 'The node answered and is registering over the mesh.'
+          : 'The node sent its key and is registering over the mesh.',
       }
     case 'completed':
       return { label: 'Joined', tone: 'ok' }
@@ -203,7 +279,7 @@ export function pairingProgress(pairing: NodePairingResponse): {
 
 /**
  * The steps of adding a server over SSH, in order, as the server names them
- * (`crates/temps-deployments/src/services/node_ssh.rs` and, for the last one,
+ * (`crates/temps-nodes/src/services/node_ssh.rs` and, for the last one,
  * `node_ssh_enrollment.rs`). Before the first step the server reports
  * `queued`, and `done` once it succeeded.
  */

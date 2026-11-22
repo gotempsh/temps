@@ -45,6 +45,7 @@ pub use console_proxy::{
     ConsoleDispatchSlot, ConsoleDispatchTarget, ConsoleOidcSink, ConsoleProxyWorker,
     ConsoleRouterHandle, NoopConsoleOidcSink,
 };
+pub use heartbeat::{ConsoleLogoutOutcome, ConsoleLogoutSink};
 pub use link::{
     CloudFallbackReason, CloudLink, CloudTelemetryFallback, EnrollmentKind, FirstLinkEnrollment,
     FlushOutcome, OutboxShipOutcome, SubmissionScope, SubmissionScopeBusy,
@@ -87,6 +88,7 @@ use temps_cloud_protocol::{
     BackupLifecycleEventAccepted, BackupLifecycleEventRequest, EnrollRequest, EnrollResponse,
     IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse, ManagedAiCapability,
     ManagedAiChatRequest, ManagedAiChatResponse, ManagedBackupCapability,
+    ManagedBackupScopedCredentials, ManagedBackupScopedCredentialsRequest,
     ManagedNotificationAccepted, ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest,
     SpanRecord, TelemetryBatch, WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest,
     WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
@@ -249,6 +251,11 @@ pub enum CloudError {
 
     #[error("Backend rejected the payload: {detail}")]
     Rejected { detail: String },
+
+    /// The backend does not serve `route` (an older Cloud). Not transient:
+    /// the caller says the feature is not available yet.
+    #[error("Managed backend does not serve {route} (it answered {status})")]
+    RouteUnavailable { route: &'static str, status: u16 },
 
     #[error("Backend acknowledgement did not match submission {submission_id}: {detail}")]
     InvalidAcknowledgement { submission_id: Uuid, detail: String },
@@ -423,6 +430,35 @@ impl CloudClient {
                 reason: error.to_string(),
                 spooled_bytes: 0,
             })?;
+        decode_managed_response(response).await
+    }
+
+    /// Mint a credential for one worker job, scoped to prefixes of the
+    /// managed bucket (ADR-102). A Cloud without the route answers 404 or
+    /// 405, reported as [`CloudError::RouteUnavailable`].
+    pub async fn managed_backup_scoped_credentials(
+        &self,
+        token: &str,
+        request: &ManagedBackupScopedCredentialsRequest,
+    ) -> Result<ManagedBackupScopedCredentials, CloudError> {
+        const ROUTE: &str = "/v1/backups/managed/scoped-credentials";
+        let response = self
+            .http
+            .post(self.backend.endpoint(ROUTE))
+            .bearer_auth(token)
+            .json(request)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: error.without_url().to_string(),
+                spooled_bytes: 0,
+            })?;
+        if matches!(response.status().as_u16(), 404 | 405) {
+            return Err(CloudError::RouteUnavailable {
+                route: ROUTE,
+                status: response.status().as_u16(),
+            });
+        }
         decode_managed_response(response).await
     }
 

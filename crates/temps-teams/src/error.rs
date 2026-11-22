@@ -82,6 +82,11 @@ pub enum TeamError {
         reason: String,
     },
 
+    /// Revoking the Temps-login ingress grants an access change
+    /// invalidates failed; the access change was rolled back with it.
+    #[error("Failed to revoke the ingress login grants of {scope}: {reason}")]
+    IngressGrantRevocation { scope: String, reason: String },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 }
@@ -135,7 +140,9 @@ impl From<TeamError> for Problem {
                     .with_detail("Could not verify project access; please try again")
             }
 
-            TeamError::Database(_) | TeamError::CorruptStoredRole { .. } => {
+            TeamError::Database(_)
+            | TeamError::CorruptStoredRole { .. }
+            | TeamError::IngressGrantRevocation { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())

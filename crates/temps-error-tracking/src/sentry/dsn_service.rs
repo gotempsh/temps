@@ -4,11 +4,12 @@
 use chrono::Utc;
 use moka::future::Cache;
 use rand::RngExt;
+use sea_orm::sea_query::Expr;
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use temps_entities::{project_dsns, projects};
+use temps_entities::{deployments, environments, project_dsns, projects};
 
 use super::types::{ParsedDSN, ProjectDSN, SentryIngesterError};
 
@@ -546,10 +547,10 @@ impl DSNService {
             .await?;
 
         // Parse base URL to get host
-        let (protocol, host_with_port) = if base_url.starts_with("https://") {
-            ("https", base_url.strip_prefix("https://").unwrap())
-        } else if base_url.starts_with("http://") {
-            ("http", base_url.strip_prefix("http://").unwrap())
+        let (protocol, host_with_port) = if let Some(rest) = base_url.strip_prefix("https://") {
+            ("https", rest)
+        } else if let Some(rest) = base_url.strip_prefix("http://") {
+            ("http", rest)
         } else {
             ("https", base_url)
         };
@@ -624,19 +625,51 @@ fn active_dsn_query() -> sea_orm::Select<project_dsns::Entity> {
         .filter(project_dsns::Column::IsActive.eq(true))
         .inner_join(projects::Entity)
         .filter(projects::Column::IsDeleted.eq(false))
+        .left_join(environments::Entity)
+        .left_join(deployments::Entity)
+        .filter(
+            sea_orm::Condition::any()
+                .add(project_dsns::Column::EnvironmentId.is_null())
+                .add(
+                    sea_orm::Condition::all()
+                        .add(
+                            Expr::col((environments::Entity, environments::Column::ProjectId))
+                                .equals((project_dsns::Entity, project_dsns::Column::ProjectId)),
+                        )
+                        .add(environments::Column::DeletedAt.is_null()),
+                ),
+        )
+        .filter(
+            sea_orm::Condition::any()
+                .add(project_dsns::Column::DeploymentId.is_null())
+                .add(
+                    sea_orm::Condition::all()
+                        .add(
+                            Expr::col((deployments::Entity, deployments::Column::ProjectId))
+                                .equals((project_dsns::Entity, project_dsns::Column::ProjectId)),
+                        )
+                        .add(
+                            sea_orm::Condition::any()
+                                .add(project_dsns::Column::EnvironmentId.is_null())
+                                .add(
+                                    Expr::col((
+                                        deployments::Entity,
+                                        deployments::Column::EnvironmentId,
+                                    ))
+                                    .equals((
+                                        project_dsns::Entity,
+                                        project_dsns::Column::EnvironmentId,
+                                    )),
+                                ),
+                        ),
+                ),
+        )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, projects};
-
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
-    }
 
     #[test]
     fn build_dsn_preserves_scheme_host_and_port() {
@@ -690,7 +723,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_generate_project_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -716,7 +749,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_parse_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -732,7 +765,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_validate_dsn_auth() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -761,7 +794,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_revoke_dsn() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
 
@@ -799,7 +832,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_if_epoch_unchanged_skips_insert_when_epoch_moved_during_the_query() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -822,7 +855,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn cache_if_epoch_unchanged_caches_when_nothing_raced_it() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 
@@ -841,7 +874,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn revoke_and_rotate_bump_the_cache_epoch() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -876,7 +909,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalidate_all_cached_scopes_bumps_the_epoch_and_clears_the_cache() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = DSNService::new(db);
 

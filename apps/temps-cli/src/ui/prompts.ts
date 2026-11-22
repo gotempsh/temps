@@ -24,6 +24,8 @@ export interface PasswordPromptOptions {
   message: string
   mask?: string
   validate?: (value: string) => boolean | string | Promise<boolean | string>
+  /** Render the prompt on stderr so stdout stays machine-readable (`--json`). */
+  toStderr?: boolean
 }
 
 export interface ConfirmPromptOptions {
@@ -66,18 +68,31 @@ export async function promptText(options: TextPromptOptions): Promise<string> {
 }
 
 export async function promptPassword(options: PasswordPromptOptions): Promise<string> {
-  const result = await password({
-    message: options.message,
-    mask: options.mask ?? '*',
-    validate: options.validate,
-    theme: {
-      prefix: colors.primary('?'),
+  const result = await password(
+    {
+      message: options.message,
+      mask: options.mask ?? '*',
+      validate: options.validate,
+      theme: {
+        prefix: colors.primary('?'),
+      },
     },
-  })
+    options.toStderr ? { output: process.stderr } : undefined
+  )
   return result
 }
 
 export async function promptConfirm(options: ConfirmPromptOptions): Promise<boolean> {
+  // Without a terminal on stdin the prompt can never be answered: Bun would
+  // exit 0 with nothing done and Node would report a force-closed prompt. Fail
+  // loudly so a pipeline step that skipped confirmation is not reported as a
+  // success. Only stdin has to be a terminal; output may be piped.
+  if (!process.stdin.isTTY) {
+    throw new Error(
+      `Cannot ask "${options.message}" because stdin is not an interactive terminal. ` +
+        'Run the command from a terminal, or pass --yes if the command supports it.'
+    )
+  }
   const result = await confirm({
     message: options.message,
     default: options.default ?? false,
@@ -100,16 +115,26 @@ export async function promptSelect<T = string>(options: SelectPromptOptions<T>):
   return result
 }
 
-export async function promptCheckbox<T = string>(options: CheckboxPromptOptions<T>): Promise<T[]> {
-  const result = await checkbox({
-    message: options.message,
-    choices: options.choices,
-    required: options.required,
-    // Note: validate is not passed as inquirer expects different signature
-    theme: {
-      prefix: colors.primary('?'),
+/**
+ * `context` lets a caller prompt on another stream than stdin, e.g. the
+ * controlling terminal when stdin carries piped data.
+ */
+export async function promptCheckbox<T = string>(
+  options: CheckboxPromptOptions<T>,
+  context?: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream }
+): Promise<T[]> {
+  const result = await checkbox(
+    {
+      message: options.message,
+      choices: options.choices,
+      required: options.required,
+      // Note: validate is not passed as inquirer expects different signature
+      theme: {
+        prefix: colors.primary('?'),
+      },
     },
-  })
+    context
+  )
   return result
 }
 

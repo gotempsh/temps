@@ -55,7 +55,7 @@ const LEVEL_COLORS: Record<LiveLogLevel, string> = {
   WARN: 'bg-yellow-500/15 text-yellow-700 dark:text-yellow-400 border-yellow-500/20',
   INFO: 'bg-blue-500/15 text-blue-700 dark:text-blue-400 border-blue-500/20',
   DEBUG: 'bg-zinc-500/15 text-zinc-700 dark:text-zinc-400 border-zinc-500/20',
-  TRACE: 'bg-zinc-400/15 text-zinc-500 dark:text-zinc-500 border-zinc-400/20',
+  TRACE: 'bg-zinc-400/15 text-zinc-600 dark:text-zinc-400 border-zinc-400/20',
 }
 
 interface ColumnVisibility {
@@ -196,6 +196,7 @@ export function ContainerLogsViewer({
     filteredLogs,
     connectionStatus,
     errorMessage,
+    retry,
     searchTerm,
     selectedLevels,
     currentMatchIndex,
@@ -259,12 +260,12 @@ export function ContainerLogsViewer({
             className={cn(
               'flex items-center gap-1.5 text-xs',
               connectionStatus === 'connected'
-                ? 'text-emerald-600 dark:text-emerald-400'
+                ? 'text-emerald-700 dark:text-emerald-400'
                 : connectionStatus === 'complete'
                   ? 'text-muted-foreground'
                   : connectionStatus === 'connecting'
-                    ? 'text-yellow-600 dark:text-yellow-400'
-                    : 'text-red-600 dark:text-red-400'
+                    ? 'text-muted-foreground'
+                    : 'text-red-700 dark:text-red-400'
             )}
           >
             <span
@@ -277,7 +278,7 @@ export function ContainerLogsViewer({
                   : connectionStatus === 'complete'
                     ? 'bg-muted-foreground'
                     : connectionStatus === 'connecting'
-                      ? 'bg-yellow-500'
+                      ? 'bg-muted-foreground'
                       : 'bg-red-500'
               )}
             />
@@ -389,7 +390,7 @@ export function ContainerLogsViewer({
                   aria-label="Toggle columns"
                 >
                   <Columns3 className="h-3.5 w-3.5" />
-                  <span className="hidden sm:inline text-xs">Columns</span>
+                  <span className="max-sm:sr-only text-xs">Columns</span>
                 </Button>
               </DropdownMenuTrigger>
               <DropdownMenuContent align="end" className="w-44">
@@ -437,7 +438,7 @@ export function ContainerLogsViewer({
                   ) : (
                     <Pause className="h-3.5 w-3.5" />
                   )}
-                  <span className="hidden sm:inline text-xs">
+                  <span className="max-sm:sr-only text-xs">
                     {paused ? 'Resume' : 'Pause'}
                   </span>
                   {paused && bufferedCount > 0 && (
@@ -497,7 +498,12 @@ export function ContainerLogsViewer({
         {errorMessage && (
           <Alert className="flex-shrink-0 mx-4 mt-2 border-destructive">
             <AlertCircle className="h-4 w-4" />
-            <AlertDescription>{errorMessage}</AlertDescription>
+            <AlertDescription>
+              {errorMessage}
+              <Button variant="outline" size="sm" onClick={retry}>
+                Retry
+              </Button>
+            </AlertDescription>
           </Alert>
         )}
 

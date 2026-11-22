@@ -12,15 +12,37 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::environment_service::EnvironmentService;
+use crate::services::environment_teardown::EnvironmentTeardownService;
+use crate::services::ingress_service::IngressService;
+use crate::services::preview_cleanup::PreviewCleanupService;
 use crate::services::secret_service::SecretService;
 use crate::EnvVarService;
 
 /// Environments Plugin for managing environment lifecycle and configurations
-pub struct EnvironmentsPlugin;
+pub struct EnvironmentsPlugin {
+    local_workloads_enabled: bool,
+}
 
 impl EnvironmentsPlugin {
+    fn environment_teardown(context: &PluginContext) -> Arc<EnvironmentTeardownService> {
+        Arc::new(EnvironmentTeardownService::new(
+            context.require_service::<EnvironmentService>(),
+            context.require_service::<dyn temps_core::DeploymentCanceller>(),
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>(),
+        ))
+    }
+
     pub fn new() -> Self {
-        Self
+        Self {
+            local_workloads_enabled: true,
+        }
+    }
+
+    /// Whether the control plane itself runs workloads, for what's reported about
+    /// where an environment's replicas can go.
+    pub fn with_local_workloads(mut self, enabled: bool) -> Self {
+        self.local_workloads_enabled = enabled;
+        self
     }
 }
 
@@ -48,7 +70,8 @@ impl TempsPlugin for EnvironmentsPlugin {
             // Create EnvironmentService with queue service
             let environment_service = Arc::new(
                 EnvironmentService::new(db.clone(), config_service)
-                    .with_queue_service(queue_service),
+                    .with_queue_service(queue_service)
+                    .with_local_workloads(self.local_workloads_enabled),
             );
             context.register_service(environment_service);
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
@@ -57,7 +80,28 @@ impl TempsPlugin for EnvironmentsPlugin {
             context.register_service(env_var_service);
             let secret_service = Arc::new(SecretService::new(db.clone(), encryption_service));
             context.register_service(secret_service);
+            context.register_service(Arc::new(IngressService::new(db.clone())));
             tracing::debug!("Environments plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Built here, not in `register_services`: the deployment canceller
+            // and container cleaner are registered by the deployments plugin.
+            let cleanup = Arc::new(PreviewCleanupService::new(
+                Self::environment_teardown(context),
+                context.require_service::<dyn temps_core::AuditLogger>(),
+            ));
+            let receiver = context
+                .require_service::<dyn temps_core::JobQueue>()
+                .subscribe();
+            tokio::spawn(cleanup.run(receiver));
+            tracing::debug!("Preview cleanup listening for closed branches");
             Ok(())
         })
     }
@@ -67,9 +111,7 @@ impl TempsPlugin for EnvironmentsPlugin {
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let env_var_service = context.require_service::<EnvVarService>();
         let secret_service = context.require_service::<SecretService>();
-        let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
-        let deployment_container_cleaner =
-            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
+        let environment_teardown = Self::environment_teardown(context);
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
             context.get_service::<dyn temps_core::ProjectEnvVarsProvider>();
@@ -80,13 +122,20 @@ impl TempsPlugin for EnvironmentsPlugin {
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
+        let ingress_state = Arc::new(crate::handlers::ingress::IngressAppState {
+            ingress_service: context.require_service::<IngressService>(),
+            environment_service: environment_service.clone(),
+            cookie_crypto: context.require_service::<temps_core::CookieCrypto>(),
+            audit_service: audit_service.clone(),
+            project_access_checker: project_access_checker.clone(),
+        });
+
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
             env_var_service,
             secret_service,
             audit_service,
-            deployment_service,
-            deployment_container_cleaner,
+            environment_teardown,
             on_demand_waker,
             integration_env_provider,
             telemetry,
@@ -94,12 +143,16 @@ impl TempsPlugin for EnvironmentsPlugin {
             sensitive_action_authorizer,
         );
 
-        let routes = crate::handlers::configure_routes().with_state(app_state);
+        let routes = crate::handlers::configure_routes()
+            .with_state(app_state)
+            .merge(crate::handlers::ingress::configure_routes().with_state(ingress_state));
         Some(PluginRoutes::new(routes))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<crate::handlers::ApiDoc as OpenApiTrait>::openapi())
+        let mut doc = <crate::handlers::ApiDoc as OpenApiTrait>::openapi();
+        doc.merge(<crate::handlers::ingress::IngressApiDoc as OpenApiTrait>::openapi());
+        Some(doc)
     }
 }
 
@@ -115,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_environments_plugin_default() {
-        let environments_plugin = EnvironmentsPlugin;
+        let environments_plugin = EnvironmentsPlugin::new();
         assert_eq!(environments_plugin.name(), "environments");
     }
 }

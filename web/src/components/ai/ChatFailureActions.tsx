@@ -5,7 +5,11 @@ import { useState } from 'react'
 import { Link } from 'react-router'
 import { importLocalAiProviderCredential, listAiProviders } from '@/api/client'
 import { Button } from '@/components/ui/button'
-import { canRefreshLocalCredential } from './chat-failure-recovery'
+import {
+  canRefreshLocalCredential,
+  chatProviderSettingsHref,
+  chatProvidersHref,
+} from './chat-failure-recovery'
 
 export function ChatFailureActions({
   code,
@@ -73,13 +77,13 @@ export function ChatFailureActions({
           </Button>
         )}
         <Button size="sm" variant="outline" asChild>
-          <Link to={`/agent-sandbox/providers/${encodeURIComponent(provider)}`}>
-            Provider settings
-          </Link>
+          <Link to={chatProviderSettingsHref(provider)}>Provider settings</Link>
         </Button>
         {code === 'provider_quota_exhausted' && (
           <Button size="sm" variant="outline" asChild>
-            <Link to="/agent-sandbox/providers">Choose another provider</Link>
+            <Link to={chatProvidersHref(provider)}>
+              Choose another provider
+            </Link>
           </Button>
         )}
         {onRetry && (

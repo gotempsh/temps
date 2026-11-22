@@ -32,6 +32,7 @@ pub mod typed;
 
 pub use preflight::{
     HarnessCheck, HarnessCheckMode, HarnessCheckOverall, HarnessCheckReport, HarnessCheckStatus,
+    HarnessUpdateStatus,
 };
 pub use provider::{
     ModelCapability, ModelCatalogSource, ProviderAuthSource, ProviderCapabilities,
@@ -44,8 +45,8 @@ pub use service::{
     RuntimeProcessSnapshot,
 };
 pub use streaming::{
-    ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
+    ChatImage, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse,
+    ChatTurnStream, ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
     InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, SandboxAttachment,
     SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };

@@ -14,6 +14,7 @@ import { resolveCredentials, describeCredentials, type CredentialFlags } from '.
 import { displayImportPlan } from './plan-display.js'
 import { displayExecuteResult } from './execute-display.js'
 import { runVercelMigrationWizard } from '../migrate/index.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 const VERCEL_SOURCE: ImportSourceInfo = {
   source: 'vercel',
@@ -78,7 +79,7 @@ export function registerImportsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listSourcesAction)
 
-  imports
+  const discoverCommand = imports
     .command('discover')
     .description('Discover workloads from a source')
     .option('-s, --source <source>', 'Import source (coolify, dokploy, caprover, portainer, kubernetes, kamal, docker)')
@@ -89,8 +90,9 @@ export function registerImportsCommands(program: Command): void {
     .option('--deploy-yml <path>', 'Path to config/deploy.yml (kamal source)')
     .option('--json', 'Output in JSON format')
     .action(discoverAction)
+  addCredentialSources(discoverCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
-  imports
+  const planCommand = imports
     .command('plan')
     .description('Discover a source, pick a workload, and show the import plan')
     .option('-s, --source <source>', 'Import source')
@@ -101,8 +103,9 @@ export function registerImportsCommands(program: Command): void {
     .option('--kubeconfig <path>', 'Path to a kubeconfig file (kubernetes source)')
     .option('--deploy-yml <path>', 'Path to config/deploy.yml (kamal source)')
     .action(planAction)
+  addCredentialSources(planCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
-  imports
+  const runCommand = imports
     .command('run')
     .description('Guided end-to-end migration: discover, plan, review, and execute')
     .option('-s, --source <source>', 'Import source (vercel, coolify, dokploy, caprover, portainer, kubernetes, kamal, docker)')
@@ -119,6 +122,7 @@ export function registerImportsCommands(program: Command): void {
     .option('--dry-run', 'Plan only — do not create or deploy anything')
     .option('-y, --yes', 'Skip the confirmation prompt (for automation)')
     .action(runAction)
+  addCredentialSources(runCommand, [{ flag: 'token', what: 'the source API token or admin password' }])
 
   imports
     .command('execute')

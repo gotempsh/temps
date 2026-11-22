@@ -61,19 +61,29 @@ export function toRatePerSecond(
 ): MetricDataPoint[] {
   if (points.length === 0) return [];
   const times = points.map((p) => Date.parse(p.time));
-  const stepFor = (i: number): number => {
-    if (points.length === 1) return fallbackStepSeconds;
-    const here = times[i] ?? NaN;
-    const prev = times[i - 1];
-    const next = times[i + 1];
-    const gap =
-      (i > 0 && prev != null ? here - prev : (next ?? NaN) - here) / 1000;
-    return Number.isFinite(gap) && gap > 0 ? gap : fallbackStepSeconds;
+  const secondsBetween = (a: number, b: number): number | null => {
+    const secs = ((times[b] ?? NaN) - (times[a] ?? NaN)) / 1000;
+    return Number.isFinite(secs) && secs > 0 ? secs : null;
   };
-  return points.map((p, i) => ({
-    time: p.time,
-    value: Math.max(0, p.value) / stepFor(i),
-  }));
+  // Buckets nothing was sampled in come back as `null`. The store diffs each
+  // sampled bucket against the previous *sampled* one, so the first bucket
+  // after a gap carries the whole gap's increase: divide by the time since
+  // that previous sample, not by one bucket width.
+  let previousSample: number | null = null;
+  return points.map((p, i) => {
+    if (p.value == null) return { time: p.time, value: null };
+    const span =
+      previousSample != null
+        ? secondsBetween(previousSample, i)
+        : i + 1 < points.length
+          ? secondsBetween(i, i + 1)
+          : null;
+    previousSample = i;
+    return {
+      time: p.time,
+      value: Math.max(0, p.value) / (span ?? fallbackStepSeconds),
+    };
+  });
 }
 
 /** Whether a metric name is a cumulative counter (mirrors `is_monotonic_counter`). */
@@ -290,7 +300,7 @@ async function serverMetricsAction(options: {
 
   newline();
   header(`${options.metric} — last ${range} on node ${nodeId}`);
-  if (series.length === 0) {
+  if (!series.some((p) => p.value != null)) {
     newline();
     info("No data points in this window.");
     newline();
@@ -306,7 +316,11 @@ async function serverMetricsAction(options: {
         : v.toFixed(2);
   const columns: TableColumn<MetricDataPoint>[] = [
     { header: "Time", accessor: (p) => new Date(p.time).toLocaleString() },
-    { header: cumulative ? "Rate" : "Value", accessor: (p) => fmt(p.value) },
+    {
+      header: cumulative ? "Rate" : "Value",
+      // `null`: no sample in this bucket (the agent or server was down).
+      accessor: (p) => (p.value == null ? "—" : fmt(p.value)),
+    },
   ];
   printTable(series, columns, { style: "minimal" });
   newline();

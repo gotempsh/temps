@@ -25,6 +25,8 @@ Import historical revenue data from a CSV export
 
 Import current subscriptions CSV (e.g., Stripe → Subscriptions → Export)
 
+**Usage:** `revenue import subscriptions <file> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -37,6 +39,8 @@ Import current subscriptions CSV (e.g., Stripe → Subscriptions → Export)
 #### `revenue import invoices`
 
 Import paid invoices CSV to backfill the revenue chart
+
+**Usage:** `revenue import invoices <file> [options]`
 
 **Options:**
 

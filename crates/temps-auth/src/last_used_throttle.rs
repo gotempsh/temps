@@ -55,6 +55,15 @@ impl LastUsedThrottle {
             }
         }
     }
+
+    /// Drop the record for `id`, so the next [`Self::should_update`] call
+    /// for it returns `true`. Used when the write that `should_update`
+    /// allowed failed, so the next request retries instead of the timestamp
+    /// staying stale for a whole interval.
+    pub fn forget(&self, id: i32) {
+        let mut last_updates = self.last_updates.lock().unwrap_or_else(|e| e.into_inner());
+        last_updates.remove(&id);
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +89,16 @@ mod tests {
         assert!(throttle.should_update(1));
         std::thread::sleep(Duration::from_millis(5));
         assert!(throttle.should_update(1));
+    }
+
+    #[test]
+    fn test_forget_lets_the_next_call_update() {
+        let throttle = LastUsedThrottle::new(Duration::from_secs(60));
+        assert!(throttle.should_update(1));
+        assert!(throttle.should_update(2));
+        throttle.forget(1);
+        assert!(throttle.should_update(1));
+        assert!(!throttle.should_update(2), "forget is per id");
     }
 
     #[test]

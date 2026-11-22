@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { listDomainsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  listDomainsOptions,
+  listIngressHostnamesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
 import { Button } from '@/components/ui/button'
 import {
   Command,
@@ -21,7 +25,7 @@ import { reservedHostnameReason } from '@/lib/reservedHostnames'
 import { useDebounce } from '@/hooks/useDebounce'
 import { useSettings } from '@/hooks/useSettings'
 import { useQuery } from '@tanstack/react-query'
-import { Check, ChevronsUpDown, Globe } from 'lucide-react'
+import { Check, ChevronsUpDown, Cloud, Globe } from 'lucide-react'
 import { useState } from 'react'
 
 interface DomainSelectorProps {
@@ -66,6 +70,36 @@ export function DomainSelector({
 
   const domains = data?.domains ?? []
   const { data: platformSettings } = useSettings()
+
+  // Names a tunnel carries need no certificate (ADR 058 D10): each tunnel's
+  // `*.domain`, and the names picked for a tunnel. Without settings access
+  // these return 403 and the group stays hidden.
+  const connectorsQuery = useQuery({
+    ...allTunnelsOptions(),
+    enabled: open,
+    retry: false,
+  })
+  const hostnamesQuery = useQuery({
+    ...listIngressHostnamesOptions(),
+    enabled: open,
+    retry: false,
+  })
+  const certNames = new Set(domains.map((d) => d.domain))
+  const needle = debouncedSearch.trim().toLowerCase()
+  const tunneled = [
+    ...(connectorsQuery.data ?? []).map((c) => ({
+      name: `*.${c.domain}`,
+      via: c.name,
+    })),
+    ...(hostnamesQuery.data ?? [])
+      .filter((h) => h.mode === 'tunnel' && h.connector_name)
+      .map((h) => ({ name: h.hostname, via: h.connector_name as string })),
+  ].filter(
+    (t, i, all) =>
+      !certNames.has(t.name) &&
+      all.findIndex((o) => o.name === t.name) === i &&
+      (!needle || t.name.includes(needle))
+  )
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -142,6 +176,41 @@ export function DomainSelector({
                       ) : (
                         <DomainStatusBadge status={domain.status} />
                       )}
+                    </CommandItem>
+                  )
+                })}
+              </CommandGroup>
+            )}
+            {tunneled.length > 0 && (
+              <CommandGroup heading="Through a tunnel (no certificate needed)">
+                {tunneled.map((t) => {
+                  const reserved = !!reservedHostnameReason(
+                    t.name,
+                    platformSettings
+                  )
+                  return (
+                    <CommandItem
+                      key={t.name}
+                      value={t.name}
+                      disabled={reserved}
+                      onSelect={() => {
+                        if (reserved) return
+                        onValueChange(t.name)
+                        setOpen(false)
+                        setSearch('')
+                      }}
+                    >
+                      <Check
+                        className={cn(
+                          'mr-2 h-4 w-4 shrink-0',
+                          value === t.name ? 'opacity-100' : 'opacity-0'
+                        )}
+                      />
+                      <Cloud className="mr-2 h-4 w-4 shrink-0 text-muted-foreground" />
+                      <span className="truncate flex-1">{t.name}</span>
+                      <span className="ml-2 shrink-0 rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                        {reserved ? 'Reserved' : `Tunnel ${t.via}`}
+                      </span>
                     </CommandItem>
                   )
                 })}

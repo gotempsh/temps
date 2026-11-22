@@ -18,9 +18,11 @@ use temps_cloud_protocol::{
 };
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
+
+use crate::console_oidc_bootstrap::{ConsentTrace, ConsoleAccessConsent, ConsoleOidcApplyFailure};
 use temps_core::{
-    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleProvisioner,
-    DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
+    BackupScheduleAuthority, ManagedBackupArchiveConflict, ManagedBackupSchedule,
+    ManagedBackupScheduleProvisioner, DEFAULT_MANAGED_BACKUP_RETENTION_DAYS,
 };
 use thiserror::Error;
 use tokio::sync::{watch, Mutex as AsyncMutex, Notify};
@@ -200,6 +202,8 @@ pub struct CloudService {
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     heartbeat_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// ADR-094: the Temps Cloud console session re-check.
+    console_session_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     lifecycle_notify_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// ADR-045 §3: the console-proxy connection task and its own stop
     /// switch. Separate from `cancel` because the worker owns a dedicated
@@ -285,6 +289,7 @@ impl CloudService {
             backup_task: Mutex::new(None),
             backup_credential_rotation_task: Mutex::new(None),
             heartbeat_task: Mutex::new(None),
+            console_session_task: Mutex::new(None),
             lifecycle_notify_task: Mutex::new(None),
             console_proxy_task: Mutex::new(None),
             backup_mirror_wake: Arc::new(Notify::new()),
@@ -322,7 +327,7 @@ impl CloudService {
     /// Publish `settings.cloud.console_access_enabled` to
     /// [`Self::console_access_enabled_rx`]. A no-op send when the value has
     /// not changed, so subscribers only wake on a real transition.
-    fn apply_console_access_from_settings(&self, settings: &temps_core::AppSettings) {
+    fn apply_console_access_from_settings(&self, settings: &temps_config::AppSettings) {
         let enabled = settings.cloud.console_access_enabled;
         self.console_access_tx.send_if_modified(|current| {
             if *current == enabled {
@@ -336,7 +341,7 @@ impl CloudService {
 
     /// Consume the `<TEMPS_DATA_DIR>/cloud-oidc.json` first-boot bootstrap
     /// file at `path`, if present: parse it, apply it via
-    /// [`Self::apply_console_oidc_config`], and delete it. A thin wrapper
+    /// [`Self::apply_bootstrap_console_oidc_config`], and delete it. A thin wrapper
     /// around [`crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with`]
     /// so that function stays testable without a real `CloudService`.
     pub async fn apply_console_oidc_bootstrap_file(
@@ -346,10 +351,52 @@ impl CloudService {
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome,
         crate::console_oidc_bootstrap::ConsoleOidcBootstrapError,
     > {
-        crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
-            self.apply_console_oidc_config(config)
-        })
-        .await
+        let mut outcome =
+            crate::console_oidc_bootstrap::apply_console_oidc_bootstrap_file_with(path, |config| {
+                self.apply_bootstrap_console_oidc_config(config)
+            })
+            .await?;
+        if let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            telemetry,
+            ..
+        } = &mut outcome
+        {
+            if *telemetry == crate::console_oidc_bootstrap::TelemetryConsent::Requested {
+                *telemetry = self.apply_bootstrap_telemetry_consent().await;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// Turn telemetry export on because the bootstrap file asked for it (see
+    /// [`crate::console_oidc_bootstrap::TelemetryConsent`]). Never fails the
+    /// bootstrap: console access has already been applied, and a plane that
+    /// cannot switch export on keeps working locally -- the failure is
+    /// returned for the caller to log and audit.
+    async fn apply_bootstrap_telemetry_consent(
+        &self,
+    ) -> crate::console_oidc_bootstrap::TelemetryConsent {
+        use crate::console_oidc_bootstrap::TelemetryConsent;
+        let _update = self.feature_update_lock.lock().await;
+        let previous = self.link.feature_switches();
+        let updated = match self.config.grant_bootstrap_telemetry_consent().await {
+            Ok(Some(updated)) => updated,
+            Ok(None) => return TelemetryConsent::AlreadyDecided,
+            Err(error) => {
+                return TelemetryConsent::Failed {
+                    reason: error.to_string(),
+                }
+            }
+        };
+        if previous.telemetry {
+            return TelemetryConsent::AlreadyEnabled;
+        }
+        match self.publish_cloud_switches(&updated) {
+            Ok(new) => TelemetryConsent::GrantedByBootstrap { previous, new },
+            Err(error) => TelemetryConsent::Failed {
+                reason: error.to_string(),
+            },
+        }
     }
 
     /// Wire the backup scheduler in once it is registered. Idempotent.
@@ -377,11 +424,15 @@ impl CloudService {
     /// has not read one yet (a restart, say). A schedule is never created
     /// from a guessed figure: a 30-day plan must not end up with a 7-day
     /// schedule because the capability was not loaded.
-    async fn plan_retention_days(&self, s3_source_id: i32) -> Result<u16, CloudServiceError> {
+    async fn plan_retention_days(
+        &self,
+        s3_source_id: i32,
+        authority: BackupScheduleAuthority,
+    ) -> Result<u16, CloudServiceError> {
         if let Some(days) = self.loaded_retention_days() {
             return Ok(days);
         }
-        let outcome = self.provision_managed_backup_source().await;
+        let outcome = self.provision_managed_backup_source(authority).await;
         self.loaded_retention_days().ok_or_else(|| {
             temps_core::ManagedBackupScheduleError::Create {
                 s3_source_id,
@@ -471,9 +522,21 @@ impl CloudService {
     /// already targets it, and answer the setup with the schedule attached.
     /// The operator-facing entry point behind "Create nightly schedule";
     /// enrollment calls the same path when it first creates the destination.
+    ///
+    /// The schedule backs up every database and the control plane, so only
+    /// [`BackupScheduleAuthority::InstanceAdmin`] may create it (NV1); a
+    /// scoped caller gets [`temps_core::ManagedBackupScheduleError::NotAuthorized`]
+    /// before any lookup or Cloud call.
     pub async fn ensure_managed_backup_schedule(
         &self,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSetup, CloudServiceError> {
+        if !authority.is_instance_admin() {
+            let s3_source_id = self.managed_backup_source_id().await?.unwrap_or(0);
+            return Err(
+                temps_core::ManagedBackupScheduleError::NotAuthorized { s3_source_id }.into(),
+            );
+        }
         let _guard = self.managed_backup_reconcile_lock.lock().await;
         let setup = match self.managed_backup_setup() {
             Some(setup) => setup,
@@ -489,9 +552,9 @@ impl CloudService {
                 reason: "the backup plugin is not enabled on this instance".to_string(),
             }
         })?;
-        let retention_days = self.plan_retention_days(source_id).await?;
+        let retention_days = self.plan_retention_days(source_id, authority).await?;
         let schedule = provisioner
-            .ensure_schedule_for_source(source_id, retention_days)
+            .ensure_schedule_for_source(source_id, retention_days, authority)
             .await?;
         tracing::info!(
             schedule_id = schedule.id,
@@ -612,13 +675,7 @@ impl CloudService {
     /// working the moment the instance links and goes quiet (cheaply) the
     /// moment it disconnects, with no separate start/stop wiring needed.
     ///
-    /// This same connection also negotiates `Capability::InstanceStatusReporting`
-    /// (ADR-039), but no `StatusProvider` is wired up here yet: counting
-    /// deployments/services/projects and reading resource usage needs
-    /// database and system access this crate does not have reason to hold
-    /// just for this. Passing `None` is a deliberately silent no-op — the
-    /// capability is still offered, and status reporting activates with no
-    /// further wiring once a provider is registered.
+    /// Reports the worker count from the local database in the background.
     pub fn start_heartbeat_sender(&self) {
         let mut task = self
             .heartbeat_task
@@ -628,12 +685,50 @@ impl CloudService {
             tracing::info!("Cloud service launching heartbeat sender task");
             let link = self.link.clone();
             let cancel = self.cancel.subscribe();
+            let provider = Arc::new(temps_cloud_client::status_provider::WorkerStatusProvider(
+                self.db.clone(),
+            ));
+            // ADR-094: with an auth plugin, this instance applies Cloud's
+            // signed console logouts and says so in its `Hello`.
+            let console_logout = self.oidc_provisioner.get().map(|oidc| {
+                Arc::new(crate::console_sessions::ConsoleLogoutAdapter::new(
+                    oidc.clone(),
+                )) as Arc<dyn temps_cloud_client::ConsoleLogoutSink>
+            });
             *task = Some(tokio::spawn(async move {
-                temps_cloud_client::heartbeat::run(link, cancel, None).await;
+                temps_cloud_client::heartbeat::run_with_console_logout(
+                    link,
+                    cancel,
+                    Some(provider),
+                    console_logout,
+                )
+                .await;
             }));
         } else {
             tracing::debug!("Cloud heartbeat sender task is already registered");
         }
+    }
+
+    /// ADR-094: re-check Temps Cloud console sessions with Cloud every minute
+    /// and end the ones Cloud no longer vouches for. Safe to start
+    /// unconditionally: without the Cloud-managed provider each pass is one
+    /// local query that finds nothing to do.
+    pub fn start_console_session_checker(&self) {
+        let mut task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_some() {
+            return;
+        }
+        let Some(oidc) = self.oidc_provisioner.get().cloned() else {
+            tracing::debug!("no OidcService registered; no Temps Cloud console sessions to check");
+            return;
+        };
+        let cancel = self.cancel.subscribe();
+        *task = Some(tokio::spawn(crate::console_sessions::run_session_checker(
+            oidc, cancel,
+        )));
     }
 
     /// Launch the backup lifecycle notifier: subscribes to the job queue and
@@ -915,28 +1010,61 @@ impl CloudService {
     pub async fn update_feature_switches(
         &self,
         switches: CloudFeatureSwitches,
+        authority: BackupScheduleAuthority,
     ) -> Result<CloudStatus, CloudServiceError> {
         self.patch_feature_switches(
             Some(switches.telemetry),
             Some(switches.backups),
             Some(switches.notifications),
             Some(switches.console_access),
+            authority,
         )
         .await
     }
 
+    /// `authority` only matters when turning backups on provisions the
+    /// managed destination for the first time: its nightly schedule is
+    /// created for an instance administrator and withheld otherwise (NV1).
     pub async fn patch_feature_switches(
         &self,
         telemetry: Option<bool>,
         backups: Option<bool>,
         notifications: Option<bool>,
         console_access: Option<bool>,
+        authority: BackupScheduleAuthority,
     ) -> Result<CloudStatus, CloudServiceError> {
         let _update = self.feature_update_lock.lock().await;
         let updated = self
             .config
             .update_cloud_features(telemetry, backups, notifications, console_access)
             .await?;
+        let switches = self.publish_cloud_switches(&updated)?;
+        if switches.backups {
+            self.reconcile_managed_backup_source(authority).await?;
+        } else {
+            self.set_managed_backup_setup(default_managed_backup_setup(false));
+        }
+        // ADR-045 §5: "Toggling off does the reverse [of toggling on]:
+        // symmetric with disconnect" -- the managed OIDC provider row (and
+        // its sessions) must not survive an operator turning console access
+        // back off, even though the console-proxy connection itself is torn
+        // down asynchronously by the worker observing `console_access_tx`.
+        if console_access == Some(false) {
+            // Explicit retries must re-attempt revocation even after the
+            // persisted switch and relay have already been disabled.
+            self.revoke_console_oidc_provider().await?;
+        }
+        self.status().await
+    }
+
+    /// Push freshly persisted Cloud settings into the live link and the
+    /// console-access watch channel. The caller must hold
+    /// [`Self::feature_update_lock`] and must have just written `updated`
+    /// through [`ConfigService::update_cloud_features`].
+    fn publish_cloud_switches(
+        &self,
+        updated: &temps_config::AppSettings,
+    ) -> Result<CloudFeatureSwitches, CloudServiceError> {
         let switches = CloudFeatureSwitches {
             telemetry: updated.cloud.telemetry_enabled,
             backups: updated.cloud.backups_enabled,
@@ -957,22 +1085,124 @@ impl CloudService {
                 true
             }
         });
-        if switches.backups {
-            self.reconcile_managed_backup_source().await?;
-        } else {
-            self.set_managed_backup_setup(default_managed_backup_setup(false));
+        Ok(switches)
+    }
+
+    /// Persist `cloud.console_access_enabled` alone and publish it. The
+    /// caller must hold [`Self::feature_update_lock`].
+    async fn persist_console_access_locked(
+        &self,
+        enabled: bool,
+    ) -> Result<CloudFeatureSwitches, CloudServiceError> {
+        let updated = self
+            .config
+            .update_cloud_features(None, None, None, Some(enabled))
+            .await?;
+        self.publish_cloud_switches(&updated)
+    }
+
+    /// Last-resort, in-memory-only fail-closed: force the console-access
+    /// switch off in the link and the watch channel without touching the
+    /// database. Used only when the durable write that should have done it
+    /// has itself failed.
+    fn force_console_access_off_in_memory(&self) {
+        let mut switches = self.link.feature_switches();
+        switches.console_access = false;
+        if let Err(error) = self.link.set_feature_switches(switches) {
+            tracing::error!(%error, "could not clear the in-memory console-access switch");
         }
-        // ADR-045 §5: "Toggling off does the reverse [of toggling on]:
-        // symmetric with disconnect" -- the managed OIDC provider row (and
-        // its sessions) must not survive an operator turning console access
-        // back off, even though the console-proxy connection itself is torn
-        // down asynchronously by the worker observing `console_access_tx`.
-        if console_access == Some(false) {
-            // Explicit retries must re-attempt revocation even after the
-            // persisted switch and relay have already been disabled.
-            self.revoke_console_oidc_provider().await?;
+        self.console_access_tx.send_replace(false);
+    }
+
+    /// Apply the managed console-access OIDC configuration found in the
+    /// `cloud-oidc.json` first-boot bootstrap file (ADR-045 Amendment 1).
+    ///
+    /// Unlike [`Self::apply_console_oidc_config`], which handles the
+    /// per-connect `ConsoleOidcConfig` frame and demands *enabled and linked*,
+    /// this treats the file's presence on a Cloud-hosted plane as the
+    /// operator's consent: if `cloud.console_access_enabled` is off it is
+    /// persisted on through the normal settings path (so the watch channel,
+    /// link switches and Settings UI agree) and the change is returned in
+    /// [`ConsoleAccessConsent::GrantedByBootstrap`] for the caller to audit.
+    /// It does not require the link to be established -- enrollment runs
+    /// after the bootstrap and in the background.
+    ///
+    /// **Ordering is the safety property.** The provider is upserted *first*
+    /// and consent is written *second*, so the only states a failure can leave
+    /// behind are fail-closed ones: provider upsert fails -> consent was never
+    /// touched; consent write fails -> the provider is revoked again and
+    /// consent is forced back off (durably if the database allows, in memory
+    /// regardless). The reverse order would leave remote-console consent on
+    /// whenever the compensating write failed. The database cannot make the two
+    /// writes one transaction (they go through different services), so any
+    /// compensation that itself fails is reported in the returned
+    /// [`ConsentTrace`] and logged at `error`, never swallowed.
+    pub async fn apply_bootstrap_console_oidc_config(
+        &self,
+        config: temps_auth::oidc_service::ManagedCloudOidcConfig,
+    ) -> Result<ConsoleAccessConsent, ConsoleOidcApplyFailure> {
+        let _update = self.feature_update_lock.lock().await;
+        let Some(oidc) = self.oidc_provisioner.get() else {
+            tracing::error!(
+                "the cloud-oidc.json bootstrap file was found but no OidcService is registered \
+                 on this build; console access cannot be authenticated"
+            );
+            return Err(ConsoleOidcApplyFailure::untouched(
+                CloudServiceError::ConsoleOidcUnavailable,
+            ));
+        };
+        if let Err(error) = oidc.upsert_managed_cloud_provider(config).await {
+            return Err(ConsoleOidcApplyFailure::untouched(
+                CloudServiceError::ConsoleOidcProvisioning(error),
+            ));
         }
-        self.status().await
+        if self.console_access_enabled() {
+            return Ok(ConsoleAccessConsent::AlreadyEnabled);
+        }
+
+        let previous = self.link.feature_switches();
+        match self.persist_console_access_locked(true).await {
+            Ok(new) => Ok(ConsoleAccessConsent::GrantedByBootstrap { previous, new }),
+            Err(error) => {
+                // The settings row may have committed before the failure
+                // surfaced (e.g. while publishing to the link), so do not
+                // assume nothing was written: undo both halves.
+                let restored = match self.persist_console_access_locked(false).await {
+                    Ok(_) => true,
+                    Err(restore_error) => {
+                        self.force_console_access_off_in_memory();
+                        tracing::error!(
+                            %restore_error,
+                            "the cloud-oidc.json bootstrap could not durably switch console \
+                             access back off after failing to switch it on; the settings row \
+                             may still say cloud.console_access_enabled=true -- check Settings > \
+                             Temps Cloud"
+                        );
+                        false
+                    }
+                };
+                let provider_revoked = match self.revoke_console_oidc_provider().await {
+                    Ok(_) => true,
+                    Err(revoke_error) => {
+                        tracing::error!(
+                            %revoke_error,
+                            "the cloud-oidc.json bootstrap created the managed OIDC provider but \
+                             could not remove it after the consent write failed; remove it by \
+                             disabling console access in Settings > Temps Cloud"
+                        );
+                        false
+                    }
+                };
+                Err(ConsoleOidcApplyFailure {
+                    error,
+                    consent: ConsentTrace::WriteFailed {
+                        previous,
+                        restored,
+                        provider_revoked,
+                    },
+                })
+            }
+        }
     }
 
     /// Upsert the managed console-access `oidc_providers` row from a
@@ -1026,12 +1256,19 @@ impl CloudService {
     /// still see the prior credential, and it exists so a caller with a side
     /// effect that belongs to linking — ADR-042's purchase-triggered telemetry
     /// activation — does not fire it on an ordinary credential recovery.
+    ///
+    /// `authority` decides only the nightly schedule for a newly created
+    /// managed destination (NV1): enrollment itself, and the destination,
+    /// succeed for any `settings:write` holder.
     pub async fn enroll(
         &self,
         code: &str,
+        authority: BackupScheduleAuthority,
     ) -> Result<(CloudStatus, ManagedBackupOutcome, EnrollmentKind), CloudServiceError> {
         let enrollment = self.enroll_link(code).await?;
-        let backup_outcome = self.provision_managed_backups_after_enrollment().await;
+        let backup_outcome = self
+            .provision_managed_backups_after_enrollment(authority)
+            .await;
         let status = self.status().await?;
         Ok((status, backup_outcome, enrollment))
     }
@@ -1164,8 +1401,11 @@ impl CloudService {
     /// The second half of [`Self::enroll`]: fetch the tenant's managed backup
     /// credential (if the plan includes one) and record the resulting setup
     /// state. Never fails -- see [`ManagedBackupOutcome`].
-    pub async fn provision_managed_backups_after_enrollment(&self) -> ManagedBackupOutcome {
-        let backup_outcome = self.provision_managed_backup_source().await;
+    pub async fn provision_managed_backups_after_enrollment(
+        &self,
+        authority: BackupScheduleAuthority,
+    ) -> ManagedBackupOutcome {
+        let backup_outcome = self.provision_managed_backup_source(authority).await;
         self.set_managed_backup_setup(managed_backup_setup_from_outcome(&backup_outcome));
         backup_outcome
     }
@@ -1174,7 +1414,15 @@ impl CloudService {
     /// it into `s3_sources`. Failures are logged and returned as
     /// [`ManagedBackupOutcome::Unavailable`] rather than propagated — a
     /// linked instance must never lose its link over this.
-    pub(crate) async fn provision_managed_backup_source(&self) -> ManagedBackupOutcome {
+    ///
+    /// When the destination is created for the first time it also gets its
+    /// nightly schedule -- but only for [`BackupScheduleAuthority::InstanceAdmin`].
+    /// For a scoped caller the schedule is withheld and the console keeps
+    /// offering "Create nightly schedule" to an administrator (NV1).
+    pub(crate) async fn provision_managed_backup_source(
+        &self,
+        authority: BackupScheduleAuthority,
+    ) -> ManagedBackupOutcome {
         let capability = match self.link.managed_backup_credentials().await {
             Ok(capability) => capability,
             Err(error) => {
@@ -1217,7 +1465,14 @@ impl CloudService {
                 // nightly schedule the offer promises (ADR-044). Best effort
                 // here; the console shows the gap and offers the same action
                 // if this does not happen.
-                if let Some(provisioner) = self.schedule_provisioner.get() {
+                if !authority.is_instance_admin() {
+                    tracing::info!(
+                        "created the Temps Cloud backup destination but withheld its nightly \
+                         schedule: it backs up every database and the control plane, which \
+                         only an instance administrator may set up. An administrator can create \
+                         it from Settings -> Temps Cloud."
+                    );
+                } else if let Some(provisioner) = self.schedule_provisioner.get() {
                     if let Ok(Some(source_id)) = self.managed_backup_source_id().await {
                         // The capability was read just above, so the plan's
                         // retention is loaded.
@@ -1225,7 +1480,7 @@ impl CloudService {
                             .loaded_retention_days()
                             .unwrap_or(DEFAULT_MANAGED_BACKUP_RETENTION_DAYS);
                         match provisioner
-                            .ensure_schedule_for_source(source_id, retention_days)
+                            .ensure_schedule_for_source(source_id, retention_days, authority)
                             .await
                         {
                             Ok(schedule) => tracing::info!(
@@ -1371,8 +1626,11 @@ impl CloudService {
             > 0)
     }
 
+    /// `authority` gates only the nightly schedule a first-time destination
+    /// would get (see [`Self::provision_managed_backup_source`]).
     pub async fn reconcile_managed_backup_source(
         &self,
+        authority: BackupScheduleAuthority,
     ) -> Result<ManagedBackupSetup, CloudServiceError> {
         let _guard = self.managed_backup_reconcile_lock.lock().await;
         if !self.link.feature_switches().backups {
@@ -1381,7 +1639,7 @@ impl CloudService {
             return Ok(setup);
         }
 
-        let outcome = self.provision_managed_backup_source().await;
+        let outcome = self.provision_managed_backup_source(authority).await;
         let setup = managed_backup_setup_from_outcome(&outcome);
         self.set_managed_backup_setup(setup.clone());
         Ok(self.with_schedule(setup).await)
@@ -1481,6 +1739,19 @@ impl CloudService {
             .take();
         if let Some(task) = heartbeat_task {
             await_task_shutdown(task, "Cloud heartbeat sender", SHUTDOWN_TASK_TIMEOUT).await;
+        }
+        let console_session_task = self
+            .console_session_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = console_session_task {
+            await_task_shutdown(
+                task,
+                "Temps Cloud console session checker",
+                SHUTDOWN_TASK_TIMEOUT,
+            )
+            .await;
         }
         let console_proxy_task = self
             .console_proxy_task
@@ -1930,6 +2201,7 @@ mod tests {
             managed_by_cloud: true,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2037,7 +2309,13 @@ mod tests {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             db.clone(),
             Arc::new(EncryptionService::new_from_password("consent-race-test")),
-            Arc::new(temps_auth::UserService::new(db)),
+            Arc::new(temps_auth::UserService::new(
+                db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         )));
         service.console_access_tx.send_replace(true);
         let guard = service.feature_update_lock.lock().await;
@@ -2103,7 +2381,7 @@ mod tests {
     async fn explicit_disable_retries_failed_provider_revocation() {
         let row = temps_entities::settings::Model {
             id: 1,
-            data: temps_core::AppSettings::default().to_json(),
+            data: temps_config::AppSettings::default().to_json(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2140,11 +2418,23 @@ mod tests {
         service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
             Arc::new(EncryptionService::new_from_password("oidc-retry-test")),
-            Arc::new(temps_auth::UserService::new(oidc_db)),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         )));
         for _ in 0..2 {
             let result = service
-                .patch_feature_switches(None, None, None, Some(false))
+                .patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                )
                 .await;
             assert!(
                 matches!(result, Err(CloudServiceError::ConsoleOidcProvisioning(_))),
@@ -2153,6 +2443,874 @@ mod tests {
             assert!(
                 !service.console_access_enabled(),
                 "the relay stays disabled while revocation is retried"
+            );
+        }
+    }
+
+    fn bootstrap_settings_row() -> temps_entities::settings::Model {
+        temps_entities::settings::Model {
+            id: 1,
+            data: temps_config::AppSettings::default().to_json(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn managed_provider_row() -> temps_entities::oidc_providers::Model {
+        temps_entities::oidc_providers::Model {
+            id: 1,
+            name: "Temps Cloud".into(),
+            issuer_url: "https://cloud.example.com".into(),
+            client_id: "bootstrap-client".into(),
+            client_secret_encrypted: "encrypted".into(),
+            scopes: "openid email profile temps_cloud_instance_role".into(),
+            jit_provisioning: true,
+            enabled: true,
+            template: "temps_cloud".into(),
+            group_claim: "temps_cloud_instance_role".into(),
+            role_claim: "temps_cloud_instance_role".into(),
+            default_role: "user".into(),
+            trust_idp_email: false,
+            managed_by_cloud: true,
+            admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn bootstrap_role_mapping_rows() -> Vec<Vec<temps_entities::oidc_role_mappings::Model>> {
+        (0..3)
+            .map(|id| {
+                vec![temps_entities::oidc_role_mappings::Model {
+                    id: id + 1,
+                    provider_id: 1,
+                    priority: id,
+                    idp_group: "owner".into(),
+                    role: "admin".into(),
+                    created_at: chrono::Utc::now(),
+                }]
+            })
+            .collect()
+    }
+
+    /// Mock DB for the OIDC side of a successful managed-provider upsert
+    /// onto an empty `oidc_providers` table.
+    fn oidc_db_accepting_a_first_upsert() -> Arc<sea_orm::DatabaseConnection> {
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                // no existing managed row
+                vec![],
+                // no ordinary provider already using the issuer
+                vec![],
+                // the inserted managed row
+                vec![managed_provider_row()],
+            ])
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }]);
+        let mappings = bootstrap_role_mapping_rows();
+        for mapping in mappings {
+            db = db.append_query_results(vec![mapping]);
+        }
+        Arc::new(db.into_connection())
+    }
+
+    fn settings_db_accepting_consent_writes(writes: usize) -> Arc<sea_orm::DatabaseConnection> {
+        let row = bootstrap_settings_row();
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres);
+        for _ in 0..writes {
+            // One consent write consumes three result sets: the locked read,
+            // the row Sea-ORM re-selects after UPDATE, and the cache reload.
+            db = db.append_query_results(vec![
+                vec![row.clone()],
+                vec![row.clone()],
+                vec![row.clone()],
+            ]);
+        }
+        Arc::new(
+            db.append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                };
+                writes
+            ])
+            .into_connection(),
+        )
+    }
+
+    /// Every `cloud.console_access_enabled` value that was actually written
+    /// to the settings row, in order, read from the mock's statement log.
+    /// This is what "persisted" means: the in-memory switch and the watch
+    /// channel can say `true` while the row was never saved. The caller must
+    /// have dropped every other handle to `db`.
+    fn persisted_console_access_writes(db: Arc<sea_orm::DatabaseConnection>) -> Vec<bool> {
+        let db = Arc::try_unwrap(db)
+            .unwrap_or_else(|_| panic!("a handle to the settings mock is still alive"));
+        let mut writes = Vec::new();
+        for transaction in db.into_transaction_log() {
+            for statement in transaction.statements() {
+                let Some(values) = &statement.values else {
+                    continue;
+                };
+                for value in &values.0 {
+                    if let sea_orm::Value::Json(Some(document)) = value {
+                        if let Some(enabled) = document
+                            .pointer("/cloud/console_access_enabled")
+                            .and_then(serde_json::Value::as_bool)
+                        {
+                            writes.push(enabled);
+                        }
+                    }
+                }
+            }
+        }
+        writes
+    }
+
+    fn failing_settings_db(
+        failures: usize,
+        then_succeeding_writes: usize,
+    ) -> Arc<sea_orm::DatabaseConnection> {
+        let row = bootstrap_settings_row();
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(
+                (0..failures).map(|_| sea_orm::DbErr::Custom("settings store unavailable".into())),
+            );
+        for _ in 0..then_succeeding_writes {
+            db = db.append_query_results(vec![
+                vec![row.clone()],
+                vec![row.clone()],
+                vec![row.clone()],
+            ]);
+        }
+        Arc::new(
+            db.append_exec_results(vec![
+                sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                };
+                then_succeeding_writes
+            ])
+            .into_connection(),
+        )
+    }
+
+    /// Mock DB for a successful first upsert followed by a revoke that finds
+    /// and deletes the row it just created.
+    fn oidc_db_upserting_then_revoking() -> Arc<sea_orm::DatabaseConnection> {
+        let mut db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![], vec![], vec![managed_provider_row()]]);
+        for mapping in bootstrap_role_mapping_rows() {
+            db = db.append_query_results(vec![mapping]);
+        }
+        Arc::new(
+            db.append_query_results(vec![vec![managed_provider_row()]])
+                // upsert: delete old mappings; revoke: login states, sessions,
+                // ingress grants, mappings, provider.
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    };
+                    6
+                ])
+                .into_connection(),
+        )
+    }
+
+    fn attach_oidc(service: &CloudService, oidc_db: Arc<sea_orm::DatabaseConnection>) {
+        service.set_oidc_service(Arc::new(temps_auth::oidc_service::OidcService::new(
+            oidc_db.clone(),
+            Arc::new(EncryptionService::new_from_password("bootstrap-oidc-test")),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
+        )));
+    }
+
+    const BOOTSTRAP_FILE: &str = r#"{"issuer":"https://cloud.example.com","client_id":"bootstrap-client","client_secret":"shh"}"#;
+
+    /// ADR-045 Amendment 1: on a hosted plane the file is the consent. With
+    /// the switch off and the link not yet established -- the exact state
+    /// that used to fail with "feature 'console_access' is disabled" -- the
+    /// provider is created, the switch is persisted on, and the file goes.
+    #[tokio::test]
+    async fn bootstrap_file_grants_consent_and_provisions_without_a_link() {
+        let settings_db = settings_db_accepting_consent_writes(1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        assert!(!service.link.is_linked(), "precondition: not enrolled yet");
+        assert!(
+            !service.console_access_enabled(),
+            "precondition: switch off"
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed on an unlinked, switched-off instance");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied { consent, .. } =
+            outcome
+        else {
+            panic!("expected Applied");
+        };
+        let ConsoleAccessConsent::GrantedByBootstrap { previous, new } = consent else {
+            panic!("expected consent to be granted by the bootstrap");
+        };
+        assert!(!previous.console_access, "audit must show the prior state");
+        assert!(new.console_access, "audit must show the new state");
+        assert!(service.console_access_enabled(), "watch channel is on");
+        assert!(
+            service.feature_switches().console_access,
+            "link feature switch is consistent with the watch channel"
+        );
+        assert!(!path.exists(), "the file is consumed");
+        assert!(!service.link.is_linked(), "the bootstrap does not enroll");
+        drop(service);
+        assert_eq!(
+            persisted_console_access_writes(settings_db),
+            vec![true],
+            "consent must be saved to the settings row, not only held in memory"
+        );
+    }
+
+    /// A hosted plane's file also asks for telemetry export: it is switched on,
+    /// persisted, and reported for auditing -- after console access, never
+    /// instead of it.
+    #[tokio::test]
+    async fn bootstrap_file_asking_for_telemetry_turns_export_on() {
+        let settings_db = settings_db_accepting_consent_writes(2);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        assert!(!service.feature_switches().telemetry, "precondition: off");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(
+            &path,
+            r#"{"issuer":"https://cloud.example.com","client_id":"bootstrap-client","client_secret":"shh","telemetry_enabled":true}"#,
+        )
+        .expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+            consent,
+            telemetry,
+            ..
+        } = outcome
+        else {
+            panic!("expected Applied");
+        };
+        assert!(consent.was_granted(), "console access is still granted");
+        let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry else {
+            panic!("expected telemetry to be granted by the bootstrap, got {telemetry:?}");
+        };
+        assert!(!previous.telemetry && new.telemetry);
+        assert!(service.feature_switches().telemetry, "link switch is on");
+        assert!(!path.exists(), "the file is consumed");
+    }
+
+    /// Without the field nothing about telemetry changes -- the shape every
+    /// file had before Cloud started asking.
+    #[tokio::test]
+    async fn bootstrap_file_without_the_telemetry_field_leaves_export_alone() {
+        let settings_db = settings_db_accepting_consent_writes(1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("the bootstrap must succeed");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                telemetry: crate::TelemetryConsent::NotRequested,
+                ..
+            }
+        ));
+        assert!(!service.feature_switches().telemetry);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_file_on_an_instance_that_already_consented_leaves_consent_alone() {
+        // No settings writes are queued: touching the settings row would fail.
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        service.console_access_tx.send_replace(true);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("bootstrap on an already-enabled instance must succeed");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                consent: ConsoleAccessConsent::AlreadyEnabled,
+                ..
+            }
+        ));
+        assert!(!path.exists());
+        drop(service);
+        assert!(
+            persisted_console_access_writes(settings_db).is_empty(),
+            "an instance that already consented is not rewritten"
+        );
+    }
+
+    /// Self-hosted instances never have the file: nothing may change.
+    #[tokio::test]
+    async fn no_bootstrap_file_changes_nothing_and_leaves_consent_off() {
+        // Neither database has queued results; any query would error.
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(
+            &service,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("a missing file is not an error");
+
+        assert_eq!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::NotPresent
+        );
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        drop(service);
+        assert!(
+            persisted_console_access_writes(settings_db).is_empty(),
+            "no file means no settings write at all"
+        );
+    }
+
+    /// Provider first, consent second: when the provider cannot be created the
+    /// consent write is never even attempted, so nothing needs undoing and
+    /// nothing can be left on.
+    #[tokio::test]
+    async fn failed_provider_upsert_never_writes_consent_and_keeps_the_file() {
+        let settings_db = settings_db_accepting_consent_writes(0);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(
+            &service,
+            Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_errors(vec![sea_orm::DbErr::Custom(
+                        "provider table unavailable".into(),
+                    )])
+                    .into_connection(),
+            ),
+        );
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing upsert must fail the bootstrap");
+
+        assert!(
+            error.to_string().contains("provider table unavailable"),
+            "the error names the real cause: {error}"
+        );
+        assert!(matches!(
+            error,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply {
+                consent: ConsentTrace::Untouched,
+                ..
+            }
+        ));
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists(), "the file stays in place");
+        drop(service);
+        assert!(persisted_console_access_writes(settings_db).is_empty());
+    }
+
+    /// The consent write fails after the provider was created: the provider
+    /// is revoked again, consent is durably written back off, and the failed
+    /// attempt is reported so it can be audited.
+    #[tokio::test]
+    async fn failed_consent_write_revokes_the_provider_and_restores_consent() {
+        // First write (grant) fails; the compensating write succeeds.
+        let settings_db = failing_settings_db(1, 1);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_upserting_then_revoking());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing consent write must fail the bootstrap");
+
+        assert!(
+            error.to_string().contains("settings store unavailable"),
+            "the error names the real cause: {error}"
+        );
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply { consent, .. } = error
+        else {
+            panic!("expected an Apply error");
+        };
+        assert!(
+            matches!(
+                consent,
+                ConsentTrace::WriteFailed {
+                    restored: true,
+                    provider_revoked: true,
+                    ..
+                }
+            ),
+            "the failed consent attempt must be reported: {consent:?}"
+        );
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists(), "the file stays for the next boot to retry");
+        drop(service);
+        assert_eq!(
+            persisted_console_access_writes(settings_db),
+            vec![false],
+            "the only row ever written says consent is off"
+        );
+    }
+
+    /// If even the compensating write fails, the in-memory switch is still
+    /// forced off (fail closed) and the trace says the row may be stale.
+    #[tokio::test]
+    async fn failed_consent_write_with_failed_restore_still_fails_closed_in_memory() {
+        let settings_db = failing_settings_db(2, 0);
+        let service = test_cloud_service(settings_db.clone());
+        attach_oidc(&service, oidc_db_upserting_then_revoking());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a failing consent write must fail the bootstrap");
+
+        let crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply { consent, .. } = error
+        else {
+            panic!("expected an Apply error");
+        };
+        assert!(
+            matches!(
+                consent,
+                ConsentTrace::WriteFailed {
+                    restored: false,
+                    provider_revoked: true,
+                    ..
+                }
+            ),
+            "an unconfirmed restore must be reported as such: {consent:?}"
+        );
+        assert!(!service.console_access_enabled(), "relay stays off");
+        assert!(!service.feature_switches().console_access);
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn bootstrap_without_an_oidc_service_fails_closed_and_grants_nothing() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+
+        let result = service
+            .apply_bootstrap_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "client".into(),
+                client_secret: "test-secret".into(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(ConsoleOidcApplyFailure {
+                error: CloudServiceError::ConsoleOidcUnavailable,
+                consent: ConsentTrace::Untouched,
+            })
+        ));
+        assert!(!service.console_access_enabled());
+    }
+
+    /// The per-connect frame path keeps its guards: a bootstrap that turned
+    /// the switch on must not have loosened them.
+    #[tokio::test]
+    async fn frame_path_still_rejects_when_disabled_or_unlinked() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(0));
+        attach_oidc(&service, oidc_db_accepting_a_first_upsert());
+        let config = || temps_auth::oidc_service::ManagedCloudOidcConfig {
+            issuer: "https://cloud.example.com".into(),
+            client_id: "client".into(),
+            client_secret: "test-secret".into(),
+        };
+
+        // Disabled and unlinked.
+        assert!(matches!(
+            service.apply_console_oidc_config(config()).await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+        // Enabled but still unlinked (the state right after a bootstrap).
+        service.console_access_tx.send_replace(true);
+        assert!(matches!(
+            service.apply_console_oidc_config(config()).await,
+            Err(CloudServiceError::Client(CloudError::FeatureDisabled {
+                feature: "console_access"
+            }))
+        ));
+    }
+
+    /// Turning console access off after a bootstrap still tears the managed
+    /// provider down (ADR-045 §5): delete role mappings and provider, and
+    /// invalidate its sessions and login states.
+    #[tokio::test]
+    async fn disabling_console_access_after_bootstrap_still_removes_the_provider() {
+        let service = test_cloud_service(settings_db_accepting_consent_writes(1));
+        service.console_access_tx.send_replace(true);
+        let oidc_db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![
+                    vec![managed_provider_row()],
+                    // The provider is gone by the second look.
+                    vec![],
+                ])
+                // Login states, sessions, ingress grants, mappings, provider.
+                .append_exec_results(vec![
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    };
+                    5
+                ])
+                .into_connection(),
+        );
+        attach_oidc(&service, oidc_db);
+
+        service
+            .patch_feature_switches(
+                None,
+                None,
+                None,
+                Some(false),
+                BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await
+            .expect("disabling must succeed and revoke the provider");
+
+        assert!(!service.console_access_enabled());
+        assert!(!service.feature_switches().console_access);
+        // The first revoke deleted the row; a second finds nothing to do.
+        assert!(!service
+            .revoke_console_oidc_provider()
+            .await
+            .expect("a second revoke is a no-op, not an error"));
+    }
+
+    // ---- Real-Postgres tests (skip when no container runtime is available) ----
+
+    async fn postgres_or_skip(name: &str) -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => Some(database),
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker unavailable; skipping {name}: {error}");
+                None
+            }
+            Err(error) => panic!("failed to create the {name} test database: {error}"),
+        }
+    }
+
+    /// A service over a real database: real `ConfigService` settings row,
+    /// real `OidcService` tables, link not enrolled.
+    fn real_service(db: Arc<sea_orm::DatabaseConnection>) -> CloudService {
+        let service = test_cloud_service(db.clone());
+        attach_oidc(&service, db);
+        service
+    }
+
+    async fn persisted_console_access(db: &sea_orm::DatabaseConnection) -> bool {
+        match temps_entities::settings::Entity::find_by_id(1)
+            .one(db)
+            .await
+            .expect("settings row query")
+        {
+            Some(row) => {
+                temps_config::AppSettings::from_json(row.data)
+                    .cloud
+                    .console_access_enabled
+            }
+            None => false,
+        }
+    }
+
+    async fn managed_provider_count(db: &sea_orm::DatabaseConnection) -> u64 {
+        temps_entities::oidc_providers::Entity::find()
+            .filter(temps_entities::oidc_providers::Column::ManagedByCloud.eq(true))
+            .count(db)
+            .await
+            .expect("provider count")
+    }
+
+    fn write_bootstrap_file(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let path = dir.path().join(crate::CONSOLE_OIDC_BOOTSTRAP_FILENAME);
+        std::fs::write(&path, BOOTSTRAP_FILE).expect("fixture");
+        path
+    }
+
+    /// End to end against real tables: the file creates an admin-gated,
+    /// Cloud-managed provider with its three role mappings, consent is saved
+    /// to the settings row, and the file is gone -- all before any enrollment.
+    #[tokio::test]
+    async fn postgres_bootstrap_provisions_an_admin_gated_provider_and_saves_consent() {
+        let Some(test_db) = postgres_or_skip("bootstrap provisioning").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_bootstrap_file(&dir);
+
+        let outcome = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect("bootstrap against a real database");
+
+        assert!(matches!(
+            outcome,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapOutcome::Applied {
+                consent: ConsoleAccessConsent::GrantedByBootstrap { .. },
+                ..
+            }
+        ));
+        assert!(persisted_console_access(&db).await, "consent is saved");
+        assert!(!path.exists());
+        let provider = temps_entities::oidc_providers::Entity::find()
+            .filter(temps_entities::oidc_providers::Column::ManagedByCloud.eq(true))
+            .one(db.as_ref())
+            .await
+            .expect("provider query")
+            .expect("the managed provider exists");
+        assert!(provider.enabled);
+        assert!(
+            provider.admin_only_role_required,
+            "only owners/admins may sign in through the managed provider"
+        );
+        assert!(
+            !provider.trust_idp_email,
+            "Cloud must supply verified email provenance on every login"
+        );
+        assert_eq!(provider.issuer_url, "https://cloud.example.com");
+        let mappings = temps_entities::oidc_role_mappings::Entity::find()
+            .filter(temps_entities::oidc_role_mappings::Column::ProviderId.eq(provider.id))
+            .count(db.as_ref())
+            .await
+            .expect("mapping count");
+        assert_eq!(mappings, 3);
+        assert!(!service.link.is_linked());
+    }
+
+    /// The frame path keeps its guard after a real bootstrap: consent is on
+    /// but the link is not established, so a frame is still refused.
+    #[tokio::test]
+    async fn postgres_frame_path_still_requires_a_link_after_bootstrap() {
+        let Some(test_db) = postgres_or_skip("frame guard").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        service
+            .apply_console_oidc_bootstrap_file(&write_bootstrap_file(&dir))
+            .await
+            .expect("bootstrap");
+
+        let result = service
+            .apply_console_oidc_config(temps_auth::oidc_service::ManagedCloudOidcConfig {
+                issuer: "https://cloud.example.com".into(),
+                client_id: "other".into(),
+                client_secret: "other".into(),
+            })
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(CloudServiceError::Client(
+                CloudError::FeatureDisabled { .. }
+            ))
+        ));
+    }
+
+    /// A real failure: an ordinary provider already registered for the same
+    /// issuer makes the managed upsert refuse (it would bypass the admin
+    /// gate). Consent must never be written, and the file must survive.
+    #[tokio::test]
+    async fn postgres_conflicting_provider_fails_the_bootstrap_without_granting_consent() {
+        let Some(test_db) = postgres_or_skip("bootstrap conflict").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        use sea_orm::{ActiveModelTrait, Set};
+        temps_entities::oidc_providers::ActiveModel {
+            name: Set("Operator SSO".to_string()),
+            issuer_url: Set("https://cloud.example.com".to_string()),
+            client_id: Set("operator".to_string()),
+            client_secret_encrypted: Set("encrypted".to_string()),
+            scopes: Set("openid email profile".to_string()),
+            jit_provisioning: Set(false),
+            enabled: Set(true),
+            template: Set("generic".to_string()),
+            group_claim: Set("groups".to_string()),
+            role_claim: Set("groups".to_string()),
+            default_role: Set("user".to_string()),
+            trust_idp_email: Set(false),
+            managed_by_cloud: Set(false),
+            admin_only_role_required: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("ordinary provider");
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = write_bootstrap_file(&dir);
+
+        let error = service
+            .apply_console_oidc_bootstrap_file(&path)
+            .await
+            .expect_err("a shadowing provider must fail the bootstrap");
+
+        assert!(matches!(
+            error,
+            crate::console_oidc_bootstrap::ConsoleOidcBootstrapError::Apply {
+                consent: ConsentTrace::Untouched,
+                ..
+            }
+        ));
+        assert!(!persisted_console_access(&db).await, "consent not saved");
+        assert!(!service.console_access_enabled());
+        assert_eq!(managed_provider_count(&db).await, 0);
+        assert!(path.exists());
+    }
+
+    /// Disabling console access after a bootstrap deletes the managed
+    /// provider and its role mappings from the real tables.
+    #[tokio::test]
+    async fn postgres_disable_after_bootstrap_deletes_the_provider_and_mappings() {
+        let Some(test_db) = postgres_or_skip("disable after bootstrap").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = real_service(db.clone());
+        let dir = tempfile::tempdir().expect("tempdir");
+        service
+            .apply_console_oidc_bootstrap_file(&write_bootstrap_file(&dir))
+            .await
+            .expect("bootstrap");
+        assert_eq!(managed_provider_count(&db).await, 1);
+
+        service
+            .patch_feature_switches(
+                None,
+                None,
+                None,
+                Some(false),
+                BackupScheduleAuthority::InstanceAdmin,
+            )
+            .await
+            .expect("disable");
+
+        assert!(!persisted_console_access(&db).await);
+        assert_eq!(managed_provider_count(&db).await, 0);
+        let leftover_mappings = temps_entities::oidc_role_mappings::Entity::find()
+            .count(db.as_ref())
+            .await
+            .expect("mapping count");
+        assert_eq!(leftover_mappings, 0, "no orphaned role mappings");
+    }
+
+    /// The bootstrap races an operator disabling console access. The lifecycle
+    /// lock must serialize them, so whichever wins the persisted switch and the
+    /// provider row always agree: on with a provider, or off without one.
+    #[tokio::test]
+    async fn postgres_bootstrap_racing_a_disable_never_leaves_consent_and_provider_split() {
+        let Some(test_db) = postgres_or_skip("bootstrap race").await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        for round in 0..6 {
+            let service = real_service(db.clone());
+            // Reset to a known state: off, no provider.
+            service
+                .patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                )
+                .await
+                .expect("reset");
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = write_bootstrap_file(&dir);
+
+            let (bootstrap, disable) = tokio::join!(
+                service.apply_console_oidc_bootstrap_file(&path),
+                service.patch_feature_switches(
+                    None,
+                    None,
+                    None,
+                    Some(false),
+                    BackupScheduleAuthority::InstanceAdmin,
+                ),
+            );
+            bootstrap.expect("the bootstrap itself must not fail in a race");
+            disable.expect("the disable itself must not fail in a race");
+
+            let persisted = persisted_console_access(&db).await;
+            let providers = managed_provider_count(&db).await;
+            assert_eq!(
+                persisted,
+                providers == 1,
+                "round {round}: consent saved={persisted} but managed providers={providers}"
+            );
+            assert_eq!(
+                service.console_access_enabled(),
+                persisted,
+                "round {round}: in-memory switch must match the saved one"
             );
         }
     }
@@ -2184,7 +3342,13 @@ mod tests {
         let oidc = Arc::new(temps_auth::oidc_service::OidcService::new(
             oidc_db.clone(),
             Arc::new(EncryptionService::new_from_password("oidc-revocation-test")),
-            Arc::new(temps_auth::UserService::new(oidc_db)),
+            Arc::new(temps_auth::UserService::new(
+                oidc_db,
+                Arc::new(
+                    temps_core::EncryptionService::new(&"7a".repeat(32))
+                        .expect("fixed test key must be valid"),
+                ),
+            )),
         ));
         service.set_oidc_service(oidc);
 
@@ -2216,7 +3380,7 @@ mod bootstrap_backend_url_tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_cloud_client::CloudLink;
     use temps_cloud_protocol::EnrollRequest;
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
 
     use super::*;
 

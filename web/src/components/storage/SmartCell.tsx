@@ -124,7 +124,7 @@ export function SmartCell({
         className={cn(
           'font-mono text-[10px] px-1.5 py-0',
           truthy
-            ? 'bg-green-500/15 text-green-600 dark:text-green-400 hover:bg-green-500/15'
+            ? 'bg-green-500/15 text-green-700 dark:text-green-400 hover:bg-green-500/15'
             : 'bg-muted text-muted-foreground hover:bg-muted'
         )}
       >

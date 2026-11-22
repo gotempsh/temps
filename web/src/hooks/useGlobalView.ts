@@ -2,8 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router'
+import { usePageInRange } from './usePageInRange'
+import { useComposedSearchParams } from '@temps-sdk/ds'
 import {
+  OBSERVABILITY_PAGE_SIZE,
   patchObservationFilters,
   positiveInteger,
   readObservationWindow,
@@ -16,7 +18,7 @@ import {
 } from '@/lib/date-time-range'
 
 export function useGlobalView() {
-  const [params, setParams] = useSearchParams()
+  const [params, updateParams] = useComposedSearchParams()
   const [now, setNow] = useState(Date.now)
   const window = useMemo(
     () => readObservationWindow(params, now),
@@ -30,15 +32,11 @@ export function useGlobalView() {
       (window.range !== 'custom' && (params.has('from') || params.has('to'))) ||
       params.get('range') !== window.range
     ) {
-      setParams((current) => normalizeObservationWindow(current, now), {
-        replace: true,
-      })
+      updateParams((current) => normalizeObservationWindow(current, now))
     }
-  }, [params, setParams, now, window.from, window.to, window.range])
+  }, [params, updateParams, now, window.from, window.to, window.range])
   const patch = (values: Record<string, string | undefined>) =>
-    setParams((current) => patchObservationFilters(current, values), {
-      replace: true,
-    })
+    updateParams((current) => patchObservationFilters(current, values))
   const setTimeRange = (value: DateTimeRangeValue) => {
     if (value.preset !== 'custom') setNow(Date.parse(value.to))
     patch({
@@ -52,32 +50,75 @@ export function useGlobalView() {
   return {
     params,
     patch,
+    /**
+     * Replaces the query in one composed update, for changes `patch` cannot
+     * express (repeated params such as `attr`).
+     */
+    update: (transform: (current: URLSearchParams) => URLSearchParams) =>
+      updateParams((current) => {
+        const next = transform(new URLSearchParams(current))
+        next.delete('page')
+        next.delete('cursor')
+        return next
+      }),
     ...window,
     page: positiveInteger(params.get('page')) ?? 1,
     projectId: positiveInteger(params.get('project_id')),
     search: params.get('q') ?? '',
     setRange,
     setTimeRange,
-    setPage: (page: number) =>
-      setParams((current) => {
-        const next = new URLSearchParams(current)
-        next.set('page', String(page))
-        return next
-      }),
+    /**
+     * Moves a relative window to now and leaves everything else, page
+     * included, as it is (a Refresh). A custom window does not move.
+     */
+    advance: () => setNow(Date.now()),
+    /** `replace` corrects the page in place, without a history entry. */
+    setPage: (page: number, { replace = false }: { replace?: boolean } = {}) =>
+      updateParams(
+        (next) => {
+          next.set('page', String(page))
+          return next
+        },
+        { replace }
+      ),
     setCursor: (cursor?: string) =>
-      setParams((current) => {
-        // A cursor belongs to one exact window. Freeze a relative preset
-        // before attaching it so a later reload cannot reuse a stale cursor.
-        const next = normalizeObservationWindow(current, now)
-        if (cursor && window.range !== 'custom') {
-          next.set('from', window.from)
-          next.set('to', window.to)
-          next.set('range', 'custom')
-        }
-        if (cursor) next.set('cursor', cursor)
-        else next.delete('cursor')
-        return next
-      }),
+      updateParams(
+        (current) => {
+          // A cursor belongs to one exact window. Freeze a relative preset
+          // before attaching it so a later reload cannot reuse a stale cursor.
+          const next = normalizeObservationWindow(current, now)
+          if (cursor && window.range !== 'custom') {
+            next.set('from', window.from)
+            next.set('to', window.to)
+            next.set('range', 'custom')
+          }
+          if (cursor) next.set('cursor', cursor)
+          else next.delete('cursor')
+          return next
+        },
+        { replace: false }
+      ),
   }
 }
 export type GlobalView = ReturnType<typeof useGlobalView>
+
+/**
+ * Refresh keeps a global page's `page` while it moves the window to now; if
+ * the moved window holds fewer items, go back to the last page that exists.
+ * `loaded` is this page's own answer: rows on it and the list's total.
+ */
+export function useGlobalPageInRange(
+  view: GlobalView,
+  loaded: { rows: number; total: number } | undefined
+) {
+  usePageInRange(
+    view.page,
+    loaded
+      ? {
+          rows: loaded.rows,
+          totalPages: Math.ceil(loaded.total / OBSERVABILITY_PAGE_SIZE),
+        }
+      : undefined,
+    (page) => view.setPage(page, { replace: true })
+  )
+}

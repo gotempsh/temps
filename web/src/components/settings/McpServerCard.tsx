@@ -2,20 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { CodeTabs, type CodeExample } from '@/components/ui/code-tabs'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Label } from '@/components/ui/label'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertTriangle, Bot, ExternalLink } from 'lucide-react'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { ReadFailure } from '@/components/ui/read-failure'
+import { isForbiddenRead } from '@/lib/read-failure'
+import { Bot, ExternalLink } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
 
@@ -57,19 +53,13 @@ function connectExamples(baseUrl: string): CodeExample[] {
 }
 
 export function McpServerCard() {
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
   const [connectClientId, setConnectClientId] = useState(MCP_CLIENTS[0].id)
 
   if (isLoading) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bot className="h-5 w-5" />
-            MCP Server
-          </CardTitle>
-        </CardHeader>
         <CardContent>
           <Skeleton className="h-16 w-full" />
         </CardContent>
@@ -80,21 +70,12 @@ export function McpServerCard() {
   if (error || !settings) {
     return (
       <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2">
-            <Bot className="h-5 w-5" />
-            MCP Server
-          </CardTitle>
-        </CardHeader>
         <CardContent>
-          <Alert variant="destructive">
-            <AlertTriangle className="h-4 w-4" />
-            <AlertTitle>Failed to load settings</AlertTitle>
-            <AlertDescription>
-              The server returned an error. Check console logs or contact your
-              administrator.
-            </AlertDescription>
-          </Alert>
+          <ReadFailure
+            resource="MCP server settings"
+            error={error}
+            onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+          />
         </CardContent>
       </Card>
     )
@@ -115,20 +96,6 @@ export function McpServerCard() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Bot className="h-5 w-5" />
-          MCP Server
-        </CardTitle>
-        <CardDescription>
-          Lets AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code,
-          Windsurf, Zed) connect to this Temps instance over the Model Context
-          Protocol — e.g. ask &quot;list my Temps projects&quot; or &quot;deploy
-          the latest commit&quot; and have the assistant call real tools against
-          this instance. Every write action still requires a separate
-          confirmation before it executes.
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-4">
         <div className="flex items-start justify-between rounded-lg border p-3">
           <div className="space-y-0.5">

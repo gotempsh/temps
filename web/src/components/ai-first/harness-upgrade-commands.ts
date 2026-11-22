@@ -17,8 +17,11 @@ const UPGRADE_COMMANDS = [
   {
     providerId: 'codex_cli',
     name: 'Codex',
+    // Runtime images differ: current ones install Codex with npm into a
+    // sandbox-owned prefix, older ones with bun into ~/.bun. Upgrade it where
+    // it actually lives, otherwise the new copy would be shadowed on PATH.
     command:
-      'BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest && codex --version',
+      'case "$(command -v codex)" in "$HOME"/.bun/*) BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest;; *) npm install -g @openai/codex@latest;; esac && codex --version',
   },
   {
     providerId: 'opencode',

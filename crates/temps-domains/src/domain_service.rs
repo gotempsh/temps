@@ -2,10 +2,10 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder,
+    PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::telemetry::{
@@ -22,6 +22,79 @@ use crate::tls::{
     CertificateProvider, CertificateRepository, ChallengeType, ProvisioningResult, RepositoryError,
     TlsError,
 };
+
+/// Policy for future certificate orders. Saving it never changes the serving certificate.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, utoipa::ToSchema, PartialEq, Eq)]
+pub struct DomainCertificateSettings {
+    /// Validation method for future ACME orders. Saving this does not convert an imported certificate to ACME.
+    pub challenge_type: String,
+    /// Start ACME renewal this many days before expiry (1–90). Does not schedule renewal of imported certificates.
+    pub renewal_days: i32,
+    /// Override the instance SSL expiry warning threshold; null inherits it.
+    pub alert_days: Option<i32>,
+    /// Override instance SSL expiry alerts; null inherits it.
+    pub alerts_enabled: Option<bool>,
+}
+
+/// How the current certificate is renewed, independently of its future-order policy.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CertificateRenewalMode {
+    /// Imported certificate: upload a replacement before expiry. ACME policy fields do not enable automatic renewal.
+    Manual,
+    /// ACME certificate. DNS-01 requires a configured DNS provider for unattended renewal.
+    Acme,
+}
+
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct DomainCertificateSettingsResponse {
+    #[serde(flatten)]
+    pub settings: DomainCertificateSettings,
+    /// Effective renewal mode of the current certificate. Saving settings does not change it.
+    pub renewal_mode: CertificateRenewalMode,
+}
+
+impl DomainCertificateSettingsResponse {
+    fn from_domain(domain: &domains::Model, settings: DomainCertificateSettings) -> Self {
+        Self {
+            settings,
+            renewal_mode: if domain.verification_method == "manual" {
+                CertificateRenewalMode::Manual
+            } else {
+                CertificateRenewalMode::Acme
+            },
+        }
+    }
+}
+
+impl DomainCertificateSettings {
+    fn validate(&self, domain: &domains::Model) -> Result<(), DomainServiceError> {
+        if !matches!(self.challenge_type.as_str(), "http-01" | "dns-01")
+            || ((domain.is_wildcard || domain.domain.starts_with("*."))
+                && self.challenge_type != "dns-01")
+            || !(1..=90).contains(&self.renewal_days)
+            || self
+                .alert_days
+                .is_some_and(|days| !(1..=90).contains(&days))
+        {
+            return Err(DomainServiceError::InvalidDomain(format!(
+                "Invalid certificate settings for {}: choose http-01 or dns-01 (wildcards require dns-01), with thresholds between 1 and 90 days", domain.domain
+            )));
+        }
+        Ok(())
+    }
+}
+
+impl From<temps_entities::domain_certificate_settings::Model> for DomainCertificateSettings {
+    fn from(value: temps_entities::domain_certificate_settings::Model) -> Self {
+        Self {
+            challenge_type: value.challenge_type,
+            renewal_days: value.renewal_days,
+            alert_days: value.alert_days,
+            alerts_enabled: value.alerts_enabled,
+        }
+    }
+}
 
 /// Allowlisted sort columns for the paginated domain collection.
 #[derive(Debug, Clone, Copy, Default, serde::Deserialize, utoipa::ToSchema)]
@@ -62,10 +135,22 @@ fn sorted_domains_query(
     if let Some(search) = search.filter(|value| !value.is_empty()) {
         query = query.filter(domains::Column::Domain.contains(search));
     }
-    query
-        .order_by_with_nulls(column, order, NullOrdering::Last)
-        .order_by_asc(domains::Column::Domain)
-        .order_by_asc(domains::Column::Id)
+    // Tiebreakers: descending (the default) keeps `domain ASC, id ASC`;
+    // ascending is its exact reverse. When most rows share the sort value
+    // (typically a certificate expiry that is still unknown), a fixed
+    // tiebreaker made the second click on "Certificate expires" look like a
+    // no-op. `id` keeps the order total so LIMIT/OFFSET pages never overlap.
+    let tiebreak = match direction {
+        DomainSortDirection::Asc => Order::Desc,
+        DomainSortDirection::Desc => Order::Asc,
+    };
+    let mut query = query.order_by_with_nulls(column, order, NullOrdering::Last);
+    // Sorting by the domain name already orders by that column; repeating it
+    // as a tiebreaker would only add a redundant key.
+    if !matches!(sort, DomainSort::Domain) {
+        query = query.order_by(domains::Column::Domain, tiebreak.clone());
+    }
+    query.order_by(domains::Column::Id, tiebreak)
 }
 
 #[derive(Error, Debug)]
@@ -78,6 +163,23 @@ pub enum DomainServiceError {
     InvalidDomain(String),
     #[error("Challenge error: {0}")]
     Challenge(String),
+
+    /// The ACME server permanently invalidated the order (or one of its
+    /// authorizations) for `domain`, usually because validation ran before the
+    /// DNS record / HTTP token was in place. An invalid challenge can never
+    /// become valid again and cannot be re-submitted, so retrying the same
+    /// order is pointless: a new order with fresh challenge values is required.
+    #[error(
+        "ACME challenge for domain {domain} (ID {domain_id}) is no longer valid and cannot be \
+         retried (order {order_url}): {detail}. Start a new order with \
+         POST /domains/{domain_id}/order to get fresh challenge values"
+    )]
+    ChallengeInvalidated {
+        domain: String,
+        domain_id: i32,
+        order_url: String,
+        detail: String,
+    },
     #[error("TLS error: {0}")]
     Tls(#[from] TlsError),
     #[error("Provider error: {0}")]
@@ -86,6 +188,18 @@ pub enum DomainServiceError {
     Repository(#[from] RepositoryError),
     #[error("Internal error: {0}")]
     Internal(String),
+
+    /// On-demand issuance for `hostname` was not attempted: an earlier
+    /// failure's backoff, stored on the domain row (possibly by another
+    /// process sharing the database), runs until `backoff_until`. Nothing was
+    /// sent to the CA and the failure streak did not grow.
+    #[error(
+        "On-demand TLS for {hostname} is backing off after earlier failures until {backoff_until}"
+    )]
+    OnDemandBackoffActive {
+        hostname: String,
+        backoff_until: DateTime<Utc>,
+    },
 
     /// On-demand HTTP-01 issuance for `hostname` hit a Let's Encrypt rate limit
     /// (`urn:ietf:params:acme:error:rateLimited`). `retry_after` carries the LE
@@ -103,12 +217,17 @@ pub enum DomainServiceError {
     /// reason. `category` is the coarse `error_category` written to the
     /// `on_demand_cert_attempts` audit row (`dns_failure`, `acme_order_expired`,
     /// `challenge_mismatch`, `timeout`, or `internal`); `error_chain` is the full
-    /// `source()` chain of the underlying error.
+    /// `source()` chain of the underlying error. `backoff_until` is the retry
+    /// deadline `provision_on_demand` persisted on the `domains` row, so the
+    /// proxy's negative cache waits exactly as long as the ladder says; `None`
+    /// when no backoff was armed (the failure happened before one could be
+    /// stored).
     #[error("On-demand TLS issuance failed for {hostname} ({category}): {error_chain}")]
     OnDemandIssuanceFailed {
         hostname: String,
         category: String,
         error_chain: String,
+        backoff_until: Option<DateTime<Utc>>,
     },
 
     /// `begin_on_demand_issuing` found that the domain already has an `active`
@@ -116,6 +235,53 @@ pub enum DomainServiceError {
     /// no-op success — no ACME request should be sent.
     #[error("Certificate already active for {0}: skipping on-demand re-issuance")]
     CertificateAlreadyActive(String),
+
+    /// DNS-01 through a provider was asked for `domain`, but no active DNS
+    /// provider in Temps manages a verified zone for it with automatic DNS.
+    #[error(
+        "No DNS provider in Temps manages a verified zone for {domain} with automatic DNS on, \
+         so Temps cannot publish its DNS-01 challenge"
+    )]
+    Dns01NoProvider { domain: String },
+
+    /// The zone's DNS provider could not be reached or did not create every
+    /// DNS-01 challenge record for `domain`.
+    #[error(
+        "DNS provider {provider} could not publish the DNS-01 challenge for {domain}: {detail}"
+    )]
+    Dns01Provider {
+        domain: String,
+        provider: String,
+        detail: String,
+    },
+
+    /// The challenge record was published but public resolvers did not see
+    /// it in time; Let's Encrypt was not asked to validate, so the order is
+    /// not spent.
+    #[error(
+        "The DNS-01 challenge record {record} for {domain} was published, but public resolvers \
+         did not see it within {waited_secs}s. Let's Encrypt was not asked to validate it yet; \
+         try again in a few minutes"
+    )]
+    Dns01NotVisible {
+        domain: String,
+        record: String,
+        waited_secs: u64,
+    },
+
+    /// Saving or reading the record of which DNS-01 challenge records were
+    /// published for `domain` failed. When `records_may_have_changed`, the
+    /// provider may hold records Temps can no longer name exactly.
+    #[error(
+        "The record of DNS-01 challenge records published for {domain} could not be saved or \
+         read{}: {detail}",
+        if *records_may_have_changed { " after the provider may have changed them" } else { "" }
+    )]
+    Dns01Receipt {
+        domain: String,
+        records_may_have_changed: bool,
+        detail: String,
+    },
 }
 
 /// Fixed telemetry label for a certificate's verification method. The column is
@@ -130,6 +296,30 @@ pub(crate) fn verification_method_label(raw: &str) -> &'static str {
     }
 }
 
+/// Stored `acme_orders.status` for an order the ACME server permanently
+/// invalidated. Terminal: the order cannot be finalized or re-submitted.
+pub(crate) const ORDER_STATUS_INVALID: &str = "invalid";
+
+/// Prefix of the `error_chain` written by the DNS preflight, so the failure
+/// path can tell "never reached the CA" apart from a real ACME failure.
+const DNS_PREFLIGHT_MARKER: &str = "DNS preflight: ";
+
+/// A quiet gap, in hours, after which a host's failure streak starts over.
+/// Twice the 24h cap, so a host retried at the cap keeps its place.
+const ON_DEMAND_STREAK_GAP_HOURS: i64 = 48;
+
+/// The one-level wildcard that would cover `host` (`app.example.com` ->
+/// `*.example.com`). Mirrors the proxy certificate loader's `wildcard_for` so
+/// coverage decisions here match what a handshake would be served.
+fn wildcard_parent(host: &str) -> Option<String> {
+    let (_, parent) = host.split_once('.')?;
+    if parent.is_empty() {
+        None
+    } else {
+        Some(format!("*.{parent}"))
+    }
+}
+
 pub struct DomainService {
     db: Arc<DatabaseConnection>,
     cert_provider: Arc<dyn CertificateProvider>,
@@ -138,6 +328,28 @@ pub struct DomainService {
     /// Anonymous product telemetry. No-op unless wired with
     /// [`Self::with_telemetry`].
     telemetry: Arc<dyn TelemetryReporter>,
+    /// When set, on-demand issuance resolves the hostname first and fails fast
+    /// (without touching the CA) when it has no DNS records. See
+    /// [`Self::with_dns_preflight`].
+    dns_preflight: bool,
+}
+
+/// How a challenge operation finds its `domains` row.
+#[derive(Debug, Clone, Copy)]
+enum DomainLookup<'a> {
+    /// By hostname: the row currently holding that name.
+    Name(&'a str),
+    /// By primary key: exactly that row, or `NotFound`.
+    Id(i32),
+}
+
+impl std::fmt::Display for DomainLookup<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Name(name) => f.write_str(name),
+            Self::Id(id) => write!(f, "domain id {id}"),
+        }
+    }
 }
 
 impl DomainService {
@@ -153,7 +365,21 @@ impl DomainService {
             repository,
             encryption_service,
             telemetry: Arc::new(NoopTelemetryReporter),
+            dns_preflight: false,
         }
+    }
+
+    /// Resolve the hostname before every on-demand ACME order and fail fast
+    /// with a `dns_failure` attempt when it has no DNS records.
+    ///
+    /// Custom domains are attached by users, so a hostname can be added before
+    /// its DNS exists. Ordering anyway would burn the CA's failed-authorization
+    /// budget (5 per hostname per hour) for a result that cannot succeed; the
+    /// preflight records the failure and applies the normal backoff ladder
+    /// without sending a request. Off by default so unit tests stay offline.
+    pub fn with_dns_preflight(mut self, enabled: bool) -> Self {
+        self.dns_preflight = enabled;
+        self
     }
 
     /// Report failed certificate attempts as anonymous `ssl_certificate_failed`
@@ -183,6 +409,12 @@ impl DomainService {
         has_material && not_expiring_imminently
     }
 
+    /// Whether setup may keep this serving certificate without placing a new order.
+    pub fn can_reuse_serving_certificate(domain: &domains::Model) -> bool {
+        domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
+            && Self::has_usable_certificate(domain)
+    }
+
     /// Status to fall back to when a renewal/order is abandoned.
     ///
     /// `renewal_failed = true`  → the renewal attempt failed. If a usable cert is still
@@ -204,6 +436,90 @@ impl DomainService {
         } else {
             domains::STATUS_ACTIVE
         }
+    }
+
+    pub async fn certificate_settings(
+        &self,
+        id: i32,
+    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        self.certificate_settings_for(&domain).await
+    }
+
+    pub async fn certificate_settings_response(
+        &self,
+        id: i32,
+    ) -> Result<DomainCertificateSettingsResponse, DomainServiceError> {
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        Ok(DomainCertificateSettingsResponse::from_domain(
+            &domain,
+            self.certificate_settings_for(&domain).await?,
+        ))
+    }
+
+    pub(crate) async fn certificate_settings_for(
+        &self,
+        domain: &domains::Model,
+    ) -> Result<DomainCertificateSettings, DomainServiceError> {
+        let stored = temps_entities::domain_certificate_settings::Entity::find_by_id(domain.id)
+            .one(self.db.as_ref())
+            .await?;
+        Ok(stored
+            .map(Into::into)
+            .unwrap_or_else(|| DomainCertificateSettings {
+                challenge_type: if domain.is_wildcard
+                    || domain.domain.starts_with("*.")
+                    || domain.verification_method == "dns-01"
+                {
+                    "dns-01".into()
+                } else {
+                    "http-01".into()
+                },
+                renewal_days: 30,
+                alert_days: None,
+                alerts_enabled: None,
+            }))
+    }
+
+    pub async fn update_certificate_settings(
+        &self,
+        id: i32,
+        settings: DomainCertificateSettings,
+    ) -> Result<DomainCertificateSettingsResponse, DomainServiceError> {
+        use temps_entities::domain_certificate_settings as policy;
+        let domain = self
+            .get_domain_by_id(id)
+            .await?
+            .ok_or_else(|| DomainServiceError::NotFound(id.to_string()))?;
+        settings.validate(&domain)?;
+        policy::Entity::insert(policy::ActiveModel {
+            domain_id: Set(id),
+            challenge_type: Set(settings.challenge_type.clone()),
+            renewal_days: Set(settings.renewal_days),
+            alert_days: Set(settings.alert_days),
+            alerts_enabled: Set(settings.alerts_enabled),
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(policy::Column::DomainId)
+                .update_columns([
+                    policy::Column::ChallengeType,
+                    policy::Column::RenewalDays,
+                    policy::Column::AlertDays,
+                    policy::Column::AlertsEnabled,
+                ])
+                .to_owned(),
+        )
+        .exec(self.db.as_ref())
+        .await?;
+        Ok(DomainCertificateSettingsResponse::from_domain(
+            &domain, settings,
+        ))
     }
 
     /// Step 1: Create a domain record in the database
@@ -334,7 +650,9 @@ impl DomainService {
             .paginate(self.db.as_ref(), page_size.max(1));
 
         let total = paginator.num_items().await?;
-        let attempts = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let attempts = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((attempts, total))
     }
@@ -344,7 +662,7 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(domain_name, user_email, true)
+        self.request_challenge_with(DomainLookup::Name(domain_name), user_email, true, None)
             .await
     }
 
@@ -355,20 +673,27 @@ impl DomainService {
         &self,
         domain_name: &str,
         user_email: &str,
+        challenge: ChallengeType,
     ) -> Result<ChallengeData, DomainServiceError> {
-        self.request_challenge_with(domain_name, user_email, false)
-            .await
+        self.request_challenge_with(
+            DomainLookup::Name(domain_name),
+            user_email,
+            false,
+            Some(challenge),
+        )
+        .await
     }
 
     async fn request_challenge_with(
         &self,
-        domain_name: &str,
+        target: DomainLookup<'_>,
         user_email: &str,
         report_telemetry: bool,
+        challenge_override: Option<ChallengeType>,
     ) -> Result<ChallengeData, DomainServiceError> {
         info!(
             "Requesting Let's Encrypt challenge for domain: {} with email: {}",
-            domain_name, user_email
+            target, user_email
         );
 
         // Validate email is provided
@@ -379,30 +704,33 @@ impl DomainService {
         }
 
         // Find the domain
-        let mut domain = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(domain_name))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let mut domain = self.find_domain(target).await?;
+        let domain_name_owned = domain.domain.clone();
+        let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
-        // Clean up any existing order for this domain (important for renewals)
-        // This ensures we always start fresh with a new challenge
-        if let Some(existing_order) = self.repository.find_acme_order_by_domain(domain.id).await? {
-            info!(
-                "Deleting existing ACME order for domain: {} (order_url: {})",
-                domain_name, existing_order.order_url
-            );
-            self.repository
-                .delete_acme_order(&existing_order.order_url)
-                .await?;
-        }
+        // The order this request replaces (important for renewals: always start
+        // fresh with a new challenge). It is deleted only once its replacement
+        // exists — and never silently when it carries the receipt of DNS
+        // records Temps published for it: deleting first lost that receipt
+        // whenever the CA call then failed or returned a certificate outright,
+        // leaving the TXT records in the customer's zone with nothing to
+        // remove them.
+        let existing_order = self.repository.find_acme_order_by_domain(domain.id).await?;
 
-        // Determine challenge type from domain's verification method
-        let challenge_type = match domain.verification_method.as_str() {
-            "http-01" => ChallengeType::Http01,
-            "dns-01" => ChallengeType::Dns01,
-            _ => ChallengeType::Http01, // Default to HTTP-01
+        // The scheduler already loaded a bounded batch of policies. Interactive
+        // requests read the current preference before creating their order.
+        let challenge_type = match challenge_override {
+            Some(challenge) => challenge,
+            None => match self
+                .certificate_settings_for(&domain)
+                .await?
+                .challenge_type
+                .as_str()
+            {
+                "dns-01" => ChallengeType::Dns01,
+                _ => ChallengeType::Http01,
+            },
         };
         let challenge_type_str = match challenge_type {
             ChallengeType::Http01 => "http-01",
@@ -412,7 +740,7 @@ impl DomainService {
         // Request challenge from Let's Encrypt
         let provisioning_result = match self
             .cert_provider
-            .provision(domain_name, challenge_type, user_email)
+            .provision(domain_name, challenge_type.clone(), user_email)
             .await
         {
             Ok(result) => result,
@@ -433,6 +761,11 @@ impl DomainService {
                 let mut domain_active: domains::ActiveModel = domain.clone().into();
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some("challenge_request".to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
+                        .as_str()
+                        .to_string(),
+                ));
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
                         "Failed to persist challenge-request failure for domain {}: {}",
@@ -478,7 +811,7 @@ impl DomainService {
                     "validation_url": challenge_data.validation_url
                 });
 
-                let order = crate::tls::models::AcmeOrder {
+                let mut order = crate::tls::models::AcmeOrder {
                     id: 0, // Will be set by database
                     order_url: challenge_data.order_url.clone().unwrap_or_default(),
                     domain_id: domain.id,
@@ -497,11 +830,51 @@ impl DomainService {
                     expires_at: Some(Utc::now() + chrono::Duration::days(7)), // ACME orders typically expire in 7 days
                 };
 
+                // The receipt of DNS records published for the replaced order
+                // moves to the new order, so cleanup after a successful
+                // verification still removes them.
+                if let Some(receipt) = existing_order.as_ref().and_then(cleanup_receipt_of) {
+                    if let Some(object) = order
+                        .authorizations
+                        .as_mut()
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        object.insert(
+                            crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(),
+                            receipt,
+                        );
+                    }
+                }
+                let new_order_url = order.order_url.clone();
+
                 self.repository.save_acme_order(order).await?;
 
+                if let Some(old_order) = &existing_order {
+                    if old_order.order_url != new_order_url {
+                        info!(
+                            "Deleting replaced ACME order for domain: {} (order_url: {})",
+                            domain_name, old_order.order_url
+                        );
+                        self.repository
+                            .delete_acme_order(&old_order.order_url)
+                            .await?;
+                    }
+                }
+
                 // Update domain status based on challenge type
+                let status = if Self::has_usable_certificate(&domain) {
+                    domains::STATUS_ACTIVE
+                } else {
+                    "challenge_requested"
+                };
                 let mut domain_active: domains::ActiveModel = domain.into();
-                domain_active.status = Set("challenge_requested".to_string());
+                domain_active.status = Set(status.to_string());
+                // A brand-new order supersedes whatever failed before it; leaving
+                // the previous attempt's error would show a stale failure next to
+                // fresh challenge instructions.
+                domain_active.last_error = Set(None);
+                domain_active.last_error_type = Set(None);
+                domain_active.failure_cause = Set(None);
 
                 match challenge_data.challenge_type {
                     ChallengeType::Http01 => {
@@ -576,15 +949,46 @@ impl DomainService {
                         ))
                     })?;
 
+                // No new order exists, so a replaced order that carries a DNS
+                // cleanup receipt stays for the handler's cleanup (as after a
+                // normal verification); one without a receipt is just removed.
+                if let Some(old_order) = &existing_order {
+                    if cleanup_receipt_of(old_order).is_none() {
+                        self.repository
+                            .delete_acme_order(&old_order.order_url)
+                            .await?;
+                    }
+                }
+
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("active".to_string());
                 domain_active.certificate = Set(Some(cert_data.certificate_pem.clone()));
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(cert_data.expiration_time));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
+                // As in `complete_challenge`: the certificate came from an ACME
+                // order for this challenge type, so the renewal job can renew
+                // it the same way.
+                domain_active.verification_method = Set(challenge_type_str.to_string());
 
-                let domain = domain_active.update(self.db.as_ref()).await?;
+                let txn = self.db.begin().await?;
+                let domain = domain_active.update(&txn).await?;
+                if let Some(old_order) = existing_order
+                    .as_ref()
+                    .filter(|order| cleanup_receipt_of(order).is_some())
+                {
+                    temps_entities::acme_orders::Entity::update_many()
+                        .col_expr(
+                            temps_entities::acme_orders::Column::Status,
+                            sea_orm::sea_query::Expr::value("valid"),
+                        )
+                        .filter(
+                            temps_entities::acme_orders::Column::OrderUrl.eq(&old_order.order_url),
+                        )
+                        .exec(&txn)
+                        .await?;
+                }
+                txn.commit().await?;
 
                 self.record_renewal_attempt(
                     domain_id,
@@ -611,13 +1015,56 @@ impl DomainService {
         }
     }
 
+    /// [`Self::request_challenge`] for the row with id `domain_id`.
+    ///
+    /// For callers that own a specific row: a hostname can be deleted and
+    /// created again (by another owner) while a request is in flight, and a
+    /// lookup by name would then act on the new row. By id, a request for a
+    /// row that no longer exists fails with `NotFound` instead.
+    pub async fn request_challenge_for_id(
+        &self,
+        domain_id: i32,
+        user_email: &str,
+    ) -> Result<ChallengeData, DomainServiceError> {
+        self.request_challenge_with(DomainLookup::Id(domain_id), user_email, true, None)
+            .await
+    }
+
+    /// [`Self::complete_challenge`] for the row with id `domain_id`; see
+    /// [`Self::request_challenge_for_id`].
+    pub async fn complete_challenge_for_id(
+        &self,
+        domain_id: i32,
+        user_email: &str,
+    ) -> Result<domains::Model, DomainServiceError> {
+        self.complete_challenge_with(DomainLookup::Id(domain_id), user_email, true)
+            .await
+    }
+
+    async fn find_domain(
+        &self,
+        target: DomainLookup<'_>,
+    ) -> Result<domains::Model, DomainServiceError> {
+        match target {
+            DomainLookup::Name(name) => domains::Entity::find()
+                .filter(domains::Column::Domain.eq(name))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| DomainServiceError::NotFound(name.to_string())),
+            DomainLookup::Id(id) => domains::Entity::find_by_id(id)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| DomainServiceError::NotFound(format!("domain id {id}"))),
+        }
+    }
+
     /// Step 3: Complete the challenge (after user has added DNS record)
     pub async fn complete_challenge(
         &self,
         domain_name: &str,
         user_email: &str,
     ) -> Result<domains::Model, DomainServiceError> {
-        self.complete_challenge_with(domain_name, user_email, true)
+        self.complete_challenge_with(DomainLookup::Name(domain_name), user_email, true)
             .await
     }
 
@@ -629,19 +1076,19 @@ impl DomainService {
         domain_name: &str,
         user_email: &str,
     ) -> Result<domains::Model, DomainServiceError> {
-        self.complete_challenge_with(domain_name, user_email, false)
+        self.complete_challenge_with(DomainLookup::Name(domain_name), user_email, false)
             .await
     }
 
     async fn complete_challenge_with(
         &self,
-        domain_name: &str,
+        target: DomainLookup<'_>,
         user_email: &str,
         report_telemetry: bool,
     ) -> Result<domains::Model, DomainServiceError> {
         debug!(
             "Completing challenge for domain: {} with email: {}",
-            domain_name, user_email
+            target, user_email
         );
 
         // Validate email is provided
@@ -652,11 +1099,9 @@ impl DomainService {
         }
 
         // Find the domain
-        let domain = domains::Entity::find()
-            .filter(domains::Column::Domain.eq(domain_name))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DomainServiceError::NotFound(domain_name.to_string()))?;
+        let domain = self.find_domain(target).await?;
+        let domain_name_owned = domain.domain.clone();
+        let domain_name = domain_name_owned.as_str();
         let domain_id = domain.id;
 
         // Find the ACME order for this domain
@@ -666,6 +1111,21 @@ impl DomainService {
                     domain_name, domain.id)
             ))?;
         let retain_order_for_dns_cleanup = has_pending_dns_cleanup(order.authorizations.as_ref());
+
+        // An order we already recorded as invalidated by the ACME server must
+        // not be re-submitted: the server would reject the challenge update.
+        // Point the caller at the new-order flow instead.
+        if order.status == ORDER_STATUS_INVALID {
+            return Err(DomainServiceError::ChallengeInvalidated {
+                domain: domain_name.to_string(),
+                domain_id: domain.id,
+                order_url: order.order_url.clone(),
+                detail: order
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "the order was previously marked invalid".to_string()),
+            });
+        }
 
         // Check if order is in a valid state
         if order.status != "pending" && order.status != "ready" {
@@ -744,7 +1204,10 @@ impl DomainService {
                         ))
                     })?;
 
-                // Save certificate to tls_acme_certificates table
+                // Save the certificate copy and its domain row together. The
+                // row can be deleted while the CA is issuing (its owner was
+                // removed); then the update fails and the copy, with its
+                // encrypted private key, must not be left behind either.
                 let acme_cert = tls_acme_certificates::ActiveModel {
                     domain: Set(domain_name.to_string()),
                     certificate: Set(certificate.certificate_pem.clone()),
@@ -754,19 +1217,59 @@ impl DomainService {
                     ..Default::default()
                 };
 
-                acme_cert.insert(self.db.as_ref()).await?;
-
-                // Update domain record
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set("active".to_string());
                 domain_active.certificate = Set(Some(certificate.certificate_pem));
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(certificate.expiration_time));
                 domain_active.last_renewed = Set(Some(Utc::now()));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
+                // Record the challenge that was actually validated. A row
+                // created as `manual` (e.g. by `temps setup`) and issued here
+                // would otherwise stay `manual`, which the renewal job never
+                // renews.
+                domain_active.verification_method = Set(match &challenge_type {
+                    ChallengeType::Http01 => "http-01".to_string(),
+                    ChallengeType::Dns01 => "dns-01".to_string(),
+                });
 
-                let updated_domain = domain_active.update(self.db.as_ref()).await?;
+                let txn = self.db.begin().await?;
+                let saved = async {
+                    acme_cert.insert(&txn).await?;
+                    if retain_order_for_dns_cleanup {
+                        temps_entities::acme_orders::Entity::update_many()
+                            .col_expr(
+                                temps_entities::acme_orders::Column::Status,
+                                sea_orm::sea_query::Expr::value("valid"),
+                            )
+                            .filter(
+                                temps_entities::acme_orders::Column::OrderUrl.eq(&order.order_url),
+                            )
+                            .exec(&txn)
+                            .await?;
+                    }
+                    domain_active.update(&txn).await
+                }
+                .await;
+                let updated_domain = match saved {
+                    Ok(updated) => {
+                        txn.commit().await?;
+                        updated
+                    }
+                    Err(e) => {
+                        if let Err(rollback) = txn.rollback().await {
+                            warn!(
+                                "Failed to roll back certificate save for domain {} (id {}): {}",
+                                domain_name, domain_id, rollback
+                            );
+                        }
+                        error!(
+                            "Issued certificate for domain {} (id {}) was not stored: {}",
+                            domain_name, domain_id, e
+                        );
+                        return Err(e.into());
+                    }
+                };
 
                 // Keep orders carrying provider record receipts until the
                 // handler completes (or explicitly skips) external DNS
@@ -824,6 +1327,38 @@ impl DomainService {
                     );
                 }
 
+                // When the ACME server itself invalidated the order, remember that on
+                // the stored order so the next retry starts a new one instead of
+                // re-submitting a dead challenge, and so the order endpoint reports a
+                // terminal state the console already knows how to render.
+                let invalidation_detail = match &e {
+                    crate::tls::ProviderError::ChallengeInvalidated { detail, .. } => {
+                        Some(detail.clone())
+                    }
+                    _ => None,
+                };
+                if let Some(detail) = invalidation_detail.as_ref() {
+                    if let Err(update_err) = self
+                        .repository
+                        .update_acme_order_status(
+                            &order.order_url,
+                            ORDER_STATUS_INVALID,
+                            Some(detail.clone()),
+                        )
+                        .await
+                    {
+                        error!(
+                            "Failed to mark ACME order {} invalid for domain {} (ID {}): {}",
+                            order.order_url, domain_name, domain_id, update_err
+                        );
+                    }
+                }
+                let error_type = if invalidation_detail.is_some() {
+                    "challenge_invalidated"
+                } else {
+                    "challenge_completion"
+                };
+
                 // Persist the error so the failure is visible, and actually write it —
                 // the previous implementation built this ActiveModel but never called
                 // update(), silently dropping the status/error change. The full error is
@@ -832,7 +1367,12 @@ impl DomainService {
                 let mut domain_active: domains::ActiveModel = domain.into();
                 domain_active.status = Set(fallback_status.to_string());
                 domain_active.last_error = Set(Some(e.to_string()));
-                domain_active.last_error_type = Set(Some("challenge_completion".to_string()));
+                domain_active.last_error_type = Set(Some(error_type.to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
+                        .as_str()
+                        .to_string(),
+                ));
 
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
@@ -847,15 +1387,23 @@ impl DomainService {
                     challenge_type_str,
                     "failed",
                     Some(e.to_string()),
-                    Some("challenge_completion".to_string()),
+                    Some(error_type.to_string()),
                     report_telemetry,
                 )
                 .await;
 
-                Err(DomainServiceError::Challenge(format!(
-                    "Failed to complete challenge: {}.",
-                    e
-                )))
+                match invalidation_detail {
+                    Some(detail) => Err(DomainServiceError::ChallengeInvalidated {
+                        domain: domain_name.to_string(),
+                        domain_id,
+                        order_url: order.order_url.clone(),
+                        detail,
+                    }),
+                    None => Err(DomainServiceError::Challenge(format!(
+                        "Failed to complete challenge: {}.",
+                        e
+                    ))),
+                }
             }
         }
     }
@@ -897,7 +1445,7 @@ impl DomainService {
     ) -> Result<Vec<domains::Model>, DomainServiceError> {
         let domains = domains::Entity::find()
             .paginate(self.db.as_ref(), page_size)
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?;
         Ok(domains)
     }
@@ -917,7 +1465,9 @@ impl DomainService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let domains = paginator.fetch_page(page - 1).await?;
+        let domains = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((domains, total))
     }
 
@@ -1054,9 +1604,11 @@ impl DomainService {
             // leave a stale "error" surfaced to operators for a healthy domain.
             domain_active.last_error = Set(None);
             domain_active.last_error_type = Set(None);
+            domain_active.failure_cause = Set(None);
         } else {
             domain_active.last_error = Set(Some("Order cancelled by user".to_string()));
             domain_active.last_error_type = Set(Some("cancelled".to_string()));
+            domain_active.failure_cause = Set(None);
         }
 
         let updated_domain = domain_active.update(self.db.as_ref()).await?;
@@ -1155,10 +1707,30 @@ impl DomainService {
                 hostname: hostname.to_string(),
                 category: "internal".to_string(),
                 error_chain: "no ACME contact email configured for on-demand issuance".to_string(),
+                backoff_until: None,
             };
             self.record_on_demand_outcome(hostname, false, false, None, Some(&err), started)
                 .await;
             return Err(err);
+        }
+
+        // 0. A hostname already served by an exact or wildcard certificate needs
+        //    no order. The route-reload pre-provisioning path hands this method
+        //    every cert-eligible host, so covered ones are dropped here.
+        match self.find_covered_hostnames(&[hostname.to_string()]).await {
+            Ok(covered) if covered.contains(hostname) => {
+                debug!(
+                    hostname = %hostname,
+                    "on-demand TLS: hostname already covered by a certificate, skipping order"
+                );
+                return Ok(());
+            }
+            Ok(_) => {}
+            Err(e) => {
+                self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
+                    .await;
+                return Err(e);
+            }
         }
 
         // 1. Create or reuse the domains row, transitioning into the issuing state.
@@ -1170,6 +1742,15 @@ impl DomainService {
                 // The cert loader serves it regardless of this function being called.
                 return Ok(());
             }
+            Err(e @ DomainServiceError::OnDemandBackoffActive { .. }) => {
+                // No attempt was made, so no audit row: the caller gets the
+                // stored deadline and holds the host until then.
+                debug!(
+                    hostname = %hostname,
+                    "on-demand TLS: stored backoff still running, not contacting the CA"
+                );
+                return Err(e);
+            }
             Err(e) => {
                 self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
                     .await;
@@ -1180,7 +1761,7 @@ impl DomainService {
 
         // 2. Run the ACME order: request_challenge persists the order + serves the
         //    token, complete_challenge finalizes and stores cert+key as "active".
-        match self.run_on_demand_acme(hostname, email).await {
+        match self.issue_on_demand(hostname, email).await {
             Ok(()) => {
                 let duration_ms = Self::elapsed_ms(started);
                 info!(
@@ -1206,16 +1787,20 @@ impl DomainService {
                 // before recording the audit row and returning.
                 let (category, retry_after) = Self::categorize_on_demand_error(&e);
                 let error_chain = error_chain_string(&e);
-                if let Err(persist_err) = self
+                let backoff_until = match self
                     .mark_on_demand_failed(hostname, &error_chain, &category, retry_after)
                     .await
                 {
-                    error!(
-                        hostname = %hostname,
-                        "on-demand TLS: failed to persist failure state: {}",
-                        persist_err
-                    );
-                }
+                    Ok(until) => Some(until),
+                    Err(persist_err) => {
+                        error!(
+                            hostname = %hostname,
+                            "on-demand TLS: failed to persist failure state: {}",
+                            persist_err
+                        );
+                        None
+                    }
+                };
                 let duration_ms = Self::elapsed_ms(started);
                 warn!(
                     hostname = %hostname,
@@ -1223,16 +1808,177 @@ impl DomainService {
                     outcome = "failed",
                     error_category = %category,
                     error_chain = %error_chain,
+                    backoff_until = ?backoff_until,
                     duration_ms,
                     "on-demand TLS: issuance failed"
                 );
-                // acme_request_sent is true whenever we reached request_challenge.
+                // acme_request_sent is true whenever we reached request_challenge;
+                // a DNS preflight failure never reached the CA.
+                let reached_ca = !Self::is_dns_preflight_failure(&e);
                 let acme_status = Self::acme_status_for(&e);
-                self.record_on_demand_outcome(hostname, true, true, acme_status, Some(&e), started)
-                    .await;
-                Err(e)
+                self.record_on_demand_outcome(
+                    hostname,
+                    reached_ca,
+                    reached_ca,
+                    acme_status,
+                    Some(&e),
+                    started,
+                )
+                .await;
+                Err(Self::with_backoff_deadline(
+                    hostname,
+                    e,
+                    category,
+                    error_chain,
+                    backoff_until,
+                ))
             }
         }
+    }
+
+    /// The error `provision_on_demand` returns for a failed attempt: it carries
+    /// the backoff deadline just persisted, whatever went wrong. The proxy's
+    /// negative cache is what actually holds a host back (`provision_on_demand`
+    /// itself does not consult the stored backoff), so without the deadline it
+    /// fell back to a fixed 5 minutes and the persisted ladder never applied.
+    fn with_backoff_deadline(
+        hostname: &str,
+        err: DomainServiceError,
+        category: String,
+        error_chain: String,
+        backoff_until: Option<DateTime<Utc>>,
+    ) -> DomainServiceError {
+        match err {
+            DomainServiceError::OnDemandRateLimited {
+                hostname,
+                detail,
+                retry_after,
+            } => DomainServiceError::OnDemandRateLimited {
+                hostname,
+                detail,
+                // The CA's own window when it gave one; otherwise the deadline
+                // the failure path derived for it (now + 1h).
+                retry_after: retry_after.or(backoff_until),
+            },
+            _ => DomainServiceError::OnDemandIssuanceFailed {
+                hostname: hostname.to_string(),
+                category,
+                error_chain,
+                backoff_until,
+            },
+        }
+    }
+
+    /// Run the optional DNS preflight, then the ACME order.
+    async fn issue_on_demand(&self, hostname: &str, email: &str) -> Result<(), DomainServiceError> {
+        if self.dns_preflight {
+            Self::preflight_dns(hostname).await?;
+        }
+        self.run_on_demand_acme(hostname, email).await
+    }
+
+    /// Fail fast when `hostname` has no DNS records at all.
+    ///
+    /// Only existence is checked: the instance does not know every address it is
+    /// reachable on (NAT, load balancers, several IPs), so comparing against one
+    /// would reject valid setups. A hostname that resolves somewhere else still
+    /// fails the CA's own validation and takes the normal backoff ladder.
+    async fn preflight_dns(hostname: &str) -> Result<(), DomainServiceError> {
+        const DNS_PREFLIGHT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        let failure = |reason: String| DomainServiceError::OnDemandIssuanceFailed {
+            hostname: hostname.to_string(),
+            category: "dns_failure".to_string(),
+            error_chain: format!("{DNS_PREFLIGHT_MARKER}{reason}"),
+            backoff_until: None,
+        };
+
+        let lookup = tokio::time::timeout(
+            DNS_PREFLIGHT_TIMEOUT,
+            tokio::net::lookup_host((hostname, 80)),
+        )
+        .await
+        .map_err(|_| {
+            failure(format!(
+                "DNS lookup for {hostname} timed out after {}s",
+                DNS_PREFLIGHT_TIMEOUT.as_secs()
+            ))
+        })?;
+
+        match lookup {
+            Ok(mut addrs) => {
+                if addrs.next().is_some() {
+                    Ok(())
+                } else {
+                    Err(failure(format!(
+                        "DNS lookup for {hostname} returned no addresses; point an A/AAAA record at this server"
+                    )))
+                }
+            }
+            Err(e) => Err(failure(format!(
+                "DNS lookup for {hostname} failed: {e}; point an A/AAAA record at this server"
+            ))),
+        }
+    }
+
+    fn is_dns_preflight_failure(err: &DomainServiceError) -> bool {
+        matches!(
+            err,
+            DomainServiceError::OnDemandIssuanceFailed { error_chain, .. }
+                if error_chain.starts_with(DNS_PREFLIGHT_MARKER)
+        )
+    }
+
+    /// Of `hostnames`, return those a serving certificate already covers: a
+    /// `domains` row for the host itself, or for its one-level wildcard parent
+    /// (`app.example.com` -> `*.example.com`), holding both certificate and key.
+    ///
+    /// This is the same rule the proxy's certificate loader applies at handshake
+    /// time (exact match first, then the wildcard), so "covered" here means
+    /// exactly "the handshake would be served". One query regardless of how many
+    /// hostnames are passed.
+    pub async fn find_covered_hostnames(
+        &self,
+        hostnames: &[String],
+    ) -> Result<std::collections::HashSet<String>, DomainServiceError> {
+        use sea_orm::QuerySelect;
+
+        let mut covered = std::collections::HashSet::new();
+        if hostnames.is_empty() {
+            return Ok(covered);
+        }
+
+        // Chunked so a large route table never builds an unbounded IN list.
+        for chunk in hostnames.chunks(500) {
+            let mut candidates: Vec<String> = Vec::with_capacity(chunk.len() * 2);
+            for host in chunk {
+                candidates.push(host.clone());
+                if let Some(wildcard) = wildcard_parent(host) {
+                    candidates.push(wildcard);
+                }
+            }
+            candidates.sort();
+            candidates.dedup();
+
+            let served: std::collections::HashSet<String> = domains::Entity::find()
+                .select_only()
+                .column(domains::Column::Domain)
+                .filter(domains::Column::Domain.is_in(candidates))
+                .filter(domains::Column::Certificate.is_not_null())
+                .filter(domains::Column::PrivateKey.is_not_null())
+                .into_tuple::<String>()
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .collect();
+
+            for host in chunk {
+                let by_wildcard = wildcard_parent(host).is_some_and(|w| served.contains(&w));
+                if served.contains(host) || by_wildcard {
+                    covered.insert(host.clone());
+                }
+            }
+        }
+        Ok(covered)
     }
 
     /// Create the `domains` row for `hostname` if absent, then move it into the
@@ -1275,12 +2021,26 @@ impl DomainService {
                         hostname.to_string(),
                     ));
                 }
+                // Each proxy only caches the deadline it was handed, so one
+                // whose cache expired can arrive while a later deadline,
+                // stored by another process's failure, still runs. Honour the
+                // stored one: clearing it here would reach the CA early.
+                if let Some(backoff_until) = existing
+                    .on_demand_backoff_until
+                    .filter(|until| *until > Utc::now())
+                {
+                    return Err(DomainServiceError::OnDemandBackoffActive {
+                        hostname: hostname.to_string(),
+                        backoff_until,
+                    });
+                }
                 let mut active: domains::ActiveModel = existing.into();
                 active.status = Set("on_demand_issuing".to_string());
                 active.verification_method = Set("http-01".to_string());
                 active.on_demand_backoff_until = Set(None);
                 active.last_error = Set(None);
                 active.last_error_type = Set(None);
+                active.failure_cause = Set(None);
                 let updated = active.update(self.db.as_ref()).await?;
                 Ok(updated)
             }
@@ -1309,8 +2069,15 @@ impl DomainService {
     ) -> Result<(), DomainServiceError> {
         // Step 1: create + persist a fresh ACME order. This sets the HTTP-01
         // token on the domains row, which the proxy serves.
+        // On-demand issuance only serves HTTP challenges; DNS policy remains
+        // available for explicit orders and scheduled renewal.
         let challenge = self
-            .request_challenge(hostname, email)
+            .request_challenge_with(
+                DomainLookup::Name(hostname),
+                email,
+                true,
+                Some(ChallengeType::Http01),
+            )
             .await
             .map_err(|e| Self::map_acme_error(hostname, e))?;
 
@@ -1358,56 +2125,90 @@ impl DomainService {
     /// `on_demand_failed`, the full error chain, an `on_demand` error type, and
     /// an exponential `on_demand_backoff_until` (ADR §4 Layer 2). For a rate
     /// limit, `retry_after` (when present) overrides the exponential delay.
+    /// Returns the deadline as stored.
+    ///
+    /// The rung comes from the failure streak on the same row, and this one
+    /// update writes the deadline and the grown streak together, so nothing
+    /// that can fail separately (the audit row, a history read) can lower the
+    /// next rung or leave the row without its failure state. The row is read
+    /// `FOR UPDATE` in the same transaction: two processes sharing the
+    /// database (a standalone proxy beside the server) that fail the same host
+    /// at once take turns, so neither increment is lost.
     async fn mark_on_demand_failed(
         &self,
         hostname: &str,
         error_chain: &str,
         category: &str,
         retry_after: Option<DateTime<Utc>>,
-    ) -> Result<(), DomainServiceError> {
+    ) -> Result<DateTime<Utc>, DomainServiceError> {
+        use sea_orm::QuerySelect;
+        let txn = self.db.begin().await?;
         let domain = domains::Entity::find()
             .filter(domains::Column::Domain.eq(hostname))
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(hostname.to_string()))?;
 
-        let backoff_until = match retry_after {
-            Some(ts) => ts,
-            None => {
-                let prev = domain.on_demand_backoff_until;
-                Utc::now() + Self::next_backoff_delay(prev, domain.updated_at)
-            }
-        };
+        // PostgreSQL keeps timestamps to the microsecond; truncate first so the
+        // deadline handed to the proxy is exactly the one stored.
+        let now = Utc::now().trunc_subsecs(6);
+        let previous = Self::previous_failures(
+            domain.on_demand_failure_streak,
+            domain.on_demand_last_failure_at,
+            now,
+        );
+        let backoff_until = retry_after
+            .unwrap_or_else(|| now + Self::backoff_delay(previous))
+            .trunc_subsecs(6);
 
         let mut active: domains::ActiveModel = domain.into();
         active.status = Set("on_demand_failed".to_string());
         active.last_error = Set(Some(error_chain.to_string()));
         active.last_error_type = Set(Some(category.to_string()));
+        active.failure_cause = Set(Some(
+            crate::failure_cause::classify(error_chain)
+                .as_str()
+                .to_string(),
+        ));
         active.on_demand_backoff_until = Set(Some(backoff_until));
-        active.update(self.db.as_ref()).await?;
-        Ok(())
+        active.on_demand_failure_streak = Set(previous.saturating_add(1));
+        active.on_demand_last_failure_at = Set(Some(now));
+        let updated = active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated.on_demand_backoff_until.unwrap_or(backoff_until))
     }
 
-    /// Compute the next exponential backoff delay: 5m → 15m → 1h → 4h → 24h
-    /// (capped). The previous step is inferred from the gap between the last
-    /// `on_demand_backoff_until` and the row's `updated_at` (the time that
-    /// backoff was set); a missing/short gap restarts at 5m.
-    fn next_backoff_delay(
-        prev_backoff_until: Option<DateTime<Utc>>,
-        prev_set_at: DateTime<Utc>,
-    ) -> Duration {
-        const LADDER_MINS: [i64; 5] = [5, 15, 60, 240, 1440];
-        let prev_delay_mins = prev_backoff_until
-            .map(|until| (until - prev_set_at).num_minutes())
-            .unwrap_or(0);
+    /// How many failures in a row `hostname` had before this one, from the
+    /// streak stored on its row.
+    ///
+    /// The ladder used to be inferred from `on_demand_backoff_until` and the
+    /// row's `updated_at`, but each attempt clears the first and rewrites the
+    /// second before it runs, so every failure restarted at 5 minutes. The
+    /// streak is only written by a failure and reset by an issued or imported
+    /// certificate ([`domains::ActiveModel::clear_certificate_failure`]).
+    ///
+    /// A streak whose last failure is older than [`ON_DEMAND_STREAK_GAP_HOURS`]
+    /// starts over: a host nobody requested for two days begins at 5 minutes.
+    fn previous_failures(
+        streak: i32,
+        last_failure_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> i32 {
+        match last_failure_at {
+            Some(at) if now - at <= Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) => streak.max(0),
+            _ => 0,
+        }
+    }
 
-        // Find the next rung strictly greater than the previous delay; cap at 24h.
-        let next = LADDER_MINS
-            .iter()
-            .copied()
-            .find(|&m| m > prev_delay_mins)
-            .unwrap_or(1440);
-        Duration::minutes(next)
+    /// Backoff for an attempt that follows `previous_failures` failures in a
+    /// row: 5m → 15m → 1h → 4h → 24h, capped at 24h.
+    fn backoff_delay(previous_failures: i32) -> Duration {
+        const LADDER_MINS: [i64; 5] = [5, 15, 60, 240, 1440];
+        let rung = usize::try_from(previous_failures)
+            .unwrap_or(0)
+            .min(LADDER_MINS.len() - 1);
+        Duration::minutes(LADDER_MINS[rung])
     }
 
     /// Map a `DomainServiceError` from the on-demand flow to a coarse
@@ -1422,7 +2223,15 @@ impl DomainService {
             return ("rate_limited".to_string(), Some(deadline));
         }
 
-        let chain = error_chain_string(err).to_lowercase();
+        let chain = error_chain_string(err);
+        // The CA's problem type, when the error carries one, is exact. The
+        // keyword fallback below misread HTTP-01 failures: their text always
+        // contains `/.well-known/acme-challenge/`, and a hostname may contain
+        // "dns".
+        if let Some(cause) = crate::failure_cause::classify_problem(&chain) {
+            return (cause.legacy_category().to_string(), None);
+        }
+        let chain = chain.to_lowercase();
         let category = if chain.contains("ratelimited") || chain.contains("rate limit") {
             "rate_limited"
         } else if chain.contains("dns") {
@@ -1545,7 +2354,9 @@ impl DomainService {
             .paginate(self.db.as_ref(), page_size);
 
         let total = paginator.num_items().await?;
-        let attempts = paginator.fetch_page(page.saturating_sub(1)).await?;
+        let attempts = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         if attempts.is_empty() {
             return Ok((Vec::new(), total));
@@ -1670,6 +2481,16 @@ pub struct OnDemandCertStatus {
     pub latest_attempt: Option<on_demand_cert_attempts::Model>,
 }
 
+/// The DNS cleanup receipt (the plan of TXT records Temps published) stored on
+/// an ACME order, if it has one.
+fn cleanup_receipt_of(order: &crate::tls::models::AcmeOrder) -> Option<serde_json::Value> {
+    order
+        .authorizations
+        .as_ref()
+        .and_then(|authorizations| authorizations.get(crate::tls::models::DNS_CLEANUP_PLAN_KEY))
+        .cloned()
+}
+
 /// Render the full `Display` chain of an error — the top-level message plus every
 /// `source()` level joined by `: ` — for the `on_demand_cert_attempts.error_chain`
 /// audit column (ADR-018 §5). This is the operator's first-line diagnostic, so it
@@ -1719,13 +2540,317 @@ fn parse_retry_after(detail: &str) -> Option<DateTime<Utc>> {
     None
 }
 
+mod dns01;
+
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn regression_on_demand_ignores_dns_policy() {
+        let Some((service, _, db, _guard)) =
+            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
+        else {
+            return;
+        };
+        let hostname = "on-demand.example.test";
+        let domain = service.create_domain(hostname, "dns-01").await.unwrap();
+        assert!(domain.certificate.is_none());
+        let policy = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            renewal_days: 20,
+            alert_days: Some(7),
+            alerts_enabled: Some(true),
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        service
+            .provision_on_demand(hostname, "ops@example.test")
+            .await
+            .unwrap();
+        let issued = domain_row(db.as_ref(), hostname).await;
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.verification_method, "http-01");
+        assert!(issued.certificate.is_some());
+        // The on-demand override must not rewrite the operator's future-order policy.
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+    }
+
+    #[tokio::test]
+    async fn certificate_settings_normalize_legacy_methods() {
+        let Some((service, _, db, _guard)) =
+            scripted_service(ScriptedProvider::new(CompletionMode::Succeed)).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("legacy.example.test", "http-01")
+            .await
+            .unwrap();
+        for (method, wildcard, expected) in [
+            ("manual", false, "http-01"),
+            ("acme", false, "http-01"),
+            ("http", false, "http-01"),
+            ("dns-01", false, "dns-01"),
+            ("acme", true, "dns-01"),
+        ] {
+            let mut row: domains::ActiveModel = domain.clone().into();
+            row.verification_method = Set(method.into());
+            row.is_wildcard = Set(wildcard);
+            let row = row.update(db.as_ref()).await.unwrap();
+            let response = service.certificate_settings_response(row.id).await.unwrap();
+            assert_eq!(
+                response.renewal_mode,
+                if method == "manual" {
+                    CertificateRenewalMode::Manual
+                } else {
+                    CertificateRenewalMode::Acme
+                }
+            );
+            let settings = response.settings;
+            assert_eq!(settings.challenge_type, expected);
+            settings.validate(&row).unwrap();
+        }
+    }
+
     use temps_core::EncryptionService;
 
     use super::*;
     use chrono::Datelike;
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn certificate_settings_preserve_serving_state_and_pending_orders() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "switch.example.test";
+        let domain = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        let before_order = repository
+            .find_acme_order_by_domain(domain.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let mut active: domains::ActiveModel = domain_row(db.as_ref(), name).await.into();
+        active.status = Set("active".into());
+        active.certificate = Set(Some("existing-certificate".into()));
+        active.private_key = Set(Some("existing-encrypted-key".into()));
+        active.expiration_time = Set(Some(Utc::now() + Duration::days(45)));
+        active.update(db.as_ref()).await.unwrap();
+        let before = domain_row(db.as_ref(), name).await;
+        let policy = DomainCertificateSettings {
+            challenge_type: "http-01".into(),
+            renewal_days: 20,
+            alert_days: Some(7),
+            alerts_enabled: Some(true),
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+        assert_eq!(domain_row(db.as_ref(), name).await, before);
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(domain.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .order_url,
+            before_order.order_url
+        );
+        let challenge = service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        assert_eq!(challenge.challenge_type, "http-01");
+        let after = domain_row(db.as_ref(), name).await;
+        assert_eq!(after.certificate, before.certificate);
+        assert_eq!(after.private_key, before.private_key);
+        assert!(domains::CERT_SERVING_STATUSES.contains(&after.status.as_str()));
+        // A late result can update the issuance method without undoing the saved choice.
+        let mut late: domains::ActiveModel = after.into();
+        late.verification_method = Set("dns-01".into());
+        late.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            service.certificate_settings(domain.id).await.unwrap(),
+            policy
+        );
+        let reverse = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            ..policy
+        };
+        service
+            .update_certificate_settings(domain.id, reverse)
+            .await
+            .unwrap();
+        assert_eq!(
+            service
+                .request_challenge(name, "ops@example.test")
+                .await
+                .unwrap()
+                .challenge_type,
+            "dns-01"
+        );
+        assert!(matches!(
+            service
+                .update_certificate_settings(
+                    -1,
+                    service.certificate_settings(domain.id).await.unwrap()
+                )
+                .await,
+            Err(DomainServiceError::NotFound(_))
+        ));
+        let wildcard = service
+            .create_domain("*.example.test", "dns-01")
+            .await
+            .unwrap();
+        let invalid = DomainCertificateSettings {
+            challenge_type: "http-01".into(),
+            renewal_days: 30,
+            alert_days: None,
+            alerts_enabled: None,
+        };
+        assert!(service
+            .update_certificate_settings(wildcard.id, invalid)
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn certificate_alerts_use_instance_preferences_and_domain_overrides() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let domain = service
+            .create_domain("alerts.example.test", "dns-01")
+            .await
+            .unwrap();
+        let mut cert = mock_certificate(&domain.domain);
+        cert.id = domain.id;
+        cert.verification_method = "dns-01".into();
+        cert.expiration_time = Utc::now() + Duration::days(20);
+        repository.save_certificate(cert).await.unwrap();
+        let prefs = temps_notifications::NotificationPreferencesService::new(db.clone());
+        let mut preferences = temps_notifications::NotificationPreferences {
+            ssl_days_before_expiration: 7,
+            ..Default::default()
+        };
+        prefs.update_preferences(preferences.clone()).await.unwrap();
+        let tls = crate::TlsService::new(repository.clone(), provider)
+            .unwrap()
+            .with_db(db.clone());
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+        let policy = DomainCertificateSettings {
+            challenge_type: "dns-01".into(),
+            renewal_days: 30,
+            alert_days: Some(25),
+            alerts_enabled: None,
+        };
+        service
+            .update_certificate_settings(domain.id, policy.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            tls.check_and_renew_certificates(30)
+                .await
+                .unwrap()
+                .manual_action_needed
+                .len(),
+            1
+        );
+        preferences.ssl_expiration_enabled = false;
+        prefs.update_preferences(preferences).await.unwrap();
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+        service
+            .update_certificate_settings(
+                domain.id,
+                DomainCertificateSettings {
+                    alerts_enabled: Some(true),
+                    ..policy.clone()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tls.check_and_renew_certificates(30)
+                .await
+                .unwrap()
+                .manual_action_needed
+                .len(),
+            1
+        );
+        service
+            .update_certificate_settings(
+                domain.id,
+                DomainCertificateSettings {
+                    alerts_enabled: Some(false),
+                    ..policy
+                },
+            )
+            .await
+            .unwrap();
+        assert!(tls
+            .check_and_renew_certificates(30)
+            .await
+            .unwrap()
+            .manual_action_needed
+            .is_empty());
+    }
+
+    #[test]
+    fn certificate_settings_validate_methods_and_thresholds() {
+        let domain = domain_with_cert(None, None, None);
+        for days in [0, -1, 91] {
+            let policy = DomainCertificateSettings {
+                challenge_type: "http-01".into(),
+                renewal_days: days,
+                alert_days: None,
+                alerts_enabled: None,
+            };
+            assert!(policy.validate(&domain).is_err());
+            assert!(DomainCertificateSettings {
+                renewal_days: 30,
+                alert_days: Some(days),
+                ..policy
+            }
+            .validate(&domain)
+            .is_err());
+        }
+        for method in ["http-01", "dns-01"] {
+            assert!(DomainCertificateSettings {
+                challenge_type: method.into(),
+                renewal_days: 30,
+                alert_days: Some(7),
+                alerts_enabled: None
+            }
+            .validate(&domain)
+            .is_ok());
+        }
+    }
 
     #[tokio::test]
     async fn domain_sorted_pagination_handles_nulls_search_and_empty_results() {
@@ -1804,9 +2929,11 @@ mod tests {
     #[test]
     fn domain_sorting_is_bounded_and_stable() {
         use sea_orm::{DbBackend, QuerySelect, QueryTrait};
-        for (direction, sql_direction) in [
-            (DomainSortDirection::Asc, "ASC"),
-            (DomainSortDirection::Desc, "DESC"),
+        // Descending keeps the original `domain ASC, id ASC` tiebreak; ascending
+        // is its exact reverse so a second click always reorders tied rows.
+        for (direction, sql_direction, tie_direction) in [
+            (DomainSortDirection::Asc, "ASC", "DESC"),
+            (DomainSortDirection::Desc, "DESC", "ASC"),
         ] {
             let sql = sorted_domains_query(Some("example"), DomainSort::Expiration, direction)
                 .limit(20)
@@ -1818,12 +2945,24 @@ mod tests {
                 "{sql}"
             );
             assert!(
-                sql.contains("\"domain\" ASC, \"domains\".\"id\" ASC"),
+                sql.contains(&format!(
+                    "\"domain\" {tie_direction}, \"domains\".\"id\" {tie_direction}"
+                )),
                 "{sql}"
             );
             assert!(sql.contains("LIKE '%example%'"), "{sql}");
             assert!(sql.contains("LIMIT 20 OFFSET 20"), "{sql}");
         }
+        // Sorting by name must not repeat the column as its own tiebreaker.
+        let by_name = sorted_domains_query(None, DomainSort::Domain, DomainSortDirection::Asc)
+            .build(DbBackend::Postgres)
+            .to_string();
+        assert!(
+            by_name.contains(
+                "ORDER BY \"domains\".\"domain\" ASC NULLS LAST, \"domains\".\"id\" DESC"
+            ),
+            "{by_name}"
+        );
         for (sort, column) in [
             (DomainSort::Domain, "domain"),
             (DomainSort::Status, "status"),
@@ -1988,15 +3127,25 @@ mod tests {
     ) -> Option<(
         DomainService,
         Arc<DatabaseConnection>,
-        temps_database::test_utils::TestDatabase,
+        temps_test_utils::TestDatabase,
     )> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping on-demand TLS test: {e}");
                 return None;
             }
         };
+        let service = on_demand_service_on(test_db.db.clone(), mode);
+        let db = test_db.db.clone();
+        // Return the TestDatabase guard so the caller keeps it alive for the whole
+        // test; its Drop reaps the dedicated schema afterwards.
+        Some((service, db, test_db))
+    }
+
+    /// A service with the given provider behaviour over an existing database,
+    /// so a test can fail and then succeed against the same rows.
+    fn on_demand_service_on(db: Arc<DatabaseConnection>, mode: OnDemandMockMode) -> DomainService {
         let encryption_service = Arc::new(
             EncryptionService::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
@@ -2004,19 +3153,29 @@ mod tests {
             .unwrap(),
         );
         let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
-            test_db.db.clone(),
+            db.clone(),
             encryption_service.clone(),
         ));
-        let service = DomainService::new(
-            test_db.db.clone(),
+        DomainService::new(
+            db,
             Arc::new(OnDemandMockProvider { mode }),
             repository,
             encryption_service,
-        );
-        let db = test_db.db.clone();
-        // Return the TestDatabase guard so the caller keeps it alive for the whole
-        // test; its Drop reaps the dedicated schema afterwards.
-        Some((service, db, test_db))
+        )
+    }
+
+    /// Move the stored backoff deadline of `hostname` into the past, as if the
+    /// wait had elapsed, so the next attempt may run.
+    async fn expire_on_demand_backoff(db: &DatabaseConnection, hostname: &str) {
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db)
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let mut active: domains::ActiveModel = row.into();
+        active.on_demand_backoff_until = Set(Some(Utc::now() - Duration::seconds(1)));
+        active.update(db).await.unwrap();
     }
 
     #[tokio::test]
@@ -2121,6 +3280,291 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("incorrect key authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_repeated_failures_climb_the_ladder() {
+        // Regression: each attempt cleared `on_demand_backoff_until` before it
+        // ran, so every failure restarted at 5 minutes and a host with port 80
+        // closed was retried ~12 times an hour, past the CA's failed-validation
+        // limit. The returned error also carried no deadline, so the proxy's
+        // negative cache fell back to 5 minutes regardless.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "closed-port.1-2-3-4.sslip.io";
+
+        let mut rungs = Vec::new();
+        for _ in 0..6 {
+            let err = service
+                .provision_on_demand(hostname, "ops@example.com")
+                .await
+                .expect_err("issuance keeps failing");
+            let DomainServiceError::OnDemandIssuanceFailed {
+                backoff_until: Some(returned),
+                ..
+            } = err
+            else {
+                panic!("a failed attempt must return its backoff deadline, got {err:?}");
+            };
+            let stored = domains::Entity::find()
+                .filter(domains::Column::Domain.eq(hostname))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("domains row exists")
+                .on_demand_backoff_until
+                .expect("failure arms the backoff");
+            assert_eq!(
+                returned, stored,
+                "the proxy must wait as long as the row says"
+            );
+            assert_eq!(
+                returned.timestamp_subsec_nanos() % 1_000,
+                0,
+                "the deadline carries no precision the database drops"
+            );
+            // Round to the nearest minute: the deadline was set a moment ago.
+            rungs.push((stored - Utc::now() + Duration::seconds(30)).num_minutes());
+            // The audit log is observability only: losing its rows (a failed
+            // insert) must not lower the next rung.
+            on_demand_cert_attempts::Entity::delete_many()
+                .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+            expire_on_demand_backoff(db.as_ref(), hostname).await;
+        }
+        assert_eq!(rungs, vec![5, 15, 60, 240, 1440, 1440]);
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 6);
+        assert!(row.on_demand_last_failure_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_honours_a_stored_backoff() {
+        // Regression: starting an attempt cleared the stored deadline without
+        // looking at it, so a proxy whose own cache had expired reached the
+        // CA while a later deadline stored by another process still ran.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "held.1-2-3-4.sslip.io";
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+        // Another process's failure stored a longer deadline meanwhile.
+        let held_until = (Utc::now() + Duration::hours(24)).trunc_subsecs(6);
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let streak = row.on_demand_failure_streak;
+        let mut active: domains::ActiveModel = row.into();
+        active.on_demand_backoff_until = Set(Some(held_until));
+        active.update(db.as_ref()).await.unwrap();
+        let attempts_before = on_demand_cert_attempts::Entity::find()
+            .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("a running backoff refuses the attempt");
+        assert!(
+            matches!(
+                &err,
+                DomainServiceError::OnDemandBackoffActive { backoff_until, .. }
+                    if *backoff_until == held_until
+            ),
+            "the refusal carries the stored deadline, got {err:?}"
+        );
+
+        let after = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(after.on_demand_backoff_until, Some(held_until));
+        assert_eq!(after.on_demand_failure_streak, streak, "no new failure");
+        assert_eq!(after.status, "on_demand_failed");
+        let attempts_after = on_demand_cert_attempts::Entity::find()
+            .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(attempts_after, attempts_before, "no attempt was recorded");
+
+        // Once the deadline passes the next attempt runs again.
+        expire_on_demand_backoff(db.as_ref(), hostname).await;
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("issuance still fails");
+        assert!(
+            matches!(err, DomainServiceError::OnDemandIssuanceFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_on_demand_failures_each_count_once() {
+        // Two processes sharing the database (a standalone proxy beside the
+        // server) can fail the same host at once. Each failure must grow the
+        // streak; a read-then-write without a row lock loses increments.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "raced.1-2-3-4.sslip.io";
+        service.begin_on_demand_issuing(hostname).await.unwrap();
+        let service = Arc::new(service);
+
+        let failures: Vec<_> = (0..8)
+            .map(|_| {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .mark_on_demand_failed(hostname, "connection refused", "timeout", None)
+                        .await
+                })
+            })
+            .collect();
+        for failure in failures {
+            failure.await.unwrap().unwrap();
+        }
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 8);
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_success_resets_the_ladder() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "flaky.1-2-3-4.sslip.io";
+        for _ in 0..3 {
+            let _ = service
+                .provision_on_demand(hostname, "ops@example.com")
+                .await;
+            expire_on_demand_backoff(db.as_ref(), hostname).await;
+        }
+        let failing = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(failing.on_demand_failure_streak, 3);
+
+        // A certificate is issued: the streak ends with it.
+        on_demand_service_on(db.clone(), OnDemandMockMode::ImmediateCert)
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect("issuance succeeds");
+        let issued = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.on_demand_failure_streak, 0);
+        assert!(issued.on_demand_last_failure_at.is_none());
+        assert!(issued.on_demand_backoff_until.is_none());
+
+        // The certificate goes away (removed by an operator); the next failure
+        // starts the ladder from the bottom.
+        let mut cleared: domains::ActiveModel = issued.into();
+        cleared.status = Set("pending".to_string());
+        cleared.certificate = Set(None);
+        cleared.private_key = Set(None);
+        cleared.update(db.as_ref()).await.unwrap();
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let mins = (row.on_demand_backoff_until.unwrap() - Utc::now() + Duration::seconds(30))
+            .num_minutes();
+        assert_eq!(
+            mins, 5,
+            "the first failure after a success starts at 5 minutes"
+        );
+        assert_eq!(row.on_demand_failure_streak, 1);
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_failure_records_the_typed_cause() {
+        // A closed port 80, in the shape the provider reports the CA's
+        // problem. The hostname contains "dns": that must not decide.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "Order validation failed after 2 attempt(s): [mydns.1-2-3-4.sslip.io Http01] \
+             urn:ietf:params:acme:error:connection: 203.0.113.10: Fetching \
+             http://mydns.1-2-3-4.sslip.io/.well-known/acme-challenge/abc: Connection refused"
+                .to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "mydns.1-2-3-4.sslip.io";
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.failure_cause.as_deref(), Some("unreachable"));
+        assert_eq!(row.last_error_type.as_deref(), Some("challenge_mismatch"));
+        let attempt = service
+            .latest_on_demand_attempt(hostname)
+            .await
+            .unwrap()
+            .expect("the failure is audited");
+        assert_eq!(
+            attempt.error_category.as_deref(),
+            Some("challenge_mismatch")
+        );
     }
 
     #[tokio::test]
@@ -2252,6 +3696,143 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_wildcard_parent_is_one_level() {
+        assert_eq!(
+            wildcard_parent("app.example.com").as_deref(),
+            Some("*.example.com")
+        );
+        assert_eq!(wildcard_parent("example.com").as_deref(), Some("*.com"));
+        assert_eq!(wildcard_parent("localhost"), None);
+        assert_eq!(wildcard_parent("trailing."), None);
+    }
+
+    async fn insert_served_cert(db: &DatabaseConnection, domain: &str, with_key: bool) {
+        let now = Utc::now();
+        domains::ActiveModel {
+            domain: Set(domain.to_string()),
+            certificate: Set(Some("CERT".to_string())),
+            private_key: Set(with_key.then(|| "KEY".to_string())),
+            status: Set("active".to_string()),
+            is_wildcard: Set(domain.starts_with("*.")),
+            verification_method: Set("dns-01".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("seed domains row");
+    }
+
+    #[tokio::test]
+    async fn test_find_covered_hostnames_matches_exact_and_wildcard_only_with_key() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        insert_served_cert(db.as_ref(), "*.apps.example.com", true).await;
+        insert_served_cert(db.as_ref(), "exact.other.example.com", true).await;
+        // A row without key material does not serve a handshake.
+        insert_served_cert(db.as_ref(), "*.keyless.example.com", false).await;
+
+        let hosts: Vec<String> = [
+            "web.apps.example.com",      // wildcard-covered
+            "exact.other.example.com",   // exact row
+            "web.keyless.example.com",   // wildcard row has no key
+            "web.unrelated.example.com", // nothing
+            "a.b.apps.example.com",      // two levels deep: *.apps does not match
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let covered = service
+            .find_covered_hostnames(&hosts)
+            .await
+            .expect("coverage query should succeed");
+
+        assert!(covered.contains("web.apps.example.com"));
+        assert!(covered.contains("exact.other.example.com"));
+        assert!(!covered.contains("web.keyless.example.com"));
+        assert!(!covered.contains("web.unrelated.example.com"));
+        assert!(!covered.contains("a.b.apps.example.com"));
+        assert!(service
+            .find_covered_hostnames(&[])
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_skips_wildcard_covered_host() {
+        // Fail mode: any attempt to reach the provider would surface as an error.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "provider must not be called for a covered host".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        insert_served_cert(db.as_ref(), "*.apps.example.com", true).await;
+
+        service
+            .provision_on_demand("web.apps.example.com", "ops@example.com")
+            .await
+            .expect("a wildcard-covered host needs no order");
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq("web.apps.example.com"))
+            .one(db.as_ref())
+            .await
+            .unwrap();
+        assert!(row.is_none(), "no per-host row may be created");
+        assert!(service
+            .latest_on_demand_attempt("web.apps.example.com")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_dns_preflight_fails_without_reaching_ca() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
+        else {
+            return;
+        };
+        let service = service.with_dns_preflight(true);
+        // `.invalid` is reserved (RFC 6761) and never resolves.
+        let hostname = "custom.no-such-host.invalid";
+
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("an unresolvable host must fail the preflight");
+        assert!(matches!(
+            &err,
+            DomainServiceError::OnDemandIssuanceFailed { category, .. } if category == "dns_failure"
+        ));
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("a failed row carries the backoff");
+        assert_eq!(row.status, "on_demand_failed");
+        assert!(row.on_demand_backoff_until.is_some());
+        assert!(row.certificate.is_none());
+
+        let attempt = service
+            .latest_on_demand_attempt(hostname)
+            .await
+            .unwrap()
+            .expect("the failure is audited");
+        assert_eq!(attempt.outcome, "failed");
+        assert_eq!(attempt.error_category.as_deref(), Some("dns_failure"));
+        assert_eq!(attempt.acme_request_sent, Some(false));
+    }
+
     #[tokio::test]
     async fn test_on_demand_cert_status_unknown_host_is_empty_not_error() {
         let Some((service, _db, _guard)) = on_demand_service(OnDemandMockMode::ImmediateCert).await
@@ -2268,45 +3849,720 @@ mod tests {
         assert!(status.latest_attempt.is_none());
     }
 
+    // ---- DNS-01 retry after the CA invalidated the challenge (#1442) ----
+
+    /// How the scripted provider answers `complete_challenge`.
+    #[derive(Clone, Copy)]
+    enum CompletionMode {
+        /// The CA invalidated the order (e.g. the TXT record was missing).
+        Invalidate,
+        /// A transient failure that leaves the challenge open.
+        Transient,
+        /// Validation succeeds.
+        Succeed,
+    }
+
+    /// Provider that hands out a distinct order and TXT value on every
+    /// `provision` call and counts how often a challenge is submitted.
+    struct ScriptedProvider {
+        /// When set, `provision` fails (as on a CA rate limit).
+        fail_provision: std::sync::atomic::AtomicBool,
+        /// When set, `provision` returns a certificate outright (the CA still
+        /// held a valid authorization).
+        immediate_certificate: std::sync::atomic::AtomicBool,
+        provisions: std::sync::atomic::AtomicUsize,
+        completions: std::sync::atomic::AtomicUsize,
+        mode: std::sync::Mutex<CompletionMode>,
+    }
+
+    impl ScriptedProvider {
+        fn new(mode: CompletionMode) -> Arc<Self> {
+            Arc::new(Self {
+                fail_provision: std::sync::atomic::AtomicBool::new(false),
+                immediate_certificate: std::sync::atomic::AtomicBool::new(false),
+                provisions: std::sync::atomic::AtomicUsize::new(0),
+                completions: std::sync::atomic::AtomicUsize::new(0),
+                mode: std::sync::Mutex::new(mode),
+            })
+        }
+
+        fn completions(&self) -> usize {
+            self.completions.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn set_mode(&self, mode: CompletionMode) {
+            *self.mode.lock().unwrap() = mode;
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateProvider for ScriptedProvider {
+        async fn provision(
+            &self,
+            domain: &str,
+            challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            if self
+                .fail_provision
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(crate::tls::ProviderError::Acme(
+                    "rate limited by the CA".to_string(),
+                ));
+            }
+            if self
+                .immediate_certificate
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Ok(ProvisioningResult::Certificate(mock_certificate(domain)));
+            }
+            let n = self
+                .provisions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            let dns_txt_records = match challenge {
+                ChallengeType::Dns01 => vec![crate::tls::models::DnsTxtRecord {
+                    name: format!("_acme-challenge.{domain}"),
+                    value: format!("txt-value-{n}"),
+                    validation_url: format!("https://acme.example.test/chall/{n}"),
+                }],
+                ChallengeType::Http01 => vec![],
+            };
+            Ok(ProvisioningResult::Challenge(
+                crate::tls::models::ChallengeData {
+                    challenge_type: challenge,
+                    domain: domain.to_string(),
+                    token: format!("token-{n}"),
+                    key_authorization: format!("key-auth-{n}"),
+                    validation_url: Some(format!("https://acme.example.test/chall/{n}")),
+                    dns_txt_records,
+                    order_url: Some(format!("https://acme.example.test/order/{n}")),
+                },
+            ))
+        }
+
+        async fn complete_challenge(
+            &self,
+            domain: &str,
+            challenge_data: &crate::tls::models::ChallengeData,
+            _email: &str,
+        ) -> Result<crate::tls::models::Certificate, crate::tls::ProviderError> {
+            self.completions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mode = *self.mode.lock().unwrap();
+            match mode {
+                CompletionMode::Invalidate => {
+                    Err(crate::tls::ProviderError::ChallengeInvalidated {
+                        domain: domain.to_string(),
+                        order_url: challenge_data.order_url.clone().unwrap_or_default(),
+                        detail: "[example.com Dns01] urn:ietf:params:acme:error:unauthorized: \
+                                 no TXT record found"
+                            .to_string(),
+                    })
+                }
+                CompletionMode::Transient => Err(crate::tls::ProviderError::Network(
+                    "connection reset by ACME server".to_string(),
+                )),
+                CompletionMode::Succeed => Ok(mock_certificate(domain)),
+            }
+        }
+
+        fn supported_challenges(&self) -> Vec<ChallengeType> {
+            vec![ChallengeType::Http01, ChallengeType::Dns01]
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<crate::tls::models::ValidationResult, crate::tls::ProviderError> {
+            Ok(crate::tls::models::ValidationResult {
+                is_valid: true,
+                errors: vec![],
+                warnings: vec![],
+            })
+        }
+
+        async fn cancel_order(&self, _domain: &str) -> Result<(), crate::tls::ProviderError> {
+            Ok(())
+        }
+    }
+
+    /// `DomainService` over a real (Docker) test schema and a scripted provider.
+    /// `None` when no database is available, so the test skips gracefully.
+    async fn scripted_service(
+        provider: Arc<ScriptedProvider>,
+    ) -> Option<(
+        DomainService,
+        Arc<dyn CertificateRepository>,
+        Arc<DatabaseConnection>,
+        temps_test_utils::TestDatabase,
+    )> {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping DNS-01 retry test: {e}");
+                return None;
+            }
+        };
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .unwrap(),
+        );
+        let repository: Arc<dyn CertificateRepository> =
+            Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+                test_db.db.clone(),
+                encryption_service.clone(),
+            ));
+        let service = DomainService::new(
+            test_db.db.clone(),
+            provider,
+            repository.clone(),
+            encryption_service,
+        );
+        let db = test_db.db.clone();
+        Some((service, repository, db, test_db))
+    }
+
+    async fn domain_row(db: &DatabaseConnection, name: &str) -> domains::Model {
+        domains::Entity::find()
+            .filter(domains::Column::Domain.eq(name))
+            .one(db)
+            .await
+            .unwrap()
+            .expect("domain row should exist")
+    }
+
+    /// Gives the domain's current order the receipt `setup-dns` leaves behind
+    /// and returns it with the order URL.
+    async fn attach_cleanup_receipt(
+        repository: &Arc<dyn CertificateRepository>,
+        domain_id: i32,
+        name: &str,
+    ) -> (serde_json::Value, String) {
+        let mut order = repository
+            .find_acme_order_by_domain(domain_id)
+            .await
+            .unwrap()
+            .expect("the order exists");
+        let receipt = serde_json::json!({
+            "provider_id": 3,
+            "zone": "example.com",
+            "records": [{
+                "name": format!("_acme-challenge.{name}"),
+                "value": "txt-value-1",
+                "record_id": "rec-1"
+            }]
+        });
+        order
+            .authorizations
+            .as_mut()
+            .and_then(|a| a.as_object_mut())
+            .expect("authorizations are an object")
+            .insert(
+                crate::tls::models::DNS_CLEANUP_PLAN_KEY.to_string(),
+                receipt.clone(),
+            );
+        let url = order.order_url.clone();
+        repository.save_acme_order(order).await.unwrap();
+        (receipt, url)
+    }
+
+    /// Replacing an order moves the receipt of the TXT records published for
+    /// it onto the new order instead of deleting it with the old row.
+    #[tokio::test]
+    async fn test_replacing_an_order_carries_its_dns_cleanup_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "receipt.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, old_url) = attach_cleanup_receipt(&repository, created.id, name).await;
+
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        let current = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the new order exists");
+        assert_ne!(current.order_url, old_url, "the order was replaced");
+        assert_eq!(cleanup_receipt_of(&current), Some(receipt));
+    }
+
+    /// If the CA call that replaces an order fails, the old order — and the
+    /// receipt of the records published for it — must still be there.
+    #[tokio::test]
+    async fn test_dns_renewal_receipt_is_pending_until_certificate_saved() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "receipt-renewal.example.test";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        service
+            .request_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        attach_cleanup_receipt(&repository, created.id, name).await;
+        assert_eq!(domain_row(&db, name).await.status, "active");
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+        service
+            .complete_challenge(name, "ops@example.test")
+            .await
+            .unwrap();
+        assert_eq!(
+            repository
+                .find_acme_order_by_domain(created.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            "valid"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_failed_replacement_keeps_the_old_order_and_its_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "keep.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, url) = attach_cleanup_receipt(&repository, created.id, name).await;
+        provider
+            .fail_provision
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let result = service.request_challenge(name, "ops@example.com").await;
+
+        assert!(result.is_err(), "the CA refused the new order");
+        let kept = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the old order must not be deleted before its replacement exists");
+        assert_eq!(kept.order_url, url);
+        assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
+    }
+
+    /// A certificate issued outright leaves no new order to carry the receipt,
+    /// so the old order stays for the handler's DNS cleanup.
+    #[tokio::test]
+    async fn test_immediate_certificate_keeps_the_order_that_has_a_receipt() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, _db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "cached.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let (receipt, url) = attach_cleanup_receipt(&repository, created.id, name).await;
+        provider
+            .immediate_certificate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let issued = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .expect("certificate issued outright");
+
+        assert_eq!(issued.status, "completed");
+        let kept = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the order with the receipt is retained for cleanup");
+        assert_eq!(kept.order_url, url);
+        assert_eq!(kept.status, "valid");
+        assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn test_dns_01_proof_the_ca_cannot_verify_records_a_txt_record_mismatch() {
+        // Regression: the CA reports an unverified DNS-01 proof as
+        // `unauthorized`, the same type as an HTTP-01 response from the wrong
+        // server, and the cause read "upstream answered" for a domain that
+        // never served anything.
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "txt.example.com";
+        service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("an invalidated challenge must fail");
+
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.failure_cause.as_deref(), Some("dns_record_mismatch"));
+    }
+
+    #[tokio::test]
+    async fn test_invalidated_challenge_is_recorded_and_not_resubmitted() {
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        // First verification: the CA rejects the challenge.
+        let err = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("an invalidated challenge must fail");
+        assert!(
+            matches!(
+                &err,
+                DomainServiceError::ChallengeInvalidated { domain, domain_id, .. }
+                    if domain == name && *domain_id == created.id
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(provider.completions(), 1);
+
+        // The domain is failed with a typed error type, and the stored order
+        // is terminal so the console offers a new order.
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.last_error_type.as_deref(),
+            Some("challenge_invalidated")
+        );
+        assert!(failed
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("no longer valid"));
+        let order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("order is kept so the failure stays inspectable");
+        assert_eq!(order.status, "invalid");
+        assert!(order.error.as_deref().unwrap_or_default().contains("TXT"));
+
+        // Retrying must NOT submit the dead challenge again.
+        let retry = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("retrying an invalidated order must fail fast");
+        assert!(matches!(
+            retry,
+            DomainServiceError::ChallengeInvalidated { .. }
+        ));
+        assert_eq!(
+            provider.completions(),
+            1,
+            "the provider must not be asked to complete an invalidated order again"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_order_after_invalidation_has_fresh_challenge_and_clears_the_error() {
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        let first = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("first attempt is invalidated");
+        let old_order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The retry path: start a new order.
+        let second = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        assert_ne!(
+            first.txt_records[0].value, second.txt_records[0].value,
+            "a new order must expose a new TXT value"
+        );
+        let new_order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(new_order.order_url, old_order.order_url);
+        assert_eq!(new_order.status, "pending");
+        assert!(repository
+            .find_acme_order_by_url(&old_order.order_url)
+            .await
+            .unwrap()
+            .is_none());
+
+        let domain = domain_row(&db, name).await;
+        assert_eq!(domain.status, "challenge_requested");
+        assert!(
+            domain.last_error.is_none() && domain.last_error_type.is_none(),
+            "the previous attempt's error must not linger next to fresh instructions"
+        );
+
+        // The new, still-valid challenge is submitted normally.
+        provider.set_mode(CompletionMode::Succeed);
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("a fresh order should complete");
+        assert_eq!(active.status, "active");
+    }
+
+    #[tokio::test]
+    async fn test_transient_failure_keeps_the_order_and_reuses_it_on_retry() {
+        let provider = ScriptedProvider::new(CompletionMode::Transient);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "app.example.com";
+        let created = service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let order_before = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("a transient failure is reported");
+        assert!(
+            matches!(err, DomainServiceError::Challenge(_)),
+            "a transient failure is not an invalidation: {err:?}"
+        );
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            failed.last_error_type.as_deref(),
+            Some("challenge_completion")
+        );
+        let order_after = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(order_after.status, "pending");
+        assert_eq!(order_after.order_url, order_before.order_url);
+
+        // The challenge is still open, so retrying reuses the same order.
+        provider.set_mode(CompletionMode::Succeed);
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the open challenge is verified again");
+        assert_eq!(active.status, "active");
+        assert_eq!(provider.completions(), 2);
+    }
+
+    // ---- verification_method after an ACME issuance (#1587) ----
+
+    /// Turns `name` into a `manual` row, as `temps setup` stores its domains.
+    /// `create_domain` only accepts `http-01`/`dns-01`, so the column is
+    /// rewritten directly.
+    async fn mark_manual(db: &DatabaseConnection, name: &str) {
+        let mut active: domains::ActiveModel = domain_row(db, name).await.into();
+        active.verification_method = Set("manual".to_string());
+        active.update(db).await.unwrap();
+    }
+
+    /// Finalizing an order for a `manual` domain goes through HTTP-01, so the
+    /// row must say `http-01` afterwards — the renewal job never renews a
+    /// `manual` row.
+    #[tokio::test]
+    async fn test_finalizing_a_manual_domain_records_the_validated_challenge() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "installer.example.com";
+        let created = service.create_domain(name, "http-01").await.unwrap();
+        mark_manual(&db, name).await;
+
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        let order = repository
+            .find_acme_order_by_domain(created.id)
+            .await
+            .unwrap()
+            .expect("the order exists");
+        assert_eq!(
+            order.authorizations.as_ref().unwrap()["challenge_type"],
+            "http-01"
+        );
+        assert_eq!(domain_row(&db, name).await.verification_method, "manual");
+
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the challenge is verified");
+
+        assert_eq!(active.status, "active");
+        assert_eq!(active.verification_method, "http-01");
+        assert_eq!(domain_row(&db, name).await.verification_method, "http-01");
+    }
+
+    /// A DNS-01 domain keeps `dns-01` after finalizing.
+    #[tokio::test]
+    async fn test_finalizing_a_dns01_domain_keeps_dns01() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "dns.example.com";
+        service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+
+        let active = service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect("the challenge is verified");
+
+        assert_eq!(active.verification_method, "dns-01");
+        assert_eq!(domain_row(&db, name).await.verification_method, "dns-01");
+    }
+
+    /// When the CA hands back a certificate without a challenge (it still held
+    /// a valid authorization), a `manual` row is updated the same way.
+    #[tokio::test]
+    async fn test_immediate_certificate_for_a_manual_domain_records_the_challenge() {
+        let provider = ScriptedProvider::new(CompletionMode::Succeed);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider.clone()).await
+        else {
+            return;
+        };
+        let name = "cached-installer.example.com";
+        service.create_domain(name, "http-01").await.unwrap();
+        mark_manual(&db, name).await;
+        provider
+            .immediate_certificate
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        let issued = service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .expect("certificate issued outright");
+
+        assert_eq!(issued.status, "completed");
+        let row = domain_row(&db, name).await;
+        assert_eq!(row.status, "active");
+        assert_eq!(row.verification_method, "http-01");
+    }
+
     // ---- Pure unit tests (no DB) for the on-demand helpers ----
 
     #[test]
-    fn test_next_backoff_delay_climbs_the_ladder() {
-        let set_at = Utc::now();
-        // No previous backoff → first rung (5m).
+    fn test_backoff_delay_climbs_the_ladder_and_caps_at_24h() {
+        let mins: Vec<i64> = (0..7)
+            .map(|n| DomainService::backoff_delay(n).num_minutes())
+            .collect();
+        assert_eq!(mins, vec![5, 15, 60, 240, 1440, 1440, 1440]);
+    }
+
+    #[test]
+    fn test_previous_failures_keeps_a_recent_streak() {
+        let now = Utc::now();
+        assert_eq!(DomainService::previous_failures(0, None, now), 0);
         assert_eq!(
-            DomainService::next_backoff_delay(None, set_at).num_minutes(),
-            5
+            DomainService::previous_failures(3, Some(now - Duration::minutes(20)), now),
+            3
         );
-        // Previous was 5m → 15m.
+    }
+
+    #[test]
+    fn test_previous_failures_keeps_a_streak_retried_at_the_cap() {
+        // The 24h rung retries a day later: still one streak.
+        let now = Utc::now();
+        let last = Some(now - Duration::hours(24) - Duration::minutes(5));
+        assert_eq!(DomainService::previous_failures(5, last, now), 5);
+    }
+
+    #[test]
+    fn test_previous_failures_restarts_after_a_long_quiet_gap() {
+        let now = Utc::now();
+        let stale = Some(now - Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) - Duration::minutes(1));
+        assert_eq!(DomainService::previous_failures(4, stale, now), 0);
+    }
+
+    #[test]
+    fn test_previous_failures_without_a_failure_time_is_zero() {
+        // A streak with no time (a row written before the column existed, or
+        // edited by hand) starts over rather than guessing.
+        assert_eq!(DomainService::previous_failures(4, None, Utc::now()), 0);
         assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(5)), set_at)
-                .num_minutes(),
-            15
-        );
-        // Previous was 15m → 1h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(15)), set_at)
-                .num_minutes(),
-            60
-        );
-        // Previous was 1h → 4h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(60)), set_at)
-                .num_minutes(),
-            240
-        );
-        // Previous was 4h → 24h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(240)), set_at)
-                .num_minutes(),
-            1440
-        );
-        // Previous was 24h → stays capped at 24h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(1440)), set_at)
-                .num_minutes(),
-            1440
+            DomainService::previous_failures(-1, Some(Utc::now()), Utc::now()),
+            0
         );
     }
 
@@ -2337,6 +4593,20 @@ mod tests {
                 "challenge_mismatch",
             ),
             ("connection reset by peer", "internal"),
+            // With the CA's problem type the type decides, not words in the
+            // hostname or the token path.
+            (
+                "[mydns.example.com Http01] urn:ietf:params:acme:error:connection: Fetching http://mydns.example.com/.well-known/acme-challenge/x: Connection refused",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:dns: DNS problem: NXDOMAIN looking up A for app.example.com",
+                "dns_failure",
+            ),
         ];
         for (msg, expected) in cases {
             let err =
@@ -2378,7 +4648,7 @@ mod tests {
     #[tokio::test]
     async fn test_domain_validation() {
         // Create a test database
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let encryption_service = Arc::new(
@@ -2438,8 +4708,31 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    #[test]
+    fn setup_reuses_only_serving_certificates_with_usable_material() {
+        for status in domains::CERT_SERVING_STATUSES {
+            let mut domain = domain_with_cert(Some("cert"), Some("key"), None);
+            domain.status = status.into();
+            for minutes in [None, Some(-1), Some(2), Some(60)] {
+                domain.expiration_time = minutes.map(|m| Utc::now() + chrono::Duration::minutes(m));
+                assert_eq!(
+                    DomainService::can_reuse_serving_certificate(&domain),
+                    minutes == Some(60)
+                );
+            }
+            domain.status = "pending".into();
+            assert!(!DomainService::can_reuse_serving_certificate(&domain));
+            domain.status = status.into();
+            domain.private_key = None;
+            assert!(!DomainService::can_reuse_serving_certificate(&domain));
         }
     }
 
@@ -2779,7 +5072,8 @@ mod tests {
     ///   challenge_served=true, acme_request_sent=true is written.
     /// - The issued certificate chains to Pebble's CA.
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_provision_on_demand_real_pebble_http01() {
+    async fn test_provision_on_demand_real_pebble_http01_and_method_switches() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::core::{IntoContainerPort, WaitFor};
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
@@ -2800,7 +5094,7 @@ mod tests {
         };
 
         // ── 0b. Guard: skip gracefully when the test database is not available ─
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Test database not available, skipping Pebble E2E test: {e}");
@@ -2854,6 +5148,7 @@ mod tests {
                 .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
                 .with_network(network_name.clone())
                 .with_container_name(challtestsrv_alias.clone())
+                .with_test_labels()
                 .start()
                 .await
                 .expect("challtestsrv failed to start");
@@ -2938,6 +5233,8 @@ mod tests {
             // recovery is instant-acme's responsibility; keep this test focused
             // on Temps' real challenge-serving and certificate-storage flow.
             .with_env_var("PEBBLE_WFE_NONCEREJECT", "0")
+            // Each renewal must actually validate the newly selected method.
+            .with_env_var("PEBBLE_AUTHZREUSE", "0")
             // Add host-gateway so Pebble's VA can reach the host's challenge
             // responder (the A-record points the hostname at the gateway IP).
             .with_host(
@@ -2954,6 +5251,7 @@ mod tests {
                 "-dnsserver",
                 &challtestsrv_dns_addr,
             ])
+            .with_test_labels()
             .start()
             .await
             .expect("Pebble container failed to start");
@@ -3015,8 +5313,6 @@ mod tests {
 
         // ── 6. Build LetsEncryptProvider with Pebble CA and directory URL ─────
         let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
-        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
 
         let encryption_service = Arc::new(
             EncryptionService::new(
@@ -3031,6 +5327,8 @@ mod tests {
 
         let provider = Arc::new(
             crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+                .with_environment("staging")
+                .with_directory_url(acme_directory_url.clone())
                 .with_custom_ca_pem(pebble_ca_pem.clone()),
         );
 
@@ -3043,7 +5341,7 @@ mod tests {
         // token in the path. We pass the pre-bound listener so the port is never
         // released between allocation and use (prevents TOCTOU race).
         let db_arc = test_db.db.clone();
-        let (responder_actual_port, _responder_handle) =
+        let (responder_actual_port, responder_handle) =
             spawn_challenge_responder_flat(db_arc, responder_listener, test_hostname.to_string());
         println!(
             "Challenge responder bound on port {}",
@@ -3162,7 +5460,67 @@ mod tests {
         let cert_pem = domain.certificate.as_deref().unwrap();
         verify_cert_chains_to_ca(cert_pem, &pebble_ca_pem);
 
-        println!("Pebble E2E test passed — real cert issued via HTTP-01");
+        // Renew the same row in both directions, using real DNS and HTTP
+        // validation. The current certificate/key must survive both saving the
+        // policy and creating the pending order, until its replacement is ready.
+        let mut previous = domain;
+        for method in ["dns-01", "http-01"] {
+            service
+                .update_certificate_settings(
+                    previous.id,
+                    DomainCertificateSettings {
+                        challenge_type: method.into(),
+                        renewal_days: 30,
+                        alert_days: Some(7),
+                        alerts_enabled: Some(true),
+                    },
+                )
+                .await
+                .unwrap();
+            let saved = service
+                .get_domain_by_id(previous.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.certificate, previous.certificate);
+            assert_eq!(saved.private_key, previous.private_key);
+            assert_eq!(saved.status, "active");
+
+            let challenge = service
+                .request_challenge_for_id(previous.id, test_email)
+                .await
+                .unwrap();
+            assert_eq!(challenge.challenge_type, method);
+            let pending = service
+                .get_domain_by_id(previous.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(pending.certificate, previous.certificate);
+            assert_eq!(pending.private_key, previous.private_key);
+            assert_eq!(pending.status, "active");
+            assert!(DomainService::has_usable_certificate(&pending));
+            for record in &challenge.txt_records {
+                reqwest::Client::new()
+                    .post(format!("{mgmt_base}/set-txt"))
+                    .json(&serde_json::json!({"host": format!("{}.", record.name.trim_end_matches('.')), "value": record.value}))
+                    .send().await.unwrap().error_for_status().unwrap();
+            }
+            let renewed = service
+                .complete_challenge_for_id(previous.id, test_email)
+                .await
+                .unwrap();
+            assert_eq!(renewed.id, previous.id);
+            assert_eq!(renewed.status, "active");
+            assert_eq!(renewed.verification_method, method);
+            assert_ne!(renewed.certificate, previous.certificate);
+            verify_cert_chains_to_ca(renewed.certificate.as_deref().unwrap(), &pebble_ca_pem);
+            verify_cert_has_san(renewed.certificate.as_deref().unwrap(), test_hostname);
+            println!("Pebble renewal via {method} passed; existing certificate stayed active while pending");
+            previous = renewed;
+        }
+        responder_handle.abort();
+        println!("Pebble E2E passed: HTTP-01 → DNS-01 → HTTP-01 on the same domain");
     }
 
     /// Full end-to-end DNS-01 WILDCARD issuance test against a real Pebble.
@@ -3190,6 +5548,7 @@ mod tests {
     /// Skips gracefully (returns) when Docker is unavailable; it is NOT #[ignore].
     #[tokio::test(flavor = "multi_thread")]
     async fn test_provision_dns01_wildcard_real_pebble() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::core::{IntoContainerPort, WaitFor};
         use testcontainers::{runners::AsyncRunner, GenericImage, ImageExt};
 
@@ -3229,6 +5588,7 @@ mod tests {
                 .with_cmd(["-https01=", "-tlsalpn01=", "-doh="])
                 .with_network(network_name.clone())
                 .with_container_name(challtestsrv_alias.clone())
+                .with_test_labels()
                 .start()
                 .await
                 .expect("challtestsrv failed to start");
@@ -3264,6 +5624,7 @@ mod tests {
                 "-dnsserver",
                 &challtestsrv_dns_addr,
             ])
+            .with_test_labels()
             .start()
             .await
             .expect("Pebble container failed to start");
@@ -3288,7 +5649,7 @@ mod tests {
         // ── 5. Build LetsEncryptProvider pointed at Pebble ────────────────────
         // We only need a CertificateRepository for ACME account persistence; back
         // it with a Docker Postgres test schema (skip gracefully if unavailable).
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!(
@@ -3299,8 +5660,6 @@ mod tests {
         };
 
         let acme_directory_url = format!("https://localhost:{}/dir", pebble_acme_port);
-        std::env::set_var("ACME_DIRECTORY_URL", &acme_directory_url);
-        std::env::set_var("LETSENCRYPT_MODE", "staging");
 
         let encryption_service = Arc::new(
             temps_core::EncryptionService::new(
@@ -3314,6 +5673,8 @@ mod tests {
         ));
 
         let provider = crate::tls::providers::LetsEncryptProvider::new(repository.clone())
+            .with_environment("staging")
+            .with_directory_url(acme_directory_url.clone())
             .with_custom_ca_pem(pebble_ca_pem.clone());
 
         // Pre-flight: confirm HTTPS reachability of Pebble's directory with the
@@ -3718,6 +6079,118 @@ mod tests {
         println!(
             "Certificate chain verified: leaf issuer = '{}', CA subject = '{}'",
             leaf_issuer_str, ca_subject_str
+        );
+    }
+
+    /// A provider whose CA "issues" only after the domain row was deleted
+    /// (its owner removed it mid-order), as happens when a status page
+    /// hostname is removed while its certificate is being completed.
+    struct RowDeletedDuringIssuanceProvider {
+        db: Arc<DatabaseConnection>,
+    }
+
+    #[async_trait::async_trait]
+    impl CertificateProvider for RowDeletedDuringIssuanceProvider {
+        async fn provision(
+            &self,
+            domain: &str,
+            challenge: ChallengeType,
+            _email: &str,
+        ) -> Result<ProvisioningResult, crate::tls::ProviderError> {
+            Ok(ProvisioningResult::Challenge(
+                crate::tls::models::ChallengeData {
+                    challenge_type: challenge,
+                    domain: domain.to_string(),
+                    token: "token".to_string(),
+                    key_authorization: "token.key".to_string(),
+                    validation_url: Some("https://ca.example.test/chall/1".to_string()),
+                    dns_txt_records: vec![],
+                    order_url: Some("https://ca.example.test/order/1".to_string()),
+                },
+            ))
+        }
+
+        async fn complete_challenge(
+            &self,
+            domain: &str,
+            _challenge_data: &crate::tls::models::ChallengeData,
+            _email: &str,
+        ) -> Result<crate::tls::models::Certificate, crate::tls::ProviderError> {
+            domains::Entity::delete_many()
+                .filter(domains::Column::Domain.eq(domain))
+                .exec(self.db.as_ref())
+                .await
+                .map_err(|e| crate::tls::ProviderError::Acme(e.to_string()))?;
+            Ok(mock_certificate(domain))
+        }
+
+        fn supported_challenges(&self) -> Vec<ChallengeType> {
+            vec![ChallengeType::Http01]
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _domain: &str,
+            _email: &str,
+        ) -> Result<crate::tls::models::ValidationResult, crate::tls::ProviderError> {
+            Ok(crate::tls::models::ValidationResult {
+                is_valid: true,
+                errors: vec![],
+                warnings: vec![],
+            })
+        }
+
+        async fn cancel_order(&self, _domain: &str) -> Result<(), crate::tls::ProviderError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_certificate_issued_for_a_deleted_row_leaves_no_stored_copy() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping certificate storage test: {e}");
+                return;
+            }
+        };
+        let db = test_db.db.clone();
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("encryption service"),
+        );
+        let service = DomainService::new(
+            db.clone(),
+            Arc::new(RowDeletedDuringIssuanceProvider { db: db.clone() }),
+            Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
+                db.clone(),
+                encryption_service.clone(),
+            )),
+            encryption_service,
+        );
+        let row = service
+            .create_domain("late-copy.example.org", "http-01")
+            .await
+            .expect("create domain");
+        service
+            .request_challenge_for_id(row.id, "ops@example.com")
+            .await
+            .expect("order");
+
+        let result = service
+            .complete_challenge_for_id(row.id, "ops@example.com")
+            .await;
+        assert!(result.is_err(), "the owning row is gone: {result:?}");
+        let copies = tls_acme_certificates::Entity::find()
+            .filter(tls_acme_certificates::Column::Domain.eq("late-copy.example.org"))
+            .count(db.as_ref())
+            .await
+            .expect("count copies");
+        assert_eq!(
+            copies, 0,
+            "the certificate and its private key are not stored without their row"
         );
     }
 }

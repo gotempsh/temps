@@ -42,6 +42,9 @@ Discover workloads from a source
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
 | `--json` | Output in JSON format | - | No |
+| `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `migrate plan`
 
@@ -58,6 +61,9 @@ Discover a source, pick a workload, and show the import plan
 | `--username <name>` | Admin username (portainer source, defaults to "admin") | - | No |
 | `--kubeconfig <path>` | Path to a kubeconfig file (kubernetes source) | - | No |
 | `--deploy-yml <path>` | Path to config/deploy.yml (kamal source) | - | No |
+| `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `migrate run`
 
@@ -80,6 +86,9 @@ Guided end-to-end migration: discover, plan, review, and execute
 | `--branch <branch>` | Branch to deploy | `main` | No |
 | `--dry-run` | Plan only — do not create or deploy anything | - | No |
 | `-y, --yes` | Skip the confirmation prompt (for automation) | - | No |
+| `--token-file <path>` | Read the source API token or admin password from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the source API token or admin password from stdin instead of --token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `migrate execute`
 

@@ -13,10 +13,12 @@ import {
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
+import { RecordLink, RecordListItem } from '@temps-sdk/ds'
 import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -30,7 +32,6 @@ import {
   EmailProviderLogo,
   type EmailProviderType,
 } from '@/components/ui/email-provider-logo'
-import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -46,7 +47,6 @@ import { formatDistanceToNow } from 'date-fns'
 import {
   AlertCircle,
   CheckCircle2,
-  ChevronRight,
   Clock,
   EllipsisVertical,
   Globe,
@@ -54,8 +54,8 @@ import {
   Info,
   RefreshCw,
 } from 'lucide-react'
-import { useMemo } from 'react'
-import { useNavigate } from 'react-router'
+import { useMemo, useState } from 'react'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { problemMessage } from './sharedUtils'
 
@@ -133,6 +133,7 @@ function StatusDot({
           : 'Unknown'
   return (
     <span
+      role="img"
       className={cn(
         'inline-block size-2 rounded-full ring-2 ring-background',
         tone,
@@ -230,7 +231,7 @@ function DnsRecordStatusBadge({
   switch (status) {
     case 'verified':
       return (
-        <div className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1.5 text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span className="text-xs font-medium">Verified</span>
         </div>
@@ -313,7 +314,7 @@ export function DnsVerificationSummary({
   if (allVerified) {
     return (
       <div className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 p-3 dark:border-emerald-900 dark:bg-emerald-950/30">
-        <CheckCircle2 className="size-5 text-emerald-600 dark:text-emerald-500" />
+        <CheckCircle2 className="size-5 text-emerald-700 dark:text-emerald-500" />
         <span className="text-sm font-medium text-emerald-700 dark:text-emerald-400">
           All {totalCount} required DNS records verified successfully
         </span>
@@ -325,7 +326,7 @@ export function DnsVerificationSummary({
     <div className="flex flex-wrap items-center gap-x-4 gap-y-2 rounded-lg border bg-muted/40 p-3">
       <span className="text-sm font-medium">DNS status</span>
       {verifiedCount > 0 && (
-        <div className="flex items-center gap-1 text-sm text-emerald-600 dark:text-emerald-500">
+        <div className="flex items-center gap-1 text-sm text-emerald-700 dark:text-emerald-500">
           <CheckCircle2 className="size-4" />
           <span>{verifiedCount} verified</span>
         </div>
@@ -480,6 +481,7 @@ function LoadingSkeleton() {
 export function EmailDomainsManagement() {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const [domainToDelete, setDomainToDelete] = useState<EmailDomain | null>(null)
 
   const domainsQuery = useQuery({
     queryKey: ['email-domains'],
@@ -564,10 +566,10 @@ export function EmailDomainsManagement() {
     onError: (error: Error) => {
       toast.error('Failed to delete domain', { description: error.message })
     },
+    onSettled: () => setDomainToDelete(null),
   })
 
   const handleVerify = (id: number) => verifyMutation.mutate(id)
-  const handleDelete = (id: number) => deleteMutation.mutate(id)
   const handleOpen = (id: number) => navigate(`/email/domains/${id}`)
 
   // Provider lookup by id — avoids N+1 fetches per row.
@@ -588,6 +590,16 @@ export function EmailDomainsManagement() {
 
   return (
     <div className="space-y-4">
+      <div className="flex min-h-9 items-center justify-between gap-3">
+        <h2 className="text-base font-semibold">Domains</h2>
+        {hasProviders && (
+          <CreateActionButton
+            to="/email/domains/new"
+            label="Add domain"
+            size="sm"
+          />
+        )}
+      </div>
       {loadFailed && (
         <Alert role="alert">
           <AlertCircle className="size-4" />
@@ -616,33 +628,23 @@ export function EmailDomainsManagement() {
       {isLoading ? (
         <LoadingSkeleton />
       ) : uncachedFailure ? null : !hasProviders ? (
-        <EmptyState
-          size="compact"
-          icon={Globe}
-          title="No email providers configured"
-          description="Add an email provider to verify a domain and start sending email."
-          action={
-            <CreateActionButton
-              to="/email/providers/new"
-              label="Add provider"
-            />
-          }
-        />
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No domains yet.{' '}
+          <Link
+            to="/email/providers/new"
+            className="font-medium text-foreground underline underline-offset-4"
+          >
+            Connect a provider
+          </Link>{' '}
+          first, then add the domain you send from.
+        </p>
       ) : !hasDomains ? (
-        <EmptyState
-          icon={Globe}
-          title="No email domains configured"
-          description="Add a domain to start sending emails. You'll need to configure DNS records for verification."
-          action={
-            <CreateActionButton to="/email/domains/new" label="Add domain" />
-          }
-        />
+        <p className="rounded-md border border-dashed p-4 text-sm text-muted-foreground">
+          No domains yet. Add the domain you send from, then publish its DNS
+          records.
+        </p>
       ) : (
         <>
-          <div className="mb-4 flex items-center justify-end">
-            <CreateActionButton to="/email/domains/new" label="Add Domain" />
-          </div>
-
           <div className="overflow-hidden rounded-lg border">
             <ul role="list" className="divide-y">
               {domains.map((domain) => {
@@ -654,10 +656,9 @@ export function EmailDomainsManagement() {
                 const isSmtp = isSmtpProvider(provider)
                 const canEnableSending = isSmtp && domain.status !== 'verified'
                 return (
-                  <li
+                  <RecordListItem
                     key={domain.id}
-                    onClick={() => handleOpen(domain.id)}
-                    className="group flex cursor-pointer items-center gap-4 px-4 py-3 transition-colors hover:bg-muted/40"
+                    className="flex items-center gap-4 px-4 py-3"
                   >
                     {/* Provider logo tile mirrors Storage page's ServiceLogo pattern,
                         with a health dot anchored to the bottom-right. */}
@@ -681,10 +682,13 @@ export function EmailDomainsManagement() {
                     </div>
 
                     <div className="min-w-0 flex-1">
-                      <div className="flex items-center gap-2">
-                        <p className="truncate text-sm font-medium">
+                      <div className="flex flex-wrap items-center gap-x-2">
+                        <RecordLink
+                          to={`/email/domains/${domain.id}`}
+                          className="min-h-0"
+                        >
                           {domain.domain}
-                        </p>
+                        </RecordLink>
                         {provider && (
                           <span className="rounded border bg-muted/50 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-muted-foreground">
                             {provider.provider_type}
@@ -719,10 +723,7 @@ export function EmailDomainsManagement() {
                       </div>
                     </div>
 
-                    <div
-                      className="flex items-center gap-1"
-                      onClick={(e) => e.stopPropagation()}
-                    >
+                    <div className="flex items-center gap-1">
                       {canEnableSending && (
                         <Button
                           variant="outline"
@@ -787,22 +788,34 @@ export function EmailDomainsManagement() {
                           <DropdownMenuSeparator />
                           <DropdownMenuItem
                             className="text-destructive"
-                            onClick={() => handleDelete(domain.id)}
+                            onClick={() => setDomainToDelete(domain)}
                           >
                             Delete
                           </DropdownMenuItem>
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </div>
-
-                    <ChevronRight className="size-4 shrink-0 text-muted-foreground/40 transition-transform group-hover:translate-x-0.5 group-hover:text-muted-foreground" />
-                  </li>
+                  </RecordListItem>
                 )
               })}
             </ul>
           </div>
         </>
       )}
+
+      <ConfirmDeleteDialog
+        open={domainToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="email domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences="Email can no longer be sent from this domain, and its DNS records are no longer tracked."
+        isPending={deleteMutation.isPending}
+        onConfirm={() => {
+          if (domainToDelete) deleteMutation.mutate(domainToDelete.id)
+        }}
+      />
     </div>
   )
 }

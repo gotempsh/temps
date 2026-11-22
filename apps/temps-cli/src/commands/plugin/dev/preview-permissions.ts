@@ -48,6 +48,7 @@ export const previewPermissions = {
     "load_balancer:read",
     "load_balancer:write",
     "logs:read",
+    "logs:write",
     "logs:delete",
     "metrics:read",
     "notifications:read",
@@ -103,6 +104,8 @@ export const previewPermissions = {
     "git_connections:delete",
     "git_repositories:read",
     "git_repositories:sync",
+    "git_repositories:create",
+    "git_repositories:write",
     "imports:read",
     "imports:create",
     "email_providers:read",
@@ -133,6 +136,8 @@ export const previewPermissions = {
     "flags:read",
     "flags:write",
     "flags:delete",
+    "surveys:read",
+    "surveys:write",
     "status_page:read",
     "status_page:write",
     "status_page:create",
@@ -149,7 +154,16 @@ export const previewPermissions = {
     "stacks:create",
     "sandboxes:read",
     "sandboxes:write",
-    "sandboxes:exec"
+    "sandboxes:exec",
+    "edge_rules:read",
+    "edge_rules:write",
+    "workflows:read",
+    "workflows:write",
+    "workflow_runs:create",
+    "workflow_runs:write",
+    "workflow_runs:delete",
+    "workflow_events:create",
+    "workflow_payloads:read"
   ],
   "reader": [
     "projects:read",
@@ -186,10 +200,13 @@ export const previewPermissions = {
     "blob:read",
     "kv:read",
     "flags:read",
+    "surveys:read",
     "status_page:read",
     "otel:read",
     "ai_gateway:read",
     "stacks:read",
-    "sandboxes:read"
+    "sandboxes:read",
+    "edge_rules:read",
+    "workflows:read"
   ]
 } as const;

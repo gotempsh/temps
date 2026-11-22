@@ -39,7 +39,7 @@ export function EditDomainDialog({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[600px]">
         <DialogHeader>
-          <DialogTitle>Edit Domain</DialogTitle>
+          <DialogTitle>Edit domain</DialogTitle>
         </DialogHeader>
         {environments && domain && (
           <DomainForm

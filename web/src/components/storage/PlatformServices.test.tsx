@@ -77,13 +77,13 @@ for (const error of [
     const html = render(client)
     expect(html).toContain(
       error instanceof TypeError || error.status !== 403
-        ? 'KV Store status unavailable'
-        : 'KV Store status: access denied'
+        ? 'KV store status unavailable'
+        : 'KV store status: access denied'
     )
     expect(html).toContain('Status unknown')
-    expect(html).not.toContain('Enable KV Store')
+    expect(html).not.toContain('Enable KV store')
     expect(html).not.toContain('Disabled')
-    expect(html).toContain('Disable Blob Storage')
+    expect(html).toContain('Disable Blob storage')
     expect(html).toContain('Retry')
     client.clear()
   })
@@ -99,8 +99,8 @@ for (const error of [
     const html = render(client)
     expect(html.match(/Status unknown/g)).toHaveLength(2)
     expect(html).toContain('Retry')
-    expect(html).not.toContain('Enable KV Store')
-    expect(html).not.toContain('Enable Blob Storage')
+    expect(html).not.toContain('Enable KV store')
+    expect(html).not.toContain('Enable Blob storage')
     client.clear()
   })
 }
@@ -136,6 +136,6 @@ function actionButton(html: string) {
     Array.from(
       html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g),
       (match) => match[0]
-    ).find((button) => button.includes('Disable KV Store')) ?? ''
+    ).find((button) => button.includes('Disable KV store')) ?? ''
   )
 }

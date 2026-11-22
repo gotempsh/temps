@@ -752,6 +752,7 @@ async fn fetch_timescale_batch(
         spans.push(SourcedSpan {
             row_id: row.try_get::<i64>("", "id").ok(),
             span: SpanRecord {
+                ingest_identity: None,
                 project_id: row.try_get("", "project_id").unwrap_or(project_id),
                 deployment_id: None,
                 resource: ResourceInfo {
@@ -854,6 +855,7 @@ fn chrow_to_span(row: ChBackfillRow) -> SourcedSpan {
         // ClickHouse has no row id; `span_id` is the keyset tiebreaker.
         row_id: None,
         span: SpanRecord {
+            ingest_identity: None,
             project_id: row.project_id,
             deployment_id: None,
             resource: ResourceInfo {
@@ -943,6 +945,7 @@ mod tests {
         SourcedSpan {
             row_id,
             span: SpanRecord {
+                ingest_identity: None,
                 project_id: 7,
                 deployment_id: None,
                 resource: ResourceInfo::default(),

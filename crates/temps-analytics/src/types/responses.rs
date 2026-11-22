@@ -137,6 +137,12 @@ pub struct VisitorInfo {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: Option<bool>,
+    /// Browser named by `user_agent` (e.g. "Chrome"), as analytics breakdowns name it
+    pub browser: Option<String>,
+    pub browser_version: Option<String>,
+    /// Operating system named by `user_agent` (e.g. "Windows 10")
+    pub operating_system: Option<String>,
+    pub operating_system_version: Option<String>,
     /// Most recent page path visited by this visitor
     pub current_page: Option<String>,
     // First-visit attribution
@@ -146,6 +152,11 @@ pub struct VisitorInfo {
     pub first_referrer_hostname: Option<String>,
     /// Marketing channel from the first visit (e.g. "Organic Search", "Direct")
     pub first_channel: Option<String>,
+    /// The app's own user id, once `identify()` labelled this visitor.
+    pub user_id: Option<String>,
+    /// Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+    /// token). `None` while the visitor is anonymous.
+    pub identity_source: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -180,6 +191,11 @@ pub struct VisitorDetails {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: Option<bool>,
+    /// Autonomous system (network) number the visitor's IP is announced from,
+    /// when an ASN database was loaded.
+    pub asn_number: Option<i32>,
+    /// Organisation operating that network.
+    pub asn_org: Option<String>,
     // First-visit attribution
     /// Full referrer URL from the visitor's first session
     pub first_referrer: Option<String>,
@@ -187,6 +203,16 @@ pub struct VisitorDetails {
     pub first_referrer_hostname: Option<String>,
     /// Marketing channel from the first visit (e.g. "Organic Search", "Direct")
     pub first_channel: Option<String>,
+    /// The app's own user id, once `identify()` labelled this visitor.
+    pub user_id: Option<String>,
+    /// Who set `user_id`: `browser` (the SDK) or `server` (a deployment
+    /// token). `None` while the visitor is anonymous.
+    pub identity_source: Option<String>,
+    #[schema(value_type = Option<String>, format = "date-time", example = "2024-01-01T00:00:00Z")]
+    pub identified_at: Option<UtcDateTime>,
+    /// Who last set each key of `custom_data`: `{"plan": "server"}`. Keys
+    /// written before identify existed are absent.
+    pub trait_sources: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -928,6 +954,34 @@ pub struct EventBrowserStats {
     /// Number of event occurrences from this browser
     pub count: i64,
     /// Percentage of total events
+    pub percentage: f64,
+}
+
+/// One event broken down by one of its custom properties, most frequent
+/// value first. Used for the outbound-link and file-download reports
+/// (ADR 109 D1), and for any `trackEvent()` property.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct EventPropertiesResponse {
+    /// The event that was broken down
+    pub event_name: String,
+    /// The property the values belong to
+    pub property: String,
+    /// Occurrences of the event in the period, whatever the property's value
+    pub total_count: i64,
+    /// The most frequent values, at most `limit` of them
+    pub items: Vec<EventPropertyValue>,
+}
+
+/// One value of an event property and how often it occurred
+#[derive(Debug, Serialize, Deserialize, ToSchema, Clone)]
+pub struct EventPropertyValue {
+    /// The value as text; null when the event did not carry the property
+    pub value: Option<String>,
+    /// Occurrences of the event with this value
+    pub count: i64,
+    /// Distinct visitors who sent the event with this value
+    pub unique_visitors: i64,
+    /// Share of `total_count`, 0 to 100
     pub percentage: f64,
 }
 

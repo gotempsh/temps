@@ -45,6 +45,14 @@
 //! Every test needs Postgres and skips gracefully when no container runtime is
 //! available, per CLAUDE.md — never `#[ignore]`.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -380,7 +388,7 @@ async fn serve_stub(stub: Stub) -> Option<String> {
 // ── Harness ────────────────────────────────────────────────────────────────
 
 struct Harness {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<DatabaseConnection>,
     link: Arc<CloudLink>,
     stub: Stub,
@@ -391,7 +399,7 @@ impl Harness {
     /// `None` means the environment cannot run the test (no container runtime,
     /// or no TCP bind), and the caller returns instead of failing.
     async fn start() -> Option<Self> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) => {
                 eprintln!("skipping Cloud-primary write-mode test: no test database ({error})");
@@ -463,6 +471,27 @@ impl Harness {
         )
         .await
         .expect("the inserted project must be readable")
+    }
+
+    /// Wait until this process's clock has passed the database's.
+    ///
+    /// A new ledger interval is stamped with the database's `NOW()`, and a read
+    /// resolves its window against this process's `Utc::now()`. With the database
+    /// clock ahead, a read straight after a mode switch ends before the interval
+    /// starts and is answered from the previous store. Tests of *routing* wait
+    /// that skew out instead of depending on two clocks agreeing.
+    async fn wait_for_clock_to_pass_database(&self) {
+        let database_now = self
+            .scalar::<chrono::DateTime<chrono::Utc>>("SELECT clock_timestamp() AS v", vec![])
+            .await
+            .expect("the database clock must be readable");
+        if let Ok(skew) = (database_now - chrono::Utc::now()).to_std() {
+            assert!(
+                skew < std::time::Duration::from_secs(30),
+                "the database clock is {skew:?} ahead of this process; fix the clocks"
+            );
+            tokio::time::sleep(skew).await;
+        }
     }
 
     /// Read one value aliased as `v`.
@@ -609,6 +638,7 @@ fn linked() -> CloudLinkSnapshot {
 fn span(project_id: i32, n: usize) -> SpanRecord {
     let start = chrono::Utc::now();
     SpanRecord {
+        ingest_identity: None,
         project_id,
         deployment_id: None,
         resource: ResourceInfo {
@@ -2355,6 +2385,7 @@ fn span_stats_query(project_ids: Vec<i32>) -> SpanStatsQuery {
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -2380,6 +2411,8 @@ async fn every_span_reader_is_served_from_cloud_for_a_cloud_primary_project() {
         .set_write_mode(project, CloudTelemetryWriteMode::Cloud, linked())
         .await
         .expect("the gate must allow this project");
+
+    harness.wait_for_clock_to_pass_database().await;
 
     let local = LocalSpanStoreSpy::new();
     let cloud = Arc::new(CountingCloudSource::default());
@@ -2506,6 +2539,8 @@ async fn a_span_stats_query_across_both_sources_is_refused_rather_than_merged() 
         .set_write_mode(cloud_project, CloudTelemetryWriteMode::Cloud, linked())
         .await
         .expect("the gate must allow this project");
+
+    harness.wait_for_clock_to_pass_database().await;
 
     let routed = CloudRoutedOtelStorage::new(
         Arc::new(LocalSpanStoreSpy::new()) as Arc<dyn OtelStorage>,

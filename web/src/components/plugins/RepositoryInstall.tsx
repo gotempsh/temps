@@ -31,6 +31,7 @@ import { useEffect, useState } from 'react'
 import { PluginGrantFields } from './PluginGrantFields'
 import { RepositoryInstallProgress } from './RepositoryInstallProgress'
 import { emptyPluginGrants } from '@/lib/plugin-grants'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 export type { RepositorySelection } from '@/lib/plugin-repository'
 
@@ -69,9 +70,7 @@ export function RepositoryInstall({
   useEffect(() => {
     reset(repositorySelectionValues(selection))
     if (selection && !compact)
-      document
-        .getElementById('repository-install-title')
-        ?.scrollIntoView({ block: 'center' })
+      scrollToElementId('repository-install-title', { block: 'center' })
   }, [selection, reset, compact])
   const install = useMutation({
     mutationFn: async ({ values, id }: { values: Values; id: string }) => {
@@ -137,12 +136,14 @@ export function RepositoryInstall({
       await install.mutateAsync({ values, id })
     } catch (error) {
       if (onSensitiveError(error, () => void submit(values))) return
-      const message = sensitiveActionErrorMessage(
-        error,
-        'GitHub installation failed. Check host Git credentials and Docker availability.'
+      // The app-wide mutation error handler already toasts the problem title
+      // and detail; toasting here as well shows the failure twice.
+      setFailure(
+        sensitiveActionErrorMessage(
+          error,
+          'GitHub installation failed. Check host Git credentials and Docker availability.'
+        )
       )
-      setFailure(message)
-      toast.error(message)
     }
   }
   return (

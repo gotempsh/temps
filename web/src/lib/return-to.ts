@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { safeReturnTo } from '@/lib/safe-return-to'
+
 const KEY = 'temps:returnTo'
 
 /**
@@ -41,6 +43,23 @@ export function captureReturnTo(): void {
   }
 }
 
+/**
+ * Remember `path` (rather than the current URL) as the post-login
+ * destination. Used when a sign-in has to restart and the only record of
+ * where the user was going is a `return_to` the server put in this page's
+ * query string. Unsafe or auth-only paths are ignored.
+ */
+export function rememberReturnTo(path: string | null | undefined): void {
+  if (typeof window === 'undefined') return
+  const safe = safeReturnTo(path)
+  if (!safe || safe === '/' || isAuthPath(safe)) return
+  try {
+    window.sessionStorage.setItem(KEY, safe)
+  } catch {
+    /* storage disabled */
+  }
+}
+
 export function consumeReturnTo(fallback = '/dashboard'): string {
   if (typeof window === 'undefined') return fallback
   try {
@@ -51,4 +70,28 @@ export function consumeReturnTo(fallback = '/dashboard'): string {
     /* storage disabled */
   }
   return fallback
+}
+
+/**
+ * Paths the server answers rather than the console's router: the signed-in
+ * gate's authorize step (`/_temps/gate/authorize`) sends a signed-out visitor
+ * here to sign in and must be loaded as a page afterwards, not routed to.
+ */
+export function isServerPath(path: string): boolean {
+  return path.startsWith('/_temps/')
+}
+
+/**
+ * Go to a post-login destination: a full page load for a server path, the
+ * router otherwise.
+ */
+export function goToReturnTo(
+  navigate: (to: string, options?: { replace?: boolean }) => void,
+  path: string
+): void {
+  if (isServerPath(path) && typeof window !== 'undefined') {
+    window.location.replace(path)
+    return
+  }
+  navigate(path, { replace: true })
 }

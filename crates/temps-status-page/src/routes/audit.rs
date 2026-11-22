@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -14,6 +13,7 @@ pub enum StatusPageMutationAction {
     IncidentCreated,
     IncidentStatusUpdated,
     IncidentUpdateVisibilityChanged,
+    IncidentPublicTitleChanged,
 }
 
 impl StatusPageMutationAction {
@@ -27,6 +27,7 @@ impl StatusPageMutationAction {
             Self::IncidentUpdateVisibilityChanged => {
                 "STATUS_PAGE_INCIDENT_UPDATE_VISIBILITY_CHANGED"
             }
+            Self::IncidentPublicTitleChanged => "STATUS_PAGE_INCIDENT_PUBLIC_TITLE_CHANGED",
         }
     }
 }
@@ -71,9 +72,8 @@ impl AuditOperation for StatusPageMutationAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("failed to serialize status-page audit: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -87,6 +87,11 @@ pub enum PublicStatusPageAction {
     Unpublished,
     UrlRotated,
     Deleted,
+    DomainAdded,
+    DomainVerified,
+    DomainVerificationAttempted,
+    DomainRenewalRequested,
+    DomainRemoved,
 }
 
 impl PublicStatusPageAction {
@@ -98,6 +103,11 @@ impl PublicStatusPageAction {
             Self::Unpublished => "STATUS_PAGE_UNPUBLISHED",
             Self::UrlRotated => "STATUS_PAGE_URL_ROTATED",
             Self::Deleted => "STATUS_PAGE_DELETED",
+            Self::DomainAdded => "STATUS_PAGE_DOMAIN_ADDED",
+            Self::DomainVerified => "STATUS_PAGE_DOMAIN_VERIFIED",
+            Self::DomainVerificationAttempted => "STATUS_PAGE_DOMAIN_VERIFICATION_ATTEMPTED",
+            Self::DomainRenewalRequested => "STATUS_PAGE_DOMAIN_RENEWAL_REQUESTED",
+            Self::DomainRemoved => "STATUS_PAGE_DOMAIN_REMOVED",
         }
     }
 }
@@ -112,12 +122,21 @@ pub struct PublicStatusPageAudit {
     pub ip_address: Option<String>,
     pub user_agent: String,
     pub action: PublicStatusPageAction,
-    pub project_id: i32,
+    /// Every project the page drew components from when the action ran:
+    /// whose monitors it exposed or stopped exposing.
+    pub project_ids: Vec<i32>,
     pub status_page_id: i32,
     pub title: Option<String>,
     pub is_published: Option<bool>,
     /// Selected monitor ids, in display order, when the selection was set.
     pub monitor_ids: Option<Vec<i32>>,
+    /// Custom hostname added, verified or removed (#1412).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Result of a verification or renewal attempt: `verified`, `renewed`,
+    /// `pending` or the error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
 }
 
 impl AuditOperation for PublicStatusPageAudit {
@@ -137,11 +156,250 @@ impl AuditOperation for PublicStatusPageAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!(
-                "failed to serialize status page {} audit: {error}",
-                self.status_page_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {}", self.status_page_id),
+                source,
+            )
+        })
+    }
+}
+
+/// Actions on a status page's email subscriptions (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageSubscriberAction {
+    SettingsUpdated,
+    SubscriberDeleted,
+    SubscribersExported,
+}
+
+impl StatusPageSubscriberAction {
+    fn operation_type(self) -> &'static str {
+        match self {
+            Self::SettingsUpdated => "STATUS_PAGE_SUBSCRIPTIONS_UPDATED",
+            Self::SubscriberDeleted => "STATUS_PAGE_SUBSCRIBER_DELETED",
+            Self::SubscribersExported => "STATUS_PAGE_SUBSCRIBERS_EXPORTED",
+        }
+    }
+}
+
+/// Audit payload for subscription settings and subscriber data. The address
+/// itself is never recorded: it is personal data, and a deletion that left
+/// it in the audit log would not erase it.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageSubscriberAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageSubscriberAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// The page's sender address (an operator-owned address, not a
+    /// subscriber's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sender: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub subscriber_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exported_count: Option<usize>,
+}
+
+impl AuditOperation for StatusPageSubscriberAudit {
+    fn operation_type(&self) -> String {
+        self.action.operation_type().to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {} subscriptions", self.status_page_id),
+                source,
+            )
+        })
+    }
+}
+
+/// Actions on a status page's webhooks (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageWebhookAction {
+    Created,
+    Updated,
+    Deleted,
+}
+
+/// Audit payload of a webhook change. The URL is recorded (it is where the
+/// page's events go); the signing secret never is.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageWebhookAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageWebhookAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub webhook_id: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl AuditOperation for StatusPageWebhookAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            StatusPageWebhookAction::Created => "STATUS_PAGE_WEBHOOK_CREATED",
+            StatusPageWebhookAction::Updated => "STATUS_PAGE_WEBHOOK_UPDATED",
+            StatusPageWebhookAction::Deleted => "STATUS_PAGE_WEBHOOK_DELETED",
+        }
+        .to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "status page {} webhook {}",
+                    self.status_page_id, self.webhook_id
+                ),
+                source,
+            )
+        })
+    }
+}
+
+/// A status page's password was set, changed or removed (ADR 108 D2). The
+/// password itself is never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPagePasswordAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub has_password: bool,
+}
+
+impl AuditOperation for StatusPagePasswordAudit {
+    fn operation_type(&self) -> String {
+        if self.has_password {
+            "STATUS_PAGE_PASSWORD_SET".to_string()
+        } else {
+            "STATUS_PAGE_PASSWORD_REMOVED".to_string()
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("status page {} password", self.status_page_id),
+                source,
+            )
+        })
+    }
+}
+
+/// Actions on a status page's maintenance windows (ADR 108 D2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusPageMaintenanceAction {
+    Scheduled,
+    Updated,
+    Cancelled,
+}
+
+impl StatusPageMaintenanceAction {
+    fn operation_type(self) -> &'static str {
+        match self {
+            Self::Scheduled => "STATUS_PAGE_MAINTENANCE_SCHEDULED",
+            Self::Updated => "STATUS_PAGE_MAINTENANCE_UPDATED",
+            Self::Cancelled => "STATUS_PAGE_MAINTENANCE_CANCELLED",
+        }
+    }
+}
+
+/// Audit payload of a maintenance window change: what the window covers
+/// and when, so an audit reader can tell which checks it took out of uptime.
+#[derive(Debug, Clone, Serialize)]
+pub struct StatusPageMaintenanceAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: StatusPageMaintenanceAction,
+    pub project_ids: Vec<i32>,
+    pub status_page_id: i32,
+    pub maintenance_id: i32,
+    pub title: String,
+    pub starts_at: temps_core::UtcDateTime,
+    pub ends_at: temps_core::UtcDateTime,
+    pub monitor_ids: Vec<i32>,
+}
+
+impl AuditOperation for StatusPageMaintenanceAudit {
+    fn operation_type(&self) -> String {
+        self.action.operation_type().to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "status page {} maintenance window {}",
+                    self.status_page_id, self.maintenance_id
+                ),
+                source,
             )
         })
     }
@@ -195,19 +453,75 @@ mod tests {
             ip_address: None,
             user_agent: "status-page-test".to_string(),
             action: PublicStatusPageAction::Published,
-            project_id: 9,
+            project_ids: vec![4, 9],
             status_page_id: 12,
             title: Some("Public status".to_string()),
             is_published: Some(true),
             monitor_ids: Some(vec![3, 1]),
+            hostname: None,
+            outcome: None,
         };
         assert_eq!(audit.operation_type(), "STATUS_PAGE_PUBLISHED");
         let serialized = AuditOperation::serialize(&audit).expect("audit should serialize");
         let payload: serde_json::Value =
             serde_json::from_str(&serialized).expect("serialized audit should be valid JSON");
         assert_eq!(payload["status_page_id"], 12);
+        assert_eq!(payload["project_ids"], serde_json::json!([4, 9]));
         assert_eq!(payload["monitor_ids"], serde_json::json!([3, 1]));
         assert_eq!(payload["action"], "published");
         assert!(payload.get("slug").is_none());
+    }
+}
+
+/// Actions on a monitor for a target outside Temps (ADR 108 D4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetMonitorAction {
+    Created,
+    Updated,
+}
+
+/// A target monitor was created or changed. Only the target's host is
+/// recorded: a URL's path or query may carry a token, and request headers
+/// and bodies are never recorded.
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetMonitorAudit {
+    pub actor_user_id: Option<i32>,
+    pub ip_address: Option<String>,
+    pub user_agent: String,
+    pub action: TargetMonitorAction,
+    pub project_id: i32,
+    pub monitor_id: i32,
+    pub check_kind: String,
+    pub target_host: Option<String>,
+    pub header_names: Vec<String>,
+    pub is_active: bool,
+    pub probe_from_nodes: bool,
+}
+
+impl AuditOperation for TargetMonitorAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            TargetMonitorAction::Created => "STATUS_PAGE_MONITOR_CREATED".to_string(),
+            TargetMonitorAction::Updated => "STATUS_PAGE_MONITOR_UPDATED".to_string(),
+        }
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        self.actor_user_id
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(format!("monitor {}", self.monitor_id), source)
+        })
     }
 }

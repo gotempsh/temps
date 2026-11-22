@@ -15,6 +15,33 @@ import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/type
  */
 export const WORKER_NODES_URL = '/settings/nodes'
 
+/**
+ * Anchors for the cards in the Worker Nodes page's collapsed "Advanced"
+ * section. Linking to one (`/settings/nodes#cluster-dns`) opens the section
+ * and scrolls to that card, so search and other pages can point at it.
+ */
+export const NODES_ADVANCED_SECTIONS = [
+  'mesh-hub',
+  'cluster-network',
+  'cluster-dns',
+  'cluster-trust',
+] as const
+
+export type NodesAdvancedSection = (typeof NODES_ADVANCED_SECTIONS)[number]
+
+/** The advanced card a location hash points at, if any. */
+export function nodesAdvancedSection(
+  hash: string
+): NodesAdvancedSection | null {
+  const id = hash.replace(/^#/, '')
+  return (NODES_ADVANCED_SECTIONS as readonly string[]).includes(id)
+    ? (id as NodesAdvancedSection)
+    : null
+}
+
+/** The Cluster DNS settings card (`*.temps.local` resolution). */
+export const CLUSTER_DNS_URL = `${WORKER_NODES_URL}#cluster-dns`
+
 /** Public documentation for joining a worker node (`temps join`). */
 export const WORKER_NODES_DOCS_URL = 'https://temps.sh/docs/multi-node'
 
@@ -153,6 +180,69 @@ export function unremovedNodeContainers(
   }
 }
 
+/**
+ * Seconds without a heartbeat after which the control plane treats a node as
+ * unreachable; matches `NODE_HEARTBEAT_STALE_SECS` on the server.
+ */
+export const NODE_HEARTBEAT_STALE_SECS = 90
+
+/**
+ * Whether the control plane has stopped hearing from a node: never heard
+ * from, or silent past the threshold. Decided on the heartbeat alone, like
+ * the server: a node that was draining when its agent stopped keeps its
+ * status (ADR 057).
+ */
+export function nodeIsUnreachable(
+  node: { last_heartbeat?: string | null },
+  now: number = Date.now()
+): boolean {
+  if (!node.last_heartbeat) return true
+  const heartbeat = Date.parse(node.last_heartbeat)
+  if (Number.isNaN(heartbeat)) return false
+  return now - heartbeat > NODE_HEARTBEAT_STALE_SECS * 1000
+}
+
+/** What a removal of an unreachable node would take down. */
+export interface ServingOnUnreachableNode {
+  /** Containers of live deployments recorded on the node. */
+  count: number
+  /** The environments they serve, as the API describes them. */
+  environments: string[]
+}
+
+/**
+ * The live deployments an unreachable node still serves, when the API
+ * refused its removal for that reason (409 "Unreachable Node Still Serves
+ * Deployments"). Only then does retrying with `force=true` remove it anyway,
+ * and those environments stop until they are redeployed.
+ */
+export function servingOnUnreachableNode(
+  error: unknown
+): ServingOnUnreachableNode | undefined {
+  if (!error || typeof error !== 'object') return undefined
+  type Fields = {
+    force_removes_serving?: unknown
+    serving_containers?: unknown
+    serving_environments?: unknown
+  }
+  const problem = error as Fields & { extensions?: Fields | null }
+  const field = <K extends keyof Fields>(key: K) =>
+    problem[key] ?? problem.extensions?.[key]
+  if (field('force_removes_serving') !== true) return undefined
+  const list = field('serving_environments')
+  const environments = Array.isArray(list)
+    ? list.filter((item): item is string => typeof item === 'string')
+    : []
+  const count = field('serving_containers')
+  return {
+    count:
+      typeof count === 'number' && Number.isInteger(count) && count > 0
+        ? count
+        : environments.length,
+    environments,
+  }
+}
+
 /** True when a failed request failed because no worker node can run it. */
 export function isWorkerNodeRequiredProblem(error: unknown): boolean {
   return problemErrorCode(error) === WORKER_NODE_REQUIRED_ERROR_CODE
@@ -169,4 +259,147 @@ export function sameOriginSetupPath(path: string | undefined): string {
     return WORKER_NODES_URL
   if (/[^\x21-\x7e]|\\/.test(path)) return WORKER_NODES_URL
   return path
+}
+
+/** The fields of a node the removal rule reads. */
+export interface NodeRemovalFacts {
+  id: number
+  role: string
+  status: string
+  last_heartbeat?: string | null
+  serving_containers?: number | null
+  live_sandboxes?: number | null
+}
+
+/**
+ * What the console offers for removing a node.
+ *
+ * - `none`: no removal action (the control plane's own entry, or a state such
+ *   as `pending` the server would not remove directly).
+ * - `remove`: the node can be removed in one step. For an unreachable or
+ *   offline node the server may still refuse and offer a forced removal.
+ * - `drain-first`: a reachable node still runs deployment containers; a drain
+ *   moves them (or is already moving them, when `draining`).
+ * - `sandboxes`: the node hosts sandboxes, which draining does not move; they
+ *   have to be destroyed first.
+ * - `unknown`: the server predates `serving_containers`/`live_sandboxes`, so
+ *   callers keep their previous behaviour: the node detail page decides from
+ *   the drain status, and the node list offers no action.
+ */
+export type NodeRemoval =
+  | { kind: 'none' }
+  | { kind: 'remove' }
+  | { kind: 'drain-first'; containers: number; draining: boolean }
+  | { kind: 'sandboxes'; sandboxes: number }
+  | { kind: 'unknown' }
+
+/** The control plane's id in the node list (`CONTROL_PLANE_NODE_ID`). */
+export const CONTROL_PLANE_NODE_ID = 0
+
+/**
+ * Whether, and how, a node can be removed, from what the node list reports.
+ *
+ * Mirrors what `DELETE /internal/nodes/{id}` accepts: a reachable node is
+ * removed directly once nothing serves from it and it hosts no sandboxes; an
+ * unreachable or offline node can be removed whatever it ran (a drain cannot
+ * finish without its agent, ADR 057), with the server asking before it
+ * forcibly removes containers still serving. Sandboxes block either way.
+ */
+export function nodeRemoval(
+  node: NodeRemovalFacts,
+  now: number = Date.now()
+): NodeRemoval {
+  if (node.role === 'control-plane' || node.id === CONTROL_PLANE_NODE_ID) {
+    return { kind: 'none' }
+  }
+  const serving = node.serving_containers
+  const sandboxes = node.live_sandboxes
+  if (serving == null || sandboxes == null) return { kind: 'unknown' }
+  // Sandboxes block every removal, forced or not, and a drain never moves
+  // them.
+  if (sandboxes > 0) return { kind: 'sandboxes', sandboxes }
+  if (nodeIsUnreachable(node, now) || node.status === 'offline') {
+    return { kind: 'remove' }
+  }
+  if (serving > 0) {
+    return {
+      kind: 'drain-first',
+      containers: serving,
+      draining: node.status === 'draining',
+    }
+  }
+  return node.status === 'active' ||
+    node.status === 'draining' ||
+    node.status === 'drained'
+    ? { kind: 'remove' }
+    : { kind: 'none' }
+}
+
+function plural(count: number, one: string, many: string): string {
+  return `${count} ${count === 1 ? one : many}`
+}
+
+/**
+ * Why a node cannot be removed yet, in one short line, or `null` when nothing
+ * stands in the way (or the rule has nothing to say).
+ */
+export function nodeRemovalBlocker(removal: NodeRemoval): string | null {
+  switch (removal.kind) {
+    case 'drain-first':
+      return removal.draining
+        ? `Draining — ${plural(removal.containers, 'container', 'containers')} left`
+        : `Drain first — it has ${plural(removal.containers, 'container', 'containers')}`
+    case 'sandboxes':
+      return `Hosts ${plural(removal.sandboxes, 'sandbox', 'sandboxes')} — destroy ${removal.sandboxes === 1 ? 'it' : 'them'} first (draining does not move sandboxes)`
+    default:
+      return null
+  }
+}
+
+/**
+ * A Mac worker (ADR 090), as its agent reports in the heartbeat's
+ * `capacity.host`: its containers run in a Docker app's VM on a Mac. Such a
+ * worker suits development and personal use, and goes offline whenever the
+ * Mac sleeps, then reconnects on its own.
+ */
+export interface MacWorkerHost {
+  /** The Docker app holding its containers, when reported. */
+  dockerApp: string | null
+}
+
+const DOCKER_APP_NAMES: Record<string, string> = {
+  docker_desktop: 'Docker Desktop',
+  orb_stack: 'OrbStack',
+  colima: 'colima',
+  rancher_desktop: 'Rancher Desktop',
+}
+
+/** The Mac this node runs on, or `null` for any other worker. */
+export function macWorkerHost(capacity: unknown): MacWorkerHost | null {
+  if (!capacity || typeof capacity !== 'object') return null
+  const host = (capacity as Record<string, unknown>).host
+  if (!host || typeof host !== 'object') return null
+  const { os, docker_app: app } = host as Record<string, unknown>
+  if (os !== 'macos') return null
+  return {
+    dockerApp:
+      typeof app === 'string' ? (DOCKER_APP_NAMES[app] ?? null) : null,
+  }
+}
+
+/**
+ * How a node's status reads. An offline Mac worker is most likely asleep,
+ * not broken, so it says so instead of a bare "offline".
+ */
+export function nodeStatusLabel(
+  status: string,
+  mac: MacWorkerHost | null
+): { label: string; hint: string | null } {
+  if (status === 'offline' && mac) {
+    return {
+      label: 'Asleep or offline',
+      hint: 'A Mac worker goes offline while the Mac sleeps or leaves the network, and reconnects on its own when it wakes.',
+    }
+  }
+  return { label: status, hint: null }
 }

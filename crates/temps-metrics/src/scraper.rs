@@ -22,7 +22,9 @@
 //!    in-memory `last_scalar_values` map.  Counter resets are detected when
 //!    the current raw value is less than the previous one — in that case the
 //!    raw value is used as the delta directly.
-//! 6. Calls [`MetricsStore::write_batch`].  A write failure is logged as a
+//! 6. Replaces the Postgres block counters with the windowed cache hit ratio
+//!    ([`crate::cache_hit_window`]).
+//! 7. Calls [`MetricsStore::write_batch`].  A write failure is logged as a
 //!    warning but never propagates — the scraper loop continues regardless.
 //!
 //! # Counter baseline
@@ -43,8 +45,10 @@ use tracing::{debug, error, info, warn};
 
 use temps_config::ConfigService;
 use temps_core::EncryptionService;
-use temps_entities::external_services;
+use temps_entities::{external_services, nodes};
 
+use crate::cache_hit_window::CacheHitWindows;
+use crate::collector::mariadb::MariaDbCollector;
 use crate::collector::mongodb::MongoCollector;
 use crate::collector::postgres::PostgresCollector;
 use crate::collector::redis::RedisCollector;
@@ -87,6 +91,16 @@ type ClusterPrimaries = Arc<StdMutex<HashMap<i32, String>>>;
 /// Minimum scrape interval enforced at runtime regardless of configuration.
 const MIN_INTERVAL_SECS: u64 = 10;
 
+/// The scrape interval the loop actually uses for a configured value, and
+/// whether it differs from it. Settings saved through the API are already
+/// within bounds; a value stored before the maximum existed is capped at
+/// [`temps_config::MAX_SCRAPE_INTERVAL_SECS`] so windowed metrics (the
+/// Postgres cache hit ratio) keep whole scrape intervals inside their window.
+fn effective_interval_secs(configured: u64) -> (u64, bool) {
+    let effective = configured.clamp(MIN_INTERVAL_SECS, temps_config::MAX_SCRAPE_INTERVAL_SECS);
+    (effective, effective != configured)
+}
+
 /// Timeout given to each per-service collector task.
 const COLLECTOR_TIMEOUT_SECS: u64 = 5;
 
@@ -102,6 +116,10 @@ const MAX_CONCURRENT_COLLECTORS: usize = 20;
 /// plus one unlabelled instance-wide aggregate; without it they would share a
 /// baseline and produce garbage deltas.
 type CounterBaselines = Arc<RwLock<HashMap<(i32, String, String), f64>>>;
+
+/// Trailing cache-hit windows of every Postgres series; see
+/// [`crate::cache_hit_window`]. Each critical section is one map update.
+type CacheHitState = Arc<StdMutex<CacheHitWindows>>;
 
 /// Background metrics scraper.
 ///
@@ -126,6 +144,8 @@ pub struct MetricsScraper {
     cluster_primary: Option<Arc<dyn ClusterPrimaryConnector>>,
     /// Which member supplied each cluster's counter baselines.
     cluster_primaries: ClusterPrimaries,
+    /// Windowed Postgres cache hit ratio state.
+    cache_hit: CacheHitState,
 }
 
 impl MetricsScraper {
@@ -154,6 +174,7 @@ impl MetricsScraper {
             in_flight: Arc::new(StdMutex::new(HashSet::new())),
             cluster_primary: None,
             cluster_primaries: Arc::new(StdMutex::new(HashMap::new())),
+            cache_hit: Arc::new(StdMutex::new(CacheHitWindows::default())),
         }
     }
 
@@ -175,19 +196,39 @@ impl MetricsScraper {
             // Re-read interval each cycle — live settings changes take effect
             // without a binary restart.
             let interval_secs = match self.config_service.get_settings().await {
-                Ok(settings) => settings
-                    .monitoring
-                    .scrape_interval_secs
-                    .max(MIN_INTERVAL_SECS),
+                Ok(settings) => {
+                    let configured = settings.monitoring.scrape_interval_secs;
+                    let (effective, adjusted) = effective_interval_secs(configured);
+                    if adjusted && configured > effective {
+                        warn!(
+                            configured_secs = configured,
+                            effective_secs = effective,
+                            "MetricsScraper: monitoring.scrape_interval_secs is above the \
+                             maximum; scraping every {effective}s so the Postgres cache hit \
+                             ratio (last 15 minutes) keeps whole scrapes in its window. Save \
+                             the monitoring settings with an interval of at most {effective}s \
+                             to clear this warning"
+                        );
+                    }
+                    effective
+                }
                 Err(e) => {
                     warn!("MetricsScraper: failed to read settings, using default 30s: {e}");
                     30
                 }
             };
+            lock_unpoisoned(&self.cache_hit)
+                .set_scrape_interval(chrono::Duration::seconds(interval_secs as i64));
 
+            let cycle_started = std::time::Instant::now();
             if let Err(e) = self.run_cycle().await {
                 error!("MetricsScraper: cycle failed: {e}");
             }
+            // The sleep starts after the cycle, so sources are scraped every
+            // interval plus this: the cache hit window must expect it.
+            let cycle = chrono::Duration::from_std(cycle_started.elapsed())
+                .unwrap_or_else(|_| chrono::Duration::zero());
+            lock_unpoisoned(&self.cache_hit).record_cycle(chrono::Utc::now(), cycle);
 
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
         }
@@ -213,6 +254,7 @@ impl MetricsScraper {
             // Consider only clearing entries for services that have been absent for
             // longer than one retention window, or persisting baselines to a DB table.
             self.last_scalar_values.write().await.clear();
+            lock_unpoisoned(&self.cache_hit).retain_sources(&HashSet::new());
             return Ok(());
         }
 
@@ -220,6 +262,13 @@ impl MetricsScraper {
 
         // Collect the active service ID set for stale-entry pruning after the cycle.
         let active_ids: HashSet<i32> = services.iter().map(|s| s.id).collect();
+
+        // Where each worker node publishes its services, loaded once for the
+        // whole cycle rather than once per service.
+        let (worker_addresses, node_lookup_error) =
+            self.load_worker_data_addresses(&services).await;
+        let worker_addresses = Arc::new(worker_addresses);
+        let node_lookup_error = Arc::new(node_lookup_error);
 
         // Semaphore caps concurrent collector tasks to avoid thundering-herd on
         // the DB pool and TimescaleDB chunk locks.
@@ -232,7 +281,7 @@ impl MetricsScraper {
             // Per-service deduplication: skip if a task for this service is
             // still running from a previous cycle (prevents double-delta corruption).
             {
-                let mut in_flight = self.in_flight.lock().unwrap();
+                let mut in_flight = lock_unpoisoned(&self.in_flight);
                 if !in_flight.insert(service.id) {
                     warn!(
                         service_id = service.id,
@@ -244,14 +293,27 @@ impl MetricsScraper {
             }
 
             let encryption = Arc::clone(&self.encryption_service);
+            let worker_addresses = Arc::clone(&worker_addresses);
+            let node_lookup_error = Arc::clone(&node_lookup_error);
             let cluster_primary = self.cluster_primary.clone();
             let cluster_primaries = Arc::clone(&self.cluster_primaries);
             let last_values = Arc::clone(&self.last_scalar_values);
+            let cache_hit = Arc::clone(&self.cache_hit);
             let in_flight = Arc::clone(&self.in_flight);
-            let permit = Arc::clone(&sem)
-                .acquire_owned()
-                .await
-                .expect("semaphore should never be closed");
+            // `sem` is local to this cycle and never closed; if that ever
+            // changes, end the cycle instead of panicking the scraper.
+            let permit = match Arc::clone(&sem).acquire_owned().await {
+                Ok(permit) => permit,
+                Err(e) => {
+                    lock_unpoisoned(&self.in_flight).remove(&service.id);
+                    warn!(
+                        service_id = service.id,
+                        error = %e,
+                        "MetricsScraper: concurrency semaphore closed; ending this scrape cycle"
+                    );
+                    break;
+                }
+            };
 
             join_set.spawn(async move {
                 // Permit is held for the lifetime of this task.
@@ -268,9 +330,7 @@ impl MetricsScraper {
                 }
                 impl Drop for InFlightGuard {
                     fn drop(&mut self) {
-                        if let Ok(mut g) = self.set.lock() {
-                            g.remove(&self.id);
-                        }
+                        lock_unpoisoned(&self.set).remove(&self.id);
                     }
                 }
                 let _guard = InFlightGuard {
@@ -294,16 +354,52 @@ impl MetricsScraper {
                         // than diffing them against the old primary's.
                         if primary_changed(&cluster_primaries, service_id, &member) {
                             reset_baselines(&last_values, service_id).await;
+                            lock_unpoisoned(&cache_hit).reset_source(service_id);
                         }
                         if raw_points.is_empty() {
                             return Err(());
                         }
-                        return Ok(apply_delta(&last_values, service_id, raw_points).await);
+                        return Ok(
+                            finish_points(&last_values, &cache_hit, service_id, raw_points).await,
+                        );
                     }
 
                     // Build a connection string from the encrypted service config.
-                    let connection_string = build_connection_string(&service, &encryption)
-                        .map_err(|e| {
+                    let mut params =
+                        decrypt_service_params(&service, &encryption).map_err(|e| {
+                            warn!(
+                                service_id,
+                                service_type, "MetricsScraper: cannot read service config: {e}"
+                            );
+                        })?;
+                    match worker_data_address(service.node_id, &worker_addresses) {
+                        Ok(Some(data_address)) => use_worker_host(&mut params, data_address),
+                        Ok(None) => {}
+                        Err(node_id) => {
+                            // Dialling the stored loopback host would reach
+                            // the control plane, and possibly an unrelated
+                            // service there on the same port.
+                            match node_lookup_error.as_deref() {
+                                Some(lookup_error) => warn!(
+                                    service_id,
+                                    service_type,
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id} but \
+                                     the node lookup failed ({lookup_error}); skipping scrape"
+                                ),
+                                None => warn!(
+                                    service_id,
+                                    service_type,
+                                    node_id,
+                                    "MetricsScraper: service is placed on node {node_id}, \
+                                     which has no node record; skipping scrape"
+                                ),
+                            }
+                            return Err(());
+                        }
+                    }
+                    let connection_string =
+                        build_connection_string(&service, &params).map_err(|e| {
                             warn!(
                                 service_id,
                                 service_type, "MetricsScraper: cannot build connection string: {e}"
@@ -320,6 +416,13 @@ impl MetricsScraper {
                         "postgres" => collect_with_timeout(PostgresCollector::new(), &config).await,
                         "redis" => collect_with_timeout(RedisCollector::new(), &config).await,
                         "mongodb" => collect_with_timeout(MongoCollector::new(), &config).await,
+                        "mariadb" => {
+                            let mut collector = MariaDbCollector::new();
+                            if let Some(app_user) = mariadb_app_user_connection_string(&params) {
+                                collector = collector.with_fallback_connection_string(app_user);
+                            }
+                            collect_with_timeout(collector, &config).await
+                        }
                         // RustFS is S3-compatible: reuse the same collector.
                         "s3" | "rustfs" => collect_with_timeout(S3Collector::new(), &config).await,
                         _ => {
@@ -336,9 +439,7 @@ impl MetricsScraper {
                         return Err(());
                     }
 
-                    // Apply delta computation for counter metrics.
-                    let points = apply_delta(&last_values, service_id, raw_points).await;
-                    Ok(points)
+                    Ok(finish_points(&last_values, &cache_hit, service_id, raw_points).await)
                 }
                 .await;
 
@@ -369,15 +470,94 @@ impl MetricsScraper {
             let mut guard = self.last_scalar_values.write().await;
             guard.retain(|(sid, _, _), _| active_ids.contains(sid));
         }
-        if let Ok(mut primaries) = self.cluster_primaries.lock() {
-            primaries.retain(|sid, _| active_ids.contains(sid));
-        }
+        lock_unpoisoned(&self.cluster_primaries).retain(|sid, _| active_ids.contains(sid));
+        lock_unpoisoned(&self.cache_hit).retain_sources(&active_ids);
 
         Ok(())
     }
 }
 
+impl MetricsScraper {
+    /// `data_address` of every worker node hosting one of `services`.
+    ///
+    /// A failed lookup is logged and returned alongside an empty map, so each
+    /// worker-placed service can report "lookup failed" rather than "no such
+    /// node"; those services skip this cycle while control-plane services are
+    /// still scraped.
+    async fn load_worker_data_addresses(
+        &self,
+        services: &[external_services::Model],
+    ) -> (HashMap<i32, String>, Option<String>) {
+        let node_ids: HashSet<i32> = services
+            .iter()
+            .filter_map(|s| s.node_id)
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        if node_ids.is_empty() {
+            return (HashMap::new(), None);
+        }
+        match nodes::Entity::find()
+            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(rows) => (
+                rows.into_iter()
+                    .map(|node| (node.id, node.data_address().to_string()))
+                    .collect(),
+                None,
+            ),
+            Err(e) => {
+                warn!(
+                    node_ids = ?node_ids,
+                    "MetricsScraper: failed to load worker node addresses; services on \
+                     worker nodes are skipped this cycle: {e}"
+                );
+                (HashMap::new(), Some(e.to_string()))
+            }
+        }
+    }
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Node id the control plane uses for itself. A service placed there runs
+/// beside the scraper, like one with no node at all.
+const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// The address to dial for a service on a worker node: `Ok(None)` for a
+/// service on the control plane, `Err(node_id)` when its worker is unknown.
+fn worker_data_address(
+    node_id: Option<i32>,
+    worker_addresses: &HashMap<i32, String>,
+) -> Result<Option<&str>, i32> {
+    match node_id {
+        None | Some(CONTROL_PLANE_NODE_ID) => Ok(None),
+        Some(id) => worker_addresses
+            .get(&id)
+            .map(|address| Some(address.as_str()))
+            .ok_or(id),
+    }
+}
+
+/// Point a worker-placed service's connection at its node.
+///
+/// A managed service on a worker is stored with a loopback `host`, which means
+/// "this machine" to the worker and the wrong machine to the control plane.
+/// The worker's agent publishes the service's host `port` on the node's data
+/// address (its private address, or its WireGuard mesh address when it joined
+/// with a public one — `nodes::Model::data_address`), so that is where the
+/// scraper must dial. A host the operator set explicitly is kept.
+fn use_worker_host(params: &mut ServiceParams, data_address: &str) {
+    if !temps_core::node_address::is_local_service_host(&param_str(params, "host")) {
+        return;
+    }
+    // Every connection string embeds the host in a URL authority.
+    params.insert(
+        "host".to_string(),
+        serde_json::Value::String(temps_core::node_address::url_host(data_address)),
+    );
+}
 
 /// Scrape an HA (cluster-topology) service at its current primary.
 ///
@@ -436,15 +616,24 @@ async fn scrape_cluster(
     Some((primary.member, points))
 }
 
+/// Lock a scraper bookkeeping mutex, recovering it if a panic poisoned it.
+///
+/// Every critical section on these mutexes is a single set/map operation,
+/// so a poisoned one still holds consistent data. Recovering matters: the
+/// in-flight set's drop guard could otherwise never release a service again
+/// (silently stopping its scrapes for the life of the process), and a
+/// poisoned primary map would reset every cluster's counters on every cycle.
+fn lock_unpoisoned<T>(mutex: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 /// Record `member` as `service_id`'s primary; `true` when it differs from the
 /// member that supplied the service's current counter baselines (including
 /// the first time a primary is seen).
 fn primary_changed(primaries: &ClusterPrimaries, service_id: i32, member: &str) -> bool {
-    let Ok(mut primaries) = primaries.lock() else {
-        // A poisoned lock: treat as a change, which only costs one skipped
-        // counter interval — never a false spike.
-        return true;
-    };
+    let mut primaries = lock_unpoisoned(primaries);
     match primaries.get(&service_id) {
         Some(previous) if previous == member => false,
         _ => {
@@ -503,7 +692,7 @@ async fn collect_with_timeout<C: Collector>(
 /// and lose their delta baseline. Sorting the pairs makes the key stable. An
 /// empty label set yields `""`, distinguishing instance-wide aggregates from
 /// per-label series of the same metric name.
-fn labels_key(labels: &HashMap<String, String>) -> String {
+pub(crate) fn labels_key(labels: &HashMap<String, String>) -> String {
     if labels.is_empty() {
         return String::new();
     }
@@ -514,6 +703,20 @@ fn labels_key(labels: &HashMap<String, String>) -> String {
         .map(|(k, v)| format!("{k}={v}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// Turn one service's raw collector points into what is persisted: counter
+/// deltas ([`apply_delta`]), then the Postgres block counters folded into the
+/// windowed cache hit ratio ([`CacheHitWindows::derive`]).
+async fn finish_points(
+    last_values: &CounterBaselines,
+    cache_hit: &CacheHitState,
+    source_id: i32,
+    raw_points: Vec<MetricPoint>,
+) -> Vec<MetricPoint> {
+    let points = apply_delta(last_values, source_id, raw_points).await;
+    let mut windows = lock_unpoisoned(cache_hit);
+    windows.derive(source_id, points)
 }
 
 /// Compute counter deltas and update `last_scalar_values`.
@@ -564,16 +767,14 @@ async fn apply_delta(
     out
 }
 
-/// Build a connection string for the given external service using its
-/// encrypted config blob.
-///
-/// Parses the decrypted JSON parameters and produces an appropriate URI or
-/// DSN for the service type.  Returns an error if the config cannot be
-/// decrypted or does not contain the required parameters.
-fn build_connection_string(
+/// Decrypted service parameters, as stored in `external_services.config`.
+type ServiceParams = HashMap<String, serde_json::Value>;
+
+/// Decrypt and parse the given external service's config blob.
+fn decrypt_service_params(
     service: &external_services::Model,
     encryption: &EncryptionService,
-) -> Result<String, String> {
+) -> Result<ServiceParams, String> {
     let encrypted_config = service
         .config
         .as_deref()
@@ -583,16 +784,66 @@ fn build_connection_string(
         .decrypt_string(encrypted_config)
         .map_err(|e| format!("Failed to decrypt config for service {}: {e}", service.id))?;
 
-    let params: HashMap<String, serde_json::Value> = serde_json::from_str(&config_json)
-        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))?;
+    serde_json::from_str(&config_json)
+        .map_err(|e| format!("Failed to parse config for service {}: {e}", service.id))
+}
 
-    let get_str = |key: &str| -> String {
-        params
-            .get(key)
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string()
-    };
+/// A string parameter, or `""` when it is missing or not a string.
+fn param_str(params: &ServiceParams, key: &str) -> String {
+    params
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Host and port of a MariaDB service, with the provider's defaults.
+fn mariadb_host_port(params: &ServiceParams) -> (String, String) {
+    let host = param_str(params, "host");
+    let port = param_str(params, "port");
+    (
+        if host.is_empty() {
+            "localhost".to_string()
+        } else {
+            host
+        },
+        if port.is_empty() {
+            "3306".to_string()
+        } else {
+            port
+        },
+    )
+}
+
+/// Connection string for a MariaDB service's application user — the
+/// collector's fallback when the root login is rejected. `None` when the
+/// service has no application credentials.
+fn mariadb_app_user_connection_string(params: &ServiceParams) -> Option<String> {
+    let username = param_str(params, "username");
+    let password = param_str(params, "password");
+    if username.is_empty() || password.is_empty() {
+        return None;
+    }
+    let (host, port) = mariadb_host_port(params);
+    Some(format!(
+        "mysql://{}:{}@{}:{}/",
+        urlencoded(&username),
+        urlencoded(&password),
+        host,
+        port
+    ))
+}
+
+/// Build a connection string for the given external service from its
+/// decrypted parameters.
+///
+/// Produces an appropriate URI or DSN for the service type. Returns an error
+/// if the parameters required for the service type are missing.
+fn build_connection_string(
+    service: &external_services::Model,
+    params: &ServiceParams,
+) -> Result<String, String> {
+    let get_str = |key: &str| -> String { param_str(params, key) };
 
     let host = {
         let h = get_str("host");
@@ -700,6 +951,29 @@ fn build_connection_string(
                 ))
             }
         }
+        // MariaDB: log in as root, the account Temps provisions with, so the
+        // scrape sees every schema (project databases have their own users)
+        // and the replication status. The collector falls back to the
+        // application user — see `mariadb_app_user_connection_string`.
+        "mariadb" => {
+            let root_password = get_str("root_password");
+            if root_password.is_empty() {
+                return mariadb_app_user_connection_string(params).ok_or_else(|| {
+                    format!(
+                        "Service {}: MariaDB config has neither root_password nor \
+                         username/password",
+                        service.id
+                    )
+                });
+            }
+            let (host, port) = mariadb_host_port(params);
+            Ok(format!(
+                "mysql://root:{}@{}:{}/",
+                urlencoded(&root_password),
+                host,
+                port
+            ))
+        }
         // S3 (MinIO) and RustFS both use S3-compatible APIs.
         // The S3Collector expects: region|access_key|secret_key[|endpoint_url]
         // For locally-hosted services the endpoint is http://host:port.
@@ -748,7 +1022,7 @@ fn build_connection_string(
 /// Encodes all characters that are either reserved in the URI user-info
 /// position or could break URI parsing if left bare.  Crucially, `%` itself
 /// is encoded first so that subsequent passes do not double-encode it.
-fn urlencoded(s: &str) -> String {
+pub(crate) fn urlencoded(s: &str) -> String {
     // Each byte is encoded independently so multi-byte UTF-8 sequences are
     // handled correctly (each byte gets its own %XX escape).
     let mut out = String::with_capacity(s.len() * 3);
@@ -803,6 +1077,7 @@ mod tests {
             config: None,
             node_id: None,
             topology: "cluster".to_string(),
+            workload_mode: Default::default(),
             error_message: None,
             health_status: None,
             last_health_check_at: None,
@@ -811,11 +1086,17 @@ mod tests {
             health_metadata: None,
             metrics_enabled: true,
             default_backup_provisioned: false,
-            ai_data_access: false,
             container_name: None,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -941,6 +1222,456 @@ mod tests {
         }
     }
 
+    #[test]
+    fn effective_interval_keeps_the_configured_value_within_bounds() {
+        assert_eq!(effective_interval_secs(30), (30, false));
+        assert_eq!(effective_interval_secs(1), (MIN_INTERVAL_SECS, true));
+        assert_eq!(
+            effective_interval_secs(900),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, true)
+        );
+        assert_eq!(
+            effective_interval_secs(temps_config::MAX_SCRAPE_INTERVAL_SECS),
+            (temps_config::MAX_SCRAPE_INTERVAL_SECS, false)
+        );
+    }
+
+    /// Scraping at the maximum interval, plus a slow cycle on top, must still
+    /// leave whole intervals in the cache hit window: a ratio is served.
+    #[tokio::test]
+    async fn the_maximum_scrape_interval_still_serves_a_cache_hit_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // The loop sleeps the interval after each cycle, so scrapes are the
+        // interval plus the cycle's duration apart.
+        let gap_secs = temps_config::MAX_SCRAPE_INTERVAL_SECS as i64 + 30;
+        let start = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap();
+        let mut counters = (0.0, 0.0);
+        let mut last = Vec::new();
+        for scrape in 0..6 {
+            counters.0 += 9_900.0;
+            counters.1 += 100.0;
+            let mut points = pg_blocks(0, counters.0, counters.1);
+            for p in &mut points {
+                p.time = start + chrono::Duration::seconds(scrape * gap_secs);
+            }
+            last = finish_points(&baselines, &windows, 7, points).await;
+        }
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+        assert!(served(&last, "pg.cache_blocks_accessed_15m").unwrap() >= 20_000.0);
+    }
+
+    // ── windowed Postgres cache hit ratio ──────────────────────────────────
+
+    /// One Postgres scrape's raw, lifetime `blks_hit` / `blks_read` counters
+    /// for each `(database, hit, read)`, as the collector reports them.
+    fn pg_scrape(minute: i64, databases: &[(&str, f64, f64)]) -> Vec<MetricPoint> {
+        let time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_760_000_000, 0).unwrap()
+            + chrono::Duration::minutes(minute);
+        let mut points = Vec::new();
+        for (db, hit, read) in databases {
+            for (name, value) in [
+                (crate::cache_hit_window::PG_BLKS_HIT, *hit),
+                (crate::cache_hit_window::PG_BLKS_READ, *read),
+            ] {
+                points.push(MetricPoint {
+                    time,
+                    source_kind: SourceKind::Database,
+                    source_id: 7,
+                    name: name.to_string(),
+                    value,
+                    kind: MetricKind::Counter,
+                    engine: Some("postgres".to_string()),
+                    environment: None,
+                    node_id: None,
+                    labels: HashMap::from([("datname".to_string(), db.to_string())]),
+                });
+            }
+        }
+        points
+    }
+
+    fn pg_blocks(minute: i64, hit: f64, read: f64) -> Vec<MetricPoint> {
+        pg_scrape(minute, &[("app", hit, read)])
+    }
+
+    /// [`pg_blocks`] plus the database's `stats_reset` time, as the
+    /// collector reports it.
+    fn pg_blocks_since(minute: i64, hit: f64, read: f64, stats_reset: f64) -> Vec<MetricPoint> {
+        let mut points = pg_blocks(minute, hit, read);
+        let mut reset = points[0].clone();
+        reset.name = crate::cache_hit_window::PG_STATS_RESET.to_string();
+        reset.value = stats_reset;
+        reset.kind = MetricKind::Gauge;
+        points.push(reset);
+        points
+    }
+
+    /// The instance-wide value of `name`, the one the tiles and alarm read.
+    fn served(points: &[MetricPoint], name: &str) -> Option<f64> {
+        points
+            .iter()
+            .find(|p| p.name == name && p.labels.is_empty())
+            .map(|p| p.value)
+    }
+
+    /// The scrape-to-store pipeline over minutes `minutes`, each scrape adding
+    /// `hit`/`read` blocks to the running counters. Returns the last scrape's
+    /// persisted points.
+    async fn scrape_minutes(
+        baselines: &CounterBaselines,
+        windows: &CacheHitState,
+        counters: &mut (f64, f64),
+        minutes: std::ops::Range<i64>,
+        (hit, read): (f64, f64),
+    ) -> Vec<MetricPoint> {
+        let mut last = Vec::new();
+        for minute in minutes {
+            counters.0 += hit;
+            counters.1 += read;
+            last = finish_points(
+                baselines,
+                windows,
+                7,
+                pg_blocks(minute, counters.0, counters.1),
+            )
+            .await;
+            if let Some(ratio) = served(&last, "pg.cache_hit_ratio") {
+                assert!((0.0..=1.0).contains(&ratio), "minute {minute}: {ratio}");
+            }
+        }
+        last
+    }
+
+    /// Regression for a reported case: after a bulk load the lifetime ratio
+    /// sat near 30%. The operator raised `shared_buffers` and restarted
+    /// Postgres, after which the database served 99% of block reads from
+    /// cache, but the console (and the "Low cache hit ratio" alarm) kept
+    /// reading the lifetime counters and stayed near 30%.
+    #[tokio::test]
+    async fn cache_hit_ratio_follows_the_recent_workload_across_a_stats_reset() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+
+        // Lifetime history: 30M hits, 70M reads (a 30% ratio).
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        // The first scrape only records baselines; nothing is served yet.
+        let first = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+        assert!(first.is_empty(), "{first:?}");
+
+        // The bulk load keeps missing: 30% over the window.
+        let during_load =
+            scrape_minutes(&baselines, &windows, &mut counters, 1..20, (300.0, 700.0)).await;
+        let ratio = served(&during_load, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.3).abs() < 1e-9, "{ratio}");
+
+        // Restart that resets the statistics: the counters start again from
+        // zero. The scrape after it must not see a negative delta.
+        counters = (0.0, 0.0);
+        let after_restart = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            20..21,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&after_restart, "pg.cache_hit_ratio").unwrap();
+        assert!(
+            ratio > 0.3,
+            "the reset interval counts as fresh accesses: {ratio}"
+        );
+
+        // Fifteen minutes of the tuned workload: the window holds only it.
+        let tuned = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            21..36,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&tuned, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+        assert_eq!(
+            served(&tuned, "pg.cache_blocks_accessed_15m"),
+            Some(15.0 * 10_000.0)
+        );
+        // Only the derived gauges are persisted, never the raw block counters.
+        let names: HashSet<&str> = tuned.iter().map(|p| p.name.as_str()).collect();
+        assert_eq!(tuned.len(), 4, "per-database and instance-wide gauges");
+        assert_eq!(
+            names,
+            HashSet::from(["pg.cache_hit_ratio", "pg.cache_blocks_accessed_15m"])
+        );
+    }
+
+    /// Dropping a database takes its row out of `pg_stat_database`, so a
+    /// counter summed over databases goes backwards. The instance-wide window
+    /// must not read that as a reset and fill up with the remaining
+    /// databases' lifetime totals.
+    #[tokio::test]
+    async fn dropping_a_database_does_not_inject_lifetime_history() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // Lifetime: the app database 30M hits / 70M reads, a scratch
+        // database with a large history of reads.
+        let (mut app, mut scratch) = ((30_000_000.0, 70_000_000.0), (1_000.0, 5_000_000.0));
+        for minute in 0..16 {
+            app.0 += 9_900.0;
+            app.1 += 100.0;
+            scratch.1 += 10.0;
+            finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_scrape(
+                    minute,
+                    &[("app", app.0, app.1), ("scratch", scratch.0, scratch.1)],
+                ),
+            )
+            .await;
+        }
+
+        // The scratch database is dropped.
+        app.0 += 9_900.0;
+        app.1 += 100.0;
+        let after_drop = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_scrape(16, &[("app", app.0, app.1)]),
+        )
+        .await;
+
+        let ratio = served(&after_drop, "pg.cache_hit_ratio").unwrap();
+        assert!(ratio > 0.98, "the live workload still dominates: {ratio}");
+        let accessed = served(&after_drop, "pg.cache_blocks_accessed_15m").unwrap();
+        assert!(
+            accessed < 200_000.0,
+            "no lifetime totals in the window: {accessed}"
+        );
+    }
+
+    /// `pg_stat_reset()` between two scrapes: hits fall below their old
+    /// value but reads, already past theirs, look as if they kept growing.
+    /// The interval mixing both sides of the reset must not count.
+    #[tokio::test]
+    async fn a_stats_reset_that_only_one_counter_shows_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let scrape = |minute, hit, read, reset| {
+            finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, hit, read, reset),
+            )
+        };
+        scrape(0, 1_000_000.0, 5_000.0, 0.0).await;
+        scrape(1, 2_000_000.0, 9_000.0, 0.0).await;
+        // Reset, then 9,900 hits and 10,100 reads before the next scrape.
+        // Hits fall below their old value, so the delta step sees that reset;
+        // reads (10,100) are above theirs (9,000), so it reports a delta of
+        // 1,100 and only `stats_reset` reveals the reset.
+        scrape(2, 9_900.0, 10_100.0, 600.0).await;
+        let mut last = Vec::new();
+        for minute in 3..=16 {
+            let since = (minute - 2) as f64 * 10_000.0;
+            last = scrape(minute, 9_900.0 + since, 10_100.0 + since, 600.0).await;
+        }
+
+        // At minute 16 the window holds minutes 2 to 16. Minute 2's skewed
+        // 9,900 / 1,100 is left out; minutes 3 to 16 are 10,000 / 10,000 each,
+        // 280,000 accesses over 14 minutes, reported for the whole 15.
+        assert_eq!(served(&last, "pg.cache_hit_ratio"), Some(0.5));
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed_15m"),
+            Some(300_000.0)
+        );
+        assert!(
+            last.iter().all(|p| p.name != "pg.stats_reset"),
+            "never persisted"
+        );
+    }
+
+    /// The same reset right after the scrape that set the baselines (a Temps
+    /// restart, a failover, a new database): that scrape only records the
+    /// reset time, and the next interval is still recognised as mixed. No
+    /// scrape ever serves a ratio that counts it.
+    #[tokio::test]
+    async fn a_stats_reset_right_after_the_baseline_scrape_does_not_skew_the_ratio() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let first = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks_since(0, 1_000_000.0, 10_000.0, 0.0),
+        )
+        .await;
+        assert!(first.is_empty(), "baselines only: {first:?}");
+        // Reset, then 9,900 hits and 10,100 reads; 10,000 / 10,000 a minute
+        // from then on.
+        let mut served_ratios = Vec::new();
+        for minute in 1..=17 {
+            let since = (minute - 1) as f64 * 10_000.0;
+            let out = finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, 9_900.0 + since, 10_100.0 + since, 600.0),
+            )
+            .await;
+            served_ratios.extend(served(&out, "pg.cache_hit_ratio"));
+        }
+        assert!(!served_ratios.is_empty());
+        assert!(
+            served_ratios.iter().all(|ratio| *ratio == 0.5),
+            "{served_ratios:?}"
+        );
+    }
+
+    /// After a Temps restart the windows refill from empty. Their first
+    /// minutes are not 15 minutes of traffic: nothing is served until the
+    /// window is whole, so the store's latest values stay those of the last
+    /// whole window.
+    #[tokio::test]
+    async fn a_restart_serves_nothing_until_the_window_is_whole() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        // 200 block accesses per second at a 70% hit ratio.
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        let mut last = Vec::new();
+        for minute in 0..=15 {
+            counters.0 += 8_400.0;
+            counters.1 += 3_600.0;
+            last = finish_points(
+                &baselines,
+                &windows,
+                7,
+                pg_blocks_since(minute, counters.0, counters.1, 0.0),
+            )
+            .await;
+            if minute < 15 {
+                assert_eq!(served(&last, "pg.cache_hit_ratio"), None, "{minute}");
+                assert_eq!(
+                    served(&last, "pg.cache_blocks_accessed_15m"),
+                    None,
+                    "{minute}"
+                );
+            }
+        }
+        let ratio = served(&last, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.7).abs() < 1e-9, "{ratio}");
+        assert_eq!(
+            served(&last, "pg.cache_blocks_accessed_15m"),
+            Some(15.0 * 12_000.0)
+        );
+    }
+
+    /// Failed scrapes keep the counter baselines, so the first good scrape
+    /// after an outage carries the whole outage's block accesses. They must
+    /// not be served as the last 15 minutes.
+    #[tokio::test]
+    async fn a_scrape_outage_is_not_served_as_the_last_15_minutes() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+        scrape_minutes(&baselines, &windows, &mut counters, 1..5, (9_900.0, 100.0)).await;
+
+        // Minutes 5..45: every scrape fails (nothing reaches finish_points)
+        // while a cold bulk load runs.
+        counters.0 += 40.0 * 300.0;
+        counters.1 += 40.0 * 700.0;
+        let after_outage = finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(45, counters.0, counters.1),
+        )
+        .await;
+        assert_eq!(served(&after_outage, "pg.cache_hit_ratio"), None);
+        assert_eq!(served(&after_outage, "pg.cache_blocks_accessed_15m"), None);
+
+        // The window refills from minute 45 and serves again once whole.
+        let refilling = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            46..47,
+            (9_900.0, 100.0),
+        )
+        .await;
+        assert_eq!(served(&refilling, "pg.cache_hit_ratio"), None);
+        let next = scrape_minutes(
+            &baselines,
+            &windows,
+            &mut counters,
+            47..61,
+            (9_900.0, 100.0),
+        )
+        .await;
+        let ratio = served(&next, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+    }
+
+    /// PostgreSQL 15+ keeps its statistics across a clean restart, so the
+    /// lifetime counters never reset and their ratio barely moves. The window
+    /// must follow the workload anyway.
+    #[tokio::test]
+    async fn cache_hit_ratio_follows_the_recent_workload_without_a_stats_reset() {
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+        let windows: CacheHitState = Arc::new(StdMutex::new(CacheHitWindows::default()));
+        let mut counters = (30_000_000.0, 70_000_000.0);
+        finish_points(
+            &baselines,
+            &windows,
+            7,
+            pg_blocks(0, counters.0, counters.1),
+        )
+        .await;
+
+        let tuned =
+            scrape_minutes(&baselines, &windows, &mut counters, 1..30, (9_900.0, 100.0)).await;
+
+        let lifetime = counters.0 / (counters.0 + counters.1);
+        assert!(lifetime < 0.31, "lifetime ratio stays near 30%: {lifetime}");
+        let ratio = served(&tuned, "pg.cache_hit_ratio").unwrap();
+        assert!((ratio - 0.99).abs() < 1e-9, "{ratio}");
+    }
+
+    /// A poisoned primary map must not report "changed" forever (which
+    /// would reset the cluster's counter baselines on every cycle).
+    #[test]
+    fn poisoned_primary_map_still_tracks_the_primary() {
+        let primaries: ClusterPrimaries = Arc::new(StdMutex::new(HashMap::new()));
+        let poisoner = Arc::clone(&primaries);
+        let _ = std::thread::spawn(move || {
+            let _guard = poisoner.lock().unwrap();
+            panic!("poison the primary map");
+        })
+        .join();
+        assert!(primaries.is_poisoned());
+
+        assert!(primary_changed(&primaries, 7, "ha-pg-1"));
+        assert!(!primary_changed(&primaries, 7, "ha-pg-1"));
+    }
+
     /// Regression: after a failover the new primary's independent counters
     /// were diffed against the old primary's baseline. 100,000 commits on the
     /// old primary then 20,000 on the new one recorded 20,000 commits in one
@@ -1016,13 +1747,188 @@ mod tests {
 
     // ── build_connection_string ────────────────────────────────────────────
 
-    // We can't test build_connection_string directly with a real EncryptionService
-    // in unit tests because it requires a real encryption key. Instead, we test
-    // the urlencoded helper and apply_delta logic directly.
-
     #[test]
     fn urlencoded_slash() {
         assert_eq!(urlencoded("a/b"), "a%2Fb");
+    }
+
+    fn params(pairs: &[(&str, &str)]) -> ServiceParams {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::Value::String(v.to_string())))
+            .collect()
+    }
+
+    /// Regression: a MariaDB service had no connection string builder, so
+    /// metrics for it could never be collected.
+    #[test]
+    fn mariadb_connects_as_root_with_the_app_user_as_fallback() {
+        let service = cluster_service(5, "mariadb");
+        let p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("database", "appdb"),
+            ("username", "app"),
+            ("password", "app:p@ss"),
+            ("root_password", "r00t/pw#"),
+        ]);
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:r00t%2Fpw%23@localhost:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app%3Ap%40ss@localhost:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn mariadb_without_root_password_connects_as_the_app_user() {
+        let service = cluster_service(6, "MariaDB");
+        let p = params(&[("username", "app"), ("password", "secret12")]);
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://app:secret12@localhost:3306/".to_string())
+        );
+
+        let err = build_connection_string(&service, &params(&[]))
+            .expect_err("no credentials at all cannot be scraped");
+        assert!(err.contains("Service 6"), "error names the service: {err}");
+    }
+
+    /// Regression: a service placed on a worker node is stored with host
+    /// `localhost`, so the scraper dialled the control plane and never
+    /// reached it. It must dial the worker's data address, where the agent
+    /// publishes the service's host port.
+    #[test]
+    fn worker_placed_mariadb_is_dialled_at_its_node_data_address() {
+        let mut service = cluster_service(12, "mariadb");
+        service.node_id = Some(4);
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        let mut p = params(&[
+            ("host", "localhost"),
+            ("port", "33061"),
+            ("username", "app"),
+            ("password", "app-secret"),
+            ("root_password", "rootpw12"),
+        ]);
+
+        let address = worker_data_address(service.node_id, &workers).expect("node 4 is known");
+        use_worker_host(&mut p, address.expect("node 4 is a worker"));
+
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("mysql://root:rootpw12@10.100.0.7:33061/".to_string())
+        );
+        assert_eq!(
+            mariadb_app_user_connection_string(&p),
+            Some("mysql://app:app-secret@10.100.0.7:33061/".to_string())
+        );
+    }
+
+    #[test]
+    fn worker_host_applies_to_every_engine() {
+        let mut service = cluster_service(13, "postgres");
+        service.node_id = Some(4);
+        let mut p = params(&[
+            ("host", "127.0.0.1"),
+            ("port", "25432"),
+            ("username", "postgres"),
+            ("password", "pw"),
+            ("database", "app"),
+        ]);
+        use_worker_host(&mut p, "10.100.0.7");
+        assert_eq!(
+            build_connection_string(&service, &p),
+            Ok("postgresql://postgres:pw@10.100.0.7:25432/app".to_string())
+        );
+    }
+
+    #[test]
+    fn control_plane_services_keep_their_stored_host() {
+        let workers = HashMap::from([(4, "10.100.0.7".to_string())]);
+        assert_eq!(worker_data_address(None, &workers), Ok(None));
+        assert_eq!(
+            worker_data_address(Some(CONTROL_PLANE_NODE_ID), &workers),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn unknown_worker_node_is_reported_not_dialled_locally() {
+        assert_eq!(worker_data_address(Some(9), &HashMap::new()), Err(9));
+    }
+
+    #[test]
+    fn worker_host_keeps_an_explicit_host_and_brackets_ipv6() {
+        let mut explicit = params(&[("host", "db.internal")]);
+        use_worker_host(&mut explicit, "10.100.0.7");
+        assert_eq!(param_str(&explicit, "host"), "db.internal");
+
+        for loopback in ["", "localhost", "127.0.0.1", "::1", "0.0.0.0"] {
+            let mut p = params(&[("host", loopback)]);
+            use_worker_host(&mut p, "fd00::7");
+            assert_eq!(
+                param_str(&p, "host"),
+                "[fd00::7]",
+                "stored host {loopback:?}"
+            );
+        }
+    }
+
+    /// The MariaDB collector reports raw cumulative status counters; the
+    /// scraper must turn them into per-interval deltas (queries per interval,
+    /// not queries since the server started).
+    #[tokio::test]
+    async fn mariadb_status_counters_become_per_interval_deltas() {
+        use crate::collector::mariadb::{build_points, parse_name_value_rows, MariaDbSnapshot};
+
+        let config = CollectorConfig::new(11, SourceKind::Database, "unused");
+        let snapshot = |questions: &str, connected: &str| MariaDbSnapshot {
+            status: parse_name_value_rows([
+                ("Questions".to_string(), questions.to_string()),
+                ("Threads_connected".to_string(), connected.to_string()),
+            ]),
+            ..Default::default()
+        };
+        let baselines: CounterBaselines = Arc::new(RwLock::new(HashMap::new()));
+
+        let first = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1000", "4"), &config),
+        )
+        .await;
+        assert!(
+            first.iter().all(|p| p.name != "mariadb.queries_total"),
+            "the first scrape only records the counter baseline"
+        );
+        assert!(first.iter().any(|p| p.name == "mariadb.connections"));
+
+        let second = apply_delta(
+            &baselines,
+            11,
+            build_points(&snapshot("1250", "5"), &config),
+        )
+        .await;
+        let value = |name: &str| second.iter().find(|p| p.name == name).map(|p| p.value);
+        assert_eq!(value("mariadb.queries_total"), Some(250.0));
+        assert_eq!(
+            value("mariadb.connections"),
+            Some(5.0),
+            "gauges pass through"
+        );
+
+        // Server restart: counters start over.
+        let third = apply_delta(&baselines, 11, build_points(&snapshot("30", "1"), &config)).await;
+        assert_eq!(
+            third
+                .iter()
+                .find(|p| p.name == "mariadb.queries_total")
+                .map(|p| p.value),
+            Some(30.0)
+        );
     }
 
     #[tokio::test]

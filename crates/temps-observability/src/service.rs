@@ -691,6 +691,10 @@ mod tests {
             visitor_id: None,
             trace_id: Some("4bf92f3577b34da6a3ce929d0e0e4736".into()),
             error_group_id: Some(99),
+            shield_verdict: None,
+            shield_reasons: None,
+            ja4: None,
+            ja4_source: None,
         }
     }
 
@@ -724,6 +728,7 @@ mod tests {
         let mut attributes = BTreeMap::new();
         attributes.insert("http.method".to_string(), "GET".to_string());
         let record = SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: Some(3),
             resource: temps_otel::types::ResourceInfo {

@@ -10,7 +10,10 @@ import {
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
   silenceAlarmMutation,
+  unsilenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { bulkUpdateProjectAlarms } from '@/api/client'
 import type {
   AlarmResponse,
@@ -27,14 +30,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ReadFailure } from '@/components/ui/read-failure'
 import { Card, CardContent } from '@/components/ui/card'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
@@ -94,6 +100,7 @@ import {
   toggleRow,
   togglePage,
 } from './alarmBulkSelection'
+import { scrollElementIntoView } from '@/lib/scroll-to-element'
 
 const SILENCE_OPTIONS = [
   { label: '1 hour', hours: 1 },
@@ -153,7 +160,7 @@ function severityBadge(severity: string) {
       return <Badge variant="destructive">Critical</Badge>
     case 'warning':
       return (
-        <Badge className="border-transparent bg-amber-500/15 text-amber-700 hover:bg-amber-500/25 dark:text-amber-400">
+        <Badge className="border-transparent bg-amber-500/15 text-amber-800 hover:bg-amber-500/25 dark:text-amber-400">
           Warning
         </Badge>
       )
@@ -182,8 +189,12 @@ function statusBadge(status: string) {
   }
 }
 
+// A silence only mutes an alarm that is still open: once it is resolved the
+// backend lets the next breach alarm again, so don't advertise a mute that no
+// longer applies.
 function isSilenced(alarm: AlarmResponse): boolean {
   return (
+    alarm.status !== 'resolved' &&
     !!alarm.silenced_until &&
     new Date(alarm.silenced_until).getTime() > Date.now()
   )
@@ -276,7 +287,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   usePageTitle('Alarms')
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Monitoring & Alerts' }, { label: 'Alarms' }])
+    setBreadcrumbs([{ label: 'Monitoring & alerts' }, { label: 'Alarms' }])
   }, [setBreadcrumbs])
 
   // Deep-link support (e.g. from an alert rule's per-series "View" link):
@@ -306,9 +317,13 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   const [confirmAction, setConfirmAction] =
     useState<BulkAlarmActionRequest | null>(null)
 
-  const { data: projectsData, isLoading: projectsLoading } = useQuery(
-    getProjectsOptions({ query: { per_page: 100 } })
-  )
+  const {
+    data: projectsData,
+    isLoading: projectsLoading,
+    error: projectsError,
+    refetch: refetchProjects,
+    isFetching: projectsFetching,
+  } = useQuery(getProjectsOptions({ query: { per_page: 100 } }))
   const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
   const effectiveProjectId = selectedProjectId ?? projects[0]?.id ?? null
   const effectiveProject = projects.find(
@@ -405,8 +420,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success('Alarm acknowledged')
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error(`Failed to acknowledge: ${err.message}`),
+    onError: (err) =>
+      toast.error(`Failed to acknowledge: ${getErrorMessage(err)}`),
   })
 
   const resolve = useMutation({
@@ -415,7 +430,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success('Alarm resolved')
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to resolve: ${err.message}`),
+    onError: (err) => toast.error(`Failed to resolve: ${getErrorMessage(err)}`),
   })
 
   const silence = useMutation({
@@ -427,7 +442,17 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
       toast.success(`Alarm silenced for ${label}`)
       invalidate()
     },
-    onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
+    onError: (err) => toast.error(`Failed to silence: ${getErrorMessage(err)}`),
+  })
+
+  const unsilence = useMutation({
+    ...unsilenceAlarmMutation(),
+    onSuccess: () => {
+      toast.success('Alarm silence lifted')
+      invalidate()
+    },
+    onError: (err) =>
+      toast.error(`Failed to unsilence: ${getErrorMessage(err)}`),
   })
 
   const bulk = useMutation({
@@ -538,6 +563,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     acknowledge.isPending ||
     resolve.isPending ||
     silence.isPending ||
+    unsilence.isPending ||
     bulk.isPending
   const hasSelection = selectionCount(selection) !== 0
   const pageSelectable = selectableIds(items).length > 0
@@ -547,7 +573,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
   useEffect(() => {
     if (deepLinkAlarmId == null || items.length === 0) return
     const el = document.querySelector(`[data-alarm-id="${deepLinkAlarmId}"]`)
-    if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    if (el) scrollElementIntoView(el, { behavior: 'smooth', block: 'center' })
   }, [deepLinkAlarmId, items])
 
   const resetFilters = () => {
@@ -576,44 +602,56 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     },
   ]
 
+  const projectPicker = (
+    <Select
+      value={
+        effectiveProjectId != null ? String(effectiveProjectId) : undefined
+      }
+      onValueChange={(v) => selectProject(Number(v))}
+      disabled={projectsLoading || projects.length === 0 || bulk.isPending}
+    >
+      <SelectTrigger className="w-full sm:w-[240px]">
+        <SelectValue placeholder="Select a service…" />
+      </SelectTrigger>
+      <SelectContent>
+        {projects.map((p) => (
+          <SelectItem key={p.id} value={String(p.id)}>
+            {p.name}
+          </SelectItem>
+        ))}
+      </SelectContent>
+    </Select>
+  )
+
+  const refresh = hasProject ? (
+    <RefreshButton
+      queryKeys={[
+        getProjectAlarmsSummaryQueryKey({ path: projectPath }),
+        queryKeyPrefix(listProjectAlarmsQueryKey, { path: projectPath }),
+      ]}
+    />
+  ) : null
+
   return (
     <div className="space-y-4">
       {/* Header */}
-      <div
-        className={cn(
-          'flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between',
-          embedded && 'justify-end sm:justify-end'
-        )}
-      >
-        {!embedded && (
-          <div className="flex flex-col gap-1">
-            <h1 className="text-2xl font-semibold tracking-tight">Alarms</h1>
-            <p className="text-sm text-muted-foreground">
-              Firing history across metrics, containers, uptime, and databases —
-              acknowledge or resolve from one place, one at a time or in bulk by
-              selecting rows.
-            </p>
-          </div>
-        )}
-        <Select
-          value={
-            effectiveProjectId != null ? String(effectiveProjectId) : undefined
+      {embedded ? (
+        <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+          {refresh}
+          {projectPicker}
+        </div>
+      ) : (
+        <PageHeader
+          title="Alarms"
+          description="Firing history across metrics, containers, uptime, and databases — acknowledge or resolve from one place, one at a time or in bulk by selecting rows."
+          actions={
+            <>
+              {refresh}
+              {projectPicker}
+            </>
           }
-          onValueChange={(v) => selectProject(Number(v))}
-          disabled={projectsLoading || projects.length === 0 || bulk.isPending}
-        >
-          <SelectTrigger className="w-full sm:w-[240px]">
-            <SelectValue placeholder="Select a project…" />
-          </SelectTrigger>
-          <SelectContent>
-            {projects.map((p) => (
-              <SelectItem key={p.id} value={String(p.id)}>
-                {p.name}
-              </SelectItem>
-            ))}
-          </SelectContent>
-        </Select>
-      </div>
+        />
+      )}
 
       {/* Summary cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-5">
@@ -772,7 +810,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
           </div>
         )}
         <div className="overflow-x-auto">
-          <Table>
+          <Table className="min-w-[760px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="w-[40px]">
@@ -799,12 +837,28 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
               {!hasProject && !projectsLoading ? (
                 <TableRow className="hover:bg-transparent">
                   <TableCell colSpan={7} className="p-0">
-                    <EmptyState
-                      size="compact"
-                      icon={AlarmClock}
-                      title="No project selected"
-                      description="Select a project to view its alarm history."
-                    />
+                    {projectsError ? (
+                      <div className="p-4">
+                        <ReadFailure
+                          resource="Services"
+                          error={projectsError}
+                          onRetry={() => void refetchProjects()}
+                          retrying={projectsFetching}
+                        />
+                      </div>
+                    ) : (
+                      <EmptyState
+                        size="compact"
+                        icon={AlarmClock}
+                        title="No services yet"
+                        description="Alarms are raised per service. Deploy a service and its alarm history appears here."
+                        action={
+                          <Button asChild>
+                            <Link to="/projects/new">Deploy a service</Link>
+                          </Button>
+                        }
+                      />
+                    )}
                   </TableCell>
                 </TableRow>
               ) : alarmsLoading || (projectsLoading && !hasProject) ? (
@@ -843,7 +897,7 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                       description={
                         hasFilters
                           ? 'Try adjusting your filters to see more results.'
-                          : 'Nothing has fired for this project yet.'
+                          : 'Nothing has fired for this service yet.'
                       }
                     />
                   </TableCell>
@@ -991,6 +1045,23 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                                   {opt.label}
                                 </DropdownMenuItem>
                               ))}
+                              {isSilenced(alarm) && (
+                                <>
+                                  <DropdownMenuSeparator />
+                                  <DropdownMenuItem
+                                    onClick={() =>
+                                      unsilence.mutate({
+                                        path: {
+                                          project_id: effectiveProjectId ?? 0,
+                                          alarm_id: alarm.id,
+                                        },
+                                      })
+                                    }
+                                  >
+                                    Unsilence now
+                                  </DropdownMenuItem>
+                                </>
+                              )}
                             </DropdownMenuContent>
                           </DropdownMenu>
                         )}
@@ -1054,8 +1125,8 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
             </AlertDialogTitle>
             <AlertDialogDescription>
               {confirmAction === 'acknowledge'
-                ? 'Every firing alarm in this project that matches the current filters — including ones on other pages — will be marked acknowledged.'
-                : 'Every firing or acknowledged alarm in this project that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
+                ? 'Every firing alarm in this service that matches the current filters — including ones on other pages — will be marked acknowledged.'
+                : 'Every firing or acknowledged alarm in this service that matches the current filters — including ones on other pages — will be marked resolved. An alarm fires again if its condition recurs.'}
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>

@@ -58,6 +58,8 @@ impl Default for CookieConfig {
 
 /// Result of resolving an upstream peer, including optional container metadata
 pub struct PeerSelection {
+    pub in_flight: Option<temps_routes::replica_policy::InFlightGuard>,
+
     pub peer: Box<HttpPeer>,
     pub container_id: Option<String>,
     pub container_name: Option<String>,
@@ -91,6 +93,22 @@ pub trait UpstreamResolver: Send + Sync {
     ) -> PingoraResult<PeerSelection> {
         let _ = method;
         self.resolve_peer(host, path, sni_hostname).await
+    }
+
+    /// Resolve the retry of a failed connect, skipping the backends in `avoid`
+    /// when the host has others. A resolver with one backend per host has nothing
+    /// to skip, so this defaults to resolving as usual.
+    async fn resolve_peer_avoiding(
+        &self,
+        host: &str,
+        path: &str,
+        method: &str,
+        sni_hostname: Option<&str>,
+        avoid: &[String],
+    ) -> PingoraResult<PeerSelection> {
+        let _ = avoid;
+        self.resolve_peer_for_request(host, path, method, sni_hostname)
+            .await
     }
 
     /// Check if a host has custom routing configured
@@ -138,6 +156,14 @@ pub trait UpstreamResolver: Send + Sync {
     fn is_public_ingress_host(&self, _host: &str) -> bool {
         false
     }
+
+    /// The status-page binding for `host` when it is a status page's custom
+    /// hostname (#1412). Such a host may only ever reach the two status-page
+    /// routes on the public-only listener. Must not block: it runs for every
+    /// request.
+    fn status_page_host(&self, _host: &str) -> Option<temps_routes::StatusPageHostRoute> {
+        None
+    }
 }
 
 /// Trait for resolving project context from request information
@@ -154,6 +180,12 @@ pub trait ProjectContextResolver: Send + Sync {
 
     /// Get static file path for a host (if it serves static files)
     async fn get_static_path(&self, host: &str) -> Option<String>;
+
+    /// The path route (ADR 050) that hands `path` on `host` to another
+    /// service, if any. Must be an in-memory lookup: it runs per request.
+    fn match_path_route(&self, _host: &str, _path: &str) -> Option<temps_routes::PathRoute> {
+        None
+    }
 }
 
 /// First-visit attribution data for a new visitor

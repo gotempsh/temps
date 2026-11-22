@@ -6,6 +6,13 @@
 //! The same policy is applied when artifacts are ingested and immediately before
 //! the proxy resolves a request. This prevents an accidentally packaged secret
 //! from becoming public even when one of those boundaries is bypassed.
+//!
+//! The two boundaries react differently to a [`StaticPathPolicyError::Sensitive`]
+//! path, on purpose. Ingestion **skips** the entry (it is never copied or
+//! uploaded, so a harmless marker such as `.nojekyll` cannot abort an otherwise
+//! valid deployment), while the proxy **rejects** a request for it. Every other
+//! [`StaticPathPolicyError`] describes a structurally invalid path and must stay
+//! a hard failure at both boundaries.
 
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
@@ -55,6 +62,11 @@ impl fmt::Display for StaticPathPolicyError {
 impl std::error::Error for StaticPathPolicyError {}
 
 /// Validate a relative file path before it enters a static deployment.
+///
+/// Callers that walk a source tree should treat
+/// [`StaticPathPolicyError::Sensitive`] as "do not publish this entry" and
+/// continue, and every other error as a corrupt or malicious tree that aborts
+/// the deployment.
 pub fn validate_static_artifact_path(path: &Path) -> Result<(), StaticPathPolicyError> {
     validate_clean_relative_path(path, false)?;
     if is_sensitive_static_path(path) {
@@ -370,6 +382,50 @@ mod tests {
                 normalize_static_request_path(path),
                 Err(StaticPathPolicyError::Sensitive),
                 "{path} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn site_generator_marker_files_stay_unservable_at_the_request_boundary() {
+        // Ingestion skips these instead of failing the deployment, so the
+        // serving side must keep refusing them even if one is ever present.
+        for path in [
+            "/.nojekyll",
+            "/%2enojekyll",
+            "/%252enojekyll",
+            "/docs/.nojekyll",
+            "/.DS_Store",
+        ] {
+            assert_eq!(
+                normalize_static_request_path(path),
+                Err(StaticPathPolicyError::Sensitive),
+                "{path} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_policy_reports_dotfile_markers_as_sensitive_not_structural() {
+        // Ingestion relies on this distinction: `Sensitive` entries are
+        // skipped, every other error aborts the deployment.
+        for path in [".nojekyll", ".DS_Store", "docs/.nojekyll", ".git/config"] {
+            assert_eq!(
+                validate_static_artifact_path(Path::new(path)),
+                Err(StaticPathPolicyError::Sensitive),
+                "{path} must be classified as sensitive"
+            );
+        }
+        for (path, expected) in [
+            ("", StaticPathPolicyError::Empty),
+            ("/etc/passwd", StaticPathPolicyError::Absolute),
+            ("../outside", StaticPathPolicyError::NotClean),
+            ("./app.js", StaticPathPolicyError::NotClean),
+        ] {
+            assert_eq!(
+                validate_static_artifact_path(Path::new(path)),
+                Err(expected),
+                "{path:?} must be classified as structurally invalid"
             );
         }
     }

@@ -29,8 +29,15 @@ describe('harnessUpgradeCommands', () => {
     const codex = harnessUpgradeCommands('sbx_0123456789abcdef')[1]
 
     expect(codex.cliCommand).toBe(
-      `bunx @temps-sdk/cli sandbox exec sbx_0123456789abcdef -- sh -lc 'BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest && codex --version'`
+      `bunx @temps-sdk/cli sandbox exec sbx_0123456789abcdef -- sh -lc 'case "$(command -v codex)" in "$HOME"/.bun/*) BUN_INSTALL="$HOME/.bun" BUN_INSTALL_BIN="$HOME/.bun/bin" bun add -g @openai/codex@latest;; *) npm install -g @openai/codex@latest;; esac && codex --version'`
     )
+  })
+
+  test('upgrades Codex with npm unless it was installed by bun', () => {
+    const { command } = harnessUpgradeCommands('sbx_0123456789abcdef')[1]
+
+    expect(command).toContain('*) npm install -g @openai/codex@latest;;')
+    expect(command).toContain('"$HOME"/.bun/*) BUN_INSTALL="$HOME/.bun"')
   })
 
   test('builds the existing reattachable CLI shell command', () => {

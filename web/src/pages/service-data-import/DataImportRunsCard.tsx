@@ -30,7 +30,7 @@ import {
 } from '@/components/ui/table'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { DatabaseZap, Loader2, XCircle } from 'lucide-react'
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -227,7 +227,7 @@ function RunsBody({
           <TableBody>
             {runs.map((run) => (
               <Fragment key={run.id}>
-                <TableRow>
+                <RecordRow>
                   <TableCell className="font-mono text-sm">
                     <RecordLink
                       to={importRunPath(serviceId, run.id)}
@@ -267,11 +267,11 @@ function RunsBody({
                         onClick={() => onCancel(run.id)}
                       >
                         <XCircle className="h-4 w-4 sm:mr-2" />
-                        <span className="hidden sm:inline">Cancel</span>
+                        <span className="max-sm:sr-only">Cancel</span>
                       </Button>
                     )}
                   </TableCell>
-                </TableRow>
+                </RecordRow>
                 {run.error_message && (
                   <TableRow className="hover:bg-transparent">
                     <TableCell colSpan={6} className="pt-0">

@@ -42,6 +42,7 @@
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD as BASE64URL, Engine};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use temps_core::crypto::constant_time_eq;
 use temps_core::DBDateTime;
 
 use crate::services::cloud_bulk_activation::BulkJobProjectPlan;
@@ -392,19 +393,6 @@ fn sign(key: &[u8; 32], payload: &[u8]) -> Option<String> {
     Some(hex::encode(mac.finalize().into_bytes()))
 }
 
-/// Length-independent comparison, so a signature cannot be recovered a byte at
-/// a time from response timing.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut differences = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        differences |= x ^ y;
-    }
-    differences == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -582,12 +570,5 @@ mod tests {
             PLAN_TOKEN_KEY_DOMAIN,
             "temps-otel-cloud-bulk-activation-plan"
         );
-    }
-
-    #[test]
-    fn constant_time_equality_matches_ordinary_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abx"));
-        assert!(!constant_time_eq(b"abc", b"ab"));
     }
 }

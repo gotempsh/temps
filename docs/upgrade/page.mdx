@@ -9,9 +9,24 @@ export const metadata = {
 
 # Upgrading Temps
 
-An upgrade replaces the `temps` binary and then applies the new release's database migrations. Migrations run automatically the next time `temps serve` starts (or explicitly with `temps migrate`). Before they run, Temps backs up the database so the upgrade can be rolled back, and it refuses to run an older binary against a database that a newer release has already migrated. {{ className: 'lead' }}
+An upgrade replaces the `temps` binary and then applies the new release's database migrations. Migrations run automatically the next time `temps serve` starts (or explicitly with `temps migrate`). Before they run, Temps can back up the database so the upgrade can be rolled back, and it warns when an older binary is started against a database that a newer release has already migrated. {{ className: 'lead' }}
 
 ---
+
+## Response branding is now opt-in
+
+After upgrading, Temps no longer adds identifying headers or branding to its
+proxy responses by default, including on existing installations. To restore
+branded responses, enable **Settings → Security → Show Temps branding in
+responses** (`expose_platform_identity: true`). The switch defaults to off.
+The branding setting does not otherwise remove application headers: existing
+proxy policies can still replace security headers and `X-Request-ID`, and
+reserved proxy marker headers are removed from upstream responses. A request ID
+remains available for troubleshooting in either mode.
+
+Challenge solver assets use neutral paths and module names, but retain required
+copyright and license notices. The setting removes routine response branding;
+it does not guarantee that the platform cannot be identified.
 
 ## Before you upgrade
 
@@ -26,7 +41,7 @@ Read the [release notes](https://github.com/gotempsh/temps/releases) for every v
 
 ### What Temps can back up for you
 
-Start the new binary with `--pre-migration-backup` and, when it finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. The backup is off by default. See [Pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate, so the flag can stay in your service unit.
+Start the new binary with `--pre-migration-backup` and, when it finds pending migrations on an existing database, it dumps the database **before applying any of them** to `<data dir>/backups/pre-migration/`. The backup is off by default. See [Pre-migration backup](#automatic-pre-migration-backup) for what the dump contains. Nothing is backed up on a fresh install or on a normal restart with nothing to migrate, so the flag can stay in your service unit. Where you can only set environment variables (a container launched through an API, for example), set `TEMPS_PRE_MIGRATION_BACKUP=true` instead; it is the same switch.
 
 ### Stateless installations
 
@@ -45,6 +60,18 @@ If you configured S3 backup storage, also run a control-plane backup from **Sett
 
 ---
 
+## Upgrading to Projects and Services {{ anchor: true, id: 'upgrading-to-projects-and-services' }}
+
+Read this before upgrading from a release that did not have Projects (groups of services). The upgrade itself is automatic; these are the changes you will notice.
+
+- **Your apps are now called Services.** Every app you had is a service with the same slug, URLs, domains, deployments, variables and linked databases. Nothing moves and nothing is redeployed. See [Projects and Services](/docs/projects).
+- **Projects are optional and start empty.** A Project groups services that ship together so they share a repository, variables and path routes. The upgrade does not create any; create one when you need it. See [Create a project and add services](/docs/create-a-project-and-add-services).
+- **Additional templates with an unsupported preset are skipped.** If a template in a file passed with `temps serve --templates <file>` (or `TEMPS_ADDITIONAL_TEMPLATES`) uses a build preset this release no longer supports, the server logs a warning naming the template, its preset and the supported presets, and loads the rest instead of refusing to start. After restarting, check the logs for those warnings and fix the listed templates. A file that is missing or is not valid YAML still stops the server with an error.
+- **Template kind `service` is now `app`.** Templates that say `kind: service` keep loading, but the API returns them as `app`. With CLI 0.1.36 or older, `templates list --kind service` returns nothing: upgrade the CLI (`bunx @temps-sdk/cli@latest`) and use `--kind app`.
+- **Service template snapshots move to schema 3.** A service created from a service template (Keycloak, Browserless and others) keeps a copy of that template so it can be upgraded later. This release writes that copy in a new format (schema 3) when it creates or upgrades such a service, and still reads the old one. An older Temps binary cannot read schema 3, so **downgrading after this upgrade is not supported**. Take the backups described in [Before you upgrade](#before-you-upgrade) first.
+
+---
+
 ## Upgrade the binary
 
 Use whichever method matches how you installed Temps.
@@ -52,25 +79,39 @@ Use whichever method matches how you installed Temps.
 ### `temps upgrade` (self-upgrade)
 
 ```bash
-temps upgrade            # newest release on your channel (stable by default)
+temps upgrade            # newest release on the channel you are already on
 sudo temps upgrade       # if the binary lives in a root-owned directory
 ```
 
-It downloads the release for your platform, verifies its SHA-256 checksum, and atomically replaces the binary. It does **not** restart the running server — see [Restart Temps](#restart-temps).
+It downloads the release for your platform, verifies its SHA-256 checksum and its [Sigstore signature](/docs/installation#release-signature-verification) from the Temps release workflow at that tag, and atomically replaces the binary. It does **not** restart the running server — see [Restart Temps](#restart-temps).
 
 ```bash
-temps upgrade --channel beta      # include beta pre-releases
+temps upgrade --channel beta      # switch to (or stay on) beta pre-releases
 temps upgrade --version v1.1.0    # a specific release (also how you go back to an older one)
 temps upgrade --yes               # no confirmation prompt
 temps upgrade --check             # only report whether an update is available
 temps upgrade --path /opt/temps/bin/temps
 ```
 
-`--stable` is a deprecated alias for `--channel stable`, which is already the default.
+Without `--channel`, `temps upgrade` stays on the channel of the binary you
+are running: a `-beta.N` version tracks **beta**, a `-nightly.` version tracks
+**nightly**, and a plain `vX.Y.Z` version tracks **stable**. The upgrade plan
+prints the channel and says when it was inferred. Pass `--channel` to switch;
+nothing else (no environment variable, no setting) changes the channel this
+command uses. `temps doctor` always infers the channel the same way. The
+console's **Update now** does too, unless a channel is set under
+**Settings → Version**, which only the console reads.
+
+If the stable channel has no release yet, `temps upgrade --channel stable` says
+so and suggests `--channel beta`. It never downgrades: when the newest release
+on the chosen channel is older than the running binary it stops and asks you to
+pin `--version` to roll back on purpose.
+
+`--stable` is a deprecated alias for `--channel stable`.
 
 ### From the console
 
-When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup`), and restarts. Start the server with `--disable-self-update` to forbid this path.
+When an update is available, the console shows a banner with an **Update now** action. It downloads the new binary, runs `temps migrate` with it (with the pre-migration backup when the server was started with `--pre-migration-backup` or `TEMPS_PRE_MIGRATION_BACKUP=true`), and restarts. It verifies the release's checksum and Sigstore signature exactly as `temps upgrade` does, with no unsigned opt-out. Start the server with `--disable-self-update`, or set `TEMPS_DISABLE_SELF_UPDATE=true`, to forbid this path. Unlike the toggle in **Settings → Platform**, this cannot be undone from the console: it lasts for the lifetime of the process.
 
 ### Upgrade script (`deploy.sh` installs)
 
@@ -90,9 +131,15 @@ curl -fsSL https://temps.sh/install.sh | bash -s -- v1.1.0          # a specific
 brew update && brew upgrade temps                                   # Homebrew (macOS)
 ```
 
-The install script picks a channel the same way `temps upgrade` does: by
+The install script picks a release the same way `temps upgrade` does: by
 version, not publication date, and only among releases that ship an archive
-for your platform.
+for your platform. Unlike `temps upgrade`, it does not look at an installed
+binary: without `--channel` it installs the newest stable release. It verifies
+the checksum, refuses a release without a signature unless you pass
+`--allow-unsigned`, and checks the signature with `cosign` or an authenticated
+`gh` when either is installed. On a server with neither, it says the origin was
+not verified and prints the commands to check it yourself; see
+[Verify release downloads](/docs/installation#release-signature-verification).
 
 <CodeGroup>
 
@@ -256,7 +303,7 @@ Pass `--data-dir` (or set `TEMPS_DATA_DIR`) if your data directory is not `~/.te
 
 Each startup, in order:
 
-1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps refuses to start and changes nothing. See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
+1. **Schema guard.** Temps compares the migrations recorded in the database with the ones it knows. If the database has migrations this binary does not know — it was migrated by a newer release — Temps logs a warning naming them and keeps starting. It never rolls those migrations back; it only applies migrations of its own that the database is missing (normally none). See [Database schema is newer than this binary](#database-schema-is-newer-than-this-binary).
 2. **Pre-migration backup**, only with `--pre-migration-backup` and only if there are pending migrations on an existing database. See below. Either way, a `pg_dump` container left running by an interrupted earlier backup of the same data directory is removed first: it holds a lock on every table and would make the first migration time out.
 3. **Migrations.** Each runs in its own transaction; a statement waiting more than 15 seconds for a lock fails fast, and the whole step is bounded at 10 minutes. If a migration fails, the server does not start and the database stays at the last migration that succeeded.
 4. **Maintenance** that does not block startup (large concurrent index builds, analytics backfills) runs in the background once the server is up.
@@ -279,6 +326,8 @@ The log line `Pre-migration database backup written to …` gives the exact path
 ```bash
 temps serve --pre-migration-backup ...     # or: temps migrate --pre-migration-backup
 ```
+
+Both commands also read `TEMPS_PRE_MIGRATION_BACKUP`. It accepts `true`/`false` (also `1`/`0`, `yes`/`no`, `on`/`off`, case-insensitive); an empty value means `false`, and anything else makes the command exit with an error rather than guess. `--pre-migration-backup` on the command line always turns it on.
 
 **If the backup fails, nothing is migrated** and Temps exits with the reason (for example, no suitable `pg_dump` and no reachable Docker daemon). Fix the cause and start again, or take your own backup and start without the flag.
 
@@ -339,7 +388,11 @@ Open the console and check that your projects, environments and services are lis
 
 ## Roll back an upgrade {{ anchor: true, id: 'roll-back-an-upgrade' }}
 
-Migrations only go forward. To return to the previous release you need **both** the previous binary **and** the database as it was before the upgrade. Starting only the old binary on the upgraded database does not work: the schema guard (and, in older releases, the migrator) refuses it, so that an older binary cannot write to a schema it does not understand.
+Migrations only go forward. A full rollback to the previous release needs **both** the previous binary **and** the database as it was before the upgrade.
+
+If the new release stops working and you need Temps back up quickly, you can roll back only the binary (`temps upgrade --version vX.Y.Z --yes`) and start it against the upgraded database. It starts with a [warning](#database-schema-is-newer-than-this-binary) that the schema is newer than the binary, and it leaves the newer migrations in place. That is a stopgap, not a rollback: the older binary does not know about the newer schema, so features that depend on it can misbehave, and anything it writes is written to that newer schema. Plan to either move forward to a fixed release or complete the rollback below. (Earlier releases refused to start in that state.)
+
+To roll back fully, restore the database as well.
 
 The example below is for a `deploy.sh` install (database container `temps-timescaledb`, user and database `temps`, data in `~/.temps/data`). Adjust names to your setup.
 
@@ -430,11 +483,13 @@ launchctl kickstart -k gui/$(id -u)/dev.temps.localup-tunnel   # macOS
 
 ### Database schema is newer than this binary {{ anchor: true, id: 'database-schema-is-newer-than-this-binary' }}
 
+Logged as a warning at startup (and reported by `temps doctor`):
+
 ```text
-The database schema is newer than this Temps binary (v…): N applied migration(s) are unknown to it: m2026…
+The database schema is newer than this Temps binary (v…): N applied migration(s) are unknown to it: m2026…. … Starting anyway: the unknown migrations are left in place and only migrations this binary defines are applied, …
 ```
 
-A newer release migrated this database, then an older binary was started on it — usually after rolling back only the binary. Nothing was changed. Either start the newer release again (`temps upgrade --version <that release>`), or [roll back](#roll-back-an-upgrade) properly by restoring the pre-migration backup.
+A newer release migrated this database, then an older binary was started on it — usually after rolling back only the binary. Temps keeps running: it does not roll back the unknown migrations and does not touch them, but it is running against a schema it does not fully understand, so features that rely on the newer schema can misbehave. To get back to a matching pair, either start the newer release again (`temps upgrade --version <that release>`), or [roll back](#roll-back-an-upgrade) fully by restoring the pre-migration backup from `<data dir>/backups/pre-migration`.
 
 ### Pre-migration backup failed
 

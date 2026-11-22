@@ -46,7 +46,8 @@
 //! to probe over HTTP, so the `Running` state is taken as ready.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use thiserror::Error;
 
@@ -252,39 +253,40 @@ pub async fn wait_until_accepting_requests(
     runtime_context: &temps_core::RuntimeContext,
 ) -> Result<(), ReadinessError> {
     let client = build_client(probe.request_timeout)?;
-    let start = Instant::now();
-
+    let deadline = Instant::now() + probe.timeout;
+    let mut last_status = None;
     loop {
-        // The status observed this iteration — surfaced in the timeout error so
-        // a stuck wake reports *why* (e.g. still `Created`, or `Running` but
-        // not yet answering HTTP).
-        let last_status = match check_accepting_requests_with_client(
-            deployer,
-            container_id,
-            &client,
-            runtime_context,
+        let check = tokio::time::timeout_at(
+            deadline,
+            check_accepting_requests_with_client(deployer, container_id, &client, runtime_context),
         )
-        .await?
-        {
-            ReadinessCheck::Ready => return Ok(()),
-            ReadinessCheck::Terminal(status) => {
+        .await;
+        match check {
+            Ok(Ok(ReadinessCheck::Ready)) => return Ok(()),
+            Ok(Ok(ReadinessCheck::Terminal(status))) => {
                 return Err(ReadinessError::Terminal {
                     container_id: container_id.to_string(),
                     status,
-                });
+                })
             }
-            ReadinessCheck::NotYet(status) => status,
-        };
-
-        if start.elapsed() >= probe.timeout {
+            Ok(Ok(ReadinessCheck::NotYet(status))) => last_status = Some(status),
+            Ok(Err(error)) => return Err(error),
+            Err(_) => {
+                return Err(ReadinessError::Timeout {
+                    container_id: container_id.to_string(),
+                    timeout_secs: probe.timeout.as_secs(),
+                    last_status,
+                })
+            }
+        }
+        if Instant::now() >= deadline {
             return Err(ReadinessError::Timeout {
                 container_id: container_id.to_string(),
                 timeout_secs: probe.timeout.as_secs(),
-                last_status: Some(last_status),
+                last_status,
             });
         }
-
-        tokio::time::sleep(probe.poll_interval).await;
+        tokio::time::sleep_until(deadline.min(Instant::now() + probe.poll_interval)).await;
     }
 }
 
@@ -414,6 +416,18 @@ mod tests {
 
     #[async_trait]
     impl ContainerDeployer for ScriptedDeployer {
+        async fn exec_in_container(
+            &self,
+            container_id: &str,
+            _command: Vec<String>,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::ExecResult, crate::DeployerError> {
+            Err(crate::DeployerError::ExecFailed {
+                container_id: container_id.to_string(),
+                reason: "exec is not scripted by this test deployer".to_string(),
+            })
+        }
+
         async fn deploy_container(
             &self,
             _request: DeployRequest,
@@ -436,6 +450,9 @@ mod tests {
             unimplemented!()
         }
         async fn get_container_info(&self, _id: &str) -> Result<ContainerInfo, DeployerError> {
+            if self.infos.lock().unwrap().is_empty() {
+                return std::future::pending().await;
+            }
             let mut infos = self.infos.lock().unwrap();
             if infos.len() > 1 {
                 Ok(infos.remove(0))
@@ -633,6 +650,32 @@ mod tests {
         )
         .await
         .is_ok());
+    }
+
+    #[tokio::test]
+    async fn readiness_deadline_bounds_inspection_and_poll_delay() {
+        for infos in [vec![], vec![info(ContainerStatus::Created, vec![])]] {
+            let deployer = ScriptedDeployer::arc(infos);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                wait_until_accepting_requests(
+                    &deployer,
+                    "candidate-42",
+                    ReadinessProbe {
+                        timeout: Duration::from_millis(20),
+                        poll_interval: Duration::from_secs(60),
+                        request_timeout: Duration::from_secs(60),
+                    },
+                    &temps_core::RuntimeContext::host(),
+                ),
+            )
+            .await
+            .expect("the total readiness deadline must bound Docker inspection and polling");
+            let error = result.unwrap_err();
+            assert!(
+                matches!(&error, ReadinessError::Timeout { container_id, .. } if container_id == "candidate-42")
+            );
+        }
     }
 
     #[tokio::test]

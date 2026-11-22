@@ -3,6 +3,7 @@
 
 import {
   deleteGitProviderMutation,
+  completeConnectionReauthorizationMutation,
   getGitProviderOptions,
   getProviderConnectionsOptions,
   getProviderConnectionsQueryKey,
@@ -10,6 +11,7 @@ import {
   syncRepositoriesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProviderResponse } from '@/api/client/types.gen'
+import { readReauthorizationCallback } from '@/components/git/reauthorization'
 import { ConnectionsCompactList } from '@/components/git/ConnectionsCompactList'
 import {
   CredentialsEditorDialog,
@@ -23,14 +25,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -71,7 +66,7 @@ import {
 } from 'lucide-react'
 import GithubIcon from '@/icons/Github'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { isGitHubApp, isGitLabOAuth } from '@/lib/provider'
@@ -131,6 +126,42 @@ export default function GitProviderDetail() {
     })
     queryClient.invalidateQueries({ queryKey: listConnectionsQueryKey({}) })
   }
+
+  const completeReauthorization = useMutation({
+    ...completeConnectionReauthorizationMutation(),
+    onSuccess: () => {
+      showSuccess(
+        'Connection reauthorized. Projects, repositories and webhooks remain linked.'
+      )
+      invalidateConnectionQueries()
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          completeReauthorization.mutate(variables)
+        )
+      )
+        return
+      const problem = error as { detail?: string; message?: string }
+      showError(
+        `Reauthorization failed: ${problem.detail ?? problem.message ?? 'Try Reauthorize again.'}`
+      )
+    },
+  })
+  const callbackHandled = useRef(false)
+  const { mutate: finishReauthorization } = completeReauthorization
+  useEffect(() => {
+    if (callbackHandled.current) return
+    const callback = readReauthorizationCallback(window.location.hash)
+    if (!callback) return
+    callbackHandled.current = true
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search
+    )
+    finishReauthorization({ body: callback })
+  }, [finishReauthorization])
 
   const syncMutation = useMutation({
     ...syncRepositoriesMutation(),
@@ -243,7 +274,7 @@ export default function GitProviderDetail() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'Git Providers', href: '/git-providers' },
+        { label: 'Git providers', href: '/git-providers' },
         { label: provider.name },
       ])
     }
@@ -313,7 +344,7 @@ export default function GitProviderDetail() {
       <PageState
         variant="failed"
         icon={AlertTriangle}
-        title="Git Provider Not Found"
+        title="Git provider not found"
         description="The git provider you're looking for doesn't exist or was deleted."
         action={backAction}
       />
@@ -423,7 +454,7 @@ export default function GitProviderDetail() {
                   }}
                 >
                   <Key className="mr-2 h-4 w-4" />
-                  Edit Credentials
+                  Edit credentials
                 </DropdownMenuItem>
               )}
               <DropdownMenuItem
@@ -434,7 +465,7 @@ export default function GitProviderDetail() {
                 }}
               >
                 <Trash2 className="mr-2 h-4 w-4" />
-                Delete Provider
+                Delete provider
               </DropdownMenuItem>
             </DropdownMenuContent>
           </DropdownMenu>
@@ -443,6 +474,11 @@ export default function GitProviderDetail() {
       facts={facts}
       main={
         <>
+          {completeReauthorization.isPending && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Completing reauthorization…
+            </p>
+          )}
           {/* Feedback Alert */}
           <FeedbackAlert feedback={feedback} onDismiss={clearFeedback} />
 
@@ -463,7 +499,7 @@ export default function GitProviderDetail() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <GithubIcon className="h-5 w-5" />
-                    GitHub App Setup
+                    GitHub App setup
                   </CardTitle>
                   <CardDescription>
                     This provider uses GitHub App authentication for enhanced
@@ -472,7 +508,7 @@ export default function GitProviderDetail() {
                 </CardHeader>
                 <CardContent className="space-y-4">
                   <div className="rounded-lg border bg-muted/30 p-4">
-                    <h4 className="font-medium mb-2">Installation Required</h4>
+                    <h4 className="font-medium mb-2">Installation required</h4>
                     <p className="text-sm text-muted-foreground mb-3">
                       To use this GitHub provider, you need to install the
                       GitHub App in your GitHub account or organization.
@@ -491,7 +527,7 @@ export default function GitProviderDetail() {
 
           {/* Security Notice for PAT */}
           {provider.auth_method === 'token' && (
-            <Callout tone="info" title="Personal Access Token">
+            <Callout tone="info" title="Personal access token">
               This provider uses a Personal Access Token for authentication.
               Tokens are stored securely and encrypted. For enhanced security
               and automatic deployments, consider using GitHub App
@@ -574,44 +610,16 @@ export default function GitProviderDetail() {
 
       {verificationDialog}
 
-      {/* Delete Confirmation Dialog */}
-      <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Git Provider</DialogTitle>
-            <DialogDescription>
-              Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone. Its {connections?.length ?? 0}{' '}
-              connection(s) and their synced repositories are deleted with it.
-              Projects still deployed from this provider block the delete — the
-              error names them.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setShowDeleteDialog(false)}
-              disabled={deleteMutation.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteMutation.isPending}
-            >
-              {deleteMutation.isPending ? (
-                <>
-                  <RefreshCw className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+      <ConfirmDeleteDialog
+        open={showDeleteDialog}
+        onOpenChange={setShowDeleteDialog}
+        resourceType="git provider"
+        resourceName={provider.name}
+        consequences={`Its ${connections?.length ?? 0} connection(s) and their synced repositories are deleted with it. Services still deployed from this provider block the delete — the error names them.`}
+        confirmLabel="Delete provider"
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDelete}
+      />
     </>
   )
 }

@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[test]
+preload = ["./src/test/setup-dom.ts", "./src/test/setup-hooks.ts"]

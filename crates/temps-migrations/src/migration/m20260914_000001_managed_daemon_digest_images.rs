@@ -9,7 +9,7 @@ pub struct Migration;
 const DIGEST_PREDICATE: &str =
     "image ~ '^ghcr[.]io/gotempsh/temps-sandbox-(nodejs|python|all)@sha256:[0-9a-f]{64}$'";
 
-fn up_sql() -> Result<String, DbErr> {
+pub(super) fn up_sql() -> Result<String, DbErr> {
     let previous = super::m20260913_000002_managed_daemon_workspace_images_v034::UP_SQL;
     let without_closing = previous.strip_suffix("))").ok_or_else(|| {
         DbErr::Custom("previous managed daemon image constraint has an unexpected shape".into())

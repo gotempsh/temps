@@ -10,18 +10,9 @@ import { ProviderResponse } from '@/api/client/types.gen'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { EmptyPlaceholder } from '@/components/EmptyPlaceholder'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   DropdownMenu,
@@ -41,7 +32,6 @@ import {
   ChevronRight,
   EllipsisVertical,
   GitBranch,
-  Loader2,
   Plus,
   RefreshCw,
   Trash2,
@@ -49,8 +39,9 @@ import {
 import GithubIcon from '@/icons/Github'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { reportSubmitFailure } from '@/lib/unhandled-rejections'
 
 // Helper function to check if provider is GitHub App
 const isGitHubApp = (provider: ProviderResponse) =>
@@ -60,7 +51,19 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, clearFeedback } = useFeedback()
+  const { feedback, clearFeedback, showError } = useFeedback()
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1))
+    if (params.get('reauthorize_error') !== 'invalid_state') return
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search
+    )
+    showError(
+      'Reauthorization could not be completed. The authorization was already used, is invalid, or the connection was removed. Start Reauthorize again from the connection.'
+    )
+  }, [showError])
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)
@@ -145,39 +148,37 @@ export function GitSources() {
       const deletion = deleteProviderMut.mutateAsync({
         path: { provider_id: providerToDelete.id },
       })
+      // No `error` message here: the app-wide mutation handler announces the
+      // failure, and toast.promise dismisses its loading toast without one.
       toast.promise(deletion, {
         loading: 'Removing Git provider...',
         success: 'Git provider removed successfully',
-        error: 'Failed to remove provider',
       })
       await deletion
 
       // Refresh the provider list after successful deletion
       queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
     } catch (error) {
-      // Handle any errors that occur during the check
-      toast.error('Failed to check provider', {
-        description:
-          error instanceof Error
-            ? error.message
-            : 'An unexpected error occurred',
-      })
+      // A failed deletion is already toasted by the app-wide mutation handler;
+      // this adds one for a failure of the safety check, which is not a
+      // mutation.
+      reportSubmitFailure(error)
     } finally {
       setProviderToDelete(null)
     }
   }
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Git Providers' }])
+    setBreadcrumbs([{ label: 'Git providers' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Git Providers')
+  usePageTitle('Git providers')
 
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer>
         <PageHeader
-          title="Git Providers"
+          title="Git providers"
           description="Manage your Git providers for repository access and deployments"
           actions={
             <>
@@ -193,7 +194,7 @@ export function GitSources() {
               <CreateActionButton
                 size="sm"
                 onClick={() => navigate('/git-providers/add')}
-                label="Add Git Provider"
+                label="Add Git provider"
               />
             </>
           }
@@ -233,13 +234,11 @@ export function GitSources() {
           >
             <Button onClick={() => navigate('/git-providers/add')}>
               <Plus className="mr-2 h-4 w-4" />
-              Add Git Provider
+              Add Git provider
             </Button>
           </EmptyPlaceholder>
         ) : (
           (() => {
-            const goToDetail = (id: number) => navigate(`/git-providers/${id}`)
-
             const ProviderIcon = ({
               provider,
               className = 'size-4 text-muted-foreground',
@@ -313,7 +312,7 @@ export function GitSources() {
                       }}
                     >
                       <Trash2 className="h-4 w-4 mr-2" />
-                      Remove Provider
+                      Remove provider
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>
@@ -326,16 +325,7 @@ export function GitSources() {
                   {gitProviders.map((provider: ProviderResponse) => (
                     <li
                       key={provider.id}
-                      role="button"
-                      tabIndex={0}
-                      onClick={() => goToDetail(provider.id)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter' || e.key === ' ') {
-                          e.preventDefault()
-                          goToDetail(provider.id)
-                        }
-                      }}
-                      className="flex cursor-pointer items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus:outline-none focus:bg-muted/40"
+                      className="relative flex items-center gap-3 px-3 py-3 sm:gap-4 sm:px-4 hover:bg-muted/40 transition-colors focus-within:bg-muted/40"
                     >
                       <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                         <ProviderIcon provider={provider} />
@@ -343,7 +333,15 @@ export function GitSources() {
                       <div className="min-w-0 flex-1">
                         <div className="flex items-center gap-2 flex-wrap">
                           <p className="truncate text-sm font-medium">
-                            {provider.name}
+                            {/* Stretched link: the whole row opens the
+                                provider, while the actions menu stays a
+                                separate control above it. */}
+                            <Link
+                              to={`/git-providers/${provider.id}`}
+                              className="after:absolute after:inset-0 focus-visible:outline-none focus-visible:underline"
+                            >
+                              {provider.name}
+                            </Link>
                           </p>
                           <Badge
                             variant="secondary"
@@ -369,7 +367,9 @@ export function GitSources() {
                           <TimeAgo date={provider.created_at} />
                         </p>
                       </div>
-                      <ActionsMenu provider={provider} />
+                      <div className="relative z-10">
+                        <ActionsMenu provider={provider} />
+                      </div>
                       <ChevronRight className="hidden size-4 shrink-0 text-muted-foreground/50 sm:block" />
                     </li>
                   ))}
@@ -382,47 +382,19 @@ export function GitSources() {
 
       {/* Single controlled confirm dialog, rendered once at the page level so
           it survives the dropdown closing. Driven by `providerToDelete`. */}
-      <AlertDialog
-        open={!!providerToDelete}
+      <ConfirmDeleteDialog
+        open={providerToDelete !== null}
         onOpenChange={(open) => {
           if (!open) setProviderToDelete(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove Git Provider</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to remove &quot;{providerToDelete?.name}
-              &quot;? This action cannot be undone and will remove all
-              associated connections and repositories.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel onClick={() => setProviderToDelete(null)}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProviderMut.isPending}
-              // Don't let Radix auto-close the dialog on click — we close it
-              // ourselves once the async delete (and its safety check) resolves.
-              onClick={(e) => {
-                e.preventDefault()
-                handleConfirmDeleteProvider()
-              }}
-            >
-              {deleteProviderMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Removing...
-                </>
-              ) : (
-                'Remove Provider'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="git provider"
+        resourceName={providerToDelete?.name ?? ''}
+        verb="Remove"
+        confirmLabel="Remove provider"
+        consequences="All of its connections and synced repositories are removed with it. Providers still used by deployed services cannot be removed."
+        isPending={deleteProviderMut.isPending}
+        onConfirm={handleConfirmDeleteProvider}
+      />
     </div>
   )
 }

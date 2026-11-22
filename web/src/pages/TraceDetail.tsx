@@ -24,6 +24,7 @@ import type {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Collapsible,
   CollapsibleContent,
@@ -61,19 +62,21 @@ import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
+  AlertCircle,
   ArrowLeft,
+  Bot,
   ChevronRight,
   Clock,
-  AlertCircle,
   Info,
   Layers,
-  RefreshCw,
-  Bot,
+  ListTree,
+  Loader2,
   Pin,
   PinOff,
-  Loader2,
+  RefreshCw,
+  ScrollText,
 } from 'lucide-react'
-import { useCallback, useMemo, type ReactNode } from 'react'
+import { useCallback, useMemo, useState, type ReactNode } from 'react'
 import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
@@ -127,6 +130,7 @@ function FacetToggle({ attributeKey }: { attributeKey: string }) {
   const facets = facetsData?.data ?? []
   const isFaceted = facets.some((f) => f.attribute_key === attributeKey)
   const atCapacity = facets.length >= 20
+  const [confirmUnfacetOpen, setConfirmUnfacetOpen] = useState(false)
 
   const invalidate = useCallback(
     () => queryClient.invalidateQueries({ queryKey: listFacetsQueryKey() }),
@@ -151,10 +155,12 @@ function FacetToggle({ attributeKey }: { attributeKey: string }) {
   const remove = useMutation({
     ...deleteFacetMutation(),
     onSuccess: () => {
+      setConfirmUnfacetOpen(false)
       toast.success(`"${attributeKey}" is no longer faceted`)
       invalidate()
     },
     onError: (err) => {
+      setConfirmUnfacetOpen(false)
       toast.error('Failed to remove facet', {
         description:
           (err as ProblemDetails)?.detail ??
@@ -167,41 +173,64 @@ function FacetToggle({ attributeKey }: { attributeKey: string }) {
   const isPending = create.isPending || remove.isPending
 
   return (
-    <Tooltip>
-      <TooltipTrigger asChild>
-        <button
-          type="button"
-          disabled={isPending || (!isFaceted && atCapacity)}
-          onClick={(e) => {
-            e.stopPropagation()
-            if (isFaceted) {
-              remove.mutate({ path: { key: attributeKey } })
-            } else {
-              create.mutate({ body: { attribute_key: attributeKey } })
+    <>
+      <Tooltip>
+        <TooltipTrigger asChild>
+          <button
+            type="button"
+            aria-label={
+              isFaceted
+                ? `Unpin attribute ${attributeKey}`
+                : `Pin attribute ${attributeKey}`
             }
-          }}
-          className={cn(
-            'inline-flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40',
-            isFaceted && 'text-primary hover:text-primary'
-          )}
-        >
-          {isPending ? (
-            <Loader2 className="h-3 w-3 animate-spin" />
-          ) : isFaceted ? (
-            <Pin className="h-3 w-3 fill-current" />
-          ) : (
-            <PinOff className="h-3 w-3" />
-          )}
-        </button>
-      </TooltipTrigger>
-      <TooltipContent>
-        {isFaceted
-          ? `Faceted — fast-filterable across all traces. Click to unfacet.`
-          : atCapacity
-            ? 'Facet capacity reached (20/20) — remove one to add another'
-            : 'Click to make this attribute fast-filterable across all traces'}
-      </TooltipContent>
-    </Tooltip>
+            disabled={isPending || (!isFaceted && atCapacity)}
+            onClick={(e) => {
+              e.stopPropagation()
+              if (isFaceted) {
+                setConfirmUnfacetOpen(true)
+              } else {
+                create.mutate({ body: { attribute_key: attributeKey } })
+              }
+            }}
+            className={cn(
+              'inline-flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40',
+              isFaceted && 'text-primary hover:text-primary'
+            )}
+          >
+            {isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : isFaceted ? (
+              <Pin className="h-3 w-3 fill-current" />
+            ) : (
+              <PinOff className="h-3 w-3" />
+            )}
+          </button>
+        </TooltipTrigger>
+        <TooltipContent>
+          {isFaceted
+            ? `Faceted — fast-filterable across all traces. Click to unfacet.`
+            : atCapacity
+              ? 'Facet capacity reached (20/20) — remove one to add another'
+              : 'Click to make this attribute fast-filterable across all traces'}
+        </TooltipContent>
+      </Tooltip>
+      {/* Dialog events bubble through the React tree; the toggle sits inside
+        clickable rows, so stop them here. */}
+      <span className="contents" onClick={(e) => e.stopPropagation()}>
+        <ConfirmDeleteDialog
+          open={confirmUnfacetOpen}
+          onOpenChange={setConfirmUnfacetOpen}
+          resourceType="faceted attribute"
+          resourceName={attributeKey}
+          verb="Unpin"
+          confirmLabel="Unpin attribute"
+          irreversible={false}
+          consequences="Facets are shared across every project. Filtering by this attribute stops being fast across all traces until it is pinned again."
+          isPending={remove.isPending}
+          onConfirm={() => remove.mutate({ path: { key: attributeKey } })}
+        />
+      </span>
+    </>
   )
 }
 
@@ -586,7 +615,7 @@ function CrossProjectBar({
               : 'hover:bg-blue-100 dark:hover:bg-blue-900/50'
           )}
         >
-          This project
+          This service
         </button>
         <button
           type="button"
@@ -731,7 +760,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
             projectId={span.project_id}
             name={
               projectById.get(span.project_id)?.project_name ??
-              `Project ${span.project_id}`
+              `Service ${span.project_id}`
             }
           />
         )
@@ -776,7 +805,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     const rootName = tree[0]?.span?.name ?? '(root span)'
     return [
       'The user is viewing a distributed trace (OpenTelemetry) in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
       `Trace id: ${traceId}.`,
       `Root span: ${rootName}. Duration: ${formatDuration(traceDuration)}. ${spans.length} span(s) across service(s): ${services.join(', ') || 'unknown'}. Status: ${hasError ? 'ERROR' : 'OK'}.`,
       'If they say "this trace"/"this span"/"these logs", they mean this one. You can pull details with the temps CLI: `traces get_trace --trace_id <id>` and `telemetry-logs query_logs --trace_id <id>`.',
@@ -811,7 +840,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          Back to Traces
+          Back to traces
         </Button>
         <Card>
           <CardContent className="flex items-center gap-3 p-6 text-destructive">
@@ -845,7 +874,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
-          <span className="hidden sm:inline">Back</span>
+          <span className="max-sm:sr-only">Back</span>
         </Button>
         <div className="flex-1 min-w-0">
           <h2 className="truncate text-base font-semibold sm:text-lg">
@@ -932,19 +961,21 @@ export default function TraceDetail({ project }: TraceDetailProps) {
       {/* Spans / Logs tabs */}
       <Tabs defaultValue="spans" className="w-full">
         <TabsList>
-          <TabsTrigger value="spans" className="gap-1.5">
+          <TabsTrigger
+            value="spans"
+            icon={ListTree}
+            count={displaySpans.length}
+          >
             Spans
-            <span className="text-xs text-muted-foreground">
-              {displaySpans.length}
-            </span>
           </TabsTrigger>
-          <TabsTrigger value="logs" className="gap-1.5">
+          <TabsTrigger
+            value="logs"
+            icon={ScrollText}
+            count={
+              correlatedLogs.length > 0 ? correlatedLogs.length : undefined
+            }
+          >
             Logs
-            {correlatedLogs.length > 0 && (
-              <span className="text-xs text-muted-foreground">
-                {correlatedLogs.length}
-              </span>
-            )}
           </TabsTrigger>
         </TabsList>
 

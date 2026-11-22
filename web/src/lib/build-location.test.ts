@@ -14,6 +14,7 @@ describe('buildLocationToSelect', () => {
   test('an explicit override is shown as-is', () => {
     expect(buildLocationToSelect('node')).toBe('node')
     expect(buildLocationToSelect('control_plane')).toBe('control_plane')
+    expect(buildLocationToSelect('ci')).toBe('ci')
   })
 })
 
@@ -27,5 +28,6 @@ describe('buildLocationToPayload', () => {
   test('an explicit location is sent unchanged', () => {
     expect(buildLocationToPayload('node')).toBe('node')
     expect(buildLocationToPayload('control_plane')).toBe('control_plane')
+    expect(buildLocationToPayload('ci')).toBe('ci')
   })
 })

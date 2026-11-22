@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TempsConfig {
+    /// Durable workflows started once after this deployment becomes live.
+    /// Inputs identify the project, environment and deployment; at most 16 names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployment_workflows: Vec<String>,
+
     /// Cron job configurations
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<Vec<CronJobConfig>>,
@@ -80,10 +85,36 @@ pub struct SourceContextConfig {
     pub include: Option<Vec<String>>,
 }
 
-/// Cron job configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Cron job configuration.
+///
+/// Two modes (ADR-055 §14):
+///
+/// - **http** (`path`): a GET to `path` on the environment's running
+///   deployment, as before;
+/// - **job** (`command`): `command` runs in a new container from the
+///   environment's current deployment image, with the environment's
+///   variables, until it exits. Kubernetes CronJob semantics apply:
+///   `concurrency_policy`, `starting_deadline_seconds`, `retry_limit`,
+///   `timeout_seconds` and `ttl_seconds_after_finished`.
+///
+/// ```yaml
+/// cron:
+///   - path: /api/cron/cleanup          # http
+///     schedule: "0 * * * *"
+///   - name: nightly-report             # job
+///     command: ["bin/report", "--yesterday"]
+///     schedule: "0 3 * * *"
+///     concurrency_policy: forbid
+///     retry_limit: 2
+///     timeout_seconds: 1800
+///   - workflow: send-digest            # workflow (ADR-106)
+///     input: { "period": "weekly" }
+///     schedule: "0 8 * * 1"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobConfig {
-    /// HTTP path to invoke for this cron job
+    /// HTTP path to invoke (`http` mode). Leave it out for a `job`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 
     /// Cron schedule in standard cron format
@@ -91,9 +122,132 @@ pub struct CronJobConfig {
     /// Example: "0 0 * * *" (daily at midnight)
     pub schedule: String,
 
-    /// Optional name/description for the cron job
+    /// Optional name/description for the cron job. For a `job`, it is also
+    /// what identifies the cron between deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// `job` mode: the argv to run in the environment's image. It replaces
+    /// the image's command; the image's entrypoint is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+
+    /// `workflow` mode: the durable workflow each occurrence starts a run of.
+    /// Leave out `path` and `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+
+    /// `workflow` mode: the input every run gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+
+    /// `job` and `workflow` modes: what a run does while the previous one is
+    /// still active. Default `forbid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_policy: Option<CronConcurrencyPolicy>,
+
+    /// `job` and `workflow` modes: a run that cannot start within this many
+    /// seconds of its scheduled time is skipped instead of started late.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_deadline_seconds: Option<u32>,
+
+    /// `job` mode: attempts after the first when a run fails. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+
+    /// `job` mode: maximum run time, after which the run is stopped and
+    /// failed. Default one hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+
+    /// `job` mode: how long a finished run's container (and its logs) is
+    /// kept. Default ten minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds_after_finished: Option<u32>,
+}
+
+impl CronJobConfig {
+    /// Whether this entry is a `job` (it has a `command`).
+    pub fn is_job(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// Whether this entry starts a workflow (it has a `workflow`).
+    pub fn is_workflow(&self) -> bool {
+        self.workflow.is_some()
+    }
+
+    /// Names of the fields only a `job` runs with, for refusing them on a
+    /// `workflow` entry.
+    pub fn run_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.retry_limit.is_some() {
+            fields.push("retry_limit");
+        }
+        if self.timeout_seconds.is_some() {
+            fields.push("timeout_seconds");
+        }
+        if self.ttl_seconds_after_finished.is_some() {
+            fields.push("ttl_seconds_after_finished");
+        }
+        fields
+    }
+
+    /// Names of the `job`-only fields this entry sets, for refusing them on
+    /// an `http` entry.
+    pub fn job_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.concurrency_policy.is_some() {
+            fields.push("concurrency_policy");
+        }
+        if self.starting_deadline_seconds.is_some() {
+            fields.push("starting_deadline_seconds");
+        }
+        if self.retry_limit.is_some() {
+            fields.push("retry_limit");
+        }
+        if self.timeout_seconds.is_some() {
+            fields.push("timeout_seconds");
+        }
+        if self.ttl_seconds_after_finished.is_some() {
+            fields.push("ttl_seconds_after_finished");
+        }
+        fields
+    }
+}
+
+/// What a `job` cron run does while the previous run is still active
+/// (Kubernetes CronJob `concurrencyPolicy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronConcurrencyPolicy {
+    /// Start it anyway: runs overlap.
+    Allow,
+    /// Skip it: the active run finishes first.
+    #[default]
+    Forbid,
+    /// Stop the active run and start this one.
+    Replace,
+}
+
+impl CronConcurrencyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CronConcurrencyPolicy::Allow => "allow",
+            CronConcurrencyPolicy::Forbid => "forbid",
+            CronConcurrencyPolicy::Replace => "replace",
+        }
+    }
+
+    /// Parses the stored value; anything unknown is `forbid`, the safe
+    /// choice.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "allow" => CronConcurrencyPolicy::Allow,
+            "replace" => CronConcurrencyPolicy::Replace,
+            _ => CronConcurrencyPolicy::Forbid,
+        }
+    }
 }
 
 /// Build configuration
@@ -122,11 +276,29 @@ pub struct BuildConfig {
     /// Output directory for static builds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+
+    /// Variables to pass as build arguments even though the Dockerfile
+    /// declares them where Docker keeps the value in the final image's
+    /// metadata, readable by anyone who can pull the image. Without this, a
+    /// control-plane build withholds them.
+    ///
+    /// Prefer a BuildKit secret mount, which needs no opt-in:
+    /// `RUN --mount=type=secret,id=NAME,env=NAME ...`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_build_args: Option<Vec<String>>,
 }
 
 /// Health check configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(default)]
 pub struct HealthCheckConfig {
+    /// Probe kind. Unset selects HTTP for a declared port, process otherwise.
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub probe_type: Option<String>,
+    /// Continuous running window for a process probe, in seconds.
+    pub stable_for: u64,
+    /// Argument vector executed directly inside the container (no implicit shell).
+    pub command: Vec<String>,
     /// HTTP path for health checks
     pub path: String,
 
@@ -145,6 +317,66 @@ pub struct HealthCheckConfig {
     /// Number of consecutive failures before marking unhealthy (default: 3)
     #[serde(default = "default_health_retries")]
     pub retries: u32,
+}
+
+impl Default for HealthCheckConfig {
+    fn default() -> Self {
+        Self {
+            probe_type: None,
+            stable_for: 15,
+            command: Vec::new(),
+            path: "/".to_string(),
+            status: default_health_status(),
+            interval: default_health_interval(),
+            timeout: default_health_timeout(),
+            retries: default_health_retries(),
+        }
+    }
+}
+
+impl HealthCheckConfig {
+    pub fn kind(&self, has_port: bool) -> &str {
+        self.probe_type
+            .as_deref()
+            .unwrap_or(if has_port { "http" } else { "process" })
+    }
+
+    /// Validate before running a gate; malformed settings must never skip health.
+    pub fn validate(&self) -> Result<(), String> {
+        match self.probe_type.as_deref() {
+            None | Some("http" | "tcp" | "process" | "exec") => {}
+            Some(kind) => {
+                return Err(format!(
+                    "Unsupported health.type '{kind}'; choose http, tcp, process or exec"
+                ))
+            }
+        }
+        if self.interval == 0 || self.interval > 3600 || self.timeout == 0 || self.timeout > 300 {
+            return Err(
+                "Health interval must be 1-3600 seconds and timeout must be 1-300 seconds"
+                    .to_string(),
+            );
+        }
+        if self
+            .probe_type
+            .as_deref()
+            .is_none_or(|kind| kind == "process")
+            && self.stable_for == 0
+        {
+            return Err("health.stable_for must be at least one second".to_string());
+        }
+        if self.kind(true) == "exec"
+            && (self.command.is_empty() || self.command[0].trim().is_empty())
+        {
+            return Err(
+                "health.type: exec requires a nonempty command argument vector".to_string(),
+            );
+        }
+        if self.kind(true) == "http" && !self.path.starts_with('/') {
+            return Err("health.path must start with '/'".to_string());
+        }
+        Ok(())
+    }
 }
 
 fn default_health_status() -> u16 {
@@ -893,13 +1125,13 @@ impl MetricAlertYamlConfig {
 
 impl TempsConfig {
     /// Parse configuration from YAML string
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_yaml::Error> {
-        serde_yaml::from_str(yaml)
+    pub fn from_yaml(yaml: &str) -> Result<Self, yaml_serde::Error> {
+        yaml_serde::from_str(yaml)
     }
 
     /// Serialize configuration to YAML string
-    pub fn to_yaml(&self) -> Result<String, serde_yaml::Error> {
-        serde_yaml::to_string(self)
+    pub fn to_yaml(&self) -> Result<String, yaml_serde::Error> {
+        yaml_serde::to_string(self)
     }
 
     /// Check if configuration has any cron jobs defined
@@ -931,6 +1163,20 @@ impl TempsConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_secret_build_args_opt_in() {
+        let config = TempsConfig::from_yaml(
+            "build:\n  secret_build_args:\n    - API_KEY\n    - SIGNING_KEY\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.build.unwrap().secret_build_args,
+            Some(vec!["API_KEY".to_string(), "SIGNING_KEY".to_string()])
+        );
+        let config = TempsConfig::from_yaml("build:\n  dockerfile: Dockerfile\n").unwrap();
+        assert_eq!(config.build.unwrap().secret_build_args, None);
+    }
 
     #[test]
     fn test_parse_complete_config() {
@@ -1029,6 +1275,73 @@ cron:
     }
 
     #[test]
+    fn job_cron_entries_parse_next_to_http_ones() {
+        let yaml = r#"
+cron:
+  - path: /api/cron/cleanup
+    schedule: "0 * * * *"
+  - name: nightly-report
+    command: ["bin/report", "--yesterday"]
+    schedule: "0 3 * * *"
+    concurrency_policy: replace
+    starting_deadline_seconds: 120
+    retry_limit: 2
+    timeout_seconds: 1800
+    ttl_seconds_after_finished: 60
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let crons = config.cron_jobs();
+        assert_eq!(crons.len(), 2);
+
+        assert!(!crons[0].is_job());
+        assert!(crons[0].job_only_fields().is_empty());
+
+        let job = crons[1];
+        assert!(job.is_job());
+        assert!(job.path.is_empty());
+        assert_eq!(
+            job.command.as_deref(),
+            Some(&["bin/report".to_string(), "--yesterday".to_string()][..])
+        );
+        assert_eq!(job.concurrency_policy, Some(CronConcurrencyPolicy::Replace));
+        assert_eq!(job.starting_deadline_seconds, Some(120));
+        assert_eq!(job.retry_limit, Some(2));
+        assert_eq!(job.timeout_seconds, Some(1800));
+        assert_eq!(job.ttl_seconds_after_finished, Some(60));
+        assert_eq!(job.job_only_fields().len(), 5);
+    }
+
+    #[test]
+    fn an_unknown_concurrency_policy_is_a_parse_error_and_stored_values_default_to_forbid() {
+        let yaml = r#"
+cron:
+  - command: ["true"]
+    schedule: "* * * * *"
+    concurrency_policy: sometimes
+"#;
+        assert!(TempsConfig::from_yaml(yaml).is_err());
+        assert_eq!(
+            CronConcurrencyPolicy::default(),
+            CronConcurrencyPolicy::Forbid
+        );
+        assert_eq!(
+            CronConcurrencyPolicy::from_stored("allow"),
+            CronConcurrencyPolicy::Allow
+        );
+        assert_eq!(
+            CronConcurrencyPolicy::from_stored("garbage"),
+            CronConcurrencyPolicy::Forbid
+        );
+        for policy in [
+            CronConcurrencyPolicy::Allow,
+            CronConcurrencyPolicy::Forbid,
+            CronConcurrencyPolicy::Replace,
+        ] {
+            assert_eq!(CronConcurrencyPolicy::from_stored(policy.as_str()), policy);
+        }
+    }
+
+    #[test]
     fn test_parse_config_no_crons() {
         let yaml = r#"
 build:
@@ -1047,12 +1360,14 @@ build:
                 path: "/api/cron/test".to_string(),
                 schedule: "0 0 * * *".to_string(),
                 name: Some("Test Cron".to_string()),
+                ..Default::default()
             }]),
             build: None,
             env: None,
             health: None,
             agents: None,
             workflows: None,
+            deployment_workflows: vec![],
             source_context: None,
             alerts: None,
         };
@@ -1093,7 +1408,7 @@ prompt: |
 provider: claude_cli
 max_turns: 25
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.name, "error-fixer");
         assert_eq!(agent.slug(), "error-fixer");
         assert!(agent.on.error.as_ref().unwrap().new_issue);
@@ -1103,7 +1418,7 @@ max_turns: 25
     #[test]
     fn test_agent_yaml_defaults() {
         let yaml = "name: minimal-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.provider, None);
         assert_eq!(agent.max_turns, 25);
         assert_eq!(agent.timeout_seconds, 600);
@@ -1113,7 +1428,7 @@ max_turns: 25
     #[test]
     fn test_agent_slug_normalizes_spaces_and_special_chars() {
         let yaml = "name: My Cool Agent!\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.slug(), "my-cool-agent");
     }
 
@@ -1135,7 +1450,7 @@ provider: claude_cli
 max_turns: 25
 deliverable: pull_request
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(workflow.name, "Error Autofix");
         assert_eq!(workflow.slug(), "error-autofix");
         assert!(workflow.on.error.as_ref().unwrap().new_issue);
@@ -1154,7 +1469,7 @@ on:
 prompt: Watch this deploy for regressions
 deliverable: report
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let deploy = workflow.on.deploy.as_ref().unwrap();
         assert!(deploy.production);
         assert!(!deploy.preview);
@@ -1172,7 +1487,7 @@ on:
 prompt: Investigate the downtime
 deliverable: report
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let monitoring = workflow.on.monitoring.as_ref().unwrap();
         assert!(monitoring.downtime);
         assert!(!monitoring.latency_spike);
@@ -1193,7 +1508,7 @@ on:
   manual: false
 prompt: Do something
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let json = workflow.trigger_config_json();
         assert_eq!(json["manual"], false);
         assert_eq!(json["error"]["new_issue"], true);
@@ -1207,7 +1522,7 @@ prompt: Do something
 name: minimal
 prompt: do something
 "#;
-        let workflow: WorkflowYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let workflow: WorkflowYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(workflow.provider, None);
         assert_eq!(workflow.max_turns, 25);
         assert_eq!(workflow.timeout_seconds, 600);
@@ -1227,7 +1542,7 @@ on:
     cron: "0 9 * * 1"
   manual: false
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let json = agent.trigger_config_json();
         assert_eq!(json["manual"], false);
         assert_eq!(json["error"]["new_issue"], true);
@@ -1245,7 +1560,7 @@ on:
 config_repo: myorg/claude-config
 config_repo_branch: develop
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.config_repo.as_deref(), Some("myorg/claude-config"));
         assert_eq!(agent.config_repo_branch.as_deref(), Some("develop"));
     }
@@ -1253,7 +1568,7 @@ config_repo_branch: develop
     #[test]
     fn test_agent_yaml_without_config_repo_defaults_to_none() {
         let yaml = "name: minimal-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(agent.config_repo.is_none());
         assert!(agent.config_repo_branch.is_none());
     }
@@ -1265,7 +1580,7 @@ name: test-agent
 model: opencode
 provider: claude_cli
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_provider(), Some("opencode"));
     }
 
@@ -1276,7 +1591,7 @@ name: test-agent
 system: You are a system prompt
 prompt: You are a prompt
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_prompt(), Some("You are a system prompt"));
     }
 
@@ -1286,14 +1601,14 @@ prompt: You are a prompt
 name: test-agent
 prompt: You are a prompt
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_prompt(), Some("You are a prompt"));
     }
 
     #[test]
     fn test_agent_yaml_no_provider_returns_none() {
         let yaml = "name: test-agent\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.resolved_provider(), None);
     }
 
@@ -1309,7 +1624,7 @@ tools:
     server: my-server
     url: http://localhost:8080
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         let tools = agent.tools.as_ref().unwrap();
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].tool_type, "web_search");
@@ -1341,7 +1656,7 @@ tools:
 deliverable: pull_request
 max_turns: 30
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.name, "Coding Assistant");
         assert_eq!(agent.resolved_provider(), Some("claude_cli"));
         assert!(agent
@@ -1386,7 +1701,7 @@ tools:
       required:
         - query
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(agent.tools.as_ref().unwrap().len(), 2);
 
         let tools_json = agent.tools_config_json().unwrap();
@@ -1417,7 +1732,7 @@ name: content-writer
 skills: [blog-writer, seo-optimizer]
 mcp_servers: [browser, github]
 "#;
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             agent.skills.as_ref().unwrap(),
             &["blog-writer", "seo-optimizer"]
@@ -1437,7 +1752,7 @@ mcp_servers: [browser, github]
     #[test]
     fn test_agent_yaml_no_skills_or_mcp_defaults_to_none() {
         let yaml = "name: minimal\n";
-        let agent: AgentYamlConfig = serde_yaml::from_str(yaml).unwrap();
+        let agent: AgentYamlConfig = yaml_serde::from_str(yaml).unwrap();
         assert!(agent.skills.is_none());
         assert!(agent.mcp_servers.is_none());
         assert!(agent.skills_config_json().is_none());
@@ -1629,5 +1944,45 @@ alerts:
         let config = TempsConfig::from_yaml(yaml).unwrap();
         assert!(config.has_crons());
         assert!(config.has_alerts());
+    }
+}
+
+#[cfg(test)]
+mod health_probe_tests {
+    use super::*;
+
+    #[test]
+    fn health_probe_defaults_preserve_http_and_detect_portless_workers() {
+        let config = HealthCheckConfig::default();
+        assert_eq!(config.kind(true), "http");
+        assert_eq!(config.kind(false), "process");
+        assert_eq!(config.stable_for, 15);
+        let legacy: HealthCheckConfig = yaml_serde::from_str("path: /ready").unwrap();
+        assert_eq!(legacy.kind(true), "http");
+        assert_eq!(legacy.path, "/ready");
+    }
+
+    #[test]
+    fn health_probe_yaml_accepts_each_kind_and_rejects_misconfiguration() {
+        for kind in ["http", "tcp", "process", "exec"] {
+            let config: TempsConfig = yaml_serde::from_str(&format!("health:\n  type: {kind}\n  command: [redis-cli, ping]\n  stable_for: 15\n  timeout: 5\n")).unwrap();
+            assert!(config.health.unwrap().validate().is_ok());
+        }
+        for yaml in [
+            "type: heartbeat",
+            "type: exec",
+            "type: process\nstable_for: 0",
+            "type: tcp\ntimeout: 0",
+            "type: exec\ncommand: ['']",
+            "type: http\npath: ready",
+            "interval: 0",
+        ] {
+            let config: HealthCheckConfig = yaml_serde::from_str(yaml).unwrap();
+            assert!(config.validate().is_err(), "{yaml}");
+        }
+        assert!(
+            yaml_serde::from_str::<HealthCheckConfig>("type: exec\ncommand: redis-cli ping")
+                .is_err()
+        );
     }
 }

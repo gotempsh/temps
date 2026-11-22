@@ -19,10 +19,9 @@ merge commit is outside the Rust inputs, so a binary from a few commits back
 is used only when those commits did not touch Rust either.
 
 Trust. A binary is only taken from a `push` run of rust-tests.yml on `main` of
-this repository -- the same provenance rule nextest-cache-seed.py applies to
-its target seed. A fork, a pull request run, a dispatch from another branch or
-another workflow can never be selected, because the artifact a pull request
-downloads here ships in the image it tests.
+this repository. A fork, a pull request run, a dispatch from another branch
+or another workflow can never be selected, because the artifact a pull
+request downloads here ships in the image it tests.
 
 Fail closed. Any error, or no candidate, writes empty outputs and exits 0, and
 `build-binary` compiles as before. A wrong match would test the wrong binary; a

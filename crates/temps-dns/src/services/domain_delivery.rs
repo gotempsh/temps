@@ -1316,7 +1316,9 @@ impl DomainDeliveryService {
         let rows = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         let items = rows
             .into_iter()
@@ -1367,7 +1369,7 @@ impl DomainDeliveryService {
             let defaults = settings::Entity::find_by_id(1)
                 .one(self.db.as_ref())
                 .await?
-                .map(|row| temps_core::AppSettings::from_json(row.data))
+                .map(|row| temps_config::AppSettings::from_json(row.data))
                 .unwrap_or_default();
             let default_kind = if defaults.cloudflare_new_projects {
                 Some("cloudflare")
@@ -1771,6 +1773,7 @@ impl DomainDeliveryService {
             project_id: Some(binding.project_id),
             environment_id: Some(binding.environment_id),
             controller: Some("domain-delivery"),
+            run_id: None,
         }
     }
     fn validate_owned_scope(
@@ -2300,6 +2303,7 @@ impl DomainDeliveryService {
             project_id: Some(project_id),
             environment_id: Some(request.environment_id),
             controller: Some(DELIVERY_CONTROLLER),
+            run_id: None,
         };
         // Whether Temps added the hostname to the Bunny Pull Zone: what an
         // earlier attempt for this binding recorded, or `true` once this
@@ -2975,7 +2979,9 @@ impl DomainDeliveryService {
         let bindings = if page_is_past_end(page, page_size, total) {
             Vec::new()
         } else {
-            paginator.fetch_page(page - 1).await?
+            paginator
+                .fetch_page(temps_core::config::page_index(page))
+                .await?
         };
         // Every profile this page references, in one query rather than one
         // per binding.
@@ -3413,6 +3419,19 @@ mod apply_resume_and_progress_tests {
             updated_at: now,
             certificate_id: None,
             service_name: None,
+            audience: "public".to_string(),
+            private_range: None,
+            private_node_id: None,
+            private_listener: None,
+            gate: None,
+            gate_allow: None,
+            gate_not_before: None,
+            gate_access_provider_id: None,
+            gate_access_app_id: None,
+            gate_access_aud: None,
+            private_via: None,
+            private_service: None,
+            http_policy: None,
         };
         let request = request();
         assert!(DomainDeliveryService::route_unchanged(&route, 1, &request));

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 import { useState } from 'react'
-import { CredentialProviderMark } from '@temps-sdk/ds'
+import { CredentialProviderMark, useUrlSearchText } from '@temps-sdk/ds'
 import type { ProviderPreset } from '@/api/client'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
@@ -27,7 +27,7 @@ export function CredentialProviderCatalog({
   selectedId: string
   onSelect: (id: string) => void
 }) {
-  const [query, setQuery] = useState('')
+  const [query, setQuery] = useUrlSearchText('provider_q')
   const [page, setPage] = useState(1)
   const filtered = filterCredentialProviders(providers, query)
   const pageSize = 6

@@ -45,7 +45,7 @@ export function reservedHostnameReason(
   if (!host || host.includes('*')) return null
 
   if (consoleHostname(settings) === host) {
-    return 'This is the Temps console domain. Routing it to a project would make the console unreachable.'
+    return 'This is the Temps console domain. Routing it to a service would make the console unreachable.'
   }
 
   const preview = settings?.preview_domain
@@ -53,7 +53,7 @@ export function reservedHostnameReason(
     .replace(/\.$/, '')
     .toLowerCase()
   if (preview && preview === host) {
-    return 'This is the preview domain Temps generates deployment URLs from and cannot be assigned to a project.'
+    return 'This is the preview domain Temps generates deployment URLs from and cannot be assigned to a service.'
   }
 
   return null

@@ -2,24 +2,34 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * NodeAlertRules — the control-plane's own monitoring alert rules.
+ * NodeAlertRules — monitoring alert rules of one node.
  *
- * These rules live on the synthetic node 0 rather than on any project or
- * service: the seeded proxy health alerts (error rate, p99 latency) and the
- * file-descriptor / socket exhaustion alerts. Nothing else in the console
- * surfaces them, so without this panel the operator has no way to learn that
- * the platform is watching itself, let alone retune or silence a rule.
+ * For the control plane (synthetic node 0, the default) these are the seeded
+ * proxy health alerts (error rate, p99 latency) and the file-descriptor /
+ * socket exhaustion alerts. Nothing else in the console surfaces them, so
+ * without this panel the operator has no way to learn that the platform is
+ * watching itself, let alone retune or silence a rule.
  *
- * Update-only by design. The defaults are re-seeded on every server start
- * (`ON CONFLICT DO NOTHING`), so a deleted rule silently reappears on the next
- * restart — disabling is the operation that actually sticks, which is why the
- * row offers a toggle and not a delete.
+ * For a worker (`nodeId` > 0) the operator adds rules on CPU, memory and disk
+ * usage, one per metric, and can delete them.
+ *
+ * The control plane's rules are update-only by design. The defaults are
+ * re-seeded on every server start (`ON CONFLICT DO NOTHING`), so a deleted
+ * rule silently reappears on the next restart — disabling is the operation
+ * that actually sticks, which is why those rows offer a toggle and not a
+ * delete.
  */
 import {
+  nodeMetricsCreateAlertRuleMutation,
+  nodeMetricsDeleteAlertRuleMutation,
   nodeMetricsGetAlertRulesOptions,
   nodeMetricsUpdateAlertRuleMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import type { ServiceAlertRuleResponse } from '@/api/client/types.gen'
+import type {
+  NodeCreateAlertRuleRequest,
+  ServiceAlertRuleResponse,
+} from '@/api/client/types.gen'
+import { AddNodeAlertRuleDialog } from '@/components/monitoring/AddNodeAlertRuleDialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -29,6 +39,7 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Input } from '@/components/ui/input'
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
@@ -41,7 +52,18 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { Plus, Sparkles, Trash2 } from 'lucide-react'
 import { useState } from 'react'
+import { ReadFailure } from '@/components/ui/read-failure'
+import {
+  NODE_ALERT_METRIC_LABELS,
+  canDeleteNodeRule,
+  canDeleteNodeRules,
+  metricsWithoutRule,
+  missingRecommendedAlerts,
+  nodeAlertMetricLabel,
+} from '@/lib/node-alert-rules'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { toast } from 'sonner'
 
 /** The control-plane is always node 0 — mirrors `CONTROL_PLANE_NODE_ID`. */
@@ -52,6 +74,7 @@ const CONTROL_PLANE_NODE_ID = 0
  * the table means nothing to an operator who has never read the collector.
  */
 const METRIC_LABELS: Record<string, string> = {
+  ...NODE_ALERT_METRIC_LABELS,
   'node.fd_percent': 'System file descriptors in use',
   'node.process_fd_percent': 'Process file descriptors in use',
   'proxy.error_rate_percent': 'Proxy 5xx rate',
@@ -60,6 +83,9 @@ const METRIC_LABELS: Record<string, string> = {
 
 /** Unit suffix per metric, so "90" reads as "90%" rather than a bare number. */
 const METRIC_UNITS: Record<string, string> = {
+  'node.cpu_percent': '%',
+  'node.memory_percent': '%',
+  'node.disk_percent': '%',
   'node.fd_percent': '%',
   'node.process_fd_percent': '%',
   'proxy.error_rate_percent': '%',
@@ -67,7 +93,7 @@ const METRIC_UNITS: Record<string, string> = {
 }
 
 function metricLabel(metric: string): string {
-  return METRIC_LABELS[metric] ?? metric
+  return nodeAlertMetricLabel(metric) ?? METRIC_LABELS[metric] ?? metric
 }
 
 function metricUnit(metric: string): string {
@@ -98,10 +124,21 @@ type RuleRowProps = {
   rule: ServiceAlertRuleResponse
   onThresholdSave: (rule: ServiceAlertRuleResponse, threshold: number) => void
   onToggle: (rule: ServiceAlertRuleResponse, enabled: boolean) => void
+  /** Present only where deleting sticks (workers); the control plane re-seeds. */
+  onDelete?: (rule: ServiceAlertRuleResponse) => void
+  /** A default rule in a table that has a delete column: disable, not delete. */
+  deleteProtected?: boolean
   isSaving: boolean
 }
 
-function RuleRow({ rule, onThresholdSave, onToggle, isSaving }: RuleRowProps) {
+function RuleRow({
+  rule,
+  onThresholdSave,
+  onToggle,
+  onDelete,
+  deleteProtected = false,
+  isSaving,
+}: RuleRowProps) {
   // `null` means "not being edited" — the cell shows the server value. Any
   // string means the operator is typing, so the input owns the value until
   // they save or cancel.
@@ -184,16 +221,60 @@ function RuleRow({ rule, onThresholdSave, onToggle, isSaving }: RuleRowProps) {
           aria-label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.name}`}
         />
       </TableCell>
+      {onDelete && deleteProtected && (
+        <TableCell className="align-top">
+          <span className="sr-only">
+            Default rule: turn it off instead of deleting it
+          </span>
+        </TableCell>
+      )}
+      {onDelete && !deleteProtected && (
+        <TableCell className="align-top">
+          <Button
+            size="icon"
+            variant="ghost"
+            className="size-8"
+            onClick={() => onDelete(rule)}
+            disabled={isSaving}
+            aria-label={`Delete ${rule.name}`}
+          >
+            <Trash2 className="size-4" />
+          </Button>
+        </TableCell>
+      )}
     </TableRow>
   )
 }
 
-export function NodeAlertRules() {
+export type NodeAlertRulesProps = {
+  /** Node whose rules are shown; the control plane (`0`) when omitted. */
+  nodeId?: number
+}
+
+function invalidateRules(queryClient: ReturnType<typeof useQueryClient>) {
+  return queryClient.invalidateQueries({
+    predicate: (query) =>
+      (query.queryKey[0] as Record<string, unknown>)?._id ===
+      'nodeMetricsGetAlertRules',
+  })
+}
+
+export function NodeAlertRules({
+  nodeId = CONTROL_PLANE_NODE_ID,
+}: NodeAlertRulesProps = {}) {
   const queryClient = useQueryClient()
+  const isControlPlane = nodeId === CONTROL_PLANE_NODE_ID
+  const deletable = canDeleteNodeRules(nodeId)
+  const subject = isControlPlane ? 'the control plane' : 'this worker'
+
+  const [addOpen, setAddOpen] = useState(false)
+  const [deleteTarget, setDeleteTarget] =
+    useState<ServiceAlertRuleResponse | null>(null)
+  const [recommendedPending, setRecommendedPending] = useState(false)
 
   const rulesQuery = useQuery({
     ...nodeMetricsGetAlertRulesOptions({
-      path: { id: CONTROL_PLANE_NODE_ID },
+      path: { id: nodeId },
     }),
     staleTime: 30_000,
   })
@@ -201,13 +282,19 @@ export function NodeAlertRules() {
   const updateMutation = useMutation({
     ...nodeMetricsUpdateAlertRuleMutation(),
     meta: { errorTitle: 'Failed to update the alert rule' },
-    onSuccess: () => {
-      queryClient.invalidateQueries({
-        predicate: (query) =>
-          (query.queryKey[0] as Record<string, unknown>)?._id ===
-          'nodeMetricsGetAlertRules',
-      })
-    },
+    onSuccess: () => invalidateRules(queryClient),
+  })
+
+  const createMutation = useMutation({
+    ...nodeMetricsCreateAlertRuleMutation(),
+    meta: { errorTitle: 'Failed to add the alert rule' },
+    onSuccess: () => invalidateRules(queryClient),
+  })
+
+  const deleteMutation = useMutation({
+    ...nodeMetricsDeleteAlertRuleMutation(),
+    meta: { errorTitle: 'Failed to delete the alert rule' },
+    onSuccess: () => invalidateRules(queryClient),
   })
 
   const handleThresholdSave = (
@@ -216,7 +303,7 @@ export function NodeAlertRules() {
   ) => {
     updateMutation.mutate(
       {
-        path: { id: CONTROL_PLANE_NODE_ID, rule_id: rule.id },
+        path: { id: nodeId, rule_id: rule.id },
         body: { threshold },
       },
       {
@@ -229,7 +316,7 @@ export function NodeAlertRules() {
   const handleToggle = (rule: ServiceAlertRuleResponse, enabled: boolean) => {
     updateMutation.mutate(
       {
-        path: { id: CONTROL_PLANE_NODE_ID, rule_id: rule.id },
+        path: { id: nodeId, rule_id: rule.id },
         body: { enabled },
       },
       {
@@ -240,17 +327,101 @@ export function NodeAlertRules() {
   }
 
   const rules = rulesQuery.data ?? []
+  const availableMetrics = metricsWithoutRule(rules)
+  const recommended = missingRecommendedAlerts(rules)
+
+  const handleCreate = (body: NodeCreateAlertRuleRequest) => {
+    createMutation.mutate(
+      { path: { id: nodeId }, body },
+      {
+        onSuccess: () => {
+          toast.success(`Alert rule "${body.name}" added`)
+          setAddOpen(false)
+        },
+      }
+    )
+  }
+
+  // Sequential on purpose: three small writes, and a failure on one (say the
+  // rule appeared meanwhile) must not hide the outcome of the others.
+  const handleAddRecommended = async () => {
+    setRecommendedPending(true)
+    let added = 0
+    for (const rec of recommended) {
+      try {
+        await createMutation.mutateAsync({
+          path: { id: nodeId },
+          body: { ...rec, enabled: true },
+        })
+        added += 1
+      } catch {
+        // The mutation's error toast already names the failure.
+      }
+    }
+    setRecommendedPending(false)
+    if (added > 0) {
+      toast.success(
+        `Added ${added} recommended alert rule${added === 1 ? '' : 's'}`
+      )
+    }
+  }
+
+  const handleDeleteConfirm = () => {
+    if (!deleteTarget) return
+    const target = deleteTarget
+    deleteMutation.mutate(
+      { path: { id: nodeId, rule_id: target.id } },
+      {
+        onSuccess: () => {
+          toast.success(`Alert rule "${target.name}" deleted`)
+          setDeleteTarget(null)
+        },
+      }
+    )
+  }
+
+  const recommendedLabel = recommended
+    .map((r) => `${metricLabel(r.metric_name)} > ${r.threshold}%`)
+    .join(', ')
 
   return (
     <Card>
       <CardHeader className="pb-3">
-        <CardTitle className="text-base">Platform alert rules</CardTitle>
-        <CardDescription>
-          Alerts the control-plane raises about itself — proxy health and file
-          descriptor (socket) exhaustion. Seeded on startup; retune a threshold
-          or switch a rule off here. Deleting is deliberately not offered: the
-          defaults are re-seeded on every restart, so only disabling sticks.
-        </CardDescription>
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div className="space-y-1.5">
+            <CardTitle className="text-base">
+              {isControlPlane ? 'Platform alert rules' : 'Alert rules'}
+            </CardTitle>
+            <CardDescription>
+              {isControlPlane
+                ? 'Alerts the control-plane raises about itself — proxy health and file descriptor (socket) exhaustion. Seeded on startup; retune a threshold or switch a rule off here. You can also add rules on CPU, memory and disk usage. Deleting is deliberately not offered: the defaults are re-seeded on every restart, so only disabling sticks.'
+                : 'Alerts raised when this worker runs short of CPU, memory or disk. Each metric has one rule; a rule fires once usage stays beyond its threshold for the configured time.'}
+            </CardDescription>
+          </div>
+          <div className="flex flex-wrap gap-2">
+            {recommended.length > 0 && (
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => void handleAddRecommended()}
+                disabled={recommendedPending || !rulesQuery.isSuccess}
+                title={recommendedLabel}
+              >
+                <Sparkles className="mr-2 size-4" />
+                Add recommended alerts
+              </Button>
+            )}
+            <Button
+              size="sm"
+              onClick={() => setAddOpen(true)}
+              disabled={!rulesQuery.isSuccess}
+            >
+              <Plus className="mr-2 size-4" />
+              <span className="hidden sm:inline">Add alert rule</span>
+              <span className="sm:hidden">Add</span>
+            </Button>
+          </div>
+        </div>
       </CardHeader>
       <CardContent>
         {rulesQuery.isPending ? (
@@ -260,20 +431,20 @@ export function NodeAlertRules() {
             <Skeleton className="h-10 w-full" />
           </div>
         ) : rulesQuery.isError ? (
-          <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-            Failed to load the platform alert rules.{' '}
-            <button
-              type="button"
-              className="underline underline-offset-2"
-              onClick={() => rulesQuery.refetch()}
-            >
-              Retry
-            </button>
-          </p>
+          <ReadFailure
+            resource={isControlPlane ? 'Platform alert rules' : 'Alert rules'}
+            error={rulesQuery.error}
+            onRetry={
+              isForbiddenRead(rulesQuery.error)
+                ? undefined
+                : () => void rulesQuery.refetch()
+            }
+          />
         ) : rules.length === 0 ? (
           <p className="px-2 py-6 text-center text-sm text-muted-foreground">
-            No alert rules on the control-plane node yet. Defaults are seeded
-            the next time the server starts.
+            {isControlPlane
+              ? 'No alert rules on the control-plane node yet. Defaults are seeded the next time the server starts, or add one now.'
+              : `No alert rules for this worker yet. Add one, or use "Add recommended alerts" to be told when it passes ${recommendedLabel}.`}
           </p>
         ) : (
           <div className="overflow-x-auto">
@@ -285,6 +456,11 @@ export function NodeAlertRules() {
                   <TableHead className="hidden md:table-cell">For</TableHead>
                   <TableHead>Severity</TableHead>
                   <TableHead>Enabled</TableHead>
+                  {deletable && (
+                    <TableHead className="w-12">
+                      <span className="sr-only">Delete</span>
+                    </TableHead>
+                  )}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -294,6 +470,10 @@ export function NodeAlertRules() {
                     rule={rule}
                     onThresholdSave={handleThresholdSave}
                     onToggle={handleToggle}
+                    onDelete={deletable ? setDeleteTarget : undefined}
+                    deleteProtected={
+                      !canDeleteNodeRule(nodeId, rule.metric_name)
+                    }
                     isSaving={updateMutation.isPending}
                   />
                 ))}
@@ -302,6 +482,26 @@ export function NodeAlertRules() {
           </div>
         )}
       </CardContent>
+
+      <AddNodeAlertRuleDialog
+        open={addOpen}
+        onOpenChange={setAddOpen}
+        availableMetrics={availableMetrics}
+        subject={subject}
+        isPending={createMutation.isPending}
+        onSubmit={handleCreate}
+      />
+      <ConfirmDeleteDialog
+        open={deleteTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setDeleteTarget(null)
+        }}
+        resourceType="alert rule"
+        resourceName={deleteTarget?.name ?? ''}
+        consequences="This worker stops being checked against this metric until you add a rule again."
+        isPending={deleteMutation.isPending}
+        onConfirm={handleDeleteConfirm}
+      />
     </Card>
   )
 }

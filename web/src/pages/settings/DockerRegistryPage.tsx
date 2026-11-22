@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
+import { PageHeader, SaveRow } from '@temps-sdk/ds'
+import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
+import { isForbiddenRead } from '@/lib/read-failure'
 import { DockerRegistrySettings } from '@/components/settings/DockerRegistrySettings'
 import { RegistryMirrorSettings } from '@/components/settings/RegistryMirrorSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { useSettings, useUpdateSettings } from '@/hooks/useSettings'
-import { AlertCircle, Loader2, Save } from 'lucide-react'
+import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
+import { Loader2 } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
@@ -27,7 +28,7 @@ interface DockerRegistryFormData {
 
 export function DockerRegistryPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { data: settings, isLoading, error } = useSettings()
+  const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
 
   const {
@@ -60,11 +61,11 @@ export function DockerRegistryPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Docker Registry' },
+      { label: 'Docker registry' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Docker Registry')
+  usePageTitle('Docker registry')
 
   useEffect(() => {
     if (settings) {
@@ -88,7 +89,7 @@ export function DockerRegistryPage() {
       reset(data)
       toast.success('Docker registry settings saved')
     } catch {
-      toast.error('Failed to save settings')
+      // useUpdateSettings already toasts this failure, with the server's reason.
     }
   }
 
@@ -102,16 +103,16 @@ export function DockerRegistryPage() {
 
   if (error) {
     return (
-      <Alert variant="destructive">
-        <AlertCircle className="h-4 w-4" />
-        <AlertTitle>Error</AlertTitle>
-        <AlertDescription>Failed to load settings.</AlertDescription>
-      </Alert>
+      <SettingsLoadFailure
+        error={error}
+        onRetry={isForbiddenRead(error) ? undefined : () => void refetch()}
+      />
     )
   }
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      <PageHeader title="Docker registry" />
       <DockerRegistrySettings
         control={control}
         register={register}
@@ -122,28 +123,7 @@ export function DockerRegistryPage() {
         prefixField={register('registry_mirror_prefix')}
         currentPrefix={registryMirrorPrefix}
       />
-      {isDirty && (
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex justify-between items-center">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved changes
-            </p>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
-      )}
+      <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
     </form>
   )
 }

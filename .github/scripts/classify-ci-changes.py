@@ -21,6 +21,11 @@ Actions outputs, which areas the pull request touches:
         reads
   web   the console under `web/`
   cli   the TypeScript CLI under `apps/temps-cli/`
+  console  the console under `web/` changed in this pull request itself, or
+        one of CONSOLE_SUITE_INPUTS did. Unlike `web`, a Rust change does not
+        set it: it gates only the non-blocking full Playwright report, whose
+        specs mostly route-mock the API and assert on UI copy, so they test
+        what `web/` changed. The blocking smoke suite still runs on `web`.
 
 `rust=false` is what lets rust-tests.yml skip the Rust jobs and reuse the
 `temps` binary built for `main` (see find-reusable-binary.py) instead of
@@ -40,7 +45,7 @@ stays Rust because the scenario E2E suite builds it.
 
 Documentation means a file under `docs/` or a Markdown file at the repository
 root. Markdown elsewhere is not exempt: some of it is build or test input
-(`crates/temps-core/templates/README.md` is embedded into the binary, and test
+(`crates/temps-presets/templates/README.md` is embedded into the binary, and test
 fixtures carry their own READMEs).
 
 Some pages under `docs/` are test input as well. `scripts/test-compose-security.sh`
@@ -68,6 +73,16 @@ TEST_INPUT_DOCS = frozenset(
     }
 )
 
+
+# Files outside web/ that decide how the full Playwright report runs. Editing
+# one runs that report on the pull request, as a web/ change does.
+CONSOLE_SUITE_INPUTS = frozenset(
+    {
+        ".github/workflows/e2e-tests.yml",
+        ".github/workflows/rust-tests.yml",
+        ".github/scripts/serve-console-from-source.sh",
+    }
+)
 
 # Areas whose files cannot change the `temps` binary's Rust code. Prefix match
 # on the full directory, so `web-foo/` or `apps/temps-cli-ee/` stay Rust.
@@ -129,13 +144,17 @@ def classify(paths: Iterable[str]) -> dict[str, str]:
     code_reason = first_code_path(paths)
     rust_reason = first_rust_path(paths)
     rust = rust_reason is not None
+    # Fail closed like the other areas: an empty diff runs the report too.
+    console = not paths or "web" in areas or any(path in CONSOLE_SUITE_INPUTS for path in paths)
     return {
         "code": "true" if code_reason is not None else "false",
         "rust": "true" if rust else "false",
         # Every area is assumed touched when the Rust jobs run, so a consumer
         # gating on `web` or `cli` alone can never skip work a full run does.
+        # `console` is the deliberate exception (see the module docstring).
         "web": "true" if rust or "web" in areas else "false",
         "cli": "true" if rust or "cli" in areas else "false",
+        "console": "true" if console else "false",
         "code_reason": code_reason or "",
         "rust_reason": rust_reason or "",
     }
@@ -158,7 +177,7 @@ def changed_paths(base: str, head: str) -> list[str]:
     return [path for path in result.stdout.decode("utf-8").split("\0") if path]
 
 
-OUTPUTS = ("code", "rust", "web", "cli")
+OUTPUTS = ("code", "rust", "web", "cli", "console")
 
 
 def write_outputs(result: dict[str, str]) -> None:

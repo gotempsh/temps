@@ -3815,7 +3815,7 @@ impl MigrationTrait for Migration {
                             .not_null()
                             .default(0),
                     ) // JobStatus enum: 0=Pending, 1=Waiting, 2=Running, 3=Success, 4=Failure, 5=Cancelled, 6=Skipped
-                    .col(ColumnDef::new(DeploymentJobs::LogId).string().not_null()) // Log identifier for temps-logs service
+                    .col(ColumnDef::new(DeploymentJobs::LogId).string().not_null()) // Log identifier for temps-deployment-logs service
                     .col(ColumnDef::new(DeploymentJobs::JobConfig).json().null()) // Job-specific configuration
                     .col(ColumnDef::new(DeploymentJobs::Outputs).json().null()) // Job outputs as key-value pairs
                     .col(ColumnDef::new(DeploymentJobs::Dependencies).json().null()) // List of job IDs this job depends on

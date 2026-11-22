@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-mod audit;
+pub(crate) mod audit;
 pub mod custom_domains;
 #[allow(clippy::module_inception)]
 mod handlers;
+pub mod ingest_setup;
 pub mod operations;
 mod preset_configs;
 pub mod templates;

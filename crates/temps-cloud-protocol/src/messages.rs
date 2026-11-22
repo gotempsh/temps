@@ -822,6 +822,40 @@ impl std::fmt::Debug for ManagedBackupCapability {
     }
 }
 
+/// `POST /v1/backups/managed/scoped-credentials` (ADR-102): a credential for
+/// one worker job, minted by Cloud from the tenant's token and limited to
+/// `prefixes` of the managed bucket, to `access`, and to `ttl_seconds`.
+/// Cloud refuses a prefix outside the tenant's `bucket_path`, and a `write`
+/// for a tenant that may not write (unpaid, quota revoked).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedBackupScopedCredentialsRequest {
+    /// Object-key prefixes inside the managed bucket, each ending in `/`.
+    pub prefixes: Vec<String>,
+    /// `read` (restore) or `write` (backup, archiving).
+    pub access: String,
+    pub ttl_seconds: u64,
+}
+
+/// The credential Cloud minted. `Debug` redacts the secret and the token.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ManagedBackupScopedCredentials {
+    pub access_key_id: String,
+    pub secret_key: String,
+    pub session_token: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl std::fmt::Debug for ManagedBackupScopedCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedBackupScopedCredentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_key", &"[REDACTED]")
+            .field("session_token", &"[REDACTED]")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
 /// One OpenAI-compatible completion proxied by Cloud for a connected OSS
 /// instance. The body remains opaque at the control-plane protocol layer so
 /// OpenAI-compatible additive fields do not require a protocol-version bump.
@@ -1186,6 +1220,9 @@ pub struct StatusReport {
     pub deployment_count: u32,
     pub service_count: u32,
     pub project_count: u32,
+    /// Active worker nodes, excluding the control plane; advisory only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_node_count: Option<u32>,
     /// `None` when the instance cannot compute a resource summary at all
     /// (rather than reporting one with every field `None`, which the nested
     /// type already supports for a partial reading).
@@ -1217,9 +1254,77 @@ pub struct StatusRequest {
     pub instance_id: Option<Uuid>,
 }
 
+// ---------------------------------------------------------------------------
+// Console session logout — ADR-094
+//
+// The one backend → instance message that makes the instance act. It is safe
+// because the action only ever *removes* access, and because the instance
+// acts on a token signed by the identity provider it already trusts to sign
+// users in, never on the channel's say-so.
+// ---------------------------------------------------------------------------
+
+/// Envelope kind of [`ConsoleLogout`].
+pub const CONSOLE_LOGOUT_KIND: &str = "console_logout";
+/// Envelope kind of [`ConsoleLogoutAck`].
+pub const CONSOLE_LOGOUT_ACK_KIND: &str = "console_logout_ack";
+/// Envelope kind of [`ConsoleLogoutRejected`].
+pub const CONSOLE_LOGOUT_REJECTED_KIND: &str = "console_logout_rejected";
+/// Longest [`ConsoleLogoutRejected::reason`] an instance sends.
+pub const MAX_CONSOLE_LOGOUT_REJECTION_CHARS: usize = 256;
+
+/// End one user's console sessions issued through the backend-managed OIDC
+/// provider. Sent only to an instance that advertised
+/// [`crate::Capability::ConsoleSessionLogout`].
+///
+/// `logout_token` is an OpenID Connect Back-Channel Logout 1.0 logout token
+/// (JOSE `typ` `logout+jwt`, RS256), signed by the same keys as the
+/// provider's ID tokens. Its `jti` identifies the request in the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogout {
+    pub logout_token: String,
+}
+
+/// The instance verified the token and ended `sessions_ended` sessions (zero
+/// is normal: the user may have had none here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogoutAck {
+    pub jti: Uuid,
+    pub sessions_ended: u32,
+}
+
+/// The instance refused the token. `reason` is a short, fixed description,
+/// never token contents. Sent only when the token's `jti` could be read;
+/// anything less is dropped silently, since there is nothing to answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConsoleLogoutRejected {
+    pub jti: Uuid,
+    pub reason: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn console_logout_frames_keep_their_wire_shape() {
+        let logout: ConsoleLogout =
+            serde_json::from_value(serde_json::json!({"logout_token": "a.b.c"})).unwrap();
+        assert_eq!(logout.logout_token, "a.b.c");
+        let ack = ConsoleLogoutAck {
+            jti: Uuid::nil(),
+            sessions_ended: 2,
+        };
+        assert_eq!(
+            serde_json::to_value(ack).unwrap(),
+            serde_json::json!({"jti": Uuid::nil(), "sessions_ended": 2})
+        );
+        let envelope = Envelope::new(CONSOLE_LOGOUT_KIND, &logout).unwrap();
+        assert_eq!(envelope.kind, "console_logout");
+        assert_eq!(
+            envelope.decode::<ConsoleLogout>(CONSOLE_LOGOUT_KIND),
+            Some(logout)
+        );
+    }
 
     #[test]
     fn envelope_round_trips() {
@@ -1805,6 +1910,7 @@ mod tests {
             uptime_seconds: 3_600,
             deployment_count: 4,
             service_count: 6,
+            worker_node_count: None,
             project_count: 2,
             resources: Some(StatusResourceSummary {
                 memory_used_mb: Some(1_024),
@@ -1860,6 +1966,7 @@ mod tests {
             uptime_seconds: 0,
             deployment_count: 0,
             service_count: 0,
+            worker_node_count: None,
             project_count: 0,
             resources: None,
             self_update: None,
@@ -2005,5 +2112,26 @@ mod tests {
         let error = attempt.error.expect("error must be set");
         assert!(error.chars().count() < raw_error.chars().count());
         assert!(error.chars().count() <= MAX_STATUS_TEXT_CHARS + " …[truncated]".chars().count());
+    }
+}
+
+#[cfg(test)]
+mod worker_count_tests {
+    use super::*;
+    #[test]
+    fn worker_count_round_trip_and_legacy() {
+        let old = serde_json::json!({"instance_id": Uuid::nil(), "temps_version": "test",
+            "uptime_seconds": 1, "deployment_count": 0, "service_count": 0, "project_count": 0});
+        let mut report: StatusReport = serde_json::from_value(old).unwrap();
+        assert_eq!(report.worker_node_count, None);
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("worker_node_count")
+            .is_none());
+        report.worker_node_count = Some(1);
+        assert_eq!(
+            serde_json::from_value::<StatusReport>(serde_json::to_value(&report).unwrap()).unwrap(),
+            report
+        );
     }
 }

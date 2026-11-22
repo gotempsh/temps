@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
+import { registerLocalInstall } from "./install-local.js";
 import type { Command } from "commander";
 import { requireAuth } from "../../config/store.js";
 import { client, setupClient, getErrorMessage } from "../../lib/api-client.js";
@@ -276,4 +277,5 @@ export function registerPluginInstallCommands(plugin: Command) {
           options.ref === undefined ? {} : { ref_name: options.ref },
         );
     });
+  registerLocalInstall(plugin);
 }

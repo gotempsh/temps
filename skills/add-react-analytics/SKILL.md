@@ -8,7 +8,7 @@ description: |
 
 Integrate the `@temps-sdk/react-analytics` SDK into a React application.
 
-> **Verified against `@temps-sdk/react-analytics@0.0.7`.** A prior version of
+> **Verified against `@temps-sdk/react-analytics@0.0.9`.** A prior version of
 > this skill documented props and hooks that do not exist
 > (`autoTrack={{...}}`, `debug`, `useAnalytics()` as the accessor, `reset`,
 > `getVisitorId`) and broke integrations. Use the API described in this skill.
@@ -20,13 +20,13 @@ Integrate the `@temps-sdk/react-analytics` SDK into a React application.
 ## Installation
 
 ```bash
-npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.7
+npm install --ignore-scripts --save-exact @temps-sdk/react-analytics@0.0.9
 ```
 
 Before running the install, explain that it changes the application's
 dependencies and lockfile and ask for confirmation. The reviewed npm package
 integrity is
-`sha512-2b0N/9Ya/wyWLInMolj8jVSWiWOC5R6CkrXeCFdfv4hgUWcHtkgj+vFZdR+qxNGEDfYna4LbFShIimNxytbw7w==`.
+`sha512-qR2e1nBVc4YXxYAqmBsBpJN4wyGqv3lWh3rD+KPlo0tAQ5OS+dycqLW7W61up+76mFoeLnC1Eu74PIJcCyKoWQ==`.
 Verify that the resolved lockfile records this exact version and integrity.
 
 Peer deps: React 18 or 19 (`react`, `react-dom`).
@@ -46,6 +46,8 @@ The SDK POSTs to `${basePath}/event`, `${basePath}/speed`, `${basePath}/heartbea
   2. Mint a key in the Console (Project → Analytics → Setup → "Not hosted on Temps") or with `bunx @temps-sdk/cli analytics keys create -p <project-slug-or-id>`, and pass it as `ingestKey="pa_..."`.
   3. The key is **not a secret** — it's designed to ship in client-side JS, same as a Sentry DSN public key.
   > **Requires an SDK version with `ingestKey` support.** Check the installed package's exported prop types before using this pattern; if `ingestKey` is missing, either upgrade or fall back to a same-origin proxy route that forwards to Temps with the project resolved server-side.
+
+- **No React, or no framework at all** → skip the SDK and call the HTTP API directly: `POST https://<temps-host>/api/_temps/event` with header `X-Temps-Analytics-Key: <pa_ key>` and a JSON body containing `event_name` (`page_view` or a custom name), `request_path`, `request_query`, `event_data`, plus a client-generated `visitor_id`/`session_id` and the site's `domain`. A `204` means it was recorded. `navigator.sendBeacon` cannot set headers, so pass the key as `?temps_key=` and send a `text/plain` body. The Console's **Analytics → Setup → Plain HTTP / any framework** option shows this project's exact URL, a `curl` example and a copyable agent prompt.
 
 The package's built-in default basePath is `/api/_temps`. Set `basePath` only when the app needs a custom same-origin proxy path, or is not hosted on Temps at all (see above).
 

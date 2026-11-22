@@ -4,6 +4,7 @@
 import {
   addManagedDomain,
   applyHostnameMode,
+  createIngressConnector,
   deleteDnsProvider as deleteProvider,
   getDnsProvider as getProvider,
   listManagedDomains,
@@ -18,18 +19,9 @@ import {
   type ManagedDomainResponse,
   type UpdateDnsProviderRequest,
 } from '@/api/client'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -66,6 +58,14 @@ import {
 } from '@/components/domains/delivery-errors'
 import { HostnameConflictList } from '@/components/domains/HostnameConflictList'
 import {
+  NO_ZONE_TUNNEL,
+  ZoneTunnelChoice,
+  tunnelKindFor,
+  tunnelNameFor,
+  type ZoneTunnel,
+} from '@/components/domains/ZoneTunnelChoice'
+import { problemDetail } from '@/lib/api-problem'
+import {
   conflictDecisionsRequest,
   conflictKey,
   plannedDnsChanges,
@@ -93,7 +93,6 @@ import {
   Cloud,
   Edit,
   Globe,
-  Loader2,
   Plus,
   RefreshCw,
   TestTube2,
@@ -253,6 +252,7 @@ export default function DnsProviderDetail() {
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isAddDomainDialogOpen, setIsAddDomainDialogOpen] = useState(false)
+  const [zoneTunnel, setZoneTunnel] = useState<ZoneTunnel>(NO_ZONE_TUNNEL)
   const [domainToRemove, setDomainToRemove] =
     useState<ManagedDomainResponse | null>(null)
 
@@ -387,12 +387,40 @@ export default function DnsProviderDetail() {
           sync_generated_records: data.proxied_by_default,
         },
       })
-      return requireDeliveryData(response)
+      requireDeliveryData(response)
+      // ADR 058 D10: the tunnel for the zone, created right after it. The
+      // zone stays added if this fails; the message says where to retry.
+      const kind = provider ? tunnelKindFor(provider.provider_type) : undefined
+      if (zoneTunnel.mode !== 'tunnel' || !kind) return { tunnelError: null }
+      const tunnel = await createIngressConnector({
+        body: {
+          name: tunnelNameFor(data.domain),
+          provider: kind,
+          values: { dns_provider_id: providerId, domain: data.domain },
+          node_ids: zoneTunnel.nodeIds,
+        },
+      })
+      return {
+        tunnelError: tunnel.error
+          ? problemDetail(tunnel.error, 'The provider refused the tunnel.')
+          : null,
+      }
     },
-    onSuccess: () => {
-      toast.success('Zone added successfully')
+    onSuccess: ({ tunnelError }) => {
+      if (tunnelError) {
+        toast.warning('Zone added, but its tunnel was not created', {
+          description: `${tunnelError} Set it up from a worker's page.`,
+        })
+      } else {
+        toast.success(
+          zoneTunnel.mode === 'tunnel'
+            ? 'Zone and tunnel added. Apps under it go live through the tunnel.'
+            : 'Zone added successfully'
+        )
+      }
       refetchDomains()
       setIsAddDomainDialogOpen(false)
+      setZoneTunnel(NO_ZONE_TUNNEL)
       addDomainForm.reset()
     },
     onError: (err: Error) => {
@@ -606,7 +634,7 @@ export default function DnsProviderDetail() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'DNS Providers', href: '/dns-providers' },
+        { label: 'DNS providers', href: '/dns-providers' },
         { label: provider.name },
       ])
     }
@@ -661,7 +689,7 @@ export default function DnsProviderDetail() {
               busyLabel="Testing…"
             >
               <TestTube2 className="mr-2 size-4" />
-              Test Connection
+              Test connection
             </Button>
             <Button
               variant="outline"
@@ -771,7 +799,7 @@ export default function DnsProviderDetail() {
                                 className="flex items-center gap-1"
                               >
                                 <XCircle className="h-3 w-3" />
-                                Not Verified
+                                Not verified
                               </Badge>
                             )}
                             {domain.auto_manage && (
@@ -971,7 +999,7 @@ export default function DnsProviderDetail() {
             {zones && zones.zones.length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Available Zones</CardTitle>
+                  <CardTitle>Available zones</CardTitle>
                   <CardDescription>
                     DNS zones available in this provider account
                   </CardDescription>
@@ -1151,7 +1179,7 @@ export default function DnsProviderDetail() {
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit DNS Provider</DialogTitle>
+            <DialogTitle>Edit DNS provider</DialogTitle>
             <DialogDescription>Update the provider settings</DialogDescription>
           </DialogHeader>
           <Form {...editForm}>
@@ -1254,7 +1282,7 @@ export default function DnsProviderDetail() {
                   busy={updateProviderMut.isPending}
                   busyLabel="Saving…"
                 >
-                  Save Changes
+                  Save
                 </Button>
               </DialogFooter>
             </form>
@@ -1368,6 +1396,12 @@ export default function DnsProviderDetail() {
                 )}
               />
 
+              <ZoneTunnelChoice
+                providerType={provider.provider_type}
+                value={zoneTunnel}
+                onChange={setZoneTunnel}
+              />
+
               <DialogFooter>
                 <Button
                   type="button"
@@ -1381,11 +1415,13 @@ export default function DnsProviderDetail() {
                   busy={addDomainMut.isPending}
                   busyLabel="Adding…"
                   disabled={
-                    providerSupportsZoneSelection &&
-                    (zonesPending ||
-                      zonesError ||
-                      selectableZones.length === 0 ||
-                      !addDomainForm.watch('domain'))
+                    (zoneTunnel.mode === 'tunnel' &&
+                      zoneTunnel.nodeIds.length === 0) ||
+                    (providerSupportsZoneSelection &&
+                      (zonesPending ||
+                        zonesError ||
+                        selectableZones.length === 0 ||
+                        !addDomainForm.watch('domain')))
                   }
                 >
                   Add zone
@@ -1397,74 +1433,33 @@ export default function DnsProviderDetail() {
       </Dialog>
 
       {/* Delete Provider Dialog */}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={isDeleteDialogOpen}
         onOpenChange={setIsDeleteDialogOpen}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete DNS Provider</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to delete &quot;{provider.name}&quot;? This
-              action cannot be undone and will remove all managed zones
-              associated with this provider.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProviderMut.isPending}
-              onClick={() => deleteProviderMut.mutate()}
-            >
-              {deleteProviderMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Deleting...
-                </>
-              ) : (
-                'Delete Provider'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        resourceType="DNS provider"
+        resourceName={provider.name}
+        confirmLabel="Delete Provider"
+        consequences="All managed zones associated with this provider are removed, and DNS records for them will no longer be automatically managed."
+        isPending={deleteProviderMut.isPending}
+        onConfirm={() => deleteProviderMut.mutate()}
+      />
 
       {/* Remove managed zone dialog */}
-      <AlertDialog
-        open={!!domainToRemove}
-        onOpenChange={(open) => !open && setDomainToRemove(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Remove managed zone</AlertDialogTitle>
-            <AlertDialogDescription>
-              Are you sure you want to remove &quot;{domainToRemove?.domain}
-              &quot; from this provider? DNS records will no longer be
-              automatically managed.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={removeDomainMut.isPending}
-              onClick={() =>
-                domainToRemove && removeDomainMut.mutate(domainToRemove.domain)
-              }
-            >
-              {removeDomainMut.isPending ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Removing...
-                </>
-              ) : (
-                'Remove zone'
-              )}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={domainToRemove !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToRemove(null)
+        }}
+        resourceType="managed zone"
+        resourceName={domainToRemove?.domain ?? ''}
+        verb="Remove"
+        confirmLabel="Remove zone"
+        consequences={`It is removed from ${provider.name}; DNS records for it will no longer be automatically managed.`}
+        isPending={removeDomainMut.isPending}
+        onConfirm={() => {
+          if (domainToRemove) removeDomainMut.mutate(domainToRemove.domain)
+        }}
+      />
     </>
   )
 }

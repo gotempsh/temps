@@ -1,20 +1,28 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import {
+  memberProgress,
+  type MemberProgressInput,
+} from '@/lib/cluster-member-progress'
 import { linkedResourceCopy } from '@/lib/service-link-copy'
 import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
-  listS3SourcesOptions,
   getServiceOptions,
+  getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
   listServiceProjectsOptions,
+  listServiceProjectsQueryKey,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { revealServiceParameter } from '@/api/client/sdk.gen'
+import {
+  revealServiceEnvironmentVariables,
+  revealServiceParameter,
+} from '@/api/client/sdk.gen'
 import { cn } from '@/lib/utils'
 import {
   externalServiceBackupsQueryKey,
@@ -24,12 +32,16 @@ import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
+import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
   ServiceHealthBadge,
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
+import { backupDestinationsOptions } from '@/components/storage/backup-destinations-query'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import {
   ScheduleBackupsAction,
@@ -40,7 +52,9 @@ import {
   backupDestinationState,
 } from '@/lib/service-backup-setup'
 import { ActiveRestoreBanner } from '@/pages/service-restore/ActiveRestoreBanner'
+import { MigrateS3Dialog } from '@/components/storage/MigrateS3Dialog'
 import { UpgradeServiceDialog } from '@/components/storage/UpgradeServiceDialog'
+import { s3EngineLabel, s3MigrationSupported } from '@/lib/s3-engine'
 import {
   listPgUpgrades,
   phaseIndex,
@@ -76,11 +90,10 @@ import {
   PopoverContent,
   PopoverTrigger,
 } from '@/components/ui/popover'
-import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
-import { Input } from '@/components/ui/input'
-import { Label } from '@/components/ui/label'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
@@ -127,8 +140,6 @@ import {
   ArrowUpCircle,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Clock,
   Database,
   Eye,
@@ -148,10 +159,13 @@ import {
   XCircle,
   BarChart2,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
+import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 /**
  * Pick the role label to render for a cluster member.
@@ -214,8 +228,8 @@ export function ServiceDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
-  const [deleteConfirmName, setDeleteConfirmName] = useState('')
   const [isUpgradeDialogOpen, setIsUpgradeDialogOpen] = useState(false)
+  const [isMigrateS3DialogOpen, setIsMigrateS3DialogOpen] = useState(false)
   const [isMajorUpgradeDialogOpen, setIsMajorUpgradeDialogOpen] =
     useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -253,6 +267,7 @@ export function ServiceDetail() {
     isLoading,
     error: queryError,
     refetch,
+    isFetching: isFetchingService,
   } = useQuery({
     ...getServiceOptions({
       path: { id: parseInt(id!) },
@@ -360,7 +375,7 @@ export function ServiceDetail() {
   // Backup destinations decide whether the Backups card can offer to back
   // this database up or must onboard a destination first.
   const backupSourcesQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     retry: false,
   })
   const backupSources = backupSourcesQuery.data ?? []
@@ -390,18 +405,6 @@ export function ServiceDetail() {
 
   const paginatedBackups = serviceBackups
 
-  const backupsPageWindow = useMemo(() => {
-    const windowSize = Math.min(5, backupsTotalPages)
-    const start = Math.max(
-      1,
-      Math.min(
-        backupsPage - Math.floor(windowSize / 2),
-        backupsTotalPages - windowSize + 1
-      )
-    )
-    return Array.from({ length: windowSize }, (_, idx) => start + idx)
-  }, [backupsPage, backupsTotalPages])
-
   const [isLinkPopoverOpen, setIsLinkPopoverOpen] = useState(
     () =>
       (
@@ -413,9 +416,9 @@ export function ServiceDetail() {
 
   const linkService = useMutation({
     ...linkServiceToProjectMutation(),
-    meta: { errorTitle: 'Failed to link project' },
+    meta: { errorTitle: 'Failed to link service' },
     onSuccess: (_data, variables) => {
-      toast.success('Project linked successfully')
+      toast.success('Service linked successfully')
       refetchLinkedProjects()
       setIsLinkPopoverOpen(false)
       const project = allProjectsData?.projects?.find(
@@ -443,7 +446,7 @@ export function ServiceDetail() {
     } else {
       setBreadcrumbs([
         { label: 'Databases', href: '/storage' },
-        { label: 'Service Details', href: `/storage/${id}` },
+        { label: 'Service details', href: `/storage/${id}` },
       ])
     }
   }, [setBreadcrumbs, id, service])
@@ -454,9 +457,7 @@ export function ServiceDetail() {
   const serviceLoaded = !!service
   useEffect(() => {
     if (!serviceLoaded || location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`) return
-    document
-      .getElementById(SERVICE_BACKUPS_ANCHOR)
-      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    scrollToElementId(SERVICE_BACKUPS_ANCHOR, { behavior: 'smooth' })
   }, [serviceLoaded, location.hash])
 
   // Notify when cluster creation or a readiness-gated start settles
@@ -642,10 +643,6 @@ export function ServiceDetail() {
       toast.promise(startService.mutateAsync({ path: { id: parseInt(id!) } }), {
         loading: `Starting ${service.service.name}…`,
         success: `${service.service.name} started`,
-        error: (err: Error) =>
-          err?.message
-            ? `Failed to start ${service.service.name}: ${err.message}`
-            : `Failed to start ${service.service.name}`,
       })
     }
   }
@@ -657,24 +654,14 @@ export function ServiceDetail() {
     )
   }
 
-  const handleDelete = async () => {
-    if (deleteConfirmName.trim() !== service?.service?.name) return
+  const handleDelete = () => {
     deleteService.mutate({ path: { id: parseInt(id!) } })
   }
-
-  const backAction = (
-    <Button variant="ghost" size="icon" asChild>
-      <Link to="/storage">
-        <ArrowLeft className="h-4 w-4" />
-      </Link>
-    </Button>
-  )
 
   if (isLoading) {
     return (
       <Detail
         title={<Skeleton className="h-7 w-56" />}
-        actions={backAction}
         facts={[0, 1, 2, 3].map(() => ({
           label: <Skeleton className="h-3 w-16" />,
           value: <Skeleton className="h-4 w-24" />,
@@ -690,7 +677,25 @@ export function ServiceDetail() {
     )
   }
 
-  if (queryError || !service) {
+  if (queryError && isVerifiedNotFound(queryError)) {
+    return (
+      <PageState
+        variant="empty"
+        icon={AlertCircle}
+        title="Service not found"
+        description="This storage service does not exist, or it has been deleted."
+        action={
+          <Button asChild>
+            <Link to="/storage">All storage services</Link>
+          </Button>
+        }
+      />
+    )
+  }
+
+  // A failed refresh keeps the loaded page (and its open dialogs); only a
+  // service that never loaded is replaced by the error.
+  if (!service) {
     return (
       <PageState
         variant="failed"
@@ -722,6 +727,15 @@ export function ServiceDetail() {
     label: service.service.status,
   }
 
+  const s3Engine = s3EngineLabel(
+    service.service.service_type,
+    service.current_parameters
+  )
+  const canMigrateS3 = s3MigrationSupported(
+    service.service.service_type,
+    service.current_parameters
+  )
+
   const facts: DetailFact[] = [
     {
       label: 'Type',
@@ -735,6 +749,7 @@ export function ServiceDetail() {
         </span>
       ),
     },
+    ...(s3Engine ? [{ label: 'Engine', value: s3Engine }] : []),
     {
       label: 'Topology',
       value:
@@ -769,7 +784,18 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
-            {backAction}
+            <RefreshButton
+              queryKeys={[
+                getServiceQueryKey({ path: { id: service.service.id } }),
+                listServiceProjectsQueryKey({
+                  path: { id: service.service.id },
+                }),
+                ['pg-upgrades', id],
+                externalServiceBackupsQueryKey(service.service.id),
+                // The header badge and the health strip.
+                ['service-health', service.service.id],
+              ]}
+            />
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -796,7 +822,7 @@ export function ServiceDetail() {
               <PopoverContent className="w-[320px] p-0" align="end">
                 <div className="border-b p-3">
                   <p className="text-xs font-medium text-muted-foreground">
-                    Linked projects
+                    Linked services
                   </p>
                   <LinkedResourceNote
                     serviceType={service.service.service_type}
@@ -826,14 +852,14 @@ export function ServiceDetail() {
                     </ul>
                   ) : (
                     <p className="mt-2 text-xs text-muted-foreground">
-                      No projects yet.
+                      No services linked yet.
                     </p>
                   )}
                 </div>
                 <Command>
-                  <CommandInput placeholder="Link a project..." />
+                  <CommandInput placeholder="Link a service..." />
                   <CommandList>
-                    <CommandEmpty>No projects found.</CommandEmpty>
+                    <CommandEmpty>No services found.</CommandEmpty>
                     <CommandGroup>
                       {allProjectsData?.projects
                         ?.filter(
@@ -954,6 +980,15 @@ export function ServiceDetail() {
                   <ArrowUpCircle className="h-4 w-4 mr-2" />
                   Upgrade
                 </DropdownMenuItem>
+                {canMigrateS3 ? (
+                  <DropdownMenuItem
+                    className="min-h-12 sm:min-h-8"
+                    onClick={() => setIsMigrateS3DialogOpen(true)}
+                  >
+                    <DatabaseZap className="h-4 w-4 mr-2" />
+                    Migrate data from another S3 service…
+                  </DropdownMenuItem>
+                ) : null}
                 {service.service.service_type === 'postgres' ? (
                   <DropdownMenuItem
                     className="min-h-12 sm:min-h-8"
@@ -1005,8 +1040,26 @@ export function ServiceDetail() {
         main={
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
+            {queryError ? (
+              <Callout tone="error" title="Couldn't refresh service">
+                Showing the last loaded service.{' '}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refetch()}
+                  disabled={isFetchingService}
+                >
+                  Retry service
+                </Button>
+              </Callout>
+            ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
+
+            {/* This service's containers over the log ingestion budget. */}
+            <LogIngestBudgetWarning
+              scope={{ externalServiceId: service.service.id }}
+            />
 
             {/*
               Why a service is still starting, or why it failed to
@@ -1040,7 +1093,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />
@@ -1055,6 +1114,7 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
 
@@ -1062,8 +1122,8 @@ export function ServiceDetail() {
             {service.service.topology === 'cluster' &&
               service.service.status === 'creating' && (
                 <Callout tone="info" title="Creating cluster members…">
-                  This may take a minute. Members will appear below as they are
-                  provisioned.
+                  Members are created one at a time, the monitor first. Each row
+                  below shows what it is doing.
                 </Callout>
               )}
 
@@ -1144,7 +1204,7 @@ export function ServiceDetail() {
                           <Button variant="outline" size="sm" asChild>
                             <Link to={`/storage/${id}/members/add`}>
                               <Plus className="h-4 w-4 mr-1" />
-                              Add Replica
+                              Add replica
                             </Link>
                           </Button>
                         )}
@@ -1193,7 +1253,7 @@ export function ServiceDetail() {
                                 <Server className="h-4 w-4 text-muted-foreground flex-shrink-0" />
                               )}
                               <div className="flex flex-col min-w-0">
-                                <div className="flex items-center gap-2">
+                                <div className="flex min-w-0 items-center gap-2">
                                   <span className="font-mono text-sm truncate">
                                     {member.container_name}
                                   </span>
@@ -1219,6 +1279,7 @@ export function ServiceDetail() {
                                     </span>
                                   )}
                                 </div>
+                                <MemberProgressLine member={member} />
                               </div>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
@@ -1294,6 +1355,22 @@ export function ServiceDetail() {
               serviceName={service.service.name}
             />
 
+            {/* The container's Docker healthcheck and its overrides */}
+            <ServiceHealthcheckCard
+              serviceId={service.service.id}
+              serviceName={service.service.name}
+              serviceStatus={service.service.status}
+            />
+
+            {/* Server TLS for managed PostgreSQL (ADR-093) */}
+            {service.service.service_type === 'postgres' && (
+              <ServiceTlsCard
+                serviceId={service.service.id}
+                serviceName={service.service.name}
+                serviceStatus={service.service.status}
+              />
+            )}
+
             {/* Backups Section */}
             <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">
               <CardHeader>
@@ -1364,7 +1441,7 @@ export function ServiceDetail() {
                     onTriggerBackup={() => setIsBackupDialogOpen(true)}
                   />
                 ) : (
-                  <ul role="list" className="divide-y divide-border">
+                  <ul role="list" className="@container divide-y divide-border">
                     {paginatedBackups.map((backup) => {
                       const key =
                         backup.backup_id ||
@@ -1406,7 +1483,7 @@ export function ServiceDetail() {
                         <li key={key}>
                           <Link
                             to={linkTo}
-                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md sm:gap-4 -mx-2 px-2"
+                            className="flex items-center gap-3 py-3 transition-colors hover:bg-muted/40 focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:rounded-md @md:gap-4 -mx-2 px-2"
                           >
                             <div className="flex size-9 shrink-0 items-center justify-center rounded-md bg-muted">
                               <ServiceIcon className="size-4 text-muted-foreground" />
@@ -1418,54 +1495,66 @@ export function ServiceDetail() {
                               short UUID, error preview). */}
                             <div className="min-w-0 flex-1">
                               <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
-                                <p className="truncate text-sm font-medium">
-                                  <TimeAgo date={backup.started_at} />
-                                </p>
-                                <span
-                                  className="hidden text-xs text-muted-foreground sm:inline"
-                                  aria-hidden
-                                >
-                                  ·
-                                </span>
-                                <span className="font-mono text-xs text-muted-foreground tabular-nums hidden sm:inline">
-                                  {fmtDateTime(backup.started_at)}
-                                </span>
-                                {backup.backup_type ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    {backup.backup_type}
-                                  </Badge>
-                                ) : null}
-                                {isCompleted ? (
-                                  <Badge
-                                    variant="outline"
-                                    className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                {/* Two groups that wrap whole, so every row
+                                  breaks in the same place whatever its length. */}
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <p className="truncate text-sm font-medium">
+                                    <TimeAgo date={backup.started_at} />
+                                  </p>
+                                  <span
+                                    className="hidden text-xs text-muted-foreground @md:inline"
+                                    aria-hidden
                                   >
-                                    <CheckCircle2 className="h-3 w-3" />
-                                    Completed
-                                  </Badge>
-                                ) : isRunning ? (
-                                  <Badge
-                                    variant="secondary"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <Radio className="h-3 w-3 animate-pulse" />
-                                    {state === 'pending'
-                                      ? 'Pending'
-                                      : 'Running'}
-                                  </Badge>
-                                ) : isFailed ? (
-                                  <Badge
-                                    variant="destructive"
-                                    className="gap-1 text-xs"
-                                  >
-                                    <XCircle className="h-3 w-3" />
-                                    Failed
-                                  </Badge>
-                                ) : (
-                                  <Badge variant="outline" className="text-xs">
-                                    {state}
-                                  </Badge>
-                                )}
+                                    ·
+                                  </span>
+                                  <span className="font-mono text-xs text-muted-foreground tabular-nums hidden @md:inline">
+                                    {fmtDateTime(backup.started_at)}
+                                  </span>
+                                </div>
+                                <div className="flex basis-full items-center gap-2 @2xl:basis-auto">
+                                  {backup.backup_type ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {backup.backup_type}
+                                    </Badge>
+                                  ) : null}
+                                  {isCompleted ? (
+                                    <Badge
+                                      variant="outline"
+                                      className="gap-1 border-emerald-500/50 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-xs"
+                                    >
+                                      <CheckCircle2 className="h-3 w-3" />
+                                      Completed
+                                    </Badge>
+                                  ) : isRunning ? (
+                                    <Badge
+                                      variant="secondary"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <Radio className="h-3 w-3 animate-pulse" />
+                                      {state === 'pending'
+                                        ? 'Pending'
+                                        : 'Running'}
+                                    </Badge>
+                                  ) : isFailed ? (
+                                    <Badge
+                                      variant="destructive"
+                                      className="gap-1 text-xs"
+                                    >
+                                      <XCircle className="h-3 w-3" />
+                                      Failed
+                                    </Badge>
+                                  ) : (
+                                    <Badge
+                                      variant="outline"
+                                      className="text-xs"
+                                    >
+                                      {state}
+                                    </Badge>
+                                  )}
+                                </div>
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground tabular-nums">
                                 <span className="truncate">
@@ -1484,7 +1573,7 @@ export function ServiceDetail() {
                                   </span>
                                 ) : null}
                                 {backup.backup_id ? (
-                                  <span className="font-mono">
+                                  <span className="hidden font-mono @lg:inline">
                                     #{backup.backup_id.slice(0, 8)}
                                   </span>
                                 ) : null}
@@ -1511,7 +1600,7 @@ export function ServiceDetail() {
                             <Button
                               variant="ghost"
                               size="sm"
-                              className="hidden gap-2 sm:flex"
+                              className="hidden gap-2 @md:flex"
                               tabIndex={-1}
                               asChild={false}
                             >
@@ -1525,62 +1614,15 @@ export function ServiceDetail() {
                   </ul>
                 )}
                 {backupsTotalPages > 1 && (
-                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between mt-4">
-                    <div className="text-sm text-muted-foreground">
-                      <span className="hidden sm:inline tabular-nums">
-                        Showing {(backupsPage - 1) * BACKUPS_PAGE_SIZE + 1} to{' '}
-                        {Math.min(
-                          backupsPage * BACKUPS_PAGE_SIZE,
-                          serviceBackupsData?.total ?? 0
-                        )}{' '}
-                        of {serviceBackupsData?.total ?? 0} backups
-                      </span>
-                      <span className="sm:hidden tabular-nums">
-                        {backupsPage} / {backupsTotalPages}
-                      </span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(Math.max(1, backupsPage - 1))
-                        }
-                        disabled={backupsPage === 1}
-                      >
-                        <ChevronLeft className="h-4 w-4" />
-                        <span className="hidden sm:inline">Previous</span>
-                      </Button>
-                      <div className="hidden sm:flex items-center gap-1">
-                        {backupsPageWindow.map((pageNum) => (
-                          <Button
-                            key={pageNum}
-                            variant={
-                              pageNum === backupsPage ? 'default' : 'outline'
-                            }
-                            size="sm"
-                            onClick={() => setBackupsPage(pageNum)}
-                            className="w-10"
-                          >
-                            {pageNum}
-                          </Button>
-                        ))}
-                      </div>
-                      <Button
-                        variant="outline"
-                        size="sm"
-                        onClick={() =>
-                          setBackupsPage(
-                            Math.min(backupsTotalPages, backupsPage + 1)
-                          )
-                        }
-                        disabled={backupsPage === backupsTotalPages}
-                      >
-                        <span className="hidden sm:inline">Next</span>
-                        <ChevronRight className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
+                  <ResponsivePagination
+                    className="mt-4"
+                    page={backupsPage}
+                    pageSize={BACKUPS_PAGE_SIZE}
+                    total={serviceBackupsData?.total ?? 0}
+                    totalPages={backupsTotalPages}
+                    onPageChange={setBackupsPage}
+                    ariaLabel="Backups pagination"
+                  />
                 )}
               </CardContent>
             </Card>
@@ -1590,7 +1632,7 @@ export function ServiceDetail() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <ArrowUpCircle className="h-5 w-5" />
-                    Major Version Upgrades
+                    Major version upgrades
                   </CardTitle>
                   <CardDescription>
                     History of PostgreSQL major-version upgrades for this
@@ -1864,10 +1906,10 @@ export function ServiceDetail() {
             {/* Environment Variables Section */}
             <Card>
               <CardHeader>
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
-                  Preview of environment variables available to projects using
-                  this service
+                  Preview of environment variables available to the services
+                  linked to it
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -1888,15 +1930,24 @@ export function ServiceDetail() {
                 ) : envVars ? (
                   <>
                     <EnvVariablesDisplay
+                      key={id}
                       variables={envVars}
                       showCopy={true}
                       showMaskToggle={true}
                       defaultMasked={true}
                       maxHeight="20rem"
+                      reveal={async () =>
+                        (
+                          await revealServiceEnvironmentVariables({
+                            path: { id: parseInt(id!) },
+                            throwOnError: true,
+                          })
+                        ).data
+                      }
                     />
                     <p className="text-xs text-muted-foreground text-center mt-3">
-                      These variables are automatically available to projects
-                      that use this service
+                      These variables are automatically available to every
+                      linked service
                     </p>
                   </>
                 ) : null}
@@ -1909,14 +1960,14 @@ export function ServiceDetail() {
       <Dialog open={isStopDialogOpen} onOpenChange={setIsStopDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Stop Service</DialogTitle>
+            <DialogTitle>Stop service</DialogTitle>
             <DialogDescription>
               Are you sure you want to stop{' '}
               <span className="font-medium text-foreground">
                 {service.service.name}
               </span>
-              ? All connected projects will lose access to this service until it
-              is started again.
+              ? Every linked service will lose access to it until it is started
+              again.
             </DialogDescription>
           </DialogHeader>
           <DialogFooter>
@@ -1932,106 +1983,49 @@ export function ServiceDetail() {
               busy={stopService.isPending}
               busyLabel="Stopping…"
             >
-              Stop Service
+              Stop service
             </Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
 
-      <Dialog
+      <ConfirmDeleteDialog
         open={isDeleteDialogOpen}
-        onOpenChange={(open) => {
-          setIsDeleteDialogOpen(open)
-          if (!open) setDeleteConfirmName('')
-        }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Delete Service</DialogTitle>
-            <DialogDescription>
-              This action cannot be undone and all data associated with this
-              service will be permanently removed.
-            </DialogDescription>
-          </DialogHeader>
-          <div className="space-y-2">
-            <Label htmlFor="confirm-delete-service-name">
-              Type <ConfirmNameBadge value={service.service.name} /> to confirm
-            </Label>
-            <Input
-              id="confirm-delete-service-name"
-              value={deleteConfirmName}
-              onChange={(e) => setDeleteConfirmName(e.target.value)}
-              placeholder={service.service.name}
-              autoComplete="off"
-              autoFocus
-            />
-          </div>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setIsDeleteDialogOpen(false)}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={handleDelete}
-              disabled={deleteConfirmName.trim() !== service.service.name}
-              busy={deleteService.isPending}
-              busyLabel="Deleting…"
-            >
-              Delete
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        onOpenChange={setIsDeleteDialogOpen}
+        resourceType="service"
+        resourceName={service.service.name}
+        requireTypedName
+        consequences="All data associated with this service will be permanently removed."
+        isPending={deleteService.isPending}
+        onConfirm={handleDelete}
+      />
 
-      <Dialog
-        open={!!memberToRemove}
+      <ConfirmDeleteDialog
+        open={memberToRemove !== null}
         onOpenChange={(open) => {
           if (!open) setMemberToRemove(null)
         }}
-      >
-        <DialogContent>
-          <DialogHeader>
-            <DialogTitle>Remove Cluster Member</DialogTitle>
-            <DialogDescription>
-              Stop and remove{' '}
-              <span className="font-mono text-foreground">
-                {memberToRemove?.container_name}
-              </span>{' '}
-              from this cluster. The container, its data volume, and the
-              member&apos;s DNS record will be deleted. The pg_auto_failover
-              monitor will mark the node as unreachable; run{' '}
-              <span className="font-mono">pg_autoctl drop node</span> manually
-              if you want a fully-clean monitor view.
-            </DialogDescription>
-          </DialogHeader>
-          <DialogFooter>
-            <Button
-              variant="outline"
-              onClick={() => setMemberToRemove(null)}
-              disabled={removeMember.isPending}
-            >
-              Cancel
-            </Button>
-            <Button
-              variant="destructive"
-              onClick={() =>
-                memberToRemove &&
-                removeMember.mutate({
-                  serviceId: parseInt(id!),
-                  memberId: memberToRemove.id,
-                })
-              }
-              busy={removeMember.isPending}
-              busyLabel="Removing…"
-            >
-              Remove Member
-            </Button>
-          </DialogFooter>
-        </DialogContent>
-      </Dialog>
+        resourceType="cluster member"
+        resourceName={memberToRemove?.container_name ?? ''}
+        verb="Remove"
+        consequences={
+          <>
+            Stops and removes it from {service.service.name}. The container, its
+            data volume, and the member&apos;s DNS record will be deleted. The
+            pg_auto_failover monitor will mark the node as unreachable; run{' '}
+            <span className="font-mono">pg_autoctl drop node</span> manually if
+            you want a fully-clean monitor view.
+          </>
+        }
+        isPending={removeMember.isPending}
+        onConfirm={() => {
+          if (memberToRemove)
+            removeMember.mutate({
+              serviceId: parseInt(id!),
+              memberId: memberToRemove.id,
+            })
+        }}
+      />
 
       <Dialog
         open={!!memberToPromote}
@@ -2041,7 +2035,7 @@ export function ServiceDetail() {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Promote to Primary</DialogTitle>
+            <DialogTitle>Promote to primary</DialogTitle>
             <DialogDescription>
               Trigger a pg_auto_failover failover so{' '}
               <span className="font-mono text-foreground">
@@ -2086,6 +2080,14 @@ export function ServiceDetail() {
         serviceName={service.service.name}
         currentImage={service.current_parameters?.docker_image || undefined}
         serviceType={service.service.service_type}
+        onSuccess={() => refetch()}
+      />
+
+      <MigrateS3Dialog
+        open={isMigrateS3DialogOpen}
+        onOpenChange={setIsMigrateS3DialogOpen}
+        serviceId={parseInt(id!)}
+        serviceName={service.service.name}
         onSuccess={() => refetch()}
       />
 
@@ -2160,6 +2162,22 @@ function LinkedResourceNote({ serviceType }: { serviceType: string }) {
         </>
       ) : null}
       {copy.trail}
+    </p>
+  )
+}
+
+function MemberProgressLine({ member }: { member: MemberProgressInput }) {
+  const progress = memberProgress(member)
+  if (!progress) return null
+  return (
+    <p
+      className={
+        progress.tone === 'error'
+          ? 'text-xs text-destructive break-words'
+          : 'text-xs text-muted-foreground'
+      }
+    >
+      {progress.text}
     </p>
   )
 }

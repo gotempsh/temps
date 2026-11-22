@@ -19,6 +19,7 @@ use netlink_packet_route::link::{
     InfoData, InfoKind, InfoVxlan, LinkAttribute, LinkInfo, LinkMessage,
 };
 use std::fmt;
+use std::net::IpAddr;
 use std::process::Output;
 
 /// A link, as needed to compare it with a requested VXLAN device and to
@@ -45,6 +46,9 @@ pub struct VxlanAttributes {
     /// Index of the underlay device it sends through; `None` when it is not
     /// bound to one.
     pub parent: Option<u32>,
+    /// The source address of what it encapsulates; `None` for a device
+    /// created before the local address was set.
+    pub local: Option<IpAddr>,
 }
 
 impl LinkDescription {
@@ -71,6 +75,7 @@ impl LinkDescription {
                                     vni: None,
                                     port: None,
                                     parent: None,
+                                    local: None,
                                 });
                             }
                             LinkInfo::Kind(kind) => link.kind = Some(kind.to_string()),
@@ -116,6 +121,12 @@ impl LinkDescription {
             && vxlan.port == Some(port))
     }
 
+    /// Whether a VXLAN device sends from `local`. A device without one, as
+    /// every one created before it was set, does not.
+    pub fn has_local(&self, local: IpAddr) -> bool {
+        self.vxlan.is_some_and(|vxlan| vxlan.local == Some(local))
+    }
+
     /// Whether this is a VXLAN device other than `name` holding `vni` on
     /// `port`: the kernel refuses a second one.
     pub fn holds(&self, name: &str, vni: u32, port: u16) -> bool {
@@ -131,20 +142,28 @@ fn vxlan_attributes(data: &[InfoVxlan]) -> VxlanAttributes {
         vni: None,
         port: None,
         parent: None,
+        local: None,
     };
     for attribute in data {
         match attribute {
             InfoVxlan::Id(vni) => vxlan.vni = Some(*vni),
             InfoVxlan::Port(port) => vxlan.port = Some(*port),
             InfoVxlan::Link(index) if *index != 0 => vxlan.parent = Some(*index),
+            // The kernel reports an unset local address as all zeros.
+            InfoVxlan::Local(local) if !local.is_unspecified() => {
+                vxlan.local = Some(IpAddr::V4(*local));
+            }
+            InfoVxlan::Local6(local) if !local.is_unspecified() => {
+                vxlan.local = Some(IpAddr::V6(*local));
+            }
             _ => {}
         }
     }
     vxlan
 }
 
-/// For logs and errors: `vxlan-temps0 (index 11): vxlan id 42 dev index 3
-/// dstport 4789 mtu 1450`.
+/// For logs and errors: `vxlan-temps0 (index 11): vxlan id 42 local
+/// 10.0.0.1 dev index 3 dstport 4789 mtu 1450`.
 impl fmt::Display for LinkDescription {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -157,6 +176,10 @@ impl fmt::Display for LinkDescription {
             write!(f, ": vxlan")?;
             if let Some(vni) = vxlan.vni {
                 write!(f, " id {vni}")?;
+            }
+            match vxlan.local {
+                Some(local) => write!(f, " local {local}")?,
+                None => write!(f, " no local")?,
             }
             match vxlan.parent {
                 Some(parent) => write!(f, " dev index {parent}")?,
@@ -190,6 +213,7 @@ mod tests {
     use super::{command_failure, LinkDescription, VxlanAttributes};
     use netlink_packet_core::Parseable;
     use netlink_packet_route::link::LinkMessage;
+    use std::net::IpAddr;
 
     /// A netlink attribute: length, type, payload, padded to 4 bytes.
     fn nla(kind: u16, payload: &[u8]) -> Vec<u8> {
@@ -223,17 +247,33 @@ mod tests {
     const IFLA_INFO_KIND: u16 = 1;
     const IFLA_INFO_DATA: u16 = 2;
 
-    /// `vxlan-temps0` with VNI 42 on port 4789 over the link at index 3,
-    /// enslaved to the bridge at index 5, reported with `extra` VXLAN
+    const IFLA_VXLAN_GROUP: u16 = 2;
+    const IFLA_VXLAN_LOCAL: u16 = 4;
+    const IFLA_VXLAN_LOCAL6: u16 = 17;
+
+    fn local() -> IpAddr {
+        IpAddr::from([10, 0, 0, 1])
+    }
+
+    /// `vxlan-temps0` with VNI 42 on port 4789 from 10.0.0.1 over the link at
+    /// index 3, enslaved to the bridge at index 5, reported with `extra` VXLAN
     /// attributes.
     fn vxlan_device(extra: &[Vec<u8>]) -> LinkMessage {
+        vxlan_device_from(&[nla(IFLA_VXLAN_LOCAL, &[10, 0, 0, 1])], extra)
+    }
+
+    /// [`vxlan_device`] with the local-address attributes `local` instead.
+    fn vxlan_device_from(local: &[Vec<u8>], extra: &[Vec<u8>]) -> LinkMessage {
         let mut data = vec![
-            nla(1, &42u32.to_ne_bytes()),    // IFLA_VXLAN_ID
-            nla(3, &3u32.to_ne_bytes()),     // IFLA_VXLAN_LINK
+            nla(1, &42u32.to_ne_bytes()), // IFLA_VXLAN_ID
+            nla(3, &3u32.to_ne_bytes()),  // IFLA_VXLAN_LINK
+        ];
+        data.extend_from_slice(local);
+        data.extend_from_slice(&[
             nla(7, &[0]),                    // IFLA_VXLAN_LEARNING
             nla(15, &4789u16.to_be_bytes()), // IFLA_VXLAN_PORT, network order
             nla(10, &[0, 0, 0, 0]),          // IFLA_VXLAN_PORT_RANGE
-        ];
+        ]);
         data.extend_from_slice(extra);
         let info = [
             nla(IFLA_INFO_KIND, b"vxlan\0"),
@@ -261,6 +301,7 @@ mod tests {
                 vni: Some(42),
                 port: Some(4789),
                 parent: Some(3),
+                local: Some(local()),
             }),
         }
     }
@@ -270,6 +311,7 @@ mod tests {
         let link = LinkDescription::from_message(&vxlan_device(&[]));
         assert_eq!(link, expected_vxlan());
         assert_eq!(link.matches_topology(Some(3), 42, 4789), Ok(true));
+        assert!(link.has_local(local()));
     }
 
     /// The regression: a kernel that reports VXLAN attributes newer than the
@@ -287,6 +329,41 @@ mod tests {
         let link = LinkDescription::from_message(&message);
         assert_eq!(link, expected_vxlan());
         assert_eq!(link.matches_topology(Some(3), 42, 4789), Ok(true));
+    }
+
+    #[test]
+    fn a_vxlan_without_the_local_address_is_told_apart() {
+        // Every device created before `local` was set: no attribute, or the
+        // kernel's all-zero address.
+        for unset in [vec![], vec![nla(IFLA_VXLAN_LOCAL, &[0, 0, 0, 0])]] {
+            let legacy = LinkDescription::from_message(&vxlan_device_from(&unset, &[]));
+            assert_eq!(legacy.vxlan.and_then(|vxlan| vxlan.local), None);
+            assert!(!legacy.has_local(local()));
+            // The rest of its topology still matches: only the address is off.
+            assert_eq!(legacy.matches_topology(Some(3), 42, 4789), Ok(true));
+            assert!(legacy.to_string().contains("no local"), "{legacy}");
+        }
+        // Another address.
+        assert!(!expected_vxlan().has_local(IpAddr::from([10, 0, 0, 2])));
+        // A remote (group) address is not a local one.
+        let remote = LinkDescription::from_message(&vxlan_device_from(
+            &[nla(IFLA_VXLAN_GROUP, &[10, 0, 0, 1])],
+            &[],
+        ));
+        assert!(!remote.has_local(local()));
+    }
+
+    #[test]
+    fn an_ipv6_local_address_is_read() {
+        let address: std::net::Ipv6Addr = "fd00::1".parse().expect("an IPv6 address");
+        let link = LinkDescription::from_message(&vxlan_device_from(
+            &[nla(IFLA_VXLAN_LOCAL6, &address.octets())],
+            &[],
+        ));
+        let expanded: IpAddr = "fd00:0:0:0:0:0:0:1".parse().expect("an IPv6 address");
+        assert!(link.has_local(expanded));
+        assert!(!link.has_local(local()));
+        assert!(link.to_string().contains("local fd00::1"), "{link}");
     }
 
     #[test]

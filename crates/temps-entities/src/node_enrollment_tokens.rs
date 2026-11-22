@@ -16,6 +16,7 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     /// SHA-256 hex of the plaintext token (never store plaintext).
+    #[serde(skip_serializing)]
     pub token_hash: String,
     /// Maximum number of registrations this token may authorize.
     pub max_uses: i32,
@@ -40,3 +41,32 @@ pub struct Model {
 pub enum Relation {}
 
 impl ActiveModelBehavior for ActiveModel {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serializing_a_token_leaves_out_its_hash() {
+        let now = chrono::Utc::now();
+        let token = Model {
+            id: 1,
+            token_hash: "stored-token-hash".to_string(),
+            max_uses: 1,
+            used_count: 0,
+            expires_at: now,
+            bound_node_name: Some("worker-1".to_string()),
+            bound_labels: None,
+            created_by_user_id: None,
+            revoked_at: None,
+            ca_fingerprint: None,
+            created_at: now,
+            updated_at: now,
+        };
+
+        let json = serde_json::to_string(&token).expect("serializes");
+
+        assert!(!json.contains("stored-token-hash"), "{json}");
+        assert!(json.contains("worker-1"), "{json}");
+    }
+}

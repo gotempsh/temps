@@ -41,6 +41,7 @@ Add a custom domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
+| `--manual-dns` | With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`

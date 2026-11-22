@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::IpAddr;
+use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -12,9 +14,9 @@ use openidconnect::core::{
     CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreIdTokenClaims, CoreProviderMetadata,
 };
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet, EndpointNotSet,
-    EndpointSet, IssuerUrl, Nonce, PkceCodeChallenge, PkceCodeVerifier, RedirectUrl,
-    RequestTokenError, Scope, TokenResponse,
+    AsyncHttpClient, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointMaybeSet,
+    EndpointNotSet, EndpointSet, HttpClientError, HttpRequest, HttpResponse, IssuerUrl, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, RequestTokenError, Scope, TokenResponse,
 };
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseBackend,
@@ -24,12 +26,18 @@ use sea_orm::{
 use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
+
+mod cloud_sessions;
 use crate::oidc_types::{
     derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
     UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
+pub use cloud_sessions::{
+    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
+    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
+};
 use temps_core::EncryptionService;
 use temps_entities::oidc_login_states;
 use temps_entities::oidc_providers;
@@ -37,7 +45,7 @@ use temps_entities::oidc_role_mappings;
 use temps_entities::types::RoleType;
 use temps_entities::users;
 
-const LOGIN_STATE_TTL_MINUTES: i64 = 10;
+pub(crate) const LOGIN_STATE_TTL_MINUTES: i64 = 10;
 const DISCOVERY_CACHE_TTL: Duration = Duration::from_secs(3600);
 /// Hard cap on how long an OIDC discovery or token-exchange round-trip
 /// can take. openidconnect 4.x lets us own the `reqwest::Client`, so
@@ -90,9 +98,15 @@ struct CachedClient {
 /// made. Installing this resolver on the OIDC `reqwest::Client` means the IP
 /// is re-validated at connect time, eliminating the window.
 ///
-/// Loopback addresses (`127.x`, `::1`) are **not** blocked here for parity
-/// with `assert_issuer_host_allowed`, which explicitly allows loopback so
-/// local Keycloak / Authentik dev continues to work.
+/// Loopback addresses (`127.x`, `::1`) are blocked like every other
+/// internal range: an issuer on loopback turned discovery into an
+/// authenticated port/path oracle against services bound to the Temps host.
+/// An operator running a local Keycloak / Authentik for development lifts
+/// that explicitly by adding the loopback address under Settings > Security >
+/// Trusted private networks, which `is_trusted_private_destination` honours.
+///
+/// A resolver is only consulted for host *names*; IP-literal URLs never reach
+/// it. Those are checked by [`OidcHttpClient`] before the request is sent.
 struct BlocklistResolver;
 
 impl reqwest::dns::Resolve for BlocklistResolver {
@@ -130,6 +144,68 @@ impl reqwest::dns::Resolve for BlocklistResolver {
     }
 }
 
+/// The HTTP client used for every IdP round-trip (discovery, JWKS, token
+/// exchange).
+///
+/// Wraps the `reqwest::Client` (which carries [`BlocklistResolver`]) and
+/// rejects requests whose target is an IP *literal* in a blocked range before
+/// they are sent. The resolver alone cannot do that: reqwest never consults a
+/// resolver for an IP-literal host, so a discovery document pointing its
+/// `jwks_uri` or `token_endpoint` at `http://127.0.0.1:6379/` would otherwise
+/// be fetched no matter what the issuer pre-check decided.
+struct OidcHttpClient {
+    /// `Err` holds why the client could not be built at service init (the
+    /// platform TLS / cert store is unusable). Every IdP call then fails with
+    /// that reason instead of the whole server panicking at startup.
+    inner: Result<reqwest::Client, String>,
+}
+
+impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
+    type Error = HttpClientError<reqwest::Error>;
+    type Future =
+        Pin<Box<dyn Future<Output = Result<HttpResponse, Self::Error>> + Send + Sync + 'c>>;
+
+    fn call(&'c self, request: HttpRequest) -> Self::Future {
+        if let Err(reason) = check_request_target(request.uri()) {
+            tracing::warn!(
+                target: "temps_auth::oidc::abuse",
+                uri = %request.uri(),
+                %reason,
+                "Refusing OIDC request to a blocked address"
+            );
+            return Box::pin(std::future::ready(Err(HttpClientError::Other(reason))));
+        }
+        match &self.inner {
+            Ok(client) => client.call(request),
+            Err(reason) => Box::pin(std::future::ready(Err(HttpClientError::Other(format!(
+                "OIDC HTTP client is unavailable because it failed to build at startup: {reason}"
+            ))))),
+        }
+    }
+}
+
+/// Reject an outbound IdP request whose host is a literal IP in a blocked
+/// range (see [`is_blocked_ip`]) that the operator has not trusted. Host
+/// names are left to [`BlocklistResolver`], which validates them at connect
+/// time.
+fn check_request_target(uri: &openidconnect::http::Uri) -> Result<(), String> {
+    let host = uri
+        .host()
+        .ok_or_else(|| format!("OIDC request URI '{uri}' has no host"))?;
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        if is_blocked_ip(&ip) && !temps_core::url_validation::is_trusted_private_destination(ip) {
+            return Err(format!(
+                "OIDC request to blocked private/internal address {ip} refused"
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct OidcService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<EncryptionService>,
@@ -141,11 +217,15 @@ pub struct OidcService {
     /// `request_async`, so timeout, redirect policy, and any future
     /// custom DNS resolution apply uniformly to every IdP
     /// round-trip. Built once at service init in `new()`.
-    http_client: reqwest::Client,
+    http_client: OidcHttpClient,
 }
 
 pub struct OidcLoginStart {
     pub authorize_url: String,
+    /// The `state` value sent to the issuer. The handler ties it to the
+    /// browser that started the login, so the callback can refuse a link that
+    /// another browser started.
+    pub state: String,
 }
 
 pub struct OidcLoginState {
@@ -217,11 +297,10 @@ impl OidcService {
         //     malicious IdP could otherwise 302 us to an internal
         //     URL on first request.
         //
-        // We `expect` here because failure of `ClientBuilder::build`
-        // means the platform's rustls / native cert store is broken,
-        // which is unrecoverable at the service layer. If this fires
-        // in production it's an "install OS certs" problem, not a
-        // runtime concern.
+        // A failure of `ClientBuilder::build` means the platform's rustls /
+        // native cert store is broken. That is an "install OS certs"
+        // problem, so it is logged here and every OIDC request then fails
+        // with the reason, rather than taking the whole server down.
         // `BlocklistResolver` re-validates every resolved IP at connect time,
         // closing the TOCTOU window between `assert_issuer_host_allowed`
         // (which runs before the HTTP attempt) and the actual TCP connect
@@ -233,7 +312,14 @@ impl OidcService {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(BlocklistResolver))
             .build()
-            .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Failed to build the OIDC HTTP client; OS TLS / cert store is unusable, OIDC logins will fail"
+                );
+                e.to_string()
+            });
+        let http_client = OidcHttpClient { inner: http_client };
 
         Self {
             db,
@@ -242,6 +328,26 @@ impl OidcService {
             discovery_cache: Mutex::new(HashMap::new()),
             http_client,
         }
+    }
+
+    /// Test hook: record that discovery already happened for `provider`, so
+    /// the login start routes run without reaching an issuer.
+    #[cfg(test)]
+    pub(crate) async fn seed_discovery_for_test(
+        &self,
+        provider: &oidc_providers::Model,
+        metadata: CoreProviderMetadata,
+        client_secret: &str,
+    ) {
+        self.discovery_cache.lock().await.insert(
+            provider.id,
+            CachedClient {
+                metadata,
+                client_secret: client_secret.to_string(),
+                client_secret_ciphertext: provider.client_secret_encrypted.clone(),
+                cached_at: Instant::now(),
+            },
+        );
     }
 
     pub async fn list_enabled_providers(&self) -> Result<Vec<OidcProviderSummary>, OidcError> {
@@ -318,7 +424,7 @@ impl OidcService {
             .await?;
         let encrypted_secret = self
             .encryption_service
-            .encrypt_string(&request.client_secret)
+            .encrypt_string(request.client_secret.expose())
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: request.issuer_url.clone(),
                 reason: format!("failed to encrypt client secret: {e}"),
@@ -383,7 +489,7 @@ impl OidcService {
         if let Some(client_secret) = request.client_secret {
             let encrypted_secret = self
                 .encryption_service
-                .encrypt_string(&client_secret)
+                .encrypt_string(client_secret.expose())
                 .map_err(|e| OidcError::DiscoveryFailed {
                     issuer: "local".into(),
                     reason: format!("failed to encrypt client secret: {e}"),
@@ -467,11 +573,20 @@ impl OidcService {
             ))
             .await?;
 
+        // The Temps-login ingress grants those sessions minted would keep
+        // opening protected environments for up to twelve hours otherwise.
+        // Same user set as the session delete above (pending MFA challenges
+        // never mint a grant, so the `mfa_pending_origin` arm has no
+        // counterpart here).
+        let grants_revoked =
+            crate::ingress_grants::revoke_for_oidc_provider(conn, provider_id).await?;
+
         tracing::info!(
             target: "temps_auth::oidc",
             provider_id = provider_id,
             sessions_revoked = result.rows_affected(),
-            "Revoked SSO sessions for provider"
+            ingress_grants_revoked = grants_revoked,
+            "Revoked SSO sessions and ingress login grants for provider"
         );
 
         Ok(())
@@ -605,8 +720,10 @@ impl OidcService {
 
         txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
+            // The column holds the token's digest, never the token (see
+            // `auth_service::stored_session_token`).
             "DELETE FROM sessions WHERE session_token = $1",
-            vec![session_token.into()],
+            vec![crate::auth_service::stored_session_token(session_token).into()],
         ))
         .await?;
         txn.commit().await?;
@@ -748,6 +865,7 @@ impl OidcService {
                 active.client_id = Set(client_id);
                 active.client_secret_encrypted = Set(encrypted_secret);
                 active.enabled = Set(true);
+                active.trust_idp_email = Set(false);
                 let updated = active.update(&txn).await?;
                 self.discovery_cache.lock().await.remove(&provider_id);
                 updated
@@ -780,11 +898,10 @@ impl OidcService {
                     group_claim: Set(CLOUD_MANAGED_OIDC_ROLE_CLAIM.to_string()),
                     role_claim: Set(CLOUD_MANAGED_OIDC_ROLE_CLAIM.to_string()),
                     default_role: Set(RoleType::User.as_str().to_string()),
-                    // Reaching this exchange already required operator-level
-                    // access to the Cloud account this instance is enrolled
-                    // under (ADR-045 §4's documented carve-out for
-                    // admin-controlled IdPs).
-                    trust_idp_email: Set(true),
+                    // Cloud must supply verified email provenance, even for
+                    // returning subjects. Enrollment and instance roles are
+                    // separate evidence and cannot substitute for it.
+                    trust_idp_email: Set(false),
                     managed_by_cloud: Set(true),
                     admin_only_role_required: Set(true),
                     ..Default::default()
@@ -1040,6 +1157,7 @@ impl OidcService {
 
         Ok(OidcLoginStart {
             authorize_url: authorize_url.to_string(),
+            state: csrf_token.secret().clone(),
         })
     }
 
@@ -1073,13 +1191,13 @@ impl OidcService {
             .await?;
 
         let row = row.ok_or_else(|| OidcError::StateNotFound {
-            state: state.to_string(),
+            state: "<redacted>".into(),
         })?;
 
-        if row.expires_at < Utc::now() {
+        if row.expires_at <= Utc::now() {
             let age_secs = (Utc::now() - row.expires_at).num_seconds().abs();
             return Err(OidcError::StateExpired {
-                state: state.to_string(),
+                state: "<redacted>".into(),
                 age_secs,
             });
         }
@@ -1199,6 +1317,14 @@ impl OidcService {
         raw_claims: &serde_json::Value,
     ) -> Result<OidcResolvedUser, OidcError> {
         let provider = self.get_provider(provider_id).await?;
+        // A persisted older managed row may still carry the former trust
+        // exception until reconnect. Enforce this at use, before the existing
+        // subject fast path, role mutation, linking or JIT provisioning.
+        if provider.managed_by_cloud && claims.email_verified() != Some(true) {
+            return Err(OidcError::EmailNotVerified {
+                email: "<redacted>".into(),
+            });
+        }
         let mappings = self.load_role_mappings(provider_id).await?;
         let group_claim_name = claim_name_or_default(&provider.group_claim, "groups");
         // SECURITY (fixed post-audit): `admin_only_role_required` providers
@@ -1500,13 +1626,10 @@ impl OidcService {
         let issuer_str = normalize_issuer_url(&provider.issuer_url)?;
 
         // SSRF defense — refuse to talk to issuers whose hostname
-        // resolves to RFC 1918 / link-local / CGNAT IPs. Runs *before*
-        // we hand the URL to openidconnect so a malicious admin
-        // can't point the server at e.g. the cloud metadata service.
-        // Loopback hostnames (localhost / 127.0.0.1 / ::1) are
-        // intentionally allowed for local Keycloak / Authentik dev —
-        // they're physically incapable of reaching the public
-        // internet, so they don't widen the SSRF surface. See
+        // resolves to loopback / RFC 1918 / link-local / CGNAT IPs. Runs
+        // *before* we hand the URL to openidconnect so a malicious admin
+        // can't point the server at e.g. the cloud metadata service or a
+        // service bound to the Temps host's loopback. See
         // `assert_issuer_host_allowed` for the full policy.
         assert_issuer_host_allowed(&issuer_str).await?;
 
@@ -1616,8 +1739,9 @@ fn normalize_issuer_url(issuer: &str) -> Result<String, OidcError> {
 
 /// True for hostnames that are guaranteed to resolve to the local
 /// machine and never to a public address. Used to suppress the
-/// `http://` warning (loopback over plaintext is fine for dev) and
-/// to fast-path past the SSRF guard.
+/// `http://` warning (loopback over plaintext is fine for dev). It is
+/// *not* an SSRF bypass: `assert_issuer_host_allowed` blocks loopback
+/// unless the operator has trusted it.
 fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]")
 }
@@ -1630,15 +1754,15 @@ fn is_loopback_url(url: &str) -> bool {
 }
 
 /// SSRF guard for OIDC discovery. Refuses to talk to issuers whose
-/// hostname resolves to RFC 1918 / link-local / CGNAT / multicast IPs.
+/// hostname resolves to loopback / RFC 1918 / link-local / CGNAT /
+/// multicast IPs.
 ///
-/// Loopback (127/8, ::1) is the one private range we *do* allow,
-/// because it's the only way to talk to a local Keycloak / Authentik
-/// instance during dev and it can't reach anything the temps process
-/// couldn't already touch directly. Every other private range —
-/// 10/8, 172.16/12, 192.168/16, 169.254/16, 100.64/10 — is blocked
-/// outright: those are the addresses that point at the AWS metadata
-/// service, the cluster-internal mesh, the office VPN, etc.
+/// Loopback (127/8, ::1) is blocked too: an issuer on loopback let an
+/// admin probe services bound to the Temps host itself (each discovery
+/// attempt is a GET to an attacker-chosen port and path). Operators who
+/// run a local Keycloak / Authentik for development opt in explicitly by
+/// trusting the address under Settings > Security > Trusted private
+/// networks; that list is honoured here and in the connect-time resolver.
 ///
 /// This function acts as defense-in-depth at the admin-save / test-connection
 /// call site — it runs synchronously before any HTTP is attempted and produces
@@ -1655,38 +1779,40 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
         reason: "issuer URL has no host".into(),
     })?;
 
-    // Fast path: a literal loopback hostname is always OK. Saves a
-    // DNS round-trip and keeps the local-dev path zero-latency.
-    if is_loopback_host(host) {
-        return Ok(());
-    }
-
-    let port = url.port_or_known_default().unwrap_or(443);
-    // `(host, port)` is `(&str, u16)`; `lookup_host` is generic over
-    // `ToSocketAddrs`, so we need to nudge the inference with an
-    // explicit type to disambiguate.
-    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host((host, port))
-        .await
-        .map_err(|e| OidcError::DiscoveryFailed {
-            issuer: issuer.to_string(),
-            reason: format!("DNS lookup failed: {e}"),
-        })?
-        .collect();
-    for addr in addrs {
-        if is_blocked_ip(&addr.ip())
-            && !temps_core::url_validation::is_trusted_private_destination(addr.ip())
-        {
+    // IP literals are classified directly: `host_str()` keeps the brackets
+    // of an IPv6 literal (`[::1]`), which `lookup_host` cannot resolve.
+    let ips: Vec<IpAddr> = match url.host() {
+        Some(openidconnect::url::Host::Ipv4(v4)) => vec![IpAddr::V4(v4)],
+        Some(openidconnect::url::Host::Ipv6(v6)) => vec![IpAddr::V6(v6)],
+        Some(openidconnect::url::Host::Domain(domain)) => {
+            let port = url.port_or_known_default().unwrap_or(443);
+            tokio::net::lookup_host((domain, port))
+                .await
+                .map_err(|e| OidcError::DiscoveryFailed {
+                    issuer: issuer.to_string(),
+                    reason: format!("DNS lookup failed: {e}"),
+                })?
+                .map(|addr| addr.ip())
+                .collect()
+        }
+        None => {
+            return Err(OidcError::InvalidIssuer {
+                reason: "issuer URL has no host".into(),
+            })
+        }
+    };
+    for ip in ips {
+        if is_blocked_ip(&ip) && !temps_core::url_validation::is_trusted_private_destination(ip) {
             tracing::warn!(
                 target: "temps_auth::oidc::abuse",
                 issuer = %issuer,
                 host = %host,
-                ip = %addr.ip(),
+                ip = %ip,
                 "Refusing to contact OIDC issuer that resolves to a private/internal IP"
             );
             return Err(OidcError::InvalidIssuer {
                 reason: format!(
-                    "issuer {host} resolves to non-public IP {} (use a public DNS name, run the IdP on localhost, or add its network under Settings > Security > Trusted private networks)",
-                    addr.ip()
+                    "issuer {host} resolves to non-public IP {ip} (use a public DNS name, or add its network under Settings > Security > Trusted private networks)"
                 ),
             });
         }
@@ -1700,15 +1826,18 @@ async fn assert_issuer_host_allowed(issuer: &str) -> Result<(), OidcError> {
 /// benchmarking ranges (which can mask metadata services in some
 /// clouds), and IPv6 unique-local + unspecified.
 ///
-/// Loopback (127/8, ::1) is intentionally *not* in this list —
-/// loopback can't reach anything outside the temps process and is
-/// useful for local Keycloak / Authentik dev. The early-return in
-/// `assert_issuer_host_allowed` short-circuits literal loopback
-/// hostnames before we even hit this function.
+/// Loopback (127/8, ::1) and `0.0.0.0/8` (which Linux routes to the
+/// local host) are blocked as well, so discovery cannot be used as a port
+/// probe against services bound to the Temps host. IPv4-mapped IPv6
+/// (`::ffff:127.0.0.1`) is classified by its IPv4 form. Callers still honour
+/// the operator's trusted private networks on top of this classifier.
 fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => {
-            v4.is_private()
+            v4.is_loopback()
+                // 0.0.0.0/8 — "this network"; connects to the local host.
+                || v4.octets()[0] == 0
+                || v4.is_private()
                 || v4.is_link_local()
                 || v4.is_broadcast()
                 || v4.is_multicast()
@@ -1720,7 +1849,11 @@ fn is_blocked_ip(ip: &IpAddr) -> bool {
                 || (v4.octets()[0] == 100 && (v4.octets()[1] & 0xc0) == 0x40)
         }
         IpAddr::V6(v6) => {
-            v6.is_unspecified()
+            if let Some(mapped) = v6.to_ipv4_mapped() {
+                return is_blocked_ip(&IpAddr::V4(mapped));
+            }
+            v6.is_loopback()
+                || v6.is_unspecified()
                 || v6.is_multicast()
                 // fe80::/10 — link-local
                 || (v6.segments()[0] & 0xffc0) == 0xfe80
@@ -2065,10 +2198,25 @@ mod tests {
         use std::net::Ipv4Addr;
         use std::net::Ipv6Addr;
 
-        // Loopback is INTENTIONALLY allowed — local Keycloak /
-        // Authentik dev needs it and it can't reach anything else.
-        assert!(!is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
-        assert!(!is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // Loopback is blocked: an issuer on loopback was a port/path
+        // oracle against services bound to the Temps host. Local IdP dev
+        // opts in through the trusted private networks setting instead.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(127, 1, 2, 3))));
+        assert!(is_blocked_ip(&IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // 0.0.0.0/8 connects to the local host on Linux.
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0))));
+        assert!(is_blocked_ip(&IpAddr::V4(Ipv4Addr::new(0, 1, 2, 3))));
+        // IPv4-mapped IPv6 must not smuggle loopback / RFC 1918 past the check.
+        assert!(is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(127, 0, 0, 1).to_ipv6_mapped()
+        )));
+        assert!(is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped()
+        )));
+        assert!(!is_blocked_ip(&IpAddr::V6(
+            Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped()
+        )));
 
         // RFC 1918 — blocked because it usually points at office
         // network / on-prem service mesh.
@@ -2110,16 +2258,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn assert_issuer_host_allowed_permits_loopback_host() {
-        // Loopback is explicitly allowed so local Keycloak / Authentik
-        // dev works without an env-var escape hatch. The early-return
-        // in `assert_issuer_host_allowed` also avoids a DNS round-trip.
-        assert_issuer_host_allowed("http://localhost:8080/")
+    async fn assert_issuer_host_allowed_rejects_loopback_issuer() {
+        // A loopback issuer made `/test` GET an attacker-chosen port and
+        // path on the Temps host and reflect the answer. It is refused
+        // unless the operator trusts loopback explicitly.
+        for issuer in [
+            "http://127.0.0.1:19999/probe",
+            "http://127.0.0.1:8080/realms/temps",
+            "http://[::1]:8080/",
+            "http://[::ffff:127.0.0.1]:8080/",
+            "http://0.0.0.0:8080/",
+        ] {
+            let err = assert_issuer_host_allowed(issuer)
+                .await
+                .expect_err("loopback issuer must be blocked");
+            assert!(
+                matches!(err, OidcError::InvalidIssuer { .. }),
+                "{issuer}: {err}"
+            );
+        }
+        // `localhost` resolves to loopback and must be refused too (DNS
+        // failure would also be a refusal, never a pass).
+        assert!(assert_issuer_host_allowed("http://localhost:8080/")
             .await
-            .expect("localhost must be allowed");
-        assert_issuer_host_allowed("http://127.0.0.1:8080/realms/temps")
-            .await
-            .expect("127.0.0.1 must be allowed");
+            .is_err());
+    }
+
+    #[test]
+    fn check_request_target_rejects_literal_internal_ips() {
+        // reqwest never consults the resolver for IP literals, so a
+        // discovery document pointing `jwks_uri` / `token_endpoint` at an
+        // internal literal must be refused by the client wrapper.
+        for uri in [
+            "http://127.0.0.1:6379/",
+            "http://[::1]/jwks",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://10.0.0.5/token",
+        ] {
+            let parsed: openidconnect::http::Uri = uri.parse().expect("test URI parses");
+            assert!(
+                check_request_target(&parsed).is_err(),
+                "{uri} must be refused"
+            );
+        }
+        for uri in ["https://auth.example.com/jwks", "https://8.8.8.8/jwks"] {
+            let parsed: openidconnect::http::Uri = uri.parse().expect("test URI parses");
+            assert!(check_request_target(&parsed).is_ok(), "{uri} must pass");
+        }
     }
 
     #[test]
@@ -2274,6 +2459,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2334,6 +2520,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2371,6 +2558,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: true,
             admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2514,19 +2702,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blocklist_resolver_allows_loopback() {
+    async fn blocklist_resolver_rejects_loopback() {
         use reqwest::dns::Resolve;
         use std::str::FromStr;
 
         // `localhost` resolves to 127.0.0.1 / ::1 on virtually all systems.
-        // is_blocked_ip deliberately allows loopback so local Keycloak works.
+        // Loopback is blocked at connect time too, so a rebinding host
+        // cannot reach services bound to the Temps host.
         let resolver = BlocklistResolver;
         let name = reqwest::dns::Name::from_str("localhost").unwrap();
         let result = resolver.resolve(name).await;
         assert!(
-            result.is_ok(),
-            "BlocklistResolver must allow localhost (loopback): {}",
-            result.err().map(|e| e.to_string()).unwrap_or_default()
+            result.is_err(),
+            "BlocklistResolver must reject localhost (loopback)"
         );
     }
 
@@ -2565,9 +2753,8 @@ mod tests {
     // testcontainers); skips gracefully rather than failing the run when
     // Docker is unavailable, per CLAUDE.md.
 
-    async fn test_oidc_service() -> Option<(temps_database::test_utils::TestDatabase, OidcService)>
-    {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_oidc_service() -> Option<(temps_test_utils::TestDatabase, OidcService)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Docker not available, skipping test: {e}");
@@ -2577,7 +2764,7 @@ mod tests {
         let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
             "oidc-service-managed-cloud-tests",
         ));
-        let user_service = Arc::new(UserService::new(db.db.clone()));
+        let user_service = Arc::new(UserService::new(db.db.clone(), encryption.clone()));
         let service = OidcService::new(db.db.clone(), encryption, user_service);
         Some((db, service))
     }
@@ -2603,7 +2790,7 @@ mod tests {
 
         assert!(provider.managed_by_cloud);
         assert!(provider.admin_only_role_required);
-        assert!(provider.trust_idp_email);
+        assert!(!provider.trust_idp_email);
         assert!(provider.jit_provisioning);
         assert_eq!(provider.template, CLOUD_MANAGED_OIDC_TEMPLATE);
         assert_eq!(provider.role_claim, CLOUD_MANAGED_OIDC_ROLE_CLAIM);
@@ -2822,11 +3009,31 @@ mod tests {
         .insert(db.db.as_ref())
         .await
         .expect("test session must insert");
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+        let local_user = users::ActiveModel {
+            name: Set("Local User".to_string()),
+            email: Set("local-user@example.com".to_string()),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("local user must insert");
+        let local_grant =
+            crate::ingress_grants::test_support::live_grant(&db.db, local_user.id).await;
 
         assert!(service
             .revoke_managed_cloud_provider()
             .await
             .expect("revoke must succeed"));
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted from a session of the revoked provider must end with it"
+        );
+        assert!(
+            !crate::ingress_grants::test_support::is_revoked(&db.db, local_grant).await,
+            "users who do not sign in through the provider keep their grants"
+        );
 
         let remaining = sessions::Entity::find()
             .filter(sessions::Column::UserId.eq(user.id))
@@ -2918,7 +3125,7 @@ mod tests {
                 name: "Shadow Provider".to_string(),
                 issuer_url: "https://cloud.example.com".to_string(),
                 client_id: "shadow-client".to_string(),
-                client_secret: "shadow-secret".to_string(),
+                client_secret: "shadow-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -2968,7 +3175,7 @@ mod tests {
                 name: "Keycloak".to_string(),
                 issuer_url: "https://keycloak.example.com/realms/temps".to_string(),
                 client_id: "keycloak-client".to_string(),
-                client_secret: "keycloak-secret".to_string(),
+                client_secret: "keycloak-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -3054,7 +3261,7 @@ mod tests {
             name: name.to_string(),
             issuer_url: issuer_url.to_string(),
             client_id: "ordinary-client".to_string(),
-            client_secret: "ordinary-secret".to_string(),
+            client_secret: "ordinary-secret".into(),
             scopes: "openid email profile".to_string(),
             jit_provisioning: true,
             enabled: true,
@@ -3332,10 +3539,11 @@ mod tests {
         .await
         .expect("test user must insert");
 
-        // A live provider: the login keeps its session.
+        // A live provider: the login keeps its session. The rows store the
+        // token's digest, the way `create_session` writes them.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("live-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("live-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3348,7 +3556,10 @@ mod tests {
             .await
             .expect("a login completing against a live provider must keep its session");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq("live-session"))
+            .filter(
+                sessions::Column::SessionToken
+                    .eq(crate::auth_service::stored_session_token("live-session"))
+            )
             .one(db.db.as_ref())
             .await
             .expect("query must succeed")
@@ -3363,7 +3574,7 @@ mod tests {
         // revocation already deleted everything it could see.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("raced-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("raced-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3382,7 +3593,10 @@ mod tests {
         ));
         assert!(
             sessions::Entity::find()
-                .filter(sessions::Column::SessionToken.eq("raced-session"))
+                .filter(
+                    sessions::Column::SessionToken
+                        .eq(crate::auth_service::stored_session_token("raced-session"))
+                )
                 .one(db.db.as_ref())
                 .await
                 .expect("query must succeed")
@@ -3480,5 +3694,175 @@ mod tests {
             service.list_role_mappings(provider.id).await.unwrap().len(),
             mappings.len()
         );
+    }
+    #[tokio::test]
+    async fn managed_cloud_requires_verified_email_for_new_and_returning_subjects() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "managed-verification-test",
+        ));
+        let service = OidcService::new(
+            db.db.clone(),
+            encryption.clone(),
+            Arc::new(UserService::new(db.db.clone(), encryption)),
+        );
+        service.user_service.initialize_roles().await.unwrap();
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        assert!(!provider.trust_idp_email);
+        let claims = |verified: Option<bool>| -> CoreIdTokenClaims {
+            let mut value = serde_json::json!({
+                "iss": "https://idp.example.test", "sub": "stable-cloud-user-fixture",
+                "aud": "cloud-client-id", "iat": Utc::now().timestamp(),
+                "exp": (Utc::now() + ChronoDuration::minutes(2)).timestamp(),
+                "email": "member@example.test", "name": "Cloud member"
+            });
+            if let Some(flag) = verified {
+                value["email_verified"] = flag.into();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let owner = serde_json::json!({CLOUD_MANAGED_OIDC_ROLE_CLAIM: "owner"});
+        for evidence in [None, Some(false)] {
+            assert!(matches!(
+                service
+                    .resolve_user(provider.id, &claims(evidence), &owner)
+                    .await,
+                Err(OidcError::EmailNotVerified { .. })
+            ));
+        }
+        assert_eq!(
+            users::Entity::find().count(db.db.as_ref()).await.unwrap(),
+            0
+        );
+        let user = service
+            .resolve_user(provider.id, &claims(Some(true)), &owner)
+            .await
+            .unwrap()
+            .user;
+        assert!(user.email_verified);
+        // Simulate a row written by an older binary before it reconnects.
+        let mut legacy: oidc_providers::ActiveModel = provider.clone().into();
+        legacy.trust_idp_email = Set(true);
+        legacy.update(db.db.as_ref()).await.unwrap();
+        for evidence in [None, Some(false)] {
+            assert!(
+                matches!(
+                    service
+                        .resolve_user(provider.id, &claims(evidence), &owner)
+                        .await,
+                    Err(OidcError::EmailNotVerified { .. })
+                ),
+                "an existing subject or legacy trust flag cannot bypass evidence"
+            );
+        }
+        let viewer = serde_json::json!({CLOUD_MANAGED_OIDC_ROLE_CLAIM: "viewer"});
+        assert!(matches!(
+            service
+                .resolve_user(provider.id, &claims(Some(true)), &viewer)
+                .await,
+            Err(OidcError::InsufficientRole { .. })
+        ));
+        assert_eq!(
+            users::Entity::find().count(db.db.as_ref()).await.unwrap(),
+            1
+        );
+        let updated = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        assert!(
+            !updated.trust_idp_email,
+            "reconnect migrates the legacy exception"
+        );
+        let returning = service
+            .resolve_user(provider.id, &claims(Some(true)), &owner)
+            .await
+            .unwrap();
+        assert_eq!(returning.user.id, user.id);
+        println!("PASS: real Postgres managed Cloud identity requires verified email for new/returning subjects, rejects viewer roles, reuses stable identity and removes the legacy trust exception on reconnect");
+    }
+    #[tokio::test]
+    async fn login_state_is_single_use_expires_at_its_deadline_and_redacts_state() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "login-state-test",
+        ));
+        let service = OidcService::new(
+            db.db.clone(),
+            encryption.clone(),
+            Arc::new(UserService::new(db.db.clone(), encryption)),
+        );
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        let state = "single-use-attempt-fixture";
+        oidc_login_states::ActiveModel {
+            state: Set(state.into()),
+            nonce: Set("nonce-fixture".into()),
+            pkce_verifier: Set("verifier-fixture".into()),
+            provider_id: Set(provider.id),
+            expires_at: Set(Utc::now() + ChronoDuration::minutes(10)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let (a, b) = tokio::join!(
+            service.consume_login_state(state),
+            service.consume_login_state(state)
+        );
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "a login attempt completes exactly once"
+        );
+        let failure = a.err().or_else(|| b.err()).unwrap();
+        assert!(matches!(failure, OidcError::StateNotFound { .. }));
+        assert!(!format!("{failure:?}").contains(state));
+        assert!(!failure.to_string().contains(state));
+        let problem: temps_core::problemdetails::Problem = failure.into();
+        assert!(!format!("{problem:?}").contains(state));
+
+        // A state whose deadline is now is already expired.
+        let expired = "expired-attempt-fixture";
+        oidc_login_states::ActiveModel {
+            state: Set(expired.into()),
+            nonce: Set("nonce-fixture".into()),
+            pkce_verifier: Set("verifier-fixture".into()),
+            provider_id: Set(provider.id),
+            expires_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let error = service.consume_login_state(expired).await.err().unwrap();
+        assert!(matches!(error, OidcError::StateExpired { .. }));
+        assert!(!format!("{error:?}").contains(expired));
+        assert!(!error.to_string().contains(expired));
+        let problem: temps_core::problemdetails::Problem = error.into();
+        assert!(!format!("{problem:?}").contains(expired));
     }
 }

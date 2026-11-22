@@ -5,6 +5,7 @@ import type { ReactNode } from 'react'
 import { Search, X } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
+import { useUrlBoundText } from '@temps-sdk/ds'
 
 /** Legacy console list controls: search first, view context second. */
 export function ListToolbar({
@@ -22,6 +23,9 @@ export function ListToolbar({
   summary?: ReactNode
   children?: ReactNode
 }) {
+  // The value usually lives in the URL; keep what was typed locally so a
+  // router transition can never reset the box mid-keystroke.
+  const [text, setText] = useUrlBoundText(value, onChange)
   return (
     <div className="flex flex-col gap-3 sm:flex-row sm:flex-wrap sm:items-center sm:justify-between">
       <div className="relative w-full sm:w-80">
@@ -32,21 +36,21 @@ export function ListToolbar({
         <Input
           aria-label={searchLabel}
           placeholder={placeholder}
-          value={value}
-          onChange={(event) => onChange(event.target.value)}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === 'Escape') onChange('')
+            if (event.key === 'Escape') setText('')
           }}
           className="ps-9 pe-10"
         />
-        {value && (
+        {text && (
           <Button
             type="button"
             variant="ghost"
             size="icon"
             aria-label={`Clear ${searchLabel.toLowerCase()}`}
             className="absolute end-1 top-1/2 size-7 -translate-y-1/2"
-            onClick={() => onChange('')}
+            onClick={() => setText('')}
           >
             <X aria-hidden="true" className="size-4" />
           </Button>

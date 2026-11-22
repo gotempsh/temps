@@ -45,7 +45,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
 import {
@@ -67,6 +66,7 @@ import {
 import { Fragment, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { TimeAgo } from '../utils/TimeAgo'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface EventDetailProps {
   project: ProjectResponse
@@ -90,7 +90,7 @@ export function EventDetail({
   const perPage = 20
 
   // Fetch event detail analytics
-  const { data: detailData, isLoading: detailLoading } = useQuery({
+  const { data: detailData, isLoading: detailLoading } = useWindowQuery({
     ...getEventDetailOptions({
       query: {
         event_name: eventName,
@@ -104,7 +104,7 @@ export function EventDetail({
   })
 
   // Fetch visitors for this event
-  const { data: visitorsData, isLoading: visitorsLoading } = useQuery({
+  const { data: visitorsData, isLoading: visitorsLoading } = useWindowQuery({
     ...getEventVisitorsOptions({
       query: {
         event_name: eventName,
@@ -161,17 +161,17 @@ export function EventDetail({
       ) : detailData ? (
         <div className="grid grid-cols-2 md:grid-cols-3 gap-4">
           <StatCard
-            label="Total Count"
+            label="Total count"
             value={detailData.total_count.toLocaleString()}
             icon={<Hash className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Unique Visitors"
+            label="Unique visitors"
             value={detailData.unique_visitors.toLocaleString()}
             icon={<Users className="h-4 w-4 text-muted-foreground" />}
           />
           <StatCard
-            label="Unique Sessions"
+            label="Unique sessions"
             value={detailData.unique_sessions.toLocaleString()}
             icon={<BarChart3 className="h-4 w-4 text-muted-foreground" />}
           />
@@ -210,7 +210,7 @@ export function EventDetail({
         <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
           {/* Top Referrers */}
           <BreakdownCard
-            title="Top Referrers"
+            title="Top referrers"
             icon={<Link2 className="h-4 w-4 text-muted-foreground" />}
             items={detailData.referrers.slice(0, 8)}
             renderItem={(ref) => ({
@@ -223,7 +223,7 @@ export function EventDetail({
 
           {/* Top Countries */}
           <BreakdownCard
-            title="Top Countries"
+            title="Top countries"
             icon={<Globe className="h-4 w-4 text-muted-foreground" />}
             items={detailData.countries.slice(0, 8)}
             renderItem={(country) => ({
@@ -236,7 +236,7 @@ export function EventDetail({
 
           {/* Top Browsers */}
           <BreakdownCard
-            title="Top Browsers"
+            title="Top browsers"
             icon={<AppWindow className="h-4 w-4 text-muted-foreground" />}
             items={detailData.browsers.slice(0, 8)}
             renderItem={(browser) => ({
@@ -458,7 +458,7 @@ function EventEntriesCard({
     }
   }
 
-  const { data: entriesData, isLoading: entriesLoading } = useQuery({
+  const { data: entriesData, isLoading: entriesLoading } = useWindowQuery({
     ...getEventEntriesOptions({
       query: {
         event_name: eventName,
@@ -540,7 +540,7 @@ function EventEntriesCard({
                           <button
                             type="button"
                             aria-label={`Remove ${col} column`}
-                            className="text-muted-foreground/50 transition-colors hover:text-foreground"
+                            className="text-muted-foreground transition-colors hover:text-foreground"
                             onClick={() =>
                               setPropColumns(
                                 propColumns.filter((c) => c !== col)
@@ -851,7 +851,7 @@ function PropColumnsPicker({
       <PopoverTrigger asChild>
         <Button variant="outline" size="sm" className="gap-1.5">
           <Columns3 className="h-4 w-4" />
-          <span className="hidden sm:inline">Columns</span>
+          <span className="max-sm:sr-only">Columns</span>
           {columns.length > 0 && (
             <Badge variant="secondary" className="px-1.5 text-xs">
               {columns.length}

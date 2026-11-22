@@ -140,9 +140,15 @@ impl ProxyShutdownSignal for CtrlCShutdownSignal {
         let data_dir = self.data_dir.clone();
 
         Box::pin(async move {
-            tokio::signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl-c signal");
+            if let Err(e) = tokio::signal::ctrl_c().await {
+                // Without a handler there is no Ctrl+C to wait for. Never
+                // resolve, so the proxy keeps serving instead of shutting
+                // down; SIGINT then falls back to the default disposition.
+                error!(
+                    "Failed to listen for ctrl-c signal, graceful Ctrl+C shutdown disabled: {e}"
+                );
+                std::future::pending::<()>().await;
+            }
             info!("Received Ctrl+C, initiating graceful shutdown...");
 
             // Create a new instance for cleanup since we moved into the async block
@@ -164,9 +170,9 @@ pub struct ProxyCommand {
     #[arg(long, env = "TEMPS_TLS_ADDRESS")]
     pub tls_address: Option<String>,
 
-    /// Database connection URL (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -200,8 +206,9 @@ pub struct ProxyCommand {
 /// standalone proxy has no plugin registry — the mechanism every other
 /// process uses to install a gate — but it *does* have the same database,
 /// so there is no structural reason it must under-enforce. A binary that
-/// knows how to build a gate passes one here; `execute` passes none and
-/// gets [`temps_core::OpenIpGate`].
+/// knows how to build a gate (e.g. one with its own policy templates) passes
+/// one here; `execute` passes none and gets the built-in per-project /
+/// per-environment allow/deny list gate.
 ///
 /// The runtime handle is part of the contract rather than an implementation
 /// detail: pingora owns the process runtime once the proxy starts, so a gate
@@ -272,6 +279,13 @@ impl ProxyCommand {
             );
         }
 
+        // Only this process's own sources, as for `temps serve`.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
+
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
             warn!(
@@ -284,7 +298,7 @@ impl ProxyCommand {
 
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             self.tls_address.clone(),
             self.console_address.clone(),
         )?);
@@ -305,7 +319,7 @@ impl ProxyCommand {
         debug!("Initializing database connection...");
         // Create tokio runtime for database connection since we need async for this
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let db = rt.block_on(temps_schema::establish_connection(&database_url))?;
 
         // Services are now available for use
         debug!("Cookie crypto and encryption services initialized");
@@ -318,7 +332,14 @@ impl ProxyCommand {
                 debug!("proxy: enforcing project IP rules via a caller-supplied gate");
                 gate
             }
-            None => Arc::new(temps_core::OpenIpGate) as Arc<dyn temps_core::ProjectIpGate>,
+            // OSS default: the built-in per-project / per-environment allow
+            // and deny lists, hydrated before traffic is accepted.
+            None => {
+                temps_proxy::ip_access::ProjectIpAccessGate::start_blocking(db.clone(), rt.handle())
+                    .map_err(|error| {
+                        anyhow::anyhow!("Failed to initialize the proxy project IP gate: {error}")
+                    })? as Arc<dyn temps_core::ProjectIpGate>
+            }
         };
         let request_policy_gate = match request_policy_gate_builder {
             Some(build) => build(db.clone(), rt.handle())?,
@@ -364,17 +385,16 @@ impl ProxyCommand {
 
         // Fetch settings once: needed for `preview_domain`, ADR-017 version-skew
         // detection, and the ADR-018 on-demand TLS decision.
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(temps_config::ServerConfig::new(
+                address.clone(),
+                config.database_url.clone(),
+                tls_address.clone(),
+                Some(console_address.clone()),
+            )?),
+            db.clone(),
+        ));
         let settings = rt.block_on(async {
-            let config_service = temps_config::ConfigService::new(
-                Arc::new(temps_config::ServerConfig::new(
-                    address.clone(),
-                    self.database_url.clone(),
-                    tls_address.clone(),
-                    Some(console_address.clone()),
-                )?),
-                db.clone(),
-            );
-
             match config_service.get_settings().await {
                 Ok(settings) => {
                     // ADR-017 Phase 3: version-skew detection. The console records
@@ -411,7 +431,7 @@ impl ProxyCommand {
                             );
                         }
                     }
-                    Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings))
+                    Ok::<Option<temps_config::AppSettings>, anyhow::Error>(Some(settings))
                 }
                 Err(e) => {
                     warn!("Failed to fetch settings: {}, using defaults (preview_domain 'localhost', on-demand TLS disabled)", e);
@@ -426,29 +446,32 @@ impl ProxyCommand {
                 .map(|s| s.preview_domain.clone())
                 .unwrap_or_else(|| "localhost".to_string()),
         );
-        let internal_dns_sync_address = match settings.as_ref() {
-            Some(settings) if settings.cluster_dns.enabled => {
-                match rt.block_on(temps_dns::start_proxy_dns_sync_service(db.clone())) {
-                    Ok(address) => Some(address.to_string()),
-                    Err(error) => {
-                        warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
-                        None
-                    }
-                }
-            }
-            _ => None,
-        };
-        if settings
-            .as_ref()
-            .is_some_and(|settings| settings.cluster_dns.enabled)
+        // Started whatever the cluster DNS setting says, so turning it on
+        // later needs no restart; the handlers authenticate every node.
+        let internal_dns_sync_address = match rt
+            .block_on(temps_dns::start_proxy_dns_sync_service(db.clone()))
         {
-            super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
-                rt.handle(),
-                db.clone(),
-                data_dir.join("dns"),
-                Arc::new(std::sync::RwLock::new(None)),
-            );
-        }
+            Ok(address) => Some(address.to_string()),
+            Err(error) => {
+                warn!(error = %error, "Proxy DNS sync service is unavailable; HTTP proxy startup will continue");
+                None
+            }
+        };
+        // Follows the setting on every pass. Node 0's network policy
+        // enforcer runs in the console process, so this resolver has no
+        // policy view and answers every source as unrestricted; restricted
+        // workloads are still held to their rules by the datapath.
+        super::serve::proxy::spawn_control_plane_dns_bootstrap_with_docker_discovery(
+            rt.handle(),
+            db.clone(),
+            data_dir.join("dns"),
+            Arc::new(std::sync::RwLock::new(None)),
+            None,
+            config_service.clone(),
+            // ADR-104: split mode is not served. The console process deploys
+            // the containers and never points them at this resolver.
+            None,
+        );
 
         info!(
             "Starting proxy server with preview_domain: {:?}",
@@ -521,10 +544,15 @@ impl ProxyCommand {
             // proxy cannot observe its startup, so console-bound failures
             // keep the generic unavailable page.
             console_startup: None,
+            // The console process samples the host (`temps serve --role=console`).
+            host_metrics: false,
+            // The console is another process and runs no connector here
+            // (ADR-107 D2), so nothing is bound for a tunnel.
+            tunnel_origin: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
-            self.database_url.clone(),
+            config.database_url.clone(),
             queue.clone(),
         ));
 
@@ -598,7 +626,9 @@ impl ProxyCommand {
             // Background idle sweep: stops idle containers via the local Docker
             // socket. Only this process runs it in split mode — the console does
             // not instantiate an OnDemandManager.
-            on_demand_manager.start_sweep_task(Duration::from_secs(60));
+            on_demand_manager
+                .start_sweep_task(Duration::from_secs(60))
+                .map_err(|e| anyhow::anyhow!("Failed to spawn on-demand idle sweep thread: {e}"))?;
         }
 
         // Start route table listener
@@ -617,7 +647,7 @@ impl ProxyCommand {
         // Keep the listener alive on the stack so its Drop doesn't abort the background task
         info!("Starting project change listener...");
         let project_listener = temps_routes::ProjectChangeListener::new(
-            self.database_url.clone(),
+            config.database_url.clone(),
             route_table.clone(),
             queue.clone(),
         );
@@ -675,7 +705,7 @@ impl ProxyCommand {
                 // duration of the blocking Pingora server below, which is what
                 // keeps the task alive (same pattern as the route listeners).
                 let service = Arc::new(service);
-                let database_url = self.database_url.clone();
+                let database_url = config.database_url.clone();
                 rt.block_on(async { service.start_settings_listener(database_url) });
                 Some(handle)
             }
@@ -725,8 +755,9 @@ impl ProxyCommand {
             // proxy_logs_days`, refreshed in the background on `rt`.
             settings_retention,
             // Supplied by the caller when the embedding binary knows how to
-            // build one; `temps_core::OpenIpGate` (allow everything) otherwise,
-            // which is what the plain `temps proxy` entrypoint passes.
+            // build one; the built-in per-project / per-environment allow and
+            // deny list gate otherwise, which is what the plain `temps proxy`
+            // entrypoint gets.
             project_ip_gate,
             request_policy_gate,
         ) {

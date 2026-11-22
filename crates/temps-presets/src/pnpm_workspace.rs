@@ -9,8 +9,14 @@ use std::io::Read;
 use std::path::Path;
 use std::sync::LazyLock;
 
-static NUMERIC_RANGE: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"([+-]?[0-9]+)\.\.([+-]?[0-9]+)").unwrap());
+#[allow(
+    clippy::expect_used,
+    reason = "Regex::new on a compile-time literal only fails if the pattern is malformed, \
+              which the pnpm_workspace unit tests exercising brace ranges would catch"
+)]
+static NUMERIC_RANGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"([+-]?[0-9]+)\.\.([+-]?[0-9]+)").expect("NUMERIC_RANGE is a valid literal regex")
+});
 
 #[derive(Default, serde::Deserialize)]
 struct Workspace {
@@ -31,7 +37,7 @@ pub fn pnpm_workspace_contains(contents: &str, relative: &Path) -> Result<bool, 
             relative.display()
         ));
     }
-    let workspace: Workspace = serde_yaml::from_str::<Option<Workspace>>(contents)
+    let workspace: Workspace = yaml_serde::from_str::<Option<Workspace>>(contents)
         .map_err(|error| format!("Cannot parse pnpm-workspace.yaml: {error}"))?
         .unwrap_or_default();
     let patterns = workspace.packages.unwrap_or_default();
@@ -278,7 +284,7 @@ mod tests {
             ),
         ] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             assert!(
                 pnpm_workspace_contains(&contents, Path::new(member)).unwrap(),
                 "{pattern} did not match {member}"
@@ -298,7 +304,7 @@ mod tests {
             vec!["apps/*", "!apps/!(web|api)"],
         ] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": patterns})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": patterns})).unwrap();
             assert!(pnpm_workspace_contains(&contents, Path::new("apps/web")).unwrap());
             assert!(!pnpm_workspace_contains(&contents, Path::new("apps/private")).unwrap());
         }
@@ -315,7 +321,7 @@ mod tests {
             ("apps/@(.web|api)", "apps/.web", true),
         ] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             assert_eq!(
                 pnpm_workspace_contains(&contents, Path::new(candidate)).unwrap(),
                 expected,
@@ -330,7 +336,7 @@ mod tests {
         // while valid nested groups retain the pnpm matcher dialect.
         for pattern in ["apps/@(web|api", "apps/+(web", "apps/!(private"] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             assert!(pnpm_workspace_contains(&contents, Path::new("apps/web")).is_err());
         }
         assert!(
@@ -348,7 +354,7 @@ mod tests {
         let oversized = format!("apps/{}", "w".repeat(64 * 1024));
         for pattern in [nested, oversized] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             let error = pnpm_workspace_contains(&contents, Path::new("apps/web")).unwrap_err();
             assert!(error.contains("compile limit"), "{error}");
         }
@@ -362,7 +368,7 @@ mod tests {
             "apps/{-09223372036854775808..+09223372036854775807}",
         ] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             let error = pnpm_workspace_contains(&contents, Path::new("apps/web")).unwrap_err();
             assert!(error.contains("overflowing numeric range"), "{error}");
         }
@@ -381,7 +387,7 @@ mod tests {
             ),
         ] {
             let contents =
-                serde_yaml::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
+                yaml_serde::to_string(&serde_json::json!({"packages": [pattern]})).unwrap();
             assert!(pnpm_workspace_contains(&contents, Path::new(member)).unwrap());
             assert!(!pnpm_workspace_contains(&contents, Path::new(nonmember)).unwrap());
         }
@@ -390,12 +396,12 @@ mod tests {
     #[test]
     fn negative_group_budget_bounds_suffix_recompilation() {
         let repeated = format!("apps/{}web", "!(*).".repeat(9));
-        let contents = serde_yaml::to_string(&serde_json::json!({"packages": [repeated]})).unwrap();
+        let contents = yaml_serde::to_string(&serde_json::json!({"packages": [repeated]})).unwrap();
         let error = pnpm_workspace_contains(&contents, Path::new("apps/web")).unwrap_err();
         assert!(error.contains("8 negative-group compile limit"), "{error}");
 
         let nested = format!("apps/{}web{}", "!(".repeat(8), ")".repeat(8));
-        let contents = serde_yaml::to_string(&serde_json::json!({"packages": [nested]})).unwrap();
+        let contents = yaml_serde::to_string(&serde_json::json!({"packages": [nested]})).unwrap();
         assert!(pnpm_workspace_contains(&contents, Path::new("apps/web")).is_ok());
     }
 

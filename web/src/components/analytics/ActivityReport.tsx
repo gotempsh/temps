@@ -285,6 +285,7 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                         )}
                     </div>
                     <div
+                      role="group"
                       className="flex flex-wrap gap-2"
                       aria-label="Filter assessments by category"
                     >
@@ -582,7 +583,7 @@ function ActivitySettingsForm({
   return (
     <section aria-label="Report setup" className="space-y-6">
       {status.settings_revision > 0 && !discovering && (
-        <div className="space-y-3" aria-label="Saved report setup">
+        <div role="group" className="space-y-3" aria-label="Saved report setup">
           <div className="flex flex-wrap items-center justify-between gap-3">
             <div className="flex items-center gap-2">
               <Check className="h-4 w-4 text-primary" />

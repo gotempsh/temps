@@ -173,6 +173,10 @@ async fn extract_links(
     })?;
 
     let document = Html::parse_document(&body);
+    #[allow(
+        clippy::unwrap_used,
+        reason = "a literal, valid CSS selector cannot fail to parse"
+    )]
     let selector = Selector::parse("a[href]").unwrap();
 
     let current_url = Url::parse(page_url).unwrap_or_else(|_| base_url.clone());

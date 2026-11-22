@@ -93,9 +93,10 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
   },
   {
     id: 'openai_compatible',
-    name: 'Self-hosted (OpenAI-compatible)',
-    tagline: 'MLX, vLLM, llama.cpp, LM Studio or Ollama on your own network',
-    models: 'Whatever models your server lists at /v1/models',
+    name: 'OpenAI-compatible',
+    tagline:
+      'Any API that speaks the OpenAI protocol: DeepSeek, Groq, Together, or vLLM, Ollama and LM Studio on your network',
+    models: 'Whatever models the server lists at /v1/models',
     // Placeholder for code snippets; a configured key's own default model
     // is used instead when there is one.
     defaultModel: 'your-model-id',
@@ -107,6 +108,19 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
 export const BY_ID: Record<string, AiProviderMeta> = Object.fromEntries(
   AI_PROVIDERS.map((p) => [p.id, p])
 )
+
+/**
+ * The provider named by an `?add=<id>` deep link, whose add-key dialog the AI
+ * Gateway page should open. Anything that is not a supported provider id —
+ * including inherited object keys like `constructor` — is ignored.
+ */
+export function providerFromAddParam(
+  value: string | null | undefined
+): AiProviderMeta | undefined {
+  return value && Object.prototype.hasOwnProperty.call(BY_ID, value)
+    ? BY_ID[value]
+    : undefined
+}
 
 /** Look up provider metadata by id. Returns `undefined` for unknown ids. */
 export function getAiProvider(id: string): AiProviderMeta | undefined {
@@ -151,4 +165,22 @@ export interface AiProviderIconProps extends IconBaseProps {
    * The inner mark is sized to ~60 % of the wrapper.
    */
   size?: number
+}
+
+/**
+ * The host (and port) a provider key's base URL points at, e.g.
+ * `api.deepseek.com` or `10.0.0.5:8000`, so several keys of one provider
+ * (OpenAI-compatible endpoints above all) can be told apart in a list.
+ * Null when the key uses the vendor's default endpoint.
+ */
+export function providerKeyEndpoint(
+  baseUrl: string | null | undefined
+): string | null {
+  const trimmed = baseUrl?.trim()
+  if (!trimmed) return null
+  try {
+    return new URL(trimmed).host || trimmed
+  } catch {
+    return trimmed
+  }
 }

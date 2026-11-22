@@ -11,8 +11,6 @@ import {
   listEntities,
   getEntityInfo,
   readEntityRows,
-  getAiDataAccess,
-  setAiDataAccess,
   listServices,
 } from '../../api/sdk.gen.js'
 import type {
@@ -42,8 +40,7 @@ import {
  * Exists primarily so coding agents (Claude Code, Codex, OpenCode) can answer
  * questions about an application's real data without a human driving the
  * console. Every command here is a read; nothing in this group mutates
- * application data. The only writer is `data ai-access`, which toggles whether
- * the *built-in* assistant may read rows — see the note on that command.
+ * application data.
  */
 export function registerDataCommands(program: Command): void {
   const data = program
@@ -98,16 +95,6 @@ export function registerDataCommands(program: Command): void {
     .option('--sort-order <order>', 'asc or desc (default: asc)')
     .option('--json', 'Output in JSON format')
     .action(rowsCmd)
-
-  data
-    .command('ai-access <service>')
-    .description(
-      'Show or set whether the built-in AI assistant may read this service\'s rows',
-    )
-    .option('--enable', 'Allow the built-in assistant to read row data')
-    .option('--disable', 'Stop the built-in assistant reading row data')
-    .option('--json', 'Output in JSON format')
-    .action(aiAccessCmd)
 }
 
 // ============================================================================
@@ -531,98 +518,5 @@ async function rowsCmd(
     info(`Showing ${offset + 1}–${shown} of ${result.total_count}. Next: --offset ${shown}`)
   }
   info('Values are truncated for display — use --json for full values.')
-  newline()
-}
-
-async function aiAccessCmd(
-  serviceRef: string,
-  options: { enable?: boolean; disable?: boolean; json?: boolean },
-): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
-  if (options.enable && options.disable) {
-    throw new Error('Pass either --enable or --disable, not both.')
-  }
-
-  const service = await resolveService(serviceRef)
-
-  // No flag = report current state. This command is the discoverable surface
-  // for a setting that is otherwise invisible, so reading must not require
-  // guessing which flag is "safe" to pass.
-  if (!options.enable && !options.disable) {
-    const current = await withSpinner('Fetching setting...', async () => {
-      const { data, error } = await getAiDataAccess({
-        client,
-        path: { service_id: service.id },
-      })
-      if (error) throw new Error(getErrorMessage(error))
-      return data
-    })
-
-    if (options.json) {
-      json(current ?? {})
-      return
-    }
-
-    newline()
-    header(`${icons.info} AI data access — ${sanitizeTerminalText(service.name)}`)
-    newline()
-    keyValue(
-      'Built-in assistant may read rows',
-      current?.enabled ? colors.warning('yes') : 'no',
-    )
-    newline()
-    info(
-      current?.enabled
-        ? `Disable with: temps data ai-access ${sanitizeTerminalText(service.name)} --disable`
-        : `Enable with: temps data ai-access ${sanitizeTerminalText(service.name)} --enable`,
-    )
-    info(
-      colors.dim(
-        'This gates only the built-in AI assistant. It does not restrict this CLI,',
-      ),
-    )
-    info(colors.dim('the console, or any API key — those are governed by permissions.'))
-    newline()
-    return
-  }
-
-  const enabled = Boolean(options.enable)
-
-  const updated = await withSpinner(
-    enabled ? 'Enabling AI data access...' : 'Disabling AI data access...',
-    async () => {
-      const { data, error } = await setAiDataAccess({
-        client,
-        path: { service_id: service.id },
-        body: { enabled },
-      })
-      if (error) throw new Error(getErrorMessage(error))
-      return data
-    },
-  )
-
-  if (options.json) {
-    json(updated ?? {})
-    return
-  }
-
-  newline()
-  if (enabled) {
-    success(
-      `The built-in AI assistant can now read rows from ${sanitizeTerminalText(service.name)}.`,
-    )
-    newline()
-    warning(
-      'Rows are sent to your configured AI provider. If this service stores password',
-    )
-    warning('hashes, tokens or personal data, that data leaves your infrastructure.')
-  } else {
-    success(
-      `The built-in AI assistant can no longer read rows from ${sanitizeTerminalText(service.name)}.`,
-    )
-    info('Table and column names remain readable.')
-  }
   newline()
 }

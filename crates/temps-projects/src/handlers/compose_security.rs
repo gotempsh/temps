@@ -10,9 +10,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{project_permission_guard, project_scope_guard, RequireAuth};
 use temps_core::{problemdetails::Problem, AuditOperation, RequestMetadata};
-use temps_entities::compose_security::{
-    ComposeSecurityCheck, ComposeSecurityCheckDefinition, ComposeSecurityPolicy,
-};
+use temps_entities::compose_security::{ComposeSecurityCheck, ComposeSecurityPolicy};
+use temps_presets::compose_security::{ComposeSecurityCheckDefinition, ComposeSecurityCheckExt};
 use utoipa::ToSchema;
 
 #[derive(Serialize, ToSchema)]
@@ -135,15 +134,13 @@ impl AuditOperation for ComposeSecurityAudit {
     fn user_agent(&self) -> &str {
         &self.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
 /// Retire legacy grants so imports and generic project updates cannot bypass acknowledgment.
-pub(crate) fn reject_legacy_sandbox_grants(
-    config: Option<&serde_json::Value>,
-) -> Result<(), Problem> {
+pub fn reject_legacy_sandbox_grants(config: Option<&serde_json::Value>) -> Result<(), Problem> {
     let grants = config
         .and_then(|value| value.get("unsandboxedServices"))
         .and_then(serde_json::Value::as_array);
@@ -159,6 +156,22 @@ pub(crate) fn reject_legacy_sandbox_grants(
 mod tests {
     use super::*;
     use temps_auth::{AuthContext, Permission, Role};
+    use utoipa::OpenApi;
+
+    #[test]
+    fn catalog_definition_schema_is_still_published_under_its_own_name() {
+        let doc = serde_json::to_value(super::super::ApiDoc::openapi()).unwrap();
+        let schema = &doc["components"]["schemas"]["ComposeSecurityCheckDefinition"];
+        assert_eq!(
+            schema["required"],
+            serde_json::json!(["id", "group", "label", "consequence"])
+        );
+        assert_eq!(
+            schema["properties"]["id"]["$ref"],
+            "#/components/schemas/ComposeSecurityCheck"
+        );
+    }
+
     fn user() -> temps_entities::users::Model {
         temps_entities::users::Model {
             id: 1,

@@ -7,6 +7,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::analytics_identity_mode::AnalyticsIdentityMode;
 use super::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
@@ -51,6 +52,11 @@ pub struct Model {
     pub git_provider_connection_id: Option<i32>,
     /// Attack mode - when enabled, requires CAPTCHA verification for all visitors
     pub attack_mode: bool,
+    /// ADR 066 D1: how Shield acts on verdicts for the project's
+    /// environments: `off`, `log`, `selective` or `attack`. Replaces
+    /// `attack_mode`, which the API keeps writing for one release.
+    #[serde(default = "default_shield_mode")]
+    pub shield_mode: String,
     /// ADR-021 Tier 2: opt-in AI summarization of metric alert notifications for
     /// this project. NULL/false = off (the deterministic Tier-1 text is used);
     /// true = enrich with the configured AI provider when one is available.
@@ -113,6 +119,10 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
+    /// `hosted`: Temps builds and runs the app. `external`: the app runs
+    /// elsewhere and only sends Temps its telemetry; it is never deployed.
+    #[sea_orm(default_value = "hosted")]
+    pub hosting: super::types::Hosting,
     /// Bounded template provenance: a reviewed bundled slug or the fixed
     /// `custom` marker. Service projects additionally persist their complete,
     /// immutable template release in `service_template`.
@@ -120,7 +130,12 @@ pub struct Model {
     pub template_slug: Option<String>,
     /// Immutable resolved service-template release. Stored as JSONB so an
     /// existing service remains deployable and editable without consulting the
-    /// mutable catalog. Only `project_type = service` may populate it.
+    /// mutable catalog. A `service` project always has one. A `server` or
+    /// `static` project has one only when it is a source-built service of an
+    /// app template (it then also has a non-blank `template_slug`, enforced
+    /// by `projects_service_template_identity`): the release holds its
+    /// managed-database bindings, but it is built and deployed like any
+    /// other project and is not upgradeable.
     #[serde(skip_serializing)]
     pub service_template: Option<Json>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
@@ -136,6 +151,16 @@ pub struct Model {
     /// Never serialized in API responses (MUST-FIX 5).
     #[serde(skip_serializing)]
     pub gitea_webhook_signing_token: Option<String>,
+    /// Repository webhook ID returned by `POST /repos/{owner}/{repo}/hooks`
+    /// when we auto-register a webhook for a GitHub connection that is not a
+    /// GitHub App (PAT/OAuth). App connections receive pushes through the
+    /// App's own webhook and leave this NULL.
+    pub github_webhook_id: Option<i64>,
+    /// Encrypted HMAC-SHA256 secret sent to GitHub as the repository
+    /// webhook's `secret`. Deliveries carrying `X-Hub-Signature-256` are
+    /// verified against it. Never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub github_webhook_signing_token: Option<String>,
     /// Encrypted secret-in-path token for Bitbucket webhook delivery URL.
     /// Embedded in the webhook callback URL path instead of HMAC (Bitbucket
     /// Cloud does not provide HMAC body signing).
@@ -159,6 +184,17 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Whether this project's own app answers Temps' public paths on its
+    /// domains. The proxy normally sends `/api/_temps*` (browser analytics,
+    /// session replay) and `/api/otel*` (OTLP ingest and queries) to this
+    /// instance's console on every hostname, because deployed apps' SDKs post
+    /// to their own domain. A project that is itself a Temps console or API
+    /// serves those paths, and with this on they reach the project's upstream
+    /// instead — so this instance's own analytics and OTLP ingest stop
+    /// receiving that project's traffic. Off by default.
+    #[sea_orm(default_value = "false")]
+    #[serde(default)]
+    pub serves_own_temps_api: bool,
     /// Opt-in for AI summarization of API traffic analytics for this project.
     /// NULL/false = off; true = generate an AI summary when AI is configured
     /// and the project calls `GET /projects/{id}/api-analytics/summary`.
@@ -224,6 +260,65 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// ADR 109 D3: how this project's visitors are told apart. `persistent`
+    /// (the default for every existing and new project) keeps an id in a
+    /// first-party cookie or `localStorage`; `cookieless` stores nothing on
+    /// the device and counts visitors by a hash with a daily salt. On the
+    /// project row so the proxy reads it from its route table with no lookup
+    /// per request.
+    #[sea_orm(default_value = "persistent")]
+    #[serde(default)]
+    pub analytics_identity_mode: AnalyticsIdentityMode,
+    /// Container log ingestion budget for this project's containers, in
+    /// lines per second. NULL inherits the platform budget
+    /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.
+    pub log_ingest_lines_per_sec: Option<i32>,
+    /// As `log_ingest_lines_per_sec`, in KiB per second.
+    pub log_ingest_kib_per_sec: Option<i32>,
+    /// Which template instantiation created this project, and for which of
+    /// the template's services, so a resumed instantiation can tell its own
+    /// project from one that merely holds the planned slug. The row is
+    /// inserted with [`pending_instantiation_token`] and switched to the
+    /// final [`instantiation_token`] once its environment, variables and
+    /// service links exist: the final value therefore means "ours and
+    /// complete". NULL for every project created any other way. An internal
+    /// ownership marker: never serialized in API responses.
+    #[serde(skip_serializing)]
+    pub instantiation_token: Option<String>,
+}
+
+/// The ownership token stored in [`Model::instantiation_token`] for the
+/// project created for `template_service` by instantiation `instantiation_id`.
+///
+/// One token per (instantiation, service): the partial unique index on the
+/// column makes a second project for the same step impossible.
+pub fn instantiation_token(instantiation_id: i32, template_service: &str) -> String {
+    format!("instantiation:{instantiation_id}:service:{template_service}")
+}
+
+/// The value [`Model::instantiation_token`] holds while a project made for an
+/// instantiation is still being initialized (its environment, variables and
+/// service links are written after the row).
+///
+/// The row is inserted with this value and only switched to `token` once
+/// initialization finished, so the final token proves a *complete* project
+/// and this one proves "ours, not finished" -- which a resumed run discards
+/// and recreates instead of adopting. It is a different string from every
+/// final token (those start with `instantiation:`), so the one unique index
+/// covers both spellings and a service can never hold two projects.
+pub fn pending_instantiation_token(token: &str) -> String {
+    format!("pending:{token}")
+}
+
+/// Whether `token` is a value produced by [`pending_instantiation_token`].
+pub fn is_pending_instantiation_token(token: &str) -> bool {
+    token.starts_with("pending:")
+}
+
+/// The mode a project without one runs in (ADR 066 D1), for rows
+/// serialised before the column existed.
+fn default_shield_mode() -> String {
+    "log".to_string()
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -278,5 +373,31 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_pending_token_is_never_a_final_token() {
+        let token = instantiation_token(7, "backend");
+        let pending = pending_instantiation_token(&token);
+        assert_ne!(pending, token);
+        assert!(is_pending_instantiation_token(&pending));
+        assert!(!is_pending_instantiation_token(&token));
+    }
+
+    #[test]
+    fn a_service_cannot_spell_a_final_token_as_another_pending_one() {
+        // Final tokens all start with `instantiation:`, pending ones with
+        // `pending:`, whatever the service is called.
+        let tricky = instantiation_token(1, "pending:instantiation:1:service:x");
+        assert!(!is_pending_instantiation_token(&tricky));
+        assert_ne!(
+            pending_instantiation_token(&instantiation_token(1, "x")),
+            tricky
+        );
     }
 }

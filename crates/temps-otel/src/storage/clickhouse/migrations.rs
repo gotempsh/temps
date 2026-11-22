@@ -346,12 +346,6 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// First delay between failed migration attempts; doubles up to
-/// [`MIGRATION_RETRY_MAX_DELAY`].
-pub const MIGRATION_RETRY_INITIAL_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
-/// Longest delay between failed migration attempts.
-pub const MIGRATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
-
 /// Run `apply` until it succeeds, backing off between failures.
 ///
 /// The storage refuses writes until the migrations have applied, so giving
@@ -359,44 +353,33 @@ pub const MIGRATION_RETRY_MAX_DELAY: std::time::Duration = std::time::Duration::
 /// through, failing against an old schema) for the life of the process. The
 /// commonest failure is ClickHouse not yet accepting connections when Temps
 /// boots, which a later attempt survives; a failure that persists is
-/// logged at `error` on every attempt so the operator sees it.
+/// logged on every attempt so the operator sees it.
+///
+/// The cadence and classification are shared with every other ClickHouse
+/// subsystem (`temps_clickhouse::retry_until_applied`): transient failures
+/// back off from 5 s to 60 s with jitter, while a response the client cannot
+/// decode — which waiting cannot fix — is logged as such and re-checked at a
+/// slow fixed interval so recovery after the operator fixes the server needs
+/// no restart.
 ///
 /// `first_attempt_done` is signalled after the first attempt, whatever its
 /// outcome, so startup can wait for one attempt without waiting out the
 /// backoff.
 pub async fn retry_until_applied<T, F, Fut>(
-    mut apply: F,
+    apply: F,
     first_attempt_done: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> T
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, OtelError>>,
 {
-    let mut first_attempt_done = first_attempt_done;
-    let mut delay = MIGRATION_RETRY_INITIAL_DELAY;
-    let mut attempt: u32 = 1;
-    loop {
-        let result = apply().await;
-        if let Some(done) = first_attempt_done.take() {
-            // The receiver is gone once startup stopped waiting; nothing to do.
-            let _ = done.send(());
-        }
-        match result {
-            Ok(applied) => return applied,
-            Err(error) => {
-                tracing::error!(
-                    attempt,
-                    retry_in_secs = delay.as_secs(),
-                    %error,
-                    "ClickHouse OTel migrations failed; OTLP writes are answered 503 \
-                     until they apply, retrying"
-                );
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(MIGRATION_RETRY_MAX_DELAY);
-                attempt = attempt.saturating_add(1);
-            }
-        }
-    }
+    temps_clickhouse::retry_until_applied(
+        "otel",
+        &temps_clickhouse::MigrationRetryPolicy::default(),
+        apply,
+        first_attempt_done,
+    )
+    .await
 }
 
 #[cfg(test)]
@@ -497,8 +480,11 @@ mod tests {
         .await;
 
         assert_eq!(applied, 4, "must keep going until an attempt succeeds");
-        // 5s + 10s + 20s between the three failures.
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(35));
+        // 5s + 10s + 20s between the three failures, each stretched by at
+        // most 20% of jitter.
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_secs(35), "{waited:?}");
+        assert!(waited <= std::time::Duration::from_secs(42), "{waited:?}");
     }
 
     #[tokio::test(start_paused = true)]
@@ -522,8 +508,10 @@ mod tests {
         )
         .await;
 
-        // 5 + 10 + 20 + 40, then capped: 60 + 60.
-        assert_eq!(started.elapsed(), std::time::Duration::from_secs(195));
+        // 5 + 10 + 20 + 40, then capped: 60 + 60 — each plus up to 20% jitter.
+        let waited = started.elapsed();
+        assert!(waited >= std::time::Duration::from_secs(195), "{waited:?}");
+        assert!(waited <= std::time::Duration::from_secs(234), "{waited:?}");
     }
 
     #[tokio::test(start_paused = true)]

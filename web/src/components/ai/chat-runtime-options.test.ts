@@ -14,6 +14,7 @@ import {
   reconcileChatRuntimeAfterRefresh,
   resolveChatRuntimeSelection,
   shouldAutoRefreshHarnessModels,
+  storedConversationRuntime,
   usesHarnessCatalog,
   type ChatProviderOption,
 } from './chat-runtime-options'
@@ -417,3 +418,32 @@ test.each(['bootstrap', 'stale_cache'])(
     ).toBeNull()
   }
 )
+
+describe('storedConversationRuntime', () => {
+  test('a first turn asks for exactly what the chat was created with', () => {
+    expect(
+      storedConversationRuntime({
+        ai_provider: 'gateway_key:2',
+        ai_model: 'model-b',
+        ai_thinking_level: 'high',
+        ai_permission_mode: 'confirm-actions',
+      })
+    ).toEqual({
+      providerId: 'gateway_key:2',
+      modelId: 'model-b',
+      thinkingOptionId: 'high',
+      permissionModeId: 'confirm-actions',
+    })
+  })
+
+  test('unset options stay unset rather than borrowing another choice', () => {
+    expect(storedConversationRuntime({ ai_provider: 'gateway_key:2' })).toEqual(
+      {
+        providerId: 'gateway_key:2',
+        modelId: null,
+        thinkingOptionId: null,
+        permissionModeId: null,
+      }
+    )
+  })
+})

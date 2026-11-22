@@ -8,7 +8,7 @@
 //! the image -- source maps, static assets, vulnerability scans, and replicas
 //! placed on the control plane -- need it in the control plane's daemon.
 
-use temps_core::WorkflowError;
+use crate::workflow::WorkflowError;
 
 /// Outcome of [`copy_node_built_image`].
 #[derive(Debug, PartialEq, Eq)]
@@ -110,6 +110,9 @@ pub(crate) mod fake {
         pub(crate) imports: Mutex<Vec<String>>,
         /// Import this id instead of the archive's, to simulate a corrupt copy.
         pub(crate) import_as: Option<String>,
+        /// Configuration `inspect_image` reports, as a node that returns it
+        /// would; `None` simulates an agent that predates the field.
+        pub(crate) config: Option<temps_deployer::ImageConfig>,
     }
 
     impl FakeImageStore {
@@ -232,7 +235,8 @@ pub(crate) mod fake {
                 size_bytes: 0,
                 tags: vec![image_name.to_string()],
                 created: None,
-                working_dir: None,
+                working_dir: self.config.as_ref().map(|_| "/app".to_string()),
+                config: self.config.clone(),
             })
         }
 
@@ -375,7 +379,7 @@ mod tests {
     fn image_ids_compare_with_or_without_the_digest_prefix() {
         assert!(same_image_id("sha256:ABC", "abc"));
         assert!(same_image_id("abc", "sha256:abc"));
-        assert!(!same_image_id("sha256:abc", "sha256:abd"));
+        assert!(!same_image_id("sha256:abc", "sha256:ab0"));
         assert!(!same_image_id("", ""));
     }
 

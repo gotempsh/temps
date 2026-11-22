@@ -5,26 +5,34 @@ import { describe, expect, test } from 'bun:test'
 import { platformToolGroups } from './platform-tools'
 
 describe('platform tools AI discovery', () => {
-  test('separates persistent contexts from standalone compute', () => {
+  test('lists sandboxes but no longer the retired harness workspaces', () => {
     const items = platformToolGroups.flatMap((group) => group.items)
-    expect(items.find((item) => item.title === 'Workspaces')?.url).toBe(
-      '/workspaces'
-    )
     expect(items.find((item) => item.title === 'Sandboxes')?.url).toBe(
       '/sandboxes'
     )
+    expect(items.some((item) => item.url === '/workspaces')).toBe(false)
   })
-  test('keeps harness setup discoverable without conflating built-in AI', () => {
+
+  test('offers the assistant and AI providers, not retired AI surfaces', () => {
     const automate = platformToolGroups.find(
       (group) => group.label === 'Automate'
     )
+    const byTitle = (title: string) =>
+      automate?.items.find((item) => item.title === title)
 
-    expect(
-      automate?.items.find((item) => item.title === 'Connect AI harness')?.url
-    ).toBe('/setup/ai')
-    expect(
-      automate?.items.find((item) => item.title === 'Built-in AI')?.url
-    ).toBe('/ai-gateway')
+    expect(byTitle('Temps assistant')?.url).toBe('/chat')
+    expect(byTitle('Temps assistant')?.featureKey).toBe('ai-chat')
+    expect(byTitle('AI providers')?.url).toBe('/ai-gateway')
+    expect(byTitle('AI providers')?.featureKey).toBe('ai-gateway')
+    // Connecting an external coding agent to Temps is unrelated to harnesses
+    // running inside Temps, and stays.
+    expect(byTitle('Connect AI harness')?.url).toBe('/setup/ai')
+    const urls = platformToolGroups.flatMap((group) =>
+      group.items.map((item) => item.url)
+    )
+    for (const retired of ['/ai-workflows', '/skills', '/mcp-servers']) {
+      expect(urls).not.toContain(retired)
+    }
   })
 })
 

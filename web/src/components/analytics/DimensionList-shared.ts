@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { ProjectResponse, PropertyColumn } from '@/api/client/types.gen'
+import { segmentSupportsVisitors } from './SegmentVisitors-shared'
 
 export type DimensionKey =
   | 'events'
@@ -51,7 +52,7 @@ export const DIMENSIONS: Record<DimensionKey, DimensionConfig> = {
     groupBy: 'browser',
   },
   operating_systems: {
-    title: 'Operating Systems',
+    title: 'Operating systems',
     singular: 'operating system',
     plural: 'operating systems',
     groupBy: 'operating_system',
@@ -81,7 +82,7 @@ export const DIMENSIONS: Record<DimensionKey, DimensionConfig> = {
     groupBy: 'city',
   },
   channels: {
-    title: 'Traffic Channels',
+    title: 'Traffic channels',
     singular: 'channel',
     plural: 'channels',
     groupBy: 'channel',
@@ -99,31 +100,31 @@ export const DIMENSIONS: Record<DimensionKey, DimensionConfig> = {
     groupBy: 'pathname',
   },
   utm_source: {
-    title: 'UTM Sources',
+    title: 'UTM sources',
     singular: 'source',
     plural: 'sources',
     groupBy: 'utm_source',
   },
   utm_medium: {
-    title: 'UTM Mediums',
+    title: 'UTM mediums',
     singular: 'medium',
     plural: 'mediums',
     groupBy: 'utm_medium',
   },
   utm_campaign: {
-    title: 'UTM Campaigns',
+    title: 'UTM campaigns',
     singular: 'campaign',
     plural: 'campaigns',
     groupBy: 'utm_campaign',
   },
   utm_term: {
-    title: 'UTM Terms',
+    title: 'UTM terms',
     singular: 'term',
     plural: 'terms',
     groupBy: 'utm_term',
   },
   utm_content: {
-    title: 'UTM Contents',
+    title: 'UTM contents',
     singular: 'content',
     plural: 'contents',
     groupBy: 'utm_content',
@@ -152,3 +153,32 @@ export interface Row {
 }
 
 export type DimensionSortKey = 'value' | 'count'
+
+/**
+ * The page a breakdown row opens: an event's detail page, else the visitors
+ * in that segment (`/analytics/segments/:dimension/:value`), when the
+ * dimension can filter visitors. The date range carries over, so the page
+ * opens on the same window. `undefined` leaves the row plain.
+ */
+export function dimensionRowHref(
+  projectSlug: string,
+  dimension: DimensionKey,
+  value: string,
+  searchParams: URLSearchParams
+): string | undefined {
+  const base = `/projects/${projectSlug}/analytics`
+  const path =
+    dimension === 'events'
+      ? `${base}/events/${encodeURIComponent(value)}`
+      : segmentSupportsVisitors(dimension)
+        ? `${base}/segments/${dimension}/${encodeURIComponent(value)}`
+        : undefined
+  if (!path) return undefined
+  const params = new URLSearchParams()
+  for (const key of ['filter', 'from', 'to']) {
+    const current = searchParams.get(key)
+    if (current) params.set(key, current)
+  }
+  const qs = params.toString()
+  return qs ? `${path}?${qs}` : path
+}

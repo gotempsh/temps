@@ -17,13 +17,25 @@
 //!
 //! Skips gracefully (never `#[ignore]`) when Docker is unavailable.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use temps_core::{LogWriter, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::{docker::DockerRuntime, ImageBuilder};
 use temps_deployments::jobs::BuildImageJobBuilder;
+use temps_deployments::workflow::LogWriter;
+use temps_deployments::workflow::WorkflowContext;
+use temps_deployments::workflow::WorkflowError;
+use temps_deployments::workflow::WorkflowTask;
 
 struct NoopLogWriter;
 

@@ -29,7 +29,7 @@ interface TemplateListProps {
   onTemplateSelect: (template: TemplateResponse) => void
   selectedTemplate?: TemplateResponse | null
   showFeaturedFirst?: boolean
-  kind?: 'starter' | 'service'
+  kind?: 'starter' | 'app'
   showTagFilter?: boolean
   onUseGitUrl?: () => void
   onBrowseRepositories?: () => void
@@ -103,7 +103,11 @@ export function TemplateList({
 
   if (isLoadingTemplates) {
     return (
-      <div className="grid gap-4 md:grid-cols-2" aria-label="Loading templates">
+      <div
+        role="status"
+        className="grid gap-4 md:grid-cols-2"
+        aria-label="Loading templates"
+      >
         {[0, 1, 2, 3].map((item) => (
           <Skeleton key={item} className="h-52 rounded-xl" />
         ))}
@@ -238,7 +242,7 @@ export function TemplateList({
       {/* Template count */}
       <div className="text-xs text-muted-foreground text-center pt-2">
         {filteredTemplates.length} of {templatesData?.total ?? 0}{' '}
-        {kind === 'service' ? 'services' : 'templates'}
+        {kind === 'app' ? 'services' : 'templates'}
       </div>
     </div>
   )

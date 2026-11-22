@@ -5,7 +5,9 @@ import { describe, expect, test } from 'bun:test'
 
 import {
   composePreviewEndpoint,
+  composePreviewErrorClass,
   composePreviewErrorMessage,
+  composePreviewFailedCheck,
   composePreviewPolicyCheck,
   isPublicRepositoryRateLimitError,
 } from './compose-preview'
@@ -69,5 +71,42 @@ describe('Compose preview errors', () => {
     expect(isPublicRepositoryRateLimitError({ status: 429 })).toBe(true)
     expect(isPublicRepositoryRateLimitError({ status: 403 })).toBe(false)
     expect(isPublicRepositoryRateLimitError(null)).toBe(false)
+  })
+})
+
+describe('Compose preview deploy check', () => {
+  const failedCheck = {
+    passed: false,
+    error_class: 'policy_violation' as const,
+    error:
+      "Compose security policy rejected privileged for service 'web': privileged containers are not allowed",
+    resolution_reasons: [],
+    resolution_ran: false,
+    command: null,
+    unset_variables: [],
+    referenced_variables: ['APP_PORT'],
+    notes: [],
+  }
+
+  test('exposes the deploy error class and the failed check', () => {
+    const error = {
+      status: 400,
+      problem: {
+        title: 'Compose Check Failed',
+        detail: 'would fail to deploy',
+        error_class: 'policy_violation',
+        compose_check: failedCheck,
+      },
+    }
+    expect(composePreviewErrorClass(error)).toBe('policy_violation')
+    expect(composePreviewFailedCheck(error)).toEqual(failedCheck)
+    expect(composePreviewErrorMessage(error)).toBe('would fail to deploy')
+  })
+
+  test('is empty for a preview error without a check', () => {
+    const error = { status: 400, problem: { title: 'Invalid', detail: 'x' } }
+    expect(composePreviewErrorClass(error)).toBeNull()
+    expect(composePreviewFailedCheck(error)).toBeNull()
+    expect(composePreviewFailedCheck(null)).toBeNull()
   })
 })

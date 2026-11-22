@@ -33,6 +33,19 @@ pub(crate) struct DynamicPluginRouter {
     pub inner: Arc<RwLock<Router>>,
 }
 
+impl DynamicPluginRouter {
+    pub(crate) fn router(&self) -> Router {
+        let router_ref = self.inner.clone();
+        Router::new().fallback(move |request: Request| {
+            let router_ref = router_ref.clone();
+            async move {
+                let router = router_ref.read().await.clone();
+                router.oneshot(request).await.into_response()
+            }
+        })
+    }
+}
+
 /// External plugins plugin — discovers, manages, and proxies standalone
 /// binary plugins following the TempsPlugin lifecycle.
 pub struct ExternalPluginsPlugin {
@@ -73,11 +86,19 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Discovery is deferred to a background task because the
             // per-plugin handshake timeout (default 30s) would otherwise
             // block the console API from coming up.
-            let service = Arc::new(ExternalPluginsService::new_empty(
-                self.config.clone(),
-                queue,
-                db,
-            ));
+            // A process with no Docker of its own (a hosted control plane)
+            // compiles plugins on a joined worker node. Registered by the
+            // deployments plugin, which runs earlier; absent where the node
+            // machinery is not part of the build.
+            let remote_builder =
+                context.get_service::<dyn temps_core::plugin_builder::RemotePluginBuilder>();
+            let ai_tools = Arc::new(temps_ai_api_tools::PluginToolsRegistry::default());
+            context.register_service(ai_tools.clone());
+            let service = Arc::new(
+                ExternalPluginsService::new_empty(self.config.clone(), queue, db)
+                    .with_remote_builder(remote_builder)
+                    .with_ai_tools_registry(ai_tools),
+            );
             service
                 .manager()
                 .set_ai_service(context.require_service::<dyn temps_ai::AiService>())
@@ -141,19 +162,7 @@ impl TempsPlugin for ExternalPluginsPlugin {
         // Build the listing + admin routes (/x/plugins, /x/plugins/reload)
         let listing_router = handler::configure_routes().with_state((*app_state).clone());
 
-        // Create a dynamic routing layer that reads the swappable proxy router
-        // on every request. When reload_plugins() swaps the inner Router, all
-        // subsequent requests are routed to the new plugins.
-        let router_ref = dynamic.inner.clone();
-        let dynamic_proxy = Router::new().fallback(move |request: Request| {
-            let router_ref = router_ref.clone();
-            async move {
-                let router = router_ref.read().await.clone();
-                router.oneshot(request).await.into_response()
-            }
-        });
-
-        let combined_router = listing_router.merge(dynamic_proxy);
+        let combined_router = listing_router.merge(dynamic.router());
 
         Some(PluginRoutes::new(combined_router))
     }

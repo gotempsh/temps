@@ -48,6 +48,11 @@ Add a new Git provider
 | `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
 | `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--token-file <path>` | Read the access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the access token from stdin instead of --token | - | No |
+| `--password-file <path>` | Read the Bitbucket app password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the Bitbucket app password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `providers remove` (alias: `rm`)
 
@@ -141,6 +146,11 @@ Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
 | `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
 | `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--token-file <path>` | Read the access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the access token from stdin instead of --token | - | No |
+| `--password-file <path>` | Read the Bitbucket app password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the Bitbucket app password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers git repos`
 
@@ -263,7 +273,10 @@ Update access token for a Git connection
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Connection ID | - | Yes |
-| `-t, --token <token>` | New access token | - | Yes |
+| `-t, --token <token>` | New access token (prefer --token-file or --token-stdin, which keep it out of shell history) | - | No |
+| `--token-file <path>` | Read the new access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the new access token from stdin instead of --token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers connections validate`
 

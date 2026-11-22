@@ -50,23 +50,87 @@ function hashString(str: string): number {
 }
 
 const AVATAR_COLORS = [
-  { bg: 'bg-red-500/20', text: 'text-red-400', hex: '#f87171' },
-  { bg: 'bg-orange-500/20', text: 'text-orange-400', hex: '#fb923c' },
-  { bg: 'bg-amber-500/20', text: 'text-amber-400', hex: '#fbbf24' },
-  { bg: 'bg-yellow-500/20', text: 'text-yellow-400', hex: '#facc15' },
-  { bg: 'bg-lime-500/20', text: 'text-lime-400', hex: '#a3e635' },
-  { bg: 'bg-green-500/20', text: 'text-green-400', hex: '#4ade80' },
-  { bg: 'bg-emerald-500/20', text: 'text-emerald-400', hex: '#34d399' },
-  { bg: 'bg-teal-500/20', text: 'text-teal-400', hex: '#2dd4bf' },
-  { bg: 'bg-cyan-500/20', text: 'text-cyan-400', hex: '#22d3ee' },
-  { bg: 'bg-sky-500/20', text: 'text-sky-400', hex: '#38bdf8' },
-  { bg: 'bg-blue-500/20', text: 'text-blue-400', hex: '#60a5fa' },
-  { bg: 'bg-indigo-500/20', text: 'text-indigo-400', hex: '#818cf8' },
-  { bg: 'bg-violet-500/20', text: 'text-violet-400', hex: '#a78bfa' },
-  { bg: 'bg-purple-500/20', text: 'text-purple-400', hex: '#c084fc' },
+  {
+    bg: 'bg-red-500/20',
+    text: 'text-red-700 dark:text-red-400',
+    hex: '#f87171',
+  },
+  {
+    bg: 'bg-orange-500/20',
+    text: 'text-orange-700 dark:text-orange-400',
+    hex: '#fb923c',
+  },
+  {
+    bg: 'bg-amber-500/20',
+    text: 'text-amber-700 dark:text-amber-400',
+    hex: '#fbbf24',
+  },
+  {
+    bg: 'bg-yellow-500/20',
+    text: 'text-yellow-700 dark:text-yellow-400',
+    hex: '#facc15',
+  },
+  {
+    bg: 'bg-lime-500/20',
+    text: 'text-lime-700 dark:text-lime-400',
+    hex: '#a3e635',
+  },
+  {
+    bg: 'bg-green-500/20',
+    text: 'text-green-700 dark:text-green-400',
+    hex: '#4ade80',
+  },
+  {
+    bg: 'bg-emerald-500/20',
+    text: 'text-emerald-700 dark:text-emerald-400',
+    hex: '#34d399',
+  },
+  {
+    bg: 'bg-teal-500/20',
+    text: 'text-teal-700 dark:text-teal-400',
+    hex: '#2dd4bf',
+  },
+  {
+    bg: 'bg-cyan-500/20',
+    text: 'text-cyan-700 dark:text-cyan-400',
+    hex: '#22d3ee',
+  },
+  {
+    bg: 'bg-sky-500/20',
+    text: 'text-sky-700 dark:text-sky-400',
+    hex: '#38bdf8',
+  },
+  {
+    bg: 'bg-blue-500/20',
+    text: 'text-blue-600 dark:text-blue-400',
+    hex: '#60a5fa',
+  },
+  {
+    bg: 'bg-indigo-500/20',
+    text: 'text-indigo-600 dark:text-indigo-400',
+    hex: '#818cf8',
+  },
+  {
+    bg: 'bg-violet-500/20',
+    text: 'text-violet-600 dark:text-violet-400',
+    hex: '#a78bfa',
+  },
+  {
+    bg: 'bg-purple-500/20',
+    text: 'text-purple-600 dark:text-purple-400',
+    hex: '#c084fc',
+  },
   { bg: 'bg-fuchsia-500/20', text: 'text-fuchsia-400', hex: '#e879f9' },
-  { bg: 'bg-pink-500/20', text: 'text-pink-400', hex: '#f472b6' },
-  { bg: 'bg-rose-500/20', text: 'text-rose-400', hex: '#fb7185' },
+  {
+    bg: 'bg-pink-500/20',
+    text: 'text-pink-700 dark:text-pink-400',
+    hex: '#f472b6',
+  },
+  {
+    bg: 'bg-rose-500/20',
+    text: 'text-rose-700 dark:text-rose-400',
+    hex: '#fb7185',
+  },
 ]
 
 // Generate a unique two-letter code per visitor from their visitor_id hash
@@ -212,7 +276,7 @@ function VisitorPopoverContent({
       <Button size="sm" className="w-full" asChild>
         <Link to={journeyUrl}>
           <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-          View Visitor Journey
+          View visitor journey
         </Link>
       </Button>
     </div>
@@ -386,9 +450,9 @@ function RecentVisitorItem({ visitor, projectSlug }: RecentVisitorItemProps) {
 const GLOBE_QUICK_FILTERS = [
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
-  { label: 'Last 7 Days', value: '7days' },
-  { label: 'Last 15 Days', value: '15days' },
-  { label: 'Last 30 Days', value: '30days' },
+  { label: 'Last 7 days', value: '7days' },
+  { label: 'Last 15 days', value: '15days' },
+  { label: 'Last 30 days', value: '30days' },
   { label: 'Custom', value: 'custom' },
 ] as const
 
@@ -570,7 +634,7 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
           <div>
             <h2 className="text-xl font-semibold flex items-center gap-2">
               <GlobeIcon className="h-5 w-5" />
-              Visitor Globe
+              Visitor globe
             </h2>
             <p className="text-sm text-muted-foreground">
               {visitorsData?.filtered_count ?? 0} visitors &middot;{' '}
@@ -582,7 +646,7 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
           {liveCount > 0 && (
             <Badge
               variant="outline"
-              className="gap-1.5 border-green-500/50 text-green-500"
+              className="gap-1.5 border-green-500/50 text-green-700 dark:text-green-500"
             >
               <span className="relative flex h-2 w-2">
                 <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-green-400 opacity-75" />

@@ -4,19 +4,32 @@
 import * as React from 'react'
 
 import { cn } from '@/lib/utils'
+import { scrollableRegionProps, useScrollableRegion } from './scrollable-region'
 
 const Table = React.forwardRef<
   HTMLTableElement,
   React.HTMLAttributes<HTMLTableElement>
->(({ className, ...props }, ref) => (
-  <div className="relative w-full overflow-auto">
-    <table
-      ref={ref}
-      className={cn('w-full caption-bottom text-sm', className)}
-      {...props}
-    />
-  </div>
-))
+>(({ className, ...props }, ref) => {
+  // A wide table scrolls inside this wrapper. Once it overflows the wrapper
+  // becomes a named, focusable region so keyboard users can scroll it.
+  const region = useScrollableRegion<HTMLDivElement>()
+  const tableLabel = props['aria-label']
+  const regionLabel = tableLabel ? `${tableLabel}, scrollable` : undefined
+
+  return (
+    <div
+      ref={region.ref}
+      className="relative w-full overflow-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring"
+      {...scrollableRegionProps(region.scrollable, regionLabel)}
+    >
+      <table
+        ref={ref}
+        className={cn('w-full caption-bottom text-sm', className)}
+        {...props}
+      />
+    </div>
+  )
+})
 Table.displayName = 'Table'
 
 const TableHeader = React.forwardRef<

@@ -90,6 +90,28 @@ impl TempsPlugin for AnalyticsPlugin {
             context.register_service(Arc::new(AnalyticsIngestKeyService::new(db.clone())));
             context.register_service(Arc::new(AnalyticsIngestRateLimiter::new()));
 
+            // ADR 109 D3. One instance for the identity settings endpoint and
+            // every ingest path, so they share the daily salt, the session
+            // cache and the identity-mode cache a settings change clears.
+            let cookieless = Arc::new(crate::cookieless::CookielessIdentity::new(
+                db.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+            ));
+            context.register_service(Arc::new(
+                crate::identity_settings::AnalyticsIdentityService::new(
+                    db.clone(),
+                    cookieless.clone(),
+                ),
+            ));
+            context.register_service(cookieless);
+            // ADR 109 D4: identify, from the browser (ingest) and the backend.
+            context.register_service(Arc::new(
+                crate::visitor_identity::VisitorIdentityService::new(
+                    db.clone(),
+                    cookie_crypto.clone(),
+                ),
+            ));
+
             tracing::debug!("Analytics plugin services registered successfully");
             Ok(())
         })
@@ -112,6 +134,8 @@ impl TempsPlugin for AnalyticsPlugin {
                 300,
                 std::time::Duration::from_secs(60),
             )),
+            visitor_identity: context
+                .require_service::<crate::visitor_identity::VisitorIdentityService>(),
         });
 
         // ADR-040 ingest-key admin CRUD. Its own state so the key service and
@@ -126,6 +150,9 @@ impl TempsPlugin for AnalyticsPlugin {
             rate_limiter: context.require_service::<AnalyticsIngestRateLimiter>(),
             audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
             project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+            // Optional: a binary without the settings service still serves the
+            // key CRUD; the ingest-endpoint route then reports no external URL.
+            config_service: context.get_service::<temps_config::ConfigService>(),
         });
 
         // Configure routes with the state
@@ -146,7 +173,19 @@ impl TempsPlugin for AnalyticsPlugin {
                     project_access_checker:
                         context.get_service::<dyn temps_core::ProjectAccessChecker>(),
                 },
-            )));
+            )))
+            .merge(
+                crate::identity_settings::routes().with_state(Arc::new(
+                    crate::identity_settings::AnalyticsIdentityState {
+                        service: context
+                            .require_service::<crate::identity_settings::AnalyticsIdentityService>(
+                            ),
+                        audit: context.require_service::<dyn temps_core::AuditLogger>(),
+                        project_access_checker: context
+                            .get_service::<dyn temps_core::ProjectAccessChecker>(),
+                    },
+                )),
+            );
 
         Some(PluginRoutes::new(routes))
     }
@@ -156,6 +195,11 @@ impl TempsPlugin for AnalyticsPlugin {
         context: &'a PluginContext,
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
+            // Deletes past days' cookieless salts even without cookieless
+            // traffic to trigger the daily refresh (ADR 109 D3).
+            crate::cookieless::spawn_salt_sweep(
+                context.require_service::<crate::cookieless::CookielessIdentity>(),
+            );
             let activity = context.require_service::<crate::activity::service::ActivityService>();
             tokio::spawn(async move {
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
@@ -167,6 +211,40 @@ impl TempsPlugin for AnalyticsPlugin {
                     }
                 }
             });
+            // Retention for stored IP addresses and visitors, and the
+            // `events`/`error_events` policies. Skipped, loudly, when the
+            // settings service is not part of this binary's plugin set.
+            match context.get_service::<temps_config::ConfigService>() {
+                Some(config) => {
+                    let db = context.require_service::<sea_orm::DatabaseConnection>();
+                    let mut retention = crate::retention::AnalyticsRetentionService::new(db);
+                    let server = config.get_server_config();
+                    if server.is_clickhouse_enabled() {
+                        let backend = temps_analytics_backend::clickhouse::ClickHouseBackend::new(
+                            temps_analytics_backend::clickhouse::ClickHouseConfig::new(
+                                server.clickhouse_url.as_deref().unwrap_or_default(),
+                                server.clickhouse_database.as_deref().unwrap_or_default(),
+                                server.clickhouse_user.as_deref().unwrap_or_default(),
+                                server.clickhouse_password.as_deref().unwrap_or_default(),
+                            )
+                            .with_compression(config.clickhouse_compression()),
+                        );
+                        retention = retention.with_clickhouse(backend.client_clone());
+                    }
+                    crate::retention::spawn_retention_job(
+                        Arc::new(retention),
+                        config,
+                        context.require_service::<dyn temps_core::AuditLogger>(),
+                        // Present only when a plugin supplies its own
+                        // per-project retention: its windows decide how long
+                        // proxy logs keep pointing at a stored address.
+                        context.get_service::<dyn temps_core::RetentionResolver>(),
+                    );
+                }
+                None => tracing::warn!(
+                    "analytics: settings service unavailable; analytics retention job not started"
+                ),
+            }
             let service = context.require_service::<ApiTrafficService>();
             if let Some(source) =
                 context.get_service::<dyn crate::api_traffic::ApiTrafficDataSource>()
@@ -234,6 +312,7 @@ impl TempsPlugin for AnalyticsPlugin {
         doc.merge(AnalyticsIngestKeyApiDoc::openapi());
         doc.merge(crate::global_handler::GlobalAnalyticsApiDoc::openapi());
         doc.merge(crate::activity::handlers::ActivityApiDoc::openapi());
+        doc.merge(crate::identity_settings::AnalyticsIdentityApiDoc::openapi());
         Some(doc)
     }
 }

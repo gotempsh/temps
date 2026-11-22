@@ -108,4 +108,17 @@ mod tests {
         assert_eq!(preset.install_command(path), "go mod download");
         assert_eq!(preset.build_command(path), "go build -o ./bin/app .");
     }
+
+    #[tokio::test]
+    async fn the_image_runs_as_the_non_root_autopack_user() {
+        use crate::mod_rs::runtime_user_test_support::{
+            rendered_runtime_user, AUTOPACK_RUNTIME_USER,
+        };
+        assert_eq!(
+            rendered_runtime_user(&GoPreset::new(), "sample-go-app")
+                .await
+                .as_deref(),
+            Some(AUTOPACK_RUNTIME_USER)
+        );
+    }
 }

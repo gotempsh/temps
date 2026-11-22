@@ -57,6 +57,8 @@ export interface OperationsSectionState {
 export interface OperationsTrayPanelProps {
   /** In-flight work (`status=running`); the badge counts exactly these. */
   running: OperationsSectionState
+  /** Paused for human action (`status=waiting`). */
+  waiting: OperationsSectionState
   /** Finished history (`status=finished`), newest first. */
   recent: OperationsSectionState
   localOperations: readonly LocalOperation[]
@@ -69,6 +71,7 @@ export interface OperationsTrayPanelProps {
 
 export function OperationsTrayPanel({
   running,
+  waiting,
   recent,
   localOperations,
   runningCount,
@@ -99,6 +102,7 @@ export function OperationsTrayPanel({
         )}
         <OperationsTrayBody
           running={running}
+          waiting={waiting}
           recent={recent}
           hasLocal={localOperations.length > 0}
           onNavigate={onNavigate}
@@ -111,25 +115,38 @@ export function OperationsTrayPanel({
 
 function OperationsTrayBody({
   running,
+  waiting,
   recent,
   hasLocal,
   onNavigate,
   now,
 }: {
   running: OperationsSectionState
+  waiting: OperationsSectionState
   recent: OperationsSectionState
   hasLocal: boolean
   onNavigate: () => void
   now: number
 }) {
-  if (running.isPending && recent.isPending) return <OperationsTraySkeleton />
-  if (running.isError && recent.isError) {
+  if (running.isPending && waiting.isPending && recent.isPending)
+    return <OperationsTraySkeleton />
+  if (
+    running.isError &&
+    waiting.isError &&
+    recent.isError &&
+    running.operations.length === 0 &&
+    waiting.operations.length === 0 &&
+    recent.operations.length === 0
+  ) {
     return (
       <OperationsTrayError
         title="Couldn't load operations"
-        message={running.errorMessage ?? recent.errorMessage}
+        message={
+          running.errorMessage ?? waiting.errorMessage ?? recent.errorMessage
+        }
         onRetry={() => {
           running.onRetry()
+          waiting.onRetry()
           recent.onRetry()
         }}
       />
@@ -137,10 +154,13 @@ function OperationsTrayBody({
   }
   const settledEmpty =
     !running.isPending &&
+    !waiting.isPending &&
     !recent.isPending &&
     !running.isError &&
+    !waiting.isError &&
     !recent.isError &&
     running.operations.length === 0 &&
+    waiting.operations.length === 0 &&
     recent.operations.length === 0
   if (settledEmpty) return hasLocal ? null : <OperationsTrayEmpty />
   return (
@@ -150,6 +170,14 @@ function OperationsTrayBody({
         noun="running operations"
         errorTitle="Couldn't load running operations"
         state={running}
+        onNavigate={onNavigate}
+        now={now}
+      />
+      <OperationSection
+        label="Needs review"
+        noun="operations needing review"
+        errorTitle="Couldn't load operations needing review"
+        state={waiting}
         onNavigate={onNavigate}
         now={now}
       />
@@ -184,18 +212,17 @@ function OperationSection({
   if (state.isPending) {
     return <OperationsTraySkeleton rows={1} label={`Loading ${label}`} />
   }
-  if (state.isError) {
-    return (
-      <OperationsTrayError
-        title={errorTitle}
-        message={state.errorMessage}
-        onRetry={state.onRetry}
-      />
-    )
-  }
-  if (state.operations.length === 0) return null
+  const error = state.isError ? (
+    <OperationsTrayError
+      title={errorTitle}
+      message={state.errorMessage}
+      onRetry={state.onRetry}
+    />
+  ) : null
+  if (state.operations.length === 0) return error
   return (
     <section aria-label={label} className="border-b last:border-b-0">
+      {error}
       <p className="px-3 pb-1 pt-2.5 text-xs font-medium text-muted-foreground">
         {label}
       </p>
@@ -372,7 +399,7 @@ export function OperationsTraySkeleton({
 }) {
   const indexes = Array.from({ length: rows }, (_, index) => index)
   return (
-    <div aria-busy="true" aria-label={label}>
+    <div role="status" aria-busy="true" aria-label={label}>
       {indexes.map((index) => (
         <div
           key={index}

@@ -298,7 +298,12 @@ pub(crate) fn render(
         }
     }
 
-    let dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
+    let mut dockerfile = to_dockerfile(&analysis.plan).map_err(|e| e.to_string())?;
+    // Temps web presets use the platform's injected PORT=3000 unless the
+    // project/environment overrides it. Autopack omits EXPOSE, which would
+    // otherwise turn these generated web images into portless workers.
+    // Repository Dockerfiles and external images never use this renderer.
+    dockerfile.push_str("\nEXPOSE 3000\n");
     let mut rendered = DockerfileWithArgs::new(dockerfile);
     // The tracing line above only reaches the server log. Carry the same notes
     // back to the build job so the user sees which settings were ignored in the
@@ -834,6 +839,23 @@ mod tests {
         let result = AutopackPreset::new().dockerfile(config).await;
         assert!(result.content.contains("BuildKit"), "{}", result.content);
         assert!(result.content.contains("exit 1"));
+    }
+
+    #[test]
+    fn generated_server_images_declare_the_platform_default_port() {
+        let go = fixture(&[
+            ("main.go", "package main\nfunc main() {}\n"),
+            ("go.mod", "module example.test/app\n\ngo 1.22\n"),
+        ]);
+        let node = node_app();
+        for (app, provider) in [(&go, Some("go")), (&node, None)] {
+            let rendered = render(&buildkit_config(app.path()), provider).unwrap();
+            let runtime = rendered.content.rsplit("\nFROM ").next().unwrap();
+            assert!(
+                runtime.lines().any(|line| line == "EXPOSE 3000"),
+                "Generated web images must declare the port injected as PORT at deployment: {runtime}"
+            );
+        }
     }
 
     #[test]

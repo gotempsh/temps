@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-agent-core"
+version.workspace = true
+edition.workspace = true
+description = "What the AI CLI and sandbox crates share: AgentError, the sandbox user and paths, the output callback and agent run statuses"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+http = { workspace = true }
+sea-orm = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

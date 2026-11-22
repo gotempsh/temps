@@ -175,8 +175,7 @@ impl ImportValidationRule for PortConflictRule {
             .deployment
             .ports
             .iter()
-            .filter(|p| p.host_port.is_some() && p.host_port.unwrap() < 1024)
-            .map(|p| p.host_port.unwrap())
+            .filter_map(|p| p.host_port.filter(|port| *port < 1024))
             .collect();
 
         if !privileged_ports.is_empty() {

@@ -4,6 +4,7 @@
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { AlertTriangle } from 'lucide-react'
+import { bucketEnvVarName } from '@/lib/s3-buckets'
 import { type PresetGroupProps } from './ServiceTypePresets-shared'
 
 export function PresetGroup({
@@ -54,7 +55,7 @@ export function PresetGroup({
                 </span>
               )}
               {opt.hint && (
-                <span className="mt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground/70">
+                <span className="mt-0.5 text-[10px] uppercase tracking-wide text-muted-foreground">
                   {opt.hint}
                 </span>
               )}
@@ -92,6 +93,69 @@ export function PresetGroup({
           </div>
         </div>
       )}
+    </div>
+  )
+}
+
+interface BucketListFieldProps {
+  value: string
+  onChange: (value: string) => void
+  /** The names `value` parses to, already normalised. */
+  buckets: string[]
+  error: string | null
+}
+
+/**
+ * Buckets every environment that links the service receives. Left empty, each
+ * environment gets one bucket named after the project and environment.
+ */
+export function BucketListField({
+  value,
+  onChange,
+  buckets,
+  error,
+}: BucketListFieldProps) {
+  return (
+    <div className="space-y-2">
+      <div className="space-y-1">
+        <Label htmlFor="s3-buckets">Buckets</Label>
+        <p className="text-sm text-muted-foreground">
+          Comma-separated names, for example{' '}
+          <code className="font-mono text-xs">uploads, exports</code>. Each
+          linked environment gets its own copy of every bucket and its own
+          access key. Leave empty for one bucket per environment.
+        </p>
+      </div>
+      <Input
+        id="s3-buckets"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="uploads, exports"
+        autoComplete="off"
+        aria-invalid={error !== null}
+        aria-describedby="s3-buckets-feedback"
+      />
+      <div id="s3-buckets-feedback">
+        {error ? (
+          <p role="alert" className="text-sm text-destructive">
+            {error}
+          </p>
+        ) : (
+          buckets.length > 0 && (
+            <ul className="flex flex-wrap gap-1.5">
+              {buckets.map((bucket) => (
+                <li
+                  key={bucket}
+                  className="rounded-md bg-muted px-2 py-0.5 font-mono text-xs"
+                  title={`Injected into the app as ${bucketEnvVarName(bucket)}`}
+                >
+                  {bucketEnvVarName(bucket)}
+                </li>
+              ))}
+            </ul>
+          )
+        )}
+      </div>
     </div>
   )
 }

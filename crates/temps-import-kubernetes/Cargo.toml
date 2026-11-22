@@ -5,6 +5,7 @@
 name = "temps-import-kubernetes"
 version.workspace = true
 edition.workspace = true
+description = "Kubernetes importer: reads workloads, databases and ingress hosts via a kubeconfig and builds a migration plan with cost analysis"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -21,7 +22,7 @@ temps-presets = { path = "../temps-presets" }
 # From workspace
 serde = { workspace = true }
 serde_json = { workspace = true }
-serde_yaml = { workspace = true }
+yaml_serde = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -31,3 +32,6 @@ sea-orm = { workspace = true }
 reqwest = { workspace = true }
 base64 = { workspace = true }
 url = { workspace = true }
+
+[lints]
+workspace = true

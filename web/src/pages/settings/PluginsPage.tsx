@@ -21,15 +21,7 @@ import { Button } from '@/components/ui/button'
 import { PageHeader, Status, useUrlState } from '@temps-sdk/ds'
 import { Tabs, TabsList, TabsTrigger, TabsContent } from '@/components/ui/tabs'
 import { Skeleton } from '@/components/ui/skeleton'
-import {
-  AlertDialog,
-  AlertDialogContent,
-  AlertDialogHeader,
-  AlertDialogTitle,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogCancel,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { useAuth } from '@/contexts/AuthContext'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -44,24 +36,25 @@ import {
   canManageExternalPlugins,
   pluginReloadFailures,
 } from '@/lib/plugin-registry'
-import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 import {
+  Activity,
   AlertCircle,
+  ArrowUpRight,
+  Compass,
+  GitPullRequest,
+  MoreHorizontal,
   Plus,
-  Loader2,
   Puzzle,
   RefreshCw,
   Shield,
-  MoreHorizontal,
-  ArrowUpRight,
-  GitPullRequest,
-  Trash2,
   Tag,
+  Trash2,
 } from 'lucide-react'
 import { createElement, useEffect, useState } from 'react'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { LocalFileInstall } from '@/components/plugins/LocalFileInstall'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import {
   RepositoryUpdate,
@@ -73,7 +66,8 @@ import { PluginPermissionsDialog } from '@/components/plugins/PluginPermissionsD
 export function PluginsPage() {
   const navigate = useNavigate()
   const platformFeatures = usePlatformFeatures()
-  const requiresPersistentStorage = platformFeatures.data?.external_plugins === false
+  const requiresPersistentStorage =
+    platformFeatures.data?.external_plugins === false
 
   const { setBreadcrumbs } = useBreadcrumbs()
   const { user } = useAuth()
@@ -81,6 +75,7 @@ export function PluginsPage() {
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
+  const [fileName, setFileName] = useState<string | null>(null)
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [updateName, setUpdateName] = useState<string | null>(null)
   const [updatePending, setUpdatePending] = useState(false)
@@ -95,15 +90,15 @@ export function PluginsPage() {
   const tab = getUrlState('tab') === 'running' ? 'running' : 'browse'
   const setTab = (value: string) =>
     patchUrlState({ tab: value === 'browse' ? undefined : value })
-  const managementPending = requiresPersistentStorage || reloadPlugins.isPending || uninstallPlugin.isPending
+  const managementPending =
+    requiresPersistentStorage ||
+    reloadPlugins.isPending ||
+    uninstallPlugin.isPending
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Settings', href: '/settings' },
-      { label: 'Plugins' },
-    ])
+    setBreadcrumbs([{ label: 'Plugins' }])
   }, [setBreadcrumbs])
 
   usePageTitle('Plugins')
@@ -120,10 +115,8 @@ export function PluginsPage() {
       }
     } catch (error) {
       if (handleSensitiveActionError(error, () => void handleReload())) return
+      // The toast comes from the app-wide mutation error handler.
       setReloadFailures(pluginReloadFailures(error))
-      toast.error(
-        sensitiveActionErrorMessage(error, 'Failed to reload plugins.')
-      )
     }
   }
 
@@ -137,9 +130,6 @@ export function PluginsPage() {
         setUninstallName(null)
         return
       }
-      toast.error(
-        sensitiveActionErrorMessage(error, `Failed to uninstall ${name}.`)
-      )
     }
   }
 
@@ -149,9 +139,9 @@ export function PluginsPage() {
         <Alert>
           <AlertTitle>Plugins need persistent storage</AlertTitle>
           <AlertDescription>
-            Browse available plugins here. Installing them requires a full-profile
-            instance that retains plugin binaries and data. This stateless control
-            plane replaces its local disk when it restarts.
+            Browse available plugins here. Installing them requires a
+            full-profile instance that retains plugin binaries and data. This
+            stateless control plane replaces its local disk when it restarts.
           </AlertDescription>
         </Alert>
       )}
@@ -186,64 +176,64 @@ export function PluginsPage() {
         }}
         onSensitiveError={handleSensitiveActionError}
       />
+      <LocalFileInstall
+        open={canManagePlugins && fileName !== null}
+        expectedName={fileName ?? ''}
+        onOpenChange={() => setFileName(null)}
+        onSensitiveError={handleSensitiveActionError}
+      />
       {canManagePlugins && verificationDialog}
-      <AlertDialog
+      <ConfirmDeleteDialog
         open={canManagePlugins && uninstallName !== null}
         onOpenChange={(open) => {
-          if (!open && !uninstallPlugin.isPending) setUninstallName(null)
+          if (!open) setUninstallName(null)
         }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Uninstall {uninstallName}?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This stops the plugin and removes it from navigation. Its data is
-              preserved so you can reinstall it later.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={uninstallPlugin.isPending}>
-              Cancel
-            </AlertDialogCancel>
-            <Button
-              variant="destructive"
-              disabled={managementPending}
-              onClick={() => {
-                if (uninstallName) void handleUninstall(uninstallName)
-              }}
-            >
-              {uninstallPlugin.isPending && (
-                <Loader2 className="mr-2 size-4 animate-spin" />
-              )}
-              {uninstallPlugin.isPending ? 'Uninstalling…' : 'Uninstall'}
-            </Button>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+        verb="Uninstall"
+        resourceType="plugin"
+        resourceName={uninstallName ?? ''}
+        irreversible={false}
+        consequences="This stops the plugin and removes it from navigation. Its data is preserved so you can reinstall it later."
+        isPending={uninstallPlugin.isPending}
+        onConfirm={() => {
+          if (uninstallName) void handleUninstall(uninstallName)
+        }}
+      />
       <PageHeader
         title="Plugins"
         description="Extend Temps with tools for your deployments."
         actions={
           canManagePlugins && (
-            <Button
-              onClick={() => {
-                navigate('/settings/plugins/install')
-              }}
-              disabled={managementPending}
-            >
-              <Plus className="mr-2 size-4" /> Install from GitHub
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                disabled={managementPending}
+                onClick={() => setFileName('')}
+              >
+                Install from file
+              </Button>
+              <Button
+                onClick={() => {
+                  navigate('/settings/plugins/install')
+                }}
+                disabled={managementPending}
+              >
+                <Plus className="mr-2 size-4" /> Install from GitHub
+              </Button>
+            </div>
           )
         }
       />
       <Tabs value={tab} onValueChange={setTab} className="space-y-6">
         <TabsList aria-label="Plugin views">
-          <TabsTrigger value="browse">Browse</TabsTrigger>
-          <TabsTrigger value="running">
-            Running{' '}
-            <span className="ml-2 text-xs tabular-nums">
-              {pluginsLoading ? '…' : plugins.length}
-            </span>
+          <TabsTrigger value="browse" icon={Compass}>
+            Browse
+          </TabsTrigger>
+          <TabsTrigger
+            value="running"
+            icon={Activity}
+            count={pluginsLoading ? undefined : plugins.length}
+          >
+            Running
           </TabsTrigger>
         </TabsList>
         {canManagePlugins && reloadFailures.length > 0 && (
@@ -375,6 +365,7 @@ export function PluginsPage() {
                         <RepositoryUpdateButton
                           name={plugin.name}
                           onClick={() => setUpdateName(plugin.name)}
+                          onFileUpdate={() => setFileName(plugin.name)}
                           disabled={managementPending}
                         />
                       )}

@@ -55,6 +55,21 @@ curl -X POST https://your-temps-instance.com/api/kv/enable \
   -d '{"persistence": true}'
 ```
 
+### Sharing a Docker host with another Temps instance
+
+The Redis container is named `redis-<service name>`. A Temps instance that enabled KV before per-instance names existed keeps `redis-temps-kv`, so upgrading never orphans a running container. A new instance derives a name that is unique to it (`redis-temps-kv-` followed by eight hex characters), so two instances on the same Docker daemon do not collide.
+
+If you want to choose the name yourself, or enabling fails with `409 KV container name already in use`, set one before enabling. In the dashboard this is the **Change name** button on the KV Store card (Storage page); via the API:
+
+```bash
+curl -X PATCH https://your-temps-instance.com/api/kv/settings \
+  -H "Authorization: Bearer tk_your_api_key" \
+  -H "Content-Type: application/json" \
+  -d '{"container_name": "redis-temps-kv-staging"}'
+```
+
+The name must start with `redis-`, use only letters, digits, `-` and `_`, and be at most 63 characters. An empty value restores the default. The name cannot change while the KV service exists, because renaming its container would orphan the data: delete the service first. Blob storage works the same way with `PATCH /api/blob/settings` and the `rustfs-` prefix.
+
 ---
 
 ## Operations
@@ -213,6 +228,9 @@ KV operations support two authentication methods:
   </Property>
   <Property name="POST /api/kv/enable">
     Enable KV storage (provisions a Redis container). Requires SystemAdmin permission.
+  </Property>
+  <Property name="GET /api/kv/settings, PATCH /api/kv/settings">
+    Read or change the Docker container name of the KV service (`kv.container_name`). Changing it requires SystemAdmin permission and is refused with 409 while the KV service exists.
   </Property>
   <Property name="PATCH /api/kv/update">
     Update KV configuration (e.g., change Docker image version). Requires SystemAdmin permission.

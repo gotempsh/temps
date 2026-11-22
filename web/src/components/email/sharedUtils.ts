@@ -4,7 +4,7 @@
 // Shared pure helpers for the email management UI.
 // Extracted from EmailsSentList / EmailDetail / EmailDomainsManagement /
 // EmailDomainDetail / EmailProvidersManagement / EmailEventTimeline /
-// EmailAnalytics to avoid copy-pasted logic drifting out of sync.
+// EmailEventLog to avoid copy-pasted logic drifting out of sync.
 
 import { deleteEmailProvider as deleteEmailProviderApi } from '@/api/client'
 

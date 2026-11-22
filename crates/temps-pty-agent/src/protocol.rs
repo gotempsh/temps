@@ -63,9 +63,10 @@ pub struct OpenRequest {
     /// have to set it.
     #[serde(default)]
     pub cwd: Option<String>,
-    /// Environment pairs to hand to the child. When absent the agent uses
-    /// its default (TERM + sandbox PATH + HOME). Tests override this to
-    /// supply a minimal env that works on the test host.
+    /// Environment pairs to hand to the child. When absent the agent hands
+    /// the shell its own (the sandbox container's) environment with TERM and
+    /// PATH pinned and HOME defaulted. Tests override this to supply a
+    /// minimal env that works on the test host.
     #[serde(default)]
     pub env: Option<Vec<(String, String)>>,
 }

@@ -21,6 +21,21 @@ import {
   trackLocalOperation,
   VIEW_IN_OPERATIONS_ACTION,
 } from '@/components/operations/operations-tray-store'
+import { getErrorMessage } from '@/utils/errorHandling'
+
+type ContainerAction = 'start' | 'stop' | 'restart'
+
+/**
+ * The toast for a failed container action. The API answers with a Problem
+ * whose `detail` says why (a microVM cannot be started by hand, for one), so
+ * read that rather than an `Error`'s `message`, which a Problem does not have.
+ */
+export function containerActionErrorMessage(
+  action: ContainerAction,
+  error: unknown
+): string {
+  return `Failed to ${action} container: ${getErrorMessage(error, 'Unknown error')}`
+}
 
 interface ContainerActionDialogProps {
   projectId: string
@@ -124,11 +139,9 @@ export function ContainerActionDialog({
       })
       onSuccess?.()
     },
-    onError: (error: any, { action }, context) => {
+    onError: (error, { action }, context) => {
       if (context) toast.dismiss(context.toastId)
-      toast.error(
-        `Failed to ${action} container: ${error?.message || 'Unknown error'}`
-      )
+      toast.error(containerActionErrorMessage(action, error))
     },
   })
 
@@ -145,14 +158,10 @@ export function ContainerActionDialog({
       'This will restart the container. There may be a brief interruption in service.',
   }
 
-  const handleConfirm = async () => {
+  const handleConfirm = () => {
     if (!action || !containerId) return
-
-    await mutation.mutateAsync({
-      containerId,
-      action,
-    })
-    onClose()
+    // `onError` reports a failure; only a success closes the dialog here.
+    mutation.mutate({ containerId, action }, { onSuccess: onClose })
   }
 
   return (
@@ -166,15 +175,17 @@ export function ContainerActionDialog({
             {action ? actionDescriptions[action] : ''}
           </AlertDialogDescription>
         </AlertDialogHeader>
-        <div className="bg-muted p-3 rounded-md text-sm">
-          <p className="text-muted-foreground">This action cannot be undone.</p>
-        </div>
         <div className="flex justify-end gap-3">
           <AlertDialogCancel disabled={mutation.isPending}>
             Cancel
           </AlertDialogCancel>
           <AlertDialogAction
-            onClick={handleConfirm}
+            onClick={(event) => {
+              // An action button closes the dialog on click; keep it open so
+              // a refusal is read against the action that caused it.
+              event.preventDefault()
+              handleConfirm()
+            }}
             disabled={mutation.isPending}
             className={
               action === 'stop' || action === 'restart'

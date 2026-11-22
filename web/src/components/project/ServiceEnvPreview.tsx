@@ -4,6 +4,7 @@
 import { useCallback, useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { getServicePreviewEnvironmentVariablesMaskedOptions } from '@/api/client/@tanstack/react-query.gen'
+import { revealServiceEnvironmentVariables } from '@/api/client/sdk.gen'
 import { Button } from '@/components/ui/button'
 import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
 import {
@@ -69,6 +70,12 @@ export function ServiceEnvPreview({
                 variant="ghost"
                 size="sm"
                 className="h-6 w-6 p-0"
+                aria-label={
+                  isOpen
+                    ? `Collapse ${serviceName} variables`
+                    : `Expand ${serviceName} variables`
+                }
+                aria-expanded={isOpen}
                 onClick={handleToggleExpand}
               >
                 {isOpen ? (
@@ -93,12 +100,12 @@ export function ServiceEnvPreview({
               {showPreview ? (
                 <>
                   <EyeOff className="h-3 w-3 mr-1" />
-                  Hide Variables
+                  Hide variables
                 </>
               ) : (
                 <>
                   <Eye className="h-3 w-3 mr-1" />
-                  Preview Variables
+                  Preview variables
                 </>
               )}
             </Button>
@@ -142,11 +149,20 @@ export function ServiceEnvPreview({
             {envVars && showPreview && (
               <>
                 <EnvVariablesDisplay
+                  key={serviceId}
                   variables={envVars}
                   showCopy={true}
                   showMaskToggle={true}
                   defaultMasked={true}
                   maxHeight="10rem"
+                  reveal={async () =>
+                    (
+                      await revealServiceEnvironmentVariables({
+                        path: { id: serviceId },
+                        throwOnError: true,
+                      })
+                    ).data
+                  }
                 />
                 <p className="text-xs text-muted-foreground text-center mt-3">
                   These variables will be automatically available in your

@@ -1,0 +1,100 @@
+export const metadata = {
+  title: 'Create a Project and Add Services',
+  description:
+    'Group the services that ship together into a Project, from the console or the CLI, and add new or existing services to it.',
+  alternates: {
+    canonical: '/docs/create-a-project-and-add-services',
+  },
+}
+
+export const sections = [
+  { title: 'Before you start', id: 'before-you-start' },
+  { title: 'Create a project in the console', id: 'create-a-project-in-the-console' },
+  { title: 'Add services in the console', id: 'add-services-in-the-console' },
+  { title: 'Use the CLI', id: 'use-the-cli' },
+  { title: 'Remove a service or delete a project', id: 'remove-a-service-or-delete-a-project' },
+]
+
+# Create a Project and Add Services
+
+A Project groups the services that ship together, such as a frontend, its API and a worker. Once they are in one project they can share a repository, variables and path routes. This guide creates a project and puts services in it. {{ className: 'lead' }}
+
+---
+
+## Before you start {{ anchor: true, id: 'before-you-start' }}
+
+- A **Service** is one deployable app (earlier versions called it a project). A **Project** is a group of services. See [Projects and Services](/docs/projects).
+- A service belongs to at most one project. Adding it to a project moves it out of the one it was in, and removes the path routes it had there.
+- Adding a service to a project does not redeploy it. It receives the project's shared variables on its next deployment.
+
+---
+
+## Create a project in the console {{ anchor: true, id: 'create-a-project-in-the-console' }}
+
+1. Open **Projects** in the sidebar.
+2. Click **New project**.
+3. Enter a **Name** (for example `Acme Shop`) and, optionally, a **Description**.
+4. Under **Services**, tick the services that belong in it, or leave it empty to add them later.
+5. Click **Create project** (or **Create with N services**).
+
+The project opens on its own page, with **Overview**, **Shared variables** and **Settings** tabs.
+
+---
+
+## Add services in the console {{ anchor: true, id: 'add-services-in-the-console' }}
+
+On the project's page, click **Add services** and choose one of:
+
+<Properties>
+  <Property name="New service">
+    Opens the new-service flow (repository, template, Docker image, files, or an app hosted elsewhere). The service is added to the project when it is created.
+  </Property>
+  <Property name="From the repository">
+    Scans the project's repository and adds its apps as services. See [Import services from a monorepo](/docs/import-services-from-a-monorepo).
+  </Property>
+  <Property name="Existing services">
+    Moves services you already deploy into this project. Pick them and click **Add N services**.
+  </Property>
+</Properties>
+
+---
+
+## Use the CLI {{ anchor: true, id: 'use-the-cli' }}
+
+In the CLI, a Project is managed with `project-groups` and a service with `projects`. (The `services` command manages databases and caches, not these.)
+
+```bash
+# Create a project with two existing services (slugs or ids from `projects list`)
+bunx @temps-sdk/cli project-groups create --name "Acme Shop" --service web --service api
+
+# Add another service later
+bunx @temps-sdk/cli project-groups add acme-shop worker
+
+# Check the result
+bunx @temps-sdk/cli project-groups show acme-shop
+bunx @temps-sdk/cli projects group -p worker
+```
+
+To create a new service and put it in the project, create it first, then add it:
+
+```bash
+# Walks you through the source, branch and preset
+bunx @temps-sdk/cli projects create --name docs
+bunx @temps-sdk/cli project-groups add acme-shop docs
+```
+
+---
+
+## Remove a service or delete a project {{ anchor: true, id: 'remove-a-service-or-delete-a-project' }}
+
+Neither action stops or deletes a service. The service keeps running on its own and stops receiving the project's shared variables on its next deployment. Path routes that involve it are removed.
+
+```bash
+# Take one service out of the project
+bunx @temps-sdk/cli project-groups remove acme-shop worker
+
+# Delete the project; its shared variables are deleted, its services keep running
+bunx @temps-sdk/cli project-groups delete acme-shop
+```
+
+In the console, use the service's menu in the project's **Services** list, or the project's **Settings**.

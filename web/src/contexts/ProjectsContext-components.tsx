@@ -8,7 +8,7 @@ import { ProjectsContext } from './ProjectsContext-shared'
 
 export function ProjectsProvider({ children }: { children: React.ReactNode }) {
   const { user } = useAuth()
-  const { data, isLoading } = useQuery({
+  const { data, isLoading, error, refetch } = useQuery({
     // The generated `getProjectsOptions()` key carries no identity, so a
     // session that expires and is followed by a different account signing
     // in (no full page reload in between) would re-enable that same cache
@@ -36,7 +36,12 @@ export function ProjectsProvider({ children }: { children: React.ReactNode }) {
 
   return (
     <ProjectsContext.Provider
-      value={{ projects: data?.projects || [], isLoading }}
+      value={{
+        projects: data?.projects || [],
+        isLoading,
+        error: data ? null : error,
+        refetch: () => void refetch(),
+      }}
     >
       {children}
     </ProjectsContext.Provider>

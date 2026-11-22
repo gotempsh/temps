@@ -49,4 +49,16 @@ pub enum MetricsError {
         engine: String,
         reason: String,
     },
+
+    /// The write buffer in front of a store is full (the store is not
+    /// keeping up, or is down), so this batch was dropped instead of
+    /// blocking the producer.
+    #[error(
+        "Metrics write buffer full ({capacity} pending batches); dropped {points} point(s), {dropped_total} dropped since start"
+    )]
+    WriteBufferFull {
+        capacity: usize,
+        points: usize,
+        dropped_total: u64,
+    },
 }

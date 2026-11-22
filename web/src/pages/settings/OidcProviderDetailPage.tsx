@@ -23,18 +23,10 @@ import {
   providerToFormValues,
 } from '@/components/settings/oidc-provider-constants'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import {
   Card,
   CardContent,
@@ -65,6 +57,7 @@ import {
 import { useEffect, useMemo, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
+import { ScrollRegion } from '@/components/ui/scroll-region'
 
 /**
  * ADR-045 §4: tooltip shown on the disabled delete control for the provider
@@ -83,7 +76,7 @@ function formatDate(iso: string): string {
 }
 
 export function OidcProviderDetailPage() {
-  usePageTitle('SSO Provider')
+  usePageTitle('SSO provider')
   const params = useParams<{ providerId: string }>()
   const providerId = Number(params.providerId)
   const navigate = useNavigate()
@@ -136,6 +129,7 @@ export function OidcProviderDetailPage() {
       navigate('/settings/auth')
     },
     onError: (error) => {
+      setDeleteOpen(false)
       toast.error(problemMessage(error, 'Failed to delete SSO provider'))
     },
   })
@@ -220,7 +214,7 @@ export function OidcProviderDetailPage() {
   return (
     <div className="space-y-6">
       {verificationDialog}
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+      <div>
         <div className="flex items-start gap-3">
           <Button
             variant="ghost"
@@ -230,24 +224,25 @@ export function OidcProviderDetailPage() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-2xl font-semibold tracking-tight">
-                {provider.name}
-              </h1>
-              <Badge variant="outline">{provider.template}</Badge>
-              {provider.managed_by_cloud && (
-                <Badge className="gap-1">
-                  <Cloud className="h-3 w-3" aria-hidden="true" />
-                  Managed by Temps Cloud
-                </Badge>
-              )}
-              {!provider.enabled && <Badge variant="secondary">Disabled</Badge>}
-            </div>
-            <p className="text-sm text-muted-foreground">
-              {provider.issuer_url}
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title={provider.name}
+            verdict={
+              <>
+                <Badge variant="outline">{provider.template}</Badge>
+                {provider.managed_by_cloud && (
+                  <Badge className="gap-1">
+                    <Cloud className="h-3 w-3" aria-hidden="true" />
+                    Managed by Temps Cloud
+                  </Badge>
+                )}
+                {!provider.enabled && (
+                  <Badge variant="secondary">Disabled</Badge>
+                )}
+              </>
+            }
+            description={provider.issuer_url}
+          />
         </div>
       </div>
 
@@ -297,31 +292,18 @@ export function OidcProviderDetailPage() {
         users={usersQuery.data ?? []}
       />
 
-      <AlertDialog open={deleteOpen} onOpenChange={setDeleteOpen}>
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Delete this SSO provider?</AlertDialogTitle>
-            <AlertDialogDescription>
-              Users that signed in via{' '}
-              <span className="font-medium">{provider.name}</span> will no
-              longer be able to use SSO. Their Temps accounts stay intact and
-              can fall back to password login.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              disabled={deleteProvider.isPending}
-              onClick={() =>
-                deleteProvider.mutate({ path: { provider_id: provider.id } })
-              }
-            >
-              {deleteProvider.isPending ? 'Deleting…' : 'Delete provider'}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={deleteOpen}
+        onOpenChange={setDeleteOpen}
+        resourceType="SSO provider"
+        resourceName={provider.name}
+        consequences="Users that signed in through it will no longer be able to use SSO. Their Temps accounts stay intact and can fall back to password login."
+        confirmLabel="Delete provider"
+        isPending={deleteProvider.isPending}
+        onConfirm={() =>
+          deleteProvider.mutate({ path: { provider_id: provider.id } })
+        }
+      />
     </div>
   )
 }
@@ -508,7 +490,7 @@ function UsersForProviderCard({
             </p>
           </div>
         ) : (
-          <div className="overflow-x-auto">
+          <ScrollRegion regionLabel="Users who signed in through this provider, scrollable">
             <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="text-left text-xs uppercase text-muted-foreground">
@@ -557,7 +539,7 @@ function UsersForProviderCard({
                 ))}
               </tbody>
             </table>
-          </div>
+          </ScrollRegion>
         )}
       </CardContent>
     </Card>

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { getRelativeTime } from './deploy.js'
+import { deploysFromGit, getRelativeTime } from './deploy.js'
 
 describe('getRelativeTime', () => {
   test('renders anything under a minute as "just now"', () => {
@@ -19,5 +19,32 @@ describe('getRelativeTime', () => {
 
   test('renders days ago beyond a day', () => {
     expect(getRelativeTime(new Date(Date.now() - 2 * 24 * 60 * 60_000))).toBe('2d ago')
+  })
+})
+
+describe('deploysFromGit', () => {
+  test('a connected repository deploys through its connection', () => {
+    expect(deploysFromGit({ git_provider_connection_id: 3 })).toBe(true)
+  })
+
+  test('a public repository deploys from its URL without a connection', () => {
+    expect(
+      deploysFromGit({
+        git_provider_connection_id: null,
+        is_public_repo: true,
+        git_url: 'https://github.com/acme/shop.git',
+      })
+    ).toBe(true)
+  })
+
+  test('a private repository whose connection is gone cannot deploy from git', () => {
+    expect(
+      deploysFromGit({
+        git_provider_connection_id: null,
+        is_public_repo: false,
+        git_url: 'https://github.com/acme/shop.git',
+      })
+    ).toBe(false)
+    expect(deploysFromGit({ is_public_repo: true, git_url: null })).toBe(false)
   })
 })

@@ -42,6 +42,11 @@ pub enum ProviderError {
     #[error("Validation error: {0}")]
     Validation(String),
 
+    /// Log decoder errors contain only fixed reasons and JSON locations, never
+    /// submitted values, and can safely explain an unsupported SDK scenario.
+    #[error("{0}")]
+    LogBatch(crate::sentry::envelope::EnvelopeError),
+
     #[error("Storage error: {0}")]
     Storage(String),
 

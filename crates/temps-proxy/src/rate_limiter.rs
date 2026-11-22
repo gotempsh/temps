@@ -377,7 +377,7 @@ impl RateLimiter {
 /// when a project policy replaces the instance limits. `None` when neither
 /// policy is active.
 pub fn resolve_policy<'a>(
-    instance: &'a temps_core::RateLimitSettings,
+    instance: &'a temps_config::RateLimitSettings,
     project: Option<&'a temps_entities::deployment_config::SecurityConfig>,
     environment_id: i32,
 ) -> Option<ResolvedRateLimit<'a>> {
@@ -443,7 +443,7 @@ impl ResolvedRateLimit<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::RateLimitSettings;
+    use temps_config::RateLimitSettings;
     use temps_entities::deployment_config::{RateLimitConfig, SecurityConfig};
 
     const T0: u64 = 1_800_000_000; // minute- and hour-aligned

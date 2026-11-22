@@ -51,9 +51,13 @@ impl AuthState {
         notification_service: DynNotificationService,
         telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     ) -> Self {
-        let auth_service = Arc::new(AuthService::new(db.clone(), notification_service));
+        let auth_service = Arc::new(AuthService::new(
+            db.clone(),
+            notification_service,
+            encryption_service.clone(),
+        ));
         let api_key_service = Arc::new(ApiKeyService::new(db.clone()));
-        let user_service = Arc::new(UserService::new(db.clone()));
+        let user_service = Arc::new(UserService::new(db.clone(), encryption_service.clone()));
         let step_up_service = Arc::new(crate::StepUpService::new(db.clone(), user_service.clone()));
         let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> =
             Arc::new(crate::DefaultSensitiveActionAuthorizer::new(db.clone()));

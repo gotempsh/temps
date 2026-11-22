@@ -1,14 +1,18 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod archive_target_handlers;
 pub mod audit;
 pub mod data_import_handlers;
 #[allow(clippy::module_inception)]
 pub mod handlers;
+pub mod healthcheck_handlers;
 pub mod metrics_handlers;
 pub mod pg_stat_statements_handlers;
 pub mod query_handlers;
+pub mod server_tls_handlers;
 pub mod types;
+pub mod workload_handlers;
 pub use audit::*;
 pub use handlers::*;
 pub use metrics_handlers::*;

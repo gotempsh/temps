@@ -3,6 +3,8 @@
 
 import type { DeploymentResponse } from '@/api/client'
 
+import { liveListInterval } from './live-refetch'
+
 const ACTIVE_DEPLOYMENT_STATUSES = new Set([
   'pending',
   'running',
@@ -23,4 +25,19 @@ export function recentDeploymentsRefetchInterval(
   )
     ? 2500
     : false
+}
+
+/**
+ * Poll interval for the project's full deployments list: fast while a
+ * deployment is building, and still polling when idle so a deployment started
+ * in the background (webhook, CLI, another operator) shows up on its own.
+ */
+export function projectDeploymentsRefetchInterval(
+  deployments: Pick<DeploymentResponse, 'status'>[] | undefined
+): number {
+  return liveListInterval(
+    deployments?.some((deployment) =>
+      isActiveDeploymentStatus(deployment.status)
+    ) ?? false
+  )
 }

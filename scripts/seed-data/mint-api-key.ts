@@ -54,6 +54,6 @@ const session = (login.headers.getSetCookie?.() ?? [])
 if (!session) throw new Error("login returned no session cookie");
 sessionCookie = session;
 
-const apiKey = await mintApiKey(api, `cli-dev-${Date.now()}`);
+const apiKey = await mintApiKey(api, `cli-dev-${Date.now()}`, PASSWORD);
 
 console.log(apiKey);

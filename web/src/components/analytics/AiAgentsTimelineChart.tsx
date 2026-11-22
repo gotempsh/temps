@@ -12,7 +12,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ChartConfig, ChartContainer } from '@/components/ui/chart'
-import { useQuery } from '@tanstack/react-query'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 import { format } from 'date-fns'
 import * as React from 'react'
 import { Bar, BarChart, CartesianGrid, Tooltip, XAxis, YAxis } from 'recharts'
@@ -157,7 +157,7 @@ export function AiAgentsTimelineChart({
 }: AiAgentsTimelineChartProps) {
   const [groupBy, setGroupBy] = React.useState<'provider' | 'agent'>('provider')
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getAiAgentTimelineOptions({
       query: {
         project_id: project.id,
@@ -350,7 +350,7 @@ export function AiAgentsTimelineChart({
         {/* Custom legend below the chart — wraps + scrolls so a long agent
             taxonomy (~30 entries) stays readable instead of clipping. */}
         {!isLoading && !error && chartData.length > 0 && (
-          <div className="mt-3 max-h-20 overflow-y-auto">
+          <div tabIndex={0} className="mt-3 max-h-20 overflow-y-auto">
             <div className="flex flex-wrap gap-x-3 gap-y-1.5">
               {seriesKeys.map((key) => (
                 <div

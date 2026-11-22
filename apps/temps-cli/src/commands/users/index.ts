@@ -10,6 +10,7 @@ import {
   deleteUser,
   restoreUser,
   resetUserPassword,
+  resetUserMfa,
   assignRole,
   removeRole,
   getCurrentUser,
@@ -19,6 +20,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 // Matches crates/temps-entities/src/types.rs's RoleType enum exactly --
 // the backend's FromStr only ever accepts "admin"/"user" and 400s
@@ -46,6 +48,12 @@ interface RestoreOptions {
 }
 
 interface ResetPasswordOptions {
+  id: string
+  json?: boolean
+  yes?: boolean
+}
+
+interface ResetMfaOptions {
   id: string
   json?: boolean
   yes?: boolean
@@ -102,7 +110,7 @@ export function registerUsersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listUsersAction)
 
-  users
+  const createCommand = users
     .command('create')
     .alias('add')
     .description('Create a new user')
@@ -112,6 +120,7 @@ export function registerUsersCommands(program: Command): void {
     .option('-r, --roles <roles>', 'Comma-separated roles (admin, user)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createUserAction)
+  addCredentialSources(createCommand, [{ flag: 'password', what: 'the password' }])
 
   users
     .command('me')
@@ -143,6 +152,16 @@ export function registerUsersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip confirmation prompt (for automation)')
     .action(resetPasswordAction)
+
+  users
+    .command('reset-mfa')
+    .description(
+      "Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again",
+    )
+    .requiredOption('--id <id>', 'User ID')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip confirmation prompt (for automation)')
+    .action(resetMfaAction)
 
   users
     .command('role')
@@ -418,6 +437,58 @@ async function resetPasswordAction(options: ResetPasswordOptions): Promise<void>
   newline()
   info('Share it through a channel you trust. It is shown only once and cannot be retrieved later.')
   info('The user must choose a new password the next time they sign in.')
+  newline()
+}
+
+async function resetMfaAction(options: ResetMfaOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseUserId(options.id)
+  if (id === null) {
+    warning(`Invalid user ID: ${options.id}. Expected a positive whole number.`)
+    // Nothing was done: fail so scripts checking the exit status notice.
+    process.exitCode = 1
+    return
+  }
+
+  if (!options.yes) {
+    warning('Their authenticator and recovery codes stop working and they are signed out of every session. Their password and API keys keep working.')
+    const confirmed = await promptConfirm({
+      message: `Reset the MFA of user ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const result = await withSpinner('Resetting MFA...', async () => {
+    const { data, error } = await resetUserMfa({
+      client,
+      path: { user_id: id },
+    })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? 'Failed to reset MFA')
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  success(`MFA removed for user ${id}`)
+  keyValue('Sessions signed out', String(result.sessions_revoked))
+  newline()
+  if (result.password_sign_in_blocked) {
+    warning('This instance requires MFA for admins (require_mfa_for_admins), so this admin cannot sign in with a password until they enroll again. They can sign in through SSO, or turn the setting off until they have enrolled.')
+  } else {
+    info('They can sign in with their password and set up MFA again from their Account page.')
+  }
   newline()
 }
 

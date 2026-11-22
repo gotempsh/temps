@@ -26,8 +26,7 @@ pub const TOOL_USAGE_GUIDANCE: &str = "\
 Answer from tool results, not assumptions. If a claim can be checked with a tool, check it first. Cite concrete values you actually retrieved (ids, counts, timestamps, statuses), and say plainly when the data does not show something. Never invent facts, ids, or numbers.
 
 ## Querying the platform API (the `temps` tool)
-You have read-only access to the platform's REST API through a single MCP tool
-named `temps`. Its `command` argument emulates a CLI grammar, but it is NOT a
+Read the platform's REST API through the single tool named `temps`. Its `command` argument emulates a CLI grammar, but it is NOT a
 local executable: invoke the registered `temps` tool directly. Never use a
 shell, terminal, Bash, or a locally installed `temps` binary for these calls.
 Drive the tool's command grammar as follows:
@@ -41,13 +40,25 @@ deployment \"stages\"/jobs) or when you're unsure of its flags. Prefer the most
 specific operation (e.g. a get-last-deployment over a list).
 
 ## Running commands
-Pass only flags you have a real, meaningful value for. OMIT every other flag — including filters — so the endpoint applies its real defaults (no filter = everything). NEVER fabricate placeholder values such as empty strings, \"all\", 0, or sentinel timestamps to satisfy a flag: that returns wrong or empty results. Authentication, `project_id`, and pagination are handled for you — never pass `project_id`. If a command errors, READ the message and adjust (or check its `--help`) — never re-run the same command unchanged.
+Pass only flags you have a real, meaningful value for. OMIT every other flag — including filters — so the endpoint applies its real defaults (no filter = everything). NEVER fabricate placeholder values such as empty strings, \"all\", 0, or sentinel timestamps to satisfy a flag: that returns wrong or empty results. Authentication and pagination are handled for you. Never put `project_id` in the command: in a project's chat it is fixed for you, and in a chat that is not about one project you pass it as the tool's top-level `project_id`. If a command errors, READ the message and adjust (or check its `--help`) — never re-run the same command unchanged.
 
 ## Acting, not asking
 When the user asks for read-only data you can fetch, just fetch it with sensible defaults and report the result. Do not ask permission to call a read-only endpoint, and do not ask the user to confirm obvious defaults — act, then state the defaults you used. Ask a brief clarifying question only when the request is genuinely ambiguous and you truly cannot proceed.
 
 ## Output
-Be concise and practical: lead with the answer, then supporting detail. Use compact lists or tables for multi-row data.";
+Be concise and practical: lead with the answer, then supporting detail. Use compact lists or tables for multi-row data.
+
+## Language
+Reply in the language of the user's most recent message, and write the whole reply in that one language. Never switch languages mid-sentence or mid-reply. Code, commands, identifiers, and quoted tool output stay exactly as they are.";
+
+/// Context-id prefixes of user-owned conversations that are not attached to a
+/// project: the harness-backed `global_` operator chat and the gateway-backed
+/// `assistant_` chat. In both, the project a tool call targets is chosen per
+/// call through the top-level `project_id` selector and checked against the
+/// caller's live permissions, rather than being fixed when the thread began.
+pub fn is_cross_project_context(context_id: &str) -> bool {
+    context_id.starts_with("global_") || context_id.starts_with("assistant_")
+}
 
 /// The seed for a new conversation.
 #[derive(Debug, Clone, Default)]
@@ -69,6 +80,12 @@ pub struct ConversationSeed {
 pub trait ConversationContextProvider: Send + Sync {
     /// The `context_type` this provider handles, e.g. `"deployment"`.
     fn context_type(&self) -> &'static str;
+
+    /// Opaque publication identity for invalidating turn-local API tool results.
+    /// Implementations must read an in-memory snapshot, without I/O or locking.
+    fn api_tools_revision(&self) -> Option<String> {
+        None
+    }
 
     /// Finer-grained authorization for this context (the route already enforces
     /// project-level access). Default allow.
@@ -148,5 +165,20 @@ pub trait ConversationContextProvider: Send + Sync {
     ) -> String {
         self.execute_tool(project_id, context_id, name, arguments)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn guidance_pins_the_reply_language() {
+        // Some gateway models drift into another language mid-reply. The rule
+        // lives in this shared, unchanging text so it reaches every context and
+        // stays inside the cached prompt prefix.
+        assert!(TOOL_USAGE_GUIDANCE.contains("## Language"));
+        assert!(TOOL_USAGE_GUIDANCE.contains("language of the user's most recent message"));
+        assert!(TOOL_USAGE_GUIDANCE.contains("Never switch languages"));
     }
 }

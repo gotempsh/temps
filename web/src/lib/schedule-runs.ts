@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { errorWithStatus } from '@/lib/http-error-status'
+
 /**
  * Hand-written helpers for the schedule run-history and run-now endpoints.
  *
@@ -62,16 +64,20 @@ export interface ScheduleRunListResponse {
 async function readJsonOrThrow<T>(response: Response): Promise<T> {
   if (!response.ok) {
     let detail = response.statusText
+    let title: string | undefined
     try {
       const body = (await response.json()) as {
         detail?: string
         title?: string
       }
+      title = body.title
       detail = body.detail ?? body.title ?? detail
     } catch {
       // fall through with statusText
     }
-    throw new Error(detail)
+    // Carry the HTTP status: pages tell a missing run (404) from a failed
+    // read, and the retry policy stops repeating an answer that cannot change.
+    throw errorWithStatus(detail, { status: response.status, title })
   }
   return (await response.json()) as T
 }

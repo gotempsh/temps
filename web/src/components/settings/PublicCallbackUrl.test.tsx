@@ -10,7 +10,10 @@ import { PublicCallbackUrl } from './PublicCallbackUrl'
 
 const PATH = '/api/webhook/git/github/events'
 
-function render(prepare: (queryClient: QueryClient) => void = () => {}) {
+function render(
+  prepare: (queryClient: QueryClient) => void = () => {},
+  props: { codeClassName?: string; prefix?: string } = {}
+) {
   // `retryOnMount: false` keeps a failed query in its error state for the
   // render, which is what a mounted component sees once its retries are spent.
   const queryClient = new QueryClient({
@@ -19,7 +22,7 @@ function render(prepare: (queryClient: QueryClient) => void = () => {}) {
   prepare(queryClient)
   return renderToStaticMarkup(
     <QueryClientProvider client={queryClient}>
-      <PublicCallbackUrl path={PATH} label="Copy webhook URL" />
+      <PublicCallbackUrl path={PATH} label="Copy webhook URL" {...props} />
     </QueryClientProvider>
   )
 }
@@ -70,5 +73,46 @@ describe('PublicCallbackUrl', () => {
     expect(html).toContain('Retry')
     expect(html).not.toContain(PATH)
     expect(html).not.toContain('aria-label="Copy webhook URL"')
+  })
+
+  describe('styling and keyboard access', () => {
+    const known = (queryClient: QueryClient) => {
+      queryClient.setQueryData(getPublicIngressStatusOptions().queryKey, {
+        effective_url: 'https://hooks.example.com',
+        source: 'explicit',
+        configured: true,
+      })
+    }
+    const regionClass = (html: string) =>
+      /<div[^>]*class="([^"]*)"[^>]*>\s*<code/.exec(html)?.[1] ?? ''
+
+    test('codeClassName replaces the default surface and padding', () => {
+      const html = render(known, { codeClassName: 'bg-transparent p-0' })
+      const classes = regionClass(html).split(' ')
+
+      expect(classes).toContain('bg-transparent')
+      expect(classes).toContain('p-0')
+      expect(classes).not.toContain('bg-muted')
+      expect(classes).not.toContain('px-2')
+      expect(classes).not.toContain('py-1')
+    })
+
+    test('without overrides the URL sits on a muted, padded surface', () => {
+      const classes = regionClass(render(known)).split(' ')
+
+      expect(classes).toContain('bg-muted')
+      expect(classes).toContain('px-2')
+      expect(classes).toContain('overflow-auto')
+    })
+
+    test('a vertical-padding override replaces the default instead of adding to it', () => {
+      const classes = regionClass(
+        render(known, { codeClassName: 'py-1.5' })
+      ).split(' ')
+
+      expect(classes).toContain('py-1.5')
+      expect(classes).not.toContain('py-1')
+      expect(classes).toContain('px-2')
+    })
   })
 })

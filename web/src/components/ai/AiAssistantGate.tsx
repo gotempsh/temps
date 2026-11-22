@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  getAiProviderStatusOptions,
   getCloudAiCapabilityOptions,
   listProviderKeysOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -10,9 +11,11 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { isInternalConsolePath } from '@/lib/cloud-telemetry-activation'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
-import { ArrowRight, Cloud, ShieldCheck, Sparkles, X } from 'lucide-react'
+import { Sparkles, X } from 'lucide-react'
 import { type ReactNode } from 'react'
 import { Link } from 'react-router'
+import { AssistantOnboarding } from './AssistantPanels'
+import { unconfiguredAssistant } from './assistant-state'
 
 export function AiAssistantGate({
   children,
@@ -28,6 +31,14 @@ export function AiAssistantGate({
   })
   const cloud = useQuery({
     ...getCloudAiCapabilityOptions(),
+    staleTime: 15_000,
+    retry: false,
+  })
+
+  // The capability endpoint supplies the reason and where to fix it. It never
+  // gates anything: an unreachable endpoint falls back to the same copy.
+  const status = useQuery({
+    ...getAiProviderStatusOptions(),
     staleTime: 15_000,
     retry: false,
   })
@@ -55,16 +66,24 @@ export function AiAssistantGate({
       />
     )
   }
+  const onboarding = unconfiguredAssistant(status.data)
   return (
-    <CloudAiEmptyState
-      reason={cloud.data?.reason}
-      setupPath={
-        isInternalConsolePath(cloud.data?.setup_path)
-          ? cloud.data.setup_path
-          : undefined
-      }
-      onClose={onClose}
-    />
+    <div className="flex h-full flex-col">
+      <DockHeader onClose={onClose} />
+      <div className="min-h-0 flex-1">
+        <AssistantOnboarding
+          reason={onboarding.reason}
+          setupPath={onboarding.setupPath}
+          cloudPath={
+            isInternalConsolePath(cloud.data?.setup_path)
+              ? cloud.data.setup_path
+              : '/settings/cloud'
+          }
+          onNavigate={onClose}
+          onConfigured={() => void providers.refetch()}
+        />
+      </div>
+    </div>
   )
 }
 
@@ -136,105 +155,6 @@ function AiCapabilityError({
             </Link>
           </Button>
         </div>
-      </div>
-    </div>
-  )
-}
-
-export function CloudAiEmptyState({
-  reason,
-  setupPath = '/settings/cloud',
-  onClose,
-}: {
-  reason?: string | null
-  setupPath?: string
-  onClose: () => void
-}) {
-  return (
-    <div className="flex h-full flex-col">
-      <DockHeader onClose={onClose} />
-      <div className="relative flex flex-1 flex-col overflow-hidden p-5">
-        <div className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-[radial-gradient(circle_at_80%_0%,hsl(var(--primary)/0.08),transparent_62%)]" />
-        <div className="relative mt-auto space-y-6 pb-2">
-          <div className="space-y-3">
-            <p className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-              Managed analysis
-            </p>
-            <h2 className="max-w-sm text-2xl font-semibold tracking-[-0.04em]">
-              Ask your stack. Keep the evidence attached.
-            </h2>
-            <p className="max-w-md text-sm leading-6 text-muted-foreground">
-              Connect Temps Cloud for evidence-backed explanations across
-              traces, errors, analytics, and deploys. Local ingest and primary
-              telemetry storage stay on this instance.
-            </p>
-            {reason ? (
-              <p className="max-w-md text-sm font-medium text-foreground">
-                {reason}
-              </p>
-            ) : null}
-          </div>
-
-          <div className="divide-y divide-border border-y border-border">
-            <AiCloudBenefit
-              icon={<Sparkles />}
-              title="Managed AI when configured"
-            >
-              Connecting Cloud does not enable AI usage or sell credits. This
-              assistant opens only after Cloud reports an available managed
-              provider.
-            </AiCloudBenefit>
-            <AiCloudBenefit
-              icon={<ShieldCheck />}
-              title="Cited, read-only answers"
-            >
-              Conclusions link to the signals and time windows that support
-              them.
-            </AiCloudBenefit>
-            <AiCloudBenefit icon={<Cloud />} title="Optional control plane">
-              Connect in two steps without putting Cloud in your request path.
-            </AiCloudBenefit>
-          </div>
-
-          <div className="grid gap-2">
-            <Button asChild className="w-full justify-between">
-              <Link to={setupPath} onClick={onClose}>
-                Review managed AI setup <ArrowRight className="size-4" />
-              </Link>
-            </Button>
-            <Button
-              asChild
-              variant="ghost"
-              className="w-full text-muted-foreground"
-            >
-              <Link to="/ai-gateway" onClick={onClose}>
-                Use my own AI provider
-              </Link>
-            </Button>
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
-
-function AiCloudBenefit({
-  icon,
-  title,
-  children,
-}: {
-  icon: ReactNode
-  title: string
-  children: ReactNode
-}) {
-  return (
-    <div className="grid grid-cols-[28px_1fr] gap-3 py-3.5">
-      <span className="mt-0.5 text-muted-foreground [&>svg]:size-4">
-        {icon}
-      </span>
-      <div className="space-y-1">
-        <p className="text-sm font-medium">{title}</p>
-        <p className="text-xs leading-5 text-muted-foreground">{children}</p>
       </div>
     </div>
   )

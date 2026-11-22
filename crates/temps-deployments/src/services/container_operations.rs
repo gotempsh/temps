@@ -34,6 +34,10 @@ pub struct ContainerExecResult {
 pub trait ContainerOperations: Send + Sync {
     fn deployer(&self) -> Arc<dyn temps_deployer::ContainerDeployer>;
 
+    fn runtime_health_remote(&self) -> Option<Arc<temps_deployer::remote::RemoteNodeDeployer>> {
+        None
+    }
+
     async fn stream_logs(
         &self,
         container_id: &str,
@@ -52,21 +56,31 @@ pub trait ContainerOperations: Send + Sync {
 
 pub struct LocalContainerOperations {
     docker: Arc<bollard::Docker>,
-    log_service: Arc<temps_logs::DockerLogService>,
+    log_service: Arc<temps_deployment_logs::DockerLogService>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    /// The workload plane, for the replicas Docker cannot see (a microVM).
+    plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
 }
 
 impl LocalContainerOperations {
     pub fn new(
         docker: Arc<bollard::Docker>,
-        log_service: Arc<temps_logs::DockerLogService>,
+        log_service: Arc<temps_deployment_logs::DockerLogService>,
         deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     ) -> Self {
         Self {
             docker,
             log_service,
             deployer,
+            plane: None,
         }
+    }
+
+    /// Serve a microVM replica's logs from the workload plane instead of
+    /// Docker, which has no such container.
+    pub fn with_plane(mut self, plane: Option<Arc<temps_workload_plane::WorkloadPlane>>) -> Self {
+        self.plane = plane;
+        self
     }
 
     fn operation_error(
@@ -94,11 +108,34 @@ impl ContainerOperations for LocalContainerOperations {
         container_id: &str,
         params: ContainerLogParams,
     ) -> Result<ContainerLogStream, DeploymentError> {
+        // A microVM is not a Docker container: its logs come from the plane,
+        // which reads them from the guest.
+        if let Some(plane) = self.plane.as_deref() {
+            match super::plane_deployer::micro_vm_replica_logs(plane, container_id, &params).await {
+                Ok(Some(stream)) => return Ok(stream),
+                Ok(None) => {}
+                // This runs for every local container: a plane that cannot
+                // classify one must not take a healthy Docker container's logs
+                // with it. A real microVM then gets Docker's "no such container".
+                Err(error @ DeploymentError::InvalidInput(_)) => {
+                    // A request the plane understood and refused (a date range
+                    // on a microVM) is answered, not retried against Docker.
+                    return Err(error);
+                }
+                Err(error) => {
+                    warn!(
+                        container_id,
+                        %error,
+                        "Workload plane could not serve the logs; trying Docker"
+                    );
+                }
+            }
+        }
         let stream = self
             .log_service
             .get_container_logs(
                 container_id,
-                temps_logs::docker_logs::ContainerLogOptions {
+                temps_deployment_logs::docker_logs::ContainerLogOptions {
                     start_date: params
                         .start_date
                         .and_then(|timestamp| chrono::DateTime::from_timestamp(timestamp, 0)),
@@ -115,7 +152,7 @@ impl ContainerOperations for LocalContainerOperations {
                 // Preserve the typed "no local daemon" signal instead of
                 // stringifying it into a generic container-operation failure:
                 // the handler maps it to the shared 409 that names the remedy.
-                temps_logs::DockerLogError::DockerUnavailable(unavailable) => {
+                temps_deployment_logs::DockerLogError::DockerUnavailable(unavailable) => {
                     DeploymentError::DockerUnavailable(unavailable)
                 }
                 error => Self::operation_error(container_id, "log stream", error),
@@ -138,61 +175,35 @@ impl ContainerOperations for LocalContainerOperations {
             cmd: Some(command),
             ..Default::default()
         };
-        let exec = self
-            .docker
-            .create_exec(container_id, config)
-            .await
-            .map_err(|error| Self::operation_error(container_id, "exec creation", error))?;
-
-        let docker = self.docker.clone();
-        let exec_id = exec.id.clone();
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_seconds),
-            async move {
-                let started = docker
-                    .start_exec(
-                        &exec_id,
-                        Some(bollard::exec::StartExecOptions {
-                            detach: false,
-                            ..Default::default()
-                        }),
-                    )
-                    .await?;
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let StartExecResults::Attached { mut output, .. } = started {
-                    while let Some(message) = output.next().await {
-                        match message? {
-                            bollard::container::LogOutput::StdOut { message } => {
-                                stdout.push_str(&String::from_utf8_lossy(&message));
-                            }
-                            bollard::container::LogOutput::StdErr { message } => {
-                                stderr.push_str(&String::from_utf8_lossy(&message));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-                Ok::<_, bollard::errors::Error>((stdout, stderr))
-            },
+        let output = temps_docker_util::exec_capture(
+            &self.docker,
+            container_id,
+            config,
+            temps_docker_util::ExecCaptureOptions::separate(
+                temps_docker_util::OutputLimit::Unbounded,
+                temps_docker_util::OutputLimit::Unbounded,
+            )
+            .exit_code(temps_docker_util::ExitCodePolicy::BestEffort)
+            .timeout(std::time::Duration::from_secs(timeout_seconds)),
         )
         .await
-        .map_err(|_| DeploymentError::ContainerExecTimeout {
-            container_id: container_id.to_string(),
-            timeout_seconds,
-        })?
-        .map_err(|error| Self::operation_error(container_id, "exec", error))?;
+        .map_err(|error| match error {
+            temps_docker_util::DockerUtilError::ExecTimedOut { .. } => {
+                DeploymentError::ContainerExecTimeout {
+                    container_id: container_id.to_string(),
+                    timeout_seconds,
+                }
+            }
+            temps_docker_util::DockerUtilError::ExecCreate { .. } => {
+                Self::operation_error(container_id, "exec creation", error.cause_text())
+            }
+            other => Self::operation_error(container_id, "exec", other.cause_text()),
+        })?;
 
-        let exit_code = self
-            .docker
-            .inspect_exec(&exec.id)
-            .await
-            .ok()
-            .and_then(|inspection| inspection.exit_code);
         Ok(ContainerExecResult {
-            exit_code,
-            stdout: output.0,
-            stderr: output.1,
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
         })
     }
 
@@ -298,6 +309,10 @@ fn terminal_base(base: &str) -> Option<String> {
 
 #[async_trait]
 impl ContainerOperations for RemoteContainerOperations {
+    fn runtime_health_remote(&self) -> Option<Arc<temps_deployer::remote::RemoteNodeDeployer>> {
+        Some(self.deployer.clone())
+    }
+
     fn deployer(&self) -> Arc<dyn temps_deployer::ContainerDeployer> {
         self.deployer.clone()
     }
@@ -618,6 +633,123 @@ struct TerminalControl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn local_operations(docker: bollard::Docker) -> LocalContainerOperations {
+        let docker = Arc::new(docker);
+        LocalContainerOperations::new(
+            docker.clone(),
+            Arc::new(temps_deployment_logs::DockerLogService::new(Arc::new(
+                temps_core::DockerHandle::disabled("test", "no Docker in this test"),
+            ))),
+            Arc::new(temps_deployer::docker::DockerRuntime::new(
+                docker,
+                false,
+                "test-network".to_string(),
+            )),
+        )
+    }
+
+    #[tokio::test]
+    async fn exec_on_an_unreachable_daemon_fails_at_exec_creation() {
+        let docker = bollard::Docker::connect_with_http(
+            "http://127.0.0.1:1",
+            1,
+            bollard::API_DEFAULT_VERSION,
+        )
+        .expect("building the client does not connect");
+        let error = local_operations(docker)
+            .exec("replica-1", vec!["true".to_string()], 5)
+            .await
+            .expect_err("no daemon answers on that port");
+        assert!(
+            matches!(
+                &error,
+                DeploymentError::ContainerOperation { container_id, operation: "exec creation", .. }
+                    if container_id == "replica-1"
+            ),
+            "{error:?}"
+        );
+    }
+
+    /// Output is separated and uncapped, the exit code comes back, and an exec
+    /// that outlasts its timeout is the typed timeout error.
+    #[tokio::test]
+    async fn exec_captures_output_and_reports_its_timeout() {
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        };
+
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+            .await
+            .expect("pull the test image");
+        let name = format!("temps-exec-test-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:1.36".to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        if let Err(error) = docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+        {
+            // The panic ends the test before its own cleanup can run.
+            let _ = docker
+                .remove_container(
+                    &name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            panic!("start the test container {name}: {error}");
+        }
+
+        let operations = local_operations(docker.clone());
+        let sh = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let finished = operations
+            .exec(&name, sh("echo out; echo err >&2; exit 6"), 30)
+            .await;
+        let timed_out = operations.exec(&name, sh("sleep 60"), 1).await;
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let finished = finished.expect("exec");
+        assert_eq!(finished.exit_code, Some(6));
+        assert_eq!(finished.stdout, "out\n");
+        assert_eq!(finished.stderr, "err\n");
+        assert!(
+            matches!(
+                &timed_out,
+                Err(DeploymentError::ContainerExecTimeout { container_id, timeout_seconds: 1 })
+                    if container_id == &name
+            ),
+            "{timed_out:?}"
+        );
+    }
 
     #[test]
     fn terminal_url_maps_http_schemes() {

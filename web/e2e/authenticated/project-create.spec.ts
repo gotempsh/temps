@@ -37,13 +37,13 @@ test.describe('project creation', () => {
     await page.goto('/projects/new')
     await expectAppMounted(page)
     await expect(
-      page.getByRole('heading', { name: 'New Project' })
+      page.getByRole('heading', { name: 'New service', exact: true })
     ).toBeVisible()
 
     // The shared source switcher exposes the active source as an ARIA tab.
     await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
-    const urlField = page.getByLabel('Public Repository URL')
+    const urlField = page.getByLabel('Public repository URL')
     await expect(urlField).toBeVisible()
     await urlField.fill(PUBLIC_REPO_URL)
 
@@ -51,7 +51,7 @@ test.describe('project creation', () => {
 
     // The backend clones and inspects the repo here; give it room. Reaching the
     // config step at all proves the clone and preset detection succeeded.
-    const nameField = page.getByLabel('Project Name')
+    const nameField = page.getByLabel('Service name')
     await expect(
       nameField,
       'the repo should be cloned and inspected'
@@ -62,7 +62,7 @@ test.describe('project creation', () => {
     // form controls, so they are asserted by their visible text, not getByLabel.
     await expect(page.getByText('Branch', { exact: true })).toBeVisible()
     await expect(
-      page.getByText('Root Directory', { exact: true })
+      page.getByText('Root directory', { exact: true })
     ).toBeVisible()
 
     // Preset auto-detection resolves a beat AFTER the form paints, and until it
@@ -79,7 +79,7 @@ test.describe('project creation', () => {
 
     await nameField.fill(name)
     await page
-      .getByRole('button', { name: 'Create Project', exact: true })
+      .getByRole('button', { name: 'Create service', exact: true })
       .click()
 
     try {
@@ -121,7 +121,7 @@ test.describe('project creation', () => {
     await page.getByRole('tab', { name: 'Git URL', exact: true }).click()
 
     await page
-      .getByLabel('Public Repository URL')
+      .getByLabel('Public repository URL')
       .fill(
         'https://github.com/gotempsh/this-repository-does-not-exist-e2e.git'
       )

@@ -50,6 +50,7 @@ mod tests {
     use super::*;
     use crate::migration::m20260922_000001_stateless_control_plane_jobs::Migration as StatelessSchema;
     use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     const BIND: &str = "INSERT INTO stateless_control_plane \
@@ -87,6 +88,7 @@ mod tests {
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "migration-test")
+            .with_test_labels()
             .start()
             .await
         {

@@ -18,7 +18,7 @@ use std::sync::Arc;
 use sea_orm::ActiveValue::Set;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -70,6 +70,72 @@ pub struct DashboardTile {
     /// the tile query path (separate frontend task).
     #[serde(default)]
     pub group_by: Vec<String>,
+    /// What the tile charts: the metric above (the default), or a saved log
+    /// search over time (ADR 108 D1). A log tile ignores `metric_name`,
+    /// `aggregation`, `label_filters` and `group_by`.
+    #[serde(default)]
+    pub source: DashboardTileSource,
+}
+
+/// The series a tile charts.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DashboardTileSource {
+    /// An OTel metric, named by the tile's `metric_name`.
+    #[default]
+    Metric,
+    /// A saved log search of the dashboard's project, charted by
+    /// `GET /projects/{project_id}/logs/saved-searches/{id}/series`.
+    Logs {
+        saved_search_id: i32,
+        /// `count` (lines per bucket), or `avg`, `sum`, `max`, `p50`, `p95`,
+        /// `p99` or `count_distinct` followed by `:<attribute>`.
+        #[serde(default = "default_log_tile_metric")]
+        metric: String,
+    },
+}
+
+fn default_log_tile_metric() -> String {
+    "count".to_string()
+}
+
+const LOG_TILE_FUNCTIONS: &[&str] = &["count_distinct", "avg", "sum", "max", "p50", "p95", "p99"];
+
+/// Longest attribute key the line index accepts.
+const MAX_LOG_ATTRIBUTE_KEY_BYTES: usize = 64;
+
+/// The line index's attribute key grammar, `[A-Za-z_][A-Za-z0-9_.]{0,63}`.
+/// A key the index would refuse must be refused when the tile is saved, not
+/// every time it loads.
+fn is_log_attribute_key(key: &str) -> bool {
+    let bytes = key.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= MAX_LOG_ATTRIBUTE_KEY_BYTES
+        && (bytes[0].is_ascii_alphabetic() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'.')
+}
+
+/// `count`, or `<fn>:<attribute>` with an attribute name an index can hold.
+fn validate_log_tile_metric(tile_id: &str, metric: &str) -> Result<(), OtelError> {
+    if metric == "count" {
+        return Ok(());
+    }
+    let valid = metric.split_once(':').is_some_and(|(function, attr)| {
+        LOG_TILE_FUNCTIONS.contains(&function) && is_log_attribute_key(attr)
+    });
+    if valid {
+        Ok(())
+    } else {
+        Err(OtelError::Validation {
+            message: format!(
+                "Tile '{tile_id}' log metric '{metric}' is not 'count' or one of {} followed by \
+                 ':<attribute>'",
+                LOG_TILE_FUNCTIONS.join(", ")
+            ),
+        })
+    }
 }
 
 /// A titled group of tiles within a dashboard.
@@ -115,6 +181,21 @@ impl DashboardLayout {
                 });
             }
             for tile in &section.tiles {
+                if let DashboardTileSource::Logs {
+                    saved_search_id,
+                    metric,
+                } = &tile.source
+                {
+                    if *saved_search_id <= 0 {
+                        return Err(OtelError::Validation {
+                            message: format!(
+                                "Tile '{}' needs a saved log search id (got {saved_search_id})",
+                                tile.id
+                            ),
+                        });
+                    }
+                    validate_log_tile_metric(&tile.id, metric)?;
+                }
                 if tile.metric_name.len() > MAX_METRIC_NAME_LEN {
                     return Err(OtelError::Validation {
                         message: format!("Tile metric_name exceeds {MAX_METRIC_NAME_LEN} chars"),
@@ -182,6 +263,26 @@ impl DashboardLayout {
     }
 }
 
+impl DashboardLayout {
+    /// The saved log searches the layout's tiles chart, deduplicated.
+    pub fn saved_search_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .sections
+            .iter()
+            .flat_map(|section| &section.tiles)
+            .filter_map(|tile| match tile.source {
+                DashboardTileSource::Logs {
+                    saved_search_id, ..
+                } => Some(saved_search_id),
+                DashboardTileSource::Metric => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
+}
+
 /// Validate a dashboard name (non-empty after trim, within the length cap).
 fn validate_name(name: &str) -> Result<(), OtelError> {
     let trimmed = name.trim();
@@ -224,8 +325,41 @@ impl MetricDashboardService {
             .order_by_desc(Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((items, total))
+    }
+
+    /// A log tile may only chart a saved search of the dashboard's project.
+    /// One query for every log tile of the layout.
+    async fn ensure_saved_searches_in_project(
+        &self,
+        project_id: i32,
+        layout: &DashboardLayout,
+    ) -> Result<(), OtelError> {
+        use temps_entities::log_saved_searches;
+        let ids = layout.saved_search_ids();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let found: Vec<i32> = log_saved_searches::Entity::find()
+            .select_only()
+            .column(log_saved_searches::Column::Id)
+            .filter(log_saved_searches::Column::ProjectId.eq(project_id))
+            .filter(log_saved_searches::Column::Id.is_in(ids.clone()))
+            .into_tuple()
+            .all(self.db.as_ref())
+            .await?;
+        if let Some(missing) = ids.iter().find(|id| !found.contains(id)) {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Saved log search {missing} not found in project {project_id}; a dashboard \
+                     tile can only chart a saved search of its own project"
+                ),
+            });
+        }
+        Ok(())
     }
 
     /// Create a dashboard. Validates the layout before persisting.
@@ -237,6 +371,8 @@ impl MetricDashboardService {
     ) -> Result<Model, OtelError> {
         validate_name(&name)?;
         layout.validate()?;
+        self.ensure_saved_searches_in_project(project_id, &layout)
+            .await?;
 
         let layout_value = serde_json::to_value(&layout)?;
         let model = ActiveModel {
@@ -279,6 +415,7 @@ impl MetricDashboardService {
         }
         if let Some(ref l) = layout {
             l.validate()?;
+            self.ensure_saved_searches_in_project(project_id, l).await?;
         }
 
         let mut active: ActiveModel = existing.into();
@@ -334,6 +471,7 @@ mod tests {
                     title: Some("Latency".to_string()),
                     label_filters: vec![],
                     group_by: vec![],
+                    source: DashboardTileSource::Metric,
                 }],
             }],
         }
@@ -561,5 +699,103 @@ mod tests {
         let json = r#"{"id":"t1","metric_name":"foo","aggregation":"avg"}"#;
         let tile: DashboardTile = serde_json::from_str(json).unwrap();
         assert!(tile.group_by.is_empty());
+    }
+
+    // ── Log tiles (ADR 108 D1) ──────────────────────────────────────────
+
+    fn log_layout(saved_search_id: i32, metric: &str) -> DashboardLayout {
+        let mut layout = sample_layout();
+        layout.sections[0].tiles[0].source = DashboardTileSource::Logs {
+            saved_search_id,
+            metric: metric.to_string(),
+        };
+        layout.sections[0].tiles[0].aggregation = "count".to_string();
+        layout
+    }
+
+    #[test]
+    fn a_tile_without_a_source_is_a_metric_tile() {
+        let tile: DashboardTile = serde_json::from_value(serde_json::json!({
+            "id": "t1", "metric_name": "http.server.duration", "aggregation": "p95", "title": null
+        }))
+        .expect("an existing layout still decodes");
+        assert_eq!(tile.source, DashboardTileSource::Metric);
+    }
+
+    #[test]
+    fn a_log_tile_round_trips_and_defaults_to_a_count() {
+        let tile: DashboardTile = serde_json::from_value(serde_json::json!({
+            "id": "t1", "metric_name": "", "aggregation": "count", "title": "Payment errors",
+            "source": { "kind": "logs", "saved_search_id": 4 }
+        }))
+        .expect("decodes");
+        assert_eq!(
+            tile.source,
+            DashboardTileSource::Logs {
+                saved_search_id: 4,
+                metric: "count".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn log_tile_metrics_are_validated() {
+        for ok in [
+            "count",
+            "p95:duration_ms",
+            "avg:http.status",
+            "count_distinct:user_id",
+        ] {
+            assert!(log_layout(4, ok).validate().is_ok(), "{ok}");
+        }
+        for bad in [
+            "p95",
+            "median:duration_ms",
+            "avg:",
+            "avg:has space",
+            "sum:a\nb",
+            // Metric-name syntax the line index refuses.
+            "avg:request-time",
+            "avg:9lives",
+            "max:a/b",
+        ] {
+            assert!(log_layout(4, bad).validate().is_err(), "{bad}");
+        }
+        let longest = format!("sum:_{}", "a".repeat(63));
+        assert!(log_layout(4, &longest).validate().is_ok());
+        let too_long = format!("sum:_{}", "a".repeat(64));
+        assert!(log_layout(4, &too_long).validate().is_err());
+        assert!(log_layout(0, "count").validate().is_err());
+    }
+
+    #[test]
+    fn a_layout_lists_each_charted_saved_search_once() {
+        let mut layout = log_layout(4, "count");
+        let mut second = layout.sections[0].tiles[0].clone();
+        second.id = "t2".to_string();
+        layout.sections[0].tiles.push(second);
+        let mut metric = sample_layout().sections[0].tiles[0].clone();
+        metric.id = "t3".to_string();
+        layout.sections[0].tiles.push(metric);
+        assert_eq!(layout.saved_search_ids(), vec![4]);
+    }
+
+    #[tokio::test]
+    async fn a_dashboard_cannot_chart_another_projects_saved_search() {
+        // The ownership query finds nothing in this project.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<BTreeMap<String, Value>>::new()])
+            .into_connection();
+        let service = MetricDashboardService::new(Arc::new(db));
+        let error = service
+            .create(7, "Logs".to_string(), log_layout(4, "count"))
+            .await
+            .expect_err("a foreign saved search is refused");
+        assert!(
+            error
+                .to_string()
+                .contains("Saved log search 4 not found in project 7"),
+            "{error}"
+        );
     }
 }

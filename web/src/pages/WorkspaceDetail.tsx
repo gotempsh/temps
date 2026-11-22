@@ -34,26 +34,16 @@ export default function WorkspaceDetail() {
     <PageContainer>
       <PageHeader
         title={name}
-        description="Manage projects, persistent files, and the compute attached to this workspace."
+        description="Manage services, persistent files, and the compute attached to this workspace."
         actions={
-          <>
-            <Button variant="outline" asChild>
-              <Link to="/workspaces">
-                <ArrowLeft className="size-4" /> Workspaces
-              </Link>
-            </Button>
-            <Button asChild variant="outline">
-              <Link
-                to={
-                  global
-                    ? '/ai-first?scope=global'
-                    : `/ai-first?application=${encodeURIComponent(workspaceId)}`
-                }
-              >
-                Open AI threads
-              </Link>
-            </Button>
-          </>
+          // Workspaces belonged to the retired harness AI workspace. This page
+          // stays reachable from the Sandboxes operator view so their compute
+          // can still be inspected and cleaned up.
+          <Button variant="outline" asChild>
+            <Link to="/sandboxes">
+              <ArrowLeft className="size-4" /> Sandboxes
+            </Link>
+          </Button>
         }
       />
       {failed ? (
@@ -80,16 +70,16 @@ export default function WorkspaceDetail() {
         <p>Loading workspace…</p>
       ) : application.data ? (
         <>
-          <section className="space-y-3" aria-label="Linked projects">
+          <section className="space-y-3" aria-label="Linked services">
             <div>
-              <h2 className="text-sm font-semibold">Projects</h2>
+              <h2 className="text-sm font-semibold">Services</h2>
               <p className="mt-1 text-sm text-muted-foreground">
-                Linked projects stay available when workspace compute is
+                Linked services stay available when workspace compute is
                 stopped.
               </p>
             </div>
             {application.data.projects.length === 0 ? (
-              <p className="text-muted-foreground">No linked projects.</p>
+              <p className="text-muted-foreground">No linked services.</p>
             ) : (
               <ul role="list" className="divide-y rounded-lg border bg-card">
                 {application.data.projects.map((project) => (

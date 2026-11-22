@@ -57,6 +57,15 @@ interface RepositoryListProps {
   providerType?: string | null
 }
 
+/**
+ * Columns of the compact list are sized by the room a name needs, not by the
+ * viewport: the page can be narrow at any viewport width (side panel open,
+ * sidebar expanded) and a fixed three columns would cut repository names
+ * down to a few letters there.
+ */
+export const COMPACT_GRID_CLASS =
+  'grid-cols-[repeat(auto-fill,minmax(min(100%,22rem),1fr))] gap-2'
+
 type SortOption = 'name' | 'pushed' | 'created'
 type FilterOption = 'all' | 'public' | 'private'
 
@@ -384,7 +393,7 @@ export function RepositoryList({
           className={cn(
             'grid',
             compactMode
-              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              ? COMPACT_GRID_CLASS
               : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
@@ -445,6 +454,7 @@ export function RepositoryList({
               </div>
               {!searchQuery && (
                 <Button
+                  type="button"
                   onClick={handleSyncRepositories}
                   disabled={syncMutation.isPending || isConnectionSyncing}
                   className="gap-2"
@@ -465,7 +475,7 @@ export function RepositoryList({
           className={cn(
             'grid',
             compactMode
-              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              ? COMPACT_GRID_CLASS
               : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
@@ -660,7 +670,7 @@ export function RepositoryList({
                       </span>
                     )}
                     {repo.language && repo.pushed_at && (
-                      <span className="text-muted-foreground/40">•</span>
+                      <span className="text-muted-foreground">•</span>
                     )}
                     {repo.language && (
                       <span className="inline-flex items-center gap-1.5">
@@ -685,13 +695,14 @@ export function RepositoryList({
       {(currentPage > 1 || hasMorePages) && (
         <div className="flex items-center justify-center gap-2">
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
             disabled={currentPage === 1}
           >
             <ChevronLeft className="h-4 w-4 sm:mr-1" />
-            <span className="hidden sm:inline">Previous</span>
+            <span className="max-sm:sr-only">Previous</span>
           </Button>
 
           <span className="px-2 text-sm tabular-nums text-muted-foreground">
@@ -699,12 +710,13 @@ export function RepositoryList({
           </span>
 
           <Button
+            type="button"
             variant="outline"
             size="sm"
             onClick={() => setCurrentPage((p) => p + 1)}
             disabled={!hasMorePages}
           >
-            <span className="hidden sm:inline">Next</span>
+            <span className="max-sm:sr-only">Next</span>
             <ChevronRight className="h-4 w-4 sm:ml-1" />
           </Button>
         </div>

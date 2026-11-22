@@ -5,6 +5,7 @@ import {
   getServiceRuntimeOptions,
   getServiceStatsOptions,
   listServicesOptions,
+  listServicesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ExternalServiceInfo } from '@/api/client/types.gen'
 import {
@@ -21,16 +22,20 @@ import { PlatformServices } from '@/components/storage/PlatformServices'
 import EmptyStateStorage from '@/components/storage/EmptyStateStorage'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { Button } from '@/components/ui/button'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { Card } from '@/components/ui/card'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
+import { Callout } from '@temps-sdk/ds'
 import {
   Cpu,
   Database,
-  HardDrive,
+  Layers,
   MemoryStick,
   Pencil,
   RefreshCcw,
@@ -67,6 +72,7 @@ export function Storage() {
     isLoading,
     error,
     refetch,
+    isFetching,
   } = useQuery({
     ...listServicesOptions(),
   })
@@ -123,7 +129,9 @@ export function Storage() {
       )
     }
 
-    if (error) {
+    // A failed refresh keeps the loaded cards; only a list that never
+    // loaded is replaced by the error.
+    if (error && !services) {
       return (
         <div className="flex flex-col items-center justify-center py-12 text-center">
           <p className="text-sm text-muted-foreground mb-4">
@@ -137,12 +145,34 @@ export function Storage() {
       )
     }
 
+    // Shown over an empty list too: the latest read failing says nothing
+    // about whether there are services now.
+    const refreshFailed = error ? (
+      <Callout tone="error" title="Couldn't refresh services">
+        Showing the last loaded services.{' '}
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => void refetch()}
+          disabled={isFetching}
+        >
+          Retry services
+        </Button>
+      </Callout>
+    ) : null
+
     if (!services?.length) {
-      return <EmptyStateStorage />
+      return (
+        <div className="space-y-4">
+          {refreshFailed}
+          <EmptyStateStorage />
+        </div>
+      )
     }
 
     return (
-      <>
+      <div className="space-y-4">
+        {refreshFailed}
         <ServicesCardGrid
           services={services}
           healthMap={healthMap}
@@ -153,56 +183,32 @@ export function Storage() {
           }}
           onDeleteSuccess={() => refetch()}
         />
-      </>
+      </div>
     )
   }
 
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer innerClassName="space-y-6">
-        <div className="grid min-w-0 gap-6 lg:grid-cols-[220px_minmax(0,1fr)]">
-          <aside
-            className="self-start border-b pb-4 lg:border-b-0 lg:border-r lg:pr-4 lg:pb-0"
-            aria-label="Databases navigation"
-          >
-            <p className="mb-3 text-sm font-semibold">Databases</p>
-            <nav aria-label="Database pages" className="flex gap-1 lg:flex-col">
-              {[
-                {
-                  value: 'external',
-                  label: 'Databases',
-                  icon: HardDrive,
-                },
-                {
-                  value: 'platform',
-                  label: 'Platform services',
-                  icon: Database,
-                },
-              ].map(({ value, label, icon: Icon }) => (
-                <Button
-                  key={value}
-                  variant="ghost"
-                  onClick={() => handleTabChange(value)}
-                  aria-current={activeTab === value ? 'page' : undefined}
-                  className={cn(
-                    'h-auto justify-start gap-2 text-left whitespace-normal px-2.5 py-2 text-sm font-normal text-muted-foreground',
-                    activeTab === value &&
-                      'bg-muted font-medium text-foreground'
-                  )}
-                >
-                  <Icon className="size-4 shrink-0" aria-hidden="true" />
-                  {label}
-                </Button>
-              ))}
-            </nav>
-          </aside>
-          <div className="min-w-0 space-y-6">
-            <PageHeader
-              title={
-                activeTab === 'platform' ? 'Platform services' : 'Databases'
-              }
-              actions={
-                activeTab === 'external' && services?.length ? (
+        <PageHeader
+          title="Databases"
+          description={
+            activeTab === 'platform'
+              ? 'Shared by every deployed service, with each service’s data isolated by namespace. Enable one to make it available everywhere.'
+              : undefined
+          }
+          actions={
+            activeTab === 'external' ? (
+              <>
+                {/* The list and its health dots; each row's CPU and memory
+                    keep their own 10 s poll. */}
+                <RefreshButton
+                  queryKeys={[
+                    queryKeyPrefix(listServicesQueryKey),
+                    ['service-health-batch'],
+                  ]}
+                />
+                {services?.length ? (
                   <>
                     <ImportServiceButton onSuccess={() => refetch()} />
                     <CreateServiceButton
@@ -211,19 +217,30 @@ export function Storage() {
                       onOpenChange={setIsCreateDropdownOpen}
                     />
                   </>
-                ) : undefined
-              }
-            />
-            {/* Managed services are containers: without something to run
-                them, creating one cannot succeed. */}
-            <WorkerNodeRequiredBanner />
-            {activeTab === 'platform' ? (
-              <PlatformServices />
-            ) : (
-              renderExternalServicesContent()
-            )}
-          </div>
-        </div>
+                ) : null}
+              </>
+            ) : undefined
+          }
+        />
+        {/* Managed services are containers: without something to run
+            them, creating one cannot succeed. */}
+        <WorkerNodeRequiredBanner />
+        <Tabs value={activeTab} onValueChange={handleTabChange}>
+          <TabsList className="w-full lg:w-auto">
+            <TabsTrigger value="external" icon={Database}>
+              Databases
+            </TabsTrigger>
+            <TabsTrigger value="platform" icon={Layers}>
+              Platform services
+            </TabsTrigger>
+          </TabsList>
+          <TabsContent value="external" className="mt-6">
+            {renderExternalServicesContent()}
+          </TabsContent>
+          <TabsContent value="platform" className="mt-6">
+            <PlatformServices />
+          </TabsContent>
+        </Tabs>
 
         {selectedService && (
           <EditServiceDialog
@@ -284,6 +301,7 @@ function HealthDot({
         : 'Down'
   return (
     <span
+      role="img"
       className={cn('inline-block size-2 rounded-full', tone, className)}
       title={label}
       aria-label={label}
@@ -557,7 +575,7 @@ function ServiceMetricsCell({ serviceId }: { serviceId: number }) {
           <MemoryStick className="size-3.5" />
           <span>{formatBytes(memBytes, 1)}</span>
           {hasMemCap && (
-            <span className="text-muted-foreground/60">
+            <span className="text-muted-foreground">
               / {formatBytes(memLimitBytes!, 0)}
             </span>
           )}

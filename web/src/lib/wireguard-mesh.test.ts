@@ -10,6 +10,7 @@ import type {
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import {
+  controlPlaneMeshPort,
   defaultInternetMethod,
   defaultJoinPath,
   enrollmentProgress,
@@ -17,8 +18,12 @@ import {
   hubOptionValue,
   hubTargetFromOption,
   linksNeedingAttention,
+  joinUrlIsHttps,
   joinUrlReachableFromOutside,
   meshProblems,
+  offersOutboundJoin,
+  outboundJoinCommand,
+  outboundPeerReach,
   pairingProgress,
   pendingPairings,
   joinCommand,
@@ -59,6 +64,8 @@ function mesh(
     state: 'disabled',
     reason: null,
     cidr: null,
+    pool_cidr: '10.201.0.0/16',
+    ca_rotation_required: false,
     listen_port: 51820,
     control_plane: null,
     can_enable: true,
@@ -95,11 +102,98 @@ describe('join URL', () => {
 describe('join command', () => {
   test('asks for the address that matches the join path', () => {
     expect(joinCommand('https://t.example.com', 'tok', 'internet')).toBe(
-      'temps join https://t.example.com tok --private-address <worker-public-ip>'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com tok --private-address <worker-public-ip>'
     )
     expect(joinCommand('https://t.example.com', null, 'private')).toBe(
-      'temps join https://t.example.com <join-token> --private-address <worker-private-ip>'
+      'sudo -H /root/.temps/bin/temps join https://t.example.com <join-token> --private-address <worker-private-ip>'
     )
+  })
+})
+
+describe('outbound join', () => {
+  const dialable = {
+    address: '10.201.0.1',
+    endpoint: '203.0.113.1:51820',
+    endpoint_is_private: false,
+  }
+
+  test('needs no worker address', () => {
+    expect(outboundJoinCommand('https://t.example.com', 'tok')).toBe(
+      'sudo -H /root/.temps/bin/temps join https://t.example.com tok'
+    )
+    expect(outboundJoinCommand('https://t.example.com', null)).toBe(
+      'sudo -H /root/.temps/bin/temps join https://t.example.com <join-token>'
+    )
+  })
+
+  test('is offered when workers reach the join URL and the mesh endpoint', () => {
+    expect(
+      offersOutboundJoin(
+        mesh({ control_plane: dialable }),
+        'https://temps.example.com'
+      )
+    ).toBe(true)
+  })
+
+  test('is not offered when workers could not dial this server', () => {
+    const url = 'https://temps.example.com'
+    expect(offersOutboundJoin(mesh(), url)).toBe(false)
+    expect(offersOutboundJoin(undefined, url)).toBe(false)
+    expect(
+      offersOutboundJoin(
+        mesh({ control_plane: { ...dialable, endpoint: null } }),
+        url
+      )
+    ).toBe(false)
+    expect(
+      offersOutboundJoin(
+        mesh({
+          control_plane: {
+            ...dialable,
+            endpoint: '10.0.0.5:51820',
+            endpoint_is_private: true,
+          },
+        }),
+        url
+      )
+    ).toBe(false)
+    expect(
+      offersOutboundJoin(
+        mesh({ control_plane: dialable }),
+        'https://app.localho.st'
+      )
+    ).toBe(false)
+  })
+
+  test('is not offered over plain HTTP, which `temps join` refuses', () => {
+    expect(
+      offersOutboundJoin(
+        mesh({ control_plane: dialable }),
+        'http://temps.example.com'
+      )
+    ).toBe(false)
+    expect(joinUrlIsHttps('https://temps.example.com')).toBe(true)
+    expect(joinUrlIsHttps('http://temps.example.com')).toBe(false)
+    expect(joinUrlIsHttps('not a url')).toBe(false)
+  })
+
+  test('other workers reach it only through a chosen hub', () => {
+    expect(outboundPeerReach(null)).toEqual({ needsHub: true })
+    expect(
+      outboundPeerReach({ name: 'none', target: { kind: 'none' } })
+    ).toEqual({ needsHub: true })
+    expect(
+      outboundPeerReach({
+        name: 'control-plane',
+        target: { kind: 'control_plane' },
+      })
+    ).toEqual({ via: 'this server' })
+    expect(
+      outboundPeerReach({
+        name: 'edge-1',
+        target: { kind: 'node', node_id: 3 },
+      })
+    ).toEqual({ via: 'edge-1' })
   })
 })
 
@@ -227,6 +321,17 @@ describe('pairing progress', () => {
     expect(progress.tone).toBe('error')
     expect(progress.label).toBe('Refused')
     expect(progress.hint).toContain('another node')
+  })
+
+  test('says an outbound worker sent its key rather than answered', () => {
+    expect(pairingProgress(pairing({ status: 'key_received' })).hint).toContain(
+      'answered'
+    )
+    const outbound = pairingProgress(
+      pairing({ status: 'key_received', node_endpoint: null })
+    )
+    expect(outbound.label).toBe('Registering')
+    expect(outbound.hint).toContain('sent its key')
   })
 
   test('only waiting and registering pairings are pending', () => {
@@ -411,8 +516,8 @@ describe('pairing expiry', () => {
 describe('SSH enrollment steps', () => {
   test('match the steps the server reports, in order', () => {
     // The `progress.step(...)` calls in
-    // crates/temps-deployments/src/services/node_ssh.rs (`enroll`) and
-    // the heartbeat wait in crates/temps-deployments/src/services/node_ssh_enrollment.rs.
+    // crates/temps-nodes/src/services/node_ssh.rs (`enroll`) and
+    // the heartbeat wait in crates/temps-nodes/src/services/node_ssh_enrollment.rs.
     // Update both sides together: an unknown step shows no progress.
     expect(SSH_ENROLLMENT_STEPS).toEqual([
       'connecting',
@@ -423,5 +528,28 @@ describe('SSH enrollment steps', () => {
       'starting the agent',
       'waiting for the first heartbeat',
     ])
+  })
+})
+
+describe('controlPlaneMeshPort', () => {
+  const mesh = (endpoint?: string | null) => ({
+    listen_port: 51820,
+    control_plane:
+      endpoint === undefined
+        ? undefined
+        : { address: '10.201.0.1', endpoint, endpoint_is_private: false },
+  })
+
+  test('is the port of the endpoint workers dial', () => {
+    expect(controlPlaneMeshPort(mesh('203.0.113.10:20517'))).toBe(20517)
+    expect(controlPlaneMeshPort(mesh('[2001:db8::1]:443'))).toBe(443)
+  })
+
+  test('falls back to the listen port without a usable endpoint', () => {
+    expect(controlPlaneMeshPort(mesh())).toBe(51820)
+    expect(controlPlaneMeshPort(mesh(null))).toBe(51820)
+    expect(controlPlaneMeshPort(mesh('203.0.113.10'))).toBe(51820)
+    expect(controlPlaneMeshPort(mesh('203.0.113.10:0'))).toBe(51820)
+    expect(controlPlaneMeshPort(mesh('203.0.113.10:70000'))).toBe(51820)
   })
 })

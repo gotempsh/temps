@@ -106,13 +106,15 @@ export function ExampleDnsCheck() {
     dnsProvider.cloudflare_api_key
   ) {
     return (
-      <div className="text-green-600">
+      <div className="text-green-700 dark:text-green-600">
         ✓ Automatic DNS management enabled via Cloudflare
       </div>
     )
   }
 
   return (
-    <div className="text-yellow-600">⚠ Manual DNS configuration required</div>
+    <div className="text-yellow-700 dark:text-yellow-600">
+      ⚠ Manual DNS configuration required
+    </div>
   )
 }

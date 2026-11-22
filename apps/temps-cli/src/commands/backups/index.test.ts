@@ -8,9 +8,12 @@ import {
   formatRetainedUntil,
   maskSecret,
   parseCleanupScheduleId,
+  resolveRestartConsent,
   validateCreateScheduleAutomation,
   type RetentionCleanupReport,
 } from './index.js'
+import { registerBackupsCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 describe('formatBytes', () => {
   test('scales through units with one decimal place', () => {
@@ -161,5 +164,107 @@ describe('formatRetainedUntil', () => {
 
   test('falls back to "until deleted" for an unparsable timestamp', () => {
     expect(formatRetainedUntil('not-a-date')).toBe('until deleted')
+  })
+})
+
+describe('resolveRestartConsent (#1415)', () => {
+  const restarts = { restarts_database: true, reason: 'WAL archiving is off' }
+  const deps = (over: Partial<Parameters<typeof resolveRestartConsent>[0]> = {}) => {
+    // Everything the operator would see or be asked, in order.
+    const events: string[] = []
+    return {
+      events,
+      deps: {
+        confirmFlag: false,
+        isTTY: true,
+        loadPreflight: async () => {
+          events.push('preflight')
+          return restarts
+        },
+        prompt: async () => {
+          events.push('prompt')
+          return true
+        },
+        warn: (message: string) => {
+          events.push(`warn: ${message}`)
+        },
+        ...over,
+      },
+    }
+  }
+
+  test('--confirm-restart proceeds without a preflight or a prompt', async () => {
+    const { deps: d, events } = deps({ confirmFlag: true })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true })
+    expect(events).toEqual([])
+  })
+
+  test('a backup that does not restart proceeds without confirmation', async () => {
+    const { deps: d, events } = deps({ loadPreflight: async () => ({ restarts_database: false }) })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false })
+    expect(events).toEqual([])
+  })
+
+  test('a non-interactive run explains, then stops with exit 1 and never prompts', async () => {
+    const { deps: d, events } = deps({ isTTY: false })
+    expect(await resolveRestartConsent(d)).toMatchObject({ kind: 'abort', exitCode: 1 })
+    expect(events).toEqual(['preflight', 'warn: WAL archiving is off'])
+  })
+
+  test('the reason is shown before the question, and a yes sends confirm_restart', async () => {
+    const { deps: d, events } = deps()
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: true })
+    expect(events).toEqual(['preflight', 'warn: WAL archiving is off', 'prompt'])
+  })
+
+  test('an interactive no starts nothing and exits 0', async () => {
+    const { deps: d } = deps({ prompt: async () => false })
+    expect(await resolveRestartConsent(d)).toMatchObject({ kind: 'abort', exitCode: 0 })
+  })
+
+  test('an unreadable preflight sends the request unconfirmed (the server still refuses a restart)', async () => {
+    const { deps: d, events } = deps({ loadPreflight: async () => undefined })
+    expect(await resolveRestartConsent(d)).toEqual({ kind: 'proceed', confirmRestart: false })
+    expect(events).toEqual([])
+  })
+
+  test('a missing reason still warns', async () => {
+    const { deps: d, events } = deps({
+      isTTY: false,
+      loadPreflight: async () => ({ restarts_database: true, reason: null }),
+    })
+    await resolveRestartConsent(d)
+    expect(events).toContain('warn: This backup restarts the database.')
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('backups sources create credential sources', () => {
+  test('--secret-key-stdin sends the piped secret access key exactly', async () => {
+    const run = await runWithApi(registerBackupsCommands,
+      ['backups', 'sources', 'create', '-n', 's3', '--bucket', 'b', '--region', 'us-east-1', '--access-key', 'AKIAEXAMPLE', '--secret-key-stdin', '-y'],
+      { 'POST /backups/s3-sources': (_url: URL, body: unknown) => ({ id: 1, name: 's3', bucket_name: 'b', region: 'us-east-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' }) },
+      { stdin: CREDENTIAL_SENTINEL })
+    expect(run.error).toBeUndefined()
+    expect(credentialBody(run, 'POST /backups/s3-sources').secret_key).toBe(CREDENTIAL_SENTINEL)
   })
 })

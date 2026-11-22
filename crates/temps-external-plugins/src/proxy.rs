@@ -5,16 +5,16 @@
 
 use std::path::PathBuf;
 
+use crate::actor::ActorPrincipal;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Router;
 use temps_auth::context::{AuthContext, AuthSource};
-use temps_core::external_plugin::actor::ActorPrincipal;
-use temps_core::external_plugin::headers;
-use temps_core::external_plugin::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use temps_core::problemdetails;
+use temps_plugin_protocol::headers;
+use temps_plugin_protocol::{PLUGIN_CHANNEL_PATH, PLUGIN_EVENTS_PATH};
 use tracing::{debug, error, warn};
 
 /// Proxy configuration for a single external plugin.
@@ -27,7 +27,7 @@ pub struct PluginProxy {
     /// Per-process assertion secret for authenticating proxied requests.
     pub auth_secret: String,
     /// Route prefixes the plugin authenticates itself, from its manifest.
-    /// See [`temps_core::external_plugin::manifest::PluginManifest::public_paths`].
+    /// See [`temps_plugin_protocol::manifest::PluginManifest::public_paths`].
     pub public_paths: Vec<String>,
     /// Instance key material for minting the caller's actor token.
     ///
@@ -106,11 +106,113 @@ pub fn create_plugin_proxy_router(proxy: PluginProxy) -> Router {
         .with_state(proxy)
 }
 
+/// Why a request path was refused before any routing decision was made.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PathRejection {
+    /// A `..` segment would climb above the plugin's root.
+    EscapesRoot,
+    /// A backslash, raw or percent-encoded. WHATWG URL parsing (what a
+    /// JavaScript plugin's `new URL(req.url)` uses) treats `\` as a path
+    /// separator for `http:` URLs, so it could re-split segments after our
+    /// checks ran.
+    AmbiguousSeparator,
+}
+
+/// Resolve dot-segments in a request path the way the plugin will, so every
+/// decision this proxy makes is about the path the plugin actually routes.
+///
+/// This exists because of a real bypass: `is_public` used to match the raw
+/// path, so `/public/../api/subscribers` passed as a public route while the
+/// plugin's URL parser collapsed it to `/api/subscribers` — its admin API,
+/// reached unauthenticated. The same trick walked past the reserved
+/// transport-path guard (`/public/../_events`).
+///
+/// Segments that are `.`/`..` *after* decoding `%2e` are resolved (RFC 3986
+/// §5.2.4, WHATWG treats `%2e` as a dot in this position too); every other
+/// segment is kept byte-for-byte. A path that climbs above the root, or that
+/// contains a backslash a downstream parser might read as `/`, is rejected
+/// outright — no legitimate client sends either.
+fn normalize_request_path(path: &str) -> Result<String, PathRejection> {
+    if path.contains('\\') || path.to_ascii_lowercase().contains("%5c") {
+        return Err(PathRejection::AmbiguousSeparator);
+    }
+
+    let mut segments: Vec<&str> = Vec::new();
+    let raw_segments: Vec<&str> = path.split('/').skip(1).collect();
+    let last_index = raw_segments.len().saturating_sub(1);
+    // A trailing dot-segment leaves a directory-shaped path behind
+    // (`/a/b/..` -> `/a/`), matching both RFC 3986 and WHATWG.
+    let mut trailing_slash = false;
+
+    for (index, segment) in raw_segments.iter().enumerate() {
+        let decoded = segment.to_ascii_lowercase().replace("%2e", ".");
+        match decoded.as_str() {
+            "." => {
+                trailing_slash = index == last_index;
+            }
+            ".." => {
+                if segments.pop().is_none() {
+                    return Err(PathRejection::EscapesRoot);
+                }
+                trailing_slash = index == last_index;
+            }
+            _ => {
+                segments.push(segment);
+                trailing_slash = false;
+            }
+        }
+    }
+
+    let mut normalized = String::with_capacity(path.len());
+    for segment in &segments {
+        normalized.push('/');
+        normalized.push_str(segment);
+    }
+    if trailing_slash || normalized.is_empty() {
+        normalized.push('/');
+    }
+    Ok(normalized)
+}
+
 /// The actual proxy handler — forwards requests to the plugin over Unix socket.
 async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Response {
     let method = request.method().clone();
     let uri = request.uri().clone();
-    let path = uri.path();
+    let raw_path = uri.path();
+
+    // Normalize before *any* decision below. Every check — reserved
+    // transport paths, the public-route exemption — and the forwarded
+    // request itself must all see the same path, or a dot-segment can make
+    // the proxy authorize one route while the plugin serves another.
+    let normalized_path = match normalize_request_path(raw_path) {
+        Ok(normalized) => normalized,
+        Err(rejection) => {
+            warn!(
+                plugin = %proxy.plugin_name,
+                method = %method,
+                path = %raw_path,
+                reason = ?rejection,
+                "Rejecting plugin request with an unresolvable path"
+            );
+            return problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Plugin Path")
+                .with_detail(format!(
+                    "Request path '{}' for plugin '{}' contains dot-segments that escape \
+                     the plugin root or an ambiguous path separator",
+                    raw_path, proxy.plugin_name
+                ))
+                .into_response();
+        }
+    };
+    let path = normalized_path.as_str();
+    if path != raw_path {
+        debug!(
+            plugin = %proxy.plugin_name,
+            raw_path = %raw_path,
+            normalized_path = %path,
+            "Normalized dot-segments in plugin request path"
+        );
+    }
 
     // These endpoints accept assertions that only the platform may make.
     // They remain reachable over the plugin's private Unix socket for event
@@ -138,6 +240,13 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
     // through for the public ingest endpoints to handle themselves. So
     // without this check every `/api/x/<plugin>/…` path is reachable
     // unauthenticated, whatever the plugin behind it does.
+    //
+    // TODO(defense-in-depth): plugins should not rely on this routing
+    // decision alone. The plugin SDKs should refuse any non-`public_paths`
+    // route that arrives without the proxy-injected `x-temps-*` identity
+    // headers (and a valid `x-temps-auth-signature`), so a future proxy
+    // parsing gap fails closed inside the plugin instead of exposing its
+    // admin API.
     let auth = request.extensions().get::<AuthContext>().cloned();
     if auth.is_none() && !proxy.is_public(path) {
         warn!(
@@ -164,9 +273,14 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
         "Proxying request to external plugin"
     );
 
-    let path_and_query = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or(path);
+    // Forward the normalized path — exactly the one the checks above
+    // approved — never the raw one.
+    let path_and_query = match uri.query() {
+        Some(query) => format!("{}?{}", path, query),
+        None => path.to_string(),
+    };
 
-    match forward_to_unix_socket(&proxy, auth.as_ref(), request, path_and_query).await {
+    match forward_to_unix_socket(&proxy, auth.as_ref(), request, &path_and_query).await {
         Ok(response) => response,
         Err(e) => {
             error!(
@@ -222,6 +336,19 @@ async fn forward_to_unix_socket(
         .await
         .map_err(|e| format!("HTTP handshake failed: {}", e))?;
 
+    // The stream pins a particular process even if its socket path is replaced.
+    // Validate after all connection awaits and before transmitting any credentials.
+    if original_request
+        .extensions()
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+        .is_some_and(|guard| !guard.is_current())
+    {
+        return Err(format!(
+            "AI tool publication for plugin '{}' changed before dispatch",
+            proxy.plugin_name
+        ));
+    }
+
     tokio::spawn(async move {
         if let Err(e) = conn.await {
             // hyper reports "error shutting down connection" when the Unix
@@ -234,6 +361,22 @@ async fn forward_to_unix_socket(
     let (mut parts, body) = original_request.into_parts();
 
     inject_temps_headers(&mut parts.headers, proxy, auth);
+    inject_chat_origin(&mut parts.headers, &parts.extensions, auth);
+    if let Some(guard) = parts
+        .extensions
+        .get::<temps_ai_api_tools::PluginDispatchGuard>()
+    {
+        guard.record_response_credentials(
+            parts
+                .headers
+                .get(headers::AUTH_SIGNATURE)
+                .and_then(|value| value.to_str().ok()),
+            parts
+                .headers
+                .get(headers::ACTOR_TOKEN)
+                .and_then(|value| value.to_str().ok()),
+        );
+    }
 
     let target_uri: hyper::Uri = path_and_query
         .parse()
@@ -279,6 +422,29 @@ fn actor_principal(auth: &AuthContext) -> Option<ActorPrincipal> {
         }
         | AuthSource::CliToken { .. }
         | AuthSource::DeploymentToken { .. } => None,
+    }
+}
+
+fn inject_chat_origin(
+    headers: &mut hyper::HeaderMap,
+    extensions: &hyper::http::Extensions,
+    auth: Option<&AuthContext>,
+) {
+    use temps_core::ai_tool_call::{AiToolOrigin, ConfirmedAiWrite};
+    let Some(origin) = extensions.get::<AiToolOrigin>() else {
+        return;
+    };
+    if let Some(chat_id) = origin.chat_id {
+        headers.insert(headers::CHAT_ID, chat_id.into());
+        if auth.is_some() && extensions.get::<ConfirmedAiWrite>().is_some() {
+            if let Some(name) = origin
+                .agent_name
+                .as_deref()
+                .and_then(|s| hyper::header::HeaderValue::from_bytes(s.as_bytes()).ok())
+            {
+                headers.insert(headers::AGENT_NAME, name);
+            }
+        }
     }
 }
 
@@ -379,7 +545,7 @@ fn inject_temps_headers(
         // Mint the proof the plugin echoes back on channel API calls. Bound
         // to this plugin, this user, and a specific principal (a browser
         // session or an API key) that redemption re-checks — see
-        // `temps_core::external_plugin::actor` for why the principal exists
+        // `crate::actor` for why the principal exists
         // at all: without it, redemption could only rebuild the *user's*
         // full role, silently discarding whatever a restricted API key had
         // scoped the caller down to.
@@ -387,12 +553,12 @@ fn inject_temps_headers(
             match actor_principal(auth) {
                 Some(principal) => {
                     if let Some(crypto) = proxy.actor_crypto.get() {
-                        match temps_core::external_plugin::actor::encode_plugin_actor_token(
+                        match crate::actor::encode_plugin_actor_token(
                             &crypto,
                             &proxy.plugin_name,
                             user.id,
                             principal,
-                            temps_core::external_plugin::actor::PLUGIN_ACTOR_TOKEN_TTL,
+                            crate::actor::PLUGIN_ACTOR_TOKEN_TTL,
                             std::time::SystemTime::now(),
                         ) {
                             Ok((token, _exp)) => set(headers::ACTOR_TOKEN, token),
@@ -547,7 +713,7 @@ mod tests {
         inject_temps_headers(&mut after, &proxy, Some(&auth));
         let token = header(&after, headers::ACTOR_TOKEN)
             .expect("the same proxy must mint once the key arrives");
-        let verified = temps_core::external_plugin::actor::verify_plugin_actor_token(
+        let verified = crate::actor::verify_plugin_actor_token(
             &temps_core::CookieCrypto::new("0123456789abcdef0123456789abcdef").expect("test key"),
             &token,
             &proxy.plugin_name,
@@ -557,7 +723,7 @@ mod tests {
         assert_eq!(verified.user_id, 42);
         assert_eq!(
             verified.principal,
-            temps_core::external_plugin::actor::ActorPrincipal::Session { session_id: 7 }
+            crate::actor::ActorPrincipal::Session { session_id: 7 }
         );
     }
 
@@ -575,6 +741,34 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         inject_temps_headers(&mut headers, &proxy, Some(&auth));
         assert!(header(&headers, headers::ACTOR_TOKEN).is_none());
+    }
+
+    #[test]
+    fn confirmed_chat_write_forwards_only_host_asserted_sender_identity() {
+        use temps_core::ai_tool_call::{AiToolOrigin, ConfirmedAiWrite};
+        let auth = AuthContext::new_session(test_user(42, "operator@example.test"), Role::Admin);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(headers::CHAT_ID, "forged".parse().unwrap());
+        headers.insert(headers::AGENT_NAME, "forged".parse().unwrap());
+        inject_temps_headers(&mut headers, &test_proxy(), Some(&auth));
+        let mut extensions = hyper::http::Extensions::new();
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert!(!headers.contains_key(headers::CHAT_ID));
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        extensions.insert(AiToolOrigin {
+            chat_id: Some(15),
+            agent_name: Some("Équipe".into()),
+            ip_address: String::new(),
+            user_agent: String::new(),
+        });
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert_eq!(headers[headers::CHAT_ID], "15");
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        extensions.insert(ConfirmedAiWrite);
+        inject_chat_origin(&mut headers, &extensions, None);
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert_eq!(headers[headers::AGENT_NAME].as_bytes(), "Équipe".as_bytes());
     }
 
     #[test]
@@ -749,6 +943,101 @@ mod tests {
     }
 
     #[test]
+    fn normalize_resolves_dot_segments_including_percent_encoded_ones() {
+        for (raw, expected) in [
+            ("/public/../api/subscribers", "/api/subscribers"),
+            ("/public/%2e%2e/api/subscribers", "/api/subscribers"),
+            ("/public/%2E%2e/api/subscribers", "/api/subscribers"),
+            ("/public/.%2e/api/subscribers", "/api/subscribers"),
+            ("/public/./../api/subscribers", "/api/subscribers"),
+            ("/public/%2e/form", "/public/form"),
+            ("/public/../_events", "/_events"),
+            ("/public/../_temps/channel", "/_temps/channel"),
+            ("/a/b/..", "/a/"),
+            ("/a/.", "/a/"),
+            ("/", "/"),
+            ("/public/form/", "/public/form/"),
+            // Not a dot-segment: dots inside a name and double-encoding are
+            // left exactly as sent.
+            ("/public/file.v2..json", "/public/file.v2..json"),
+            ("/public/%252e%252e/x", "/public/%252e%252e/x"),
+        ] {
+            assert_eq!(
+                normalize_request_path(raw).as_deref(),
+                Ok(expected),
+                "{raw}"
+            );
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_root_escape_and_backslashes() {
+        assert_eq!(
+            normalize_request_path("/../api"),
+            Err(PathRejection::EscapesRoot)
+        );
+        assert_eq!(
+            normalize_request_path("/public/../../api"),
+            Err(PathRejection::EscapesRoot)
+        );
+        assert_eq!(
+            normalize_request_path("/public\\..\\api"),
+            Err(PathRejection::AmbiguousSeparator)
+        );
+        assert_eq!(
+            normalize_request_path("/public/..%5Capi"),
+            Err(PathRejection::AmbiguousSeparator)
+        );
+    }
+
+    /// The live-confirmed bypass: a dot-segment after a public prefix must
+    /// not borrow that prefix's exemption.
+    #[test]
+    fn dot_segment_traversal_does_not_pass_is_public() {
+        let proxy = test_proxy().with_public_paths(vec!["/public".into()]);
+        for raw in [
+            "/public/../api/subscribers",
+            "/public/%2e%2e/api/subscribers",
+            "/public/./../api/settings",
+        ] {
+            let normalized = normalize_request_path(raw).expect("resolvable path");
+            assert!(!proxy.is_public(&normalized), "{raw} -> {normalized}");
+        }
+        // Genuine public routes keep working.
+        let normalized = normalize_request_path("/public/./subscribe").expect("resolvable path");
+        assert!(proxy.is_public(&normalized));
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_traversal_out_of_a_public_prefix_is_rejected() {
+        // The socket does not exist, so a 401/404/400 proves the handler
+        // refused before forwarding; reaching the forwarder would be a 502.
+        let router =
+            create_plugin_proxy_router(test_proxy().with_public_paths(vec!["/public".into()]));
+
+        for (uri, expected) in [
+            ("/public/../api/subscribers", StatusCode::UNAUTHORIZED),
+            ("/public/%2e%2e/api/settings", StatusCode::UNAUTHORIZED),
+            ("/public/./../api/subscribers", StatusCode::UNAUTHORIZED),
+            ("/public/../_events", StatusCode::NOT_FOUND),
+            ("/public/%2e%2e/_temps/channel", StatusCode::NOT_FOUND),
+            ("/public/../../api/subscribers", StatusCode::BAD_REQUEST),
+        ] {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(uri)
+                        .body(Body::empty())
+                        .expect("traversal request should build"),
+                )
+                .await
+                .expect("proxy router should respond");
+            assert_eq!(response.status(), expected, "{uri}");
+        }
+    }
+
+    #[test]
     fn test_plugin_proxy_creation() {
         let proxy = PluginProxy::new(
             PathBuf::from("/tmp/test.sock"),
@@ -893,5 +1182,304 @@ mod tests {
         tokio::fs::remove_file(&socket_path)
             .await
             .expect("test UDS socket should be removed");
+    }
+    #[tokio::test]
+    async fn ai_plugin_read_replays_through_proxy_with_signed_user_identity() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let result = hyper::server::conn::http1::Builder::new()
+                .serve_connection(
+                    hyper_util::rt::TokioIo::new(stream),
+                    hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            assert_eq!(request.uri().path(), "/reports");
+                            assert_eq!(request.headers()[headers::USER_ID], "42");
+                            assert_eq!(request.headers()[headers::PLUGIN_NAME], "reports");
+                            assert_eq!(
+                                request.headers()[headers::AUTH_SIGNATURE],
+                                "fixture-signature"
+                            );
+                            Ok::<_, std::convert::Infallible>(Response::new(Body::from(
+                                "{\"ok\":true}",
+                            )))
+                        },
+                    ),
+                )
+                .await;
+            if let Err(error) = result {
+                // macOS UDS shutdown may report ENOTCONN after a successful response.
+                assert!(
+                    std::error::Error::source(&error)
+                        .and_then(|source| source.downcast_ref::<std::io::Error>())
+                        .is_some_and(|source| source.kind() == std::io::ErrorKind::NotConnected),
+                    "{error}"
+                );
+            }
+        });
+        let router = Router::new().nest(
+            "/x/reports",
+            create_plugin_proxy_router(PluginProxy::new(
+                socket,
+                "reports".into(),
+                "fixture-signature".into(),
+            )),
+        );
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"get":{"operationId":"list","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let handle = ApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Read,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let response = handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .unwrap();
+        assert_eq!(response.body["ok"], true);
+        server.await.unwrap();
+    }
+    #[tokio::test]
+    async fn ai_write_revoked_during_router_dispatch_sends_no_bytes_to_plugin() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope, WriteApiToolsHandle,
+        };
+        use tokio::io::AsyncReadExt;
+        #[cfg(target_os = "macos")]
+        let root = PathBuf::from("/private/tmp");
+        #[cfg(not(target_os = "macos"))]
+        let root = std::env::temp_dir();
+        let directory = tempfile::tempdir_in(root).unwrap();
+        let socket = directory.path().join("p.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            stream.read_to_end(&mut bytes).await.unwrap();
+            bytes
+        });
+        let registry = Arc::new(PluginToolsRegistry::default());
+        let revoke = registry.clone();
+        let router = Router::new()
+            .nest(
+                "/x/reports",
+                create_plugin_proxy_router(PluginProxy::new(
+                    socket,
+                    "reports".into(),
+                    "fixture-signature".into(),
+                )),
+            )
+            .layer(axum::middleware::from_fn(
+                move |request: Request, next: axum::middleware::Next| {
+                    let revoke = revoke.clone();
+                    async move {
+                        // Initial approval validation has passed; replace the publication
+                        // before the dynamic proxy can connect to the replacement process.
+                        revoke.publish(PluginToolsIndex::default());
+                        next.run(request).await
+                    }
+                },
+            ));
+        let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/reports":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+        let handle = WriteApiToolsHandle::new();
+        let target = handle.clone();
+        registry.bind(
+            InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+            PluginToolAccess::Write,
+            Arc::new(temps_core::audit::NoopAuditLogger),
+            move |caller| target.set(caller),
+        );
+        registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+        let scope = ApiCallScope {
+            auth: AuthContext::new_session(test_user(42, "reader@example.test"), Role::Admin),
+            project_scope: ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        };
+        let result = handle
+            .get()
+            .unwrap()
+            .execute_write("plugin.reports.create", serde_json::json!({}), &scope)
+            .await;
+        assert!(
+            matches!(result, Err(temps_ai_api_tools::ApiToolError::PluginOperation { plugin, operation_id, .. }) if plugin == "reports" && operation_id == "plugin.reports.create")
+        );
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            bytes.is_empty(),
+            "no identity, credential or mutation reaches a replaced plugin"
+        );
+    }
+
+    #[tokio::test]
+    async fn ai_header_echoes_scrub_injected_credentials_from_success_and_errors() {
+        use std::sync::Arc;
+        use temps_ai_api_tools::{
+            ApiCallScope, ApiToolsHandle, InternalApiCaller, PluginToolAccess, PluginToolsIndex,
+            PluginToolsRegistry, ProjectSelectorScope,
+        };
+        for method in ["GET", "TRACE"] {
+            for (status, cap) in [200, 400, 500]
+                .into_iter()
+                .flat_map(|status| [30, 70, 128 * 1024].map(|cap| (status, cap)))
+            {
+                #[cfg(target_os = "macos")]
+                let root = PathBuf::from("/private/tmp");
+                #[cfg(not(target_os = "macos"))]
+                let root = std::env::temp_dir();
+                let directory = tempfile::tempdir_in(root).unwrap();
+                let socket = directory.path().join("p.sock");
+                let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+                let (token_tx, token_rx) = tokio::sync::oneshot::channel();
+                let token_tx = Arc::new(std::sync::Mutex::new(Some(token_tx)));
+                let server = tokio::spawn(async move {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let result = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(
+                            hyper_util::rt::TokioIo::new(stream),
+                            hyper::service::service_fn(
+                                move |request: hyper::Request<hyper::body::Incoming>| {
+                                    let token_tx = token_tx.clone();
+                                    async move {
+                                        assert_eq!(request.method().as_str(), method);
+                                        let signature = request.headers()[headers::AUTH_SIGNATURE]
+                                            .to_str()
+                                            .unwrap();
+                                        let token = request.headers()[headers::ACTOR_TOKEN]
+                                            .to_str()
+                                            .unwrap();
+                                        assert_eq!(signature, "fixture-signature");
+                                        assert!(!token.is_empty());
+                                        token_tx
+                                            .lock()
+                                            .unwrap()
+                                            .take()
+                                            .unwrap()
+                                            .send(token.to_owned())
+                                            .unwrap();
+                                        Ok::<_, std::convert::Infallible>(
+                                            Response::builder()
+                                                .status(status)
+                                                .header("content-type", "text/plain")
+                                                .body(Body::from(format!(
+                                                    "echo signature={signature} actor={token}"
+                                                )))
+                                                .unwrap(),
+                                        )
+                                    }
+                                },
+                            ),
+                        )
+                        .await;
+                    if let Err(error) = result {
+                        assert!(
+                            std::error::Error::source(&error)
+                                .and_then(|source| source.downcast_ref::<std::io::Error>())
+                                .is_some_and(
+                                    |source| source.kind() == std::io::ErrorKind::NotConnected
+                                ),
+                            "{error}"
+                        );
+                    }
+                });
+                let crypto = ActorCryptoSlot::default();
+                crypto.set(Arc::new(
+                    temps_core::CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap(),
+                ));
+                let proxy = PluginProxy::new(socket, "reports".into(), "fixture-signature".into())
+                    .with_actor_minting(crypto, true);
+                let router = Router::new().nest("/x/reports", create_plugin_proxy_router(proxy));
+                let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"Reports","version":"1"},"paths":{"/echo":{(method.to_lowercase()):{"operationId":"echo","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+                let registry = Arc::new(PluginToolsRegistry::default());
+                let handle = ApiToolsHandle::new();
+                let target = handle.clone();
+                registry.bind(
+                    InternalApiCaller::new_allowlisted(router, &spec, vec![])
+                        .with_max_response_bytes(cap),
+                    if method == "GET" {
+                        PluginToolAccess::Read
+                    } else {
+                        PluginToolAccess::Write
+                    },
+                    Arc::new(temps_core::audit::NoopAuditLogger),
+                    move |caller| target.set(caller),
+                );
+                registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+                let scope = ApiCallScope {
+                    auth: AuthContext::new_persisted_session(
+                        test_user(42, "reader@example.test"),
+                        Role::Admin,
+                        7,
+                    ),
+                    project_scope: ProjectSelectorScope::Unrestricted,
+                    origin: None,
+                    secrets: None,
+                };
+                let caller = handle.get().unwrap();
+                let revision = caller.plugin_tools_revision();
+                let result = if method == "GET" {
+                    caller
+                        .call("plugin.reports.echo", serde_json::json!({}), &scope)
+                        .await
+                } else {
+                    caller
+                        .execute_approved_write(
+                            "plugin.reports.echo",
+                            serde_json::json!({}),
+                            &scope,
+                            revision.as_deref(),
+                            temps_ai_api_tools::WriteApproval::OwnerInApp,
+                        )
+                        .await
+                };
+                let output = if status == 200 {
+                    result.unwrap().body.to_string()
+                } else {
+                    result.unwrap_err().to_string()
+                };
+                let token = token_rx.await.unwrap();
+                assert!(!output.contains("fixture-signature"), "{output}");
+                assert!(!output.contains("fixture-signatur"), "{output}");
+                assert!(!output.contains(&token));
+                assert!(!output.contains(&token[..20]), "{output}");
+                if status != 500 && cap == 128 * 1024 {
+                    assert!(output.contains("signature=*** actor=***"), "{output}");
+                } else if status != 500 {
+                    assert!(
+                        output.contains("omitted to protect credentials"),
+                        "{output}"
+                    );
+                }
+                server.await.unwrap();
+            }
+        }
     }
 }

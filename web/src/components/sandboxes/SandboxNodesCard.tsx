@@ -326,9 +326,8 @@ export function ControlPlaneExcludedWarning() {
       <AlertDescription className="space-y-1 text-xs">
         <p>
           Sandboxes created without a node will go to the allowed worker with
-          the fewest sandboxes. On worker nodes the terminal, the agent runtime
-          (Fleet), snapshots, preview URLs, disk resize and volumes are not
-          available yet.
+          the fewest sandboxes. On worker nodes the agent runtime (Fleet),
+          snapshots, disk resize and volumes are not available yet.
         </p>
         <p>
           Managed AI application workspaces still always run on the control
@@ -341,7 +340,7 @@ export function ControlPlaneExcludedWarning() {
 
 function SandboxNodesSkeleton() {
   return (
-    <div
+    <div role="status"
       className="space-y-4"
       aria-busy="true"
       aria-label="Loading sandbox nodes"

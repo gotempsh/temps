@@ -96,6 +96,14 @@ pub struct DomainResponse {
     /// on-demand HTTP-01 issuance is in backoff after a failure (ADR-018 §4).
     /// `None` means no active backoff.
     pub on_demand_backoff_until: Option<i64>,
+    /// Why the last certificate attempt failed, when it did: the CA could not
+    /// reach the host (`unreachable`), DNS has no usable record
+    /// (`dns_lookup`), something other than this server answered
+    /// (`upstream_answered`), a rate limit (`rate_limited`), ... `last_error`
+    /// keeps the full text. `None` when the domain has not failed since this
+    /// was recorded.
+    #[serde(default)]
+    pub failure_cause: Option<crate::CertFailureCause>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -156,6 +164,10 @@ impl From<temps_entities::domains::Model> for DomainResponse {
             on_demand_backoff_until: domain
                 .on_demand_backoff_until
                 .map(|dt| dt.timestamp_millis()),
+            failure_cause: domain
+                .failure_cause
+                .as_deref()
+                .map(crate::CertFailureCause::from_stored),
         }
     }
 }
@@ -199,6 +211,7 @@ impl From<crate::tls::models::Certificate> for DomainResponse {
             // The `Certificate` model carries no on-demand backoff state; that
             // lives on the `domains` row, surfaced via the other `From` impl.
             on_demand_backoff_until: None,
+            failure_cause: None,
         }
     }
 }
@@ -230,6 +243,48 @@ pub struct AcmeOrderResponse {
     /// Live challenge validation status fetched from Let's Encrypt
     #[serde(skip_serializing_if = "Option::is_none")]
     pub challenge_validation: Option<ChallengeValidationStatus>,
+}
+
+/// Result of looking up the ACME order of a domain.
+///
+/// Having no order is a normal state (the certificate is already issued, or no
+/// order has been started yet), so it is reported as `order: null` with a
+/// `reason` and a 200 instead of a 404. Only an unknown domain is a 404.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct DomainOrderResponse {
+    /// The ACME order, or `null` when the domain has none.
+    pub order: Option<AcmeOrderResponse>,
+    /// Why there is no order. Present only when `order` is `null`.
+    pub reason: Option<String>,
+}
+
+impl DomainOrderResponse {
+    /// An order exists.
+    pub fn with_order(order: AcmeOrderResponse) -> Self {
+        Self {
+            order: Some(order),
+            reason: None,
+        }
+    }
+
+    /// The domain has no order; explain why from its current `status`.
+    pub fn without_order(domain: &str, status: &str) -> Self {
+        let reason = if temps_entities::domains::CERT_SERVING_STATUSES.contains(&status) {
+            format!(
+                "Domain {domain} already has an issued certificate, so no ACME order is pending. \
+                 An order is created when the certificate is renewed."
+            )
+        } else {
+            format!(
+                "No ACME order has been created for domain {domain} (status: {status}). \
+                 Create one to receive the challenge to fulfil."
+            )
+        };
+        Self {
+            order: None,
+            reason: Some(reason),
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -498,4 +553,90 @@ pub struct ListRenewalAttemptsResponse {
     pub total: u64,
     pub page: u64,
     pub page_size: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn order_lookup_without_order_for_an_issued_certificate_says_so() {
+        for status in ["active", "active_renewal_failed"] {
+            let response = DomainOrderResponse::without_order("app.example.com", status);
+            assert!(response.order.is_none());
+            let reason = response.reason.expect("an empty lookup explains itself");
+            assert!(reason.contains("app.example.com"));
+            assert!(reason.contains("already has an issued certificate"));
+        }
+    }
+
+    #[test]
+    fn order_lookup_without_order_for_a_pending_domain_points_at_creating_one() {
+        let response = DomainOrderResponse::without_order("app.example.com", "failed");
+        let reason = response.reason.expect("an empty lookup explains itself");
+        assert!(reason.contains("No ACME order has been created"));
+        assert!(reason.contains("status: failed"));
+    }
+
+    #[test]
+    fn order_lookup_without_order_serializes_explicit_null_and_reason() {
+        let response = DomainOrderResponse::without_order("app.example.com", "active");
+        let value = serde_json::to_value(&response).unwrap();
+        assert!(value["order"].is_null());
+        assert!(value["reason"].is_string());
+    }
+}
+
+#[cfg(test)]
+mod failure_cause_response_tests {
+    use super::*;
+    use crate::CertFailureCause;
+
+    fn row(failure_cause: Option<&str>) -> temps_entities::domains::Model {
+        let now = chrono::Utc::now();
+        temps_entities::domains::Model {
+            id: 7,
+            domain: "app.example.com".to_string(),
+            certificate: None,
+            private_key: None,
+            expiration_time: None,
+            last_renewed: None,
+            status: "failed".to_string(),
+            dns_challenge_token: None,
+            dns_challenge_value: None,
+            http_challenge_token: None,
+            http_challenge_key_authorization: None,
+            last_error: Some("Connection refused".to_string()),
+            last_error_type: Some("challenge_invalidated".to_string()),
+            is_wildcard: false,
+            verification_method: "http-01".to_string(),
+            on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: failure_cause.map(str::to_string),
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[test]
+    fn the_response_carries_the_stored_cause() {
+        let response = DomainResponse::from(row(Some("unreachable")));
+        assert_eq!(response.failure_cause, Some(CertFailureCause::Unreachable));
+        let json = serde_json::to_value(&response).expect("serializes");
+        assert_eq!(json["failure_cause"], "unreachable");
+    }
+
+    #[test]
+    fn a_domain_without_a_recorded_cause_has_none() {
+        let response = DomainResponse::from(row(None));
+        assert_eq!(response.failure_cause, None);
+        assert!(serde_json::to_value(&response).expect("serializes")["failure_cause"].is_null());
+    }
+
+    #[test]
+    fn a_cause_written_by_a_newer_temps_reads_as_unknown() {
+        let response = DomainResponse::from(row(Some("written_by_a_newer_temps")));
+        assert_eq!(response.failure_cause, Some(CertFailureCause::Unknown));
+    }
 }

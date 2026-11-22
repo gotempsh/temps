@@ -1,6 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
+import {
+  LogAttributeFilter,
+  type LogAttributePredicate,
+} from '@/components/logs/LogAttributeFilter'
+import type { LogAttributeOperator, LogAttributeType } from '@/api/client'
+import { Callout } from '@temps-sdk/ds'
+import { readFailureServerDetail } from '@/lib/read-failure'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
@@ -35,7 +43,8 @@ import {
   X,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { useNavigate } from 'react-router'
+import { useUrlSearchText, useUrlState } from '@temps-sdk/ds'
 import { LogsEmptyState } from '@/components/observability/LogsEmptyState'
 
 interface LogsListProps {
@@ -77,23 +86,58 @@ function severityBadge(severity: LogSeverity, text?: string) {
 
 export default function LogsList({ project }: LogsListProps) {
   const navigate = useNavigate()
-  const [searchParams, setSearchParams] = useSearchParams()
+  const urlState = useUrlState<
+    | 'range'
+    | 'severity'
+    | 'service'
+    | 'q'
+    | 'trace'
+    | 'attribute_key'
+    | 'attribute_value'
+    | 'attribute_type'
+    | 'attribute_op'
+  >()
+  const { state, patch } = urlState
   const { setBreadcrumbs } = useBreadcrumbs()
   usePageTitle(`Logs - ${project.name}`)
 
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
-  )
-  const [severity, setSeverity] = useState<string>(
-    () => searchParams.get('severity') || ALL
-  )
-  const [service, setService] = useState(
-    () => searchParams.get('service') || ''
-  )
-  const [search, setSearch] = useState(() => searchParams.get('q') || '')
+  // Every filter lives in the URL (replace, not push) so reload, back/forward
+  // and shared links keep it. Text boxes keep what was typed locally and mirror
+  // it to the URL, so a re-render can never drop a keystroke.
+  const timeRange = state.range || '24h'
+  const setTimeRange = (value: TimeRange) =>
+    patch({ range: value === '24h' ? undefined : value })
+  const severity = state.severity || ALL
+  const setSeverity = (value: string) =>
+    patch({ severity: value === ALL ? undefined : value })
+  const [service, setService] = useUrlSearchText('service', { urlState })
+  const [search, setSearch] = useUrlSearchText('q', { urlState })
   // Trace correlation: when arriving from a trace, `?trace=<id>` pins the filter.
-  const traceId = searchParams.get('trace') || ''
+  const traceId = state.trace || ''
+  const attributeFilter = useMemo<LogAttributePredicate | undefined>(() => {
+    return state.attribute_key
+      ? {
+          key: state.attribute_key,
+          value: state.attribute_value ?? '',
+          type: state.attribute_type as LogAttributeType | undefined,
+          operator: (state.attribute_op ?? 'eq') as LogAttributeOperator,
+        }
+      : undefined
+  }, [
+    state.attribute_key,
+    state.attribute_value,
+    state.attribute_type,
+    state.attribute_op,
+  ])
+  const setAttributeFilter = (value: LogAttributePredicate | undefined) =>
+    patch({
+      attribute_key: value?.key,
+      attribute_value: value?.value,
+      attribute_type: value?.type,
+      attribute_op: value?.operator,
+    })
   const [page, setPage] = useState(1)
+  const [queryClock, setQueryClock] = useState(Date.now)
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   const debouncedService = useDebounce(service, 300)
@@ -114,35 +158,28 @@ export default function LogsList({ project }: LogsListProps) {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setPage(1)
     setExpanded(new Set())
-  }, [timeRange, severity, debouncedService, debouncedSearch, traceId])
-
-  // Persist filters to the URL.
-  useEffect(() => {
-    const params = new URLSearchParams()
-    if (timeRange !== '24h') params.set('range', timeRange)
-    if (severity !== ALL) params.set('severity', severity)
-    if (debouncedService) params.set('service', debouncedService)
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (traceId) params.set('trace', traceId)
-    setSearchParams(params, { replace: true })
   }, [
     timeRange,
     severity,
     debouncedService,
     debouncedSearch,
     traceId,
-    setSearchParams,
+    attributeFilter,
   ])
 
   const { startTime, endTime } = useMemo(() => {
-    const range = resolveTimeRange(timeRange)
+    const range = resolveTimeRange(timeRange, queryClock)
     return { startTime: range.from, endTime: range.to }
-  }, [timeRange])
+  }, [timeRange, queryClock])
 
-  const { data, isLoading, isFetching, refetch } = useQuery({
+  const { data, isLoading, isFetching, refetch, isError, error } = useQuery({
     ...queryLogsOptions({
       query: {
         project_id: project.id,
+        attribute_key: attributeFilter?.key,
+        attribute_value: attributeFilter?.value,
+        attribute_type: attributeFilter?.type,
+        attribute_op: attributeFilter?.operator,
         severity: severity !== ALL ? severity : undefined,
         service_name: debouncedService || undefined,
         search: debouncedSearch || undefined,
@@ -159,7 +196,8 @@ export default function LogsList({ project }: LogsListProps) {
 
   const logs: LogRecord[] = data?.data ?? []
   const hasMore = logs.length === PAGE_SIZE
-  const hasFilters = severity !== ALL || !!service || !!search
+  const hasFilters =
+    severity !== ALL || !!service || !!search || !!attributeFilter
 
   // Tell the assistant the user is exploring logs (+ active filters).
   const assistantContext = useMemo(() => {
@@ -171,7 +209,7 @@ export default function LogsList({ project }: LogsListProps) {
     ].filter(Boolean)
     return [
       'The user is in the OpenTelemetry Logs explorer in the Temps console.',
-      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
       `Time range: ${timeRange}.${filters.length ? ` Active filters: ${filters.join(', ')}.` : ''}`,
       'Fetch logs with the temps CLI: `telemetry-logs query_logs --severity/--service_name/--search/--trace_id`.',
     ].join('\n')
@@ -188,33 +226,33 @@ export default function LogsList({ project }: LogsListProps) {
   }
 
   const clearTrace = () => {
-    const params = new URLSearchParams(searchParams)
-    params.delete('trace')
-    setSearchParams(params, { replace: true })
+    patch({ trace: undefined })
   }
 
   return (
     <div className="space-y-4">
-      {/* Header */}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h2 className="text-2xl font-bold tracking-tight">Logs</h2>
-          <p className="text-sm text-muted-foreground">
-            Structured logs from your application via OpenTelemetry
-          </p>
-        </div>
-        <Button
-          aria-label="Refresh"
-          variant="ghost"
-          size="icon"
-          onClick={() => refetch()}
-          disabled={isFetching}
-        >
-          <RefreshCw
-            className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
-          />
-        </Button>
-      </div>
+      <PageHeader
+        title="Telemetry logs"
+        description="Structured application logs from OpenTelemetry and Sentry SDKs."
+        actions={
+          <Button
+            aria-label="Refresh"
+            variant="ghost"
+            size="icon"
+            onClick={() => {
+              setQueryClock(Date.now())
+              setPage(1)
+              // Absolute windows and trace filters keep the same query key.
+              if (traceId || timeRange.startsWith('custom:')) void refetch()
+            }}
+            disabled={isFetching}
+          >
+            <RefreshCw
+              className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`}
+            />
+          </Button>
+        }
+      />
 
       {/* Trace-correlation banner */}
       {traceId && (
@@ -250,12 +288,18 @@ export default function LogsList({ project }: LogsListProps) {
           <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
             <TimeRangeFilter
               value={timeRange}
-              onChange={setTimeRange}
+              onChange={(value) => {
+                setQueryClock(Date.now())
+                setTimeRange(value)
+              }}
               disabled={!!traceId}
             />
 
             <Select value={severity} onValueChange={setSeverity}>
-              <SelectTrigger className="w-full sm:w-[150px]">
+              <SelectTrigger
+                aria-label="Severity"
+                className="w-full sm:w-[150px]"
+              >
                 <SelectValue placeholder="Severity" />
               </SelectTrigger>
               <SelectContent>
@@ -285,11 +329,25 @@ export default function LogsList({ project }: LogsListProps) {
               />
             </div>
           </div>
+          <LogAttributeFilter
+            key={JSON.stringify(attributeFilter)}
+            value={attributeFilter}
+            onApply={setAttributeFilter}
+            pending={isFetching}
+          />
         </CardContent>
       </Card>
 
       {/* List */}
-      {isLoading ? (
+      {isError ? (
+        <Callout tone="error" title="Could not load logs">
+          {readFailureServerDetail(error) ??
+            'Retry the request or adjust the attribute filter.'}
+          <Button variant="outline" onClick={() => void refetch()}>
+            Retry
+          </Button>
+        </Callout>
+      ) : isLoading ? (
         <div className="space-y-2">
           {Array.from({ length: 10 }).map((_, i) => (
             <Skeleton key={i} className="h-10 w-full" />
@@ -303,7 +361,7 @@ export default function LogsList({ project }: LogsListProps) {
             description="Try adjusting your filters or time range."
           />
         ) : (
-          <LogsEmptyState projectSlug={project.slug} />
+          <LogsEmptyState project={project} />
         )
       ) : (
         <>
@@ -315,7 +373,7 @@ export default function LogsList({ project }: LogsListProps) {
                   <button
                     type="button"
                     onClick={() => toggleExpand(i)}
-                    className="flex w-full items-start gap-3 px-3 py-1.5 text-left hover:bg-muted/50"
+                    className="flex w-full flex-wrap items-start gap-x-3 gap-y-1 px-3 py-1.5 text-left hover:bg-muted/50"
                   >
                     <span className="shrink-0 text-muted-foreground tabular-nums">
                       {format(new Date(log.timestamp), 'MMM d HH:mm:ss.SSS')}
@@ -326,7 +384,7 @@ export default function LogsList({ project }: LogsListProps) {
                     <span className="shrink-0 max-w-[140px] truncate text-muted-foreground">
                       {log.resource?.service_name || '—'}
                     </span>
-                    <span className="min-w-0 flex-1 truncate text-foreground">
+                    <span className="min-w-0 flex-1 basis-full truncate text-foreground sm:basis-0">
                       {log.body}
                     </span>
                     {log.trace_id && (
@@ -370,10 +428,21 @@ export default function LogsList({ project }: LogsListProps) {
                         <div className="space-y-0.5">
                           {Object.entries(log.attributes).map(([k, v]) => (
                             <div key={k} className="flex gap-2">
-                              <span className="shrink-0 text-muted-foreground">
+                              <span className="min-w-0 basis-1/3 break-all text-muted-foreground">
                                 {k}
+                                <span className="ml-1 text-xs">
+                                  (
+                                  {log.attribute_types &&
+                                  Object.prototype.hasOwnProperty.call(
+                                    log.attribute_types,
+                                    k
+                                  )
+                                    ? log.attribute_types[k]
+                                    : 'untyped'}
+                                  )
+                                </span>
                               </span>
-                              <span className="break-all text-foreground">
+                              <span className="min-w-0 flex-1 break-all text-foreground">
                                 {String(v)}
                               </span>
                             </div>

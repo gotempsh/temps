@@ -56,6 +56,7 @@ pub fn project_model(id: i32) -> projects::Model {
         git_url: None,
         git_provider_connection_id: None,
         attack_mode: false,
+        shield_mode: "log".to_string(),
         ai_alert_summaries_enabled: None,
         ai_debug_chat_enabled: None,
         ai_write_actions_enabled: false,
@@ -69,23 +70,31 @@ pub fn project_model(id: i32) -> projects::Model {
         source_type: temps_entities::source_type::SourceType::Git,
         project_type: temps_entities::types::ProjectType::Server,
         allow_alternate_sources: None,
+        hosting: Default::default(),
         template_slug: None,
         service_template: None,
         gitlab_webhook_id: None,
         gitlab_webhook_signing_token: None,
         gitea_webhook_signing_token: None,
+        github_webhook_id: None,
+        github_webhook_signing_token: None,
         bitbucket_webhook_token: None,
         bitbucket_webhook_hook_id: None,
         generic_webhook_token: None,
         cross_project_trace_sharing: true,
+        serves_own_temps_api: false,
         ai_api_traffic_summary_enabled: None,
         image_retention_hours: None,
+        log_ingest_lines_per_sec: None,
+        log_ingest_kib_per_sec: None,
         cloud_telemetry_fidelity:
             temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
         cloud_telemetry_write_mode:
             temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
         cloud_analytics_write_mode:
             temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+        analytics_identity_mode: Default::default(),
+        instantiation_token: None,
         cloud_telemetry_attribute_allowlist: Vec::new(),
     }
 }
@@ -115,8 +124,12 @@ pub fn environment_model(
         protected: false,
         sleeping: false,
         attack_mode: None,
+        shield_mode: None,
+        shield_exempt_paths: Default::default(),
         force_https: None,
         last_activity_at: None,
+        ingress_mode: Default::default(),
+        workload_mode: Default::default(),
     }
 }
 

@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Open project URL in browser
 
+**Usage:** `open [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

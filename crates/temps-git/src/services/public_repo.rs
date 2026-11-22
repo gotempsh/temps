@@ -12,17 +12,18 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use temps_presets::stored_preset::StoredPresetExt;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Errors that can occur when accessing public repositories
 #[derive(Error, Debug)]
 pub enum PublicRepoError {
-    #[error("Repository not found: {0}")]
-    NotFound(String),
+    #[error("Repository not found: {context}")]
+    NotFound { context: String },
 
-    #[error("Repository is not public: {0}")]
-    RepositoryNotPublic(String),
+    #[error("Repository is not public: {repository}")]
+    RepositoryNotPublic { repository: String },
 
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
@@ -38,11 +39,12 @@ pub enum PublicRepoError {
     #[error("API error: {0}")]
     ApiError(String),
 
-    #[error("Branch not found: {0}")]
-    BranchNotFound(String),
+    #[error("Branch not found: {branch}")]
+    BranchNotFound { branch: String },
 
-    #[error("Provider not supported: {0}")]
-    ProviderNotSupported(String),
+    /// `subject` is the provider's name, or a sentence saying what it cannot do.
+    #[error("Provider not supported: {subject}")]
+    ProviderNotSupported { subject: String },
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -74,6 +76,56 @@ pub struct PublicBranch {
     pub name: String,
     pub commit_sha: String,
     pub protected: bool,
+}
+
+/// What a user-supplied ref name turned out to be.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicRefKind {
+    Branch,
+    Tag,
+    Commit,
+}
+
+impl PublicRefKind {
+    /// Lowercase noun for logs and error messages.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PublicRefKind::Branch => "branch",
+            PublicRefKind::Tag => "tag",
+            PublicRefKind::Commit => "commit",
+        }
+    }
+}
+
+/// A branch, tag or commit of a public repository resolved to the commit it
+/// points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPublicRef {
+    pub kind: PublicRefKind,
+    /// The ref as looked up: the branch or tag name, or the SHA as given.
+    pub name: String,
+    /// Full object id of the commit the ref points at. A tag is peeled, so an
+    /// annotated tag yields its commit, never the tag object.
+    pub commit_sha: String,
+}
+
+/// Whether `reference` can be an abbreviated or full commit id: 7 to 40
+/// hexadecimal characters (the abbreviation floor Git itself uses).
+pub fn looks_like_commit_sha(reference: &str) -> bool {
+    (7..=40).contains(&reference.len()) && reference.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Splits `refs/heads/x` and `refs/tags/x` into the kind they pin and the
+/// bare name; any other ref is returned untouched with no kind pinned.
+fn split_qualified_ref(reference: &str) -> (Option<PublicRefKind>, &str) {
+    if let Some(name) = reference.strip_prefix("refs/heads/") {
+        (Some(PublicRefKind::Branch), name)
+    } else if let Some(name) = reference.strip_prefix("refs/tags/") {
+        (Some(PublicRefKind::Tag), name)
+    } else {
+        (None, reference)
+    }
 }
 
 /// Detected preset information
@@ -113,6 +165,101 @@ pub trait PublicRepoProvider: Send + Sync {
         repo: &str,
     ) -> Result<Vec<PublicBranch>, PublicRepoError>;
 
+    /// Look up one branch by name; `Ok(None)` when the repository has no
+    /// such branch. Providers answer this with a single request, so it works
+    /// for repositories with thousands of branches, where
+    /// [`Self::list_branches`] stops at its safety cap and would report an
+    /// existing branch as missing.
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        Ok(self
+            .list_branches(owner, repo)
+            .await?
+            .into_iter()
+            .find(|b| b.name == branch))
+    }
+
+    /// The commit a tag points at, with annotated tags peeled; `Ok(None)`
+    /// when the repository has no such tag.
+    async fn get_tag_commit(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _tag: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot look up tags",
+                self.provider_name()
+            ),
+        })
+    }
+
+    /// The full object id of a commit given its full or abbreviated id;
+    /// `Ok(None)` when the repository has no such commit.
+    async fn get_commit_sha(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _sha: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot look up commits",
+                self.provider_name()
+            ),
+        })
+    }
+
+    /// Resolve a branch, tag or commit to the commit it points at.
+    ///
+    /// Order is branch, then tag, then (for a 7 to 40 character hexadecimal
+    /// string) commit, the same order Git itself prefers, so a branch always
+    /// wins over a tag or abbreviated id of the same spelling. `refs/heads/x`
+    /// and `refs/tags/x` pin the kind. `Ok(None)` means the repository has no
+    /// such ref; provider failures (rate limit, outage) are errors, never
+    /// "missing".
+    async fn resolve_ref(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<ResolvedPublicRef>, PublicRepoError> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Ok(None);
+        }
+        let (pinned, name) = split_qualified_ref(reference);
+        let resolved = |kind: PublicRefKind, commit_sha: String| {
+            Some(ResolvedPublicRef {
+                kind,
+                name: name.to_string(),
+                commit_sha,
+            })
+        };
+
+        if pinned.is_none_or(|kind| kind == PublicRefKind::Branch) {
+            if let Some(branch) = self.get_branch(owner, repo, name).await? {
+                return Ok(resolved(PublicRefKind::Branch, branch.commit_sha));
+            }
+        }
+        if pinned.is_none_or(|kind| kind == PublicRefKind::Tag) {
+            if let Some(sha) = self.get_tag_commit(owner, repo, name).await? {
+                return Ok(resolved(PublicRefKind::Tag, sha));
+            }
+        }
+        if pinned.is_none() && looks_like_commit_sha(name) {
+            if let Some(sha) = self.get_commit_sha(owner, repo, name).await? {
+                return Ok(resolved(PublicRefKind::Commit, sha));
+            }
+        }
+        Ok(None)
+    }
+
     /// Get the file tree for preset detection
     async fn get_file_tree(
         &self,
@@ -144,10 +291,12 @@ pub trait PublicRepoProvider: Send + Sync {
         _reference: &str,
     ) -> Result<Vec<crate::services::repository_directory::DirectoryListingEntry>, PublicRepoError>
     {
-        Err(PublicRepoError::ProviderNotSupported(format!(
-            "{} public repositories cannot list directories",
-            self.provider_name()
-        )))
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot list directories",
+                self.provider_name()
+            ),
+        })
     }
 }
 
@@ -204,46 +353,61 @@ fn ensure_repository_is_public(
     if is_public {
         Ok(())
     } else {
-        Err(PublicRepoError::RepositoryNotPublic(format!(
-            "{}/{}",
-            owner, repo
-        )))
+        Err(PublicRepoError::RepositoryNotPublic {
+            repository: format!("{}/{}", owner, repo),
+        })
     }
 }
 
 impl GitHubPublicProvider {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // GitHub API URLs are known-safe origins, but never follow
+            // redirects: a compromised or SSRF-susceptible redirect target
+            // could reach internal services (GitHub tokens sent via auth header
+            // would follow the redirect too).
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: None,
-        }
+        })
     }
 
     /// Create a provider with an authentication token (increases rate limit from 60 to 5000/hr)
-    pub fn with_token(token: String) -> Self {
+    pub fn with_token(token: String) -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
+            // Same redirect guard as `new()`: the auth token follows the
+            // request; never allow a redirect to carry it to a third party.
+            .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: Some(token),
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_token_and_api_url(token: String, api_url: String) -> Self {
-        let mut provider = Self::with_token(token);
+        let mut provider = Self::with_token(token).expect("build test GitHub provider");
         provider.api_url = api_url;
         provider
     }
@@ -291,7 +455,7 @@ impl GitHubPublicProvider {
     fn map_error(e: reqwest::Error) -> PublicRepoError {
         let error_str = e.to_string();
         if error_str.contains("404") {
-            PublicRepoError::NotFound(error_str)
+            PublicRepoError::NotFound { context: error_str }
         } else if error_str.contains("403") || error_str.contains("rate limit") {
             PublicRepoError::RateLimitExceeded
         } else {
@@ -307,7 +471,9 @@ impl GitHubPublicProvider {
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
-            404 => Err(PublicRepoError::NotFound(context.to_string())),
+            404 => Err(PublicRepoError::NotFound {
+                context: context.to_string(),
+            }),
             429 => Err(PublicRepoError::RateLimitExceeded),
             403 if rate_limit_remaining == Some(0) => Err(PublicRepoError::RateLimitExceeded),
             403 => Err(PublicRepoError::PermissionDenied {
@@ -355,9 +521,70 @@ impl GitHubPublicProvider {
     }
 }
 
-impl Default for GitHubPublicProvider {
-    fn default() -> Self {
-        Self::new()
+impl GitHubPublicProvider {
+    /// The commit `reference` (a branch, tag, or full or abbreviated commit
+    /// id; slashes allowed) points at, in one request: the `sha` media type
+    /// answers with the bare object id, peels annotated tags, and expands
+    /// abbreviated ids. `Ok(None)` for a reference GitHub cannot resolve (404,
+    /// or 422 for an id it has no commit for).
+    async fn commit_sha_for(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        let encoded_reference = reference
+            .split('/')
+            .map(|segment| urlencoding::encode(segment).into_owned())
+            .collect::<Vec<_>>()
+            .join("/");
+        let url = format!(
+            "{}/repos/{}/{}/commits/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            encoded_reference
+        );
+        let response = self
+            .send_with_retry(|| {
+                self.client
+                    .get(&url)
+                    .header(reqwest::header::ACCEPT, "application/vnd.github.sha")
+            })
+            .await?;
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::UNPROCESSABLE_ENTITY
+        ) {
+            return Ok(None);
+        }
+        let response = Self::validate_response(
+            response,
+            self.token.is_some(),
+            &format!("resolve {} in {}/{}", reference, owner, repo),
+        )
+        .await?;
+        let sha = response
+            .text()
+            .await
+            .map_err(|e| {
+                PublicRepoError::ApiError(format!(
+                    "Failed to read the commit of {} in {}/{}: {}",
+                    reference, owner, repo, e
+                ))
+            })?
+            .trim()
+            .to_string();
+        if sha.len() < 40 || !sha.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(PublicRepoError::ApiError(format!(
+                "GitHub answered '{}' for the commit of {} in {}/{}, which is not an object id",
+                sha.chars().take(64).collect::<String>(),
+                reference,
+                owner,
+                repo
+            )));
+        }
+        Ok(Some(sha))
     }
 }
 
@@ -372,7 +599,12 @@ impl PublicRepoProvider for GitHubPublicProvider {
         owner: &str,
         repo: &str,
     ) -> Result<PublicRepoInfo, PublicRepoError> {
-        let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
+        let url = format!(
+            "{}/repos/{}/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo)
+        );
 
         let response = Self::validate_response(
             self.send_with_retry(|| self.client.get(&url)).await?,
@@ -451,7 +683,11 @@ impl PublicRepoProvider for GitHubPublicProvider {
         loop {
             let url = format!(
                 "{}/repos/{}/{}/branches?per_page={}&page={}",
-                self.api_url, owner, repo, per_page, page
+                self.api_url,
+                urlencoding::encode(owner),
+                urlencoding::encode(repo),
+                per_page,
+                page
             );
 
             let response = Self::validate_response(
@@ -482,6 +718,79 @@ impl PublicRepoProvider for GitHubPublicProvider {
         Ok(all_branches)
     }
 
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        #[derive(Deserialize)]
+        struct GitHubBranch {
+            name: String,
+            commit: GitHubCommit,
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitHubCommit {
+            sha: String,
+        }
+
+        let url = format!(
+            "{}/repos/{}/{}/branches/{}",
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(branch)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let response = Self::validate_response(
+            response,
+            self.token.is_some(),
+            &format!("get branch {} of {}/{}", branch, owner, repo),
+        )
+        .await?;
+        let b: GitHubBranch = response
+            .json()
+            .await
+            .map_err(|e| PublicRepoError::ApiError(format!("Failed to parse branch: {}", e)))?;
+        Ok(Some(PublicBranch {
+            name: b.name,
+            commit_sha: b.commit.sha,
+            protected: b.protected,
+        }))
+    }
+
+    async fn get_tag_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        // `refs/tags/` pins the lookup to tags, so a branch of the same name
+        // can never answer for it.
+        let qualified = format!("refs/tags/{tag}");
+        self.commit_sha_for(owner, repo, &qualified).await
+    }
+
+    async fn get_commit_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        let full = self.commit_sha_for(owner, repo, sha).await?;
+        // The commits endpoint also answers for branch and tag names; only an
+        // id that really starts with what was asked for is a commit lookup.
+        Ok(full.filter(|full| {
+            full.to_ascii_lowercase()
+                .starts_with(&sha.to_ascii_lowercase())
+        }))
+    }
+
     async fn get_file_tree(
         &self,
         owner: &str,
@@ -490,7 +799,10 @@ impl PublicRepoProvider for GitHubPublicProvider {
     ) -> Result<Vec<String>, PublicRepoError> {
         let url = format!(
             "{}/repos/{}/{}/git/trees/{}?recursive=1",
-            self.api_url, owner, repo, reference
+            self.api_url,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
+            urlencoding::encode(reference)
         );
 
         let response = Self::validate_response(
@@ -543,8 +855,8 @@ impl PublicRepoProvider for GitHubPublicProvider {
         let url = format!(
             "{}/repos/{}/{}/contents/{}?ref={}",
             self.api_url,
-            owner,
-            repo,
+            urlencoding::encode(owner),
+            urlencoding::encode(repo),
             encoded_path,
             urlencoding::encode(reference)
         );
@@ -655,7 +967,7 @@ impl GitLabPublicProvider {
     const MAX_TREE_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
     const MAX_TREE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -664,18 +976,22 @@ impl GitLabPublicProvider {
             // internal network.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for gitlab.com: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: "https://gitlab.com".to_string(),
             custom_egress_limiter: None,
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_test_base_url(base_url: String) -> Self {
-        let mut provider = Self::new();
+        let mut provider = Self::new().expect("build test GitLab provider");
         provider.base_url = base_url;
         provider
     }
@@ -743,7 +1059,7 @@ impl GitLabPublicProvider {
     fn map_error(e: reqwest::Error) -> PublicRepoError {
         let error_str = e.to_string();
         if error_str.contains("404") {
-            PublicRepoError::NotFound(error_str)
+            PublicRepoError::NotFound { context: error_str }
         } else if error_str.contains("403")
             || error_str.contains("429")
             || error_str.contains("rate limit")
@@ -760,7 +1076,9 @@ impl GitLabPublicProvider {
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
-            404 => Err(PublicRepoError::NotFound(context.to_string())),
+            404 => Err(PublicRepoError::NotFound {
+                context: context.to_string(),
+            }),
             403 => Err(PublicRepoError::PermissionDenied {
                 operation: context.to_string(),
                 required_permission: "read_api and read_repository".to_string(),
@@ -893,12 +1211,6 @@ impl GitLabPublicProvider {
     }
 }
 
-impl Default for GitLabPublicProvider {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[async_trait]
 impl PublicRepoProvider for GitLabPublicProvider {
     fn provider_name(&self) -> &'static str {
@@ -1013,6 +1325,122 @@ impl PublicRepoProvider for GitLabPublicProvider {
         }
 
         Ok(all_branches)
+    }
+
+    async fn get_branch(
+        &self,
+        owner: &str,
+        repo: &str,
+        branch: &str,
+    ) -> Result<Option<PublicBranch>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
+        #[derive(Deserialize)]
+        struct GitLabBranch {
+            name: String,
+            commit: GitLabCommit,
+            protected: bool,
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabCommit {
+            id: String,
+        }
+
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/branches/{}",
+            self.base_url,
+            Self::encode_project_path(owner, repo),
+            urlencoding::encode(branch)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_response_status(
+            response.status(),
+            &format!("Branch {} of {}/{}", branch, owner, repo),
+        )?;
+        let (b, _): (GitLabBranch, _) =
+            Self::decode_bounded_json(response, Self::MAX_LIST_BYTES, "repository branch").await?;
+        Ok(Some(PublicBranch {
+            name: b.name,
+            commit_sha: b.commit.id,
+            protected: b.protected,
+        }))
+    }
+
+    async fn get_tag_commit(
+        &self,
+        owner: &str,
+        repo: &str,
+        tag: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
+        #[derive(Deserialize)]
+        struct GitLabTag {
+            commit: GitLabTagCommit,
+        }
+
+        #[derive(Deserialize)]
+        struct GitLabTagCommit {
+            id: String,
+        }
+
+        // GitLab reports the commit an annotated tag points at, not the tag
+        // object, so no peeling is needed.
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/tags/{}",
+            self.base_url,
+            Self::encode_project_path(owner, repo),
+            urlencoding::encode(tag)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_response_status(
+            response.status(),
+            &format!("Tag {} of {}/{}", tag, owner, repo),
+        )?;
+        let (found, _): (GitLabTag, _) =
+            Self::decode_bounded_json(response, Self::MAX_METADATA_BYTES, "repository tag").await?;
+        Ok(Some(found.commit.id))
+    }
+
+    async fn get_commit_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+    ) -> Result<Option<String>, PublicRepoError> {
+        let _egress_permit = self.acquire_custom_egress_permit().await?;
+        #[derive(Deserialize)]
+        struct GitLabCommit {
+            id: String,
+        }
+
+        let url = format!(
+            "{}/api/v4/projects/{}/repository/commits/{}",
+            self.base_url,
+            Self::encode_project_path(owner, repo),
+            urlencoding::encode(sha)
+        );
+        let response = self.send_with_retry(|| self.client.get(&url)).await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Self::check_response_status(
+            response.status(),
+            &format!("Commit {} of {}/{}", sha, owner, repo),
+        )?;
+        let (found, _): (GitLabCommit, _) =
+            Self::decode_bounded_json(response, Self::MAX_LIST_BYTES, "repository commit").await?;
+        // The commits endpoint also answers for branch and tag names; only an
+        // id that really starts with what was asked for is a commit lookup.
+        Ok(Some(found.id).filter(|id| {
+            id.to_ascii_lowercase()
+                .starts_with(&sha.to_ascii_lowercase())
+        }))
     }
 
     async fn get_file_tree(
@@ -1145,9 +1573,11 @@ impl PublicRepoProviderFactory {
     /// Create a provider for the given provider name
     pub fn create(provider: &str) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
-            "github" => Ok(Box::new(GitHubPublicProvider::new())),
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            "github" => Ok(Box::new(GitHubPublicProvider::new()?)),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 
@@ -1158,11 +1588,13 @@ impl PublicRepoProviderFactory {
     ) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
             "github" => match token {
-                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t))),
-                None => Ok(Box::new(GitHubPublicProvider::new())),
+                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t)?)),
+                None => Ok(Box::new(GitHubPublicProvider::new()?)),
             },
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 
@@ -1176,22 +1608,24 @@ impl PublicRepoProviderFactory {
         match provider.to_lowercase().as_str() {
             "github" => {
                 if gitlab_instance.is_some() {
-                    return Err(PublicRepoError::ProviderNotSupported(
-                        "Custom base URLs are supported only for GitLab".to_string(),
-                    ));
+                    return Err(PublicRepoError::ProviderNotSupported {
+                        subject: "Custom base URLs are supported only for GitLab".to_string(),
+                    });
                 }
                 match token {
-                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token))),
-                    None => Ok(Box::new(GitHubPublicProvider::new())),
+                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token)?)),
+                    None => Ok(Box::new(GitHubPublicProvider::new()?)),
                 }
             }
             "gitlab" => match gitlab_instance {
                 Some((base_url, hostname, addresses)) => Ok(Box::new(
                     GitLabPublicProvider::with_resolved_base_url(base_url, &hostname, &addresses)?,
                 )),
-                None => Ok(Box::new(GitLabPublicProvider::new())),
+                None => Ok(Box::new(GitLabPublicProvider::new()?)),
             },
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 }
@@ -1256,7 +1690,7 @@ mod tests {
             .expect_err("private repositories must never pass through public endpoints");
         assert!(matches!(
             error,
-            PublicRepoError::RepositoryNotPublic(name) if name == "owner/private"
+            PublicRepoError::RepositoryNotPublic { repository: name } if name == "owner/private"
         ));
     }
 
@@ -1393,7 +1827,7 @@ mod tests {
         let result = PublicRepoProviderFactory::create("bitbucket");
         assert!(result.is_err());
         match result {
-            Err(PublicRepoError::ProviderNotSupported(name)) => {
+            Err(PublicRepoError::ProviderNotSupported { subject: name }) => {
                 assert_eq!(name, "bitbucket");
             }
             _ => panic!("Expected ProviderNotSupported error"),
@@ -1406,7 +1840,9 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let not_found = PublicRepoError::NotFound("repo not found".to_string());
+        let not_found = PublicRepoError::NotFound {
+            context: "repo not found".to_string(),
+        };
         assert!(not_found.to_string().contains("not found"));
 
         let rate_limit = PublicRepoError::RateLimitExceeded;
@@ -1479,7 +1915,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            PublicRepoError::RepositoryNotPublic(name)
+            PublicRepoError::RepositoryNotPublic { repository: name }
                 if name == "example/private-repository"
         ));
         repository.assert_async().await;
@@ -1592,6 +2028,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn github_branch_lookup_is_one_request_by_name() {
+        let mut server = mockito::Server::new_async().await;
+        let found = server
+            .mock("GET", "/repos/example/monorepo/branches/release%2F2026")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "name": "release/2026",
+                    "commit": { "sha": "abc123" },
+                    "protected": false
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let missing = server
+            .mock("GET", "/repos/example/monorepo/branches/nope")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        // Never page through the branch list.
+        let listing = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex("^/repos/example/monorepo/branches\\?".into()),
+            )
+            .expect(0)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        let branch = provider
+            .get_branch("example", "monorepo", "release/2026")
+            .await
+            .unwrap()
+            .expect("the branch exists");
+        assert_eq!(branch.commit_sha, "abc123");
+        assert!(provider
+            .get_branch("example", "monorepo", "nope")
+            .await
+            .unwrap()
+            .is_none());
+
+        found.assert_async().await;
+        missing.assert_async().await;
+        listing.assert_async().await;
+    }
+
+    #[tokio::test]
     async fn github_secondary_403_is_rate_limit_even_with_remaining_quota() {
         let mut server = mockito::Server::new_async().await;
         let response = server
@@ -1635,6 +2124,509 @@ mod tests {
 
         assert!(matches!(error, PublicRepoError::RateLimitExceeded));
         response.assert_async().await;
+    }
+
+    // -----------------------------------------------------------------
+    // Resolving a branch, tag or commit to the commit it points at
+    // -----------------------------------------------------------------
+
+    const TAG_COMMIT: &str = "1111111111111111111111111111111111111111";
+    const BRANCH_COMMIT: &str = "2222222222222222222222222222222222222222";
+    const OTHER_COMMIT: &str = "abcdef0123456789abcdef0123456789abcdef01";
+
+    /// A provider with fixed branches, tags and commits that records every
+    /// lookup, so resolution order and request counts can be asserted.
+    struct RefProvider {
+        branches: Vec<(&'static str, &'static str)>,
+        tags: Vec<(&'static str, &'static str)>,
+        commits: Vec<&'static str>,
+        calls: std::sync::Mutex<Vec<String>>,
+        fail_branch: Option<fn() -> PublicRepoError>,
+    }
+
+    impl RefProvider {
+        fn new() -> Self {
+            Self {
+                branches: vec![("main", BRANCH_COMMIT)],
+                tags: vec![("v1.2.3", TAG_COMMIT)],
+                commits: vec![OTHER_COMMIT],
+                calls: Default::default(),
+                fail_branch: None,
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl PublicRepoProvider for RefProvider {
+        fn provider_name(&self) -> &'static str {
+            "fake"
+        }
+
+        async fn get_repository(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<PublicRepoInfo, PublicRepoError> {
+            Err(PublicRepoError::Internal("not used".into()))
+        }
+
+        async fn list_branches(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+            Ok(Vec::new())
+        }
+
+        async fn get_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            branch: &str,
+        ) -> Result<Option<PublicBranch>, PublicRepoError> {
+            self.calls.lock().unwrap().push(format!("branch:{branch}"));
+            if let Some(error) = self.fail_branch {
+                return Err(error());
+            }
+            Ok(self
+                .branches
+                .iter()
+                .find(|(name, _)| *name == branch)
+                .map(|(name, sha)| PublicBranch {
+                    name: (*name).to_string(),
+                    commit_sha: (*sha).to_string(),
+                    protected: false,
+                }))
+        }
+
+        async fn get_tag_commit(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            tag: &str,
+        ) -> Result<Option<String>, PublicRepoError> {
+            self.calls.lock().unwrap().push(format!("tag:{tag}"));
+            Ok(self
+                .tags
+                .iter()
+                .find(|(name, _)| *name == tag)
+                .map(|(_, sha)| (*sha).to_string()))
+        }
+
+        async fn get_commit_sha(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            sha: &str,
+        ) -> Result<Option<String>, PublicRepoError> {
+            self.calls.lock().unwrap().push(format!("commit:{sha}"));
+            Ok(self
+                .commits
+                .iter()
+                .find(|full| full.starts_with(sha))
+                .map(|full| (*full).to_string()))
+        }
+
+        async fn get_file_tree(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _reference: &str,
+        ) -> Result<Vec<String>, PublicRepoError> {
+            Err(PublicRepoError::Internal("not used".into()))
+        }
+
+        async fn get_file_content(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _path: &str,
+            _reference: &str,
+        ) -> Result<FileContent, PublicRepoError> {
+            Err(PublicRepoError::Internal("not used".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_resolves_without_looking_up_tags_or_commits() {
+        let provider = RefProvider::new();
+        let resolved = provider
+            .resolve_ref("o", "r", "main")
+            .await
+            .unwrap()
+            .expect("branch");
+        assert_eq!(resolved.kind, PublicRefKind::Branch);
+        assert_eq!(resolved.commit_sha, BRANCH_COMMIT);
+        assert_eq!(provider.calls(), ["branch:main"]);
+    }
+
+    #[tokio::test]
+    async fn a_tag_resolves_to_its_commit_after_the_branch_lookup_misses() {
+        let provider = RefProvider::new();
+        let resolved = provider
+            .resolve_ref("o", "r", "v1.2.3")
+            .await
+            .unwrap()
+            .expect("tag");
+        assert_eq!(resolved.kind, PublicRefKind::Tag);
+        assert_eq!(resolved.name, "v1.2.3");
+        assert_eq!(resolved.commit_sha, TAG_COMMIT);
+        assert_eq!(provider.calls(), ["branch:v1.2.3", "tag:v1.2.3"]);
+    }
+
+    #[tokio::test]
+    async fn a_full_or_abbreviated_commit_resolves_to_the_full_id() {
+        let provider = RefProvider::new();
+        for reference in [OTHER_COMMIT, "abcdef0", "abcdef0123456789"] {
+            let resolved = provider
+                .resolve_ref("o", "r", reference)
+                .await
+                .unwrap()
+                .unwrap_or_else(|| panic!("{reference} must resolve"));
+            assert_eq!(resolved.kind, PublicRefKind::Commit);
+            assert_eq!(resolved.commit_sha, OTHER_COMMIT);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_branch_wins_over_a_tag_and_a_tag_over_a_commit_of_the_same_spelling() {
+        let mut provider = RefProvider::new();
+        provider.branches.push(("release", BRANCH_COMMIT));
+        provider.tags.push(("release", TAG_COMMIT));
+        let resolved = provider.resolve_ref("o", "r", "release").await.unwrap();
+        assert_eq!(resolved.unwrap().commit_sha, BRANCH_COMMIT);
+
+        // A tag spelled like an abbreviated commit id stays a tag.
+        let mut provider = RefProvider::new();
+        provider.tags.push(("abcdef0", TAG_COMMIT));
+        let resolved = provider
+            .resolve_ref("o", "r", "abcdef0")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(resolved.kind, PublicRefKind::Tag);
+        assert_eq!(resolved.commit_sha, TAG_COMMIT);
+    }
+
+    #[tokio::test]
+    async fn qualified_refs_pin_the_kind() {
+        let mut provider = RefProvider::new();
+        provider.branches.push(("release", BRANCH_COMMIT));
+        provider.tags.push(("release", TAG_COMMIT));
+
+        let tag = provider
+            .resolve_ref("o", "r", "refs/tags/release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(tag.kind, PublicRefKind::Tag);
+        assert_eq!(tag.commit_sha, TAG_COMMIT);
+        assert_eq!(tag.name, "release");
+
+        let branch = provider
+            .resolve_ref("o", "r", "refs/heads/release")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(branch.kind, PublicRefKind::Branch);
+
+        // A branch is not a tag: pinned to tags it must not match.
+        assert!(provider
+            .resolve_ref("o", "r", "refs/tags/main")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_ref_is_none_and_short_or_non_hex_refs_skip_the_commit_lookup() {
+        let provider = RefProvider::new();
+        assert!(provider
+            .resolve_ref("o", "r", "v9.9.9")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!provider.calls().iter().any(|c| c.starts_with("commit:")));
+
+        // Fewer than 7 hex characters is not an abbreviated commit id.
+        let provider = RefProvider::new();
+        assert!(provider
+            .resolve_ref("o", "r", "abcdef")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!provider.calls().iter().any(|c| c.starts_with("commit:")));
+
+        assert!(provider
+            .resolve_ref("o", "r", "  ")
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn provider_failures_are_not_reported_as_a_missing_ref() {
+        let mut provider = RefProvider::new();
+        provider.fail_branch = Some(|| PublicRepoError::RateLimitExceeded);
+        assert!(matches!(
+            provider.resolve_ref("o", "r", "v1.2.3").await,
+            Err(PublicRepoError::RateLimitExceeded)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_provider_without_tag_support_reports_it_instead_of_missing_the_ref() {
+        struct BranchOnly;
+        #[async_trait]
+        impl PublicRepoProvider for BranchOnly {
+            fn provider_name(&self) -> &'static str {
+                "branch-only"
+            }
+            async fn get_repository(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<PublicRepoInfo, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+            async fn list_branches(
+                &self,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+                Ok(Vec::new())
+            }
+            async fn get_file_tree(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<Vec<String>, PublicRepoError> {
+                Ok(Vec::new())
+            }
+            async fn get_file_content(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: &str,
+            ) -> Result<FileContent, PublicRepoError> {
+                Err(PublicRepoError::Internal("not used".into()))
+            }
+        }
+        assert!(matches!(
+            BranchOnly.resolve_ref("o", "r", "v1").await,
+            Err(PublicRepoError::ProviderNotSupported { .. })
+        ));
+    }
+
+    #[test]
+    fn commit_ids_are_seven_to_forty_hex_characters() {
+        assert!(looks_like_commit_sha("abcdef0"));
+        assert!(looks_like_commit_sha(OTHER_COMMIT));
+        assert!(!looks_like_commit_sha("abcdef"));
+        assert!(!looks_like_commit_sha(&"a".repeat(41)));
+        assert!(!looks_like_commit_sha("v1.2.3x"));
+        assert!(!looks_like_commit_sha("ghijklm"));
+    }
+
+    #[tokio::test]
+    async fn github_tag_lookup_asks_for_the_sha_media_type_of_the_qualified_tag() {
+        let mut server = mockito::Server::new_async().await;
+        let found = server
+            .mock(
+                "GET",
+                "/repos/example/monorepo/commits/refs/tags/release/1.0",
+            )
+            .match_header("accept", "application/vnd.github.sha")
+            .with_status(200)
+            .with_body(format!("{TAG_COMMIT}\n"))
+            .expect(1)
+            .create_async()
+            .await;
+        let missing = server
+            .mock("GET", "/repos/example/monorepo/commits/refs/tags/gone")
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        assert_eq!(
+            provider
+                .get_tag_commit("example", "monorepo", "release/1.0")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(TAG_COMMIT)
+        );
+        assert!(provider
+            .get_tag_commit("example", "monorepo", "gone")
+            .await
+            .unwrap()
+            .is_none());
+        found.assert_async().await;
+        missing.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_commit_lookup_expands_a_short_id_and_treats_422_as_missing() {
+        let mut server = mockito::Server::new_async().await;
+        let found = server
+            .mock("GET", "/repos/example/monorepo/commits/abcdef0")
+            .match_header("accept", "application/vnd.github.sha")
+            .with_status(200)
+            .with_body(OTHER_COMMIT)
+            .expect(1)
+            .create_async()
+            .await;
+        let unknown = server
+            .mock("GET", "/repos/example/monorepo/commits/0123456789")
+            .with_status(422)
+            .with_body(r#"{"message":"No commit found for SHA: 0123456789"}"#)
+            .expect(1)
+            .create_async()
+            .await;
+        // The commits endpoint also resolves branch names; a branch answer is
+        // not a commit-id lookup.
+        let branch_name = server
+            .mock("GET", "/repos/example/monorepo/commits/deadbeef")
+            .with_status(200)
+            .with_body(BRANCH_COMMIT)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+
+        assert_eq!(
+            provider
+                .get_commit_sha("example", "monorepo", "abcdef0")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(OTHER_COMMIT)
+        );
+        assert!(provider
+            .get_commit_sha("example", "monorepo", "0123456789")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(provider
+            .get_commit_sha("example", "monorepo", "deadbeef")
+            .await
+            .unwrap()
+            .is_none());
+        found.assert_async().await;
+        unknown.assert_async().await;
+        branch_name.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn github_ref_lookup_failures_are_errors_not_missing_refs() {
+        let mut server = mockito::Server::new_async().await;
+        let limited = server
+            .mock("GET", "/repos/example/monorepo/commits/refs/tags/v1")
+            .with_status(429)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider =
+            GitHubPublicProvider::with_token_and_api_url("token".to_string(), server.url());
+        assert!(matches!(
+            provider.get_tag_commit("example", "monorepo", "v1").await,
+            Err(PublicRepoError::RateLimitExceeded)
+        ));
+        limited.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn gitlab_tag_and_commit_lookups_read_the_commit_id() {
+        let mut server = mockito::Server::new_async().await;
+        let tag = server
+            .mock(
+                "GET",
+                "/api/v4/projects/example%2Frepository/repository/tags/release%2F1.0",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "name": "release/1.0",
+                    "target": "9999999999999999999999999999999999999999",
+                    "commit": { "id": TAG_COMMIT }
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let missing_tag = server
+            .mock(
+                "GET",
+                "/api/v4/projects/example%2Frepository/repository/tags/gone",
+            )
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let commit = server
+            .mock(
+                "GET",
+                "/api/v4/projects/example%2Frepository/repository/commits/abcdef0",
+            )
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!({ "id": OTHER_COMMIT }).to_string())
+            .expect(1)
+            .create_async()
+            .await;
+        let missing_commit = server
+            .mock(
+                "GET",
+                "/api/v4/projects/example%2Frepository/repository/commits/0123456",
+            )
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let provider = GitLabPublicProvider::with_test_base_url(server.url());
+
+        assert_eq!(
+            provider
+                .get_tag_commit("example", "repository", "release/1.0")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(TAG_COMMIT)
+        );
+        assert!(provider
+            .get_tag_commit("example", "repository", "gone")
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            provider
+                .get_commit_sha("example", "repository", "abcdef0")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(OTHER_COMMIT)
+        );
+        assert!(provider
+            .get_commit_sha("example", "repository", "0123456")
+            .await
+            .unwrap()
+            .is_none());
+        tag.assert_async().await;
+        missing_tag.assert_async().await;
+        commit.assert_async().await;
+        missing_commit.assert_async().await;
     }
 
     #[test]
@@ -1749,7 +2741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_repository_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_repository("expressjs", "express").await {
             Ok(repo) => {
@@ -1766,7 +2758,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_list_branches_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
@@ -1783,7 +2775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_file_tree_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider
             .get_file_tree("expressjs", "express", "master")
@@ -1802,15 +2794,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_github_nonexistent_repo() {
-        let provider = GitHubPublicProvider::new();
+    async fn test_github_nonexistent_repo_real_api() {
+        let provider = GitHubPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -1827,7 +2819,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_repository_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -1845,7 +2837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_list_branches_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -1871,7 +2863,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_file_tree_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller repo for file tree test
         match provider
@@ -1887,7 +2879,7 @@ mod tests {
             Err(PublicRepoError::RateLimitExceeded) => {
                 eprintln!("Skipping test due to rate limit");
             }
-            Err(PublicRepoError::BranchNotFound(_)) => {
+            Err(PublicRepoError::BranchNotFound { .. }) => {
                 // Try with master instead
                 eprintln!("main branch not found, this is expected if the default is master");
             }
@@ -1896,15 +2888,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_gitlab_nonexistent_repo() {
-        let provider = GitLabPublicProvider::new();
+    async fn test_gitlab_nonexistent_repo_real_api() {
+        let provider = GitLabPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -1920,8 +2912,8 @@ mod tests {
     // =============================================================================
 
     #[tokio::test]
-    async fn test_preset_detection_with_github() {
-        let provider = GitHubPublicProvider::new();
+    async fn test_preset_detection_with_github_real_api() {
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {
             Ok(files) => {

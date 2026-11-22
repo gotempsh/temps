@@ -15,6 +15,7 @@ use super::audit::{
     StaticBundleDeletedAudit, StaticBundleUploadedAudit,
 };
 use super::types::AppState;
+use crate::services::remote_deployment_service::RemoteDeploymentError;
 use axum::{
     extract::{Extension, Multipart, Path, Query, State},
     http::StatusCode,
@@ -23,21 +24,19 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set, TransactionTrait,
-};
+use sea_orm::{ActiveModelTrait, EntityTrait, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     RequireAuth,
 };
-use temps_core::external_plugin::VerifiedPluginApiCaller;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, DeploymentCreatedJob, Job, RequestMetadata, UtcDateTime};
 use temps_entities::deployments::DeploymentMetadata;
 use temps_entities::source_type::SourceType;
 use temps_entities::types::PipelineStatus;
 use temps_entities::{deployments, environments, projects, source_bundles};
+use temps_plugin_protocol::VerifiedPluginApiCaller;
 use tokio::io::AsyncWriteExt;
 use tracing::{debug, error, info, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
@@ -110,6 +109,18 @@ impl ArchiveUploadPermit {
 impl Drop for ArchiveUploadPermit {
     fn drop(&mut self) {
         ARCHIVE_UPLOADS_IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Refuse, before anything is written, to deploy a project whose app runs
+/// outside Temps.
+pub(crate) fn refuse_external_project(project: &projects::Model) -> Result<(), Problem> {
+    match project.hosting.deploy_refusal(&project.name) {
+        Some(reason) => Err(problemdetails::new(StatusCode::CONFLICT)
+            .with_type("https://temps.sh/probs/project-hosted-externally")
+            .with_title("Project Runs Outside Temps")
+            .with_detail(reason)),
+        None => Ok(()),
     }
 }
 
@@ -193,6 +204,58 @@ async fn rollback_uploaded_source(
     }
 }
 
+/// A failed project or environment lookup for a deployment request.
+fn deployment_target_problem(error: RemoteDeploymentError) -> Problem {
+    match error {
+        RemoteDeploymentError::ProjectNotFound(project_id) => {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(format!("Project {} not found", project_id))
+        }
+        RemoteDeploymentError::EnvironmentNotFound(environment_id)
+        | RemoteDeploymentError::EnvironmentNotInProject { environment_id, .. } => {
+            problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Environment Not Found")
+                .with_detail(format!("Environment {} not found", environment_id))
+        }
+        RemoteDeploymentError::Database(error) => {
+            error!(%error, "Could not load the deployment target");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(error.to_string())
+        }
+        other => {
+            error!(error = %other, "Could not load the deployment target");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Error")
+                .with_detail(other.to_string())
+        }
+    }
+}
+
+async fn load_deployment_project(
+    state: &AppState,
+    project_id: i32,
+) -> Result<projects::Model, Problem> {
+    state
+        .remote_deployment_service
+        .deployment_project(project_id)
+        .await
+        .map_err(deployment_target_problem)
+}
+
+async fn load_deployment_environment(
+    state: &AppState,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<environments::Model, Problem> {
+    state
+        .remote_deployment_service
+        .deployment_environment(project_id, environment_id)
+        .await
+        .map_err(deployment_target_problem)
+}
+
 /// Upload source code and immediately start a preset-based deployment.
 #[utoipa::path(
     post,
@@ -224,20 +287,8 @@ pub async fn deploy_from_uploaded_source(
     ensure_local_archive_deployments_supported(&state).await?;
     let upload_permit = ArchiveUploadPermit::acquire()?;
 
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(error.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {project_id} not found"))
-        })?;
+    let project = load_deployment_project(&state, project_id).await?;
+    refuse_external_project(&project)?;
     // ADR 045, before the upload is consumed or any row is written: the
     // planner refuses this again (it is the enforcement point), but only after
     // a deployment row exists, and a 500 on a failed plan is the wrong answer
@@ -254,20 +305,18 @@ pub async fn deploy_from_uploaded_source(
                 project.id, project.source_type, project.id
             )));
     }
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
+    let environment = state
+        .remote_deployment_service
+        .deployment_environment(project_id, environment_id)
         .await
-        .map_err(|error| {
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(error.to_string())
-        })?
-        .filter(|environment| environment.project_id == project_id)
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail("Environment does not belong to the project")
+        .map_err(|error| match error {
+            RemoteDeploymentError::EnvironmentNotFound(_)
+            | RemoteDeploymentError::EnvironmentNotInProject { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Environment Not Found")
+                    .with_detail("Environment does not belong to the project")
+            }
+            other => deployment_target_problem(other),
         })?;
 
     const MAX_SOURCE_BYTES: u64 = 500 * 1024 * 1024;
@@ -842,40 +891,11 @@ async fn validate_uploaded_image_platform(
 }
 
 fn validate_health_check_path(path: &str) -> Result<(), Problem> {
-    let invalid = |detail: &str| {
+    temps_core::request_path::validate_request_path(path).map_err(|error| {
         problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Health Check Path")
-            .with_detail(detail.to_string())
-    };
-
-    if path.len() > 2048 {
-        return Err(invalid(&format!(
-            "health_check_path length {} exceeds 2048 byte limit",
-            path.len()
-        )));
-    }
-    if !path.starts_with('/') {
-        return Err(invalid("health_check_path must start with '/'"));
-    }
-    if path.contains('@') {
-        return Err(invalid(
-            "health_check_path must not contain '@' (userinfo injection)",
-        ));
-    }
-    if path.contains("://") {
-        return Err(invalid(
-            "health_check_path must not contain '://' (scheme injection)",
-        ));
-    }
-    if path
-        .chars()
-        .any(|c| c == '\r' || c == '\n' || c == '\0' || c == '\t')
-    {
-        return Err(invalid(
-            "health_check_path must not contain control characters",
-        ));
-    }
-    Ok(())
+            .with_detail(format!("health_check_path {error}"))
+    })
 }
 
 fn validate_container_command(command: &[String]) -> Result<(), Problem> {
@@ -1051,21 +1071,8 @@ pub async fn deploy_from_image(
 
     // Load the project before resolving the request so saved template runtime
     // settings are authoritative for every API/CLI caller, not only the web UI.
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|error| {
-            error!(%error, project_id, "Could not load project for image deployment");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(error.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
+    let project = load_deployment_project(&state, project_id).await?;
+    refuse_external_project(&project)?;
     // ADR 045, before anything is resolved or written: this project's
     // containers receive `/var/run/docker.sock`, so the image and command in
     // this request would run as host root. The planner refuses it again — it
@@ -1075,22 +1082,7 @@ pub async fn deploy_from_image(
     // Reject cross-project or deleted environments before creating the
     // deployment. Runtime defaults come only from the project's persisted
     // configuration; catalog state and deployment history are never inferred.
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::ProjectId.eq(project_id))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
-        .await
-        .map_err(|error| {
-            error!(%error, project_id, environment_id, "Could not load deployment environment");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(error.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail(format!("Environment {} not found", environment_id))
-        })?;
+    let environment = load_deployment_environment(&state, project_id, environment_id).await?;
 
     let saved_runtime = persisted_project_image_runtime(project.preset_config.as_ref());
 
@@ -1134,7 +1126,7 @@ pub async fn deploy_from_image(
                 .map_err(|e| {
                     error!("Failed to get external image {}: {}", ext_id, e);
                     match e {
-                        crate::services::remote_deployment_service::RemoteDeploymentError::ImageNotFound(_) => {
+                        RemoteDeploymentError::ImageNotFound(_) => {
                             problemdetails::new(StatusCode::NOT_FOUND)
                                 .with_title("External Image Not Found")
                                 .with_detail(format!("External image with ID {} not found", ext_id))
@@ -1220,13 +1212,10 @@ pub async fn deploy_from_image(
 
     // 3. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+    let deployment_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 4. Create deployment metadata (track deployment source type for flexible projects)
     let deployment_metadata = DeploymentMetadata {
@@ -1420,21 +1409,8 @@ pub async fn deploy_from_static(
     );
 
     // 1. Verify project exists and has StaticFiles source type
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
+    let project = load_deployment_project(&state, project_id).await?;
+    refuse_external_project(&project)?;
     // ADR 045: see `deploy_from_image`. A static bundle still starts a
     // container for this project, so it is refused on the same terms.
     super::docker_socket::guard_deploy(&project.slug, &auth)?;
@@ -1453,22 +1429,7 @@ pub async fn deploy_from_static(
     }
 
     // 2. Verify environment exists, belongs to project, and is not deleted
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::ProjectId.eq(project_id))
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail(format!("Environment {} not found", environment_id))
-        })?;
+    let environment = load_deployment_environment(&state, project_id, environment_id).await?;
 
     // 3. Verify static bundle exists and belongs to project
     let bundle = state
@@ -1478,7 +1439,7 @@ pub async fn deploy_from_static(
         .map_err(|e| {
             error!("Failed to get static bundle: {}", e);
             match e {
-                crate::services::remote_deployment_service::RemoteDeploymentError::BundleNotFound(_) => {
+                RemoteDeploymentError::BundleNotFound(_) => {
                     problemdetails::new(StatusCode::NOT_FOUND)
                         .with_title("Static Bundle Not Found")
                         .with_detail(e.to_string())
@@ -1497,13 +1458,10 @@ pub async fn deploy_from_static(
 
     // 4. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-    let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+    let deployment_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 5. Create deployment metadata (track deployment source type for flexible projects)
     let deployment_metadata = DeploymentMetadata {
@@ -1701,21 +1659,8 @@ pub async fn deploy_from_image_upload(
     );
 
     // 1. Verify project exists and has DockerImage source type
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
+    let project = load_deployment_project(&state, project_id).await?;
+    refuse_external_project(&project)?;
     // ADR 045: see `deploy_from_image`. An uploaded image tarball is the same
     // attacker-chosen image and command, arriving by a different route.
     super::docker_socket::guard_deploy(&project.slug, &auth)?;
@@ -1734,27 +1679,18 @@ pub async fn deploy_from_image_upload(
     }
 
     // 2. Verify environment exists, belongs to project, and is not deleted
-    let environment = environments::Entity::find_by_id(environment_id)
-        .filter(environments::Column::DeletedAt.is_null())
-        .one(state.db.as_ref())
+    let environment = state
+        .remote_deployment_service
+        .deployment_environment(project_id, environment_id)
         .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Environment Not Found")
-                .with_detail(format!("Environment {} not found", environment_id))
+        .map_err(|error| match error {
+            RemoteDeploymentError::EnvironmentNotInProject { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Environment")
+                    .with_detail("Environment does not belong to this project")
+            }
+            other => deployment_target_problem(other),
         })?;
-
-    if environment.project_id != project_id {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Environment")
-            .with_detail("Environment does not belong to this project"));
-    }
 
     // 2b. If this exact upload attempt already produced a deployment (the
     // caller's earlier response was lost — e.g. a client-side timeout after
@@ -1928,14 +1864,10 @@ pub async fn deploy_from_image_upload(
 
     // 8. Generate deployment slug using project slug (canonical hostname source —
     //    must match the normal git-push path so URLs read `<project>-<n>`, not `<env>-<n>`)
-    let deployment_number = deployments::Entity::find()
-        .filter(deployments::Column::ProjectId.eq(project_id))
-        .count(state.db.as_ref())
-        .await
-        .unwrap_or(0)
-        + 1;
-
-    let env_slug = format!("{}-{}", project.slug, deployment_number);
+    let env_slug = state
+        .deployment_service
+        .allocate_deployment_slug(project_id, &project.slug)
+        .await?;
 
     // 9. Get deployment config from environment
     let deployment_config_snapshot = environment.deployment_config.as_ref().map(|config| {
@@ -2271,21 +2203,8 @@ pub async fn upload_static_bundle(
     debug!("Uploading static bundle for project {}", project_id);
 
     // 1. Verify project exists and has StaticFiles source type
-    let project = projects::Entity::find_by_id(project_id)
-        .filter(projects::Column::IsDeleted.eq(false))
-        .one(state.db.as_ref())
-        .await
-        .map_err(|e| {
-            error!("Database error: {}", e);
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database Error")
-                .with_detail(e.to_string())
-        })?
-        .ok_or_else(|| {
-            problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(format!("Project {} not found", project_id))
-        })?;
+    let project = load_deployment_project(&state, project_id).await?;
+    refuse_external_project(&project)?;
 
     // Verify project source type allows static file deployments
     if !project
@@ -2740,7 +2659,7 @@ pub async fn get_remote_external_image(
         .map_err(|e| {
             error!("Failed to get external image: {}", e);
             match e {
-                crate::services::remote_deployment_service::RemoteDeploymentError::ImageNotFound(_) => {
+                RemoteDeploymentError::ImageNotFound(_) => {
                     problemdetails::new(StatusCode::NOT_FOUND)
                         .with_title("Image Not Found")
                         .with_detail(e.to_string())
@@ -2785,7 +2704,7 @@ pub async fn delete_external_image(
         .map_err(|e| {
             error!("Failed to delete external image: {}", e);
             match e {
-                crate::services::remote_deployment_service::RemoteDeploymentError::ImageNotFound(_) => {
+                RemoteDeploymentError::ImageNotFound(_) => {
                     problemdetails::new(StatusCode::NOT_FOUND)
                         .with_title("Image Not Found")
                         .with_detail(e.to_string())
@@ -2895,7 +2814,7 @@ pub async fn get_static_bundle(
         .map_err(|e| {
             error!("Failed to get static bundle: {}", e);
             match e {
-                crate::services::remote_deployment_service::RemoteDeploymentError::BundleNotFound(_) => {
+                RemoteDeploymentError::BundleNotFound(_) => {
                     problemdetails::new(StatusCode::NOT_FOUND)
                         .with_title("Bundle Not Found")
                         .with_detail(e.to_string())
@@ -2940,7 +2859,7 @@ pub async fn delete_static_bundle(
         .map_err(|e| {
             error!("Failed to delete static bundle: {}", e);
             match e {
-                crate::services::remote_deployment_service::RemoteDeploymentError::BundleNotFound(_) => {
+                RemoteDeploymentError::BundleNotFound(_) => {
                     problemdetails::new(StatusCode::NOT_FOUND)
                         .with_title("Bundle Not Found")
                         .with_detail(e.to_string())
@@ -3023,6 +2942,51 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn problem_parts(problem: Problem) -> (StatusCode, serde_json::Value) {
+        let body = serde_json::to_value(&problem.body).expect("problem serializes");
+        (problem.status_code, body)
+    }
+
+    #[test]
+    fn a_missing_project_is_a_404_naming_the_id() {
+        let (status, body) = problem_parts(deployment_target_problem(
+            RemoteDeploymentError::ProjectNotFound(41),
+        ));
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body["title"], "Project Not Found");
+        assert_eq!(body["detail"], "Project 41 not found");
+    }
+
+    /// Another project's environment is reported exactly like a missing one,
+    /// so a caller cannot probe which environment IDs exist elsewhere.
+    #[test]
+    fn another_projects_environment_is_indistinguishable_from_a_missing_one() {
+        for error in [
+            RemoteDeploymentError::EnvironmentNotFound(7),
+            RemoteDeploymentError::EnvironmentNotInProject {
+                project_id: 3,
+                environment_id: 7,
+            },
+        ] {
+            let (status, body) = problem_parts(deployment_target_problem(error));
+            assert_eq!(status, StatusCode::NOT_FOUND);
+            assert_eq!(body["title"], "Environment Not Found");
+            assert_eq!(body["detail"], "Environment 7 not found");
+        }
+    }
+
+    /// The Problem detail stays the bare database message, as it was before the
+    /// lookup moved into the service.
+    #[test]
+    fn a_database_failure_is_a_500_with_the_database_message() {
+        let (status, body) = problem_parts(deployment_target_problem(
+            RemoteDeploymentError::Database(sea_orm::DbErr::Custom("connection lost".to_string())),
+        ));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body["title"], "Database Error");
+        assert_eq!(body["detail"], "Custom Error: connection lost");
+    }
 
     /// An `uploaded_source` project is what `drop` creates; it must keep
     /// working without anyone opting into anything.
@@ -3272,5 +3236,137 @@ mod tests {
                 "handler {handler_name} must restrict deployment tokens to their project"
             );
         }
+    }
+
+    /// Build a minimal `projects::Model` for unit tests. All fields that are
+    /// not relevant to the test being written can stay at their defaults.
+    fn minimal_project(
+        id: i32,
+        name: &str,
+        hosting: temps_entities::types::Hosting,
+    ) -> projects::Model {
+        let now = Utc::now();
+        projects::Model {
+            id,
+            name: name.to_string(),
+            repo_name: "repo".to_string(),
+            repo_owner: "owner".to_string(),
+            directory: String::new(),
+            pull_only_root_directory: false,
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::Dockerfile,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: name.to_lowercase().replace(' ', "-"),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            shield_mode: "log".to_string(),
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            vulnerability_scanning_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: Default::default(),
+            project_type: temps_entities::types::ProjectType::Server,
+            allow_alternate_sources: None,
+            hosting,
+            template_slug: None,
+            service_template: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+            cloud_telemetry_fidelity: Default::default(),
+            cloud_telemetry_attribute_allowlist: Vec::new(),
+            cloud_telemetry_write_mode: Default::default(),
+            cloud_analytics_write_mode: Default::default(),
+            analytics_identity_mode: Default::default(),
+            instantiation_token: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+        }
+    }
+
+    #[test]
+    fn hosted_project_passes_refuse_external() {
+        let project = minimal_project(1, "my-app", temps_entities::types::Hosting::Hosted);
+        assert!(
+            refuse_external_project(&project).is_ok(),
+            "a hosted project must not be refused"
+        );
+    }
+
+    #[test]
+    fn external_project_is_refused_with_conflict() {
+        let project = minimal_project(2, "their-app", temps_entities::types::Hosting::External);
+        let err =
+            refuse_external_project(&project).expect_err("an external project must be refused");
+        assert_eq!(
+            err.status_code,
+            StatusCode::CONFLICT,
+            "external project refusal must be 409 Conflict"
+        );
+    }
+
+    #[test]
+    fn external_project_refusal_names_the_project() {
+        let project = minimal_project(
+            3,
+            "ExternalService",
+            temps_entities::types::Hosting::External,
+        );
+        let err = refuse_external_project(&project).unwrap_err();
+        let detail = err
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            detail.contains("ExternalService"),
+            "refusal detail must name the project; got: {detail}"
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_returns_none_for_hosted() {
+        assert_eq!(
+            temps_entities::types::Hosting::Hosted.deploy_refusal("proj"),
+            None
+        );
+    }
+
+    #[test]
+    fn deploy_refusal_returns_some_for_external() {
+        let reason = temps_entities::types::Hosting::External
+            .deploy_refusal("proj")
+            .expect("External hosting must produce a refusal reason");
+        assert!(
+            reason.contains("proj"),
+            "refusal reason must mention the project name; got: {reason}"
+        );
+        assert!(
+            reason.contains("external"),
+            "refusal reason must mention 'external'; got: {reason}"
+        );
     }
 }

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   CustomDomainResponse,
   ProjectResponse,
@@ -9,17 +10,12 @@ import {
 import {
   deleteCustomDomainMutation,
   listCustomDomainsForProjectOptions,
+  listCustomDomainsForProjectQueryKey,
+  getEnvironmentReachabilityQueryKey,
+  listIngressHostnamesQueryKey,
+  listReachabilityRunsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from '@/components/ui/alert-dialog'
+import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import {
@@ -27,11 +23,14 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindings'
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
 import { ProjectDeliverySettings } from '@/components/domains/ProjectDeliverySettings'
 import { deliveryError } from '@/components/domains/delivery-errors'
+import { HostnameTunnelStatus } from '@/components/domains/TunnelHostnames'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -44,8 +43,9 @@ import { KbdBadge } from '@/components/ui/kbd-badge'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useState } from 'react'
 import { toast } from 'sonner'
+import { EnvironmentReachabilityList } from '@/components/reachability/EnvironmentReachabilityList'
 import { AddDomainDialog } from './AddDomainDialog'
 import { EditDomainDialog } from './EditDomainDialog'
 
@@ -59,7 +59,8 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
   const [editingDomain, setEditingDomain] = useState<
     CustomDomainResponse | undefined
   >()
-  const [domainToDelete, setDomainToDelete] = useState<number | null>(null)
+  const [domainToDelete, setDomainToDelete] =
+    useState<CustomDomainResponse | null>(null)
   const [deliveryOpen, setDeliveryOpen] = useState(false)
   // Bumped per opening so the always-mounted dialog starts from a fresh form
   // and preview for each target, without conditional mounting.
@@ -127,26 +128,32 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
       },
     })
   }
-  const deleteDialogOpen = useMemo(
-    () => domainToDelete !== null,
-    [domainToDelete]
-  )
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="text-lg font-semibold">Domains</h2>
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={() => setIsAddDialogOpen(true)}>
-            Add domain
-            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-          </Button>
-        </div>
-      </div>
-
-      <p className="text-sm text-muted-foreground mb-6">
-        Configure domains for your project. Each domain can be assigned to a
-        specific environment and optionally set up with redirects.
-      </p>
+      <PageHeader
+        title="Domains"
+        description="Custom domains for this service. Each one points at an environment and can redirect."
+        actions={
+          <>
+            <RefreshButton
+              queryKeys={[
+                listCustomDomainsForProjectQueryKey({
+                  path: { project_id: project.id },
+                }),
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+                queryKeyPrefix(getEnvironmentReachabilityQueryKey),
+                queryKeyPrefix(listReachabilityRunsQueryKey),
+                // The managed-delivery rows under DNS and CDN, not its form.
+                ['delivery-bindings', project.id],
+              ]}
+            />
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              Add domain
+              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+            </Button>
+          </>
+        }
+      />
 
       {isPending ? (
         <Skeleton className="h-24 w-full" />
@@ -168,6 +175,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             >
               <div className="min-w-0">
                 <p className="break-all font-medium">{domain.domain}</p>
+                {domain.status === 'hostname_conflict' && (
+                  <p className="text-sm text-destructive">{domain.message}</p>
+                )}
                 {domain.environment && (
                   <p className="text-sm text-muted-foreground">
                     Environment: {domain.environment.slug}
@@ -183,6 +193,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
                     Redirects to: {domain.redirect_to} ({domain.status_code})
                   </p>
                 )}
+                <HostnameTunnelStatus hostname={domain.domain} />
               </div>
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
@@ -213,7 +224,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
                   <DropdownMenuSeparator />
                   <DropdownMenuItem
                     className="text-destructive"
-                    onClick={() => setDomainToDelete(domain.id)}
+                    onClick={() => setDomainToDelete(domain)}
                   >
                     Delete
                   </DropdownMenuItem>
@@ -229,10 +240,20 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           description="Add a domain to get started."
           action={
             <Button onClick={() => setIsAddDialogOpen(true)}>
-              Add Domain
+              Add domain
               <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
             </Button>
           }
+        />
+      )}
+
+      {/* Domains lead the page (DESIGN.md); each environment's reachability
+          follows them. An app hosted elsewhere is never served by Temps'
+          ingress. */}
+      {project.hosting !== 'external' && project.source_type !== 'external' && (
+        <EnvironmentReachabilityList
+          projectId={project.id}
+          projectSlug={project.slug}
         />
       )}
 
@@ -247,7 +268,11 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           Optionally manage DNS records and deliver traffic through Cloudflare
           or bunny.net.
         </p>
-        <CollapsibleContent className="space-y-6 pt-4">
+        <CollapsibleContent
+          role="region"
+          aria-label="DNS and CDN settings"
+          className="space-y-6 pt-4"
+        >
           <Button variant="outline" onClick={() => configureDelivery()}>
             Configure delivery
           </Button>
@@ -287,31 +312,19 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         onSuccess={handleEditSuccess}
       />
 
-      <AlertDialog
-        open={deleteDialogOpen}
-        onOpenChange={(open) => !open && setDomainToDelete(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This action cannot be undone. This will permanently delete the
-              domain from your project.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              onClick={() => {
-                if (domainToDelete) handleDelete(domainToDelete)
-                setDomainToDelete(null)
-              }}
-            >
-              Delete
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
+      <ConfirmDeleteDialog
+        open={domainToDelete !== null}
+        onOpenChange={(open) => {
+          if (!open) setDomainToDelete(null)
+        }}
+        resourceType="custom domain"
+        resourceName={domainToDelete?.domain ?? ''}
+        consequences={`Requests to this domain stop reaching ${project.slug}, and any delivery bindings and redirects configured on it are removed.`}
+        onConfirm={() => {
+          if (domainToDelete) handleDelete(domainToDelete.id)
+          setDomainToDelete(null)
+        }}
+      />
     </div>
   )
 }

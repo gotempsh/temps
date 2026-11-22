@@ -11,14 +11,21 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 use temps_core::static_files::{
-    validate_static_artifact_path, validate_static_dir, MAX_STATIC_PATH_COMPONENTS,
+    validate_static_artifact_path, validate_static_dir, StaticPathPolicyError,
+    MAX_STATIC_PATH_COMPONENTS,
 };
 use thiserror::Error;
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::debug;
+use tracing::{debug, warn};
 
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
+
+/// Upper bound on how many skipped paths a deployment records for reporting.
+///
+/// The count is always exact; only the sample of paths is capped, so a source
+/// tree full of excluded files cannot grow the deploy result without bound.
+pub const MAX_REPORTED_SKIPPED_PATHS: usize = 20;
 
 #[derive(Error, Debug)]
 pub enum StaticDeployError {
@@ -63,6 +70,131 @@ pub struct StaticDeployResult {
     pub total_size_bytes: u64,
     /// Deployment timestamp
     pub deployed_at: chrono::DateTime<Utc>,
+    /// Number of source entries that were not published because the shared
+    /// static-artifact policy marks them sensitive (e.g. `.nojekyll`, `.env`,
+    /// `*.map`). A skipped directory counts once, not once per descendant.
+    #[serde(default)]
+    pub skipped_count: u32,
+    /// Sample of the skipped paths (relative to the source root, at most
+    /// [`MAX_REPORTED_SKIPPED_PATHS`]). Use `skipped_count` for the total.
+    #[serde(default)]
+    pub skipped_paths: Vec<String>,
+}
+
+impl StaticDeployResult {
+    /// One-line, user-facing description of the entries that were not
+    /// published, or `None` when nothing was skipped.
+    pub fn skipped_summary(&self) -> Option<String> {
+        if self.skipped_count == 0 {
+            return None;
+        }
+        let listed = self.skipped_paths.join(", ");
+        let unlisted = (self.skipped_count as usize).saturating_sub(self.skipped_paths.len());
+        let suffix = if unlisted > 0 {
+            format!(" (and {unlisted} more)")
+        } else {
+            String::new()
+        };
+        Some(format!(
+            "Skipped {} path(s) not eligible for publishing: {listed}{suffix}",
+            self.skipped_count
+        ))
+    }
+}
+
+/// Entries a deployer declined to publish while walking a source tree.
+///
+/// Shared by every `StaticDeployer` backend so the filesystem and S3 paths
+/// report skips identically.
+#[derive(Debug, Default)]
+pub(crate) struct SkippedEntries {
+    count: u32,
+    sample: Vec<String>,
+}
+
+impl SkippedEntries {
+    pub(crate) fn record(&mut self, relative_path: &Path) {
+        self.count = self.count.saturating_add(1);
+        if self.sample.len() < MAX_REPORTED_SKIPPED_PATHS {
+            // Escaped so a hostile file name cannot forge extra deployment
+            // log lines or terminal control sequences.
+            self.sample
+                .push(relative_path.to_string_lossy().escape_debug().to_string());
+        }
+    }
+
+    pub(crate) fn count(&self) -> u32 {
+        self.count
+    }
+
+    pub(crate) fn sample(&self) -> &[String] {
+        &self.sample
+    }
+
+    /// Emit the structured `warn!` for a finished deployment, if any entry
+    /// was skipped.
+    pub(crate) fn warn(&self, request: &StaticDeployRequest, backend: &'static str) {
+        if self.count == 0 {
+            return;
+        }
+        warn!(
+            backend,
+            project_slug = %request.project_slug,
+            environment_slug = %request.environment_slug,
+            deployment_slug = %request.deployment_slug,
+            skipped_count = self.count,
+            skipped_paths = ?self.sample,
+            "Skipped static deployment entries that are not eligible for publishing"
+        );
+    }
+}
+
+/// What to do with one entry of a static deployment source tree.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SourceEntryDisposition {
+    Publish,
+    /// Matches the sensitive-path policy: leave it out, keep deploying.
+    Skip,
+}
+
+/// Classify a source entry by its path relative to the source root.
+///
+/// A path the sensitivity policy rejects is skipped rather than fatal: build
+/// tools emit harmless markers and debris (`.nojekyll`, `.DS_Store`, `*.map`)
+/// that must not abort an otherwise valid site, and the proxy refuses to serve
+/// them regardless. Every other policy error means the tree itself is
+/// malformed (absolute, non-clean, too deep, non-UTF-8) and stays fatal.
+pub(crate) fn classify_source_entry(
+    relative_path: &Path,
+) -> Result<SourceEntryDisposition, StaticDeployError> {
+    match validate_static_artifact_path(relative_path) {
+        Ok(()) => Ok(SourceEntryDisposition::Publish),
+        Err(StaticPathPolicyError::Sensitive) => Ok(SourceEntryDisposition::Skip),
+        Err(error) => Err(StaticDeployError::InvalidPath(format!(
+            "Static deployment source entry '{}' is not publishable: {error}",
+            relative_path.display()
+        ))),
+    }
+}
+
+/// Fail a deployment that skipped entries and published nothing: an empty
+/// site would otherwise "succeed" and serve only 404s.
+pub(crate) fn ensure_something_published(
+    request: &StaticDeployRequest,
+    file_count: u32,
+    skipped: &SkippedEntries,
+) -> Result<(), StaticDeployError> {
+    if file_count == 0 && skipped.count() > 0 {
+        return Err(StaticDeployError::DeploymentFailed(format!(
+            "Static deployment {}/{}/{} has no publishable files: {} source entries were skipped as sensitive (e.g. {})",
+            request.project_slug,
+            request.environment_slug,
+            request.deployment_slug,
+            skipped.count(),
+            skipped.sample().join(", ")
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +262,7 @@ struct CopyStats {
     entry_count: u32,
     file_count: u32,
     total_size: u64,
+    skipped: SkippedEntries,
 }
 
 type ListFilesFuture<'a> = std::pin::Pin<
@@ -338,12 +471,13 @@ impl FilesystemStaticDeployer {
                         ),
                     });
                 }
-                validate_static_artifact_path(relative_path).map_err(|error| {
-                    StaticDeployError::InvalidPath(format!(
-                        "Static deployment source entry '{}' is not publishable: {error}",
-                        relative_path.display()
-                    ))
-                })?;
+                // Checked before the symlink/type checks on purpose: a skipped
+                // entry is never opened, followed or descended into, so a
+                // sensitively named symlink or directory is simply left out.
+                if classify_source_entry(relative_path)? == SourceEntryDisposition::Skip {
+                    stats.skipped.record(relative_path);
+                    continue;
+                }
 
                 let metadata = fs::symlink_metadata(&source_path).await?;
 
@@ -527,6 +661,18 @@ impl StaticDeployer for FilesystemStaticDeployer {
             return Err(error);
         }
 
+        if let Err(error) = ensure_something_published(&request, stats.file_count, &stats.skipped) {
+            if let Err(cleanup_error) = fs::remove_dir_all(&storage_path).await {
+                debug!(
+                    path = %storage_path.display(),
+                    error = %cleanup_error,
+                    "Failed to clean empty static deployment"
+                );
+            }
+            return Err(error);
+        }
+        stats.skipped.warn(&request, "filesystem");
+
         let file_count = stats.file_count;
         let total_size = stats.total_size;
 
@@ -564,6 +710,8 @@ impl StaticDeployer for FilesystemStaticDeployer {
             file_count,
             total_size_bytes: total_size,
             deployed_at: Utc::now(),
+            skipped_count: stats.skipped.count(),
+            skipped_paths: stats.skipped.sample().to_vec(),
         })
     }
 
@@ -898,9 +1046,51 @@ mod tests {
         );
     }
 
+    fn deploy_request(source_dir: PathBuf, deployment_slug: &str) -> StaticDeployRequest {
+        StaticDeployRequest {
+            source_dir,
+            project_slug: "docs-site".to_string(),
+            environment_slug: "production".to_string(),
+            deployment_slug: deployment_slug.to_string(),
+        }
+    }
+
     #[tokio::test]
-    async fn deploy_rejects_sensitive_files_and_cleans_partial_destination() {
-        for sensitive_path in [".env", ".git/config", "assets/app.js.map"] {
+    async fn deploy_skips_site_generator_marker_and_publishes_the_rest() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        let source_dir = temp_dir.path().join("build");
+        std_fs::create_dir_all(&source_dir).unwrap();
+        std_fs::write(source_dir.join(".nojekyll"), b"").unwrap();
+        std_fs::write(source_dir.join("index.html"), b"<html></html>").unwrap();
+
+        let deployer = FilesystemStaticDeployer::new(base_dir.clone());
+        let result = deployer
+            .deploy(deploy_request(source_dir, "deploy-marker"))
+            .await
+            .expect("a harmless marker file must not fail the deployment");
+
+        let destination = base_dir.join(&result.storage_path);
+        assert!(destination.join("index.html").is_file());
+        assert!(!destination.join(".nojekyll").exists());
+        assert_eq!(result.file_count, 1);
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.skipped_paths, vec![".nojekyll".to_string()]);
+        assert_eq!(
+            result.skipped_summary().as_deref(),
+            Some("Skipped 1 path(s) not eligible for publishing: .nojekyll")
+        );
+    }
+
+    #[tokio::test]
+    async fn deploy_skips_sensitive_entries_instead_of_failing() {
+        for sensitive_path in [
+            ".env",
+            ".git/config",
+            "assets/app.js.map",
+            "keys/server.pem",
+            "docs/.DS_Store",
+        ] {
             let temp_dir = TempDir::new().unwrap();
             let base_dir = temp_dir.path().join("static");
             let source_dir = temp_dir.path().join("source");
@@ -909,22 +1099,191 @@ mod tests {
             std_fs::write(&sensitive_file, b"must not publish").unwrap();
             std_fs::write(source_dir.join("index.html"), b"ordinary").unwrap();
 
-            let deployer = FilesystemStaticDeployer::new(base_dir);
-            let request = StaticDeployRequest {
-                source_dir,
-                project_slug: "project".to_string(),
-                environment_slug: "production".to_string(),
-                deployment_slug: "deploy-sensitive".to_string(),
-            };
-            let destination = deployer.build_storage_path(&request);
-            let error = deployer.deploy(request).await.unwrap_err();
+            let deployer = FilesystemStaticDeployer::new(base_dir.clone());
+            let result = deployer
+                .deploy(deploy_request(source_dir, "deploy-sensitive"))
+                .await
+                .unwrap_or_else(|error| panic!("{sensitive_path} must be skipped: {error}"));
 
-            assert!(matches!(error, StaticDeployError::InvalidPath(_)));
+            let destination = base_dir.join(&result.storage_path);
+            assert!(destination.join("index.html").is_file());
             assert!(
-                !destination.exists(),
-                "partial destination remained after rejecting {sensitive_path}"
+                !destination.join(sensitive_path).exists(),
+                "{sensitive_path} must not be published"
+            );
+            assert_eq!(result.file_count, 1, "{sensitive_path}");
+            assert_eq!(result.skipped_count, 1, "{sensitive_path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn deploy_counts_a_skipped_directory_once_and_never_descends_into_it() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        let source_dir = temp_dir.path().join("source");
+        std_fs::create_dir_all(source_dir.join(".git/objects/ab")).unwrap();
+        std_fs::write(source_dir.join(".git/objects/ab/cdef"), b"blob").unwrap();
+        std_fs::write(source_dir.join(".git/HEAD"), b"ref").unwrap();
+        std_fs::write(source_dir.join("index.html"), b"ordinary").unwrap();
+
+        let deployer = FilesystemStaticDeployer::new(base_dir.clone());
+        let result = deployer
+            .deploy(deploy_request(source_dir, "deploy-skipped-dir"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.skipped_count, 1);
+        assert_eq!(result.skipped_paths, vec![".git".to_string()]);
+        assert!(!base_dir.join(&result.storage_path).join(".git").exists());
+    }
+
+    #[tokio::test]
+    async fn deploy_fails_and_cleans_up_when_every_entry_is_skipped() {
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        let source_dir = temp_dir.path().join("source");
+        std_fs::create_dir_all(&source_dir).unwrap();
+        std_fs::write(source_dir.join(".env"), b"SECRET=1").unwrap();
+        std_fs::write(source_dir.join(".nojekyll"), b"").unwrap();
+
+        let deployer = FilesystemStaticDeployer::new(base_dir);
+        let request = deploy_request(source_dir, "deploy-nothing");
+        let destination = deployer.build_storage_path(&request);
+        let error = deployer.deploy(request).await.unwrap_err();
+
+        assert!(
+            matches!(&error, StaticDeployError::DeploymentFailed(message)
+                if message.contains("no publishable files") && message.contains("deploy-nothing")),
+            "unexpected error: {error}"
+        );
+        assert!(!destination.exists(), "empty destination must be removed");
+    }
+
+    #[tokio::test]
+    async fn deploy_empty_source_without_skips_still_succeeds() {
+        let temp_dir = TempDir::new().unwrap();
+        let source_dir = temp_dir.path().join("source");
+        std_fs::create_dir_all(&source_dir).unwrap();
+
+        let deployer = FilesystemStaticDeployer::new(temp_dir.path().join("static"));
+        let result = deployer
+            .deploy(deploy_request(source_dir, "deploy-empty"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.file_count, 0);
+        assert_eq!(result.skipped_count, 0);
+        assert_eq!(result.skipped_summary(), None);
+    }
+
+    #[test]
+    fn classify_source_entry_skips_only_sensitive_paths() {
+        assert_eq!(
+            classify_source_entry(Path::new("index.html")).unwrap(),
+            SourceEntryDisposition::Publish
+        );
+        assert_eq!(
+            classify_source_entry(Path::new(".well-known/security.txt")).unwrap(),
+            SourceEntryDisposition::Publish
+        );
+        for path in [".nojekyll", ".env", "app.js.map", "nested/.git/config"] {
+            assert_eq!(
+                classify_source_entry(Path::new(path)).unwrap(),
+                SourceEntryDisposition::Skip,
+                "{path}"
             );
         }
+    }
+
+    #[test]
+    fn classify_source_entry_keeps_structurally_invalid_paths_fatal() {
+        let too_deep = vec!["d"; MAX_STATIC_PATH_COMPONENTS + 1].join("/");
+        for path in [
+            "",
+            "/etc/passwd",
+            "../outside",
+            "./index.html",
+            too_deep.as_str(),
+        ] {
+            let error = classify_source_entry(Path::new(path))
+                .expect_err("structurally invalid path must stay fatal");
+            assert!(
+                matches!(&error, StaticDeployError::InvalidPath(message)
+                    if message.contains("is not publishable")),
+                "{path:?} produced {error}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_source_entry_keeps_non_utf8_names_fatal() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        let path = Path::new(OsStr::from_bytes(b"assets/\xff\xfe.js"));
+        assert!(matches!(
+            classify_source_entry(path),
+            Err(StaticDeployError::InvalidPath(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn deploy_skips_a_sensitively_named_symlink_without_following_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp_dir = TempDir::new().unwrap();
+        let base_dir = temp_dir.path().join("static");
+        let source_dir = temp_dir.path().join("source");
+        std_fs::create_dir_all(&source_dir).unwrap();
+        let outside = temp_dir.path().join("outside.txt");
+        std_fs::write(&outside, b"secret").unwrap();
+        symlink(&outside, source_dir.join(".env")).unwrap();
+        std_fs::write(source_dir.join("index.html"), b"ordinary").unwrap();
+
+        let deployer = FilesystemStaticDeployer::new(base_dir.clone());
+        let result = deployer
+            .deploy(deploy_request(source_dir, "deploy-sensitive-link"))
+            .await
+            .unwrap();
+
+        assert_eq!(result.skipped_paths, vec![".env".to_string()]);
+        assert!(!base_dir.join(&result.storage_path).join(".env").exists());
+    }
+
+    #[test]
+    fn skipped_entries_report_exact_count_but_bounded_sample() {
+        let mut skipped = SkippedEntries::default();
+        let total = MAX_REPORTED_SKIPPED_PATHS + 5;
+        for index in 0..total {
+            skipped.record(Path::new(&format!("dir/.hidden-{index}")));
+        }
+
+        assert_eq!(skipped.count() as usize, total);
+        assert_eq!(skipped.sample().len(), MAX_REPORTED_SKIPPED_PATHS);
+
+        let result = StaticDeployResult {
+            storage_path: "projects/docs-site/production/2026/01/01/deploy".to_string(),
+            file_count: 1,
+            total_size_bytes: 1,
+            deployed_at: Utc::now(),
+            skipped_count: skipped.count(),
+            skipped_paths: skipped.sample().to_vec(),
+        };
+        let summary = result.skipped_summary().unwrap();
+        assert!(summary.starts_with("Skipped 25 path(s) not eligible for publishing: "));
+        assert!(summary.ends_with("(and 5 more)"), "{summary}");
+    }
+
+    #[test]
+    fn skipped_entries_escape_control_characters_in_reported_paths() {
+        let mut skipped = SkippedEntries::default();
+        skipped.record(Path::new("evil\n\u{1b}[31m.env"));
+
+        let reported = &skipped.sample()[0];
+        assert!(!reported.contains('\n'));
+        assert!(!reported.contains('\u{1b}'));
     }
 
     #[tokio::test]

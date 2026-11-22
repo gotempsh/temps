@@ -21,6 +21,10 @@ pub struct Model {
     /// Written by Temps itself (e.g. "Incident created: <title>"). Such
     /// updates embed internal text and can never be made public.
     pub is_system: bool,
+    /// When the update last became public (ADR 108 D2): set on a public
+    /// create and whenever it is made public later. Subscribers are told of
+    /// an update from this time, not from when it was written as a draft.
+    pub published_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
 }
 

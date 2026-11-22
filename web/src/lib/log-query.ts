@@ -73,7 +73,7 @@ export function parseLogQuery(
         positiveInteger(value) ??
         (matches.length === 1 ? matches[0].id : undefined)
       if (!id)
-        return { error: 'Choose a project suggestion or enter its numeric ID.' }
+        return { error: 'Choose a service suggestion or enter its numeric ID.' }
       value = String(id)
     }
     if (key === 'node' || key === 'deployment') {
@@ -86,7 +86,7 @@ export function parseLogQuery(
   if (patch.source === 'service' && patch.project_id)
     return {
       error:
-        'Project filters apply to application logs. Remove project or choose source:application.',
+        'Service filters apply to application logs. Remove project: or choose source:application.',
     }
   if (patch.source === 'service') patch.project_id = undefined
   else if (patch.project_id && !patch.source) patch.source = 'application'

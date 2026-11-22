@@ -17,9 +17,12 @@ import type { AuditLogResponse } from '@/api/client'
 
 import {
   listAuditLogsOptions,
+  listAuditLogsQueryKey,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   SearchableSelect,
   type SearchableSelectOption,
@@ -31,16 +34,44 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { ALL_FILTER, buildOperationOptions } from './AuditLogs-shared'
 import { useQuery } from '@tanstack/react-query'
 import { ScrollText, X } from 'lucide-react'
-import { useEffect, useMemo } from 'react'
+import { useEffect, useMemo, useReducer } from 'react'
 import { Navigate } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const ITEMS_PER_PAGE = 20
 
 export function AuditLogs() {
-  const canViewAuditLogs = useCanViewAuditLogs()
   const { setBreadcrumbs } = useBreadcrumbs()
-  const { get, patch } = useUrlState<'range' | 'operation' | 'user' | 'page'>()
-  const range = get('range') ?? '24h'
+  useEffect(() => {
+    setBreadcrumbs([{ label: 'Audit logs' }])
+  }, [setBreadcrumbs])
+  usePageTitle('Audit logs')
+  return (
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader
+        title="Audit logs"
+        description="Activity across the platform — authentication, service changes, settings, and more."
+      />
+      <AuditLogView />
+    </PageContainer>
+  )
+}
+
+/** Shared audit table; a record view pins its resource scope across all filters. */
+export function AuditLogView({
+  resourceId: fixedResourceId,
+  active = true,
+}: {
+  resourceId?: string
+  active?: boolean
+}) {
+  const canViewAuditLogs = useCanViewAuditLogs()
+  const { get, patch } = useUrlState<
+    'range' | 'operation' | 'user' | 'page' | 'resource'
+  >()
+  const resourceId = fixedResourceId ?? get('resource') ?? undefined
+  const defaultRange = fixedResourceId ? 'all' : '24h'
+  const range = get('range') ?? defaultRange
   const operation = get('operation') ?? ALL_FILTER
   const userId = Number(get('user'))
   const selectedUserId =
@@ -52,13 +83,12 @@ export function AuditLogs() {
     requestedPage <= 1000000
       ? requestedPage
       : 1
-  const window = useMemo(() => resolveTimeRange(range), [range])
-
-  useEffect(() => {
-    setBreadcrumbs([{ label: 'Audit Logs' }])
-  }, [setBreadcrumbs])
-
-  usePageTitle('Audit Logs')
+  // Refresh moves a preset window ("Last 24 hours") to now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const window = useMemo(() => {
+    void windowMoves
+    return resolveTimeRange(range)
+  }, [range, windowMoves])
 
   const {
     data: users,
@@ -69,12 +99,13 @@ export function AuditLogs() {
     ...listUsersOptions({
       query: { include_deleted: false },
     }),
-    enabled: canViewAuditLogs,
+    enabled: canViewAuditLogs && active,
   })
 
-  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+  const { data, isLoading, isError, refetch, isFetching } = useWindowQuery({
     ...listAuditLogsOptions({
       query: {
+        resource_id: resourceId,
         limit: ITEMS_PER_PAGE,
         offset: (page - 1) * ITEMS_PER_PAGE,
         from: range === 'all' ? undefined : window.from,
@@ -84,13 +115,15 @@ export function AuditLogs() {
           selectedUserId !== ALL_FILTER ? Number(selectedUserId) : undefined,
       },
     }),
-    enabled: canViewAuditLogs,
+    enabled: canViewAuditLogs && active,
   })
 
   const hasMore = data?.length === ITEMS_PER_PAGE
   const showEmptyState = !isLoading && !isError && data?.length === 0
   const hasFilters =
-    range !== '24h' || operation !== ALL_FILTER || selectedUserId !== ALL_FILTER
+    range !== defaultRange ||
+    operation !== ALL_FILTER ||
+    selectedUserId !== ALL_FILTER
 
   const operationOptions = useMemo(() => buildOperationOptions(), [])
 
@@ -152,18 +185,14 @@ export function AuditLogs() {
   }
 
   return (
-    <PageContainer innerClassName="space-y-6">
-      <PageHeader
-        title="Audit Logs"
-        description="Activity across the platform — authentication, project changes, skills, MCP servers, and more."
-      />
-
+    <div className="space-y-4">
       <div
         className="flex flex-wrap items-center gap-2"
         role="group"
         aria-label="Audit log filters"
       >
         <SearchableSelect
+          label="Operation type"
           value={operation}
           onValueChange={(operation) => patch({ operation, page: null })}
           options={operationOptions}
@@ -174,6 +203,7 @@ export function AuditLogs() {
           className="w-full sm:w-56"
         />
         <SearchableSelect
+          label="User"
           value={selectedUserId}
           onValueChange={(user) => patch({ user, page: null })}
           options={userOptions}
@@ -211,10 +241,27 @@ export function AuditLogs() {
             <X className="size-4" /> Reset filters
           </Button>
         )}
+        <RefreshButton
+          className="ml-auto"
+          queryKeys={[queryKeyPrefix(listAuditLogsQueryKey)]}
+          onRefresh={moveWindow}
+        />
       </div>
+      {resourceId && !fixedResourceId && (
+        <div className="flex flex-wrap items-center gap-2 text-sm">
+          <span className="break-all">Resource: {resourceId}</span>
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => patch({ resource: null, page: null })}
+          >
+            Show all resources
+          </Button>
+        </div>
+      )}
       <p className="text-sm text-muted-foreground">
-        Times use your browser’s time zone. Filters apply to all audit records;
-        results are shown {ITEMS_PER_PAGE} at a time.
+        Times use your browser’s time zone. Results are shown {ITEMS_PER_PAGE}{' '}
+        at a time.
       </p>
       {usersFailed && (
         <Callout tone="warning" title="User filter unavailable">
@@ -308,6 +355,6 @@ export function AuditLogs() {
           </div>
         </div>
       )}
-    </PageContainer>
+    </div>
   )
 }

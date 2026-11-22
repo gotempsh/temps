@@ -359,7 +359,7 @@ export function LogQueryInput({
             {!options.length && (
               <p className="px-2 py-3 text-xs text-muted-foreground">
                 {key === 'project' && projects.isFetching
-                  ? 'Loading projects…'
+                  ? 'Loading services…'
                   : facetKey && facets.isFetching
                     ? 'Loading suggestions…'
                     : colon >= 0
@@ -374,7 +374,7 @@ export function LogQueryInput({
               size="sm"
               onClick={() => void projects.refetch()}
             >
-              Retry project suggestions
+              Retry service suggestions
             </Button>
           )}
           {facetKey && facets.isError && (
@@ -388,7 +388,7 @@ export function LogQueryInput({
           )}
           {key === 'project' && (projects.data?.total ?? 0) > 100 && (
             <p className="px-3 pb-2 text-xs text-muted-foreground">
-              Type a project name to narrow suggestions.
+              Type a service name to narrow suggestions.
             </p>
           )}
           {facetKey && (

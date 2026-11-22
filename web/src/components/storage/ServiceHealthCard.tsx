@@ -166,6 +166,7 @@ export function ServiceHealthCard({ serviceId }: { serviceId: number }) {
 
         {data.recent_checks.length > 0 ? (
           <div
+            role="group"
             className="ml-auto flex h-5 items-stretch gap-px overflow-hidden rounded-sm"
             aria-label={`Last ${data.recent_checks.length} health checks`}
           >

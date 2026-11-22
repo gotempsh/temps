@@ -16,6 +16,10 @@ import {
   warning,
   keyValue,
 } from '../../ui/output.js'
+import {
+  registerLogIngestKeyCommands,
+  registerSavedLogCommands,
+} from './saved.js'
 
 // TODO: replace these local shapes with the generated `GlobalLogSearchRequest`
 // / `GlobalLogSearchResponse` / `GlobalLogFacetsRequest` / `GlobalLogFacetsResponse`
@@ -584,6 +588,9 @@ export function registerGlobalLogsCommands(program: Command): void {
     )
     .option('--json', 'Output in JSON format')
     .action(capabilitiesAction)
+
+  registerSavedLogCommands(logs)
+  registerLogIngestKeyCommands(logs)
 }
 
 /** Filter flags shared by `logs search` and `logs facets` — same body server-side. */

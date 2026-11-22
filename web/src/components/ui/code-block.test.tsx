@@ -1,0 +1,177 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { afterEach, expect, test } from 'bun:test'
+import { act, cleanup, fireEvent, render } from '@testing-library/react'
+import { installBrowserWindow } from '@/test/dom'
+import githubDark from 'shiki/themes/github-dark.mjs'
+import { CodeBlock } from './code-block'
+import { withReadableDarkComments } from './code-block-theme'
+
+installBrowserWindow()
+afterEach(cleanup)
+
+// Long unwrapped lines scroll horizontally; axe `scrollable-region-focusable`
+// requires such a scroller to be reachable from the keyboard.
+test('the code scroller is not a tab stop while the code fits', () => {
+  const view = render(<CodeBlock code="echo hi" language="bash" />)
+  const pre = view.container.querySelector('pre')
+  const scroller = pre?.parentElement
+  expect(scroller).toBeTruthy()
+  expect(scroller?.hasAttribute('tabindex')).toBe(false)
+})
+
+test('the code scroller becomes a tab stop once the code overflows', () => {
+  // happy-dom does no layout, so report an overflowing box for every element.
+  const widths = { scrollWidth: 900, clientWidth: 300 }
+  const originals = Object.entries(widths).map(
+    ([key]) =>
+      [
+        key,
+        Object.getOwnPropertyDescriptor(HTMLElement.prototype, key),
+      ] as const
+  )
+  for (const [key, value] of Object.entries(widths)) {
+    Object.defineProperty(HTMLElement.prototype, key, {
+      configurable: true,
+      get: () => value,
+    })
+  }
+  try {
+    const view = render(
+      <CodeBlock code={'x'.repeat(400)} language="bash" disableWrapToggle />
+    )
+    const scroller = view.container.querySelector('pre')?.parentElement
+    expect(scroller?.getAttribute('tabindex')).toBe('0')
+  } finally {
+    for (const [key, descriptor] of originals) {
+      if (descriptor)
+        Object.defineProperty(HTMLElement.prototype, key, descriptor)
+      else Reflect.deleteProperty(HTMLElement.prototype, key)
+    }
+  }
+})
+
+// github-dark's comment grey measured 3.45:1 on the dark code panel; axe
+// `color-contrast` needs 4.5:1.
+test('dark comments are lightened and other token colours are untouched', () => {
+  const colours = (theme: typeof githubDark) =>
+    (theme.tokenColors ?? []).map((rule) =>
+      rule.settings?.foreground?.toLowerCase()
+    )
+  const before = colours(githubDark)
+  const after = colours(withReadableDarkComments(githubDark))
+
+  expect(before).toContain('#6a737d')
+  expect(after).not.toContain('#6a737d')
+  expect(after).toContain('#8b949e')
+  expect(after).toHaveLength(before.length)
+  before.forEach((colour, index) => {
+    if (colour !== '#6a737d') expect(after[index]).toBe(colour)
+  })
+})
+
+// Untitled blocks look like the docs: the code starts at the top and the
+// controls float in the corner, appearing on hover or keyboard focus, on the
+// panel colour so a long unwrapped line never shows through them. On touch
+// screens they take their own row so they never cover the code.
+test.each([
+  { showCopy: true, disableWrapToggle: false },
+  { showCopy: false, disableWrapToggle: false },
+  { showCopy: false, disableWrapToggle: true },
+])('untitled controls float over the code like the docs: %j', async (props) => {
+  const command = `bunx @temps-sdk/cli mcp add claude-code --url https://${'long-'.repeat(30)}example.test`
+  const view = render(<CodeBlock code={command} language="text" {...props} />)
+  await act(async () => {})
+  const pre = view.container.querySelector('pre')!
+  const scroller = pre.parentElement!
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+
+  expect(controls.nextElementSibling).toBe(scroller)
+  expect(controls.classList.contains('absolute')).toBe(true)
+  expect(controls.classList.contains('opacity-0')).toBe(true)
+  expect(controls.className).toContain('group-hover/code:opacity-100')
+  expect(controls.className).toContain('group-focus-within/code:opacity-100')
+  // Touch screens have no hover: the controls stay visible in their own row
+  // above the code instead of covering its first line.
+  expect(controls.className).toContain('[@media(hover:none)]:opacity-100')
+  expect(controls.className).toContain('[@media(hover:none)]:static')
+  expect(controls.className).toContain('[@media(hover:none)]:self-end')
+  expect(scroller.className).toContain('[@media(hover:none)]:pt-1')
+  expect(controls.className).toContain('bg-white/90')
+  // No toolbar row: the code is padded evenly from the top.
+  expect(scroller.classList.contains('py-4')).toBe(true)
+  expect(scroller.classList.contains('pt-2')).toBe(false)
+  expect(scroller.classList.contains('w-full')).toBe(true)
+  expect(pre.textContent).toBe(command)
+
+  if (!props.disableWrapToggle) {
+    fireEvent.click(view.getByRole('button', { name: 'Enable line wrap' }))
+    expect(pre.classList.contains('whitespace-pre-wrap')).toBe(true)
+    expect(pre.textContent).toBe(command)
+  }
+})
+
+// A titled block keeps its controls in the title bar, so no empty toolbar
+// row sits between the title and the code.
+test('titled blocks keep their controls in the title bar on touch screens too', () => {
+  const view = render(<CodeBlock code="A=1" language="bash" title=".env" />)
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+  expect(controls.className).not.toContain('absolute')
+  expect(controls.className).not.toContain('[@media(hover:none)]')
+  const scroller = view.container.querySelector('pre')!.parentElement!
+  expect(scroller.className).not.toContain('[@media(hover:none)]:pt-1')
+})
+
+test('a titled block puts its controls in the title bar', async () => {
+  const view = render(<CodeBlock code="A=1" language="bash" title=".env" />)
+  await act(async () => {})
+  const controls = view.getByRole('button', {
+    name: 'Show line numbers',
+  }).parentElement!
+  const header = controls.parentElement!
+  expect(header.textContent).toContain('.env')
+  expect(
+    header.nextElementSibling?.firstElementChild?.querySelector('pre')
+  ).toBeTruthy()
+  expect(view.getAllByRole('button', { name: 'Copy' })).toHaveLength(1)
+})
+
+test('wrapped lines break at spaces before splitting a word', () => {
+  const view = render(<CodeBlock code="echo hi" language="bash" defaultWrap />)
+  const pre = view.container.querySelector('pre')!
+  expect(pre.className).toContain('[overflow-wrap:anywhere]')
+  expect(pre.className).not.toContain('break-all')
+})
+
+// Self-hosted instances reached over plain http have no Clipboard API; the
+// copy control falls back to a selection copy instead of failing silently.
+test('copying works without the Clipboard API', async () => {
+  const clipboard = Object.getOwnPropertyDescriptor(navigator, 'clipboard')
+  const execCommand = document.execCommand
+  const copied: string[] = []
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: undefined,
+  })
+  document.execCommand = ((command: string) => {
+    const field = document.querySelector('textarea')
+    if (command === 'copy' && field) copied.push(field.value)
+    return true
+  }) as typeof document.execCommand
+  try {
+    const view = render(<CodeBlock code="echo hi" language="bash" title="x" />)
+    await act(async () => {
+      fireEvent.click(view.getByRole('button', { name: 'Copy' }))
+    })
+    expect(copied).toEqual(['echo hi'])
+  } finally {
+    document.execCommand = execCommand
+    if (clipboard) Object.defineProperty(navigator, 'clipboard', clipboard)
+    else Reflect.deleteProperty(navigator, 'clipboard')
+  }
+})

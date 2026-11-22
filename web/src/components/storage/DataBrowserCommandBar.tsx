@@ -212,7 +212,7 @@ export function DataBrowserCommandBar({
         {results.length > 0 && (
           <CommandGroup heading={input.trim() ? 'Matches' : 'Recent'}>
             {!input.trim() && results.length > 0 && (
-              <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground/70 flex items-center gap-1">
+              <div className="px-2 py-1 text-[10px] uppercase tracking-wider text-muted-foreground flex items-center gap-1">
                 <Clock className="h-3 w-3" />
                 ranked by frequency + recency
               </div>

@@ -3,11 +3,12 @@
 
 //! Optional per-sandbox preview password.
 //!
-//! Sandboxes default to "URL-only" protection: the 16-hex public_id is the
-//! only thing standing between the caller and the container. Users who need
-//! a stronger gate can set a password via `PUT /v1/sandbox/{id}/preview-password`.
-//! When set, the proxy's `check_preview_auth` path requires a cookie minted
-//! against the stored argon2 hash before forwarding traffic.
+//! Sandboxes default to `temps_login` preview access: a visitor must be a
+//! signed-in Temps user who may read the sandbox. Setting a password via
+//! `PUT /v1/sandboxes/{id}/preview-password` switches the sandbox to
+//! `password` access instead, so a reviewer without a Temps account can be
+//! let in; the proxy's `check_preview_auth` path then requires a cookie
+//! minted against the stored argon2 hash before forwarding traffic.
 //!
 //! Unlike workspace sessions, sandbox passwords are **user-supplied**, not
 //! generated. The user picks the password; we never see it again after

@@ -30,10 +30,13 @@ describe('projectLoadState', () => {
     }
   })
 
-  test('a refused read is a failed read, not a missing project', () => {
+  test('a refused read is forbidden, not a missing project or a retryable failure', () => {
     expect(
       projectLoadState({ ...base, error: problem(403, 'Forbidden') })
-    ).toBe('failed')
+    ).toBe('forbidden')
+    expect(
+      projectLoadState({ ...base, error: problem(401, 'Unauthorized') })
+    ).toBe('forbidden')
   })
 
   test('a network error is a failed read', () => {

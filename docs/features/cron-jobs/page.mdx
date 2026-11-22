@@ -324,6 +324,27 @@ async def cleanup_cron(authorization: str = Header(None)):
 
 ---
 
+## Start a Durable Workflow on a Schedule {{ anchor: true, id: 'workflow-crons' }}
+
+Instead of calling an endpoint, a cron can start a run of a durable workflow defined with a Temps workflows SDK (`@temps-sdk/workflows`). The run survives restarts and deploys and retries its own steps, so the cron does not need to.
+
+```yaml
+# .temps.yaml
+cron:
+  - workflow: send-digest          # the workflow's name in your code
+    input: { "period": "weekly" }  # optional, given to every run
+    schedule: "0 8 * * 1"
+    concurrency_policy: forbid     # allow | forbid (default) | replace
+    starting_deadline_seconds: 600 # optional: skip a run that starts this late
+```
+
+- Starts use an idempotency key per cron occurrence: retrying a start returns the same run while it is retained. Scheduling is best effort: the scheduler advances the due time before dispatch, so a crash in that gap can skip an occurrence. Once started, the workflow run is durable.
+- `forbid` skips an occurrence while the previous run is still active; `replace` cancels the active run (and its child runs) first; `allow` overlaps them.
+- The execution history shows each run's id and settles it as **Success** or **Failed** when the run finishes. A skipped or refused occurrence says why (for example `StartRefused` when the workflow name is invalid or the environment's active-run quota is reached).
+- `path`, `command`, `retry_limit`, `timeout_seconds` and `ttl_seconds_after_finished` do not apply to a workflow cron and are refused. Give two schedules of one workflow different `name`s.
+
+---
+
 ## Per-Environment Scheduling {{ anchor: true, id: 'per-environment-scheduling' }}
 
 Cron jobs defined in `.temps.yaml` are configured **per environment** when you deploy. This means:

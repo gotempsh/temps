@@ -47,7 +47,7 @@ export function DataBrowserTabs({
   if (tabs.length === 0) return null
 
   return (
-    <div className="flex items-stretch gap-0.5 border-b bg-muted/20 overflow-x-auto scrollbar-thin">
+    <div className="flex items-stretch gap-0.5 border-b bg-muted/20 overflow-x-auto overflow-y-hidden scrollbar-thin">
       {tabs.map((tab) => {
         const isActive = tab.id === activeTabId
         const Icon = tab.entity ? TableIcon : Database
@@ -83,7 +83,7 @@ export function DataBrowserTabs({
             <div className="flex-1 min-w-0 flex flex-col">
               <span className="truncate font-medium">{tabLabel(tab)}</span>
               {tabSubtitle(tab) && (
-                <span className="truncate text-[10px] text-muted-foreground/70">
+                <span className="truncate text-[10px] text-muted-foreground">
                   {tabSubtitle(tab)}
                 </span>
               )}

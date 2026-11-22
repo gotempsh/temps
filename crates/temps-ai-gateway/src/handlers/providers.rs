@@ -10,11 +10,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::permissions::Permission;
-use temps_auth::{AuthContext, RequireAuth};
+use temps_authz::permission_guard;
+use temps_authz::permissions::Permission;
+use temps_authz::{AuthContext, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
+use temps_core::secret_string::SecretString;
 use temps_core::RequestMetadata;
 use utoipa::{OpenApi, ToSchema};
 
@@ -28,7 +29,7 @@ use crate::handlers::types::AiGatewayAppState;
 use crate::provider_url::KeyTrust;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
 use crate::services::{NewProviderKey, ProviderKeyUpdate, TrustChange, TrustRequest};
-use crate::types::ModelInfo;
+use crate::types::DiscoveredModel;
 
 // ============================================================================
 // Error conversion
@@ -50,9 +51,21 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::UpstreamTimeout { .. } => {
+                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                    .with_title("AI Provider Timed Out")
+                    .with_detail(error.to_string())
+            }
             AiGatewayError::HttpClient(_) => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("AI Provider Unavailable")
                 .with_detail(error.to_string()),
+            AiGatewayError::UpstreamMalformedResponse { ref provider, .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("AI Provider Returned An Unreadable Response")
+                    .with_detail(format!(
+                        "Provider '{provider}' returned a response Temps could not read"
+                    ))
+            }
             AiGatewayError::ProviderNotConfigured { .. } => {
                 problemdetails::new(StatusCode::NOT_FOUND)
                     .with_title("Provider Not Configured")
@@ -64,11 +77,19 @@ impl From<AiGatewayError> for Problem {
             AiGatewayError::ModelNotAllowed { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Model Not Allowed")
                 .with_detail(error.to_string()),
-            AiGatewayError::UpstreamError { status, .. } => {
-                let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
+            AiGatewayError::UpstreamError {
+                ref model,
+                status,
+                ref message,
+            } => {
+                let http_status =
+                    StatusCode::from_u16(crate::error::upstream_failure_status(status))
+                        .unwrap_or(StatusCode::BAD_GATEWAY);
                 problemdetails::new(http_status)
                     .with_title("Upstream Provider Error")
-                    .with_detail(error.to_string())
+                    .with_detail(crate::error::upstream_failure_message(
+                        model, status, message,
+                    ))
             }
             AiGatewayError::TranslationError { .. } => problemdetails::new(StatusCode::BAD_GATEWAY)
                 .with_title("Translation Error")
@@ -117,6 +138,19 @@ impl From<AiGatewayError> for Problem {
                     .with_title("Capability Not Declared")
                     .with_detail(error.to_string())
             }
+            AiGatewayError::RateLimited { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("AI Gateway Rate Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::BudgetExceeded { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("AI Gateway Budget Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::ProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Project Not Found")
+                .with_detail(error.to_string()),
         }
     }
 }
@@ -226,6 +260,11 @@ pub struct ProviderModelResponse {
     pub is_available: bool,
     pub is_enabled: bool,
     pub owned_by: Option<String>,
+    /// What the provider's catalogue says about the model: name, context
+    /// window, input/output modalities, prices and tool support. Absent for
+    /// manual models and for providers whose catalogue lists only ids.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<crate::types::ModelDetails>,
     pub last_seen_at: Option<String>,
     pub updated_at: String,
 }
@@ -241,6 +280,9 @@ impl From<temps_entities::ai_provider_models::Model> for ProviderModelResponse {
             is_available: model.is_available,
             is_enabled: model.is_enabled,
             owned_by: model.owned_by,
+            details: model
+                .metadata
+                .and_then(|metadata| serde_json::from_value(metadata).ok()),
             last_seen_at: model.last_seen_at.map(|value| value.to_rfc3339()),
             updated_at: model.updated_at.to_rfc3339(),
         }
@@ -297,7 +339,7 @@ pub struct CreateProviderKeyRequest {
     /// Provider API key. Optional only for self-hosted providers that run
     /// without authentication.
     #[serde(default)]
-    pub api_key: String,
+    pub api_key: SecretString,
     /// Required for "openai_compatible", e.g. "http://10.0.0.5:8000/v1".
     pub base_url: Option<String>,
     /// Model id to pin for this provider (e.g. "gpt-4o-mini"). Required for
@@ -335,7 +377,7 @@ where
 pub struct UpdateProviderKeyRequest {
     pub display_name: Option<String>,
     /// New API key. An empty string removes it, for self-hosted keys only.
-    pub api_key: Option<String>,
+    pub api_key: Option<SecretString>,
     /// Double-Option: absent = leave unchanged, present-null = clear (revert to
     /// the provider's default endpoint), present-value = set. Moving the base
     /// URL to another address drops the per-key private-address trust.
@@ -353,6 +395,24 @@ pub struct UpdateProviderKeyRequest {
     pub capabilities: Option<SelfHostedCapabilities>,
 }
 
+/// The endpoint and model a replacement key is checked against: those the same
+/// request sets, otherwise the ones already on the key. A field the request
+/// clears is checked as cleared, which is how the key will then be used.
+fn replacement_check_target<'a>(
+    current: &'a temps_entities::ai_provider_keys::Model,
+    request: &'a UpdateProviderKeyRequest,
+) -> (Option<&'a str>, Option<&'a str>) {
+    let base_url = match request.base_url.as_ref() {
+        Some(requested) => requested.as_deref(),
+        None => current.base_url.as_deref(),
+    };
+    let default_model = match request.default_model.as_ref() {
+        Some(requested) => requested.as_deref(),
+        None => current.default_model.as_deref(),
+    };
+    (base_url, default_model)
+}
+
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct TestProviderKeyRequest {
     /// Provider ID: "openai", "anthropic", "xai", "gemini", "openrouter",
@@ -360,7 +420,7 @@ pub struct TestProviderKeyRequest {
     pub provider: String,
     /// The raw API key to test (may be empty for a self-hosted provider)
     #[serde(default)]
-    pub api_key: String,
+    pub api_key: SecretString,
     /// Optional custom base URL (required for "openai_compatible")
     pub base_url: Option<String>,
     /// Model to send the test completion to. Required for
@@ -388,7 +448,7 @@ pub struct DiscoverProviderModelsRequest {
     pub provider: String,
     /// API key, if the server requires one
     #[serde(default)]
-    pub api_key: String,
+    pub api_key: SecretString,
     /// Base URL of the server (required for "openai_compatible")
     pub base_url: Option<String>,
     /// Discover as if the base URL's exact private address were trusted on
@@ -401,13 +461,16 @@ pub struct DiscoverProviderModelsRequest {
 pub struct DiscoveredModelResponse {
     pub id: String,
     pub owned_by: String,
+    /// The model's human-readable name, when the server's listing gives one.
+    pub name: Option<String>,
 }
 
-impl From<ModelInfo> for DiscoveredModelResponse {
-    fn from(model: ModelInfo) -> Self {
+impl From<DiscoveredModel> for DiscoveredModelResponse {
+    fn from(model: DiscoveredModel) -> Self {
         Self {
-            id: model.id,
-            owned_by: model.owned_by,
+            id: model.info.id,
+            owned_by: model.info.owned_by,
+            name: model.details.and_then(|details| details.name),
         }
     }
 }
@@ -454,12 +517,40 @@ fn requested_key_trust(
 /// Errors from verifying a new key. A blocked base URL is reported as is,
 /// with its hint, so the form explains what to change (#1410); everything
 /// else reads as a failed verification.
-fn verification_error(error: AiGatewayError) -> AiGatewayError {
+///
+/// A vendor provider (OpenAI, Anthropic, ...) given a custom base URL is
+/// verified with that vendor's own model names, so pointing it at another
+/// vendor's OpenAI-compatible API (DeepSeek, Groq, ...) fails with an
+/// unknown-model error. `custom_vendor_base_url` carries the provider id in
+/// that case so the message says which provider to use instead. The hint is
+/// only added when the server rejected the request itself (400, 404, 422),
+/// which is how an unknown model comes back; a rejected key (401/403), a
+/// server failure or an unreachable host has another fix.
+fn verification_error(
+    error: AiGatewayError,
+    custom_vendor_base_url: Option<&str>,
+) -> AiGatewayError {
     match error {
         AiGatewayError::InvalidProviderUrl { .. } => error,
-        other => AiGatewayError::Validation {
-            message: format!("API key verification failed: {}", other.summary()),
-        },
+        other => {
+            let model_rejected = matches!(
+                other,
+                AiGatewayError::UpstreamError {
+                    status: 400 | 404 | 422,
+                    ..
+                }
+            );
+            let mut message = format!("API key verification failed: {}", other.summary());
+            if let Some(provider) = custom_vendor_base_url.filter(|_| model_rejected) {
+                message.push_str(&format!(
+                    ". The custom base URL on a '{provider}' key must serve {provider}'s own \
+                     models; for any other API that speaks the OpenAI protocol (DeepSeek, \
+                     Groq, Together, vLLM, ...) add an OpenAI-compatible provider instead, \
+                     which lists the server's models at /models"
+                ));
+            }
+            AiGatewayError::Validation { message }
+        }
     }
 }
 
@@ -542,8 +633,8 @@ async fn create_provider_key(
     let self_hosted = is_self_hosted(&request.provider);
     if self_hosted && base_url.is_none() {
         return Err(AiGatewayError::Validation {
-            message: "A base URL is required for a self-hosted (OpenAI-compatible) provider, \
-                      e.g. http://10.0.0.5:8000/v1"
+            message: "A base URL is required for an OpenAI-compatible provider, \
+                      e.g. https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1"
                 .to_string(),
         }
         .into());
@@ -555,7 +646,7 @@ async fn create_provider_key(
         let listing = app_state
             .gateway_service
             .discover_self_hosted_with_default(
-                &request.api_key,
+                request.api_key.expose(),
                 base_url,
                 request.default_model.as_deref(),
                 key_trust,
@@ -573,20 +664,27 @@ async fn create_provider_key(
         .gateway_service
         .test_provider(
             &request.provider,
-            &request.api_key,
+            request.api_key.expose(),
             base_url,
             default_model.as_deref(),
             key_trust,
         )
         .await
-        .map_err(verification_error)?;
+        .map_err(|error| {
+            verification_error(
+                error,
+                base_url
+                    .filter(|_| !self_hosted)
+                    .map(|_| request.provider.as_str()),
+            )
+        })?;
 
     let mut key = app_state
         .provider_key_service
         .create(NewProviderKey {
             provider: &request.provider,
             display_name: &request.display_name,
-            api_key: &request.api_key,
+            api_key: request.api_key.expose(),
             base_url,
             default_model: None,
             trust: key_trust.map(|_| TrustRequest {
@@ -692,7 +790,12 @@ async fn discover_provider_models(
     let key_trust = requested_key_trust(&auth, request.trust_private_address, base_url)?;
     let models = app_state
         .gateway_service
-        .discover_models(&request.provider, &request.api_key, base_url, key_trust)
+        .discover_model_catalog(
+            &request.provider,
+            request.api_key.expose(),
+            base_url,
+            key_trust,
+        )
         .await
         .map_err(|error| match error {
             AiGatewayError::InvalidProviderUrl { .. }
@@ -859,7 +962,7 @@ async fn delete_provider_model(
     request_body = UpdateProviderKeyRequest,
     responses(
         (status = 200, description = "Provider key updated", body = ProviderKeyResponse),
-        (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 400, description = "Validation error, or a new API key that failed verification (the current key is kept)", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Not found", body = ProblemDetails)
@@ -895,13 +998,44 @@ async fn update_provider_key(
     }
 
     let before = app_state.provider_key_service.get_by_id(id).await?;
+
+    // A replacement key is verified like a new one, against the endpoint and
+    // model it will be used with, before it overwrites a working key.
+    if let Some(api_key) = request.api_key.as_ref() {
+        let (base_url, default_model) = replacement_check_target(&before, &request);
+        let check_trust = match request.trust_private_address {
+            Some(trust) => requested_key_trust(&auth, trust, base_url)?,
+            None => KeyTrust::from_stored(before.trusted_private_address.as_deref()),
+        };
+        app_state
+            .gateway_service
+            .test_provider(
+                &before.provider,
+                api_key.expose(),
+                base_url,
+                default_model,
+                check_trust,
+            )
+            .await
+            .map_err(|error| match error {
+                AiGatewayError::InvalidProviderUrl { .. } => error,
+                other => AiGatewayError::Validation {
+                    message: format!(
+                        "API key verification failed for provider key {id} ('{}'); the current key was kept: {}",
+                        before.display_name,
+                        other.summary()
+                    ),
+                },
+            })?;
+    }
+
     let key = app_state
         .provider_key_service
         .update(
             id,
             ProviderKeyUpdate {
                 display_name: request.display_name.as_deref(),
-                api_key: request.api_key.as_deref(),
+                api_key: request.api_key.as_ref().map(SecretString::expose),
                 base_url: request.base_url.as_ref().map(|o| o.as_deref()),
                 default_model: request.default_model.as_ref().map(|o| o.as_deref()),
                 is_active: request.is_active,
@@ -1011,7 +1145,7 @@ async fn test_provider_key_inline(
         .gateway_service
         .test_provider(
             &request.provider,
-            &request.api_key,
+            request.api_key.expose(),
             base_url,
             request.default_model.as_deref(),
             key_trust,
@@ -1054,7 +1188,11 @@ async fn test_provider_key_by_id(
     State(app_state): State<Arc<AiGatewayAppState>>,
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayRead);
+    // Write, not Read: this decrypts a stored provider credential and spends
+    // it on an outbound call. A read-only principal must not be able to drive
+    // use of secret credentials -- the same bar as the inline test and
+    // discover endpoints, which also exercise a key against a provider.
+    permission_guard!(auth, AiGatewayWrite);
 
     // get_by_id already returns Err(ProviderKeyNotFound) if not found
     let key_record = app_state.provider_key_service.get_by_id(id).await?;
@@ -1134,5 +1272,142 @@ mod patch_deser_tests {
 
         let absent: UpdateProviderKeyRequest = serde_json::from_str(r#"{}"#).unwrap();
         assert_eq!(absent.default_model, None);
+    }
+}
+
+#[cfg(test)]
+mod replacement_check_tests {
+    use super::{replacement_check_target, UpdateProviderKeyRequest};
+    use chrono::Utc;
+    use temps_entities::ai_provider_keys;
+
+    fn key(base_url: Option<&str>, default_model: Option<&str>) -> ai_provider_keys::Model {
+        ai_provider_keys::Model {
+            id: 7,
+            provider: "openai".to_string(),
+            display_name: "Team key".to_string(),
+            api_key_encrypted: "encrypted".to_string(),
+            base_url: base_url.map(str::to_string),
+            default_model: default_model.map(str::to_string),
+            is_active: true,
+            trusted_private_address: None,
+            trusted_private_address_set_by: None,
+            trusted_private_address_set_at: None,
+            capabilities: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn request(json: &str) -> UpdateProviderKeyRequest {
+        serde_json::from_str(json).expect("a valid update request")
+    }
+
+    #[test]
+    fn a_new_key_alone_is_checked_against_the_keys_own_endpoint_and_model() {
+        let current = key(Some("https://llm.example.test/v1"), Some("small-model"));
+        let update = request(r#"{"api_key":"sk-new"}"#);
+        assert_eq!(
+            replacement_check_target(&current, &update),
+            (Some("https://llm.example.test/v1"), Some("small-model"))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_and_model_changed_with_the_key_are_the_ones_checked() {
+        let current = key(Some("https://old.example.test/v1"), Some("old-model"));
+        let update = request(
+            r#"{"api_key":"sk-new","base_url":"https://new.example.test/v1","default_model":"new-model"}"#,
+        );
+        assert_eq!(
+            replacement_check_target(&current, &update),
+            (Some("https://new.example.test/v1"), Some("new-model"))
+        );
+    }
+
+    #[test]
+    fn a_cleared_endpoint_or_model_is_checked_as_cleared() {
+        let current = key(Some("https://old.example.test/v1"), Some("old-model"));
+        let update = request(r#"{"api_key":"sk-new","base_url":null,"default_model":null}"#);
+        assert_eq!(replacement_check_target(&current, &update), (None, None));
+    }
+
+    #[test]
+    fn a_replacement_key_never_prints_through_debug() {
+        let update = request(r#"{"api_key":"sk-secret-value"}"#);
+        let rendered = format!("{update:?}");
+        assert!(!rendered.contains("sk-secret-value"), "{rendered}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn upstream_error() -> AiGatewayError {
+        upstream_status(400, "unknown model")
+    }
+
+    fn upstream_status(status: u16, message: &str) -> AiGatewayError {
+        AiGatewayError::UpstreamError {
+            model: "gpt-5-nano".to_string(),
+            status,
+            message: message.to_string(),
+        }
+    }
+
+    #[test]
+    fn verification_error_hints_only_when_the_model_was_rejected() {
+        let message = |error: AiGatewayError| match verification_error(error, Some("openai")) {
+            AiGatewayError::Validation { message } => message,
+            other => panic!("expected a validation error, got {other:?}"),
+        };
+        assert!(message(upstream_status(404, "model_not_found")).contains("OpenAI-compatible"));
+        // A wrong key, a failing server or an unreachable host is fixed
+        // elsewhere, not by changing the provider type.
+        for error in [
+            upstream_status(401, "invalid api key"),
+            upstream_status(503, "overloaded"),
+            AiGatewayError::HttpClient("connection refused".to_string()),
+        ] {
+            let message = message(error);
+            assert!(!message.contains("OpenAI-compatible"), "{message}");
+        }
+    }
+
+    #[test]
+    fn verification_error_suggests_openai_compatible_for_vendor_with_custom_base_url() {
+        let error = verification_error(upstream_error(), Some("openai"));
+
+        let AiGatewayError::Validation { message } = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(
+            message.starts_with("API key verification failed:"),
+            "{message}"
+        );
+        assert!(message.contains("gpt-5-nano"), "{message}");
+        assert!(
+            message.contains("'openai' key must serve openai's own models"),
+            "{message}"
+        );
+        assert!(
+            message.contains("add an OpenAI-compatible provider"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn verification_error_without_custom_base_url_has_no_hint() {
+        let error = verification_error(upstream_error(), None);
+
+        let AiGatewayError::Validation { message } = error else {
+            panic!("expected a validation error, got {error:?}");
+        };
+        assert!(
+            message.starts_with("API key verification failed:"),
+            "{message}"
+        );
+        assert!(!message.contains("OpenAI-compatible"), "{message}");
     }
 }

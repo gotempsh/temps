@@ -23,8 +23,9 @@ use crate::handlers::audit::{
 };
 use crate::services::anomaly_preview::{compute_anomaly_preview, compute_static_preview};
 use crate::services::metric_alert_evaluator::SeriesStateEntry;
+use crate::services::metric_alert_service::AlertSeriesSource;
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::metric_alert_rules::Model;
@@ -53,9 +54,17 @@ pub struct ListMetricAlertsParams {
 pub struct CreateMetricAlertRequest {
     pub project_id: i32,
     pub name: String,
-    pub metric_name: String,
-    /// One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`.
+    /// The OTel metric to watch. Required unless `source` is a saved log
+    /// search, in which case the series is named by the server.
+    pub metric_name: Option<String>,
+    /// One of `avg|sum|min|max|count|rate|p50|p90|p95|p99`. Forced to
+    /// `count` for a log alert, which counts matching lines.
     pub aggregation: String,
+    /// What the rule watches: the metric above (the default), or the number
+    /// of log lines matching a saved search per window (ADR 108 D1):
+    /// `{"kind":"logs","saved_search_id":3}`.
+    #[serde(default)]
+    pub source: AlertSeriesSource,
     /// The detector: a discriminated union keyed by `kind`. Today only
     /// `{ "kind": "static", "comparator": "gt", "threshold": 500 }` is evaluable.
     pub detection_config: DetectionConfig,
@@ -93,6 +102,8 @@ pub struct UpdateMetricAlertRequest {
     pub name: Option<String>,
     pub metric_name: Option<String>,
     pub aggregation: Option<String>,
+    /// Switches what the rule watches when present (absent = unchanged).
+    pub source: Option<AlertSeriesSource>,
     /// Replaces the detector wholesale when present (absent = leave unchanged).
     pub detection_config: Option<DetectionConfig>,
     pub window_secs: Option<i32>,
@@ -142,6 +153,9 @@ pub struct OtelMetricAlertRuleResponse {
     pub aggregation: String,
     /// Coarse detector discriminator: `static|anomaly|forecast|outlier|auto_watch`.
     pub detection_kind: String,
+    /// What the rule watches: the named metric, or a saved log search
+    /// (ADR 108 D1).
+    pub source: AlertSeriesSource,
     /// The typed detector definition (discriminated union keyed by `kind`).
     pub detection_config: DetectionConfig,
     pub window_secs: i32,
@@ -207,6 +221,19 @@ impl From<Model> for OtelMetricAlertRuleResponse {
         // malformed/legacy jsonb decodes to an empty map rather than failing.
         let series_states: std::collections::HashMap<String, SeriesStateEntry> =
             serde_json::from_value(model.series_states).unwrap_or_default();
+        // A row whose two source columns disagree is corruption. It reads as
+        // a metric rule here (so the list still serves) and is refused by
+        // `update` until the caller sets a source explicitly.
+        let source = AlertSeriesSource::from_columns(&model.source, model.saved_search_id)
+            .unwrap_or_else(|| {
+                warn!(
+                    rule_id = model.id,
+                    source = %model.source,
+                    saved_search_id = ?model.saved_search_id,
+                    "metric_alert_rules source columns disagree; reporting the rule as a metric rule"
+                );
+                AlertSeriesSource::Metric
+            });
         Self {
             id: model.id,
             project_id: model.project_id,
@@ -214,6 +241,7 @@ impl From<Model> for OtelMetricAlertRuleResponse {
             metric_name: model.metric_name,
             aggregation: model.aggregation,
             detection_kind: model.detection_kind,
+            source,
             detection_config,
             window_secs: model.window_secs,
             for_duration_secs: model.for_duration_secs,
@@ -397,7 +425,7 @@ pub async fn create_alert(
         .create(
             request.project_id,
             request.name,
-            request.metric_name,
+            request.metric_name.unwrap_or_default(),
             request.aggregation,
             request.detection_config,
             request.window_secs,
@@ -409,6 +437,7 @@ pub async fn create_alert(
             request.dynamic_alerts,
             request.max_series,
             request.grouped_notification_threshold,
+            request.source,
         )
         .await?;
 
@@ -498,7 +527,7 @@ pub async fn update_alert(
     project_scope_guard!(auth, scope.project_id);
     project_access_guard!(auth, scope.project_id, state.project_access_checker);
 
-    let model = state
+    let update = state
         .metric_alert_service
         .update(
             scope.project_id,
@@ -516,8 +545,18 @@ pub async fn update_alert(
             request.dynamic_alerts,
             request.max_series,
             request.grouped_notification_threshold,
+            request.source,
         )
         .await?;
+    let model = update.model;
+    if update.series_changed {
+        // The old series' alarms describe something the rule no longer
+        // watches, and nothing would ever evaluate them again.
+        state
+            .metric_alert_evaluator
+            .resolve_all_for_rule(model.id, model.project_id)
+            .await;
+    }
 
     let audit = OtelMetricAlertUpdatedAudit {
         context: AuditContext {

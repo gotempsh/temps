@@ -132,6 +132,7 @@ mod tests {
 
     fn make_span(trace_id: &str, status: SpanStatusCode, duration_ms: f64) -> SpanRecord {
         SpanRecord {
+            ingest_identity: None,
             project_id: 1,
             deployment_id: None,
             resource: ResourceInfo::default(),

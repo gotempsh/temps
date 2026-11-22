@@ -35,6 +35,19 @@ describe("toRatePerSecond", () => {
     expect(rate.map((p) => p.value)).toEqual([100, 200]);
   });
 
+  test("keeps empty buckets null and spreads the post-gap increase over the gap", () => {
+    const rate = toRatePerSecond(
+      [
+        { time: t(0), value: 6000 },
+        { time: t(60), value: null },
+        { time: t(120), value: null },
+        { time: t(180), value: 18000 },
+      ],
+      60,
+    );
+    expect(rate.map((p) => p.value)).toEqual([100, null, null, 100]);
+  });
+
   test("single point uses fallback step and negatives floor at zero", () => {
     expect(toRatePerSecond([{ time: t(0), value: 300 }], 30)[0]?.value).toBe(
       10,

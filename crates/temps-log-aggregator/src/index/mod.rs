@@ -67,6 +67,22 @@ pub trait LineIndexSink: Send + Sync {
         Ok(())
     }
 
+    /// Physically remove rows that `forget_chunks` only masked. Called on
+    /// every forget-sweeper pass; implementations rate-limit themselves and
+    /// return the number of chunk entries reclaimed (`0` when not due or
+    /// when the store deletes eagerly). The rows are already invisible to
+    /// reads, so a failure here only delays reclaiming the space.
+    async fn reclaim_forgotten(&self) -> Result<u64, LogAggregatorError> {
+        Ok(0)
+    }
+
+    /// Write rollups the index accumulates in memory between inserts (the
+    /// local attribute-key counts). Called on every forget-sweeper pass so
+    /// counts never wait on the next insert; returns the rows written.
+    async fn flush_rollups(&self) -> Result<u64, LogAggregatorError> {
+        Ok(0)
+    }
+
     /// Keep the index's own expiry equal to the chunk retention window
     /// (ADR-047 §6). Called on every retention tick with the current
     /// setting; implementations must be idempotent.

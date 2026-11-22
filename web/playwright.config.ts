@@ -2,6 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { defineConfig, devices } from '@playwright/test'
+import { fileURLToPath } from 'node:url'
+
+import {
+  missingSmokeSpecs,
+  selectedSuite,
+  SMOKE_SPECS,
+  specMatcher,
+} from './e2e/suites'
 
 /**
  * Playwright drives the console as a user does, against a *real* running Temps
@@ -32,6 +40,23 @@ import { defineConfig, devices } from '@playwright/test'
  */
 
 const baseURL = process.env.E2E_BASE_URL ?? 'http://localhost:8081'
+
+// `E2E_SUITE=smoke` is the pull-request gate; unset (or `full`) runs every
+// spec. See e2e/suites.ts for what each one contains and why.
+const suite = selectedSuite(process.env.E2E_SUITE)
+if (suite === 'smoke') {
+  const missing = missingSmokeSpecs(
+    fileURLToPath(new URL('./e2e', import.meta.url))
+  )
+  if (missing.length > 0) {
+    throw new Error(
+      `e2e/suites.ts lists smoke specs that do not exist: ${missing.join(', ')}`
+    )
+  }
+}
+// Undefined leaves Playwright's default (every *.spec.ts under the testDir).
+const smokeOnly = (files: readonly string[]) =>
+  suite === 'smoke' ? specMatcher(files) : undefined
 
 export default defineConfig({
   testDir: './e2e',
@@ -82,6 +107,7 @@ export default defineConfig({
     {
       name: 'chromium-anonymous',
       testDir: './e2e/anonymous',
+      testMatch: smokeOnly(SMOKE_SPECS.anonymous),
       use: {
         ...devices['Desktop Chrome'],
         storageState: { cookies: [], origins: [] },
@@ -90,6 +116,7 @@ export default defineConfig({
     {
       name: 'chromium',
       testDir: './e2e/authenticated',
+      testMatch: smokeOnly(SMOKE_SPECS.authenticated),
       use: {
         ...devices['Desktop Chrome'],
         storageState: 'e2e/.auth/user.json',

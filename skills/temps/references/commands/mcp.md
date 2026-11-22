@@ -40,19 +40,26 @@ Disable the Temps MCP server on this instance (admin)
 
 Configure an AI client to connect to this Temps instance over MCP. Clients: claude-code, claude-desktop, codex, cursor, vscode, windsurf, zed
 
+**Usage:** `mcp add [client] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-g, --groups <groups>` | Comma-separated tool groups to enable (default: all) | - | No |
+| `-g, --groups <groups>` | Legacy tool-group filter (optional; does not restrict temps/temps_write permissions) | - | No |
 | `-w, --write` | Enable write tools (deploy, delete, restart, etc). Default: read-only | - | No |
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
 | `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login) | - | No |
+| `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
+| `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `mcp remove`
 
 Remove the Temps MCP server from an AI client
+
+**Usage:** `mcp remove [client]`
 
 ### `mcp status`
 

@@ -64,9 +64,17 @@ pub struct PlatformFeatures {
     /// retained by this process. `true` when the backup scheduler is
     /// configured and worker credentials are present, regardless of profile.
     pub backups_remote: bool,
-    /// Agent sandboxes / workspace previews run in this process. Requires a
-    /// local Docker daemon.
+    /// The standalone sandbox API is served and sandboxes can run on some
+    /// node (ADR 063). `true` in both profiles: on a control plane they run
+    /// on worker nodes only, and a create with no usable worker answers the
+    /// worker-node-required problem pointing at Settings → Nodes.
     pub sandboxes: bool,
+    /// Sandboxes, AI agent runs and application workspaces can run on this
+    /// host itself. Requires local workloads (and so a local Docker daemon);
+    /// `false` in the `control-plane` profile, where the control plane's own
+    /// node takes no sandboxes (ADR 063).
+    #[serde(default)]
+    pub sandboxes_local: bool,
     /// Managed key-value store is registered and reachable.
     pub kv: bool,
     /// Workload importers (Compose, Coolify, Dokploy, Portainer, Kamal,
@@ -105,6 +113,7 @@ impl PlatformFeatures {
             backups_local: true,
             backups_remote: true,
             sandboxes: true,
+            sandboxes_local: true,
             kv: true,
             imports: true,
             log_aggregation: true,
@@ -142,8 +151,11 @@ impl PlatformFeatures {
             image_builds_local: false,
             managed_services: false,
             backups_local: false,
-            sandboxes: false,
+            sandboxes_local: false,
             imports: false,
+            // Served in every profile; on a control plane sandboxes are
+            // placed on worker nodes only (ADR 063).
+            sandboxes: true,
             vulnerability_scanning: false,
             // Caller-supplied: genuinely varies across CP deployments.
             backups_remote,
@@ -153,36 +165,25 @@ impl PlatformFeatures {
     }
 }
 
-/// The mode the server is running in
+/// How the request asking reached this server.
+///
+/// It describes that one request, not the instance: the same server can be
+/// opened through Cloudflare on one hostname and serve other domains with
+/// its own certificates. It never decides whether a domain can be added;
+/// which ways a domain can get HTTPS is judged per domain by
+/// `GET /ingress/certificate-methods?domain=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum ServerMode {
-    /// Running locally (localhost access)
+    /// Opened through a loopback or private address
     Local,
     /// Direct public IP access
     Direct,
     /// Behind NAT (Network Address Translation)
     Nat,
-    /// Behind Cloudflare Tunnel
+    /// The request came through Cloudflare's edge (it carried `cf-ray` or
+    /// `cf-connecting-ip`): a Cloudflare Tunnel or Cloudflare's proxy in
+    /// front of the console's hostname. Says nothing about other hostnames.
     CloudflareTunnel,
-}
-
-impl ServerMode {
-    /// Check if domain creation should be allowed for this mode
-    pub fn can_create_domains(&self) -> bool {
-        match self {
-            ServerMode::Direct | ServerMode::Nat => true,
-            ServerMode::Local | ServerMode::CloudflareTunnel => false,
-        }
-    }
-
-    /// Get a human-readable description of why domain creation is not allowed
-    pub fn domain_creation_error_message(&self) -> Option<&'static str> {
-        match self {
-            ServerMode::Local => Some("Domain creation is not supported when running locally. Please deploy to a server with a public IP address."),
-            ServerMode::CloudflareTunnel => Some("Domain creation is not supported when using Cloudflare Tunnel. Domains are managed through Cloudflare."),
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Display for ServerMode {
@@ -199,7 +200,9 @@ impl std::fmt::Display for ServerMode {
 /// Response containing information about how the service is being accessed
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ServiceAccessInfo {
-    /// Mode of access: "local", "direct", "nat", or "cloudflare_tunnel"
+    /// How this request reached the server: "local", "direct", "nat", or
+    /// "cloudflare_tunnel" (it came through Cloudflare's edge). Describes
+    /// this request only, never which domains can be added.
     pub access_mode: String,
 
     /// Server's public IP address (always returned if available)
@@ -208,10 +211,14 @@ pub struct ServiceAccessInfo {
     /// Server's private/local IP address (always returned if available)
     pub private_ip: Option<String>,
 
-    /// Whether domain creation is allowed in this mode
+    /// Always `true`: a domain can be added however this request reached
+    /// the server, and the server never refused one by access mode. How a
+    /// domain gets HTTPS (a tunnel covering it, HTTP-01, DNS-01) is judged
+    /// per domain by `GET /ingress/certificate-methods?domain=`. Kept for
+    /// older clients.
     pub can_create_domains: bool,
 
-    /// Error message if domain creation is not allowed
+    /// Always `null`; kept for older clients. See `can_create_domains`.
     pub domain_creation_error: Option<String>,
 }
 
@@ -230,6 +237,7 @@ mod tests {
         assert!(features.backups_local);
         assert!(features.backups_remote);
         assert!(features.sandboxes);
+        assert!(features.sandboxes_local);
         assert!(features.kv);
         assert!(features.imports);
         assert!(features.log_aggregation);
@@ -256,9 +264,18 @@ mod tests {
         assert!(!features.image_builds_local);
         assert!(!features.managed_services);
         assert!(!features.backups_local);
-        assert!(!features.sandboxes);
+        assert!(!features.sandboxes_local);
         assert!(!features.imports);
         assert!(!features.vulnerability_scanning);
+    }
+
+    #[test]
+    fn control_plane_serves_sandboxes_on_worker_nodes_only() {
+        // ADR 063: the API is there (sandboxes run on workers), the control
+        // plane's own host runs none.
+        let features = PlatformFeatures::control_plane(false, true, false, true);
+        assert!(features.sandboxes);
+        assert!(!features.sandboxes_local);
     }
 
     #[test]
@@ -291,6 +308,7 @@ mod tests {
             "backups_local",
             "backups_remote",
             "sandboxes",
+            "sandboxes_local",
             "kv",
             "imports",
             "log_aggregation",

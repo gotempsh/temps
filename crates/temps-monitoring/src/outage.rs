@@ -10,7 +10,8 @@ use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, Order, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
+    EntityTrait, Iterable, Order, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -123,16 +124,20 @@ pub struct OutageEvent {
 #[derive(Debug, Error)]
 pub enum OutageError {
     #[error("Database error: {0}")]
-    Database(String),
+    Database(sea_orm::DbErr),
     #[error("Monitor not found: {0}")]
     MonitorNotFound(i32),
-    #[error("Notification error: {0}")]
-    Notification(String),
+    #[error("Failed to send the {kind} notification for monitor {monitor_id}: {reason}")]
+    Notification {
+        monitor_id: i32,
+        kind: &'static str,
+        reason: String,
+    },
 }
 
 impl From<sea_orm::DbErr> for OutageError {
     fn from(err: sea_orm::DbErr) -> Self {
-        OutageError::Database(err.to_string())
+        OutageError::Database(err)
     }
 }
 
@@ -220,12 +225,62 @@ impl OutageDetectionService {
             return false;
         };
         deployments::Entity::find_by_id(current_deployment_id)
+            .select_only()
+            .columns(deployments::Column::iter().filter(|column| !matches!(column, deployments::Column::State)))
+            // Reuse the pause gate for an inapplicable HTTP monitor. This also
+            // suppresses old queued HTTP failures after a worker is promoted,
+            // including the final check under the incident's advisory lock.
+            .column_as(sea_orm::sea_query::Expr::cust(r#"CASE WHEN static_dir_location IS NULL
+                AND EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = deployments.id AND c.deleted_at IS NULL)
+                AND NOT EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = deployments.id AND c.deleted_at IS NULL AND c.container_port IS NOT NULL)
+                THEN 'paused' ELSE state END"#), deployments::Column::State)
             .one(conn)
             .await
             .ok()
             .flatten()
             .map(|d| d.state == "paused")
             .unwrap_or(false)
+    }
+
+    /// Whether `monitor_id` is covered right now by a maintenance window of
+    /// a status page that still shows it (ADR 108 D2). A failed read counts
+    /// as "not in maintenance": an alert too many beats a silenced outage.
+    async fn is_in_maintenance(&self, monitor_id: i32, now: chrono::DateTime<Utc>) -> bool {
+        #[derive(Debug, sea_orm::FromQueryResult)]
+        struct InMaintenance {
+            covered: bool,
+        }
+        let statement = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+            SELECT EXISTS (
+                SELECT 1
+                FROM status_page_maintenance_monitors mm
+                JOIN status_page_maintenances m ON m.id = mm.maintenance_id
+                JOIN status_page_monitors spm
+                  ON spm.status_page_id = m.status_page_id AND spm.monitor_id = mm.monitor_id
+                WHERE mm.monitor_id = $1
+                  AND m.cancelled_at IS NULL
+                  AND m.starts_at <= $2
+                  AND m.ends_at > $2
+            ) AS covered
+            "#,
+            [monitor_id.into(), now.into()],
+        );
+        match <InMaintenance as sea_orm::FromQueryResult>::find_by_statement(statement)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(row) => row.is_some_and(|row| row.covered),
+            Err(e) => {
+                warn!(
+                    monitor_id,
+                    error = %e,
+                    "failed to read maintenance windows; processing the check as usual"
+                );
+                false
+            }
+        }
     }
 
     /// Resolve a project's slug for display in human-facing notifications.
@@ -279,6 +334,18 @@ impl OutageDetectionService {
             debug!(
                 "Monitor {} - deployment is paused, ignoring status check",
                 monitor_id
+            );
+            return Ok(None);
+        }
+
+        // A scheduled maintenance window covers this monitor: the owner
+        // announced the downtime, so it raises no incident, notification or
+        // alarm, and the state machine does not move. When the window ends,
+        // the next check is judged against the state from before it.
+        if self.is_in_maintenance(monitor_id, now).await {
+            debug!(
+                monitor_id,
+                "monitor is in a maintenance window, ignoring status check"
             );
             return Ok(None);
         }
@@ -797,7 +864,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "outage",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -832,7 +903,11 @@ impl OutageDetectionService {
         self.notification_service
             .send_notification(notification)
             .await
-            .map_err(|e| OutageError::Notification(e.to_string()))?;
+            .map_err(|e| OutageError::Notification {
+                monitor_id: event.monitor_id,
+                kind: "recovery",
+                reason: e.to_string(),
+            })?;
 
         Ok(())
     }
@@ -873,6 +948,11 @@ impl OutageDetectionService {
                 .await?;
 
             if let Some(check) = recent_check {
+                // Nothing was probed (ADR 068 D4); read as a status it would
+                // be `operational`, which could resolve a real outage.
+                if check.status == temps_core::environment_address::NO_ADDRESS_CHECK_STATUS {
+                    continue;
+                }
                 let status = MonitorStatus::from_str(&check.status);
                 if let Some(event) = self
                     .process_check(monitor.id, status, check.error_message)
@@ -933,6 +1013,64 @@ impl OutageDetectionService {
         states.remove(&monitor_id);
     }
 
+    /// Retire HTTP state after an environment adopts a portless worker. No
+    /// recovery notification is sent: no HTTP request proved the service healthy.
+    async fn retire_http_monitor(&self, monitor_id: i32) -> Result<(), OutageError> {
+        let txn = self.db.begin().await?;
+        let monitor = status_monitors::Entity::find_by_id(monitor_id)
+            .one(&txn)
+            .await?
+            .ok_or(OutageError::MonitorNotFound(monitor_id))?;
+        let Some(environment_id) = monitor.environment_id else {
+            return Ok(());
+        };
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [sea_orm::Value::BigInt(Some(i64::from(environment_id)))],
+        ))
+        .await?;
+        // The row lock serializes retirement with deployment promotion. Delayed
+        // retirement events must never reset a newer HTTP deployment's monitor.
+        let environment = environments::Entity::find_by_id(environment_id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?;
+        let Some(deployment_id) = environment.and_then(|env| env.current_deployment_id) else {
+            return Ok(());
+        };
+        let applies = txn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+SELECT EXISTS (
+  SELECT 1 FROM deployments d WHERE d.id = $1 AND d.static_dir_location IS NULL
+    AND EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = d.id AND c.deleted_at IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM deployment_containers c WHERE c.deployment_id = d.id AND c.deleted_at IS NULL AND c.container_port IS NOT NULL)
+) AS portless"#, [deployment_id.into()])).await?
+            .map(|row| row.try_get::<bool>("", "portless")).transpose()?.unwrap_or(false);
+        if !applies {
+            return Ok(());
+        }
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres, r#"
+INSERT INTO status_checks (monitor_id, status, checked_at, error_message)
+SELECT $1, 'unknown', now(), 'HTTP monitoring does not apply to a background worker'
+WHERE NOT EXISTS (
+  SELECT 1 FROM (SELECT status, error_message FROM status_checks WHERE monitor_id = $1 ORDER BY checked_at DESC, id DESC LIMIT 1) latest
+  WHERE status = 'unknown' AND error_message = 'HTTP monitoring does not apply to a background worker'
+)"#, [monitor_id.into()])).await?;
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE status_incidents SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE monitor_id = $1 AND status != 'resolved'",
+            [monitor_id.into()])).await?;
+        txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,
+            "UPDATE alarms SET status = 'resolved', resolved_at = now(), updated_at = now() WHERE environment_id = $1 AND alarm_type = 'outage' AND status IN ('firing', 'acknowledged') AND metadata->>'monitor_id' = $2",
+            [sea_orm::Value::Int(Some(environment_id)), monitor_id.to_string().into()])).await?;
+        txn.commit().await?;
+        self.clear_monitor_state(monitor_id).await;
+        debug!(
+            monitor_id,
+            environment_id, "Retired HTTP monitor state for background worker"
+        );
+        Ok(())
+    }
+
     /// Start event-driven outage detection by listening to StatusCheckCompleted jobs
     /// This is the primary method for detecting outages in real-time.
     pub async fn start_monitoring(self: Arc<Self>, mut job_receiver: Box<dyn JobReceiver>) {
@@ -946,6 +1084,22 @@ impl OutageDetectionService {
                         job.monitor_id, job.status
                     );
 
+                    if job.status == "not_applicable" {
+                        if let Err(error) = self.retire_http_monitor(job.monitor_id).await {
+                            error!(monitor_id = job.monitor_id, reason = %error, "Failed to retire HTTP monitor state");
+                        }
+                        continue;
+                    }
+                    // ADR 068 D4: nothing was probed because nobody can
+                    // reach the environment. Neither an outage nor a
+                    // recovery: an open incident stays as it was.
+                    if job.status == "no_address" {
+                        debug!(
+                            monitor_id = job.monitor_id,
+                            "monitor has no address to check; outage state unchanged"
+                        );
+                        continue;
+                    }
                     let status = MonitorStatus::from_str(&job.status);
                     match self
                         .process_check(job.monitor_id, status, job.error_message)
@@ -991,7 +1145,6 @@ impl OutageDetectionService {
 
     /// Scan all monitors - this is now a fallback/diagnostic method
     /// The primary detection method is event-driven via start_monitoring()
-    #[allow(dead_code)]
     pub async fn start_monitoring_fallback(self: Arc<Self>, scan_interval_secs: u64) {
         info!(
             "Starting fallback outage detection with polling (interval: {}s)",
@@ -1078,6 +1231,91 @@ pub(crate) mod tests {
             Arc::new(NoopNotificationService),
             Arc::new(NoopJobQueue),
         ))
+    }
+
+    #[tokio::test]
+    async fn health_probe_retirement_clears_stale_http_incidents_and_old_deployment_alarms() {
+        use sea_orm::{MockExecResult, Value};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(1, Some(1))]])
+                .append_query_results([vec![make_environment_model(1, Some(10))]])
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "portless",
+                    Value::Bool(Some(true)),
+                )])]])
+                .append_exec_results((0..4).map(|_| MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }))
+                .into_connection(),
+        );
+        let notifications = Arc::new(TrackingNotificationService::new());
+        let service = OutageDetectionService::new(
+            db.clone(),
+            notifications.clone(),
+            create_test_alarm_service(db.clone()),
+        );
+        service.monitor_states.write().await.insert(
+            1,
+            MonitorState {
+                status: MonitorStatus::Down,
+                active_incident_id: Some(42),
+                consecutive_failures: 3,
+            },
+        );
+        service.retire_http_monitor(1).await.unwrap();
+        assert!(service.get_monitor_statuses().await.is_empty());
+        assert_eq!(
+            notifications.send_count(),
+            0,
+            "retirement must not claim HTTP recovery"
+        );
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(sql.contains("'unknown'"));
+        assert!(sql.contains("UPDATE status_incidents"));
+        assert!(sql.contains("UPDATE alarms"));
+        assert!(sql.contains("metadata->>'monitor_id'"));
+        assert!(
+            !sql.contains("deployment_id = $"),
+            "old deployment alarms must also retire"
+        );
+        assert!(
+            sql.contains("WHERE NOT EXISTS"),
+            "repeated retirement must not append duplicate unknown checks"
+        );
+        assert!(!sql.contains("'operational'"));
+    }
+
+    #[tokio::test]
+    async fn health_probe_delayed_retirement_does_not_clear_a_new_http_deployment() {
+        use sea_orm::{MockExecResult, Value};
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(1, Some(1))]])
+                .append_query_results([vec![make_environment_model(1, Some(20))]])
+                .append_query_results([[std::collections::BTreeMap::from([(
+                    "portless",
+                    Value::Bool(Some(false)),
+                )])]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = OutageDetectionService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            create_test_alarm_service(db.clone()),
+        );
+        service.retire_http_monitor(1).await.unwrap();
+        drop(service);
+        let sql = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(!sql.contains("UPDATE status_incidents"));
+        assert!(!sql.contains("UPDATE alarms"));
+        assert!(!sql.contains("INSERT"));
     }
 
     #[test]
@@ -1253,14 +1491,25 @@ pub(crate) mod tests {
 
     #[test]
     fn test_outage_error_display() {
-        let db_err = OutageError::Database("connection refused".to_string());
-        assert_eq!(db_err.to_string(), "Database error: connection refused");
+        let db_err =
+            OutageError::Database(sea_orm::DbErr::Custom("connection refused".to_string()));
+        assert_eq!(
+            db_err.to_string(),
+            "Database error: Custom Error: connection refused"
+        );
 
         let not_found = OutageError::MonitorNotFound(42);
         assert_eq!(not_found.to_string(), "Monitor not found: 42");
 
-        let notif_err = OutageError::Notification("timeout".to_string());
-        assert_eq!(notif_err.to_string(), "Notification error: timeout");
+        let notif_err = OutageError::Notification {
+            monitor_id: 42,
+            kind: "recovery",
+            reason: "timeout".to_string(),
+        };
+        assert_eq!(
+            notif_err.to_string(),
+            "Failed to send the recovery notification for monitor 42: timeout"
+        );
     }
 
     // ── Alarm bridge tests ────────────────────────────────────────────
@@ -1347,8 +1596,12 @@ pub(crate) mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -1357,12 +1610,16 @@ pub(crate) mod tests {
         temps_entities::projects::Model {
             id,
             image_retention_hours: None,
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
             cloud_telemetry_fidelity:
                 temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
             cloud_telemetry_write_mode:
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            analytics_identity_mode: Default::default(),
+            instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: slug.to_string(),
             slug: slug.to_string(),
@@ -1393,19 +1650,24 @@ pub(crate) mod tests {
             gitlab_webhook_id: None,
             gitlab_webhook_signing_token: None,
             gitea_webhook_signing_token: None,
+            github_webhook_id: None,
+            github_webhook_signing_token: None,
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
             attack_mode: false,
+            shield_mode: "log".to_string(),
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
             allow_alternate_sources: None,
+            hosting: Default::default(),
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             source_type: temps_entities::source_type::SourceType::Git,
             project_type: temps_entities::types::ProjectType::Server,
             service_template: None,
             cross_project_trace_sharing: true,
+            serves_own_temps_api: false,
         }
     }
 
@@ -1438,6 +1700,8 @@ pub(crate) mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
         }
     }
 
@@ -1454,6 +1718,12 @@ pub(crate) mod tests {
             is_active: true,
             is_managed: false,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1500,6 +1770,53 @@ pub(crate) mod tests {
             incident_id: Some(42),
             occurred_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_monitor_with_no_address_is_neither_up_nor_down_in_the_scan() {
+        let check = temps_entities::status_checks::Model {
+            id: 1,
+            checked_at: Utc::now(),
+            monitor_id: 3,
+            status: temps_core::environment_address::NO_ADDRESS_CHECK_STATUS.to_string(),
+            response_time_ms: None,
+            error_message: Some("Nothing to check".to_string()),
+            created_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_status_monitor_model(3, Some(1))]])
+                .append_query_results([vec![check]])
+                .into_connection(),
+        );
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            Arc::new(NoopJobQueue),
+        ));
+        let service = OutageDetectionService::new(
+            db.clone(),
+            Arc::new(NoopNotificationService),
+            alarm_service,
+        );
+        // It was down before its address went away.
+        service.monitor_states.write().await.insert(
+            3,
+            MonitorState {
+                status: MonitorStatus::Down,
+                active_incident_id: Some(42),
+                consecutive_failures: 3,
+            },
+        );
+
+        let events = service.scan_monitors().await.unwrap();
+
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(
+            service.get_monitor_statuses().await.get(&3),
+            Some(&MonitorStatus::Down),
+            "no_address does not resolve the outage"
+        );
     }
 
     #[tokio::test]
@@ -1779,6 +2096,61 @@ pub(crate) mod tests {
         assert_eq!(job_queue.send_count(), 0);
     }
 
+    fn maintenance_row(covered: bool) -> std::collections::BTreeMap<&'static str, sea_orm::Value> {
+        std::collections::BTreeMap::from([("covered", sea_orm::Value::Bool(Some(covered)))])
+    }
+
+    /// A check for a monitor in a scheduled maintenance window (ADR 108 D2)
+    /// is dropped before the state machine: no outage event, incident,
+    /// notification or alarm, and the state from before the window is kept.
+    #[tokio::test]
+    async fn test_process_check_skips_monitor_in_maintenance() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_status_monitor_model(1, Some(1))]])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            .append_query_results(vec![vec![maintenance_row(true)]])
+            .into_connection();
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+        let service =
+            OutageDetectionService::new(db.clone(), notification_service.clone(), alarm_service);
+        service.monitor_states.write().await.insert(
+            1,
+            MonitorState {
+                status: MonitorStatus::Operational,
+                active_incident_id: None,
+                consecutive_failures: 0,
+            },
+        );
+
+        let result = service
+            .process_check(1, MonitorStatus::Down, Some("planned restart".to_string()))
+            .await
+            .unwrap();
+
+        assert!(result.is_none(), "no outage event during maintenance");
+        assert_eq!(notification_service.send_count(), 0);
+        assert_eq!(job_queue.send_count(), 0);
+        let states = service.monitor_states.read().await;
+        assert_eq!(states.get(&1).map(|s| s.consecutive_failures), Some(0));
+        assert_eq!(
+            states.get(&1).map(|s| s.status),
+            Some(MonitorStatus::Operational)
+        );
+        drop(states);
+        drop(service);
+        let log = format!("{:?}", Arc::try_unwrap(db).unwrap().into_transaction_log());
+        assert!(log.contains("status_page_maintenances"), "{log}");
+        assert!(log.contains("cancelled_at IS NULL"), "{log}");
+    }
+
     /// Even narrower window than `test_process_check_skips_paused_deployment`:
     /// the deployment is still unpaused when `process_check`'s own guard
     /// runs, and only becomes paused afterward — while the in-memory
@@ -1794,6 +2166,8 @@ pub(crate) mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // process_check's maintenance gate: not in a window.
+            .append_query_results(vec![vec![maintenance_row(false)]])
             // process_check resolves the project slug for the outage event
             // metadata before handing off to handle_outage_event.
             .append_query_results(vec![vec![make_project_model(1, "test-project")]])
@@ -1862,6 +2236,7 @@ pub(crate) mod tests {
             environment_id: Some(1),
             monitor_id: Some(1),
             title: "API Health is down".to_string(),
+            public_title: None,
             description: Some("Connection refused".to_string()),
             severity: "critical".to_string(),
             status: "investigating".to_string(),
@@ -1881,6 +2256,8 @@ pub(crate) mod tests {
             // process_check's guard: still unpaused.
             .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
             .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // process_check's maintenance gate: not in a window.
+            .append_query_results(vec![vec![maintenance_row(false)]])
             // handle_outage_event's locked guard: still unpaused.
             .append_exec_results(vec![sea_orm::MockExecResult {
                 last_insert_id: 0,

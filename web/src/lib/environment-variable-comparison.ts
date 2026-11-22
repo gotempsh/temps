@@ -30,6 +30,71 @@ export function orderVariableEnvironments(
   })
 }
 
+export interface VariableEnvironmentGroups {
+  /** Existing non-preview environments, production first. */
+  stable: EnvironmentInfo[]
+  /** Existing preview environments. */
+  previews: EnvironmentInfo[]
+  /**
+   * Bindings to deleted environments. The server keeps them so a restored
+   * environment gets its variables back, but no deployment uses the links.
+   */
+  deleted: EnvironmentInfo[]
+}
+
+/**
+ * Split a variable's bindings for display. `liveIds` holds the project's
+ * current environments; while that list is loading or failed it is
+ * `undefined` and nothing is classified as deleted.
+ */
+export function groupVariableEnvironments(
+  environments: EnvironmentInfo[],
+  previewIds: ReadonlySet<number>,
+  liveIds: ReadonlySet<number> | undefined
+): VariableEnvironmentGroups {
+  const groups: VariableEnvironmentGroups = {
+    stable: [],
+    previews: [],
+    deleted: [],
+  }
+  for (const environment of orderVariableEnvironments(
+    environments,
+    previewIds
+  )) {
+    if (liveIds && !liveIds.has(environment.id)) {
+      groups.deleted.push(environment)
+    } else if (previewIds.has(environment.id)) {
+      groups.previews.push(environment)
+    } else {
+      groups.stable.push(environment)
+    }
+  }
+  return groups
+}
+
+/** Add or remove one environment from a selection, keeping its order. */
+export function toggleEnvironmentSelection(
+  selectedIds: readonly number[],
+  id: number
+): number[] {
+  return selectedIds.includes(id)
+    ? selectedIds.filter((selected) => selected !== id)
+    : [...selectedIds, id]
+}
+
+/**
+ * Select or clear a batch (e.g. every environment the picker's filter shows)
+ * without touching selected environments outside it.
+ */
+export function setEnvironmentSelection(
+  selectedIds: readonly number[],
+  ids: readonly number[],
+  selected: boolean
+): number[] {
+  if (!selected) return selectedIds.filter((id) => !ids.includes(id))
+  return [...selectedIds, ...ids.filter((id) => !selectedIds.includes(id))]
+}
+
 /** Explicit bindings plus inherited preview variables determine applicability. */
 export function variableAppliesToEnvironment(
   variable: Pick<

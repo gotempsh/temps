@@ -24,7 +24,6 @@ import {
 import { z } from 'zod'
 import { toast } from 'sonner'
 import { Link } from 'react-router'
-import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 
 const schema = z.object({ grants: pluginGrantsSchema })
 
@@ -92,13 +91,8 @@ export function PluginPermissionsDialog({
     try {
       await save.mutateAsync(values)
     } catch (error) {
-      if (onSensitiveError(error, () => void submit(values))) return
-      toast.error(
-        sensitiveActionErrorMessage(
-          error,
-          'Could not update plugin permissions. Your changes have not been saved.'
-        )
-      )
+      // Failures are toasted by the app-wide mutation error handler.
+      onSensitiveError(error, () => void submit(values))
     }
   }
   return (

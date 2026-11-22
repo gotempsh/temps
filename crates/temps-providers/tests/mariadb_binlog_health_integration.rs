@@ -14,6 +14,7 @@ use std::time::Duration;
 
 use sqlx::mysql::MySqlPoolOptions;
 use temps_providers::externalsvc::mariadb_binlog_health::{self, BinlogWarning};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{wait::LogWaitStrategy, ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -51,7 +52,7 @@ async fn boot_mariadb(extra_cmd: &[&str]) -> Option<(String, ContainerAsync<Gene
         image = image.with_cmd(extra_cmd.iter().map(|s| s.to_string()));
     }
 
-    let container = match image.start().await {
+    let container = match image.with_test_labels().start().await {
         Ok(c) => c,
         Err(e) => {
             eprintln!("⏭️  Docker unavailable, skipping: {e}");

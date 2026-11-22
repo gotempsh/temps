@@ -182,8 +182,15 @@ graph TB
 - Requests for `/api/__temps/temps_captcha_wasm*` bypass the block check so the challenge assets remain available.
 - If the IP access service returns an error, the proxy logs it and lets the request continue (fail-open).
 - **Allow rules** can be saved but currently have no effect.
-- There are no per-project IP rules.
 - **Default**: all IPs are allowed.
+
+**Project and environment IP lists**:
+- A project (or one of its environments) can carry an **allow** list (only these CIDRs get through) or a **deny** list (these CIDRs get `403 Forbidden`). IPv4 and IPv6 are supported, up to 256 CIDRs per list. An environment list replaces the project list for that environment.
+- Projects with no list, or with mode `disabled`, behave exactly as before.
+- The address that is checked is the socket peer, or the CDN-supplied address when the peer is a verified Cloudflare or Bunny edge. `X-Forwarded-For` and similar headers sent by other peers are ignored, so they cannot be used to claim an allowed address. `::ffff:a.b.c.d` is matched as `a.b.c.d`.
+- Lists are held in memory as a pre-parsed snapshot, so the check does no I/O. Changes are picked up within about 5 seconds.
+- If a project has an allow list and the client address cannot be determined, the request is denied. If the rules cannot be loaded at startup, the proxy refuses to start; if a later refresh fails, the last good snapshot stays in force.
+- The console and API are not subject to project lists. Denied requests get a generic `403` with no detail, and are counted in the `proxy.ip_access_denied` metric.
 
 ### Attack Mode Challenge
 
