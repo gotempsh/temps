@@ -68,8 +68,8 @@ existing route, change the subnet and all three addresses together:
 | `TEMPS_CONTROL_INTERNAL_IP` | `198.18.255.10` | Temps listener address on the private network |
 | `TEMPS_POSTGRES_INTERNAL_IP` | `198.18.255.11` | PostgreSQL address used by Temps |
 | `TEMPS_CLICKHOUSE_INTERNAL_IP` | `198.18.255.12` | ClickHouse address used by Temps |
-| `TEMPS_WORKLOAD_SUBNET` | `198.20.255.0/24` | Shared managed-workload bridge subnet |
-| `TEMPS_PUBLIC_INGRESS_IP` | `198.20.255.10` | Public proxy address reachable by managed workloads |
+| `TEMPS_WORKLOAD_SUBNET` | `10.213.255.0/24` | Shared managed-workload bridge subnet |
+| `TEMPS_PUBLIC_INGRESS_IP` | `10.213.255.10` | Public proxy address reachable by managed workloads |
 | `TEMPS_INGRESS_SUBNET` | `198.19.255.0/24` | Dedicated loopback-admin proxy bridge subnet |
 | `TEMPS_ADMIN_INGRESS_IP` | `198.19.255.10` | Admin proxy address on its dedicated bridge |
 | `TEMPS_INGRESS_GATEWAY_IP` | `198.19.255.1` | Dedicated admin bridge gateway |
