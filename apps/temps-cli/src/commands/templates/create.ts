@@ -17,6 +17,7 @@ import type {
 } from '../../api/types.gen.js'
 import { requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
+import { resolveValueSource, ValueSourceError, type ValueSourceIO } from '../../lib/value-source.js'
 import { info } from '../../ui/output.js'
 import { setQuietMode, withSpinner } from '../../ui/spinner.js'
 import { report, waitForInstantiation, waitTimeoutMs } from '../instantiations/index.js'
@@ -31,6 +32,8 @@ export interface CreateTemplateOptions {
   name?: string[]
   env?: string[]
   secret?: string[]
+  secretFile?: string[]
+  trimTrailingNewline?: boolean
   database?: string[]
   forkConnection?: string
   repoName?: string
@@ -89,7 +92,8 @@ export function parseVariable(
   isSecret: boolean
 ): TemplateVariableInput {
   const eq = value.indexOf('=')
-  if (eq <= 0) throw new Error(`"${value}" is not KEY=VALUE`)
+  // Never echo a secret entry: without "=" the whole thing may be the value.
+  if (eq <= 0) throw new Error(isSecret ? 'A --secret entry is not [service:]KEY=VALUE' : `"${value}" is not KEY=VALUE`)
   let name = value.slice(0, eq)
   let service: string | undefined
   const colon = name.indexOf(':')
@@ -98,6 +102,41 @@ export function parseVariable(
     name = name.slice(colon + 1)
   }
   return { name, value: value.slice(eq + 1), is_secret: isSecret, service: service ?? null }
+}
+
+/**
+ * Read each `--secret-file [service:]KEY=PATH` (PATH `-` is stdin) into a
+ * `[service:]KEY=VALUE` entry for `--secret`, so secret values need not be
+ * typed on the command line. Only one entry may read stdin.
+ */
+export async function resolveSecretFiles(
+  entries: readonly string[],
+  trimTrailingNewline: boolean,
+  io?: ValueSourceIO
+): Promise<string[]> {
+  if (entries.filter((entry) => entry.slice(entry.indexOf('=') + 1) === '-').length > 1) {
+    throw new ValueSourceError('Only one --secret-file entry can read stdin (PATH -)')
+  }
+  const resolved: string[] = []
+  for (const entry of entries) {
+    const eq = entry.indexOf('=')
+    if (eq <= 0 || eq === entry.length - 1) {
+      throw new ValueSourceError(`"${entry}" is not [service:]KEY=PATH (use - as PATH to read stdin)`)
+    }
+    const name = entry.slice(0, eq)
+    const path = entry.slice(eq + 1)
+    const source = await resolveValueSource(
+      { file: path, trimTrailingNewline },
+      {
+        subject: `the value for secret ${name}`,
+        flags: { inline: '--secret', file: '--secret-file', stdin: '--secret-file KEY=-' },
+        newlineHint: true,
+      },
+      io
+    )
+    resolved.push(`${name}=${source!.value}`)
+  }
+  return resolved
 }
 
 /** `postgres=new`, `postgres=new:shop-db` or `postgres=<database id>`. */
@@ -180,6 +219,11 @@ export function buildInstantiateRequest(
 
 export async function createTemplateAction(slug: string, options: CreateTemplateOptions): Promise<void> {
   if (options.json) setQuietMode(true)
+  // Read secret files before any request, so a bad path fails fast.
+  if (options.secretFile && options.secretFile.length > 0) {
+    const fromFiles = await resolveSecretFiles(options.secretFile, options.trimTrailingNewline === true)
+    options = { ...options, secret: [...(options.secret ?? []), ...fromFiles] }
+  }
   const timeoutMs = waitTimeoutMs(options.timeout)
   await requireAuth()
   await setupClient()

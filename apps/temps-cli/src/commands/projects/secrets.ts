@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { readFileSync } from 'node:fs'
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -18,6 +17,12 @@ import type { ProjectSecretResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning } from '../../ui/output.js'
+import {
+  addValueSourceOptions,
+  resolveValueSource,
+  valueSourceInput,
+  type ValueSourceIO,
+} from '../../lib/value-source.js'
 
 // Project secrets are mounted into the deployed container as FILES at
 // /run/secrets/<KEY> on the next deployment — distinct from the
@@ -31,19 +36,26 @@ interface ListOptions {
   json?: boolean
 }
 
-interface CreateOptions {
+/** Where the value may come from: `-v`, `--value-file`, `--value-stdin`. */
+interface ValueSourceOptions {
+  value?: string
+  valueFile?: string
+  valueStdin?: boolean
+  literal?: boolean
+  trimTrailingNewline?: boolean
+}
+
+interface CreateOptions extends ValueSourceOptions {
   project?: string
   key: string
-  value: string
   environment: string[]
   service: string[]
   includeInPreview?: boolean
 }
 
-interface UpdateOptions {
+interface UpdateOptions extends ValueSourceOptions {
   project?: string
   key: string
-  value?: string
   environment: string[]
   service: string[]
   allServices?: boolean
@@ -60,17 +72,34 @@ function collect(value: string, previous: string[]): string[] {
   return [...previous, value]
 }
 
-/** Resolve value: if prefixed with @, read from a local file path. */
-export function resolveValue(value: string): string {
-  if (value.startsWith('@')) {
-    const filePath = value.slice(1)
-    try {
-      return readFileSync(filePath, 'utf-8')
-    } catch (e) {
-      throw new Error(`Failed to read file '${filePath}': ${e}`)
-    }
-  }
-  return value
+/**
+ * The secret value from its one source, or `undefined` when none was given
+ * and `required` is false (update keeps the stored value). `-v @path` still
+ * reads a file, with a deprecation note, unless `--literal` is passed. The
+ * bytes are kept as is: a mounted secret file (a PEM key, an auth JSON)
+ * usually ends in a newline, so no hint is shown for one.
+ */
+export async function resolveProjectSecretValue(
+  key: string,
+  options: ValueSourceOptions,
+  required: boolean,
+  io?: ValueSourceIO,
+): Promise<string | undefined> {
+  const resolved = await resolveValueSource(
+    valueSourceInput(options.value, options as Record<string, unknown>),
+    {
+      subject: `the value for secret ${key}`,
+      flags: { inline: '-v/--value', file: '--value-file', stdin: '--value-stdin' },
+      required,
+      legacyAtPath: true,
+    },
+    io,
+  )
+  return resolved?.value
+}
+
+function hasValueSource(options: ValueSourceOptions): boolean {
+  return options.value !== undefined || options.valueFile !== undefined || options.valueStdin === true
 }
 
 async function getProjectId(projectSlug: string): Promise<number> {
@@ -102,6 +131,15 @@ async function findSecretByKey(projectId: number, key: string): Promise<ProjectS
   return found
 }
 
+const CREATE_EXAMPLES = `
+Examples:
+  # Mount a credentials file, byte-for-byte
+  $ temps projects secrets create -p my-app -k CODEX_AUTH --value-file ./auth.json
+
+  # Pipe a value from a password manager
+  $ op read op://vault/db/password | temps projects secrets create -p my-app -k DB_PASSWORD --value-stdin
+`
+
 export function registerProjectSecretsCommands(projects: Command): void {
   const secrets = projects
     .command('secrets')
@@ -118,18 +156,20 @@ export function registerProjectSecretsCommands(projects: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listAction)
 
-  secrets
+  const create = secrets
     .command('create')
     .alias('add')
-    .description('Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)')
+    .description(
+      'Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history',
+    )
     .option('-p, --project <project>', 'Project slug or ID')
     .requiredOption(
       '-k, --key <key>',
       'Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore.',
     )
-    .requiredOption(
+    .option(
       '-v, --value <value>',
-      'Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history.',
+      'Secret value on the command line (<=1 MiB; visible in shell history and `ps`). `-v @path` reading a file is deprecated: use --value-file',
     )
     .option('-e, --environment <name>', 'Scope to one environment (repeatable; default: all)', collect, [])
     .option(
@@ -139,16 +179,17 @@ export function registerProjectSecretsCommands(projects: Command): void {
       [],
     )
     .option('--include-in-preview', 'Also mount this secret in preview environments')
-    .action(createAction)
+  addValueSourceOptions(create, { what: 'the secret value (<=1 MiB)', legacyAtPath: true })
+  create.addHelpText('after', CREATE_EXAMPLES).action(createAction)
 
-  secrets
+  const update = secrets
     .command('update')
     .description('Update a project secret (a redeploy is required for running containers to pick it up)')
     .option('-p, --project <project>', 'Project slug or ID')
     .requiredOption('-k, --key <key>', 'Key of the secret to update')
     .option(
       '-v, --value <value>',
-      'New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value.',
+      'New value on the command line (<=1 MiB; visible in shell history). `-v @path` is deprecated: use --value-file. Give no value source to keep the existing value.',
     )
     .option('-e, --environment <name>', 'Replace environment scoping (repeatable)', collect, [])
     .option(
@@ -160,7 +201,8 @@ export function registerProjectSecretsCommands(projects: Command): void {
     .option('--all-services', 'Deliver to every Compose service, clearing any per-service scope')
     .option('--include-in-preview', 'Include in preview environments')
     .option('--no-include-in-preview', 'Exclude from preview environments')
-    .action(updateAction)
+  addValueSourceOptions(update, { what: 'the new secret value (<=1 MiB)', legacyAtPath: true })
+  update.action(updateAction)
 
   secrets
     .command('delete')
@@ -209,7 +251,7 @@ async function listAction(options: ListOptions): Promise<void> {
 
   if (items.length === 0) {
     info('No secrets defined yet.')
-    info(`Example: temps projects secrets create -p ${resolved.slug} -k CODEX_AUTH -v @./auth.json`)
+    info(`Example: temps projects secrets create -p ${resolved.slug} -k CODEX_AUTH --value-file ./auth.json`)
     newline()
     return
   }
@@ -232,6 +274,9 @@ async function listAction(options: ListOptions): Promise<void> {
 }
 
 async function createAction(options: CreateOptions): Promise<void> {
+  // Read the value first: a bad file or an empty pipe fails before any request.
+  const value = (await resolveProjectSecretValue(options.key, options, true))!
+
   await requireAuth()
   await setupClient()
 
@@ -239,8 +284,6 @@ async function createAction(options: CreateOptions): Promise<void> {
   if (resolved.source !== 'flag') {
     info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
   }
-
-  const value = resolveValue(options.value)
 
   const secret = await withSpinner('Saving secret...', async () => {
     const projectId = await getProjectId(resolved.slug)
@@ -273,24 +316,25 @@ async function createAction(options: CreateOptions): Promise<void> {
 }
 
 async function updateAction(options: UpdateOptions): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
   if (
-    options.value === undefined &&
+    !hasValueSource(options) &&
     options.environment.length === 0 &&
     options.service.length === 0 &&
     options.allServices !== true &&
     options.includeInPreview === undefined
   ) {
     warning(
-      'No fields to update. Provide at least one of --value, --environment, --service, --all-services, or --include-in-preview',
+      'No fields to update. Provide at least one of --value-file, --value-stdin, --value, --environment, --service, --all-services, or --include-in-preview',
     )
     return
   }
   if (options.service.length > 0 && options.allServices === true) {
     throw new Error('--service and --all-services are mutually exclusive')
   }
+  const value = await resolveProjectSecretValue(options.key, options, false)
+
+  await requireAuth()
+  await setupClient()
 
   const resolved = await requireProjectSlug(options.project)
   if (resolved.source !== 'flag') {
@@ -316,7 +360,7 @@ async function updateAction(options: UpdateOptions): Promise<void> {
       client,
       path: { project_id: projectId, secret_id: current.id },
       body: {
-        ...(options.value !== undefined ? { value: resolveValue(options.value) } : {}),
+        ...(value !== undefined ? { value } : {}),
         ...(environmentIds ? { environment_ids: environmentIds } : {}),
         compose_services: composeServices,
         ...(options.includeInPreview !== undefined ? { include_in_preview: options.includeInPreview } : {}),

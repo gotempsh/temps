@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { addCredentialSources } from '../../lib/value-source.js'
 import { login } from './login.js'
 import { logout } from './logout.js'
 import { whoami } from './whoami.js'
@@ -21,7 +22,7 @@ export function resolveLoginUrl(
 }
 
 export function registerAuthCommands(program: Command): void {
-  program
+  const loginCommand = program
     .command('login [url]')
     .description('Authenticate with a Temps server. Opens the browser for interactive logins; use --api-key for headless / CI.')
     .option('-k, --api-key <key>', 'Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI.')
@@ -33,6 +34,7 @@ export function registerAuthCommands(program: Command): void {
         url: resolveLoginUrl(url, opts),
       })
     })
+  addCredentialSources(loginCommand, [{ flag: 'api-key', what: 'the API key' }])
 
   program
     .command('logout')

@@ -22,6 +22,8 @@ import {
   addTelegramProvider,
   updateTelegramProviderAction,
 } from './index.js'
+import { registerNotificationsCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 describe('parseEnabledFlag', () => {
   test('leaves the flag untouched when not provided', () => {
@@ -356,5 +358,36 @@ describe('invalid --topic-id', () => {
     await expect(updateTelegramProviderAction(7, provider, { id: '7', topicId: '4.2' })).rejects.toThrow(
       'Invalid value for --topic-id',
     )
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('notifications add credential sources', () => {
+  test('--bot-token-file sends the Telegram bot token from the file exactly', async () => {
+    const path = await credentialFile(CREDENTIAL_SENTINEL)
+    const run = await runWithApi(registerNotificationsCommands,
+      ['notifications', 'add', '-t', 'telegram', '-n', 'tg', '--bot-token-file', path, '--chat-id', '-1001234567890', '-y'],
+      { 'POST /notification-providers/telegram': { id: 1, name: 'tg', provider_type: 'telegram', enabled: true, config: {}, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' } })
+    expect(run.error).toBeUndefined()
+    expect(JSON.stringify(credentialBody(run, 'POST /notification-providers/telegram'))).toContain(`"bot_token":"${CREDENTIAL_SENTINEL}"`)
   })
 })

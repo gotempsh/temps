@@ -9,6 +9,8 @@ import {
   groupEventsByCategory,
   formatDeliveryPayload,
 } from './index.js'
+import { registerWebhooksCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 const allEventTypes = ['deployment.started', 'deployment.completed', 'domain.verified']
 
@@ -93,5 +95,36 @@ describe('formatDeliveryPayload', () => {
 
   test('falls back to the raw string when payload is not valid JSON', () => {
     expect(formatDeliveryPayload('not json')).toBe('not json')
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('webhooks create credential sources', () => {
+  test('--secret-file sends the signing secret from the file exactly', async () => {
+    const path = await credentialFile(CREDENTIAL_SENTINEL)
+    const run = await runWithApi(registerWebhooksCommands,
+      ['webhooks', 'create', '--project-id', '4', '-u', 'https://hooks.example.com/x', '-e', 'all', '--secret-file', path, '-y'],
+      { 'GET /webhook-event-types': [{ event_type: 'deployment.succeeded', category: 'deployments', description: 'x' }], 'POST /projects/4/webhooks': (_url: URL, body: unknown) => ({ id: 1, project_id: 4, url: 'https://hooks.example.com/x', events: [], enabled: true, has_secret: true, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z', ...(body as object), secret: undefined }) })
+    expect(run.error).toBeUndefined()
+    expect(credentialBody(run, 'POST /projects/4/webhooks').secret).toBe(CREDENTIAL_SENTINEL)
   })
 })

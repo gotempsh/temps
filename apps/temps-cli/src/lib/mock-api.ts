@@ -28,12 +28,38 @@ export interface MockRun {
   error?: Error
 }
 
+export interface MockRunOptions {
+  /**
+   * What the command reads from stdin. A string or bytes stand for a pipe;
+   * `'tty'` for an interactive terminal with nothing piped. Unset leaves the
+   * runner's own stdin in place.
+   */
+  stdin?: string | Uint8Array | 'tty'
+}
+
+/** A stand-in for `process.stdin`: a pipe yielding `input`, or an empty terminal. */
+function fakeStdin(input: string | Uint8Array | 'tty'): { isTTY: boolean; [Symbol.asyncIterator](): AsyncGenerator<Uint8Array> } {
+  const isTTY = input === 'tty'
+  const bytes = typeof input === 'string' ? new TextEncoder().encode(isTTY ? '' : input) : input
+  return {
+    isTTY,
+    async *[Symbol.asyncIterator]() {
+      if (!isTTY && bytes.length > 0) yield bytes
+    },
+  }
+}
+
 /** Keys are `METHOD /path` without the `/api` prefix, e.g. `GET /projects/by-slug/web`. */
 export async function runWithApi(
   register: (program: Command) => void,
   argv: string[],
-  routes: Record<string, MockRoute>
+  routes: Record<string, MockRoute>,
+  options: MockRunOptions = {}
 ): Promise<MockRun> {
+  const savedStdin = Object.getOwnPropertyDescriptor(process, 'stdin')
+  if (options.stdin !== undefined) {
+    Object.defineProperty(process, 'stdin', { value: fakeStdin(options.stdin), configurable: true, writable: true })
+  }
   const saved = { url: process.env.TEMPS_API_URL, token: process.env.TEMPS_TOKEN, exitCode: process.exitCode }
   process.env.TEMPS_API_URL = 'http://127.0.0.1:9'
   process.env.TEMPS_TOKEN = 'test-token-never-sent'
@@ -91,6 +117,7 @@ export async function runWithApi(
     exitSpy.mockRestore()
     fetchSpy.mockRestore()
     setQuietMode(false)
+    if (options.stdin !== undefined && savedStdin) Object.defineProperty(process, 'stdin', savedStdin)
   }
   const run: MockRun = {
     exitCode: Number(process.exitCode ?? 0),

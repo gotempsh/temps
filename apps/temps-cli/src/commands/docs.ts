@@ -256,6 +256,10 @@ bunx @temps-sdk/cli@latest environments list --project my-app
 # Set an environment variable on the intended server (prompts for the value)
 bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
+# Store a secret from a file, or pipe it from a password manager (never type it on the command line)
+bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt
+op read op://vault/db/password | bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-stdin
+
 # View environment variables
 bunx @temps-sdk/cli@latest environments vars list --project my-app
 \`\`\`

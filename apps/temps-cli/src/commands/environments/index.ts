@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import * as tty from 'node:tty'
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -26,10 +27,26 @@ import {
 import type { EnvironmentResponse, EnvironmentVariableResponse, CronInfo, CronExecutionInfo } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
-import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
+import { promptText, promptPassword, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
 import { registerEnvironmentWorkloadCommands } from './workload.js'
+import { addValueSourceOptions, resolveValueSource, valueSourceInput, type ValueSourceIO } from '../../lib/value-source.js'
+
+const SET_VAR_EXAMPLES = `
+Examples:
+  # Store a secret from a file (recommended: nothing lands in shell history)
+  $ temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt
+
+  # Pipe a secret from a password manager
+  $ op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin
+
+  # A file written by an editor or echo usually ends in a newline; drop it
+  $ temps environments vars set API_TOKEN --secret --value-file ./token.txt --trim-trailing-newline
+
+  # A plain, non-secret value can still be passed inline
+  $ temps environments vars set LOG_LEVEL debug --environments production
+`
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -90,14 +107,19 @@ export function registerEnvironmentsCommands(program: Command): void {
       return getEnvVar(projectSlug, key, options)
     })
 
-  vars
+  const setVar = vars
     .command('set <key> [value]')
-    .description('Set an environment variable')
+    .description(
+      'Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs'
+    )
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--preview', 'Also include in current and future preview environments')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
+  addValueSourceOptions(setVar, { what: 'the value' })
+  setVar
+    .addHelpText('after', SET_VAR_EXAMPLES)
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -574,12 +596,53 @@ async function getEnvVar(
   }
 }
 
+export interface SetEnvVarOptions {
+  environments?: string
+  preview?: boolean
+  update?: boolean
+  secret?: boolean
+  valueFile?: string
+  valueStdin?: boolean
+  trimTrailingNewline?: boolean
+}
+
+/**
+ * The value for `vars set` from its argument, `--value-file` or
+ * `--value-stdin`; `undefined` when none was given (the caller prompts).
+ */
+export async function resolveSetVarValue(
+  key: string,
+  value: string | undefined,
+  options: SetEnvVarOptions,
+  io?: ValueSourceIO
+): Promise<string | undefined> {
+  const resolved = await resolveValueSource(
+    valueSourceInput(value, options as Record<string, unknown>),
+    {
+      subject: `the value for ${key}`,
+      flags: { inline: '<value>', file: '--value-file', stdin: '--value-stdin' },
+      newlineHint: true,
+    },
+    io
+  )
+  return resolved?.value
+}
+
 async function setEnvVar(
   projectFlag: string | undefined,
   key: string,
   value: string | undefined,
-  options: { environments?: string; preview?: boolean; update?: boolean; secret?: boolean }
+  options: SetEnvVarOptions
 ): Promise<void> {
+  // Read the value before anything else, so a bad file or an empty pipe
+  // fails fast, and stdin is consumed before any prompt could want it.
+  const sourcedValue = await resolveSetVarValue(key, value, options)
+  if (sourcedValue === undefined && !process.stdin.isTTY) {
+    throw new Error(
+      `Missing the value for ${key}: pass --value-file <path>, --value-stdin, or <value> (stdin is not a terminal, so it cannot be prompted for)`
+    )
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -618,11 +681,10 @@ async function setEnvVar(
   // Check if variable already exists
   const existingVar = existingVars.find(v => v.key === key)
 
-  // Get value if not provided
-  const actualValue = value ?? await promptText({
-    message: `Value for ${key}`,
-    required: true,
-  })
+  // Prompt only when no source was given; mask the input for a secret.
+  const actualValue = sourcedValue ?? (options.secret
+    ? await promptPassword({ message: `Value for ${key} (secret)` })
+    : await promptText({ message: `Value for ${key}`, required: true }))
 
   // Determine which environments to use
   let environmentIds: number[]
@@ -652,11 +714,7 @@ async function setEnvVar(
     if (existingVar && options.update) {
       environmentIds = existingVar.environments.map(e => e.id)
     } else {
-      const selected = await promptCheckbox({
-        message: 'Select environments',
-        choices,
-      })
-      environmentIds = selected
+      environmentIds = await pickEnvironments(choices)
     }
   }
 
@@ -708,7 +766,7 @@ async function setEnvVar(
   if (saved?.secret_suggestion) {
     warning(
       `${saved.secret_suggestion.message}. Consider rotating it and storing it as a secret: ` +
-        `temps environments vars set ${key} --update --secret`
+        `temps environments vars set ${key} --update --secret --value-file <path>`
     )
   }
 
@@ -716,6 +774,32 @@ async function setEnvVar(
   info(includeInPreview
     ? 'Current and future preview environments are also included.'
     : 'Other and future preview environments are excluded (use --preview to include them).')
+}
+
+/**
+ * The interactive environment picker. When stdin is not a terminal (the value
+ * was piped in, e.g. `op read … | temps environments vars set KEY --value-stdin`)
+ * it prompts on the controlling terminal instead; with no terminal at all it
+ * fails, since an unanswerable prompt would otherwise end the command silently.
+ */
+export async function pickEnvironments(
+  choices: Array<{ name: string; value: number }>,
+  openTerminal: () => tty.ReadStream = () => new tty.ReadStream(fs.openSync('/dev/tty', 'r'))
+): Promise<number[]> {
+  if (process.stdin.isTTY) return promptCheckbox({ message: 'Select environments', choices })
+  let input: tty.ReadStream
+  try {
+    input = openTerminal()
+  } catch {
+    throw new Error(
+      'stdin is not a terminal, so the environments cannot be picked interactively: pass --environments <names>'
+    )
+  }
+  try {
+    return await promptCheckbox({ message: 'Select environments', choices }, { input, output: process.stderr })
+  } finally {
+    input.destroy()
+  }
 }
 
 export function resolvePreviewInclusion(

@@ -16,6 +16,7 @@ import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/inde
 import { TOKEN_ENV_VAR as CODEX_TOKEN_ENV_VAR } from './clients/codex.js'
 import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 /**
  * The scheme+host+port a URL resolves to, for comparing whether two URLs
@@ -231,7 +232,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(disableAction)
 
-  mcp
+  const addCommand = mcp
     .command('add [client]')
     .description(
       `Configure an AI client to connect to this Temps instance over MCP. Clients: ${listClientIds().join(', ')}`,
@@ -245,6 +246,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
     .action(addAction)
+  addCredentialSources(addCommand, [{ flag: 'api-key', what: 'the API key' }])
 
   mcp.command('remove [client]').description('Remove the Temps MCP server from an AI client').action(removeAction)
 

@@ -20,6 +20,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 interface ListOptions {
   projectId: string
@@ -150,7 +151,7 @@ export function registerWebhooksCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listWebhooksAction)
 
-  webhooks
+  const createCommand = webhooks
     .command('create')
     .alias('add')
     .description('Create a new webhook for a project')
@@ -160,6 +161,7 @@ export function registerWebhooksCommands(program: Command): void {
     .option('-s, --secret <secret>', 'Webhook secret for signature verification')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createWebhookAction)
+  addCredentialSources(createCommand, [{ flag: 'secret', what: 'the webhook signing secret' }])
 
   webhooks
     .command('show')
@@ -169,7 +171,7 @@ export function registerWebhooksCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(showWebhook)
 
-  webhooks
+  const updateCommand = webhooks
     .command('update')
     .description('Update a webhook')
     .requiredOption('--project-id <id>', 'Project ID')
@@ -178,6 +180,7 @@ export function registerWebhooksCommands(program: Command): void {
     .option('-e, --events <events>', 'Comma-separated event types (or "all" for all events)')
     .option('-s, --secret <secret>', 'New webhook secret for signature verification')
     .action(updateWebhookAction)
+  addCredentialSources(updateCommand, [{ flag: 'secret', what: 'the webhook signing secret' }])
 
   webhooks
     .command('remove')

@@ -26,6 +26,7 @@ import {
   newline, header, icons, json, colors, success, info, warning,
   keyValue, formatDate,
 } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 const PROVIDER_TYPES: { name: string; value: EmailProviderTypeRoute }[] = [
   { name: 'Amazon SES', value: 'ses' },
@@ -128,7 +129,7 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listProvidersAction)
 
-  emailProviders
+  const createCommand = emailProviders
     .command('create')
     .alias('add')
     .description('Create a new email provider')
@@ -143,6 +144,10 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--project-id <id>', 'Scaleway project ID')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createProviderAction)
+  addCredentialSources(createCommand, [
+    { flag: 'secret-access-key', what: 'the AWS secret access key' },
+    { flag: 'api-key', what: 'the Scaleway API key' },
+  ])
 
   emailProviders
     .command('show')
