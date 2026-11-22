@@ -625,7 +625,12 @@ async fn run(
     // so the resolver tasks stay alive for the lifetime of the agent.
     let mut _resolver_handle: Option<DnsResolverHandle> = None;
 
+    // The inputs of the last container route sweep, which a stranded
+    // container scan repeats for the containers it started.
+    let (route_sweep_tx, route_sweep_rx) =
+        tokio::sync::watch::channel(None::<crate::stranded_start::RouteSweep>);
     let slots = SharedSlots {
+        route_sweep: &route_sweep_tx,
         overlay_bridge_address: &overlay_bridge_address,
         shared_peers: &shared_peers,
         dns_health: &dns_health,
@@ -639,9 +644,9 @@ async fn run(
         config.node_id
     );
     let mut mesh = MeshState::default();
-    // The mesh address last checked for containers Docker could not start
-    // before it existed (see `crate::stranded_start`).
-    let mut stranded_checked_for: Option<std::net::Ipv4Addr> = None;
+    // The scan for containers Docker could not start before the mesh address
+    // existed (see `crate::stranded_start`).
+    let mut stranded = crate::stranded_start::StrandedScan::default();
     // Built from the first snapshot: the underlay device depends on whether
     // the cluster runs the WireGuard mesh.
     let mut manager: Option<(NetworkManager, bool)> = None;
@@ -807,18 +812,16 @@ async fn run(
                             if let Some(address) =
                                 mesh.configured.as_ref().map(|interface| interface.address)
                             {
-                                if crate::stranded_start::should_check(
-                                    stranded_checked_for,
-                                    address,
-                                    rebuilt,
-                                ) {
-                                    stranded_checked_for = Some(address);
-                                    tokio::spawn(
-                                        crate::stranded_start::start_containers_stranded_on_mesh(
-                                            address,
-                                        ),
-                                    );
-                                }
+                                let routes = route_sweep_rx.clone();
+                                stranded
+                                    .on_mesh_ready(address, rebuilt, move |address| {
+                                        tokio::spawn(
+                                            crate::stranded_start::start_containers_stranded_on_mesh(
+                                                address, routes,
+                                            ),
+                                        )
+                                    })
+                                    .await;
                             }
                             if let Some(moved) =
                                 publish_mesh_bind_address(&bind_address, &config, &mesh)
@@ -1316,6 +1319,24 @@ struct MeshState {
     /// The mesh pool last checked against this host's routes. A new pool
     /// is checked again before it is applied.
     preflighted: Option<Ipv4Net>,
+    /// The interface was rebuilt and no `MeshTick::Ready` has reported it
+    /// yet: kept across a tick that fails after the rebuild (peers that
+    /// could not be reconciled), whose retry finds the interface already
+    /// in place and would otherwise report no rebuild.
+    rebuild_pending: bool,
+}
+
+impl MeshState {
+    /// Record the outcome of bringing the interface up.
+    fn note_rebuild(&mut self, rebuilt: bool) {
+        self.rebuild_pending |= rebuilt;
+    }
+
+    /// Whether a rebuild is still unreported, clearing it: called when a
+    /// tick reports `MeshTick::Ready`.
+    fn take_rebuild(&mut self) -> bool {
+        std::mem::take(&mut self.rebuild_pending)
+    }
 }
 
 /// The mesh pool from the control plane, held to the rules the control
@@ -1498,15 +1519,15 @@ async fn reconcile_mesh(
             .map_err(|e| SyncError::Mesh(e.to_string()))?;
         state.preflighted = Some(cidr);
     }
-    let mut rebuilt = false;
     if state.configured.as_ref() != Some(&interface) {
         let (apply_interface, apply_key) = (interface.clone(), key.clone());
-        rebuilt = tokio::task::spawn_blocking(move || {
+        let rebuilt = tokio::task::spawn_blocking(move || {
             temps_wireguard::mesh::ensure_interface(&apply_interface, &apply_key)
         })
         .await
         .map_err(|e| SyncError::Mesh(e.to_string()))?
         .map_err(|e| SyncError::Mesh(e.to_string()))?;
+        state.note_rebuild(rebuilt);
         info!(
             interface = temps_network::mesh::MESH_INTERFACE,
             %address,
@@ -1558,7 +1579,10 @@ async fn reconcile_mesh(
             !wire.hub
         }
     };
-    Ok(MeshTick::Ready { rebuilt, report })
+    Ok(MeshTick::Ready {
+        rebuilt: state.take_rebuild(),
+        report,
+    })
 }
 
 #[derive(Serialize)]
@@ -2092,6 +2116,8 @@ fn save_snapshot(path: &std::path::Path, snapshot: &WirePeerListResponse) -> std
 /// references for one function call.
 #[derive(Clone, Copy)]
 struct SharedSlots<'a> {
+    /// What each container route sweep used (`crate::stranded_start`).
+    route_sweep: &'a tokio::sync::watch::Sender<Option<crate::stranded_start::RouteSweep>>,
     overlay_bridge_address: &'a Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: &'a SharedPeers,
     dns_health: &'a SharedDnsHealth,
@@ -2244,6 +2270,15 @@ async fn apply(
     // update), so a sync-loop sweep is the simplest way to heal
     // automatically. `ip route replace` is idempotent — re-running
     // when nothing changed is a no-op.
+    // Published first, so a stranded-container scan that starts containers
+    // after this sweep listed the running ones installs their routes too.
+    slots
+        .route_sweep
+        .send_replace(Some(crate::stranded_start::RouteSweep {
+            overlay_network: overlay_name::current().docker_network,
+            bridge_gateway: bridge_v4.clone(),
+            peers: peers.clone(),
+        }));
     let swept = match Docker::connect_with_local_defaults() {
         Ok(docker) => {
             temps_network::overlay_routes::sweep_container_routes(
@@ -3766,5 +3801,19 @@ mod tests {
             serde_json::to_value(&down).unwrap()["status"],
             "unavailable"
         );
+    }
+
+    #[test]
+    fn a_rebuild_is_reported_by_the_next_ready_tick_even_after_a_failed_one() {
+        let mut mesh = MeshState::default();
+        // The interface was rebuilt, then reconciling its peers failed: the
+        // tick returned an error instead of `Ready`.
+        mesh.note_rebuild(true);
+        // The retry finds the interface already in place.
+        mesh.note_rebuild(false);
+        assert!(mesh.take_rebuild());
+        // Reported once.
+        mesh.note_rebuild(false);
+        assert!(!mesh.take_rebuild());
     }
 }

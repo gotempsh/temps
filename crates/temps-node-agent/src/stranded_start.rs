@@ -27,14 +27,33 @@
 //!   done had the address existed;
 //! - its last start failed with "cannot assign requested address";
 //! - it publishes at least one port on the mesh address.
+//!
+//! A failed Docker listing is retried with backoff and the address is only
+//! recorded as checked once a listing succeeds, so a Docker daemon that is
+//! slow to answer at boot does not leave the containers stopped. Once it has
+//! started a container the scan installs the overlay peer routes inside
+//! every overlay container, with the inputs the sync loop's last route sweep
+//! used: that sweep may have listed the running containers before the start,
+//! and an agent running from its offline snapshot sweeps only once.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::Ipv4Addr;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bollard::models::{ContainerInspectResponse, ContainerStateStatusEnum, RestartPolicyNameEnum};
 use bollard::Docker;
+use temps_core::retry::RetryConfig;
+use temps_network::Peer;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 use tracing::{info, warn};
+
+/// How long a scan waits for the sync loop's first route sweep before
+/// leaving the routes of the containers it started to a later sweep. The
+/// sweep runs in the same sync tick that launches the scan, so this is only
+/// reached when that tick failed to apply the overlay.
+const ROUTE_SWEEP_WAIT: Duration = Duration::from_secs(300);
 
 /// The kernel's `EADDRNOTAVAIL` text, as Docker reports a published port
 /// whose host address is not assigned to any interface.
@@ -129,6 +148,21 @@ pub(crate) trait ContainerEngine: Send + Sync {
     async fn stopped_container_ids(&self) -> Result<Vec<String>, String>;
     async fn inspect(&self, container_id: &str) -> Result<ContainerInspectResponse, String>;
     async fn start(&self, container_id: &str) -> Result<(), String>;
+    /// Install the overlay peer routes inside every running overlay
+    /// container (`ip route replace`, so repeating it changes nothing).
+    async fn sweep_routes(&self, routes: &RouteSweep) -> Result<(), String>;
+}
+
+/// The inputs of the sync loop's container route sweep, published by every
+/// sweep so a scan can repeat it for the containers it started.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RouteSweep {
+    /// The overlay's Docker network.
+    pub overlay_network: String,
+    /// This node's overlay bridge address, the containers' gateway.
+    pub bridge_gateway: String,
+    /// The peers whose subnets are routed through the gateway.
+    pub peers: Vec<Peer>,
 }
 
 #[async_trait]
@@ -169,18 +203,66 @@ impl ContainerEngine for Docker {
             .await
             .map_err(|e| format!("starting container {container_id}: {e}"))
     }
+
+    async fn sweep_routes(&self, routes: &RouteSweep) -> Result<(), String> {
+        temps_network::overlay_routes::sweep_container_routes(
+            self,
+            &routes.overlay_network,
+            &routes.bridge_gateway,
+            &routes.peers,
+            // A full pass, like the sync loop's.
+            &mut HashSet::new(),
+        )
+        .await
+        .map_err(|e| {
+            format!(
+                "sweeping container routes on {}: {e}",
+                routes.overlay_network
+            )
+        })
+    }
 }
 
-/// Whether the sync loop should look for stranded containers on this tick:
-/// once per mesh address this process brought up, and again whenever the
-/// interface was rebuilt (anything Docker tried to start while it was gone
-/// failed the same way).
-pub(crate) fn should_check(
-    checked_for: Option<Ipv4Addr>,
-    current: Ipv4Addr,
-    interface_rebuilt: bool,
-) -> bool {
-    interface_rebuilt || checked_for != Some(current)
+/// When the sync loop scans for stranded containers: once per mesh address
+/// this process brought up, and again after every interface rebuild (anything
+/// Docker tried to start while the interface was gone failed the same way).
+/// An address counts as scanned only once a scan's Docker listing succeeded,
+/// and a second scan never runs alongside the first.
+#[derive(Debug, Default)]
+pub(crate) struct StrandedScan {
+    /// The mesh address the last successful scan covered.
+    completed_for: Option<Ipv4Addr>,
+    /// An interface rebuild that no scan launched since has covered.
+    rebuild_pending: bool,
+    /// The running scan and the address it covers. Its output is whether
+    /// its Docker listing succeeded.
+    running: Option<(Ipv4Addr, JoinHandle<bool>)>,
+}
+
+impl StrandedScan {
+    /// Called on every tick the mesh interface is up on `address`; launches
+    /// a scan through `spawn` when one is due.
+    pub(crate) async fn on_mesh_ready<F>(&mut self, address: Ipv4Addr, rebuilt: bool, spawn: F)
+    where
+        F: FnOnce(Ipv4Addr) -> JoinHandle<bool>,
+    {
+        self.rebuild_pending |= rebuilt;
+        if let Some((scanned, handle)) = self.running.take() {
+            if !handle.is_finished() {
+                self.running = Some((scanned, handle));
+                return;
+            }
+            // Finished, so this does not wait. A panicked scan counts as
+            // failed and runs again.
+            if handle.await.unwrap_or(false) {
+                self.completed_for = Some(scanned);
+            }
+        }
+        if self.rebuild_pending || self.completed_for != Some(address) {
+            self.rebuild_pending = false;
+            self.running = Some((address, spawn(address)));
+        }
+    }
 }
 
 /// What one pass of [`start_stranded_containers`] did.
@@ -247,10 +329,99 @@ pub(crate) async fn start_stranded_containers(
     Ok(report)
 }
 
-/// Connect to the local Docker daemon and run [`start_stranded_containers`],
-/// logging the outcome. Spawned by the network sync loop off its reconcile
-/// path once the mesh interface is up.
-pub(crate) async fn start_containers_stranded_on_mesh(address: Ipv4Addr) {
+/// Retries of a failed Docker listing: about two minutes in all. After the
+/// last one the scan reports failure and the sync loop runs it again on its
+/// next tick.
+fn listing_retry() -> RetryConfig {
+    RetryConfig::new(6)
+        .with_base_delay(Duration::from_secs(5))
+        .with_max_delay(Duration::from_secs(60))
+}
+
+/// One scan: start the stranded containers, retrying a failed listing per
+/// `retry`, then install the overlay routes of the containers it started.
+/// Returns whether the listing succeeded, i.e. whether the address is
+/// covered.
+pub(crate) async fn run_scan(
+    engine: &dyn ContainerEngine,
+    address: Ipv4Addr,
+    retry: &RetryConfig,
+    routes: watch::Receiver<Option<RouteSweep>>,
+    route_wait: Duration,
+) -> bool {
+    let report = match retry
+        .retry(|| start_stranded_containers(engine, address))
+        .await
+    {
+        Ok(report) => report,
+        Err(error) => {
+            warn!(
+                mesh_address = %address,
+                %error,
+                attempts = retry.max_attempts,
+                "could not look for containers that failed to publish on the WireGuard mesh \
+                 address before it existed; retrying on the next network sync. Meanwhile check \
+                 `docker ps -a` for containers exited with \"cannot assign requested address\""
+            );
+            return false;
+        }
+    };
+    if report.started.is_empty() && report.failed.is_empty() {
+        return true;
+    }
+    info!(
+        mesh_address = %address,
+        started = report.started.len(),
+        failed = report.failed.len(),
+        "restarted containers whose published ports could not bind the WireGuard mesh \
+         address before it existed"
+    );
+    if !report.started.is_empty() {
+        install_routes(engine, address, routes, route_wait).await;
+    }
+    true
+}
+
+/// Repeat the sync loop's route sweep for containers a scan started,
+/// waiting up to `wait` for the loop to publish its first sweep.
+async fn install_routes(
+    engine: &dyn ContainerEngine,
+    address: Ipv4Addr,
+    mut routes: watch::Receiver<Option<RouteSweep>>,
+    wait: Duration,
+) {
+    let published = tokio::time::timeout(wait, routes.wait_for(Option::is_some))
+        .await
+        .ok()
+        .and_then(|waited| waited.ok().map(|sweep| Option::clone(&sweep)))
+        .flatten();
+    let Some(sweep) = published else {
+        warn!(
+            mesh_address = %address,
+            wait_secs = wait.as_secs(),
+            "the overlay was not applied while starting containers stranded by the missing \
+             WireGuard mesh address; their peer routes are installed by the next network sync \
+             that applies it"
+        );
+        return;
+    };
+    if let Err(error) = engine.sweep_routes(&sweep).await {
+        warn!(
+            mesh_address = %address,
+            %error,
+            "could not install overlay peer routes in containers started after the WireGuard \
+             mesh address came up; the next network sync retries"
+        );
+    }
+}
+
+/// Connect to the local Docker daemon and run [`run_scan`]. Spawned by the
+/// network sync loop off its reconcile path once the mesh interface is up;
+/// its output is whether the address is covered (see [`StrandedScan`]).
+pub(crate) async fn start_containers_stranded_on_mesh(
+    address: Ipv4Addr,
+    routes: watch::Receiver<Option<RouteSweep>>,
+) -> bool {
     let docker = match Docker::connect_with_local_defaults() {
         Ok(docker) => docker,
         Err(error) => {
@@ -258,34 +429,20 @@ pub(crate) async fn start_containers_stranded_on_mesh(address: Ipv4Addr) {
                 mesh_address = %address,
                 %error,
                 "could not connect to Docker to start containers that failed to publish on the \
-                 WireGuard mesh address before it existed; check `docker ps -a` for containers \
-                 exited with \"cannot assign requested address\""
+                 WireGuard mesh address before it existed; retrying on the next network sync. \
+                 Meanwhile check `docker ps -a` for containers exited with \"cannot assign \
+                 requested address\""
             );
-            return;
+            return false;
         }
     };
-    match start_stranded_containers(&docker, address).await {
-        Ok(report) if report.started.is_empty() && report.failed.is_empty() => {}
-        Ok(report) => info!(
-            mesh_address = %address,
-            started = report.started.len(),
-            failed = report.failed.len(),
-            "restarted containers whose published ports could not bind the WireGuard mesh \
-             address before it existed"
-        ),
-        Err(error) => warn!(
-            mesh_address = %address,
-            %error,
-            "could not look for containers that failed to publish on the WireGuard mesh address \
-             before it existed; check `docker ps -a` for containers exited with \"cannot assign \
-             requested address\""
-        ),
-    }
+    run_scan(&docker, address, &listing_retry(), routes, ROUTE_SWEEP_WAIT).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Mutex;
 
     const MESH: Ipv4Addr = Ipv4Addr::new(10, 201, 0, 8);
@@ -404,30 +561,124 @@ mod tests {
         assert_eq!(stranded_on(&inspect, MESH), None);
     }
 
-    #[test]
-    fn the_check_runs_once_per_mesh_address_and_after_every_rebuild() {
+    /// A scan that has already finished with `outcome`.
+    fn finished(outcome: bool) -> impl FnOnce(Ipv4Addr) -> JoinHandle<bool> {
+        move |_| tokio::spawn(async move { outcome })
+    }
+
+    /// Wait for the running scan, if any, to finish.
+    async fn settle(scan: &StrandedScan) {
+        while scan.running.as_ref().is_some_and(|(_, h)| !h.is_finished()) {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Run `on_mesh_ready` and report whether it launched a scan.
+    async fn ready(
+        scan: &mut StrandedScan,
+        address: Ipv4Addr,
+        rebuilt: bool,
+        outcome: bool,
+    ) -> bool {
+        let launched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = launched.clone();
+        let spawn = finished(outcome);
+        scan.on_mesh_ready(address, rebuilt, move |address| {
+            seen.store(true, Ordering::SeqCst);
+            spawn(address)
+        })
+        .await;
+        settle(scan).await;
+        launched.load(Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn the_scan_runs_once_per_mesh_address_and_after_every_rebuild() {
         let other = Ipv4Addr::new(10, 201, 0, 9);
+        let mut scan = StrandedScan::default();
         // First time the mesh is up in this process.
-        assert!(should_check(None, MESH, false));
+        assert!(ready(&mut scan, MESH, false, true).await);
         // Every later tick on the same interface.
-        assert!(!should_check(Some(MESH), MESH, false));
+        assert!(!ready(&mut scan, MESH, false, true).await);
+        assert!(!ready(&mut scan, MESH, false, true).await);
         // The interface was recreated, or moved to another address.
-        assert!(should_check(Some(MESH), MESH, true));
-        assert!(should_check(Some(MESH), other, false));
+        assert!(ready(&mut scan, MESH, true, true).await);
+        assert!(!ready(&mut scan, MESH, false, true).await);
+        assert!(ready(&mut scan, other, false, true).await);
+        assert!(!ready(&mut scan, other, false, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_scan_whose_docker_listing_failed_runs_again_on_the_next_tick() {
+        let mut scan = StrandedScan::default();
+        assert!(ready(&mut scan, MESH, false, false).await);
+        // Docker did not answer: the address is not covered yet.
+        assert!(ready(&mut scan, MESH, false, false).await);
+        assert!(ready(&mut scan, MESH, false, true).await);
+        // Covered now; an empty successful scan is not repeated.
+        assert!(!ready(&mut scan, MESH, false, true).await);
+    }
+
+    #[tokio::test]
+    async fn no_second_scan_runs_alongside_one_and_a_rebuild_meanwhile_is_kept() {
+        let mut scan = StrandedScan::default();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        scan.on_mesh_ready(MESH, false, move |_| {
+            tokio::spawn(async move { released.await.is_ok() })
+        })
+        .await;
+        assert!(scan.running.is_some());
+
+        // Still listing: neither another tick nor a rebuild starts a second
+        // scan.
+        let mut launched = false;
+        scan.on_mesh_ready(MESH, true, |address| {
+            launched = true;
+            finished(true)(address)
+        })
+        .await;
+        assert!(!launched);
+
+        release.send(()).expect("scan still waiting");
+        settle(&scan).await;
+        // The first scan covered the address, but the rebuild seen while it
+        // ran happened after its listing could have started: scan again.
+        assert!(ready(&mut scan, MESH, false, true).await);
+        assert!(!ready(&mut scan, MESH, false, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_panicked_scan_counts_as_failed() {
+        let mut scan = StrandedScan::default();
+        scan.on_mesh_ready(MESH, false, |_| {
+            tokio::spawn(async { panic!("scan task panicked") })
+        })
+        .await;
+        settle(&scan).await;
+        assert!(ready(&mut scan, MESH, false, true).await);
     }
 
     /// Docker as seen after a reboot: what it lists as stopped, what it
     /// inspects, and which starts fail.
+    #[derive(Default)]
     struct FakeEngine {
         containers: Vec<ContainerInspectResponse>,
         uninspectable: Vec<String>,
         failing_start: Vec<String>,
+        /// How many listings fail before one succeeds.
+        failing_listings: AtomicU32,
         started: Mutex<Vec<String>>,
+        swept: Mutex<Vec<RouteSweep>>,
     }
 
     #[async_trait]
     impl ContainerEngine for FakeEngine {
         async fn stopped_container_ids(&self) -> Result<Vec<String>, String> {
+            let failing = self.failing_listings.load(Ordering::SeqCst);
+            if failing > 0 {
+                self.failing_listings.store(failing - 1, Ordering::SeqCst);
+                return Err("listing stopped containers: connection refused".into());
+            }
             Ok(self
                 .containers
                 .iter()
@@ -454,6 +705,165 @@ mod tests {
                 .push(container_id.to_string());
             Ok(())
         }
+
+        async fn sweep_routes(&self, routes: &RouteSweep) -> Result<(), String> {
+            self.swept.lock().expect("swept lock").push(routes.clone());
+            Ok(())
+        }
+    }
+
+    fn sweep() -> RouteSweep {
+        RouteSweep {
+            overlay_network: "temps-overlay".into(),
+            bridge_gateway: "10.100.3.1".into(),
+            peers: vec![],
+        }
+    }
+
+    fn quick_retry(attempts: u32) -> RetryConfig {
+        RetryConfig::new(attempts).with_base_delay(Duration::from_secs(5))
+    }
+
+    fn stranded_app() -> FakeEngine {
+        FakeEngine {
+            containers: vec![inspect_json(
+                "app",
+                "exited",
+                "unless-stopped",
+                "10.201.0.8",
+                BIND_ERROR,
+            )],
+            ..FakeEngine::default()
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_docker_listing_that_fails_at_first_is_retried() {
+        let engine = stranded_app();
+        engine.failing_listings.store(2, Ordering::SeqCst);
+        let (_tx, routes) = watch::channel(Some(sweep()));
+
+        assert!(
+            run_scan(
+                &engine,
+                MESH,
+                &quick_retry(3),
+                routes,
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert_eq!(*engine.started.lock().expect("started lock"), vec!["app"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_docker_listing_that_keeps_failing_reports_the_address_uncovered() {
+        let engine = stranded_app();
+        engine.failing_listings.store(3, Ordering::SeqCst);
+        let (_tx, routes) = watch::channel(Some(sweep()));
+
+        assert!(
+            !run_scan(
+                &engine,
+                MESH,
+                &quick_retry(3),
+                routes,
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert!(engine.started.lock().expect("started lock").is_empty());
+    }
+
+    #[tokio::test]
+    async fn started_containers_get_their_overlay_routes_from_the_last_sweep() {
+        let engine = stranded_app();
+        // The sync loop swept before the scan's start finished.
+        let (_tx, routes) = watch::channel(Some(sweep()));
+
+        assert!(
+            run_scan(
+                &engine,
+                MESH,
+                &quick_retry(1),
+                routes,
+                Duration::from_secs(1)
+            )
+            .await
+        );
+        assert_eq!(*engine.swept.lock().expect("swept lock"), vec![sweep()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn started_containers_get_their_overlay_routes_once_the_loop_first_sweeps() {
+        let engine = std::sync::Arc::new(stranded_app());
+        // The scan finishes before the sync loop's first sweep.
+        let (tx, routes) = watch::channel(None);
+        let scan = tokio::spawn({
+            let engine = engine.clone();
+            async move {
+                run_scan(
+                    engine.as_ref(),
+                    MESH,
+                    &quick_retry(1),
+                    routes,
+                    Duration::from_secs(60),
+                )
+                .await
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(engine.swept.lock().expect("swept lock").is_empty());
+
+        tx.send_replace(Some(sweep()));
+        assert!(scan.await.expect("scan task"));
+        assert_eq!(*engine.swept.lock().expect("swept lock"), vec![sweep()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_that_started_nothing_does_not_sweep_or_wait() {
+        let engine = FakeEngine {
+            containers: vec![inspect_json(
+                "stopped-by-hand",
+                "exited",
+                "unless-stopped",
+                "10.201.0.8",
+                "",
+            )],
+            ..FakeEngine::default()
+        };
+        let (_tx, routes) = watch::channel(None);
+
+        assert!(
+            run_scan(
+                &engine,
+                MESH,
+                &quick_retry(1),
+                routes,
+                Duration::from_secs(60)
+            )
+            .await
+        );
+        assert!(engine.swept.lock().expect("swept lock").is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_scan_gives_up_waiting_for_a_sweep_but_still_covers_the_address() {
+        let engine = stranded_app();
+        let (_tx, routes) = watch::channel(None);
+
+        assert!(
+            run_scan(
+                &engine,
+                MESH,
+                &quick_retry(1),
+                routes,
+                Duration::from_secs(60)
+            )
+            .await
+        );
+        assert_eq!(*engine.started.lock().expect("started lock"), vec!["app"]);
+        assert!(engine.swept.lock().expect("swept lock").is_empty());
     }
 
     #[tokio::test]
@@ -473,8 +883,7 @@ mod tests {
                 inspect_json("elsewhere", "exited", "always", "192.0.2.10", BIND_ERROR),
             ],
             uninspectable: vec!["removed-meanwhile".into()],
-            failing_start: vec![],
-            started: Mutex::default(),
+            ..FakeEngine::default()
         };
 
         let report = start_stranded_containers(&engine, MESH)
@@ -498,7 +907,7 @@ mod tests {
             ],
             uninspectable: vec![],
             failing_start: vec!["first".into()],
-            started: Mutex::default(),
+            ..FakeEngine::default()
         };
 
         let report = start_stranded_containers(&engine, MESH)
