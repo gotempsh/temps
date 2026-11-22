@@ -266,3 +266,49 @@ test('Enter on the provider Retry retries instead of advancing the wizard', asyn
   expect(view.queryByText('Review your configuration')).toBeNull()
   expect(view.getByText('How it gets HTTPS')).toBeTruthy()
 })
+
+test('the confirm step shows a failed provider lookup, not the manual steps', async () => {
+  const { view } = renderWizard((domain) =>
+    domain != null
+      ? jsonResponse({ title: 'Reachability Error', status: 500 }, 500)
+      : jsonResponse(methods(domain))
+  )
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+  await view.findByText(
+    'Could not check whether a DNS provider can write the TXT record'
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  await view.findByText('Review your configuration')
+
+  expect(view.queryByText('DNS-01 (Manual)')).toBeNull()
+  expect(view.getByText('DNS-01')).toBeTruthy()
+  expect(
+    view.getByText(
+      'Could not check whether a DNS provider can write the TXT record'
+    )
+  ).toBeTruthy()
+  expect(view.queryByText(/receive a DNS\s+TXT record to add/)).toBeNull()
+  expect(
+    view.getByRole('button', { name: 'Retry the DNS provider check' })
+  ).toBeTruthy()
+})
+
+test('the confirm step shows a provider lookup still in flight, not the manual steps', async () => {
+  const { view } = renderWizard((domain) =>
+    domain != null
+      ? new Promise<Response>(() => {})
+      : jsonResponse(methods(domain))
+  )
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  await view.findByText('Review your configuration')
+
+  expect(view.queryByText('DNS-01 (Manual)')).toBeNull()
+  expect(view.getByText('DNS-01')).toBeTruthy()
+  expect(
+    view.getByText('Checking whether a DNS provider can write the TXT record…')
+  ).toBeTruthy()
+  expect(view.queryByText(/receive a DNS\s+TXT record to add/)).toBeNull()
+})

@@ -256,6 +256,20 @@ export function AddDomain() {
   const dnsProvider = domainMethods.data?.dns01_provider.configured
     ? (domainMethods.data.dns_provider ?? null)
     : null
+  const dnsLookup: 'loading' | 'failed' | 'ready' = domainMethods.isError
+    ? 'failed'
+    : domainMethods.isSuccess
+      ? 'ready'
+      : 'loading'
+  const dns01Writer = (
+    <Dns01Writer
+      lookup={dnsLookup}
+      provider={dnsProvider}
+      setupPath={domainMethods.data?.dns01_provider.setup_path ?? null}
+      retrying={domainMethods.isFetching}
+      onRetry={() => domainMethods.refetch()}
+    />
+  )
   const covering = tunnelsCovering(
     watchedValues.domain ?? '',
     connectorsQuery.data ?? []
@@ -524,24 +538,7 @@ export function AddDomain() {
                                           <CheckCircle className="h-4 w-4" />
                                           <span>Works without HTTP access</span>
                                         </div>
-                                        <Dns01Writer
-                                          lookup={
-                                            domainMethods.isError
-                                              ? 'failed'
-                                              : domainMethods.isSuccess
-                                                ? 'ready'
-                                                : 'loading'
-                                          }
-                                          provider={dnsProvider}
-                                          setupPath={
-                                            domainMethods.data?.dns01_provider
-                                              .setup_path ?? null
-                                          }
-                                          retrying={domainMethods.isFetching}
-                                          onRetry={() =>
-                                            domainMethods.refetch()
-                                          }
-                                        />
+                                        {dns01Writer}
                                       </div>
                                     </div>
                                   </label>
@@ -626,7 +623,9 @@ export function AddDomain() {
                                   ? 'HTTP-01 (Automatic)'
                                   : dnsProvider
                                     ? `DNS-01 (through ${dnsProvider})`
-                                    : 'DNS-01 (Manual)'}
+                                    : dnsLookup === 'ready'
+                                      ? 'DNS-01 (Manual)'
+                                      : 'DNS-01'}
                               </span>
                             </div>
                           </div>
@@ -653,6 +652,25 @@ export function AddDomain() {
                                     provision the certificate
                                   </li>
                                 </ol>
+                              </div>
+                            </AlertDescription>
+                          </Alert>
+                        ) : dnsLookup !== 'ready' ? (
+                          // Unknown yet whether a provider writes the record:
+                          // say so, and never prescribe the manual steps.
+                          <Alert>
+                            <Shield className="h-4 w-4" />
+                            <AlertDescription>
+                              <div className="space-y-2">
+                                <p className="font-medium">
+                                  Next steps (DNS-01):
+                                </p>
+                                {dns01Writer}
+                                <p className="text-sm">
+                                  You can create the domain now: its page shows
+                                  the TXT record and the DNS providers that can
+                                  write it.
+                                </p>
                               </div>
                             </AlertDescription>
                           </Alert>
