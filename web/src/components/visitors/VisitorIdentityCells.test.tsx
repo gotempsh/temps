@@ -186,7 +186,10 @@ test('every part of a long location and source truncates on its own text', () =>
   })
   const country = screen.getByRole('button', { name: 'Filter by Bolivia' })
   expect(city.className).toContain('truncate')
-  expect(country.className).toContain('shrink-0')
+  // The country yields last, but can still truncate (no `shrink-0`).
+  expect(country.className).toContain('shrink-[0.001]')
+  expect(country.className).toContain('truncate')
+  expect(country.className).not.toContain('shrink-0')
   const referrer = screen.getByRole('button', {
     name: 'Filter by ads.campaigns.example.com',
   })
@@ -194,5 +197,22 @@ test('every part of a long location and source truncates on its own text', () =>
   expect(referrer.className).not.toContain('shrink-0')
   expect(
     screen.getByRole('button', { name: 'Filter by Paid Search' }).className
-  ).toContain('shrink-0')
+  ).toContain('shrink-[0.001]')
+})
+
+test('a line with tooltip details is a keyboard tab stop; one without is not', () => {
+  const { container, unmount } = renderCell(
+    <VisitorTechnologyCell
+      visitor={visitor({
+        browser: 'Chrome',
+        browser_version: '131.0.0.0',
+        operating_system: 'Windows 10',
+      })}
+    />
+  )
+  const line = container.querySelector('[tabindex="0"]')
+  expect(line?.textContent).toContain('Chrome')
+  unmount()
+  const bare = renderCell(<VisitorTechnologyCell visitor={visitor()} />)
+  expect(bare.container.querySelector('[tabindex]')).toBeNull()
 })

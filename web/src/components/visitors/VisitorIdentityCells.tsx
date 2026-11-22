@@ -39,6 +39,13 @@ function IconSlot({ children }: { children: ReactNode }) {
   )
 }
 
+/**
+ * For the part that should stay readable longest (the country, the channel):
+ * it shrinks only once the other part has given way, so a very long value
+ * still truncates instead of overflowing the line.
+ */
+const GIVES_WAY_LAST = 'shrink-[0.001]'
+
 /** One line that truncates, with everything it knows in a tooltip. */
 function IdentityLine({
   detail,
@@ -49,17 +56,20 @@ function IdentityLine({
   children: ReactNode
   className?: string
 }) {
-  const line = (
-    <span
-      className={`flex min-w-0 items-center gap-2 whitespace-nowrap ${className}`}
-    >
-      {children}
-    </span>
-  )
-  if (!detail) return line
+  const classes = `flex min-w-0 items-center gap-2 whitespace-nowrap ${className}`
+  if (!detail) return <span className={classes}>{children}</span>
   return (
     <Tooltip>
-      <TooltipTrigger asChild>{line}</TooltipTrigger>
+      <TooltipTrigger asChild>
+        {/* A tab stop of its own, so keyboard users reach the tooltip's
+            details; filter buttons inside stay separate tab stops. */}
+        <span
+          tabIndex={0}
+          className={`${classes} rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring`}
+        >
+          {children}
+        </span>
+      </TooltipTrigger>
       <TooltipContent className="max-w-sm [overflow-wrap:anywhere]">
         {detail}
       </TooltipContent>
@@ -124,7 +134,7 @@ export function VisitorLocationCell({
                 {...filters}
                 // The city gives way first, so the country stays readable.
                 className={
-                  index === location.parts.length - 1 ? 'shrink-0' : ''
+                  index === location.parts.length - 1 ? GIVES_WAY_LAST : ''
                 }
               />
             </Fragment>
@@ -159,7 +169,7 @@ export function VisitorSourceCell({
         <FilterText
           {...source.primary}
           {...filters}
-          className={source.secondary ? 'shrink-0' : ''}
+          className={source.secondary ? GIVES_WAY_LAST : ''}
         />
         {source.secondary && (
           <>
