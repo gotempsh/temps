@@ -68,6 +68,11 @@ interface DiscoverableDomainsOptions {
 
 // --- Credential resolution ---
 
+/** Validator for a masked credential prompt: an empty answer is not a credential. */
+export function requireNonEmpty(value: string): true | string {
+  return value.length > 0 ? true : 'A value is required'
+}
+
 // Maps flags already supplied on the command line to the ses_credentials /
 // scaleway_credentials pair the API expects (exactly one populated, the
 // other null). Returns undefined when required flags are missing so the
@@ -286,14 +291,16 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         newline()
 
         // Keep what was already supplied (e.g. --secret-access-key-file) and
-        // prompt only for what is missing; the secret is typed masked.
-        const accessKeyId = options.accessKeyId ?? await promptText({
+        // prompt only for what is missing (an empty flag counts as missing, as
+        // in resolveEmailProviderCredentials); the secret is typed masked.
+        const accessKeyId = options.accessKeyId || await promptText({
           message: 'AWS Access Key ID',
           required: true,
         })
 
-        const secretAccessKey = options.secretAccessKey ?? await promptPassword({
+        const secretAccessKey = options.secretAccessKey || await promptPassword({
           message: 'AWS Secret Access Key',
+          validate: requireNonEmpty,
         })
 
         sesCredentials = {
@@ -308,11 +315,12 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         info('Create credentials at: https://console.scaleway.com/iam/api-keys')
         newline()
 
-        const apiKey = options.apiKey ?? await promptPassword({
+        const apiKey = options.apiKey || await promptPassword({
           message: 'Scaleway API Key',
+          validate: requireNonEmpty,
         })
 
-        const projectId = options.projectId ?? await promptText({
+        const projectId = options.projectId || await promptText({
           message: 'Scaleway Project ID',
           required: true,
         })

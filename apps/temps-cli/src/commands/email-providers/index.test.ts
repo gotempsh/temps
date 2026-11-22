@@ -116,9 +116,25 @@ describe('email-providers create prompts only for what is missing', () => {
       expect(asked).toEqual(['AWS Access Key ID'])
       const body = credentialBody(run, 'POST /email-providers') as { ses_credentials: Record<string, unknown> }
       expect(body.ses_credentials).toEqual({ access_key_id: 'AKIAEXAMPLE', secret_access_key: CREDENTIAL_SENTINEL })
+
+      // An empty --access-key-id counts as missing and is prompted for, as
+      // the non-interactive resolver already treats it.
+      asked.length = 0
+      const empty = await runWithApi(registerEmailProvidersCommands,
+        ['email-providers', 'create', '-n', 'ses', '-t', 'ses', '-r', 'us-east-1', '--access-key-id', '', '--secret-access-key-file', path],
+        { 'POST /email-providers': { id: 1, name: 'ses', provider_type: 'ses', region: 'us-east-1', is_active: true, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' } })
+      expect(empty.error).toBeUndefined()
+      expect(asked).toEqual(['AWS Access Key ID'])
+      expect((credentialBody(empty, 'POST /email-providers') as { ses_credentials: Record<string, unknown> }).ses_credentials.access_key_id).toBe('AKIAEXAMPLE')
     } finally {
       text.mockRestore()
       password.mockRestore()
     }
   })
+})
+
+test('masked credential prompts refuse an empty answer', async () => {
+  const { requireNonEmpty } = await import('./index.js')
+  expect(requireNonEmpty('')).toBe('A value is required')
+  expect(requireNonEmpty('s3cr3t-test-value')).toBe(true)
 })
