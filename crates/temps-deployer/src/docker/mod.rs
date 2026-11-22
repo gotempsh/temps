@@ -179,6 +179,15 @@ pub struct DockerRuntime {
     /// which is tmpfs on most Linux distros and got wiped on every
     /// reboot, forcing a redeploy. Override via [`Self::with_secrets_root`].
     secrets_root: PathBuf,
+    /// Whether secret files are uploaded into the created container through
+    /// the daemon instead of bound from `secrets_root`.
+    ///
+    /// A bind source is resolved by the daemon on its own filesystem. When
+    /// this process runs in a container the daemon cannot see `secrets_root`:
+    /// it would bind an empty host directory and the workload would start
+    /// with no secrets. Set from the execution environment at construction;
+    /// override via [`Self::with_uploaded_secrets`].
+    upload_secrets: bool,
     /// Projects this host grants `/var/run/docker.sock` to (ADR 045).
     ///
     /// Read once from this process's own environment at startup and injected

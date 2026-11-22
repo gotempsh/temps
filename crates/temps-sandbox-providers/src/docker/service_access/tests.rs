@@ -325,3 +325,19 @@ async fn a_host_without_local_unix_mounts_reports_service_access_as_unavailable(
     assert_eq!(sandbox_id, "sbx-test");
     assert!(reason.contains("Linux host running Docker"), "{reason}");
 }
+
+#[test]
+fn a_containerized_control_plane_does_not_host_service_access_and_says_why() {
+    use temps_core::ExecutionEnvironment;
+
+    assert!(service_access_supported(ExecutionEnvironment::Host));
+    assert!(!service_access_supported(ExecutionEnvironment::Docker));
+
+    assert_eq!(
+        service_access_unsupported_reason(ExecutionEnvironment::Host),
+        SERVICE_ACCESS_HOST_UNSUPPORTED
+    );
+    let reason = service_access_unsupported_reason(ExecutionEnvironment::Docker);
+    assert!(reason.contains("runs in a container"), "{reason}");
+    assert!(reason.contains("run Temps on the host"), "{reason}");
+}

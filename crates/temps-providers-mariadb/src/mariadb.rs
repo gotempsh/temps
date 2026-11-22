@@ -1832,15 +1832,18 @@ impl MariaDbService {
     }
 
     async fn verify_import_connection(
+        container_name: &str,
+        host: &str,
+        port: &str,
         username: &str,
         password: &str,
-        port: &str,
         database: &str,
     ) -> Result<()> {
         let connection_url = format!(
-            "mysql://{}:{}@localhost:{}/{}",
+            "mysql://{}:{}@{}:{}/{}",
             urlencoding::encode(username),
             urlencoding::encode(password),
+            host,
             port,
             urlencoding::encode(database)
         );
@@ -1850,9 +1853,13 @@ impl MariaDbService {
             .connect(&connection_url)
             .await
             .map_err(|e| {
-                EngineError::engine_failure("MariaDB", format!("Failed to connect to MariaDB-compatible container at localhost:{} with provided credentials: {}",
-                    port,
-                    e))
+                EngineError::engine_failure(
+                    "MariaDB",
+                    format!(
+                        "Failed to connect to MariaDB-compatible container '{}' at {}:{} with provided credentials: {}",
+                        container_name, host, port, e
+                    ),
+                )
             })?;
         pool.close().await;
         Ok(())
@@ -4784,45 +4791,37 @@ impl ExternalService for MariaDbService {
             .or_else(|| Self::extract_host_port(&container))
             .unwrap_or_else(|| MARIADB_INTERNAL_PORT.to_string());
 
-        Self::verify_import_connection(&username, &password, &port, &database).await?;
+        // Join the Temps network first: a containerized control plane reaches
+        // the imported container by name on it, so it must be attached before
+        // the credentials can be checked.
+        crate::externalsvc::import_attach::attach_imported_container(
+            &self.docker,
+            &self.name,
+            "MariaDB-compatible",
+            &container_id,
+            &imported_container_name,
+        )
+        .await?;
+        let published_ports = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.as_ref());
+        let (dial_host, dial_port) = crate::externalsvc::import_attach::import_dial_address(
+            published_ports,
+            &port,
+            &imported_container_name,
+            MARIADB_INTERNAL_PORT,
+        );
+        Self::verify_import_connection(
+            &imported_container_name,
+            &dial_host,
+            &dial_port,
+            &username,
+            &password,
+            &database,
+        )
+        .await?;
         info!("Successfully verified MariaDB-compatible connection for import");
-
-        let network_ready = {
-            match ensure_network_exists(&self.docker).await {
-                Ok(()) => true,
-                Err(e) => {
-                    warn!(
-                        "Failed to ensure Temps Docker network before MariaDB import attach: {:?}",
-                        e
-                    );
-                    false
-                }
-            }
-        };
-
-        if network_ready {
-            let network_name = temps_core::NETWORK_NAME.as_str();
-            let request = bollard::models::NetworkConnectRequest {
-                container: container_id.clone(),
-                ..Default::default()
-            };
-            match self.docker.connect_network(network_name, request).await {
-                Ok(()) => info!(
-                    "Attached imported MariaDB-compatible container '{}' to {}",
-                    imported_container_name, network_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 403, ..
-                }) => debug!(
-                    "Imported MariaDB-compatible container '{}' is already attached to {}",
-                    imported_container_name, network_name
-                ),
-                Err(e) => warn!(
-                    "Failed to attach imported MariaDB-compatible container '{}' to {}: {}",
-                    imported_container_name, network_name, e
-                ),
-            }
-        }
 
         let version = image
             .rfind(':')

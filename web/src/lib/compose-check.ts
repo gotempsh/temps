@@ -78,6 +78,34 @@ export function composeHostWarning(
     : 'Docker Compose v2 is not installed on the Temps host; Compose deployments will fail.'
 }
 
+/** The part of a preset catalog entry that says whether it can be used. */
+export interface PresetAvailability {
+  slug: string
+  unavailable_reason?: string | null
+}
+
+/**
+ * Why the selected preset cannot be deployed on this instance, or `null` when
+ * it can. A containerized Temps does not deploy Compose projects: the catalog
+ * keeps listing the preset with the reason, so the form can explain the limit
+ * where the choice is made instead of failing at the first deployment.
+ *
+ * `selection` is the form value, `<slug>` or `<slug>::<path>`.
+ */
+export function presetUnavailableReason(
+  presets: readonly PresetAvailability[] | null | undefined,
+  selection: string | null | undefined
+): string | null {
+  const slug = selection?.split('::')[0]?.toLowerCase()
+  if (!slug || !presets) {
+    return null
+  }
+  return (
+    presets.find((preset) => preset.slug.toLowerCase() === slug)
+      ?.unavailable_reason ?? null
+  )
+}
+
 /** How often a probed host status is refreshed, in milliseconds. */
 export const COMPOSE_STATUS_REFRESH_MS = 10 * 60 * 1000
 

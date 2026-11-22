@@ -104,7 +104,7 @@ impl ExternalServiceManager {
                 ),
             })?;
 
-        let host = if let Some(node_id) = member.node_id {
+        let worker_address = if let Some(node_id) = member.node_id {
             let node = nodes::Entity::find_by_id(node_id)
                 .one(self.db.as_ref())
                 .await
@@ -120,14 +120,20 @@ impl ExternalServiceManager {
                         member.container_name, service_id, node_id
                     ),
                 })?;
-            node.data_address().to_string()
+            Some(node.data_address().to_string())
         } else {
-            // Local members publish their container port on the control-plane
-            // host; Docker-internal names and addresses are not host-routable.
-            LOCAL_CLUSTER_HOST.to_string()
+            None
         };
 
-        Ok((host, port))
+        // A local member publishes its port on the control-plane host; a
+        // control plane that itself runs in a container reaches it on the
+        // Temps network instead (see `member_dial_target`).
+        Ok(crate::services::member_dial_target(
+            temps_core::runtime::execution_environment_compatibility(),
+            worker_address.as_deref(),
+            &member.container_name,
+            port,
+        ))
     }
 
     /// Find the live primary among a cluster's members by asking the

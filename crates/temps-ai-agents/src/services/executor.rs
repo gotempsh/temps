@@ -2363,7 +2363,10 @@ impl AgentExecutor {
     pub async fn execute_run(&self, run_id: i32) {
         tracing::info!("Starting autopilot run {}", run_id);
 
-        let work_dir = std::env::temp_dir().join(format!("autopilot-run-{}", run_id));
+        // Mounted into the run's sandbox, so it must be where the Docker
+        // daemon can reach it (see `sandbox_workspace_root`).
+        let work_dir = temps_sandbox_providers::workspace_root::sandbox_workspace_root()
+            .join(format!("autopilot-run-{}", run_id));
 
         match self.execute_run_inner(run_id, &work_dir).await {
             Ok(()) => {

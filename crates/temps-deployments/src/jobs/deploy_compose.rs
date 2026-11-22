@@ -254,6 +254,9 @@ pub struct DeployComposeJob {
     /// `enforce` refuses a project the plane cannot express before the
     /// running stack is touched.
     workload_mode: EnvironmentWorkloadMode,
+    /// Where this control plane runs. A containerized one deploys no Compose
+    /// stacks at all; see [`temps_core::ExecutionEnvironment::supports_compose_projects`].
+    execution_environment: temps_core::ExecutionEnvironment,
     /// Where the stack runs: its pinned home (see `services::compose_placement`).
     host: ComposeStackHost,
     /// The host a requested move leaves: the stack is stopped there (volumes
@@ -508,6 +511,7 @@ impl DeployComposeJobBuilder {
                 &uuid::Uuid::new_v4().simple().to_string(),
             ),
             workload_mode: self.workload_mode,
+            execution_environment: temps_core::runtime::execution_environment_compatibility(),
             host: self.host,
             vacate_host: self.vacate_host,
             pin_home: self.pin_home,
@@ -1279,6 +1283,23 @@ impl DeployComposeJob {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
         if self.cancellation_requested.load(Ordering::Acquire) {
             return Err(WorkflowError::WorkflowCancelled);
+        }
+
+        // A containerized control plane deploys no Compose stack, wherever the
+        // stack would be placed: say so before anything else can fail with a
+        // message about a missing Compose plugin or an unreadable path, which
+        // would send the operator after a fix that does not exist.
+        if let Some(reason) = self
+            .execution_environment
+            .compose_projects_unsupported_reason()
+        {
+            if let Some(ref log_id) = self.log_id {
+                let _ = self
+                    .log_service
+                    .log_error(log_id, &format!("ERROR: {}", reason))
+                    .await;
+            }
+            return Err(WorkflowError::LocalWorkloadsDisabled(reason.to_string()));
         }
 
         // Refuse before touching the repo checkout, the compose file, or the
@@ -2762,6 +2783,28 @@ mod tests {
                 assert!(message.contains("Compose"), "{message}");
                 assert!(message.contains("full profile"), "{message}");
                 assert!(message.contains("Docker"), "{message}");
+            }
+            other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
+        }
+    }
+
+    /// A containerized control plane refuses every Compose deployment with
+    /// the shared explanation, never with advice to install the Compose
+    /// plugin, and before the local-Docker check gets a say.
+    #[tokio::test]
+    async fn a_containerized_control_plane_refuses_compose_deployments() {
+        let mut job = test_job_with_disabled_docker(test_db());
+        job.execution_environment = temps_core::ExecutionEnvironment::Docker;
+        let context = crate::test_utils::create_test_context("wf".to_string(), 7, 2, 3);
+
+        let error = job.execute(context).await.unwrap_err();
+        match error {
+            WorkflowError::LocalWorkloadsDisabled(message) => {
+                assert_eq!(
+                    message,
+                    temps_core::COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER
+                );
+                assert!(!message.contains("plugin"), "{message}");
             }
             other => panic!("expected LocalWorkloadsDisabled, got {other:?}"),
         }

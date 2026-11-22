@@ -37,6 +37,8 @@ pub fn exact_named_container<'a>(
 
 pub mod cluster_role;
 pub mod container_download;
+pub mod dial;
+pub mod import_attach;
 pub use temps_docker_util::upload as container_upload;
 pub mod error;
 pub mod exec_util;

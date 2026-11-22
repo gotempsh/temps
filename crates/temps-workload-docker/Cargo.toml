@@ -20,6 +20,7 @@ bollard = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
+tar = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 

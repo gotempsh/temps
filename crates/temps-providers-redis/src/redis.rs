@@ -185,15 +185,38 @@ fn admin_host(config: &RedisConfig) -> &str {
     }
 }
 
-fn redis_admin_url(config: &RedisConfig) -> String {
-    let host = admin_host(config);
+/// Host and port Temps' own connection to the server is opened on.
+///
+/// The stored host and port are the loopback address the container
+/// publishes, which a containerized control plane cannot reach: it connects
+/// over the network it shares with the container instead (see
+/// `crate::externalsvc::dial`).
+fn admin_address(
+    config: &RedisConfig,
+    container_name: &str,
+    execution_environment: temps_core::ExecutionEnvironment,
+) -> (String, String) {
+    crate::externalsvc::dial::engine_dial_address_for_environment(
+        execution_environment,
+        admin_host(config),
+        &config.port,
+        container_name,
+        REDIS_INTERNAL_PORT,
+    )
+}
+
+fn redis_admin_url(
+    config: &RedisConfig,
+    container_name: &str,
+    execution_environment: temps_core::ExecutionEnvironment,
+) -> String {
+    let (host, port) = admin_address(config, container_name, execution_environment);
     if config.password.is_empty() {
-        format!("redis://{host}:{}", config.port)
+        format!("redis://{host}:{port}")
     } else {
         format!(
-            "redis://:{}@{host}:{}",
+            "redis://:{}@{host}:{port}",
             urlencoding::encode(&config.password),
-            config.port
         )
     }
 }
@@ -346,12 +369,14 @@ impl RedisService {
             config.port
         );
 
-        let connection_url = redis_admin_url(&config);
+        let container_name = self.get_live_container_name(&config);
+        let execution_environment = temps_core::runtime::execution_environment_compatibility();
+        let connection_url = redis_admin_url(&config, &container_name, execution_environment);
+        let (host, port) = admin_address(&config, &container_name, execution_environment);
 
         info!(
             "RedisService::get_connection - creating client for URL (password masked): redis://...@{}:{}",
-            admin_host(&config),
-            config.port
+            host, port
         );
 
         let client = Client::open(connection_url.as_str()).map_err(|e| {
@@ -2324,16 +2349,10 @@ impl ExternalService for RedisService {
             }
         };
 
-        let url = if cfg.password.is_empty() {
-            format!("redis://{}:{}", cfg.host, cfg.port)
-        } else {
-            format!(
-                "redis://:{}@{}:{}",
-                urlencoding::encode(&cfg.password),
-                cfg.host,
-                cfg.port
-            )
-        };
+        let container_name = self.get_live_container_name(&cfg);
+        let execution_environment = temps_core::runtime::execution_environment_compatibility();
+        let url = redis_admin_url(&cfg, &container_name, execution_environment);
+        let (host, port) = admin_address(&cfg, &container_name, execution_environment);
 
         let start = Instant::now();
 
@@ -2370,13 +2389,13 @@ impl ExternalService for RedisService {
         match tokio::time::timeout(PROBE_TIMEOUT, probe).await {
             Err(_) => Ok(HealthProbeResult::down(format!(
                 "redis probe to {}:{} timed out after {}s",
-                cfg.host,
-                cfg.port,
+                host,
+                port,
                 PROBE_TIMEOUT.as_secs()
             ))),
             Ok(Err(msg)) => Ok(HealthProbeResult::down(format!(
                 "redis probe to {}:{} {}",
-                cfg.host, cfg.port, msg
+                host, port, msg
             ))),
             Ok(Ok(())) => {
                 let elapsed_ms = start.elapsed().as_millis();
@@ -3346,6 +3365,13 @@ impl ExternalService for RedisService {
             .trim_start_matches('/')
             .to_string();
 
+        // Ports the container listens on and publishes, to find the engine
+        // port behind the one the operator entered.
+        let published_ports = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.clone());
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             EngineError::failed(
@@ -3365,17 +3391,36 @@ impl ExternalService for RedisService {
             .unwrap_or("6379")
             .to_string();
 
+        // Join the Temps network first: a containerized control plane reaches
+        // the imported container by name on it, so it must be attached before
+        // the credentials can be checked.
+        crate::externalsvc::import_attach::attach_imported_container(
+            &self.docker,
+            &self.instance_name(),
+            "Redis",
+            &container_id,
+            &imported_container_name,
+        )
+        .await?;
+        let (dial_host, dial_port) = crate::externalsvc::import_attach::import_dial_address(
+            published_ports.as_ref(),
+            &port,
+            &imported_container_name,
+            REDIS_INTERNAL_PORT,
+        );
+
         // Extract password if provided
         let password = credentials.get("password").cloned().unwrap_or_default();
 
         // Verify connection to the imported service
         let connection_url = if password.is_empty() {
-            format!("redis://localhost:{}", port)
+            format!("redis://{}:{}", dial_host, dial_port)
         } else {
             format!(
-                "redis://:{}@localhost:{}",
+                "redis://:{}@{}:{}",
                 urlencoding::encode(&password),
-                port
+                dial_host,
+                dial_port
             )
         };
 
@@ -3404,46 +3449,12 @@ impl ExternalService for RedisService {
             EngineError::connection(
                 self.instance_name(),
                 format!(
-                    "Failed to connect to Redis at localhost:{} with provided credentials: {}",
-                    port, e
+                    "Failed to connect to Redis container '{}' at {}:{} with provided credentials: {}",
+                    imported_container_name, dial_host, dial_port, e
                 ),
             )
         })?;
         info!("Successfully verified Redis connection for import");
-
-        let network_ready = match ensure_network_exists(&self.docker).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    "Failed to ensure Temps Docker network before Redis import attach: {:?}",
-                    e
-                );
-                false
-            }
-        };
-        if network_ready {
-            let network_name = temps_core::NETWORK_NAME.as_str();
-            let request = bollard::models::NetworkConnectRequest {
-                container: container_id.clone(),
-                ..Default::default()
-            };
-            match self.docker.connect_network(network_name, request).await {
-                Ok(()) => info!(
-                    "Attached imported Redis container '{}' to {}",
-                    imported_container_name, network_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 403, ..
-                }) => debug!(
-                    "Imported Redis container '{}' is already attached to {}",
-                    imported_container_name, network_name
-                ),
-                Err(e) => warn!(
-                    "Failed to attach imported Redis container '{}' to {}: {}",
-                    imported_container_name, network_name, e
-                ),
-            }
-        }
 
         // Build the ServiceConfig for registration
         let config = ServiceConfig {
@@ -4964,6 +4975,13 @@ mod tests {
     /// published address reaches it; a local service keeps `localhost`.
     #[test]
     fn the_admin_connection_goes_to_the_configured_host() {
+        let redis_admin_url = |config: &RedisConfig| {
+            super::redis_admin_url(
+                config,
+                "redis-cache",
+                temps_core::ExecutionEnvironment::Host,
+            )
+        };
         let config = |host: &str| RedisConfig {
             host: host.to_string(),
             port: "6380".to_string(),
@@ -4988,6 +5006,35 @@ mod tests {
         let mut open = config("localhost");
         open.password.clear();
         assert_eq!(redis_admin_url(&open), "redis://localhost:6380");
+    }
+
+    /// A containerized control plane has no route to the port the container
+    /// publishes on the host's loopback. It connects by container name on the
+    /// engine's own port, over the network the two share.
+    #[test]
+    fn the_admin_connection_of_a_containerized_control_plane_uses_the_container_name() {
+        let config = |host: &str| RedisConfig {
+            host: host.to_string(),
+            port: "6380".to_string(),
+            password: "p@ss".to_string(),
+            docker_image: "redis:8".to_string(),
+            container_name: None,
+        };
+        let docker = temps_core::ExecutionEnvironment::Docker;
+
+        assert_eq!(
+            redis_admin_url(&config("localhost"), "redis-cache", docker),
+            "redis://:p%40ss@redis-cache:6379"
+        );
+        assert_eq!(
+            redis_admin_url(&config(""), "redis-cache", docker),
+            "redis://:p%40ss@redis-cache:6379"
+        );
+        // An address a worker's agent supplied is not on this daemon: keep it.
+        assert_eq!(
+            redis_admin_url(&config("10.42.0.22"), "redis-cache", docker),
+            "redis://:p%40ss@10.42.0.22:6380"
+        );
     }
 
     /// An imported service is refused before any Docker call. This client has

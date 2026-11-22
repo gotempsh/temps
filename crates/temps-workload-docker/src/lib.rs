@@ -229,12 +229,22 @@ fn is_not_found(error: &bollard::errors::Error) -> bool {
     )
 }
 
+/// What [`DockerDriver::prepare_secret_files`] left to do for a create.
+enum PreparedSecrets {
+    /// The spec has no secret files.
+    None,
+    /// Written to `dir`; `bind` mounts them.
+    Bound { dir: PathBuf, bind: String },
+    /// To upload once the container exists.
+    Upload,
+}
+
 pub struct DockerDriver {
     docker: Docker,
     capabilities: DriverCapabilities,
-    /// Where per-instance secret directories live (`<root>/<instance>`).
-    /// `None`: specs with secret files are refused.
-    secrets_root: Option<PathBuf>,
+    /// How secret files reach an instance's `/run/secrets`. `None`: specs
+    /// with secret files are refused.
+    secret_delivery: Option<secrets::SecretDelivery>,
     /// Whether the daemon places containers with systemd on cgroup v2, so a
     /// workload slice can be their cgroup parent. Asked once, on the first
     /// create.
@@ -246,7 +256,7 @@ impl DockerDriver {
         Self {
             docker,
             capabilities: capabilities(),
-            secrets_root: None,
+            secret_delivery: None,
             slices: Arc::new(tokio::sync::OnceCell::new()),
         }
     }
@@ -256,49 +266,97 @@ impl DockerDriver {
     /// the legacy deployer does. The root must survive a reboot: the
     /// directory is bind-mounted for the container's whole life.
     pub fn with_secrets_root(mut self, root: impl Into<PathBuf>) -> Self {
-        self.secrets_root = Some(root.into());
+        self.secret_delivery = Some(secrets::SecretDelivery::HostDirectory(root.into()));
         self
     }
 
-    /// Write `spec`'s secret files and return the bind that mounts them,
-    /// or `None` when it has none.
-    async fn write_secret_files(
-        &self,
-        spec: &InstanceSpec,
-    ) -> Result<Option<(PathBuf, String)>, DriverError> {
-        if spec.secret_files.is_empty() {
-            return Ok(None);
-        }
-        let secrets_error = |reason: String| DriverError::Secrets {
+    /// Deliver secret files at `/run/secrets` by uploading them into the
+    /// created container through the daemon (same modes and owner as
+    /// [`Self::with_secrets_root`]). For a process whose filesystem the
+    /// daemon cannot see, where a directory written here cannot be bound.
+    pub fn with_uploaded_secrets(mut self) -> Self {
+        self.secret_delivery = Some(secrets::SecretDelivery::Upload);
+        self
+    }
+
+    /// Deliver secret files the way `delivery` says.
+    pub fn with_secret_delivery(mut self, delivery: secrets::SecretDelivery) -> Self {
+        self.secret_delivery = Some(delivery);
+        self
+    }
+
+    fn secrets_error(spec: &InstanceSpec, reason: String) -> DriverError {
+        DriverError::Secrets {
             driver: DRIVER.to_string(),
             instance: spec.name.clone(),
             reason,
-        };
-        let Some(root) = &self.secrets_root else {
-            return Err(secrets_error(
-                "secret files need a host directory and this driver has no secrets root; \
-                 create through a driver built with a secrets root"
-                    .to_string(),
-            ));
-        };
-        secrets::validate_secret_dir_name(&spec.name)
-            .map_err(|e| secrets_error(format!("derive host dir: {e}")))?;
-        let dir = root.join(&spec.name);
-        let files: HashMap<String, String> = spec
-            .secret_files
-            .iter()
-            .map(|file| (file.name.clone(), file.value.clone()))
-            .collect();
-        let owner = secrets::image_owner(&self.docker, &spec.image).await;
-        secrets::write_secrets_to_host_dir(&dir, &files, Some(owner))
-            .map_err(|e| secrets_error(format!("write host dir {}: {e}", dir.display())))?;
-        let bind = secrets::secrets_bind(&dir);
-        Ok(Some((dir, bind)))
+        }
     }
 
-    /// The secrets directory of instance `name`, when this driver has one.
+    fn secret_files_of(spec: &InstanceSpec) -> HashMap<String, String> {
+        spec.secret_files
+            .iter()
+            .map(|file| (file.name.clone(), file.value.clone()))
+            .collect()
+    }
+
+    /// Prepare `spec`'s secret files for a create.
+    ///
+    /// With a host directory they are written now and the bind that mounts
+    /// them is returned; with upload there is nothing to do until the
+    /// container exists (see [`Self::upload_secret_files`]).
+    async fn prepare_secret_files(
+        &self,
+        spec: &InstanceSpec,
+    ) -> Result<PreparedSecrets, DriverError> {
+        if spec.secret_files.is_empty() {
+            return Ok(PreparedSecrets::None);
+        }
+        match &self.secret_delivery {
+            None => Err(Self::secrets_error(
+                spec,
+                "secret files need a delivery and this driver has none; create through a \
+                 driver built with a secrets root or with uploaded secrets"
+                    .to_string(),
+            )),
+            Some(secrets::SecretDelivery::Upload) => Ok(PreparedSecrets::Upload),
+            Some(secrets::SecretDelivery::HostDirectory(root)) => {
+                secrets::validate_secret_dir_name(&spec.name)
+                    .map_err(|e| Self::secrets_error(spec, format!("derive host dir: {e}")))?;
+                let dir = root.join(&spec.name);
+                let owner = secrets::image_owner(&self.docker, &spec.image).await;
+                secrets::write_secrets_to_host_dir(&dir, &Self::secret_files_of(spec), Some(owner))
+                    .map_err(|e| {
+                        Self::secrets_error(spec, format!("write host dir {}: {e}", dir.display()))
+                    })?;
+                let bind = secrets::secrets_bind(&dir);
+                Ok(PreparedSecrets::Bound { dir, bind })
+            }
+        }
+    }
+
+    /// Upload `spec`'s secret files into its created container.
+    async fn upload_secret_files(
+        &self,
+        spec: &InstanceSpec,
+        handle: &InstanceHandle,
+    ) -> Result<(), DriverError> {
+        let owner = secrets::container_owner(&self.docker, &handle.id).await;
+        secrets::upload_secrets(
+            &self.docker,
+            &handle.id,
+            &Self::secret_files_of(spec),
+            owner,
+        )
+        .await
+        .map_err(|e| Self::secrets_error(spec, e.to_string()))
+    }
+
+    /// The secrets directory of instance `name`, when this driver keeps one.
     fn secrets_dir_of(&self, name: &str) -> Option<PathBuf> {
-        let root = self.secrets_root.as_ref()?;
+        let Some(secrets::SecretDelivery::HostDirectory(root)) = &self.secret_delivery else {
+            return None;
+        };
         secrets::validate_secret_dir_name(name).ok()?;
         Some(root.join(name))
     }
@@ -501,17 +559,28 @@ impl RuntimeDriver for DockerDriver {
         spec: &InstanceSpec,
         attach: &Attachments,
     ) -> Result<InstanceHandle, DriverError> {
-        let secrets = self.write_secret_files(spec).await?;
-        let binds = secrets.iter().map(|(_, bind)| bind.clone()).collect();
+        let secrets = self.prepare_secret_files(spec).await?;
+        let binds = match &secrets {
+            PreparedSecrets::Bound { bind, .. } => vec![bind.clone()],
+            PreparedSecrets::None | PreparedSecrets::Upload => Vec::new(),
+        };
         let handle = match self.create_with_binds(spec, attach, binds).await {
             Ok(handle) => handle,
             Err(error) => {
-                if let Some((dir, _)) = &secrets {
+                if let PreparedSecrets::Bound { dir, .. } = &secrets {
                     secrets::remove_secrets_dir(dir);
                 }
                 return Err(error);
             }
         };
+        if matches!(secrets, PreparedSecrets::Upload) {
+            // A container that starts without its secrets is worse than no
+            // container: remove it and report why.
+            if let Err(error) = self.upload_secret_files(spec, &handle).await {
+                let _ = self.remove(&handle, true).await;
+                return Err(error);
+            }
+        }
         if let Err(error) = self.attach_networks(&handle, attach).await {
             let _ = self.remove(&handle, true).await;
             return Err(error);
@@ -1025,6 +1094,82 @@ mod tests {
 
         driver.remove(&handle, true).await.expect("removed");
         assert!(!dir.exists(), "removing the instance removes its secrets");
+    }
+
+    /// A containerized control plane cannot bind a directory it wrote: the
+    /// daemon resolves the bind source on the host and the workload gets an
+    /// empty `/run/secrets`. Its secrets go in through the daemon instead.
+    #[tokio::test]
+    async fn uploaded_secret_files_reach_the_container_without_a_bind() {
+        let fake = temps_docker_capture::FakeDocker::start().await.unwrap();
+        fake.allow_create("shop-production-31");
+        fake.respond(
+            temps_docker_capture::Method::PUT,
+            "/containers/fake-shop-production-31/archive",
+            200,
+            serde_json::json!({}),
+        );
+        let driver = DockerDriver::new(fake.docker()).with_uploaded_secrets();
+        let mut s = spec();
+        s.secret_files.push(temps_workload::SecretFile {
+            name: "API_TOKEN".into(),
+            value: "seeded-token-value".into(),
+        });
+
+        driver.create(&s, &attach()).await.expect("created");
+
+        let create = &fake.creates()[0];
+        let body = serde_json::to_string(&create.body).unwrap();
+        assert!(!body.contains("/run/secrets"), "no bind: {body}");
+        assert!(!body.contains("seeded-token-value"), "{body}");
+        let uploads: Vec<_> = fake
+            .calls()
+            .into_iter()
+            .filter(|call| call.method == "PUT" && call.path.ends_with("/archive"))
+            .collect();
+        assert_eq!(uploads.len(), 1, "{:?}", fake.calls());
+        assert_eq!(
+            uploads[0].path,
+            "/containers/fake-shop-production-31/archive"
+        );
+        assert!(uploads[0].query.contains("path=%2F"), "{}", uploads[0]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_secret_upload_removes_the_container() {
+        let fake = temps_docker_capture::FakeDocker::start().await.unwrap();
+        fake.allow_create("shop-production-31");
+        fake.respond(
+            temps_docker_capture::Method::PUT,
+            "/containers/fake-shop-production-31/archive",
+            500,
+            serde_json::json!({ "message": "no space left on device" }),
+        );
+        fake.respond(
+            temps_docker_capture::Method::DELETE,
+            "/containers/fake-shop-production-31",
+            204,
+            serde_json::json!({}),
+        );
+        let driver = DockerDriver::new(fake.docker()).with_uploaded_secrets();
+        let mut s = spec();
+        s.secret_files.push(temps_workload::SecretFile {
+            name: "API_TOKEN".into(),
+            value: "v".into(),
+        });
+
+        let err = driver.create(&s, &attach()).await.unwrap_err();
+
+        assert!(matches!(err, DriverError::Secrets { .. }), "{err}");
+        let text = err.to_string();
+        assert!(text.contains("shop-production-31"), "{text}");
+        assert!(text.contains("no space left on device"), "{text}");
+        assert!(
+            fake.calls().iter().any(|call| call.method == "DELETE"
+                && call.path == "/containers/fake-shop-production-31"),
+            "the container without secrets is removed: {:?}",
+            fake.calls()
+        );
     }
 
     #[tokio::test]

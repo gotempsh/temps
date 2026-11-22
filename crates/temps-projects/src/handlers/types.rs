@@ -1401,6 +1401,12 @@ impl From<ProjectError> for Problem {
                 .with_title("Invalid Input")
                 .with_detail(msg),
 
+            err @ ProjectError::PresetUnsupportedInExecutionEnvironment { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Preset Not Supported Here")
+                    .with_detail(err.to_string())
+            }
+
             ProjectError::GitHubError(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("GitHub Error")
                 .with_detail(msg),
@@ -1620,6 +1626,13 @@ pub struct PresetResponse {
     /// Default port the application listens on (None for static sites)
     #[schema(example = 3000)]
     pub default_port: Option<u16>,
+    /// Whether this instance can deploy projects that use the preset. A
+    /// preset stays in the catalog when it cannot, so a client can show it
+    /// with the reason instead of hiding it.
+    pub available: bool,
+    /// Why the preset cannot be used on this instance, when `available` is
+    /// false.
+    pub unavailable_reason: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

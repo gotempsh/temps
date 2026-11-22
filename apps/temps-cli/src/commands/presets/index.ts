@@ -8,7 +8,7 @@ import { listPresets } from '../../api/sdk.gen.js'
 import type { PresetResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
-import { newline, header, icons, json, colors, info, keyValue } from '../../ui/output.js'
+import { newline, header, icons, json, colors, info, keyValue, warning } from '../../ui/output.js'
 
 export function registerPresetsCommands(program: Command): void {
   const presets = program
@@ -40,6 +40,22 @@ export function registerPresetsCommands(program: Command): void {
 export function filterPresetsByType(presets: PresetResponse[], type?: string): PresetResponse[] {
   if (!type) return presets
   return presets.filter((p) => p.project_type.toLowerCase() === type.toLowerCase())
+}
+
+/**
+ * The presets this instance cannot deploy, each with the server's reason.
+ * They stay in the list (a Compose preset on a containerized Temps, for
+ * example), so the CLI says why instead of letting a create fail later.
+ */
+export function unavailablePresets(
+  presets: PresetResponse[],
+): { slug: string; reason: string }[] {
+  return presets
+    .filter((p) => p.available === false)
+    .map((p) => ({
+      slug: p.slug,
+      reason: p.unavailable_reason || 'Not available on this instance.',
+    }))
 }
 
 async function listPresetsAction(options: { json?: boolean; type?: string }): Promise<void> {
@@ -79,10 +95,19 @@ async function listPresetsAction(options: { json?: boolean; type?: string }): Pr
       accessor: (p) => (p.default_port != null ? String(p.default_port) : '-'),
       color: (v) => (v === '-' ? colors.muted(v) : v),
     },
+    {
+      header: 'Available',
+      accessor: (p) => (p.available === false ? 'no' : 'yes'),
+      color: (v) => (v === 'no' ? colors.warning(v) : colors.muted(v)),
+    },
     { header: 'Description', key: 'description', color: (v) => colors.muted(v) },
   ]
 
   printTable(presets, columns, { style: 'minimal' })
+  for (const { slug, reason } of unavailablePresets(presets)) {
+    newline()
+    warning(`${slug}: ${reason}`)
+  }
   newline()
 }
 
@@ -125,5 +150,9 @@ async function showPresetAction(slug: string, options: { json?: boolean }): Prom
   keyValue('Project Type', preset.project_type)
   keyValue('Default Port', preset.default_port != null ? String(preset.default_port) : colors.muted('none (static)'))
   keyValue('Icon', preset.icon_url || colors.muted('not set'))
+  keyValue('Available', preset.available === false ? colors.warning('no') : 'yes')
+  for (const { reason } of unavailablePresets([preset])) {
+    warning(reason)
+  }
   newline()
 }

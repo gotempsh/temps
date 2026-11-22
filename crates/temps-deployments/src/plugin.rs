@@ -87,12 +87,25 @@ impl DeploymentsPlugin {
             temps_core::policy_or_default(context.get_service::<temps_core::LocalWorkloadPolicy>());
         let driver = match docker_handle.cloned() {
             Some(docker) if local_workloads.local_workloads_enabled() => {
+                // A native control plane binds the legacy deployer's secrets
+                // root, so a replica's `/run/secrets` lives where it always
+                // has and survives a reboot. A containerized one cannot: the
+                // daemon resolves a bind source on the host, not in this
+                // container, so its secrets go in through the daemon.
+                let secret_delivery =
+                    match temps_core::runtime::execution_environment_compatibility() {
+                        temps_core::ExecutionEnvironment::Host => {
+                            temps_workload_docker::secrets::SecretDelivery::HostDirectory(
+                                temps_workload_docker::secrets::default_secrets_root(),
+                            )
+                        }
+                        temps_core::ExecutionEnvironment::Docker => {
+                            temps_workload_docker::secrets::SecretDelivery::Upload
+                        }
+                    };
                 let driver: Arc<dyn temps_workload::RuntimeDriver> = Arc::new(
-                    // The legacy deployer's secrets root, so a replica's
-                    // `/run/secrets` lives where it always has and survives
-                    // a reboot.
                     temps_workload_docker::DockerDriver::new(docker.as_ref().clone())
-                        .with_secrets_root(temps_workload_docker::secrets::default_secrets_root()),
+                        .with_secret_delivery(secret_delivery),
                 );
                 Some(driver)
             }
@@ -947,6 +960,9 @@ impl TempsPlugin for DeploymentsPlugin {
                         context.get_service::<temps_core::LocalWorkloadPolicy>(),
                     )
                     .local_workloads_enabled(),
+                )
+                .with_execution_environment(
+                    temps_core::runtime::execution_environment_compatibility(),
                 ),
             );
             context.register_service(compose_check_service.clone());

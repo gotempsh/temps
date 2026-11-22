@@ -252,6 +252,9 @@ pub enum DeploymentFailureCode {
     ComposeUpFailed,
     /// The Docker Compose v2 CLI plugin is not installed on the host.
     ComposeUnavailable,
+    /// Temps itself runs in a container, where Compose projects are not
+    /// supported at all.
+    ComposeUnsupportedEnvironment,
     /// A volume or bind mount could not be created.
     VolumeMount,
     /// The new deployment never became routable.
@@ -324,6 +327,7 @@ impl DeploymentFailureCode {
             Self::ComposeBuildFailed => "compose_build_failed",
             Self::ComposeUpFailed => "compose_up_failed",
             Self::ComposeUnavailable => "compose_unavailable",
+            Self::ComposeUnsupportedEnvironment => "compose_unsupported_environment",
             Self::VolumeMount => "volume_mount",
             Self::RouteActivation => "route_activation",
             Self::RegistryUnavailable => "registry_unavailable",
@@ -380,6 +384,7 @@ impl DeploymentFailureCode {
         Self::ComposeBuildFailed,
         Self::ComposeUpFailed,
         Self::ComposeUnavailable,
+        Self::ComposeUnsupportedEnvironment,
         Self::VolumeMount,
         Self::RouteActivation,
         Self::RegistryUnavailable,
@@ -733,6 +738,11 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         C::ComposeUnavailable => (
             "Docker Compose is not installed",
             "This host has no Docker Compose v2 plugin. Install it (docker compose version must work) and restart Temps.",
+            None,
+        ),
+        C::ComposeUnsupportedEnvironment => (
+            "Docker Compose projects are not supported here",
+            "Temps itself runs in a container, where Compose projects cannot be deployed. Deploy the application as a Dockerfile, image or framework project, or run Temps directly on the host to use Compose.",
             None,
         ),
         C::VolumeMount => (
@@ -1254,6 +1264,14 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     ) && is_compose
     {
         return make(S::Configuration, C::ComposePolicyRejected);
+    }
+    // A containerized control plane deploys no Compose project. Matched before
+    // every other Compose rule: nothing about the project needs fixing.
+    if contains_any(
+        r,
+        &["docker compose projects are not supported while temps itself runs in a container"],
+    ) {
+        return make(S::Platform, C::ComposeUnsupportedEnvironment);
     }
     // The node cannot run Compose stacks (yet): no Compose plugin, or a
     // worker still publishing on its public address before its mesh is up.
@@ -2576,6 +2594,15 @@ mod tests {
             "Compose deploy failed: Compose command failed for project 'temps-1-2': docker compose up failed: Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: /srv/data",
         );
         assert_class(&reason, S::Deploy, C::VolumeMount);
+    }
+
+    #[test]
+    fn a_compose_deployment_refused_by_a_containerized_control_plane() {
+        let refused = wrapped(
+            "deploy_compose",
+            temps_core::COMPOSE_PROJECTS_UNSUPPORTED_IN_CONTAINER,
+        );
+        assert_class(&refused, S::Platform, C::ComposeUnsupportedEnvironment);
     }
 
     #[test]

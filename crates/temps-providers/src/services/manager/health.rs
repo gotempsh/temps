@@ -233,14 +233,15 @@ impl ExternalServiceManager {
         };
 
         // `monitor.port` is the host port the lifecycle hook published.
-        let monitor_host = match control_plane_member_dial_host(
+        let (monitor_host, monitor_port) = match control_plane_member_endpoint(
             self.db.as_ref(),
             monitor.node_id,
             &monitor.container_name,
+            monitor.port,
         )
         .await
         {
-            Ok(host) => host,
+            Ok(endpoint) => endpoint,
             Err(reason) => {
                 return ClusterProbeResult::down(format!(
                     "Cannot reach the monitor of cluster service {}: {reason}",
@@ -248,7 +249,7 @@ impl ExternalServiceManager {
                 ))
             }
         };
-        let monitor_port = monitor.port.unwrap_or(5432);
+        let monitor_port = i32::from(monitor_port);
 
         // SECURITY: `sslmode=require` prevents tokio-postgres from silently
         // accepting a cleartext socket; `autoctl_node` authenticates with
@@ -422,14 +423,15 @@ impl ExternalServiceManager {
             }
         };
 
-        let monitor_host = match control_plane_member_dial_host(
+        let (monitor_host, monitor_port) = match control_plane_member_endpoint(
             self.db.as_ref(),
             monitor.node_id,
             &monitor.container_name,
+            monitor.port,
         )
         .await
         {
-            Ok(host) => host,
+            Ok(endpoint) => endpoint,
             Err(reason) => {
                 return ClusterHealthReport {
                     configured_standbys: 0,
@@ -443,7 +445,7 @@ impl ExternalServiceManager {
                 };
             }
         };
-        let monitor_port = monitor.port.unwrap_or(5432);
+        let monitor_port = i32::from(monitor_port);
 
         // SECURITY: keep `sslmode=require`: the self-signed connector may skip
         // certificate authentication, but it must never downgrade this socket

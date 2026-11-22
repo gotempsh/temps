@@ -353,8 +353,14 @@ async fn start_metrics_pipeline(
                     .run(),
                 );
 
+                // A containerized control plane scrapes a service on its own
+                // Docker daemon by container name, which only the providers
+                // layer can derive.
                 let mut scraper =
-                    MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
+                    MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc)
+                        .with_container_endpoints(Arc::new(
+                            temps_providers::EngineContainerEndpoints,
+                        ));
                 // HA clusters are scraped at their elected primary, which
                 // only the providers layer can resolve.
                 match service_context.get_service::<temps_providers::ExternalServiceManager>() {

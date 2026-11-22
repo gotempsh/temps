@@ -29,7 +29,10 @@ impl DockerSandboxProvider {
                 .as_ref()
                 .ok_or_else(|| AgentError::ServiceAccessUnavailable {
                     sandbox_id: handle.sandbox_id.clone(),
-                    reason: SERVICE_ACCESS_HOST_UNSUPPORTED.into(),
+                    reason: service_access_unsupported_reason(
+                        temps_core::runtime::execution_environment_compatibility(),
+                    )
+                    .into(),
                 })?;
         if let ServiceAccessCommand::Retire { expected, boot_id } = command {
             if expected.container_id != handle.sandbox_id {

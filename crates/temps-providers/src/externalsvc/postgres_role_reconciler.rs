@@ -332,21 +332,23 @@ pub async fn reconcile_once(
         .ok_or(ReconcilerError::MonitorMissing { service_id })?;
 
     // The monitor must be reachable from the control plane: the worker's data
-    // address (or loopback for a control-plane monitor) plus its published
-    // port. Not `compute_ip`, which only routes on the workload overlay, and
-    // not `member.hostname` (the FQDN), which only resolves on hosts running
-    // the per-node resolver.
-    let monitor_host = crate::services::control_plane_member_dial_host(
+    // address plus its published port, or for a control-plane monitor the
+    // loopback (native) or its container on the Temps network (containerized).
+    // Not `compute_ip`, which only routes on the workload overlay, and not
+    // `member.hostname` (the FQDN), which only resolves on hosts running the
+    // per-node resolver.
+    let (monitor_host, monitor_port) = crate::services::control_plane_member_endpoint(
         db,
         monitor.node_id,
         &monitor.container_name,
+        monitor.port,
     )
     .await
     .map_err(|reason| {
         warn!(service_id, reason = %reason, "Cluster monitor address is not known yet");
         ReconcilerError::MonitorNotReady { service_id }
     })?;
-    let monitor_port = monitor.port.unwrap_or(5432);
+    let monitor_port = i32::from(monitor_port);
 
     // Build {nodehost → compute_ip} for the role-record DNS targets.
     // pg_auto_failover's `nodehost` is the worker's underlay IP

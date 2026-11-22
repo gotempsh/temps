@@ -55,6 +55,9 @@ type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
 enum PostgresConnectionPolicy {
     Standard,
     ManagedPrivate,
+    /// The host is the daemon-reported address of the service's container on
+    /// the Temps network (see [`use_container_address`]).
+    LocalContainer,
 }
 
 impl PostgresConnectionPolicy {
@@ -73,8 +76,62 @@ impl PostgresConnectionPolicy {
             Self::ManagedPrivate => {
                 PostgresSource::connect_private(host, port, username, password, database).await
             }
+            Self::LocalContainer => {
+                let address = host.parse::<IpAddr>().map_err(|_| {
+                    DataError::InvalidConfiguration(format!(
+                        "PostgreSQL container address '{host}' is not an IP address"
+                    ))
+                })?;
+                PostgresSource::connect_local_container(address, port, username, password, database)
+                    .await
+            }
         }
     }
+}
+
+/// Where a standalone service's dial host came from, which decides how it is
+/// vetted and which transport it may use.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StandaloneHostOrigin {
+    /// The service's own parameters, set by whoever created it.
+    Service,
+    /// The data address of the worker node it is placed on.
+    Node,
+    /// The address the Docker daemon reported for its container on the Temps
+    /// network, for a control plane that itself runs in a container.
+    LocalContainer,
+}
+
+impl StandaloneHostOrigin {
+    /// Whether the host came from a record Temps wrote itself rather than
+    /// from the service's parameters (see [`vet_dial_target`]).
+    fn is_trusted_record(self) -> bool {
+        !matches!(self, Self::Service)
+    }
+}
+
+/// Point a service on this control plane's own Docker daemon at its
+/// container's address on the Temps network, and the port its engine listens
+/// on there. Every engine but Postgres embeds the host in a URL, where an IPv6
+/// literal must be bracketed.
+fn use_container_address(
+    parameters: &mut serde_json::Value,
+    service_type: &crate::externalsvc::ServiceType,
+    container: crate::services::LocalContainerAddress,
+) -> bool {
+    let Some(params) = parameters.as_object_mut() else {
+        return false;
+    };
+    let host = match service_type {
+        crate::externalsvc::ServiceType::Postgres => container.address.to_string(),
+        _ => url_host(container.address),
+    };
+    params.insert("host".to_string(), serde_json::Value::String(host));
+    params.insert(
+        "port".to_string(),
+        serde_json::Value::String(container.port.to_string()),
+    );
+    true
 }
 
 /// Replace a worker-placed service's loopback `host` with its node's data
@@ -109,22 +166,19 @@ fn postgres_connection_target(
     cluster_primary: Option<(String, u16)>,
     standalone_host: String,
     standalone_port: u16,
-    standalone_host_from_node: bool,
+    standalone_host_origin: StandaloneHostOrigin,
 ) -> (String, u16, PostgresConnectionPolicy) {
-    match cluster_primary {
-        Some((host, port)) => (host, port, PostgresConnectionPolicy::ManagedPrivate),
+    let policy = match (&cluster_primary, standalone_host_origin) {
+        (Some(_), _) => PostgresConnectionPolicy::ManagedPrivate,
         // A standalone service on a worker is dialled at the node's private
         // data address, like a cluster primary: it must stay on that network.
-        None if standalone_host_from_node => (
-            standalone_host,
-            standalone_port,
-            PostgresConnectionPolicy::ManagedPrivate,
-        ),
-        None => (
-            standalone_host,
-            standalone_port,
-            PostgresConnectionPolicy::Standard,
-        ),
+        (None, StandaloneHostOrigin::Node) => PostgresConnectionPolicy::ManagedPrivate,
+        (None, StandaloneHostOrigin::LocalContainer) => PostgresConnectionPolicy::LocalContainer,
+        (None, StandaloneHostOrigin::Service) => PostgresConnectionPolicy::Standard,
+    };
+    match cluster_primary {
+        Some((host, port)) => (host, port, policy),
+        None => (standalone_host, standalone_port, policy),
     }
 }
 
@@ -148,19 +202,21 @@ fn url_host(ip: IpAddr) -> String {
 
 /// The host to dial for a data-browser connection.
 ///
-/// `host_from_node` hosts were taken from the node record (see
-/// [`use_worker_host`]), not typed by whoever created the service: the control
-/// plane wrote that address itself when the worker joined, and it is normally
-/// private, so the operator-trust check in [`vet_query_target`] would refuse
-/// it. They must still be IP literals, so nothing else can be spliced into a
-/// connection string. Every other host goes through [`vet_query_target`].
+/// `trusted_record` hosts were not typed by whoever created the service: they
+/// come from the node record (see [`use_worker_host`]), which the control
+/// plane wrote when the worker joined, or from the Docker daemon's report of
+/// the service's own container (see [`use_container_address`]). Both are
+/// normally private or non-routable, so the operator-trust check in
+/// [`vet_query_target`] would refuse them. They must still be IP literals, so
+/// nothing else can be spliced into a connection string. Every other host
+/// goes through [`vet_query_target`].
 async fn vet_dial_target(
     service_id: i32,
     host: &str,
     port: u16,
-    host_from_node: bool,
+    trusted_record: bool,
 ) -> Result<String> {
-    if !host_from_node {
+    if !trusted_record {
         return vet_query_target(service_id, host, port).await;
     }
     let trimmed = host.trim();
@@ -170,8 +226,8 @@ async fn vet_dial_target(
         .unwrap_or(trimmed);
     bare.parse::<IpAddr>().map(url_host).map_err(|_| {
         DataError::InvalidConfiguration(format!(
-            "Service {service_id}: the node hosting it has data address '{bare}', which is not an \
-             IP address"
+            "Service {service_id}: the address '{bare}' Temps recorded for it (its node's data \
+             address or its container's address) is not an IP address"
         ))
     })
 }
@@ -427,7 +483,7 @@ impl QueryService {
             .get_service(service_id)
             .await
             .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
-        let mut host_from_node = false;
+        let mut host_origin = StandaloneHostOrigin::Service;
         if placement.topology != "cluster" {
             let worker_address = self
                 .external_service_manager
@@ -440,10 +496,28 @@ impl QueryService {
                     ))
                 })?;
             if let Some(address) = worker_address {
-                host_from_node =
-                    use_worker_host(&mut service.parameters, &service.service_type, &address);
+                if use_worker_host(&mut service.parameters, &service.service_type, &address) {
+                    host_origin = StandaloneHostOrigin::Node;
+                }
             }
         }
+        // A control plane that itself runs in a container reaches a service on
+        // its own Docker daemon over the Temps network, at the address the
+        // daemon reports for the service's container: the stored loopback
+        // address is this container's own.
+        if host_origin == StandaloneHostOrigin::Service {
+            let local = self
+                .external_service_manager
+                .local_container_address(&placement, &service)
+                .await
+                .map_err(|e| DataError::ConnectionFailed(e.to_string()))?;
+            if let Some(local) = local {
+                if use_container_address(&mut service.parameters, &service.service_type, local) {
+                    host_origin = StandaloneHostOrigin::LocalContainer;
+                }
+            }
+        }
+        let host_from_node = host_origin.is_trusted_record();
 
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
@@ -523,7 +597,7 @@ impl QueryService {
                             Some((primary_host, primary_port)),
                             config.host.clone(),
                             5432,
-                            host_from_node,
+                            host_origin,
                         )
                     }
                     Ok(None) => {
@@ -543,7 +617,7 @@ impl QueryService {
                         // certificate verification and pins the addresses
                         // it resolves itself (`resolve_host_once`).
                         vet_dial_target(service_id, &config.host, port, host_from_node).await?;
-                        postgres_connection_target(None, config.host.clone(), port, host_from_node)
+                        postgres_connection_target(None, config.host.clone(), port, host_origin)
                     }
                     Err(e) => {
                         return Err(DataError::ConnectionFailed(format!(
@@ -1696,23 +1770,96 @@ mod tests {
             Some(("10.0.0.8".to_string(), 6432)),
             "public.example".to_string(),
             5432,
-            false,
+            StandaloneHostOrigin::Service,
         );
         assert_eq!(cluster.0, "10.0.0.8");
         assert_eq!(cluster.1, 6432);
         assert_eq!(cluster.2, PostgresConnectionPolicy::ManagedPrivate);
 
-        let standalone =
-            postgres_connection_target(None, "public.example".to_string(), 5433, false);
+        let standalone = postgres_connection_target(
+            None,
+            "public.example".to_string(),
+            5433,
+            StandaloneHostOrigin::Service,
+        );
         assert_eq!(standalone.0, "public.example");
         assert_eq!(standalone.1, 5433);
         assert_eq!(standalone.2, PostgresConnectionPolicy::Standard);
 
         // A standalone service on a worker is dialled at the node's private
         // address, so it takes the private-network policy a cluster does.
-        let on_worker = postgres_connection_target(None, "10.100.0.7".to_string(), 5433, true);
+        let on_worker = postgres_connection_target(
+            None,
+            "10.100.0.7".to_string(),
+            5433,
+            StandaloneHostOrigin::Node,
+        );
         assert_eq!(on_worker.0, "10.100.0.7");
         assert_eq!(on_worker.2, PostgresConnectionPolicy::ManagedPrivate);
+
+        // A containerized control plane dials the daemon-reported address of
+        // the service's own container, which takes its own policy.
+        let in_container = postgres_connection_target(
+            None,
+            "198.20.255.7".to_string(),
+            5432,
+            StandaloneHostOrigin::LocalContainer,
+        );
+        assert_eq!(in_container.0, "198.20.255.7");
+        assert_eq!(in_container.2, PostgresConnectionPolicy::LocalContainer);
+
+        // A cluster primary is never dialled through the container policy.
+        let cluster_in_container = postgres_connection_target(
+            Some(("10.0.0.8".to_string(), 6432)),
+            "198.20.255.7".to_string(),
+            5432,
+            StandaloneHostOrigin::LocalContainer,
+        );
+        assert_eq!(
+            cluster_in_container.2,
+            PostgresConnectionPolicy::ManagedPrivate
+        );
+    }
+
+    #[test]
+    fn container_address_replaces_host_and_port_in_each_engine_form() {
+        let container = crate::services::LocalContainerAddress {
+            address: "fd00::7".parse().unwrap(),
+            port: 5432,
+        };
+        let mut postgres = serde_json::json!({"host": "localhost", "port": "6097"});
+        assert!(use_container_address(
+            &mut postgres,
+            &crate::externalsvc::ServiceType::Postgres,
+            container
+        ));
+        assert_eq!(postgres["host"], "fd00::7");
+        assert_eq!(postgres["port"], "5432");
+
+        let mut redis = serde_json::json!({"host": "localhost", "port": "7043"});
+        assert!(use_container_address(
+            &mut redis,
+            &crate::externalsvc::ServiceType::Redis,
+            crate::services::LocalContainerAddress {
+                port: 6379,
+                ..container
+            }
+        ));
+        assert_eq!(redis["host"], "[fd00::7]");
+        assert_eq!(redis["port"], "6379");
+
+        assert!(!use_container_address(
+            &mut serde_json::json!("not an object"),
+            &crate::externalsvc::ServiceType::Redis,
+            container
+        ));
+    }
+
+    #[test]
+    fn only_the_service_parameters_are_vetted_as_operator_input() {
+        assert!(!StandaloneHostOrigin::Service.is_trusted_record());
+        assert!(StandaloneHostOrigin::Node.is_trusted_record());
+        assert!(StandaloneHostOrigin::LocalContainer.is_trusted_record());
     }
 
     #[tokio::test]

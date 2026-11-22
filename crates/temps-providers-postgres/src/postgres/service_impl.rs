@@ -9,12 +9,11 @@ use crate::externalsvc::{
     ExternalService, HealthProbeResult, RuntimeEnvVar, ServiceConfig, ServiceResourceLimits,
     ServiceType,
 };
-use crate::utils::ensure_network_exists;
 use async_trait::async_trait;
 use bollard::query_parameters::StopContainerOptions;
 use std::collections::HashMap;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 use urlencoding;
 
 #[async_trait]
@@ -229,9 +228,10 @@ impl ExternalService for PostgresService {
             }
         };
 
+        let (host, port) = self.dial_address(&cfg);
         let conn_str = format!(
             "host={} port={} user={} password={} dbname={} connect_timeout=3",
-            cfg.host, cfg.port, cfg.username, cfg.password, cfg.database
+            host, port, cfg.username, cfg.password, cfg.database
         );
 
         let start = Instant::now();
@@ -244,13 +244,13 @@ impl ExternalService for PostgresService {
         match connect {
             Err(_) => Ok(HealthProbeResult::down(format!(
                 "postgres probe to {}:{} timed out after {}s",
-                cfg.host,
-                cfg.port,
+                host,
+                port,
                 PROBE_TIMEOUT.as_secs()
             ))),
             Ok(Err(e)) => Ok(HealthProbeResult::down(format!(
                 "postgres connect to {}:{} failed: {}",
-                cfg.host, cfg.port, e
+                host, port, e
             ))),
             Ok(Ok((client, connection))) => {
                 // Drive the connection on a background task for the lifetime
@@ -1215,6 +1215,13 @@ impl ExternalService for PostgresService {
             .trim_start_matches('/')
             .to_string();
 
+        // Ports the container listens on and publishes, to find the engine
+        // port behind the one the operator entered.
+        let published_ports = container
+            .network_settings
+            .as_ref()
+            .and_then(|settings| settings.ports.clone());
+
         // Extract image name and version
         let image = container.config.and_then(|c| c.image).ok_or_else(|| {
             EngineError::failed(
@@ -1250,16 +1257,35 @@ impl ExternalService for PostgresService {
             .unwrap_or("5432")
             .to_string();
 
+        // Join the Temps network first: a containerized control plane reaches
+        // the imported container by name on it, so it must be attached before
+        // the credentials can be checked.
+        crate::externalsvc::import_attach::attach_imported_container(
+            &self.docker,
+            &self.name,
+            "PostgreSQL",
+            &container_id,
+            &imported_container_name,
+        )
+        .await?;
+        let (dial_host, dial_port) = crate::externalsvc::import_attach::import_dial_address(
+            published_ports.as_ref(),
+            &port,
+            &imported_container_name,
+            POSTGRES_INTERNAL_PORT,
+        );
+
         // Verify connection to the imported service. Connects directly with
         // `.await` on the current runtime — spinning up a nested
         // `tokio::runtime::Runtime` and calling `block_on` here panics with
         // "Cannot start a runtime from within a runtime", since this
         // `async fn` is already driven by one.
         let connection_url = format!(
-            "postgresql://{}:{}@localhost:{}/{}",
+            "postgresql://{}:{}@{}:{}/{}",
             urlencoding::encode(&username),
             urlencoding::encode(&password),
-            port,
+            dial_host,
+            dial_port,
             urlencoding::encode(&database)
         );
         let pool = sqlx::postgres::PgPoolOptions::new()
@@ -1267,46 +1293,16 @@ impl ExternalService for PostgresService {
             .connect(&connection_url)
             .await
             .map_err(|e| {
-                EngineError::connection(&self.name, format!("Failed to connect to PostgreSQL at localhost:{} with provided credentials: {}",
-                    port,
-                    e))
+                EngineError::connection(
+                    &self.name,
+                    format!(
+                        "Failed to connect to PostgreSQL container '{}' at {}:{} with provided credentials: {}",
+                        imported_container_name, dial_host, dial_port, e
+                    ),
+                )
             })?;
         pool.close().await;
         info!("Successfully verified PostgreSQL connection for import");
-
-        let network_ready = match ensure_network_exists(&self.docker).await {
-            Ok(()) => true,
-            Err(e) => {
-                warn!(
-                    "Failed to ensure Temps Docker network before PostgreSQL import attach: {:?}",
-                    e
-                );
-                false
-            }
-        };
-        if network_ready {
-            let network_name = temps_core::NETWORK_NAME.as_str();
-            let request = bollard::models::NetworkConnectRequest {
-                container: container_id.clone(),
-                ..Default::default()
-            };
-            match self.docker.connect_network(network_name, request).await {
-                Ok(()) => info!(
-                    "Attached imported PostgreSQL container '{}' to {}",
-                    imported_container_name, network_name
-                ),
-                Err(bollard::errors::Error::DockerResponseServerError {
-                    status_code: 403, ..
-                }) => debug!(
-                    "Imported PostgreSQL container '{}' is already attached to {}",
-                    imported_container_name, network_name
-                ),
-                Err(e) => warn!(
-                    "Failed to attach imported PostgreSQL container '{}' to {}: {}",
-                    imported_container_name, network_name, e
-                ),
-            }
-        }
 
         // Build the ServiceConfig for registration
         let config = ServiceConfig {

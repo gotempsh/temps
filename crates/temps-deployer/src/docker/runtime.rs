@@ -81,6 +81,10 @@ impl DockerRuntime {
             overlay_dns_slot: None,
             overlay_peers: None,
             secrets_root,
+            upload_secrets: matches!(
+                temps_core::runtime::execution_environment_compatibility(),
+                temps_core::ExecutionEnvironment::Docker
+            ),
             docker_socket_grant: DockerSocketGrant::default(),
             build_limits: Arc::new(LiveBuildLimits::default()),
             builds_started: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -164,6 +168,14 @@ impl DockerRuntime {
     /// a temp dir; the agent/serve paths leave it at the default.
     pub fn with_secrets_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.secrets_root = root.into();
+        self
+    }
+
+    /// Choose how secret files reach `/run/secrets`: uploaded into the
+    /// created container through the daemon (`true`), or bound from the
+    /// secrets root (`false`). The default follows the execution environment.
+    pub fn with_uploaded_secrets(mut self, upload: bool) -> Self {
+        self.upload_secrets = upload;
         self
     }
 

@@ -18,6 +18,10 @@ use temps_core::EncryptionService;
 
 mod cluster_state;
 mod cluster_topology;
+mod dial_target;
+pub use dial_target::{
+    EngineContainerEndpoints, LocalContainerAddress, LocalContainerAddressError,
+};
 mod engine_selection;
 mod healthcheck_defaults;
 mod manager;
@@ -62,32 +66,89 @@ pub use workload_ops::{
 /// to IPv6 first on Linux even though Docker is only listening on 127.0.0.1.
 pub(crate) const LOCAL_CLUSTER_HOST: &str = "127.0.0.1";
 
-/// The address the control plane dials to reach a cluster member's published
-/// port: the worker's data address for a member on a worker, the IPv4
-/// loopback for a member on the control plane.
+/// Port of a cluster member that has none stored. Only PostgreSQL has a
+/// cluster topology.
+const DEFAULT_CLUSTER_MEMBER_PORT: u16 = 5432;
+
+/// Where a control plane running in `execution_environment` connects to the
+/// cluster member `container_name`, whose PostgreSQL listens on `port`.
+///
+/// A member's PostgreSQL listens inside its container on the same port it
+/// publishes (`member.port`), so the port is the same on every route:
+///
+/// * a member on a worker: the worker's data address;
+/// * a member on this control plane's daemon, from a native process: the IPv4
+///   loopback;
+/// * the same member from a process that itself runs in a container: the
+///   member's container name, over the Temps network every local member
+///   joins; the loopback there is the control plane's own.
 ///
 /// Never the member's overlay `compute_ip`. The control plane is not on the
 /// workload overlay, so that address routes only between workloads; a monitor
 /// probe sent there times out, which left every worker-hosted cluster reading
-/// as Down with no known primary. Workers publish member ports on their data
-/// address, which is what this returns.
-pub(crate) async fn control_plane_member_dial_host<C: sea_orm::ConnectionTrait>(
+/// as Down with no known primary.
+pub(crate) fn member_dial_target(
+    execution_environment: temps_core::ExecutionEnvironment,
+    worker_data_address: Option<&str>,
+    container_name: &str,
+    port: u16,
+) -> (String, u16) {
+    let container = temps_core::managed_service_address::ContainerEndpoint {
+        name: container_name.to_string(),
+        port,
+    };
+    let target = temps_core::managed_service_address::control_plane_dial_target(
+        execution_environment,
+        LOCAL_CLUSTER_HOST,
+        port,
+        worker_data_address,
+        Some(&container),
+    );
+    (target.host, target.port)
+}
+
+/// [`member_dial_target`] for a member placed on `node_id` (`None` or `0` is
+/// this control plane), looking the worker up in the nodes table.
+/// `published_port` is the member's stored port; 5432 when it has none.
+pub(crate) async fn control_plane_member_endpoint<C: sea_orm::ConnectionTrait>(
     db: &C,
     node_id: Option<i32>,
     container_name: &str,
-) -> Result<String, String> {
-    let Some(node_id) = node_id.filter(|id| *id != 0) else {
-        return Ok(LOCAL_CLUSTER_HOST.to_string());
+    published_port: Option<i32>,
+) -> Result<(String, u16), String> {
+    let raw_port = published_port.unwrap_or(i32::from(DEFAULT_CLUSTER_MEMBER_PORT));
+    let published = u16::try_from(raw_port)
+        .ok()
+        .filter(|port| *port != 0)
+        .ok_or_else(|| {
+            format!(
+                "cluster member '{container_name}' has port {raw_port}, outside the valid TCP \
+                 range 1-65535"
+            )
+        })?;
+    let worker_address = match node_id.filter(|id| *id != 0) {
+        None => None,
+        Some(node_id) => match nodes::Entity::find_by_id(node_id).one(db).await {
+            Ok(Some(node)) => Some(node.data_address().to_string()),
+            Ok(None) => {
+                return Err(format!(
+                    "node {node_id} of cluster member '{container_name}' was not found in the \
+                     nodes table"
+                ))
+            }
+            Err(error) => {
+                return Err(format!(
+                    "failed to load node {node_id} of cluster member '{container_name}': {error}"
+                ))
+            }
+        },
     };
-    match nodes::Entity::find_by_id(node_id).one(db).await {
-        Ok(Some(node)) => Ok(node.data_address().to_string()),
-        Ok(None) => Err(format!(
-            "node {node_id} of cluster member '{container_name}' was not found in the nodes table"
-        )),
-        Err(error) => Err(format!(
-            "failed to load node {node_id} of cluster member '{container_name}': {error}"
-        )),
-    }
+    Ok(member_dial_target(
+        temps_core::runtime::execution_environment_compatibility(),
+        worker_address.as_deref(),
+        container_name,
+        published,
+    ))
 }
 
 /// Every field is `Arc`-wrapped, so `Clone` is a cheap refcount bump that
@@ -699,47 +760,82 @@ mod tests {
         monitor.node_id = Some(2);
         monitor.compute_ip = Some("172.20.1.3".to_string());
 
-        let host = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
-            .await
-            .unwrap();
+        let endpoint = control_plane_member_endpoint(
+            &db,
+            monitor.node_id,
+            &monitor.container_name,
+            Some(6100),
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(host, "10.0.0.2");
+        assert_eq!(endpoint, ("10.0.0.2".to_string(), 6100));
     }
 
     #[tokio::test]
-    async fn control_plane_dials_its_own_members_on_loopback() {
-        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
-        let mut monitor = service_member_model(1, 0, "monitor");
-        monitor.compute_ip = Some("172.18.0.5".to_string());
-        assert_eq!(
-            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
-                .await
-                .unwrap(),
-            LOCAL_CLUSTER_HOST
-        );
-        monitor.node_id = Some(0);
-        assert_eq!(
-            control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
-                .await
-                .unwrap(),
-            LOCAL_CLUSTER_HOST
-        );
-    }
-
-    #[tokio::test]
-    async fn control_plane_member_dial_host_names_a_missing_node() {
+    async fn control_plane_member_endpoint_names_a_missing_node_or_a_bad_port() {
         let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
             .append_query_results([Vec::<nodes::Model>::new()])
             .into_connection();
         let mut monitor = service_member_model(1, 0, "monitor");
         monitor.node_id = Some(9);
 
-        let reason = control_plane_member_dial_host(&db, monitor.node_id, &monitor.container_name)
-            .await
-            .unwrap_err();
-
+        let reason = control_plane_member_endpoint(
+            &db,
+            monitor.node_id,
+            &monitor.container_name,
+            Some(6100),
+        )
+        .await
+        .unwrap_err();
         assert!(reason.contains("node 9"), "{reason}");
         assert!(reason.contains("cluster-member-0"), "{reason}");
+
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let reason = control_plane_member_endpoint(&db, None, "cluster-member-0", Some(70000))
+            .await
+            .unwrap_err();
+        assert!(reason.contains("70000"), "{reason}");
+    }
+
+    #[test]
+    fn a_native_control_plane_dials_its_own_members_on_loopback() {
+        assert_eq!(
+            member_dial_target(
+                temps_core::ExecutionEnvironment::Host,
+                None,
+                "orders-monitor",
+                6100
+            ),
+            (LOCAL_CLUSTER_HOST.to_string(), 6100)
+        );
+    }
+
+    #[test]
+    fn a_containerized_control_plane_dials_its_own_members_by_container_name() {
+        assert_eq!(
+            member_dial_target(
+                temps_core::ExecutionEnvironment::Docker,
+                None,
+                "orders-monitor",
+                6100
+            ),
+            ("orders-monitor".to_string(), 6100)
+        );
+    }
+
+    #[test]
+    fn a_worker_member_is_dialled_at_its_node_from_either_environment() {
+        for environment in [
+            temps_core::ExecutionEnvironment::Host,
+            temps_core::ExecutionEnvironment::Docker,
+        ] {
+            assert_eq!(
+                member_dial_target(environment, Some("10.0.0.2"), "orders-monitor", 6100),
+                ("10.0.0.2".to_string(), 6100),
+                "{environment}"
+            );
+        }
     }
 
     /// Regression for #495.

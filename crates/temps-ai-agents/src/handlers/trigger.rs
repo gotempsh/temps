@@ -846,7 +846,9 @@ pub async fn smoke_test_agent(
             _ => 99_996,
         };
         let work_dir =
-            std::env::temp_dir().join(format!("agent-smoke-test-{}", target_provider_id));
+            // Mounted into the smoke-test sandbox: see `sandbox_workspace_root`.
+            temps_sandbox_providers::workspace_root::sandbox_workspace_root()
+                .join(format!("agent-smoke-test-{}", target_provider_id));
         let _ = tokio::fs::create_dir_all(&work_dir).await;
 
         // Inject the saved credential for *this* provider (not the active one)

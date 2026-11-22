@@ -106,6 +106,11 @@ impl ProjectService {
             request.preset_config.as_ref(),
             project.preset_config.as_ref(),
         )?;
+        ensure_preset_selectable(
+            resolved.preset,
+            Some(project.preset),
+            temps_core::runtime::execution_environment_compatibility(),
+        )?;
 
         let name = validate_project_name(&request.name)?;
         if name.to_lowercase() != project.name.to_lowercase() {
@@ -750,6 +755,7 @@ impl ProjectService {
                 )));
             }
 
+            let existing_preset = project.preset;
             let existing_preset_config = project.preset_config.clone();
             let mut active_project: projects::ActiveModel = project.into();
 
@@ -767,6 +773,11 @@ impl ProjectService {
                     preset_value.as_str(),
                     preset_config.as_ref(),
                     existing_preset_config.as_ref(),
+                )?;
+                ensure_preset_selectable(
+                    resolved.preset,
+                    Some(existing_preset),
+                    temps_core::runtime::execution_environment_compatibility(),
                 )?;
                 apply_resolved_preset(&mut active_project, resolved)?;
             } else if let Some(config_value) = preset_config.as_ref() {
