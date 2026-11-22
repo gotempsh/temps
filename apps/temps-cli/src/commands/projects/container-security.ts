@@ -76,8 +76,9 @@ export async function projectContainerSecurityAction(options: ContainerSecurityO
   const remove = (options.remove ?? []).map(normalizeCapability)
   const resolved = await requireProjectSlug(options.project)
   const project = await withSpinner('Fetching project...', async () => {
-    // `--project` takes a slug or an ID: an all-digit value is the ID.
-    const { data, error } = /^\d+$/.test(resolved.slug)
+    // `--project` takes a slug or an ID: an all-digit value given there is
+    // the ID. A linked, environment or default project is always a slug.
+    const { data, error } = resolved.source === 'flag' && /^\d+$/.test(resolved.slug)
       ? await getProject({ client, path: { id: Number(resolved.slug) } })
       : await getProjectBySlug({ client, path: { slug: resolved.slug } })
     if (error || !data) throw new Error(getErrorMessage(error) ?? `Project "${resolved.slug}" not found`)

@@ -67,4 +67,24 @@ describe('projects container-security --project', () => {
     expect(run.error).toBeUndefined()
     expect(run.requests).toEqual(['GET /projects/by-slug/12-web', 'GET /projects/3/container-security'])
   })
+
+  test('reads a numeric linked or environment project as a slug', async () => {
+    const saved = process.env.TEMPS_PROJECT
+    process.env.TEMPS_PROJECT = '12'
+    try {
+      const run = await runWithApi(
+        registerProjectsCommands,
+        ['projects', 'container-security', '--json'],
+        {
+          'GET /projects/by-slug/12': { id: 40, slug: '12', name: '12' },
+          'GET /projects/40/container-security': security,
+        }
+      )
+      expect(run.error).toBeUndefined()
+      expect(run.requests).toEqual(['GET /projects/by-slug/12', 'GET /projects/40/container-security'])
+    } finally {
+      if (saved === undefined) delete process.env.TEMPS_PROJECT
+      else process.env.TEMPS_PROJECT = saved
+    }
+  })
 })
