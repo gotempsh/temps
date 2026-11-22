@@ -83,7 +83,7 @@ bunx @temps-sdk/cli@latest --target-context staging environments vars set \
   --project example DATABASE_URL --secret --value-file ./database-url.txt \
   --environments staging
 
-op read op://vault/db/url | bunx @temps-sdk/cli@latest --target-context staging \
+op read --no-newline op://vault/db/url | bunx @temps-sdk/cli@latest --target-context staging \
   environments vars set --project example DATABASE_URL --secret --value-stdin \
   --environments staging
 ```

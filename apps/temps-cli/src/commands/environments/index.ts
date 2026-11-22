@@ -38,8 +38,8 @@ Examples:
   # Store a secret from a file (recommended: nothing lands in shell history)
   $ temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt
 
-  # Pipe a secret from a password manager (environments are picked on the
-  # terminal; without one, e.g. in CI, also pass --environments)
+  # Pipe a secret from a password manager (\`op read -n\` omits its trailing
+  # newline; environments are picked on the terminal, or pass --environments in CI)
   $ op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin
 
   # A file written by an editor or echo usually ends in a newline; drop it

@@ -137,7 +137,7 @@ Examples:
   $ temps projects secrets create -p my-app -k CODEX_AUTH --value-file ./auth.json
 
   # Pipe a value from a password manager
-  $ op read op://vault/db/password | temps projects secrets create -p my-app -k DB_PASSWORD --value-stdin
+  $ op read --no-newline op://vault/db/password | temps projects secrets create -p my-app -k DB_PASSWORD --value-stdin
 `
 
 export function registerProjectSecretsCommands(projects: Command): void {

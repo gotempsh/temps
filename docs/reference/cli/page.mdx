@@ -43,7 +43,7 @@ bunx @temps-sdk/cli configure
 
 ### Secrets and credentials
 
-Never type a secret on the command line, where it lands in shell history, `ps` output and CI logs. Commands that set a variable or secret value take `--value-file <path>` or `--value-stdin`; flags that carry a credential (`--token`, `--password`, `--api-key`, `--api-token`, `--secret`, `--secret-key`, `--secret-access-key`, `--bot-token`, `--git-password`, `--webhook-url`) take `--<flag>-file <path>` and `--<flag>-stdin`. Values are sent byte-for-byte; `--trim-trailing-newline` drops one trailing newline. The exception is `project-groups vars set`, which has always dropped one final newline from `--value-stdin` and does the same for `--value-file`. The CLI never prints the value, but a shell with tracing on (`set -x`) can echo an expanded secret into CI logs before the CLI runs, so turn tracing off around secrets.
+Never type a secret on the command line, where it lands in shell history, `ps` output and CI logs. Commands that set a variable or secret value take `--value-file <path>` or `--value-stdin`; flags that carry a credential (`--token`, `--password`, `--api-key`, `--api-token`, `--secret`, `--secret-key`, `--secret-access-key`, `--bot-token`, `--git-password`, `--webhook-url`) take `--<flag>-file <path>` and `--<flag>-stdin`. `templates create` takes secret variables as `--secret-file <[service:]KEY=PATH>`, with `KEY=-` reading stdin. Values are sent byte-for-byte; `--trim-trailing-newline` drops one trailing newline. The exception is `project-groups vars set`, which has always dropped one final newline from `--value-stdin` and does the same for `--value-file`. The CLI never prints the value, but a shell with tracing on (`set -x`) can echo an expanded secret into CI logs before the CLI runs, so turn tracing off around secrets.
 
 ## Commands
 
@@ -1149,7 +1149,7 @@ Pass exactly one of `<value>`, `--value-file` or `--value-stdin`; with none, the
 
 ```bash
 temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt --environments production
-op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin --environments production
+op read --no-newline op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin --environments production
 ```
 
 #### `environments vars delete` (alias: `rm`, `unset`)
@@ -5124,7 +5124,7 @@ bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --enviro
 
 # Store a secret from a file, or pipe it from a password manager
 bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
-op read op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
+op read --no-newline op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # View environment variables
 bunx @temps-sdk/cli environments vars list --project my-app

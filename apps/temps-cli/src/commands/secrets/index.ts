@@ -112,7 +112,7 @@ interface DeleteOptions {
 const CREATE_EXAMPLES = `
 Examples:
   # An env-type secret piped from a password manager
-  $ op read op://vault/api/key | temps secrets create -n my_api_key --value-stdin --trim-trailing-newline
+  $ op read --no-newline op://vault/api/key | temps secrets create -n my_api_key --value-stdin
 
   # A file-type secret, sent byte-for-byte
   $ temps secrets create -n gsc_creds -t file -m /home/temps/gsc.json --value-file ./gsc.json
@@ -276,7 +276,7 @@ async function listAction(options: ListOptions): Promise<void> {
     info('No secrets defined yet.')
     info('Examples:')
     info(
-      '  env:  op read op://vault/api/key | temps secrets create -n my_api_key --value-stdin',
+      '  env:  op read --no-newline op://vault/api/key | temps secrets create -n my_api_key --value-stdin',
     )
     info(
       '  file: temps secrets create -n gsc_creds -t file -m gsc.json --value-file ./gsc.json',
