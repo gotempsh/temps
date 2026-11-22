@@ -25,7 +25,7 @@ use temps_core::{
     SensitiveAction, SensitiveActionAuthorizer,
 };
 use tracing::error;
-use utoipa::{OpenApi, ToSchema};
+use utoipa::OpenApi;
 
 use temps_core::gate::GateKind;
 
@@ -52,13 +52,6 @@ pub struct ReachabilityAppState {
     pub sensitive_action_authorizer: Arc<dyn SensitiveActionAuthorizer>,
 }
 
-/// Whether HTTP-01 can issue a certificate here: a direct ingress answers
-/// on port 80.
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct CertificateMethods {
-    pub http01_available: bool,
-}
-
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -72,7 +65,6 @@ pub struct CertificateMethods {
         undo_reachability_run,
         decide_reachability_conflict,
         check_cloudflare_token,
-        get_certificate_methods,
     ),
     components(schemas(
         EnvironmentReachability,
@@ -120,7 +112,6 @@ pub struct CertificateMethods {
         PermissionState,
         TokenPermission,
         ZoneScope,
-        CertificateMethods,
     )),
     tags((name = "Reachability", description = "Making a project reachable (ADR 064)"))
 )]
@@ -157,7 +148,6 @@ pub fn configure_routes() -> Router<Arc<ReachabilityAppState>> {
             "/ingress/cloudflare/token-check",
             post(check_cloudflare_token),
         )
-        .route("/ingress/certificate-methods", get(get_certificate_methods))
 }
 
 /// One audit record per run started or undone. Answers are never recorded:
@@ -882,28 +872,6 @@ async fn check_cloudflare_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DnsProvidersWrite);
     Ok(Json(state.service.token_check(request).await))
-}
-
-/// Which certificate methods fit this cluster.
-///
-/// HTTP-01 needs an ingress that answers on port 80; without one, issue
-/// certificates through DNS-01.
-#[utoipa::path(
-    tag = "Reachability",
-    get,
-    path = "/ingress/certificate-methods",
-    operation_id = "get_certificate_methods",
-    responses((status = 200, body = CertificateMethods)),
-    security(("bearer_auth" = []))
-)]
-async fn get_certificate_methods(
-    RequireAuth(auth): RequireAuth,
-    State(state): State<Arc<ReachabilityAppState>>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, DomainsRead);
-    Ok(Json(CertificateMethods {
-        http01_available: state.service.http01_available().await?,
-    }))
 }
 
 #[cfg(test)]

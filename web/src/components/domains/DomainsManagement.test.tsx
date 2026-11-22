@@ -7,7 +7,11 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter, Route, Routes, useParams } from 'react-router'
 import { toast } from 'sonner'
 import { listIngressHostnamesQueryKey } from '@/api/client/@tanstack/react-query.gen'
-import type { DomainResponse } from '@/api/client/types.gen'
+import type {
+  ConnectorView,
+  DomainResponse,
+  ServiceAccessInfo,
+} from '@/api/client/types.gen'
 import { PlatformAccessContext } from '@/contexts/PlatformAccessContext-shared'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
@@ -37,7 +41,8 @@ function DomainPage() {
 
 function renderTable(
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
-  routes: Parameters<typeof mockApi>[0] = {}
+  routes: Parameters<typeof mockApi>[0] = {},
+  accessInfo?: ServiceAccessInfo
 ) {
   // Tunnels and capabilities answer 404: the table still lists certificates.
   mockApi(routes)
@@ -46,14 +51,14 @@ function renderTable(
       <MemoryRouter initialEntries={['/domains']}>
         <PlatformAccessContext.Provider
           value={{
-            accessInfo: undefined,
+            accessInfo,
             isLoading: false,
             error: null,
             refetch: () => {},
             isLocal: false,
             isNat: false,
-            isCloudflare: false,
-            isDirect: true,
+            isCloudflare: accessInfo?.access_mode === 'cloudflare_tunnel',
+            isDirect: accessInfo == null,
           }}
         >
           <Routes>
@@ -252,4 +257,84 @@ test('retry targets one failed hostname and refreshes its row after a conflict o
   } finally {
     success.mockRestore()
   }
+})
+
+/** A tunnel on one domain; the operator's other domains are served directly. */
+const tunnel: ConnectorView = {
+  id: 9,
+  name: 'edge',
+  provider: 'cloudflare_tunnel',
+  domain: 'apps.example.org',
+  status: 'ready',
+  auto_publish: false,
+  environment_hosts: false,
+  edge_port: 443,
+  created_at: '2026-01-01T00:00:00Z',
+  nodes: [{ node_id: 3, node_name: 'worker-1', state: 'ready' }],
+  publications: [],
+}
+
+/** The console opened through the tunnel: `cf-ray` on the request. */
+const openedThroughCloudflare: ServiceAccessInfo = {
+  access_mode: 'cloudflare_tunnel',
+  public_ip: '203.0.113.10',
+  can_create_domains: true,
+}
+
+test('opened through a Cloudflare Tunnel, Add domain is still offered', async () => {
+  const view = renderTable(
+    undefined,
+    {
+      'GET /ingress/connectors': () =>
+        jsonResponse({ connectors: [tunnel], total: 1 }),
+      'GET /ingress/hostnames': () =>
+        jsonResponse([
+          {
+            hostname: 'my-app.apps.example.org',
+            connector_id: 9,
+            connector_name: 'edge',
+            state: 'published',
+            mode: 'tunnel',
+            detail: '',
+            candidates: [],
+            served_by_workers: true,
+          },
+        ]),
+    },
+    openedThroughCloudflare
+  )
+
+  const add = view.getByRole('link', { name: /^Add domain/ })
+  expect(add.getAttribute('href')).toBe('/domains/add')
+  expect(add.getAttribute('aria-disabled')).toBeNull()
+  expect(view.queryByText('Managed by Cloudflare')).toBeNull()
+  expect(view.queryByText(/through your Cloudflare dashboard/)).toBeNull()
+
+  // The status line covers only what the tunnel serves.
+  const tunnels = await view.findByRole('list', { name: 'Tunnels' })
+  await waitFor(() =>
+    expect(tunnels.textContent).toContain(
+      'Tunnel edge serves names under apps.example.org · 1 published'
+    )
+  )
+  expect(tunnels.textContent).toContain(
+    'Other domains get HTTPS from a Temps certificate.'
+  )
+  // A certificate domain beside it keeps its certificate actions.
+  fireEvent.pointerDown(
+    view.getByRole('button', { name: 'Actions for app.example.com' }),
+    { button: 0, ctrlKey: false }
+  )
+  await view.findByText('Renew certificate')
+})
+
+test('without a tunnel there is no tunnel status line', async () => {
+  const view = renderTable(undefined, {
+    'GET /ingress/connectors': () => jsonResponse({ connectors: [], total: 0 }),
+    'GET /ingress/hostnames': () => jsonResponse([]),
+  })
+  expect(view.getByRole('link', { name: /^Add domain/ })).toBeTruthy()
+  await waitFor(() =>
+    expect(view.queryByRole('list', { name: 'Tunnels' })).toBeNull()
+  )
 })

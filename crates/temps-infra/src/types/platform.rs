@@ -165,36 +165,25 @@ impl PlatformFeatures {
     }
 }
 
-/// The mode the server is running in
+/// How the request asking reached this server.
+///
+/// It describes that one request, not the instance: the same server can be
+/// opened through Cloudflare on one hostname and serve other domains with
+/// its own certificates. It never decides whether a domain can be added;
+/// which ways a domain can get HTTPS is judged per domain by
+/// `GET /ingress/certificate-methods?domain=`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
 pub enum ServerMode {
-    /// Running locally (localhost access)
+    /// Opened through a loopback or private address
     Local,
     /// Direct public IP access
     Direct,
     /// Behind NAT (Network Address Translation)
     Nat,
-    /// Behind Cloudflare Tunnel
+    /// The request came through Cloudflare's edge (it carried `cf-ray` or
+    /// `cf-connecting-ip`): a Cloudflare Tunnel or Cloudflare's proxy in
+    /// front of the console's hostname. Says nothing about other hostnames.
     CloudflareTunnel,
-}
-
-impl ServerMode {
-    /// Check if domain creation should be allowed for this mode
-    pub fn can_create_domains(&self) -> bool {
-        match self {
-            ServerMode::Direct | ServerMode::Nat => true,
-            ServerMode::Local | ServerMode::CloudflareTunnel => false,
-        }
-    }
-
-    /// Get a human-readable description of why domain creation is not allowed
-    pub fn domain_creation_error_message(&self) -> Option<&'static str> {
-        match self {
-            ServerMode::Local => Some("Domain creation is not supported when running locally. Please deploy to a server with a public IP address."),
-            ServerMode::CloudflareTunnel => Some("Domain creation is not supported when using Cloudflare Tunnel. Domains are managed through Cloudflare."),
-            _ => None,
-        }
-    }
 }
 
 impl std::fmt::Display for ServerMode {
@@ -211,7 +200,9 @@ impl std::fmt::Display for ServerMode {
 /// Response containing information about how the service is being accessed
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ServiceAccessInfo {
-    /// Mode of access: "local", "direct", "nat", or "cloudflare_tunnel"
+    /// How this request reached the server: "local", "direct", "nat", or
+    /// "cloudflare_tunnel" (it came through Cloudflare's edge). Describes
+    /// this request only, never which domains can be added.
     pub access_mode: String,
 
     /// Server's public IP address (always returned if available)
@@ -220,10 +211,14 @@ pub struct ServiceAccessInfo {
     /// Server's private/local IP address (always returned if available)
     pub private_ip: Option<String>,
 
-    /// Whether domain creation is allowed in this mode
+    /// Always `true`: a domain can be added however this request reached
+    /// the server, and the server never refused one by access mode. How a
+    /// domain gets HTTPS (a tunnel covering it, HTTP-01, DNS-01) is judged
+    /// per domain by `GET /ingress/certificate-methods?domain=`. Kept for
+    /// older clients.
     pub can_create_domains: bool,
 
-    /// Error message if domain creation is not allowed
+    /// Always `null`; kept for older clients. See `can_create_domains`.
     pub domain_creation_error: Option<String>,
 }
 

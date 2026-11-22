@@ -422,6 +422,13 @@ impl PlatformInfoService {
         cached.private_updated = Some(Instant::now());
     }
 
+    /// Seed both cached addresses, so a test reads them without a lookup.
+    #[cfg(test)]
+    pub(crate) fn seed_network_cache(&self, public_ip: &str, private_ip: &str) {
+        self.update_cache_public_ip(Some(public_ip.to_string()));
+        self.update_cache_private_ip(Some(private_ip.to_string()));
+    }
+
     /// Force refresh the cached information.
     ///
     /// Errors from the individual lookups are discarded — this is a

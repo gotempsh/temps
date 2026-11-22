@@ -1637,6 +1637,19 @@ impl DnsProviderService {
             .map(|(_, managed)| managed))
     }
 
+    /// The active provider and verified zone that could write a TXT record
+    /// for `domain`, whichever provider it is: the one an operator can pick
+    /// for a DNS-01 challenge. Unlike [`Self::find_provider_for_domain`] the
+    /// zone need not be auto-managed, matching
+    /// [`Self::find_verified_zone_for_provider`], which the write itself uses.
+    pub async fn find_verified_zone_for_domain(
+        &self,
+        domain: &str,
+    ) -> Result<Option<(dns_providers::Model, dns_managed_domains::Model)>, DnsError> {
+        self.find_active_managed_domain_candidate(domain, None, false)
+            .await
+    }
+
     // Delivery cleanup
     /// Resolve the provider and managed zone a domain delivery binding wrote
     /// its record through, by the binding's own `provider_id` and `zone`.
@@ -2063,6 +2076,48 @@ mod upstream_tests {
         assert_eq!(
             format!("{:?}", statement.values),
             "Some(Values([String(Some(\"api.dev.example.com\")), String(Some(\"dev.example.com\")), String(Some(\"example.com\")), String(Some(\"com\")), Bool(Some(true)), Bool(Some(true)), Int(Some(42)), BigUnsigned(Some(2))]))"
+        );
+    }
+
+    /// A DNS-01 challenge may be written through any provider with a
+    /// verified zone, auto-managed or not: the lookup that says one exists
+    /// must not filter on either.
+    #[tokio::test]
+    async fn verified_zone_for_domain_finds_a_manually_managed_zone_of_any_provider() {
+        let mut manual = managed_domain(21, 303, "Example.COM.");
+        manual.auto_manage = false;
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![(
+                    manual,
+                    Some(dns_provider(303, "registrar", true)),
+                )]])
+                .into_connection(),
+        );
+        let service = DnsProviderService::new(
+            db.clone(),
+            Arc::new(EncryptionService::new_from_password("any-provider-test")),
+        );
+
+        let found = service
+            .find_verified_zone_for_domain("my-app.example.com")
+            .await
+            .expect("lookup succeeds");
+
+        let (provider, zone) = found.expect("the verified zone covers the domain");
+        assert_eq!(provider.name, "registrar");
+        assert_eq!(zone.domain, "example.com");
+        drop(service);
+        let transaction_log = Arc::try_unwrap(db)
+            .expect("test must release the database connection")
+            .into_transaction_log();
+        let statement = &transaction_log[0].statements()[0];
+        assert!(!statement.sql.contains(r#""auto_manage" = "#));
+        // The suffixes, verified, active and the limit: no provider id and
+        // no auto-manage flag bound.
+        assert_eq!(
+            format!("{:?}", statement.values),
+            "Some(Values([String(Some(\"my-app.example.com\")), String(Some(\"example.com\")), String(Some(\"com\")), Bool(Some(true)), Bool(Some(true)), BigUnsigned(Some(2))]))"
         );
     }
 

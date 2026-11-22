@@ -72,7 +72,6 @@ import {
 } from '@/pages/domain-detail-queries'
 import { PageHeader } from '@/components/layout/PageContainer'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import {
   formatExpiryRemaining,
   formatLocalDateTime,
@@ -370,19 +369,14 @@ export function DomainDetail() {
         domain?.status === 'pending'),
   })
 
-  const {
-    canManageCertificates: platformCanManageCertificates,
-    isUsingCloudflare,
-  } = usePlatformCapabilities()
   // A serving certificate can have a pending renewal. Require a successful
   // order read before offering mutations that could replace that order.
   const orderReadFailed = orderRequired && orderQuery.isError
   const orderKnown = !orderRequired || orderQuery.isSuccess
+  // A certificate domain is always Temps's to manage: a tunnel elsewhere, or
+  // a console opened through Cloudflare, does not take it over.
   const canManageCertificates =
-    platformCanManageCertificates &&
-    domainQuery.isSuccess &&
-    orderKnown &&
-    !orderReadFailed
+    domainQuery.isSuccess && orderKnown && !orderReadFailed
 
   const fetchingCount = useIsFetching({
     predicate: (q) => isDomainDetailQuery(q.queryKey),
@@ -1551,16 +1545,6 @@ export function DomainDetail() {
         </AlertDialog>
 
         {/* Alerts (shared across variants) */}
-        {isUsingCloudflare() && (
-          <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
-            <Info className="size-4 text-purple-600" />
-            <AlertDescription>
-              Domain and certificate management is handled automatically by
-              Cloudflare Tunnel.
-            </AlertDescription>
-          </Alert>
-        )}
-
         {isServingCert(domain.status) &&
           isExpiringSoon(domain.expiration_time) && (
             <ExpiringSoonAlert

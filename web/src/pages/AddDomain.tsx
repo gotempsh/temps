@@ -150,8 +150,9 @@ export function AddDomain() {
           if (covering.length > 0) {
             // A tunnel carries it: no certificate to issue.
             form.setValue('challengeType', tunnelChoice(covering[0].id))
-          } else if (domain.startsWith('*.')) {
-            // Auto-select DNS-01 for wildcard domains
+          } else if (domain.startsWith('*.') || http01Available === false) {
+            // A wildcard, or nothing answering on public port 80: only
+            // DNS-01 can issue the certificate.
             form.setValue('challengeType', 'dns-01')
           } else if (chosenTunnel(form.getValues('challengeType')) != null) {
             form.setValue('challengeType', 'http-01')
@@ -227,6 +228,15 @@ export function AddDomain() {
   }
 
   const watchedValues = useWatch({ control: form.control })
+  // Judged for this domain: whether a DNS provider can write its DNS-01
+  // record, and why HTTP-01 does not fit when it does not.
+  const typedDomain = watchedValues.domain?.trim() ?? ''
+  const domainMethods = useQuery({
+    ...getCertificateMethodsOptions({ query: { domain: typedDomain } }),
+    enabled: step !== 'domain' && typedDomain.length > 0,
+    retry: false,
+    staleTime: 60_000,
+  })
   const covering = tunnelsCovering(
     watchedValues.domain ?? '',
     connectorsQuery.data ?? []
@@ -495,19 +505,27 @@ export function AddDomain() {
                                           <CheckCircle className="h-4 w-4" />
                                           <span>Works without HTTP access</span>
                                         </div>
-                                        <div className="flex items-center gap-2 text-yellow-700 dark:text-yellow-600">
-                                          <Info className="h-4 w-4" />
-                                          <span>
-                                            Requires manual DNS record creation
-                                          </span>
-                                        </div>
+                                        <Dns01Writer
+                                          provider={
+                                            domainMethods.data?.dns01_provider
+                                              .configured
+                                              ? (domainMethods.data
+                                                  .dns_provider ?? null)
+                                              : null
+                                          }
+                                          setupPath={
+                                            domainMethods.data?.dns01_provider
+                                              .setup_path ?? null
+                                          }
+                                        />
                                       </div>
                                     </div>
                                   </label>
                                 </Card>
                                 {choices.http01Note && (
                                   <p className="text-sm text-muted-foreground">
-                                    {choices.http01Note}
+                                    {domainMethods.data?.http01.reason ??
+                                      choices.http01Note}
                                   </p>
                                 )}
                                 {covering.length === 0 &&
@@ -670,6 +688,42 @@ export function AddDomain() {
         </Wizard>
       </div>
     </PageContainer>
+  )
+}
+
+/**
+ * Who writes the DNS-01 TXT record: Temps through a DNS provider with a
+ * verified zone for the domain, or the operator by hand.
+ */
+export function Dns01Writer({
+  provider,
+  setupPath,
+}: {
+  provider: string | null
+  setupPath: string | null
+}) {
+  if (provider) {
+    return (
+      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+        <CheckCircle className="h-4 w-4" />
+        <span>Temps can write the TXT record through {provider}</span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-yellow-700 dark:text-yellow-600">
+      <Info className="h-4 w-4" />
+      <span>You add one TXT record by hand</span>
+      {setupPath && (
+        <Link
+          to={setupPath}
+          className="text-primary underline underline-offset-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Connect a DNS provider
+        </Link>
+      )}
+    </div>
   )
 }
 
