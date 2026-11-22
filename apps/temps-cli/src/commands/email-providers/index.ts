@@ -21,7 +21,7 @@ import type {
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
+import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import {
   newline, header, icons, json, colors, success, info, warning,
   keyValue, formatDate,
@@ -285,14 +285,15 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         info('Create credentials at: https://console.aws.amazon.com/iam/')
         newline()
 
-        const accessKeyId = await promptText({
+        // Keep what was already supplied (e.g. --secret-access-key-file) and
+        // prompt only for what is missing; the secret is typed masked.
+        const accessKeyId = options.accessKeyId ?? await promptText({
           message: 'AWS Access Key ID',
           required: true,
         })
 
-        const secretAccessKey = await promptText({
+        const secretAccessKey = options.secretAccessKey ?? await promptPassword({
           message: 'AWS Secret Access Key',
-          required: true,
         })
 
         sesCredentials = {
@@ -307,12 +308,11 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         info('Create credentials at: https://console.scaleway.com/iam/api-keys')
         newline()
 
-        const apiKey = await promptText({
+        const apiKey = options.apiKey ?? await promptPassword({
           message: 'Scaleway API Key',
-          required: true,
         })
 
-        const projectId = await promptText({
+        const projectId = options.projectId ?? await promptText({
           message: 'Scaleway Project ID',
           required: true,
         })

@@ -359,6 +359,8 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         }))
 
   let apiKey = options.apiKey
+  // Whether this command minted the key: only then may it be shown, once.
+  let mintedKey = false
   if (!apiKey) {
     const wantsNewKey = options.yes
       ? false
@@ -383,6 +385,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         return data
       })
       apiKey = created.api_key
+      mintedKey = true
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
@@ -437,8 +440,20 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     warning(
       `Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`,
     )
-    info(`  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`)
+    info(codexTokenExportLine(apiKey, mintedKey))
   }
+}
+
+/**
+ * The shell line that exports Codex's bearer token. A key this command just
+ * minted is shown, exactly once, because there is no other way to get it; a
+ * key the user supplied (e.g. with --api-key-file) or one reused from a saved
+ * context is never printed, so it cannot end up in captured output or CI logs.
+ */
+export function codexTokenExportLine(apiKey: string, minted: boolean): string {
+  return minted
+    ? `  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`
+    : `  export ${CODEX_TOKEN_ENV_VAR}='Bearer <your Temps API key>'`
 }
 
 async function removeAction(clientArg: string | undefined): Promise<void> {

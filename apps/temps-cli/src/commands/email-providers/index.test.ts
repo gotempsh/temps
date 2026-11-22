@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { test, expect, describe } from 'bun:test'
+import { test, expect, describe, spyOn } from 'bun:test'
 import { resolveEmailProviderCredentials } from './index.js'
 import { registerEmailProvidersCommands } from './index.js'
 import { runWithApi } from '../../lib/mock-api.js'
@@ -92,5 +92,33 @@ describe('email-providers create credential sources', () => {
     expect(run.error).toBeUndefined()
     const body = credentialBody(run, 'POST /email-providers') as { ses_credentials: { secret_access_key: unknown } }
     expect(body.ses_credentials.secret_access_key).toBe(CREDENTIAL_SENTINEL)
+  })
+})
+
+describe('email-providers create prompts only for what is missing', () => {
+  test('a --secret-access-key-file value is kept when --access-key-id is prompted for', async () => {
+    const prompts = await import('../../ui/prompts.js')
+    const asked: string[] = []
+    const text = spyOn(prompts, 'promptText').mockImplementation(async (options) => {
+      asked.push(options.message)
+      return 'AKIAEXAMPLE'
+    })
+    const password = spyOn(prompts, 'promptPassword').mockImplementation(async (options) => {
+      asked.push(options.message)
+      return 'typed-instead'
+    })
+    try {
+      const path = await credentialFile(CREDENTIAL_SENTINEL)
+      const run = await runWithApi(registerEmailProvidersCommands,
+        ['email-providers', 'create', '-n', 'ses', '-t', 'ses', '-r', 'us-east-1', '--secret-access-key-file', path],
+        { 'POST /email-providers': { id: 1, name: 'ses', provider_type: 'ses', region: 'us-east-1', is_active: true, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' } })
+      expect(run.error).toBeUndefined()
+      expect(asked).toEqual(['AWS Access Key ID'])
+      const body = credentialBody(run, 'POST /email-providers') as { ses_credentials: Record<string, unknown> }
+      expect(body.ses_credentials).toEqual({ access_key_id: 'AKIAEXAMPLE', secret_access_key: CREDENTIAL_SENTINEL })
+    } finally {
+      text.mockRestore()
+      password.mockRestore()
+    }
   })
 })
