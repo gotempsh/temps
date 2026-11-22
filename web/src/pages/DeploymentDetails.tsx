@@ -66,6 +66,7 @@ import {
   deploymentMenuHasActions,
 } from '@/lib/deployment-rollback'
 import {
+  canRedeploySameSource,
   deploymentRedeployPlan,
   resolveDeploymentSourceType,
 } from '@/lib/deployment-source-summary'
@@ -603,6 +604,7 @@ export function CancelledReason({
             )}
             {failure.suggested_fix && (
               <EntrypointCapabilityFix
+                key={deployment.id}
                 projectId={deployment.project_id}
                 fix={failure.suggested_fix}
                 settingsHref={containerSecurityHref(projectSlug)}
@@ -1282,10 +1284,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     environmentId: number
     imageRef?: string
     staticBundleId?: number
-  }) => {
+  }): Promise<boolean> => {
     if (!redeployPlan) {
       toast.error('This deployment is no longer available')
-      return
+      return false
     }
     switch (redeployPlan.kind) {
       case 'docker_image': {
@@ -1294,7 +1296,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           editedImageRef?.trim() || deployment?.metadata?.externalImageRef
         if (!ref) {
           toast.error('No image reference found for this deployment')
-          return
+          return false
         }
         await redeployImage.mutateAsync({
           path: { project_id: project.id, environment_id: environmentId },
@@ -1304,12 +1306,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
-        return
+        return true
       }
       case 'static_files':
         if (!staticBundleId || staticBundleId !== redeployPlan.staticBundleId) {
           toast.error('The stored static bundle is no longer available')
-          return
+          return false
         }
         await redeployStatic.mutateAsync({
           path: { project_id: project.id, environment_id: environmentId },
@@ -1319,14 +1321,14 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
-        return
+        return true
       case 'unsupported':
         toast.error(
           redeployPlan.sourceType === 'uploaded_source'
             ? 'Upload the source archive again to redeploy it'
             : 'This manual deployment has no reusable source artifact'
         )
-        return
+        return false
       case 'git':
         await createDeployment.mutateAsync({
           path: {
@@ -1340,6 +1342,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return true
     }
   }
 
@@ -1599,9 +1602,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           deployment={deployment}
           projectSlug={project.slug}
           onRedeploySameSource={
-            redeployPlan && redeployPlan.kind !== 'unsupported'
-              ? () =>
-                  handleRedeploy({
+            redeployPlan && canRedeploySameSource(deployment, redeployPlan)
+              ? async () => {
+                  const started = await handleRedeploy({
                     branch: deployment.branch || undefined,
                     commit: deployment.commit_hash || undefined,
                     tag: deployment.tag || undefined,
@@ -1611,6 +1614,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
                         ? redeployPlan.staticBundleId
                         : undefined,
                   })
+                  if (!started) {
+                    throw new Error(
+                      'The source of this deployment can no longer be redeployed'
+                    )
+                  }
+                }
               : undefined
           }
           onEditImage={
@@ -1767,7 +1776,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           project={project}
           isOpen={isRedeployModalOpen}
           onClose={() => setIsRedeployModalOpen(false)}
-          onConfirm={handleRedeploy}
+          onConfirm={async (reference) => {
+            await handleRedeploy(reference)
+          }}
           mode="redeploy"
           defaultBranch={deployment.branch || ''}
           defaultCommit={deployment.commit_hash || ''}

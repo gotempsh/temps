@@ -30,32 +30,49 @@ export const CONTAINER_SECURITY_SECTION_ID = 'container-security'
 
 const TITLE = 'Container security'
 const DESCRIPTION =
-  'Linux capabilities this service’s containers get back. Everything else stays dropped. Applies from the next deployment.'
+  'Linux capabilities this service’s deployment containers get back; Compose services and microVMs are not affected. Everything else stays dropped. Applies from the next deployment.'
 
+/**
+ * The project's container security section. Keyed by project, so a
+ * capability chosen and acknowledged for one project never carries over to
+ * the next one this stays mounted for.
+ */
 export function ContainerSecuritySettings({
   projectId,
 }: {
   projectId: number
 }) {
+  return <ProjectContainerSecurity key={projectId} projectId={projectId} />
+}
+
+function ProjectContainerSecurity({ projectId }: { projectId: number }) {
   const { query, save, handleSensitiveActionError, verificationDialog } =
     useContainerSecurity(projectId)
   const [pending, setPending] = useState<ContainerCapabilityOption | null>(null)
   const [acknowledged, setAcknowledged] = useState(false)
+  /** Why allowing `pending` failed, shown beside the confirmation's buttons. */
+  const [confirmError, setConfirmError] = useState<string | null>(null)
   const data = query.data
   const allowed = data?.allowed_capabilities ?? []
+
+  const closeConfirmation = () => {
+    setPending(null)
+    setAcknowledged(false)
+    setConfirmError(null)
+  }
 
   const change = (option: ContainerCapabilityOption, allow: boolean) => {
     if (!data) return
     const next = allow
       ? withCapabilities(allowed, [option.id])
       : allowed.filter((capability) => capability !== option.id)
+    setConfirmError(null)
     const run = () =>
       save.mutate(
         { allowed: next, expected: allowed, acknowledgeRisks: allow },
         {
           onSuccess: () => {
-            setPending(null)
-            setAcknowledged(false)
+            closeConfirmation()
             toast.success(
               allow
                 ? `${option.id} allowed. Redeploy to apply it.`
@@ -64,11 +81,14 @@ export function ContainerSecuritySettings({
           },
           onError: (error) => {
             if (handleSensitiveActionError(error, run)) return
-            setPending(null)
-            setAcknowledged(false)
-            toast.error('Could not save container security', {
-              description: problemDetail(error, 'Refresh and try again.'),
-            })
+            const detail = problemDetail(error, 'Try again.')
+            // Allowing keeps the confirmation, and its acknowledgement, open
+            // to retry; removing has no confirmation to keep.
+            if (allow) setConfirmError(detail)
+            else
+              toast.error('Could not save container security', {
+                description: detail,
+              })
           },
         }
       )
@@ -125,6 +145,7 @@ export function ContainerSecuritySettings({
                     onCheckedChange={(checked) => {
                       if (checked) {
                         setAcknowledged(false)
+                        setConfirmError(null)
                         setPending(option)
                       } else {
                         change(option, false)
@@ -150,10 +171,7 @@ export function ContainerSecuritySettings({
       <AlertDialog
         open={pending !== null}
         onOpenChange={(open) => {
-          if (!open && !save.isPending) {
-            setPending(null)
-            setAcknowledged(false)
-          }
+          if (!open && !save.isPending) closeConfirmation()
         }}
       >
         <AlertDialogContent>
@@ -184,6 +202,11 @@ export function ContainerSecuritySettings({
                 I understand this weakens this service’s container hardening.
               </label>
             </div>
+            {confirmError && (
+              <p className="text-sm text-destructive" role="alert">
+                Could not allow {pending?.id}: {confirmError}
+              </p>
+            )}
           </div>
           <AlertDialogFooter>
             <AlertDialogCancel disabled={save.isPending}>

@@ -62,7 +62,9 @@ export function useContainerSecurity(projectId: number) {
       })
       return data
     },
-    onSuccess: (data) => {
+    onSuccess: async (data) => {
+      // A read started before the save must not overwrite what it saved.
+      await queryClient.cancelQueries({ queryKey: options.queryKey })
       queryClient.setQueryData(options.queryKey, data)
     },
     onError: (error) => {

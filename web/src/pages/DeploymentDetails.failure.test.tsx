@@ -164,3 +164,67 @@ test('a deployment whose entrypoint needs a capability offers the one-click fix 
     })
   ).toBeTruthy()
 })
+
+test('the capability fix confirmation does not carry over to another deployment', async () => {
+  mockApi({
+    'GET /projects/1/container-security': () =>
+      jsonResponse({
+        allowed_capabilities: [],
+        options: [],
+        always_enforced: [],
+        can_edit: true,
+        edit_requirement: 'An instance administrator can change it.',
+      }),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { staleTime: Infinity, retry: false } },
+  })
+  const failedWithFix = (id: number) =>
+    ({
+      id,
+      project_id: 1,
+      environment_id: 2,
+      status: 'failed',
+      cancelled_reason:
+        'Container keeps restarting during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] (restarted 5 times)',
+      failure: {
+        code: 'entrypoint_needs_capability',
+        stage: 'runtime',
+        title: 'Entrypoint needs a Linux capability',
+        remediation: 'Allow it for this project or change the image.',
+        settings_section: 'container_security',
+        classifier_version: 9,
+        suggested_fix: {
+          required_capabilities: ['NET_BIND_SERVICE'],
+          verified: true,
+          allow_capabilities: ['NET_BIND_SERVICE'],
+          not_allowed_capabilities: [],
+          setting: 'allowed_capabilities',
+          setting_path: '/projects/1/container-security',
+          image_fix: 'Remove the file capabilities from the image.',
+        },
+      },
+    }) as unknown as DeploymentResponse
+  client.setQueryData(['lastSuccessfulDeployment', 1, 2, 5], null)
+  client.setQueryData(['lastSuccessfulDeployment', 1, 2, 6], null)
+  const view = (deployment: DeploymentResponse) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <CancelledReason
+          deployment={deployment}
+          projectSlug="app"
+          onRedeploySameSource={async () => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const name = 'Allow NET_BIND_SERVICE for this project and redeploy'
+  const screen = render(view(failedWithFix(5)))
+  fireEvent.click(await screen.findByRole('button', { name }))
+  fireEvent.click(await screen.findByRole('checkbox'))
+  expect(screen.getByRole('alertdialog')).toBeTruthy()
+
+  screen.rerender(view(failedWithFix(6)))
+  expect(screen.queryByRole('alertdialog')).toBeNull()
+  expect(await screen.findByRole('button', { name })).toBeTruthy()
+})

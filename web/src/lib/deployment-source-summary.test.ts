@@ -4,6 +4,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
 import {
+  canRedeploySameSource,
   deploymentRedeployPlan,
   deploymentSourceSummary,
   resolveDeploymentSourceType,
@@ -201,5 +202,43 @@ test('monitoring-only projects cannot be redeployed', () => {
   expect(deploymentRedeployPlan(deployment(), 'external')).toEqual({
     kind: 'unsupported',
     sourceType: 'external',
+  })
+})
+
+describe('canRedeploySameSource', () => {
+  test('a registry image, a Git revision and a stored bundle can be redeployed as they are', () => {
+    expect(
+      canRedeploySameSource(
+        deployment({
+          metadata: { externalImageRef: 'registry.example/app:1' },
+        }),
+        { kind: 'docker_image' }
+      )
+    ).toBe(true)
+    expect(canRedeploySameSource(deployment(), { kind: 'git' })).toBe(true)
+    expect(
+      canRedeploySameSource(deployment(), {
+        kind: 'static_files',
+        staticBundleId: 42,
+      })
+    ).toBe(true)
+  })
+
+  test('an uploaded image archive, a missing bundle and unsupported sources cannot', () => {
+    expect(
+      canRedeploySameSource(
+        deployment({ metadata: { uploadedImageId: 'uploaded-image-9' } }),
+        { kind: 'docker_image' }
+      )
+    ).toBe(false)
+    expect(canRedeploySameSource(deployment(), { kind: 'static_files' })).toBe(
+      false
+    )
+    expect(
+      canRedeploySameSource(deployment(), {
+        kind: 'unsupported',
+        sourceType: 'uploaded_source',
+      })
+    ).toBe(false)
   })
 })

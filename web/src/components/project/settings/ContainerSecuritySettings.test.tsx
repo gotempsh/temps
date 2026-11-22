@@ -39,21 +39,23 @@ function security(
   }
 }
 
-function renderSettings() {
-  return render(
-    <QueryClientProvider
-      client={
-        new QueryClient({
-          defaultOptions: {
-            queries: { retry: false },
-            mutations: { retry: false },
-          },
-        })
-      }
-    >
-      <ContainerSecuritySettings projectId={9} />
+function testClient() {
+  return new QueryClient({
+    defaultOptions: {
+      queries: { retry: false },
+      mutations: { retry: false },
+    },
+  })
+}
+
+function renderSettings(client = testClient(), projectId = 9) {
+  const view = (id: number) => (
+    <QueryClientProvider client={client}>
+      <ContainerSecuritySettings projectId={id} />
     </QueryClientProvider>
   )
+  const screen = render(view(projectId))
+  return { ...screen, showProject: (id: number) => screen.rerender(view(id)) }
 }
 
 test('shows the setting, its default and what is always enforced', async () => {
@@ -134,4 +136,98 @@ test('a caller who cannot change it sees who can, and a disabled control', async
     screen.getByText(/An instance administrator with projects:write/)
   ).toBeTruthy()
   expect(api.called('PUT', PATH)).toBe(false)
+})
+
+test('a failed allow keeps the confirmation and its acknowledgement to retry', async () => {
+  let attempts = 0
+  mockApi({
+    [`GET ${PATH}`]: () => jsonResponse(security()),
+    [`PUT ${PATH}`]: () => {
+      attempts += 1
+      return attempts === 1
+        ? jsonResponse(
+            { title: 'Unavailable', status: 503, detail: 'Database is busy' },
+            503
+          )
+        : jsonResponse(security({ allowed_capabilities: ['NET_BIND_SERVICE'] }))
+    },
+  })
+  const screen = renderSettings()
+  fireEvent.click(await screen.findByRole('switch', { name: LABEL }))
+  fireEvent.click(await screen.findByRole('checkbox'))
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Allow NET_BIND_SERVICE' })
+  )
+
+  expect((await screen.findByRole('alert')).textContent).toContain(
+    'Database is busy'
+  )
+  expect(screen.getByRole('alertdialog')).toBeTruthy()
+  expect(screen.getByRole('checkbox').getAttribute('aria-checked')).toBe('true')
+
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Allow NET_BIND_SERVICE' })
+  )
+  await waitFor(() => expect(screen.queryByRole('alertdialog')).toBeNull())
+  expect(attempts).toBe(2)
+  expect(
+    screen.getByRole('switch', { name: LABEL }).getAttribute('aria-checked')
+  ).toBe('true')
+})
+
+test('an acknowledgement given for one project does not carry over to the next', async () => {
+  mockApi({
+    [`GET ${PATH}`]: () => jsonResponse(security()),
+    'GET /projects/10/container-security': () => jsonResponse(security()),
+  })
+  const screen = renderSettings()
+  fireEvent.click(await screen.findByRole('switch', { name: LABEL }))
+  fireEvent.click(await screen.findByRole('checkbox'))
+  expect(screen.getByRole('alertdialog')).toBeTruthy()
+
+  screen.showProject(10)
+  expect(screen.queryByRole('alertdialog')).toBeNull()
+  fireEvent.click(await screen.findByRole('switch', { name: LABEL }))
+  expect(
+    (await screen.findByRole('checkbox')).getAttribute('aria-checked')
+  ).toBe('false')
+})
+
+test('a read that started before a save does not overwrite what was saved', async () => {
+  let resolveStaleRead: (response: Response) => void = () => {}
+  let reads = 0
+  mockApi({
+    [`GET ${PATH}`]: () => {
+      reads += 1
+      if (reads === 1) {
+        return jsonResponse(
+          security({ allowed_capabilities: ['NET_BIND_SERVICE'] })
+        )
+      }
+      return new Promise<Response>((resolve) => {
+        resolveStaleRead = resolve
+      })
+    },
+    [`PUT ${PATH}`]: () => jsonResponse(security()),
+  })
+  const client = testClient()
+  const screen = renderSettings(client)
+  const toggle = await screen.findByRole('switch', { name: LABEL })
+  expect(toggle.getAttribute('aria-checked')).toBe('true')
+
+  void client.refetchQueries()
+  await waitFor(() => expect(reads).toBe(2))
+  fireEvent.click(toggle)
+  await waitFor(() =>
+    expect(
+      screen.getByRole('switch', { name: LABEL }).getAttribute('aria-checked')
+    ).toBe('false')
+  )
+  resolveStaleRead(
+    jsonResponse(security({ allowed_capabilities: ['NET_BIND_SERVICE'] }))
+  )
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  expect(
+    screen.getByRole('switch', { name: LABEL }).getAttribute('aria-checked')
+  ).toBe('false')
 })
