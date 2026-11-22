@@ -536,6 +536,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "the temps_watch tool binds watch access to the current chat; the assistant cannot select a different conversation through the API",
+        &["list_chat_plugin_watches", "change_chat_plugin_watch"],
+    ),
+    (
         "the assistant's own chat machinery; it must not drive or approve itself",
         &[
             "accept_blueprint_version",

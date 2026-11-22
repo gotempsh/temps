@@ -295,6 +295,14 @@ impl TempsClient {
         .await
     }
 
+    /// Publish an outbox record. Retry the same event id until acknowledged.
+    pub async fn publish_watch_event(
+        &self,
+        event: PublishWatchEvent,
+    ) -> Result<WatchEventAck, PluginSdkError> {
+        self.call(event).await
+    }
+
     /// Discover this durable plugin actor's currently effective host grants.
     pub async fn host_capabilities(&self) -> Result<HostCapabilities, PluginSdkError> {
         self.call(GetHostCapabilities {}).await

@@ -45,7 +45,7 @@ tokio-tungstenite = "0.30"
 tower = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono", "uuid"] }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]

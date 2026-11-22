@@ -15,6 +15,7 @@
 pub mod channel;
 pub mod headers;
 pub mod manifest;
+pub mod watch;
 #[cfg(test)]
 mod wire_format_tests;
 

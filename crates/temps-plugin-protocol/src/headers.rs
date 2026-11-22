@@ -57,3 +57,9 @@ pub const AUTH_SIGNATURE: &str = "x-temps-auth-signature";
 /// declared an API capability. See the `actor` module of
 /// `temps-external-plugins`.
 pub const ACTOR_TOKEN: &str = "x-temps-actor-token";
+
+/// Originating conversation for a Chat tool invocation. Asserted only by the host.
+pub const CHAT_ID: &str = "x-temps-chat-id";
+
+/// UTF-8 sender display name on confirmed chat writes. The host strips client-supplied copies.
+pub const AGENT_NAME: &str = "x-temps-agent-name";

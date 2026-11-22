@@ -37,3 +37,5 @@ pub use plugin::ExternalPluginsPlugin;
 pub use service::ExternalPluginsService;
 
 pub mod ai_tools;
+
+mod watches;

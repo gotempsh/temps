@@ -170,6 +170,7 @@ impl Fixture {
                 opts.turn_id,
                 false,
                 opts.draft,
+                None,
             )
             .await
     }
@@ -2258,6 +2259,64 @@ async fn the_tool_router_shares_its_repeat_guard_across_paths() {
     assert_eq!(tool_calls.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn watch_list_reads_changes_made_in_the_same_turn() {
+    let router = stage_router(Arc::new(StubProvider {
+        tool_calls: Default::default(),
+    }));
+    let watches = crate::watches::WatchTools::default();
+    let stored = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let list = stored.clone();
+    watches.connect(
+        axum::Router::new().route(
+            "/api/ai/conversations/test-chat/plugin-watches",
+            axum::routing::get(move || async move {
+                if list.load(Ordering::SeqCst) {
+                    "one watch"
+                } else {
+                    "no watches"
+                }
+            })
+            .post(
+                move |axum::Json(body): axum::Json<serde_json::Value>| async move {
+                    stored.store(true, Ordering::SeqCst);
+                    axum::Json(body)
+                },
+            ),
+        ),
+    );
+    router.state.lock().await.watches = Some(crate::watches::ConversationWatches {
+        tools: watches,
+        chat: "test-chat".into(),
+        metadata: crate::service::tests::test_request_metadata(),
+    });
+    let list = tool_call("list", crate::watches::TOOL, r#"{"action":"list"}"#);
+    let create = tool_call("create", crate::watches::TOOL, r#"{"action":"create"}"#);
+    assert_eq!(
+        router.clone().dispatch(&list, &test_auth()).await,
+        "no watches"
+    );
+    let result = router.clone().dispatch(&create, &test_auth()).await;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+        serde_json::json!({"action":"create","mode":"wake"})
+    );
+    for arguments in [
+        r#"{"action":"create","mode":"notify"}"#,
+        r#"{"action":"create","mode":"wake"}"#,
+        r#"{"action":"create","mode":null}"#,
+        r#"{"action":"pause","id":"sample"}"#,
+    ] {
+        let call = tool_call("explicit", crate::watches::TOOL, arguments);
+        let result = router.clone().dispatch(&call, &test_auth()).await;
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&result).unwrap(),
+            serde_json::from_str::<serde_json::Value>(arguments).unwrap()
+        );
+    }
+    assert_eq!(router.dispatch(&list, &test_auth()).await, "one watch");
+}
+
 const PROCESS_START_ARGUMENTS: &str = r#"{"name":"web","program":"node"}"#;
 
 fn process_executor(
@@ -3711,6 +3770,7 @@ fn stage_inputs() -> (TurnInputs, EventReceiver) {
         pending: None,
         audit: None,
         goals: None,
+        watches: None,
         secrets: None,
         sandbox: None,
         blueprints: None,

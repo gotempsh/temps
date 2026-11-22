@@ -10403,3 +10403,69 @@ async fn test_image_user_columns_on_deployments_up_and_down() -> anyhow::Result<
     assert!(deployments_column(&db, "runs_as_root").await?.is_some());
     Ok(())
 }
+
+#[tokio::test]
+async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyhow::Result<()> {
+    use sea_orm::{DatabaseBackend, Statement};
+    let container = start_pg_container!("watch delivery recovery");
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20261121_130001_plugin_watch_delivery_recovery";
+    let before = Migrator::migrations()
+        .iter()
+        .position(|m| m.name() == target)
+        .expect("registered migration");
+    Migrator::up(&db, Some(before as u32)).await?;
+    db.execute_unprepared(
+        r#"
+        INSERT INTO external_plugin_actors(id,plugin_name,binary_sha256,source_identity,active)
+        VALUES('176aa5c4-24ca-474d-a983-a43031e46794','reports','digest','file',true);
+        INSERT INTO plugin_watch_events(actor_id,event_id,source,subject,attributes)
+        VALUES('176aa5c4-24ca-474d-a983-a43031e46794','replay','','','{}');
+    "#,
+    )
+    .await?;
+    for _ in 0..2 {
+        Migrator::up(&db, None).await?;
+        assert!(column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
+        let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
+            "SELECT received_at IS NOT NULL AS retained FROM plugin_watch_events WHERE event_id='replay'")).await?.expect("existing receipt");
+        assert!(row.try_get::<bool>("", "retained")?);
+        Migrator::down(&db, Some(steps_back_to(target))).await?;
+        assert!(!column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
+    }
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(r#"
+        INSERT INTO users(id,name,email) VALUES(9911,'Owner','owner@example.test');
+        INSERT INTO sessions(id,user_id,session_token,expires_at,mfa_pending) VALUES(9911,9911,'test-session',now()+interval '1 day',false);
+        INSERT INTO ai_conversations(id,public_id,context_type,context_id,created_by) VALUES(9911,'test-chat','assistant','assistant',9911);
+        INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id)
+        SELECT 9911,id,'digest','changed','1','{}','wake',9911 FROM external_plugin_actors WHERE plugin_name='reports';
+        INSERT INTO ai_messages(id,conversation_id,role,content) VALUES(9911,9911,'user','Resource changed');
+        INSERT INTO plugin_watch_deliveries(watch_id,event_id,wake_message_id)
+        SELECT id,'prepared',9911 FROM plugin_chat_watches WHERE conversation_id=9911;
+    "#).await?;
+    let error = Migrator::down(&db, Some(steps_back_to(target)))
+        .await
+        .expect_err("prepared wake must survive rollback");
+    assert!(error
+        .to_string()
+        .contains("pending wake has a prepared message"));
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT wake_message_id FROM plugin_watch_deliveries WHERE event_id='prepared'",
+        ))
+        .await?
+        .expect("prepared delivery");
+    assert_eq!(row.try_get::<i64>("", "wake_message_id")?, 9911);
+    db.execute_unprepared(
+        "UPDATE plugin_watch_deliveries SET status='skipped' WHERE event_id='prepared'",
+    )
+    .await?;
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
+    Ok(())
+}

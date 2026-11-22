@@ -36,6 +36,7 @@ pub(super) struct TurnInputs {
     pub(super) pending: Option<Arc<PendingActionService>>,
     pub(super) audit: Option<Arc<dyn AuditLogger>>,
     pub(super) goals: Option<crate::goals::GoalToolSupport>,
+    pub(super) watches: Option<crate::watches::ConversationWatches>,
     pub(super) secrets: Option<crate::secret_slots::SecretToolSupport>,
     pub(super) sandbox: Option<crate::sandbox_link::SandboxLinkService>,
     pub(super) blueprints: Option<crate::workspace_chats::BlueprintToolSupport>,
@@ -101,6 +102,7 @@ impl ToolLoop {
         );
         let state = Arc::new(tokio::sync::Mutex::new(ToolExecutionState {
             goals: inputs.goals,
+            watches: inputs.watches,
             secrets: inputs.secrets,
             sandbox: inputs.sandbox,
             blueprints: inputs.blueprints,

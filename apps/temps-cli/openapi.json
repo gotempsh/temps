@@ -7484,6 +7484,24 @@
         ],
         "type": "object"
       },
+      "Attribute": {
+        "additionalProperties": false,
+        "properties": {
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "$ref": "#/components/schemas/ScalarType"
+          }
+        },
+        "required": [
+          "type"
+        ],
+        "type": "object"
+      },
       "AttributeKeysResponse": {
         "properties": {
           "keys": {
@@ -7553,6 +7571,35 @@
             "type": "string"
           }
         ]
+      },
+      "AttributesSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "properties": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Attribute"
+            },
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "required": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "type": {
+            "$ref": "#/components/schemas/ObjectType"
+          }
+        },
+        "required": [
+          "type",
+          "properties",
+          "required"
+        ],
+        "type": "object"
       },
       "Audience": {
         "description": "Who an address is for.",
@@ -11568,6 +11615,61 @@
           "mode",
           "source",
           "default_mode"
+        ],
+        "type": "object"
+      },
+      "ChatWatch": {
+        "properties": {
+          "blocked": {
+            "type": "boolean"
+          },
+          "delivered": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_delivery": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mode": {
+            "type": "string"
+          },
+          "paused": {
+            "type": "boolean"
+          },
+          "plugin": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "string"
+          },
+          "where": {}
+        },
+        "required": [
+          "where",
+          "id",
+          "plugin",
+          "source",
+          "subject",
+          "mode",
+          "paused",
+          "delivered",
+          "blocked"
         ],
         "type": "object"
       },
@@ -52964,6 +53066,12 @@
         ],
         "type": "object"
       },
+      "ObjectType": {
+        "enum": [
+          "object"
+        ],
+        "type": "string"
+      },
       "ObservabilityCompressionSettings": {
         "description": "TimescaleDB compression policy configuration for append-only observability\ntables. Values are expressed in hours so operators can choose sub-day\nwindows while keeping the API representation unambiguous.",
         "properties": {
@@ -63725,6 +63833,33 @@
         ],
         "type": "object"
       },
+      "PublishedEvent": {
+        "additionalProperties": false,
+        "properties": {
+          "attributes_schema": {
+            "$ref": "#/components/schemas/AttributesSchema"
+          },
+          "filterable": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "title": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "title",
+          "attributes_schema",
+          "filterable"
+        ],
+        "type": "object"
+      },
       "PullRequestResponse": {
         "properties": {
           "base_branch": {
@@ -70994,6 +71129,14 @@
           "time_ranges"
         ],
         "type": "object"
+      },
+      "ScalarType": {
+        "enum": [
+          "string",
+          "integer",
+          "boolean"
+        ],
+        "type": "string"
       },
       "ScalewayCredentialsRequest": {
         "properties": {
@@ -91228,6 +91371,156 @@
         ],
         "type": "string"
       },
+      "WatchChange": {
+        "oneOf": [
+          {
+            "properties": {
+              "action": {
+                "enum": [
+                  "create"
+                ],
+                "type": "string"
+              },
+              "digest": {
+                "type": "string"
+              },
+              "mode": {
+                "$ref": "#/components/schemas/WatchMode"
+              },
+              "plugin": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "subject": {
+                "type": "string"
+              },
+              "where": {}
+            },
+            "required": [
+              "plugin",
+              "source",
+              "mode",
+              "digest",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "action": {
+                "enum": [
+                  "pause"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "action": {
+                "enum": [
+                  "resume"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "action"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "action": {
+                "enum": [
+                  "remove"
+                ],
+                "type": "string"
+              },
+              "id": {
+                "format": "uuid",
+                "type": "string"
+              }
+            },
+            "required": [
+              "id",
+              "action"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WatchMode": {
+        "enum": [
+          "notify",
+          "wake"
+        ],
+        "type": "string"
+      },
+      "WatchPanel": {
+        "properties": {
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/WatchSource"
+            },
+            "type": "array"
+          },
+          "watches": {
+            "items": {
+              "$ref": "#/components/schemas/ChatWatch"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "sources",
+          "watches"
+        ],
+        "type": "object"
+      },
+      "WatchSource": {
+        "properties": {
+          "declaration": {
+            "$ref": "#/components/schemas/PublishedEvent"
+          },
+          "digest": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "plugin": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "declaration",
+          "plugin",
+          "id",
+          "label",
+          "digest"
+        ],
+        "type": "object"
+      },
       "WayInChoice": {
         "description": "One way in a plan would offer, without its steps and fields.",
         "properties": {
@@ -99480,6 +99773,127 @@
           "AI Chat"
         ],
         "x-maturity": "beta"
+      }
+    },
+    "/ai/conversations/{chat}/plugin-watches": {
+      "get": {
+        "operationId": "list_chat_plugin_watches",
+        "parameters": [
+          {
+            "description": "Conversation ID",
+            "in": "path",
+            "name": "chat",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WatchPanel"
+                }
+              }
+            },
+            "description": "Watches and event sources for the conversation"
+          },
+          "400": {
+            "description": "Invalid conversation ID"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Caller cannot access watches in this conversation"
+          },
+          "404": {
+            "description": "Conversation or watch resource not found"
+          },
+          "500": {
+            "description": "Could not access watch storage"
+          },
+          "503": {
+            "description": "Watch service unavailable"
+          },
+          "504": {
+            "description": "Conversation access check timed out"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
+      },
+      "post": {
+        "operationId": "change_chat_plugin_watch",
+        "parameters": [
+          {
+            "description": "Conversation ID",
+            "in": "path",
+            "name": "chat",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WatchChange"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Watch changed"
+          },
+          "400": {
+            "description": "Invalid watch request"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Caller cannot access watches in this conversation"
+          },
+          "404": {
+            "description": "Conversation or watch resource not found"
+          },
+          "409": {
+            "description": "Watch configuration conflict"
+          },
+          "500": {
+            "description": "Could not access watch storage"
+          },
+          "502": {
+            "description": "Invalid plugin access response"
+          },
+          "503": {
+            "description": "Watch service or plugin unavailable"
+          },
+          "504": {
+            "description": "Access check timed out"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "External Plugins"
+        ]
       }
     },
     "/ai/conversations/{public_id}": {

@@ -9,6 +9,8 @@ macro_rules! mcp_request {
 }
 use super::*;
 
+mod watch_preparation;
+
 #[test]
 fn durable_failure_metadata_is_safe_preserved_and_clearable() {
     let existing = serde_json::json!({ "application_id": 42 });
@@ -326,6 +328,7 @@ async fn startup_missing_session_reacquires_once_before_answering() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let mut stream = stream;
@@ -389,6 +392,7 @@ async fn streamed_missing_session_discards_stale_metadata_before_retry() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let output = drain(stream).await;
@@ -437,6 +441,7 @@ async fn absent_durable_session_resets_stale_retained_runtime_on_first_round() {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -1768,6 +1773,7 @@ async fn authorization_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1864,6 +1870,7 @@ async fn project_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1953,6 +1960,7 @@ async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -2072,6 +2080,7 @@ async fn newly_linked_project_is_authorized_during_an_active_native_provider_str
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -2340,6 +2349,7 @@ fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> Conversati
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -2798,6 +2808,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -2832,6 +2843,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
             Vec::new(),
             None,
             true,
+            None,
             None,
         )
         .await;
@@ -3028,6 +3040,7 @@ async fn native_tool_provider_error_is_not_reported_as_round_backstop_exhaustion
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -3719,6 +3732,7 @@ pub(super) fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationSe
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -3838,6 +3852,7 @@ fn db_service_with_ai(db: DatabaseConnection, ai: Arc<dyn AiService>) -> Convers
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -4146,6 +4161,7 @@ async fn cancelled_claim_never_starts_provider_execution_after_registration() {
             Vec::new(),
             Some("turn-cancelled-during-setup".to_string()),
             false,
+            None,
             None,
         )
         .await;
@@ -4557,6 +4573,7 @@ async fn two_users_get_separate_conversations_for_the_same_context() {
         providers,
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -6962,10 +6979,16 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     let observed = calls.clone();
     let router = axum::Router::new().route(
         "/x/reports/create",
-        axum::routing::post(move || {
-            observed.fetch_add(1, Ordering::SeqCst);
-            async { axum::Json(serde_json::json!({"created":true})) }
-        }),
+        axum::routing::post(
+            move |axum::Extension(origin): axum::Extension<
+                temps_core::ai_tool_call::AiToolOrigin,
+            >| {
+                assert_eq!(origin.agent_name.as_deref(), Some("Report editor"));
+                assert_eq!(origin.chat_id, Some(1));
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({"created":true})) }
+            },
+        ),
     );
     let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
     let registry = Arc::new(PluginToolsRegistry::default());
@@ -7018,7 +7041,13 @@ async fn plugin_write_waits_for_approval_then_executes_and_audits() {
     executed.status = "executed".into();
     executed.result = Some(serde_json::json!({"created":true}));
     let db = MockDatabase::new(DatabaseBackend::Postgres)
-        .append_query_results([vec![row.clone()], vec![row], vec![executed]])
+        .append_query_results([vec![row.clone()], vec![row]])
+        .append_query_results(
+            [[std::collections::BTreeMap::<String, sea_orm::Value>::from(
+                [("title".into(), "Report editor".into())],
+            )]],
+        )
+        .append_query_results([vec![executed]])
         .append_exec_results([sea_orm::MockExecResult {
             last_insert_id: 0,
             rows_affected: 1,

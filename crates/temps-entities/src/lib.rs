@@ -366,6 +366,9 @@ pub mod access_vault_links;
 pub mod access_vault_service_history;
 pub mod access_vaults;
 pub mod external_plugin_actors;
+pub mod plugin_chat_watches;
+pub mod plugin_watch_deliveries;
+pub mod plugin_watch_events;
 
 pub mod workflow_grants;
 

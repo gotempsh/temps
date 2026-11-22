@@ -50,6 +50,8 @@ fn scope(auth: &AuthContext, metadata: &temps_core::RequestMetadata) -> ApiCallS
         auth: auth.clone(),
         project_scope: ProjectSelectorScope::Unrestricted,
         origin: Some(temps_core::ai_tool_call::AiToolOrigin {
+            chat_id: None,
+            agent_name: None,
             ip_address: metadata.ip_address.clone(),
             user_agent: metadata.user_agent.clone(),
         }),

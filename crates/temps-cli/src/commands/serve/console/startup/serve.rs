@@ -119,6 +119,17 @@ pub(super) async fn serve(
             .get_service::<temps_auth::UserService>()
         {
             Some(user_service) => {
+                if let Some(watches) = plugin_manager
+                    .service_context()
+                    .get_service::<temps_ai_chat::watches::WatchTools>()
+                {
+                    watches.connect(plugin_api_router.clone());
+                }
+                service.start_watch_delivery(
+                    plugin_api_router.clone(),
+                    user_service.clone(),
+                    cookie_crypto.clone(),
+                );
                 let bridge = Arc::new(temps_external_plugins::host_api::RouterHostApi::new(
                     plugin_api_router,
                     db.clone(),

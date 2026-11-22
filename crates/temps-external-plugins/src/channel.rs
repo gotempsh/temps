@@ -71,6 +71,8 @@ impl PluginChannel {
         host_api: Arc<HostApiSlot>,
         capabilities: Vec<PluginCapability>,
         host_permissions: Vec<PluginHostPermission>,
+        declared_events: Vec<temps_plugin_protocol::watch::PublishedEvent>,
+        watch_ready: Arc<tokio::sync::Notify>,
         binary_sha256: String,
         source_identity: String,
         defer_actor_commit: bool,
@@ -260,8 +262,11 @@ impl PluginChannel {
                             &host_api,
                             &capabilities,
                             &host_permissions,
+                            &declared_events,
+                            &watch_ready,
                             &grant_service,
                             &bound_actor_id,
+                            &binary_sha256,
                             &ai_service,
                             &audit_service,
                             &req,
@@ -401,8 +406,11 @@ async fn dispatch_request(
     host_api: &HostApiSlot,
     capabilities: &[PluginCapability],
     host_permissions: &[PluginHostPermission],
+    declared_events: &[temps_plugin_protocol::watch::PublishedEvent],
+    watch_ready: &tokio::sync::Notify,
     grants: &PluginGrantService,
     bound_actor_id: &str,
+    digest: &str,
     ai_service: &tokio::sync::RwLock<Option<Arc<dyn temps_ai::AiService>>>,
     audit_service: &tokio::sync::RwLock<Option<Arc<dyn temps_core::AuditLogger>>>,
     req: &ChannelRequest,
@@ -421,7 +429,7 @@ async fn dispatch_request(
                 req.id,
                 ChannelErrorCode::PermissionDenied,
                 format!("Plugin actor authorization failed: {error}"),
-            )
+            );
         }
     };
     if current.actor.id != bound_actor_id {
@@ -450,7 +458,9 @@ async fn dispatch_request(
             PluginHostPermission::ApiRead
         }),
         PlatformCallRequest::GenerateAi(_) => Some(PluginHostPermission::AiGenerate),
-        PlatformCallRequest::GetHostCapabilities(_) => None,
+        PlatformCallRequest::GetHostCapabilities(_) | PlatformCallRequest::PublishWatchEvent(_) => {
+            None
+        }
     };
     let allowed = required_permission.is_none_or(effective);
     let Some(auditor) = audit_service.read().await.clone() else {
@@ -547,6 +557,24 @@ async fn dispatch_request(
                 handle_api_call(plugin_name, host_api, capabilities, call.clone()).await
             } else {
                 denied(permission)
+            }
+        }
+        PlatformCallRequest::PublishWatchEvent(event) => {
+            let valid = declared_events.iter().any(|decl| {
+                decl.event_type == event.source
+                    && decl.is_valid()
+                    && decl.subject(&event.attributes, false).as_deref()
+                        == Some(event.subject.as_str())
+            });
+            if valid {
+                crate::watches::publish(watch_ready, db, plugin_name, bound_actor_id, digest, event)
+                    .await
+                    .map(PlatformCallResponse::PublishWatchEvent)
+            } else {
+                Err(ChannelError::new(
+                    ChannelErrorCode::InvalidParams,
+                    "Undeclared event, invalid attributes or incorrect watch subject",
+                ))
             }
         }
         PlatformCallRequest::GetHostCapabilities(_) => {

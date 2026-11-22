@@ -5,6 +5,7 @@
 
 mod ai_tools;
 mod local_file;
+mod watches;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
 
 use std::sync::Arc;
@@ -1690,6 +1691,10 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             get(get_repository_install_progress),
         )
         .route("/x/plugins/{name}/update", post(update_repository))
+        .route(
+            "/ai/conversations/{chat}/plugin-watches",
+            get(watches::list_chat_plugin_watches).post(watches::change_chat_plugin_watch),
+        )
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
         .route(
@@ -1717,6 +1722,8 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         update_repository,
         uninstall_plugin,
         get_plugin_status,
+        watches::list_chat_plugin_watches,
+        watches::change_chat_plugin_watch,
         ai_tools::get_plugin_ai_tools,
         ai_tools::put_plugin_ai_tools,
         get_plugin_grants,
@@ -1725,6 +1732,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
     components(
         schemas(
             PluginManifest,
+            crate::watches::WatchSource, crate::watches::WatchPanel, crate::watches::WatchChange, crate::watches::WatchMode, crate::watches::ChatWatch,
             InstallationReportingSettings,
             NavEntry,
             NavSection,
@@ -2961,6 +2969,51 @@ mod tests {
             ai_tools_enabled: enabled,
             created_at: Utc::now(),
             updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_watch_routes_require_a_caller_and_reject_cross_chat_agent_requests() {
+        use tower::ServiceExt;
+        for method in ["GET", "POST"] {
+            for authenticated in [false, true] {
+                let mut router = configure_routes()
+                    .with_state(test_state())
+                    .layer(Extension(metadata().0));
+                if authenticated {
+                    router = router
+                        .layer(Extension(user_auth(Role::Admin).0))
+                        .layer(Extension(temps_core::ai_tool_call::AiToolCall))
+                        .layer(Extension(temps_core::ai_tool_call::ChatWatchScope(
+                            "another-chat".into(),
+                        )));
+                }
+                let response = router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/ai/conversations/target/plugin-watches")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"action":"pause","id":"a1ab6f89-4446-43a0-93b5-eb48f8047a35"}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if authenticated {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+            }
         }
     }
 

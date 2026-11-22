@@ -55,6 +55,7 @@ pub struct ExternalPluginsService {
     install_progress: Arc<InstallProgressStore>,
     /// Set before shutdown waits for the lifecycle lock so queued mutations
     /// cannot start after shutdown was requested.
+    pub(crate) watch_host: std::sync::OnceLock<crate::watches::WatchHost>,
     pub(crate) closing: Arc<AtomicBool>,
     /// Compiles plugins on a worker node when this process has no Docker.
     remote_builder: Option<Arc<dyn temps_core::plugin_builder::RemotePluginBuilder>>,
@@ -639,6 +640,7 @@ impl ExternalPluginsService {
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
+            watch_host: Default::default(),
             closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
@@ -743,6 +745,7 @@ impl ExternalPluginsService {
             registry_state: tokio::sync::Mutex::new(()),
             source_catalog: crate::source_catalog::SourceCatalog::default(),
             install_progress: Arc::new(InstallProgressStore::default()),
+            watch_host: Default::default(),
             closing: Arc::new(AtomicBool::new(false)),
             remote_builder: None,
             ai_tools: Arc::new(temps_ai_api_tools::PluginToolsRegistry::default()),
@@ -1137,6 +1140,7 @@ impl ExternalPluginsService {
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         self.closing.store(true, Ordering::Release);
+        self.manager.watch_ready.notify_one();
         self.ai_recovery.cancel();
         self.ai_tools
             .publish(temps_ai_api_tools::PluginToolsIndex::default());
@@ -1623,8 +1627,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod watch_pool;
+
+    #[cfg(unix)]
     fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
-        let manifest = PluginManifest::builder(name, version).build();
+        protocol_fixture_manifest(PluginManifest::builder(name, version).build())
+    }
+
+    #[cfg(unix)]
+    fn protocol_fixture_manifest(manifest: PluginManifest) -> Vec<u8> {
         let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
             temps_plugin_protocol::PluginHello {
                 protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,

@@ -321,6 +321,7 @@ pub(super) fn missing_backtest(
 pub(super) struct ToolExecutionState {
     pub(super) api_tools_revision: (Option<String>, Option<String>),
     pub(super) goals: Option<crate::goals::GoalToolSupport>,
+    pub(super) watches: Option<crate::watches::ConversationWatches>,
     pub(super) secrets: Option<crate::secret_slots::SecretToolSupport>,
     /// Present for assistant chats on a server with a sandbox backend.
     pub(super) sandbox: Option<crate::sandbox_link::SandboxLinkService>,
@@ -472,7 +473,9 @@ pub(super) async fn dispatch_conversation_tool(
     // Shell commands and file reads legitimately repeat (`git status`, a
     // `curl` against the server just started) because the sandbox changes
     // between calls, so the repeat guard does not apply to them.
-    let repeatable = crate::sandbox_link::is_sandbox_tool(&call.name);
+    // A watch can be created, paused, resumed or removed between identical calls.
+    let repeatable =
+        crate::sandbox_link::is_sandbox_tool(&call.name) || call.name == crate::watches::TOOL;
     if let Some(previous) = state.seen_calls.get(&call_key).filter(|_| !repeatable) {
         return format!(
             "You already ran `{}` with these exact arguments earlier this turn. \
@@ -532,6 +535,11 @@ pub(super) async fn dispatch_conversation_tool(
             None => {
                 "Workspaces and architecture blueprints are not available in this chat.".to_string()
             }
+        }
+    } else if call.name == crate::watches::TOOL {
+        match &state.watches {
+            Some(watches) => watches.dispatch(auth, &call.arguments).await,
+            None => "Event watches are unavailable in this chat.".into(),
         }
     } else if call.name == TEMPS_GOAL_TOOL_NAME {
         match &state.goals {
@@ -1249,6 +1257,8 @@ pub(super) fn pending_action_tool_result(
 /// the `unknown` of an in-process request.
 fn approver_origin(resolution: &PermissionResolution) -> temps_core::ai_tool_call::AiToolOrigin {
     temps_core::ai_tool_call::AiToolOrigin {
+        chat_id: None,
+        agent_name: None,
         ip_address: resolution.metadata.ip_address.clone(),
         user_agent: resolution.metadata.user_agent.clone(),
     }

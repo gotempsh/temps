@@ -361,6 +361,7 @@ async fn forward_to_unix_socket(
     let (mut parts, body) = original_request.into_parts();
 
     inject_temps_headers(&mut parts.headers, proxy, auth);
+    inject_chat_origin(&mut parts.headers, &parts.extensions, auth);
     if let Some(guard) = parts
         .extensions
         .get::<temps_ai_api_tools::PluginDispatchGuard>()
@@ -421,6 +422,29 @@ fn actor_principal(auth: &AuthContext) -> Option<ActorPrincipal> {
         }
         | AuthSource::CliToken { .. }
         | AuthSource::DeploymentToken { .. } => None,
+    }
+}
+
+fn inject_chat_origin(
+    headers: &mut hyper::HeaderMap,
+    extensions: &hyper::http::Extensions,
+    auth: Option<&AuthContext>,
+) {
+    use temps_core::ai_tool_call::{AiToolOrigin, ConfirmedAiWrite};
+    let Some(origin) = extensions.get::<AiToolOrigin>() else {
+        return;
+    };
+    if let Some(chat_id) = origin.chat_id {
+        headers.insert(headers::CHAT_ID, chat_id.into());
+        if auth.is_some() && extensions.get::<ConfirmedAiWrite>().is_some() {
+            if let Some(name) = origin
+                .agent_name
+                .as_deref()
+                .and_then(|s| hyper::header::HeaderValue::from_bytes(s.as_bytes()).ok())
+            {
+                headers.insert(headers::AGENT_NAME, name);
+            }
+        }
     }
 }
 
@@ -717,6 +741,34 @@ mod tests {
         let mut headers = hyper::HeaderMap::new();
         inject_temps_headers(&mut headers, &proxy, Some(&auth));
         assert!(header(&headers, headers::ACTOR_TOKEN).is_none());
+    }
+
+    #[test]
+    fn confirmed_chat_write_forwards_only_host_asserted_sender_identity() {
+        use temps_core::ai_tool_call::{AiToolOrigin, ConfirmedAiWrite};
+        let auth = AuthContext::new_session(test_user(42, "operator@example.test"), Role::Admin);
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(headers::CHAT_ID, "forged".parse().unwrap());
+        headers.insert(headers::AGENT_NAME, "forged".parse().unwrap());
+        inject_temps_headers(&mut headers, &test_proxy(), Some(&auth));
+        let mut extensions = hyper::http::Extensions::new();
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert!(!headers.contains_key(headers::CHAT_ID));
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        extensions.insert(AiToolOrigin {
+            chat_id: Some(15),
+            agent_name: Some("Équipe".into()),
+            ip_address: String::new(),
+            user_agent: String::new(),
+        });
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert_eq!(headers[headers::CHAT_ID], "15");
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        extensions.insert(ConfirmedAiWrite);
+        inject_chat_origin(&mut headers, &extensions, None);
+        assert!(!headers.contains_key(headers::AGENT_NAME));
+        inject_chat_origin(&mut headers, &extensions, Some(&auth));
+        assert_eq!(headers[headers::AGENT_NAME].as_bytes(), "Équipe".as_bytes());
     }
 
     #[test]

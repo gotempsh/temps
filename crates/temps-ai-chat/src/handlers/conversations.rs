@@ -562,6 +562,8 @@ pub async fn create_global_conversation(
 /// of what the assistant did names who approved it and from where.
 pub(super) fn request_origin(metadata: &RequestMetadata) -> temps_core::ai_tool_call::AiToolOrigin {
     temps_core::ai_tool_call::AiToolOrigin {
+        chat_id: None,
+        agent_name: None,
         ip_address: metadata.ip_address.clone(),
         user_agent: metadata.user_agent.clone(),
     }

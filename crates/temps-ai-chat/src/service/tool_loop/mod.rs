@@ -252,6 +252,7 @@ impl ConversationService {
             None,
             false,
             None,
+            None,
         )
         .await
     }
@@ -273,6 +274,7 @@ impl ConversationService {
         active_turn_id: Option<String>,
         should_capture_session_title: bool,
         draft_message_id: Option<i64>,
+        watch_delivery: Option<String>,
     ) -> Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>> {
         let time_limit = self.turn_time_limit().await;
         let harness_internal_api_url = match harness_workspace {
@@ -357,6 +359,14 @@ impl ConversationService {
             repo_tools: self.providers.get("__repo_tools__").cloned(),
             pending: self.write_support.as_ref().map(|ws| ws.pending.clone()),
             audit: self.write_support.as_ref().map(|ws| ws.audit.clone()),
+            watches: (on_assistant
+                && self.watch_tools.ready()
+                && crate::autofix::incident_of_conversation(conv.metadata.as_ref()).is_none())
+            .then(|| crate::watches::ConversationWatches {
+                tools: self.watch_tools.clone(),
+                chat: conv.public_id.clone(),
+                metadata: request_metadata.clone(),
+            }),
             goals: on_assistant.then(|| self.goal_support.clone()).flatten(),
             // Offered exactly where `temps_write` is: a credential has no use
             // outside an operation that can be proposed.
@@ -404,16 +414,28 @@ impl ConversationService {
             if startup_receiver.await.is_err() {
                 return true;
             }
+            if let Some(delivery) = watch_delivery {
+                match crate::watches::start_delivery(&inputs.db, conv_id, &delivery).await {
+                    Ok(true) => {}
+                    Ok(false) => return true,
+                    Err(error) => {
+                        tracing::error!(conversation_id=conv_id,%error,"Could not start pending plugin watch delivery");
+                        return true;
+                    }
+                }
+            }
             ToolLoop::prepare(inputs).run().await
         });
 
         claim.register(&self.active_turns, turn_task.abort_handle());
+        // Install the monitor before an interruptible ownership check. If
+        // preparation times out here, dropping the barrier wakes the monitor.
+        tokio::spawn(monitor.watch(turn_task));
         // Dropping the barrier keeps the newly spawned task from starting after
         // it was cancelled.
         if claim.still_owned().await {
             let _ = startup_sender.send(());
         }
-        tokio::spawn(monitor.watch(turn_task));
 
         let out = async_stream::stream! {
             while let Some(item) = rx.recv().await {

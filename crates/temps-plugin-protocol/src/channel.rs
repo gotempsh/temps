@@ -652,7 +652,28 @@ macro_rules! define_platform_calls {
     };
 }
 
+/// Durable change signal. The host derives plugin identity from the channel.
+/// The host remembers an unmatched event ID for seven days after receipt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublishWatchEvent {
+    /// Original commit time. Retries keep this value so a new watch never receives old events.
+    pub occurred_at_ms: i64,
+    pub attributes: serde_json::Value,
+    pub source: String,
+    pub subject: String,
+    pub event_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_chat_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WatchEventAck {
+    pub accepted: bool,
+}
+
 define_platform_calls! {
+    /// Acknowledge only after matching watches have durable deliveries.
+    PublishWatchEvent(PublishWatchEvent) -> WatchEventAck,
     /// Fetch one project by ID.
     GetProject(GetProject) -> ProjectInfo,
     /// List every non-deleted project.
