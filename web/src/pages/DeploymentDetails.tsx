@@ -54,10 +54,12 @@ import {
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import {
   failedDeploymentImageRef,
+  containerSecurityHref,
   failureSettingsLink,
   failureStageLabel,
   failureTimeoutSummary,
 } from '@/lib/deployment-failure-guidance'
+import { EntrypointCapabilityFix } from '@/components/deployments/EntrypointCapabilityFix'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import {
   canRollbackTo,
@@ -502,11 +504,14 @@ export function CancelledReason({
   deployment,
   projectSlug,
   onEditImage,
+  onRedeploySameSource,
 }: {
   deployment: DeploymentResponse
   projectSlug: string
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
+  /** Redeploys this deployment's source unchanged, for a one-click fix. */
+  onRedeploySameSource?: () => Promise<void>
 }) {
   // The user's choice belongs to the deployment it was made on: opening a
   // different deployment falls back to that failure's own default, while
@@ -595,6 +600,14 @@ export function CancelledReason({
                   {failedImageRef}
                 </code>
               </p>
+            )}
+            {failure.suggested_fix && (
+              <EntrypointCapabilityFix
+                projectId={deployment.project_id}
+                fix={failure.suggested_fix}
+                settingsHref={containerSecurityHref(projectSlug)}
+                onRedeploy={onRedeploySameSource}
+              />
             )}
             <div className="flex flex-wrap gap-2">
               {failedImageRef && onEditImage && (
@@ -1585,6 +1598,21 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         <CancelledReason
           deployment={deployment}
           projectSlug={project.slug}
+          onRedeploySameSource={
+            redeployPlan && redeployPlan.kind !== 'unsupported'
+              ? () =>
+                  handleRedeploy({
+                    branch: deployment.branch || undefined,
+                    commit: deployment.commit_hash || undefined,
+                    tag: deployment.tag || undefined,
+                    environmentId: deployment.environment_id,
+                    staticBundleId:
+                      redeployPlan.kind === 'static_files'
+                        ? redeployPlan.staticBundleId
+                        : undefined,
+                  })
+              : undefined
+          }
           onEditImage={
             redeployPlan?.kind === 'docker_image'
               ? () => setIsRedeployModalOpen(true)

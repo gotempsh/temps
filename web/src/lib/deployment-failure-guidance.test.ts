@@ -38,6 +38,13 @@ describe('deployment failure guidance', () => {
     )
   })
 
+  test('deep-links a capability failure to the container security section', () => {
+    expect(failureSettingsLink('container_security', 'my-app')).toEqual({
+      href: '/projects/my-app/settings/security#container-security',
+      label: 'Container security',
+    })
+  })
+
   test('returns no link when the failure has no settings fix', () => {
     expect(failureSettingsLink(null, 'my-app')).toBeNull()
     expect(failureSettingsLink(undefined, 'my-app')).toBeNull()

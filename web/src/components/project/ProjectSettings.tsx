@@ -13,6 +13,7 @@ import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { InternalAccessCard } from './settings/InternalAccessCard'
 import { ProjectIpAccessCard } from './settings/ProjectIpAccessCard'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
+import { ContainerSecuritySettings } from './settings/ContainerSecuritySettings'
 import { SecretPage } from './settings/SecretPage'
 import { TelemetrySettings } from './settings/TelemetrySettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
@@ -132,6 +133,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
                 projectName={project.name}
                 projectSlug={project.slug}
               />
+              <ContainerSecuritySettings projectId={project.id} />
             </div>
           }
         />
