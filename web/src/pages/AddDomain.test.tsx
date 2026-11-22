@@ -249,20 +249,27 @@ test('a domain edited while the port 80 answer is out keeps the wizard on the do
 
 test('Enter on the provider Retry retries instead of advancing the wizard', async () => {
   let failures = 1
-  const { view } = renderWizard((domain) => {
+  const { view, asked } = renderWizard((domain) => {
     if (domain != null && failures > 0) {
       failures--
       return jsonResponse({ title: 'Reachability Error', status: 500 }, 500)
     }
-    return jsonResponse(methods(domain))
+    return jsonResponse(methods(domain, 'Example DNS'))
   })
   await tunnelsLoaded()
   await enterDomain(view, 'example.com')
   const retry = await view.findByRole('button', {
     name: 'Retry the DNS provider check',
   })
-  fireEvent.keyDown(retry, { key: 'Enter' })
-  await new Promise((resolve) => setTimeout(resolve, 50))
+  const lookups = () => asked.filter((d) => d === 'example.com').length
+  const before = lookups()
+  // A browser activates a focused button on Enter unless keydown's default
+  // is prevented: dispatch the keydown, then the click it leads to.
+  const activates = fireEvent.keyDown(retry, { key: 'Enter' })
+  expect(activates).toBe(true)
+  fireEvent.click(retry)
+  await view.findByText('Temps can write the TXT record through Example DNS')
+  expect(lookups()).toBe(before + 1)
   expect(view.queryByText('Review your configuration')).toBeNull()
   expect(view.getByText('How it gets HTTPS')).toBeTruthy()
 })
