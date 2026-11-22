@@ -167,6 +167,9 @@ jobs:
       - name: Test CAPTCHA WASM rebuild gate
         run: python3 scripts/test_captcha_wasm_build.py
 
+      - name: Test startup health deadline
+        run: python3 scripts/first-run/test_startup_deadline.py
+
       - name: Test source attribution tooling
         run: |
           python3 scripts/test_source_attribution.py

@@ -477,6 +477,22 @@ pub fn address_reachability(
         }
     };
 
+    // A private DNS answer can work for a LAN or VPN client. A DNS
+    // lookup here cannot verify that client's route or the listener.
+    if ips.iter().all(|ip| {
+        matches!(
+            address_scope(*ip),
+            AddressScope::Private | AddressScope::Cgnat
+        )
+    }) {
+        return verdict(
+            ReachState::Unknown,
+            None,
+            format!("{address} resolves to {}. Clients on the private network may be able to connect. Public access needs a public address or tunnel.", ip_list(ips)),
+            Some(make_reachable()),
+        );
+    }
+
     if let Some(direct) = directs
         .iter()
         .find(|d| d.ips.iter().any(|ip| ips.contains(ip)))
@@ -1483,8 +1499,9 @@ mod tests {
             true,
             "production",
         );
-        assert_eq!(private.state, ReachState::NotReachable);
-        assert!(private.reason.contains("private address"));
+        assert_eq!(private.state, ReachState::Unknown);
+        assert!(private.reason.contains("private network"));
+        assert!(!summary(&[private], true, "production", &[]).contains("nobody"));
 
         let elsewhere = address_reachability(
             &facts(

@@ -71,7 +71,7 @@ verify_checksum() {
     local file="$1" url_sha="$2"
     local sha_file="$file.sha256" expected actual
 
-    if ! curl --fail --silent --location --output "$sha_file" "$url_sha" 2>/dev/null; then
+    if ! curl --connect-timeout 15 --max-time 60 --fail --silent --location --output "$sha_file" "$url_sha" 2>/dev/null; then
         rm -f "$sha_file"
         if [[ "${TEMPS_INSTALL_SKIP_CHECKSUM:-}" = "1" ]]; then
             warning "Checksum not found at \"$url_sha\"; skipping verification (TEMPS_INSTALL_SKIP_CHECKSUM=1)."
@@ -250,7 +250,7 @@ command -v curl >/dev/null ||
 # or a network failure instead of reporting every failure as "not found".
 github_api_get() {
     local response
-    response=$(curl --silent --location --write-out $'\n%{http_code}' "$1" 2>/dev/null) || true
+    response=$(curl --connect-timeout 15 --max-time 60 --silent --location --write-out $'\n%{http_code}' "$1" 2>/dev/null) || true
     api_status=${response##*$'\n'}
     api_body=${response%$'\n'*}
     [[ $api_status =~ ^[0-9]{3}$ ]] || api_status=000
@@ -625,7 +625,7 @@ info "Downloading temps from $temps_uri..."
 
 tarball="$install_dir/temps-$target.tar.gz"
 
-curl --fail --location --progress-bar --output "$tarball" "$temps_uri" ||
+curl --connect-timeout 15 --max-time 600 --fail --location --progress-bar --output "$tarball" "$temps_uri" ||
     error "Failed to download temps from \"$temps_uri\""
 
 info "Verifying download integrity..."

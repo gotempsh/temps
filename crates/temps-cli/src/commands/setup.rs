@@ -95,6 +95,11 @@ pub struct SetupCommand {
     #[arg(long)]
     pub admin_email: Option<String>,
 
+    /// Default admin and ACME contact for this run. Overrides a saved ACME contact.
+    /// --admin-email and --letsencrypt-email override their respective defaults.
+    #[arg(long)]
+    pub email: Option<String>,
+
     /// Admin user display name (default: "Admin")
     #[arg(long, default_value = "Admin")]
     pub admin_name: String,
@@ -256,7 +261,7 @@ pub struct SetupCommand {
     /// and (like the sslip.io domain default above) skip SSL/DNS-provider
     /// setup even if --wildcard-domain is explicitly given. Zero prompts
     /// required. Use this for unattended/scripted installs.
-    #[arg(long, default_value = "false")]
+    #[arg(long, visible_alias = "yes", default_value = "false")]
     pub auto: bool,
 }
 
@@ -795,28 +800,33 @@ async fn detect_public_ip() -> anyhow::Result<String> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    // Try multiple services
-    let services = vec![
-        ("https://api.ipify.org?format=json", "ip"),
-        ("https://ipinfo.io/json", "ip"),
-        ("https://api.myip.com", "ip"),
-    ];
+    #[derive(serde::Deserialize)]
+    struct EchoResponse {
+        ip: std::net::IpAddr,
+    }
 
-    for (url, field) in services {
-        match client.get(url).send().await {
-            Ok(response) => {
-                if let Ok(json) = response.json::<serde_json::Value>().await {
-                    if let Some(ip) = json.get(field).and_then(|v| v.as_str()) {
-                        // Validate it looks like an IP address
-                        if ip.parse::<std::net::IpAddr>().is_ok() {
-                            return Ok(ip.to_string());
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Failed to get IP from {}: {}", url, e);
+    // A proxy or private
+    // exit address is not an origin for the installer to publish in DNS.
+    for url in [
+        "https://api.ipify.org?format=json",
+        "https://ipinfo.io/json",
+        "https://api.myip.com",
+    ] {
+        let response = match client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                debug!(%url, %error, "Public IP lookup failed");
                 continue;
+            }
+        };
+        if let Ok(echo) = response.json::<EchoResponse>().await {
+            if is_public_setup_origin(echo.ip) {
+                return Ok(echo.ip.to_string());
             }
         }
     }
@@ -824,6 +834,11 @@ async fn detect_public_ip() -> anyhow::Result<String> {
     Err(anyhow::anyhow!(
         "Unable to auto-detect public IP. Please provide --server-ip manually."
     ))
+}
+
+fn is_public_setup_origin(address: std::net::IpAddr) -> bool {
+    temps_core::url_validation::validate_outbound_ip(address).is_ok()
+        && temps_core::known_proxies::known_proxy(address).is_none()
 }
 
 /// Detect the primary private/LAN IP address as a fallback when public IP detection fails.
@@ -1581,6 +1596,10 @@ fn is_loopback_zone(zone: &str) -> bool {
 
 impl SetupCommand {
     fn resolve_installation_inputs(&mut self) -> anyhow::Result<()> {
+        if let Some(email) = &self.email {
+            self.admin_email.get_or_insert_with(|| email.clone());
+            self.letsencrypt_email.get_or_insert_with(|| email.clone());
+        }
         if let Some(path) = &self.admin_password_file {
             let password = fs::read_to_string(path).map_err(|error| {
                 anyhow::anyhow!(
@@ -3359,6 +3378,55 @@ mod tests {
             panic!("expected setup command");
         };
         command
+    }
+
+    #[test]
+    fn public_detection_rejects_private_and_reserved_echo_results() {
+        for address in [
+            "127.0.0.1",
+            "192.168.1.1",
+            "203.0.113.10",
+            "2001:db8::1",
+            "::1",
+        ] {
+            assert!(
+                !is_public_setup_origin(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn unattended_email_flags_override_saved_contacts() {
+        let mut setup = parse_setup(&["--yes", "--email", "owner@example.com"]);
+        assert!(setup.auto);
+        setup.resolve_installation_inputs().unwrap();
+        setup.apply_auto_defaults();
+        assert!(setup.non_interactive);
+        let admin = setup.admin_email.clone().unwrap();
+        setup
+            .resolve_acme_contact(&admin, Some("previous@example.com"))
+            .unwrap();
+        assert_eq!(admin, "owner@example.com");
+        assert_eq!(
+            setup.letsencrypt_email.as_deref(),
+            Some("owner@example.com")
+        );
+
+        let mut separate = parse_setup(&[
+            "--email",
+            "owner@example.com",
+            "--admin-email",
+            "admin@example.com",
+            "--letsencrypt-email",
+            "certs@example.com",
+        ]);
+        separate.resolve_installation_inputs().unwrap();
+        assert_eq!(separate.admin_email.as_deref(), Some("admin@example.com"));
+        assert_eq!(
+            separate.letsencrypt_email.as_deref(),
+            Some("certs@example.com")
+        );
     }
 
     #[test]

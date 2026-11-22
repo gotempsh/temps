@@ -110,18 +110,24 @@ cmd_wait() {
   local url deadline
   url="$(url_for "$FIRST_RUN_ADDRESS")"
   deadline=$((SECONDS + ${FIRST_RUN_START_TIMEOUT:-300}))
-  until curl -sf -o /dev/null "$url/api/health" || curl -sf -o /dev/null "$url/"; do
+  local path remaining
+  while (( SECONDS < deadline )); do
+    for path in /api/health /; do
+      remaining=$((deadline - SECONDS))
+      (( remaining > 0 )) || break
+      if curl -sf --connect-timeout 2 --max-time "$((remaining < 5 ? remaining : 5))" -o /dev/null "$url$path"; then
+        echo "temps is answering on $url"
+        return
+      fi
+    done
     if [[ -f "$PID_FILE" ]] && ! kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
       tail -n 80 "$LOG_FILE" >&2 || true
       die "temps serve exited during startup (log above)"
     fi
-    if (( SECONDS > deadline )); then
-      tail -n 80 "$LOG_FILE" >&2 || true
-      die "temps did not answer on $url within ${FIRST_RUN_START_TIMEOUT:-300}s"
-    fi
-    sleep 2
+    remaining=$((deadline - SECONDS))
+    (( remaining > 0 )) && sleep "$((remaining < 2 ? remaining : 2))"
   done
-  echo "temps is answering on $url"
+  die "temps did not answer on $url within ${FIRST_RUN_START_TIMEOUT:-300}s"
 }
 
 cmd_mint_key() {
@@ -131,10 +137,10 @@ cmd_mint_key() {
   jar="$(mktemp)"
   trap 'rm -f "$jar"' RETURN
   body="$(jq -n --arg email "$ADMIN_EMAIL" --rawfile password "$PASSWORD_FILE" '{email: $email, password: $password}')"
-  if ! curl -sf -c "$jar" -H 'Content-Type: application/json' -d "$body" "$url/api/auth/login" > /dev/null; then
+  if ! curl -sf --connect-timeout 2 --max-time 10 -c "$jar" -H 'Content-Type: application/json' -d "$body" "$url/api/auth/login" > /dev/null; then
     die "login as bootstrap admin $ADMIN_EMAIL failed at $url/api/auth/login (did TEMPS_ADMIN_EMAIL/TEMPS_ADMIN_PASSWORD_FILE create the admin? see $LOG_FILE)"
   fi
-  key="$(curl -sf -b "$jar" -H 'Content-Type: application/json' \
+  key="$(curl -sf --connect-timeout 2 --max-time 10 -b "$jar" -H 'Content-Type: application/json' \
     -d "{\"name\":\"first-run-$(date +%s)\",\"role_type\":\"admin\"}" \
     "$url/api/api-keys" | jq -r '.api_key // empty')" || true
   [[ -n "$key" ]] || die "creating an API key with the admin session failed at $url/api/api-keys"
