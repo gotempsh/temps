@@ -130,8 +130,9 @@ pub fn certificate_methods(facts: &CertificateMethodFacts) -> CertificateMethods
     } else if !facts.http01_reachable {
         MethodCapability::missing(
             "HTTP-01 needs Let's Encrypt to reach this server on public port 80, and visitors \
-             to reach it on 443. Nothing here answers publicly on port 80, so issue the \
-             certificate with DNS-01 instead, or open ports 80 and 443 to a node."
+             to reach it on 443. Temps sees nothing answering publicly on port 80: HTTP-01 \
+             still works if port 80 reaches this server, for example through port forwarding; \
+             otherwise issue the certificate with DNS-01, or open ports 80 and 443 to a node."
                 .to_string(),
             Some(PORTS_SETUP_PATH),
         )
@@ -461,6 +462,8 @@ mod tests {
         assert!(reason.contains("port 80"), "{reason}");
         assert!(reason.contains("443"), "{reason}");
         assert!(reason.contains("DNS-01"), "{reason}");
+        // The probe only advises: a forwarded port 80 still serves HTTP-01.
+        assert!(reason.contains("port forwarding"), "{reason}");
         // By hand always works; through a provider says what to connect.
         assert!(no_provider.dns01_manual.configured);
         assert!(!no_provider.dns01_provider.configured);

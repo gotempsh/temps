@@ -37,7 +37,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { PageContainer, Wizard } from '@temps-sdk/ds'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   AlertTriangle,
   CheckCircle,
@@ -141,33 +141,21 @@ export function AddDomain() {
     },
   })
 
-  const queryClient = useQueryClient()
   const handleNext = () => {
     if (step === 'domain') {
-      form.trigger('domain').then(async (valid) => {
+      form.trigger('domain').then((valid) => {
         if (valid) {
           const domain = form.getValues('domain')
           const covering = tunnelsCovering(domain, connectorsQuery.data ?? [])
-          // The default needs the port 80 answer: wait for it if it is still
-          // on its way. A failed read keeps HTTP-01 and its usual note.
-          const reachability = await queryClient
-            .ensureQueryData({
-              ...getCertificateMethodsOptions(),
-              retry: false,
-            })
-            .catch(() => undefined)
-          // Edited while waiting: this default was for another domain. Stay
-          // here; the next Next validates the new one.
-          if (form.getValues('domain') !== domain) return
+          // The port 80 probe only advises: port forwarding or a private CA
+          // can reach this server where Temps sees no public listener, so it
+          // recommends DNS-01 (certificateChoices) and never switches the
+          // operator's method.
           if (covering.length > 0) {
             // A tunnel carries it: no certificate to issue.
             form.setValue('challengeType', tunnelChoice(covering[0].id))
-          } else if (
-            domain.startsWith('*.') ||
-            reachability?.http01_available === false
-          ) {
-            // A wildcard, or nothing answering on public port 80: only
-            // DNS-01 can issue the certificate.
+          } else if (domain.startsWith('*.')) {
+            // Let's Encrypt issues wildcards only through DNS-01.
             form.setValue('challengeType', 'dns-01')
           } else if (chosenTunnel(form.getValues('challengeType')) != null) {
             form.setValue('challengeType', 'http-01')

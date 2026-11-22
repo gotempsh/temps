@@ -56,7 +56,7 @@ const tunnel = {
 }
 
 const NO_PORT_80 =
-  "HTTP-01 needs Let's Encrypt to reach this server on public port 80, and visitors to reach it on 443."
+  "HTTP-01 needs Let's Encrypt to reach this server on public port 80, and visitors to reach it on 443. Temps sees nothing answering publicly on port 80: HTTP-01 still works if port 80 reaches this server, for example through port forwarding; otherwise issue the certificate with DNS-01, or open ports 80 and 443 to a node."
 
 function methods(domain: string | null, provider: string | null = null) {
   return {
@@ -136,7 +136,7 @@ test('with a tunnel set up, a name it covers is offered both the tunnel and a ce
   expect(view.getByText(/DNS-01 Challenge/)).toBeTruthy()
 })
 
-test('a domain the tunnel does not cover gets a certificate, DNS-01 chosen when port 80 is not reachable', async () => {
+test('a domain the tunnel does not cover gets a certificate, DNS-01 recommended when port 80 is not reachable', async () => {
   const { view, asked } = renderWizard()
   await tunnelsLoaded()
   await enterDomain(view, 'example.com')
@@ -145,7 +145,9 @@ test('a domain the tunnel does not cover gets a certificate, DNS-01 chosen when 
   expect(view.getByText(/HTTP-01 Challenge/)).toBeTruthy()
   expect(view.getByText('Through a Cloudflare Tunnel')).toBeTruthy()
   expect(view.getByText(/No tunnel covers example.com yet/)).toBeTruthy()
-  expect(checkedMethod(view)).toEqual(['dns-01'])
+  // The probe advises; the operator's method is not switched for them.
+  expect(view.getByText(/DNS-01 Challenge \(Recommended\)/)).toBeTruthy()
+  expect(checkedMethod(view)).toEqual(['http-01'])
 
   // Judged for this domain: why HTTP-01 does not fit, and how DNS-01 works.
   await view.findByText(NO_PORT_80)
@@ -165,24 +167,26 @@ function checkedMethod(view: ReturnType<typeof render>): (string | null)[] {
     .map((radio) => radio.getAttribute('value'))
 }
 
-test('port 80 reachability that arrives after Next still picks DNS-01', async () => {
-  let release = () => {}
-  const late = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const { view } = renderWizard(async (domain) => {
-    // The cluster-wide read answers only after Next was pressed.
-    if (domain == null) await late
-    return jsonResponse(methods(domain))
-  })
-  fireEvent.change(view.getByLabelText('Domain name'), {
-    target: { value: 'example.com' },
-  })
+/** Pick DNS-01 on the method step, as the operator would. */
+function chooseDns01(view: ReturnType<typeof render>): void {
+  const radio = view
+    .getAllByRole('radio')
+    .find((r) => r.getAttribute('value') === 'dns-01')
+  if (!radio) throw new Error('no DNS-01 choice on the method step')
+  fireEvent.click(radio)
+}
+
+test('with no public port 80 seen, HTTP-01 can still be issued through port forwarding', async () => {
+  // A private CA or a forwarded port 80 reaches this server even though
+  // Temps sees no public listener: the default must not take HTTP-01 away.
+  const { view } = renderWizard()
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+  await view.findByText(/HTTP-01 still works if port 80 reaches this server/)
+
   fireEvent.click(view.getByRole('button', { name: 'Next' }))
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  release()
-  await view.findByText('How it gets HTTPS')
-  expect(checkedMethod(view)).toEqual(['dns-01'])
+  await view.findByText('Review your configuration')
+  expect(view.getByText('HTTP-01 (Automatic)')).toBeTruthy()
 })
 
 test('a failed provider lookup says so and retries, never claiming by hand', async () => {
@@ -215,36 +219,11 @@ test('a provider that writes the record is named on both steps', async () => {
   await enterDomain(view, 'example.com')
   await view.findByText('Temps can write the TXT record through registrar')
 
+  chooseDns01(view)
   fireEvent.click(view.getByRole('button', { name: 'Next' }))
   await view.findByText('DNS-01 (through registrar)')
   expect(view.getByText('Temps adds the TXT record for you')).toBeTruthy()
   expect(view.queryByText('DNS-01 (Manual)')).toBeNull()
-})
-
-test('a domain edited while the port 80 answer is out keeps the wizard on the domain step', async () => {
-  let release = () => {}
-  const late = new Promise<void>((resolve) => {
-    release = resolve
-  })
-  const { view } = renderWizard(async (domain) => {
-    if (domain == null) await late
-    // HTTP-01 works here: the stale default would keep it.
-    return jsonResponse({ ...methods(domain), http01_available: true })
-  })
-  const input = view.getByLabelText('Domain name')
-  fireEvent.change(input, { target: { value: 'example.com' } })
-  fireEvent.click(view.getByRole('button', { name: 'Next' }))
-  // Validation passed; the wizard now waits on the port 80 answer.
-  await new Promise((resolve) => setTimeout(resolve, 20))
-  fireEvent.change(input, { target: { value: '*.example.com' } })
-  release()
-  await new Promise((resolve) => setTimeout(resolve, 50))
-  expect(view.queryByText('How it gets HTTPS')).toBeNull()
-
-  // The next Next judges the wildcard: DNS-01 only.
-  fireEvent.click(view.getByRole('button', { name: 'Next' }))
-  await view.findByText('How it gets HTTPS')
-  expect(checkedMethod(view)).toEqual(['dns-01'])
 })
 
 test('Enter on the provider Retry retries instead of advancing the wizard', async () => {
@@ -285,6 +264,7 @@ test('the confirm step shows a failed provider lookup, not the manual steps', as
   await view.findByText(
     'Could not check whether a DNS provider can write the TXT record'
   )
+  chooseDns01(view)
   fireEvent.click(view.getByRole('button', { name: 'Next' }))
   await view.findByText('Review your configuration')
 
@@ -309,6 +289,7 @@ test('the confirm step shows a provider lookup still in flight, not the manual s
   )
   await tunnelsLoaded()
   await enterDomain(view, 'example.com')
+  chooseDns01(view)
   fireEvent.click(view.getByRole('button', { name: 'Next' }))
   await view.findByText('Review your configuration')
 

@@ -371,14 +371,15 @@ describe('certificate choices', () => {
       })
     ).toEqual({ showHttp01: true, recommended: 'http-01', http01Note: null })
     // Port forwarding can bring port 80 to a server Temps sees listening
-    // elsewhere: still listed, not recommended, and the note says why.
+    // elsewhere: HTTP-01 is still listed, DNS-01 is the recommendation, and
+    // the note says why.
     const noPort80 = certificateChoices({
       coveringTunnels: 0,
       wildcard: false,
       http01Available: false,
     })
     expect(noPort80.showHttp01).toBe(true)
-    expect(noPort80.recommended).toBeNull()
+    expect(noPort80.recommended).toBe('dns-01')
     expect(noPort80.http01Note).toContain('port 80')
   })
 
