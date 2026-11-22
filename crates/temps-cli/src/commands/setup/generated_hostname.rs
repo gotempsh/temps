@@ -41,8 +41,9 @@ pub(super) fn generated_domain_for(ip: &str, suffix: &str) -> anyhow::Result<Str
     })?;
     let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
     let encoded = address.to_string().replace('.', "-");
+    // Leave room for a full 63-octet application label and its dot.
     if !suffix.contains('.')
-        || encoded.len() + 1 + suffix.len() > 253
+        || 63 + 1 + encoded.len() + 1 + suffix.len() > 253
         || !suffix.split('.').all(|label| {
             !label.is_empty()
                 && label.len() <= 63
@@ -92,4 +93,23 @@ pub(super) fn is_loopback_zone(zone: &str) -> bool {
         // must stay off here exactly as it does for `localhost`/`127.0.0.1`.
         || z == "localho.st"
         || z.ends_with(".localho.st")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn generated_zone_reserves_a_full_application_label() {
+        let ip = "203.0.113.10";
+        let suffix = format!(
+            "{}.{}.{}",
+            "a".repeat(63),
+            "b".repeat(63),
+            "c".repeat(176 - 128)
+        );
+        let base = generated_domain_for(ip, &suffix).unwrap();
+        assert_eq!(format!("{}.{}", "x".repeat(63), base).len(), 253);
+        assert!(generated_domain_for(ip, &format!("{suffix}c")).is_err());
+    }
 }

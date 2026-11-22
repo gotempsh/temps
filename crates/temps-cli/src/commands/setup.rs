@@ -415,12 +415,14 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    let user = new_user.insert(conn).await?;
+    use sea_orm::TransactionTrait;
+    let txn = conn.begin().await?;
+    let user = new_user.insert(&txn).await?;
 
     // Get admin role
     let admin_role = roles::Entity::find()
         .filter(roles::Column::Name.eq("admin"))
-        .one(conn)
+        .one(&txn)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -439,7 +441,8 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    user_role.insert(conn).await?;
+    user_role.insert(&txn).await?;
+    txn.commit().await?;
 
     debug!("Created admin user: {}", email_lower);
     Ok(AdminUserResult::Created(user, password))
@@ -1598,6 +1601,12 @@ impl SetupCommand {
         }
     }
 
+    fn eager_acme_contact(&self) -> anyhow::Result<&str> {
+        self.letsencrypt_email.as_deref().ok_or_else(|| anyhow::anyhow!(
+            "Eager DNS-01 issuance requires a deliverable ACME contact. Pass --letsencrypt-email or --email."
+        ))
+    }
+
     fn resolve_acme_contact(
         &mut self,
         admin_email: &str,
@@ -2375,6 +2384,8 @@ impl SetupCommand {
             );
         }
 
+        let acme_email = self.eager_acme_contact()?;
+
         // SSL Certificate Provisioning
         print_section("SSL Certificate Provisioning");
         println!(
@@ -2603,7 +2614,7 @@ impl SetupCommand {
         print_step(4, 8, "Requesting Let's Encrypt DNS-01 challenge");
         print_spinner_step("Contacting Let's Encrypt ACME server");
         let challenge_data =
-            rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))?;
+            rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email))?;
         print_spinner_done();
 
         if challenge_data.status == "completed" {
@@ -2811,8 +2822,7 @@ impl SetupCommand {
                 }
 
                 // Request a new challenge (this creates a new ACME order)
-                match rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))
-                {
+                match rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email)) {
                     Ok(new_challenge) => {
                         if new_challenge.status == "completed" {
                             // Certificate was issued immediately (unlikely but possible)
@@ -2911,7 +2921,7 @@ impl SetupCommand {
                 "Requesting certificate issuance (attempt {}/{})",
                 attempt, max_retries
             ));
-            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, &admin_email)) {
+            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, acme_email)) {
                 Ok(completed_domain) => {
                     print_spinner_done();
                     // Success means a cert is being served. "active_renewal_failed" also
@@ -3250,6 +3260,22 @@ mod tests {
             .await
             .unwrap();
         let email = "admin@example.com";
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "ALTER TABLE user_roles ADD CONSTRAINT reject_test_assignment CHECK (FALSE) NOT VALID",
+        )
+        .await
+        .unwrap();
+        assert!(create_admin_user(db, email, "Admin", None).await.is_err());
+        assert!(users::Entity::find()
+            .filter(users::Column::Email.eq(email))
+            .one(db)
+            .await
+            .unwrap()
+            .is_none());
+        db.execute_unprepared("ALTER TABLE user_roles DROP CONSTRAINT reject_test_assignment")
+            .await
+            .unwrap();
         let AdminUserResult::Created(first, _) =
             create_admin_user(db, email, "Admin", None).await.unwrap()
         else {
@@ -3352,6 +3378,27 @@ mod tests {
                 "{address}"
             );
         }
+    }
+
+    #[test]
+    fn eager_dns_uses_the_resolved_contact_and_explains_a_missing_one() {
+        let mut cmd = parse_setup(&[
+            "--email",
+            "certs@example.com",
+            "--admin-email",
+            "admin@example.com",
+        ]);
+        cmd.resolve_installation_inputs().unwrap();
+        cmd.resolve_acme_contact("admin@example.com", Some("old@example.com"))
+            .unwrap();
+        assert_eq!(cmd.eager_acme_contact().unwrap(), "certs@example.com");
+        let mut unset = parse_setup(&[]);
+        unset.resolve_acme_contact("admin@localhost", None).unwrap();
+        assert!(unset
+            .eager_acme_contact()
+            .unwrap_err()
+            .to_string()
+            .contains("--letsencrypt-email"));
     }
 
     #[test]
