@@ -22,6 +22,7 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::error::AiGatewayError;
 use crate::handlers::gateway::wrap_stream_with_usage_tracking;
 use crate::handlers::sse_usage::UsageKind;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
@@ -230,6 +231,77 @@ impl GatewayAiService {
             .managed_model()
             .await
             .map(|_| "temps-cloud".to_string())
+    }
+}
+
+/// Classify a gateway failure so callers can show what to fix. Failures that
+/// say nothing actionable about the provider (database, encryption, request
+/// translation) stay unclassified [`AiError::Provider`] errors.
+fn completion_error(purpose: &str, model: &str, error: AiGatewayError) -> AiError {
+    use temps_ai::ProviderFailureKind as Kind;
+    let (kind, status, retry_after_secs) = match &error {
+        AiGatewayError::ProviderNotConfigured { .. }
+        | AiGatewayError::ProviderKeyNotFound { .. }
+        | AiGatewayError::AmbiguousModel { .. }
+        | AiGatewayError::SelfHostedModelUnavailable { .. }
+        | AiGatewayError::CapabilityNotDeclared { .. }
+        | AiGatewayError::UnsupportedEndpoint { .. } => (Kind::Misconfigured, None, None),
+        AiGatewayError::ModelNotFound { .. } => (Kind::ModelNotFound, None, None),
+        AiGatewayError::ModelNotAllowed { .. } => (Kind::ModelNotAllowed, None, None),
+        AiGatewayError::UpstreamError { status, .. } => {
+            let kind = match status {
+                401 | 403 => Kind::Authentication,
+                404 => Kind::ModelNotFound,
+                408 | 504 => Kind::Timeout,
+                429 => Kind::RateLimited,
+                400..=499 => Kind::Rejected,
+                _ => Kind::ProviderError,
+            };
+            (kind, Some(*status), None)
+        }
+        AiGatewayError::UpstreamMalformedResponse { .. } | AiGatewayError::StreamError { .. } => {
+            (Kind::MalformedResponse, None, None)
+        }
+        AiGatewayError::UpstreamTimeout { .. } => (Kind::Timeout, None, None),
+        AiGatewayError::HttpClient(_) | AiGatewayError::InvalidProviderUrl { .. } => {
+            (Kind::Unreachable, None, None)
+        }
+        AiGatewayError::RateLimited {
+            retry_after_secs, ..
+        } => (Kind::RateLimited, None, Some(*retry_after_secs)),
+        AiGatewayError::BudgetExceeded {
+            retry_after_secs, ..
+        } => (Kind::BudgetExceeded, None, Some(*retry_after_secs)),
+        AiGatewayError::TranslationError { .. }
+        | AiGatewayError::Validation { .. }
+        | AiGatewayError::Encryption(_)
+        | AiGatewayError::Internal { .. }
+        | AiGatewayError::Database(_)
+        | AiGatewayError::UploadTooLarge { .. }
+        | AiGatewayError::UploadCapacity
+        | AiGatewayError::ProjectNotFound { .. }
+        | AiGatewayError::ObjectNotFound { .. } => {
+            return AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: error.to_string(),
+            };
+        }
+    };
+    // A credential failure's body can echo the key: keep only its status.
+    let reason = match kind {
+        Kind::Authentication => format!(
+            "the provider refused its credentials (upstream status {})",
+            status.unwrap_or_default()
+        ),
+        _ => error.to_string(),
+    };
+    AiError::ProviderFailed {
+        purpose: purpose.to_string(),
+        model: model.to_string(),
+        kind,
+        status,
+        retry_after_secs,
+        reason,
     }
 }
 
@@ -713,10 +785,7 @@ impl AiService for GatewayAiService {
             .await
             .map_err(|e| {
                 debug!(error = %e, purpose = request.purpose, model, "AI completion failed");
-                AiError::Provider {
-                    purpose: request.purpose.clone(),
-                    reason: e.to_string(),
-                }
+                completion_error(&request.purpose, &model, e)
             })?;
 
         let text = first_text(&resp).unwrap_or_default();
@@ -1181,6 +1250,97 @@ mod tests {
     use temps_core::EncryptionService;
 
     use crate::services::ProviderKeyService;
+
+    fn classified(error: AiGatewayError) -> (temps_ai::ProviderFailureKind, Option<u64>, String) {
+        match completion_error("analytics.test", "mock-flash", error) {
+            AiError::ProviderFailed {
+                kind,
+                retry_after_secs,
+                reason,
+                model,
+                ..
+            } => {
+                assert_eq!(model, "mock-flash");
+                (kind, retry_after_secs, reason)
+            }
+            other => panic!("expected a classified provider failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_errors_are_classified_without_leaking_credential_replies() {
+        use temps_ai::ProviderFailureKind as Kind;
+        let upstream = |status: u16| AiGatewayError::UpstreamError {
+            model: "mock-flash".into(),
+            status,
+            message: "{\"error\":{\"message\":\"Incorrect API key provided: sk-test-1234\"}}"
+                .into(),
+        };
+        let (kind, _, reason) = classified(upstream(401));
+        assert_eq!(kind, Kind::Authentication);
+        assert!(!reason.contains("sk-test"), "{reason}");
+        assert_eq!(classified(upstream(403)).0, Kind::Authentication);
+        assert_eq!(classified(upstream(404)).0, Kind::ModelNotFound);
+        assert_eq!(classified(upstream(429)).0, Kind::RateLimited);
+        assert_eq!(classified(upstream(504)).0, Kind::Timeout);
+        assert_eq!(classified(upstream(422)).0, Kind::Rejected);
+        assert_eq!(classified(upstream(500)).0, Kind::ProviderError);
+        assert_eq!(
+            classified(AiGatewayError::ModelNotFound {
+                model: "mock-flash".into()
+            })
+            .0,
+            Kind::ModelNotFound
+        );
+        assert_eq!(
+            classified(AiGatewayError::UpstreamTimeout {
+                reason: "deadline".into()
+            })
+            .0,
+            Kind::Timeout
+        );
+        assert_eq!(
+            classified(AiGatewayError::HttpClient("connection refused".into())).0,
+            Kind::Unreachable
+        );
+        assert_eq!(
+            classified(AiGatewayError::UpstreamMalformedResponse {
+                provider: "mock".into(),
+                reason: "not json".into()
+            })
+            .0,
+            Kind::MalformedResponse
+        );
+        assert_eq!(
+            classified(AiGatewayError::RateLimited {
+                project_id: 7,
+                limit: 10,
+                retry_after_secs: 12
+            })
+            .1,
+            Some(12)
+        );
+        assert_eq!(
+            classified(AiGatewayError::BudgetExceeded {
+                project_id: 7,
+                limit_microcents: 1,
+                used_microcents: 2,
+                retry_after_secs: 3600
+            })
+            .0,
+            Kind::BudgetExceeded
+        );
+        assert!(matches!(
+            completion_error(
+                "analytics.test",
+                "mock-flash",
+                AiGatewayError::Internal {
+                    message: "pool closed".into()
+                }
+            ),
+            AiError::Provider { .. }
+        ));
+    }
 
     #[test]
     fn sse_lines_keep_a_character_split_across_chunks() {

@@ -10548,3 +10548,102 @@ async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyh
     Migrator::down(&db, Some(steps_back_to(target))).await?;
     Ok(())
 }
+
+/// `(data_type, is_nullable)` of `visitor_activity_reports.cooldown_until`, or
+/// `None` when it does not exist.
+async fn visitor_activity_cooldown_column(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Option<(String, String)>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT data_type, is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'visitor_activity_reports' \
+               AND column_name = 'cooldown_until'"
+                .to_string(),
+        ))
+        .await?;
+    Ok(match row {
+        Some(row) => Some((
+            row.try_get("", "data_type")?,
+            row.try_get("", "is_nullable")?,
+        )),
+        None => None,
+    })
+}
+
+/// Existing activity reports get no cooldown (NULL), so an upgrade never blocks
+/// a report run; `down` removes the column and keeps the rows.
+#[tokio::test]
+async fn test_visitor_activity_cooldown_is_nullable_and_reversible() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261122_000001_visitor_activity_cooldown";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping visitor_activity_reports.cooldown_until migration test: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(visitor_activity_cooldown_column(&db).await?.is_none());
+    db.execute_unprepared(
+        "INSERT INTO projects (id, name, slug, repo_name, repo_owner, directory, main_branch, preset, created_at, updated_at) \
+         VALUES (1, 'Sample site', 'sample-site', 'sample', 'example', '/', 'main', 'static', now(), now()); \
+         INSERT INTO visitor_activity_reports (project_id, settings, daily_enabled, last_started_at) \
+         VALUES (1, '{}'::jsonb, false, now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        visitor_activity_cooldown_column(&db).await?,
+        Some(("timestamp with time zone".to_string(), "YES".to_string()))
+    );
+    let unblocked = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM visitor_activity_reports WHERE cooldown_until IS NULL"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(unblocked.try_get::<i32>("", "count")?, 1);
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(visitor_activity_cooldown_column(&db).await?.is_none());
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM visitor_activity_reports".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}
