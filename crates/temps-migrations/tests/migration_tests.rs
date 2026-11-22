@@ -10429,15 +10429,15 @@ async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyh
     )
     .await?;
     for _ in 0..2 {
-        Migrator::up(&db, Some(1)).await?;
+        Migrator::up(&db, None).await?;
         assert!(column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
         let row = db.query_one(Statement::from_string(DatabaseBackend::Postgres,
             "SELECT received_at IS NOT NULL AS retained FROM plugin_watch_events WHERE event_id='replay'")).await?.expect("existing receipt");
         assert!(row.try_get::<bool>("", "retained")?);
-        Migrator::down(&db, Some(1)).await?;
+        Migrator::down(&db, Some(steps_back_to(target))).await?;
         assert!(!column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
     }
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, None).await?;
     db.execute_unprepared(r#"
         INSERT INTO users(id,name,email) VALUES(9911,'Owner','owner@example.test');
         INSERT INTO sessions(id,user_id,session_token,expires_at,mfa_pending) VALUES(9911,9911,'test-session',now()+interval '1 day',false);
@@ -10448,7 +10448,7 @@ async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyh
         INSERT INTO plugin_watch_deliveries(watch_id,event_id,wake_message_id)
         SELECT id,'prepared',9911 FROM plugin_chat_watches WHERE conversation_id=9911;
     "#).await?;
-    let error = Migrator::down(&db, Some(1))
+    let error = Migrator::down(&db, Some(steps_back_to(target)))
         .await
         .expect_err("prepared wake must survive rollback");
     assert!(error
@@ -10466,6 +10466,6 @@ async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyh
         "UPDATE plugin_watch_deliveries SET status='skipped' WHERE event_id='prepared'",
     )
     .await?;
-    Migrator::down(&db, Some(1)).await?;
+    Migrator::down(&db, Some(steps_back_to(target))).await?;
     Ok(())
 }

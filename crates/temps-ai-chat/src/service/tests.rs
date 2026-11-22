@@ -9,6 +9,8 @@ macro_rules! mcp_request {
 }
 use super::*;
 
+mod watch_preparation;
+
 #[test]
 fn durable_failure_metadata_is_safe_preserved_and_clearable() {
     let existing = serde_json::json!({ "application_id": 42 });

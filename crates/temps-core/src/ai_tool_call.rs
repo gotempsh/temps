@@ -38,7 +38,27 @@ pub struct AiToolCall;
 
 /// Host-only marker for a durable plugin watch delivery on a normal chat send.
 #[derive(Debug, Clone)]
-pub struct PluginWatchDelivery(pub String);
+pub struct PluginWatchDelivery {
+    pub id: String,
+    /// The host starts this clock before routing. Time spent on preflight
+    /// cannot extend the time available to claim and prepare the model turn.
+    pub prepare_by: tokio::time::Instant,
+}
+
+impl PluginWatchDelivery {
+    pub fn new(id: String) -> Self {
+        Self {
+            id,
+            prepare_by: tokio::time::Instant::now() + std::time::Duration::from_secs(30),
+        }
+    }
+
+    /// Reserve time after preparation to release the exact turn claim. This
+    /// hard limit also covers middleware, audit and other routing work.
+    pub fn request_deadline(&self) -> tokio::time::Instant {
+        self.prepare_by + std::time::Duration::from_secs(15)
+    }
+}
 
 /// Installed only by the conversation-bound watch tool. Carries the server-
 /// selected conversation, independent of any arguments supplied by a model.

@@ -19,6 +19,51 @@ use temps_core::{
 };
 use tower::ServiceExt;
 
+/// Own the interval from claiming a turn until its model task is registered.
+/// A watch uses one absolute budget across provider, sandbox, seed and tool
+/// discovery. The router reserves a separate interval for claim cleanup.
+pub(crate) async fn prepare_user_turn(
+    service: &crate::ConversationService,
+    conversation: &temps_entities::ai_conversations::Model,
+    turn_id: &str,
+    watch: Option<&temps_core::ai_tool_call::PluginWatchDelivery>,
+    prepare: impl std::future::Future<Output = Result<(), crate::ChatError>>,
+) -> Result<chrono::DateTime<chrono::Utc>, crate::ChatError> {
+    let timed_out = || crate::ChatError::WatchPreparationTimeout {
+        conversation_id: conversation.public_id.clone(),
+        turn_id: turn_id.to_owned(),
+    };
+    if watch.is_some_and(|w| w.prepare_by <= tokio::time::Instant::now()) {
+        return Err(timed_out());
+    }
+    let mut claimed = false;
+    let start = async {
+        let started = service.claim_turn(conversation, turn_id).await?;
+        claimed = true;
+        prepare.await?;
+        Ok(started)
+    };
+    let result = match watch {
+        Some(wake) => tokio::time::timeout_at(wake.prepare_by, start)
+            .await
+            .unwrap_or_else(|_| Err(timed_out())),
+        None => start.await,
+    };
+    if let Err(error) = &result {
+        // A claim's commit acknowledgement can race its deadline. Cleanup is
+        // conditional on the opaque turn ID and cannot clear a newer owner.
+        if claimed || matches!(error, crate::ChatError::WatchPreparationTimeout { .. }) {
+            if let Err(cause) = service
+                .finish_failed_turn(conversation.id, turn_id, error)
+                .await
+            {
+                tracing::error!(conversation_id=conversation.id, turn_id, %cause, "Failed to release chat turn after preparation");
+            }
+        }
+    }
+    result
+}
+
 /// Recover the original transcript message when a prior process stopped during preparation.
 pub(crate) async fn prepared_message(
     db: &sea_orm::DatabaseConnection,

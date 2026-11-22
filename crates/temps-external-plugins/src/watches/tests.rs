@@ -332,7 +332,9 @@ async fn a_wake_timeout_leaves_one_owned_preparation_to_finish() {
     let request = || Request::post("/").body(Body::empty()).unwrap();
     let first = tokio::spawn({
         let (route, slots) = (route.clone(), slots.clone());
-        async move { dispatch_watch_request(route, request(), Some(&slots)).await }
+        async move {
+            dispatch_watch_request(route, request(), Some(("fixture-event".into(), &slots))).await
+        }
     });
     started.notified().await;
     tokio::time::advance(std::time::Duration::from_secs(11)).await;
@@ -344,7 +346,7 @@ async fn a_wake_timeout_leaves_one_owned_preparation_to_finish() {
         })
     ));
     assert!(matches!(
-        dispatch_watch_request(route, request(), Some(&slots)).await,
+        dispatch_watch_request(route, request(), Some(("fixture-event".into(), &slots))).await,
         Err(WatchError::Rejected {
             status: StatusCode::SERVICE_UNAVAILABLE,
             ..
@@ -353,4 +355,27 @@ async fn a_wake_timeout_leaves_one_owned_preparation_to_finish() {
     finish.notify_one();
     completed.notified().await;
     assert!(slots.try_acquire().is_ok(), "a later wake can now start");
+}
+
+#[tokio::test(start_paused = true)]
+async fn stalled_router_releases_the_wake_slot_at_its_hard_deadline() {
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let route = Router::new().route("/", axum::routing::post(std::future::pending::<StatusCode>));
+    let request = || Request::post("/").body(Body::empty()).unwrap();
+    let response = dispatch_watch_request(route, request(), Some(("stalled".into(), &slots))).await;
+    assert!(matches!(
+        response,
+        Err(WatchError::Rejected {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            ..
+        })
+    ));
+    assert_eq!(slots.available_permits(), 0);
+    tokio::time::advance(std::time::Duration::from_secs(46)).await;
+    tokio::task::yield_now().await;
+    let healthy = Router::new().route("/", axum::routing::post(|| async { StatusCode::ACCEPTED }));
+    let next = dispatch_watch_request(healthy, request(), Some(("next".into(), &slots)))
+        .await
+        .unwrap();
+    assert_eq!(next.status(), StatusCode::ACCEPTED);
 }

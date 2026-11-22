@@ -422,8 +422,9 @@ pub async fn send_user_message(
             images,
         }
     };
+    let watch = watch.as_ref().map(|Extension(delivery)| delivery);
     let attachment_metadata = watch
-        .map(|Extension(delivery)| serde_json::json!({"plugin_watch_delivery":delivery.0}))
+        .map(|delivery| serde_json::json!({"plugin_watch_delivery":delivery.id}))
         .or_else(|| {
             (!attachments.is_empty()).then(|| serde_json::json!({ "attachments": attachments }))
         });
@@ -436,36 +437,22 @@ pub async fn send_user_message(
         .turn_id
         .clone()
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-    let turn_started_at = state.service.claim_turn(&conversation, &turn_id).await?;
-    if let Err(error) = state
-        .service
-        .send_message(
-            &conversation,
-            &turn_id,
-            &req.content,
-            attachment_metadata,
-            attachment_context.as_deref(),
-            sandbox_attachments,
-            message_images,
-            page_context,
-            &auth,
-            &metadata,
-            state.project_access_checker.clone(),
-        )
-        .await
-    {
-        if let Err(finish_error) = state
-            .service
-            .finish_failed_turn(conversation.id, &turn_id, &error)
-            .await
-        {
-            error!(
-                conversation_id = conversation.id,
-                turn_id, "failed to release AI turn after preparation error: {finish_error}"
-            );
-        }
-        return Err(error.into());
-    }
+    let prepare = state.service.send_message(
+        &conversation,
+        &turn_id,
+        &req.content,
+        attachment_metadata,
+        attachment_context.as_deref(),
+        sandbox_attachments,
+        message_images,
+        page_context,
+        &auth,
+        &metadata,
+        state.project_access_checker.clone(),
+    );
+    let turn_started_at =
+        crate::watches::prepare_user_turn(&state.service, &conversation, &turn_id, watch, prepare)
+            .await?;
     if conversation.context_type == crate::providers::assistant::ASSISTANT_CONTEXT_TYPE {
         let ids: Vec<String> = req.attachments.iter().map(|a| a.id.clone()).collect();
         state

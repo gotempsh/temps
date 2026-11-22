@@ -19,6 +19,12 @@ impl From<ChatError> for Problem {
                     .with_title("Context Not Available")
                     .with_detail(e.to_string())
             }
+            ChatError::WatchPreparationTimeout { .. } => {
+                let failure = e.public_failure();
+                problemdetails::new(axum::http::StatusCode::GATEWAY_TIMEOUT)
+                    .with_title(failure.title)
+                    .with_detail(failure.detail)
+            }
             ChatError::AiUnavailable => problemdetails::new(axum::http::StatusCode::CONFLICT)
                 .with_title("AI Not Configured")
                 .with_detail(e.to_string()),

@@ -313,15 +313,10 @@ impl WatchHost {
         let metadata = temps_core::build_request_metadata(&req, &self.crypto);
         req.extensions_mut().insert(metadata);
         req.extensions_mut().insert(auth.clone());
-        let is_wake = delivery.is_some();
-        if let Some(id) = delivery {
-            req.extensions_mut()
-                .insert(temps_core::ai_tool_call::PluginWatchDelivery(id));
-        }
         dispatch_watch_request(
             self.router.clone(),
             req,
-            is_wake.then_some(&self.wake_preparations),
+            delivery.map(|id| (id, &self.wake_preparations)),
         )
         .await
     }
@@ -398,21 +393,28 @@ impl WatchHost {
 /// Keep at most one such preparation per host, including after timeout.
 async fn dispatch_watch_request(
     router: Router,
-    request: Request<Body>,
-    wake_preparations: Option<&Arc<tokio::sync::Semaphore>>,
+    mut request: Request<Body>,
+    wake: Option<(String, &Arc<tokio::sync::Semaphore>)>,
 ) -> Result<Response, WatchError> {
     let response = async {
-        let request = router.oneshot(request);
-        if let Some(slots) = wake_preparations {
+        if let Some((id, slots)) = wake {
             let slot = slots.clone().try_acquire_owned().map_err(|_| {
                 reject(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "A previous chat wake is still being prepared",
                 )
             })?;
+            let delivery = temps_core::ai_tool_call::PluginWatchDelivery::new(id);
+            let deadline = delivery.request_deadline();
+            request.extensions_mut().insert(delivery);
             tokio::spawn(async move {
                 let _slot = slot;
-                request.await
+                tokio::time::timeout_at(deadline, router.oneshot(request))
+                    .await
+                    .map_err(|_| {
+                        tracing::warn!("Plugin watch request exceeded its deadline");
+                        reject(StatusCode::GATEWAY_TIMEOUT, "Chat wake request expired")
+                    })
             })
             .await
             .map_err(|error| {
@@ -421,10 +423,10 @@ async fn dispatch_watch_request(
                     StatusCode::SERVICE_UNAVAILABLE,
                     "Chat wake preparation failed",
                 )
-            })?
+            })??
             .map_err(|e| match e {})
         } else {
-            request.await.map_err(|e| match e {})
+            router.oneshot(request).await.map_err(|e| match e {})
         }
     };
     tokio::time::timeout(std::time::Duration::from_secs(10), response)

@@ -428,12 +428,14 @@ impl ConversationService {
         });
 
         claim.register(&self.active_turns, turn_task.abort_handle());
+        // Install the monitor before an interruptible ownership check. If
+        // preparation times out here, dropping the barrier wakes the monitor.
+        tokio::spawn(monitor.watch(turn_task));
         // Dropping the barrier keeps the newly spawned task from starting after
         // it was cancelled.
         if claim.still_owned().await {
             let _ = startup_sender.send(());
         }
-        tokio::spawn(monitor.watch(turn_task));
 
         let out = async_stream::stream! {
             while let Some(item) = rx.recv().await {
