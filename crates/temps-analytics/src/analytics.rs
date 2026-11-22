@@ -1842,35 +1842,44 @@ impl Analytics for AnalyticsService {
         .all(self.db.as_ref())
         .await?;
 
+        let parser = woothee::parser::Parser::new();
         let visitors = results
             .into_iter()
-            .map(|r| crate::types::responses::VisitorInfo {
-                id: r.id,
-                visitor_id: r.visitor_id,
-                project_id: r.project_id,
-                environment_id: r.environment_id,
-                first_seen: r.first_seen,
-                last_seen: r.last_seen,
-                user_agent: r.user_agent,
-                ip_address_id: r.ip_address_id,
-                is_crawler: r.is_crawler,
-                crawler_name: r.crawler_name,
-                custom_data: r.custom_data,
-                ip_address: r.ip_address,
-                latitude: r.latitude,
-                longitude: r.longitude,
-                region: r.region,
-                city: r.city,
-                country: r.country,
-                country_code: r.country_code,
-                timezone: r.timezone,
-                is_eu: r.is_eu,
-                current_page: r.current_page,
-                first_referrer: r.first_referrer,
-                first_referrer_hostname: r.first_referrer_hostname,
-                first_channel: r.first_channel,
-                user_id: r.user_id,
-                identity_source: r.identity_source,
+            .map(|r| {
+                let agent =
+                    crate::user_agent::UserAgentSummary::parse(&parser, r.user_agent.as_deref());
+                crate::types::responses::VisitorInfo {
+                    id: r.id,
+                    visitor_id: r.visitor_id,
+                    project_id: r.project_id,
+                    environment_id: r.environment_id,
+                    first_seen: r.first_seen,
+                    last_seen: r.last_seen,
+                    user_agent: r.user_agent,
+                    ip_address_id: r.ip_address_id,
+                    is_crawler: r.is_crawler,
+                    crawler_name: r.crawler_name,
+                    custom_data: r.custom_data,
+                    ip_address: r.ip_address,
+                    latitude: r.latitude,
+                    longitude: r.longitude,
+                    region: r.region,
+                    city: r.city,
+                    country: r.country,
+                    country_code: r.country_code,
+                    timezone: r.timezone,
+                    is_eu: r.is_eu,
+                    browser: agent.browser,
+                    browser_version: agent.browser_version,
+                    operating_system: agent.operating_system,
+                    operating_system_version: agent.operating_system_version,
+                    current_page: r.current_page,
+                    first_referrer: r.first_referrer,
+                    first_referrer_hostname: r.first_referrer_hostname,
+                    first_channel: r.first_channel,
+                    user_id: r.user_id,
+                    identity_source: r.identity_source,
+                }
             })
             .collect();
 
