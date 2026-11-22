@@ -203,6 +203,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_external_service_backup_capability",
     "list_renewal_attempts",
     "get_compose_security",
+    // Which capabilities a project's containers get back; names only.
+    "get_container_security",
     "get_project_service_template",
     // The public IPs and whether domains can be created: what a user needs
     // to point a DNS record at this platform.
@@ -1040,6 +1042,13 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // whole static flow (upload + deploy) lives in the
     // frontend.
     "deploy_from_image",
+    // ── Container security (the fix for an entrypoint that needs a Linux
+    // capability) ──
+    // Allow-listed values only (NET_BIND_SERVICE). Widening is in
+    // HUMAN_CONSENT_OPERATIONS: only the owner's confirmation of that card
+    // runs it, never a permission mode, and the handler still requires an
+    // instance administrator. Narrowing back is an ordinary confirmed write.
+    "update_container_security",
     // ── Container runtime control (reversible) ──
     "restart_container",
     "stop_container",

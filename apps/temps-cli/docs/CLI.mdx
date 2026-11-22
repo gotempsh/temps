@@ -246,6 +246,7 @@ Manage services: each one deployable app (the console calls these Services). To 
 - `git` - Update git repository settings
 - `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+- `container-security` - Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a service
 
@@ -469,6 +470,20 @@ Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, 
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `projects container-security`
+
+Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--allow <capabilities...>` | Allow these capabilities, e.g. NET_BIND_SERVICE (asks for confirmation) | - | No |
+| `--remove <capabilities...>` | Stop allowing these capabilities | - | No |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip the confirmation (for automation) | - | No |
 
 ### `projects config`
 

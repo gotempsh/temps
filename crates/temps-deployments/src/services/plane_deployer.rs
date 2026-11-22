@@ -733,6 +733,10 @@ pub fn deployment_workload_spec(
         process: Process {
             command: request.command.clone(),
             entrypoint: request.entrypoint.clone(),
+            // The project's capability opt-in. A microVM's guest runs the
+            // entrypoint under its own kernel without dropping capabilities,
+            // so the Firecracker driver has nothing to add and ignores it.
+            capabilities: request.allowed_capabilities.clone(),
             ..Default::default()
         },
         env: EnvSpec {
@@ -1238,6 +1242,17 @@ impl ContainerDeployer for PlaneContainerDeployer {
         self.local.get_container_logs(container_id).await
     }
 
+    /// A microVM replica runs its entrypoint under its own kernel without
+    /// dropping capabilities, so it never needs this; the node's deployer
+    /// answers for every container.
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        self.local.file_capabilities(container_id, path).await
+    }
+
     /// A microVM's logs are read, not followed: the stream is the current
     /// tail, then ends.
     async fn stream_container_logs(
@@ -1503,6 +1518,7 @@ mod tests {
             labels: HashMap::from([("sh.temps.deploy_id".into(), "42".into())]),
             project_slug: Some("shop".into()),
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         }
     }
 

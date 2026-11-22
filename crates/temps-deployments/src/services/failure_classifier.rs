@@ -66,7 +66,11 @@ use utoipa::ToSchema;
 /// errors, while terminal-state readiness errors are runtime container exits.
 /// Explicit Compose policy rejections take precedence over resource words in
 /// their diagnostics. Matching still ignores embedded application log tails.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 8;
+///
+/// v9: a container whose entrypoint could not be executed because it carries
+/// file capabilities Temps drops is `entrypoint_needs_capability`, read from
+/// the deploy job's own annotation, with a `suggested_fix`.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 9;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
@@ -276,6 +280,10 @@ pub enum DeploymentFailureCode {
     /// Extracting or publishing static files failed for a reason not covered
     /// above.
     StaticDeployFailed,
+    // ── v9 ──────────────────────────────────────────────────────────────
+    /// The entrypoint binary carries file capabilities (`setcap`) that are
+    /// not in the container's bounding set, so the kernel refused to exec it.
+    EntrypointNeedsCapability,
     Unknown,
 }
 
@@ -332,6 +340,7 @@ impl DeploymentFailureCode {
             Self::StaticOutputRejected => "static_output_rejected",
             Self::BuildNodeUnreachable => "build_node_unreachable",
             Self::StaticDeployFailed => "static_deploy_failed",
+            Self::EntrypointNeedsCapability => "entrypoint_needs_capability",
             Self::Unknown => "unknown",
         }
     }
@@ -388,6 +397,7 @@ impl DeploymentFailureCode {
         Self::StaticOutputRejected,
         Self::BuildNodeUnreachable,
         Self::StaticDeployFailed,
+        Self::EntrypointNeedsCapability,
         Self::Unknown,
     ];
 }
@@ -411,6 +421,8 @@ pub enum FailureSettingsSection {
     DockerRegistry,
     /// Instance → Build limits.
     BuildLimits,
+    /// Project → Settings → Container security (allowed capabilities).
+    ContainerSecurity,
 }
 
 /// Local classification of a failed deployment's reason.
@@ -463,11 +475,18 @@ pub struct DeploymentFailureInfo {
     pub timeout_elapsed_seconds: Option<u64>,
     /// Version of the classifier that produced this view.
     pub classifier_version: u8,
+    /// A concrete fix Temps can describe precisely, for failures that have
+    /// one (`entrypoint_needs_capability`). Never applied automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_fix: Option<super::entrypoint_capability::SuggestedFix>,
 }
 
 /// Build the API view for a failed deployment. Returns `None` when there is no
 /// reason to classify.
-pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
+pub fn describe_failure(
+    reason: Option<&str>,
+    project_id: Option<i32>,
+) -> Option<DeploymentFailureInfo> {
     let reason = reason?.trim();
     if reason.is_empty() {
         return None;
@@ -495,7 +514,23 @@ pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
         timeout_limit_seconds: is_timeout.then(|| timeout_limit_seconds(head)).flatten(),
         timeout_elapsed_seconds: is_timeout.then(|| elapsed_seconds(head)).flatten(),
         classifier_version: FAILURE_CLASSIFIER_VERSION,
+        suggested_fix: (classification.code == DeploymentFailureCode::EntrypointNeedsCapability)
+            .then(|| entrypoint_capability_annotation(reason))
+            .flatten()
+            .map(|(required, verified)| {
+                super::entrypoint_capability::SuggestedFix::new(&required, verified, project_id)
+            }),
     })
+}
+
+/// The capabilities the deploy job annotated a `deploy_container` failure
+/// with, read only from the start of the job's own error body.
+fn entrypoint_capability_annotation(reason: &str) -> Option<(Vec<String>, bool)> {
+    if failed_job_id(reason) != Some("deploy_container") {
+        return None;
+    }
+    let lower = reason.to_lowercase();
+    super::entrypoint_capability::parse_annotation(workflow_error_body(classification_head(&lower)))
 }
 
 /// Read only the typed check label written before any user-controlled error
@@ -764,6 +799,11 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "Build node unreachable",
             "The build finished on a worker node, but Temps could not reach that node to fetch the built files. Check the node is online (Nodes page) and reachable from the control plane, then redeploy. If the node was removed, redeploy so the build runs on an available node.",
             Some(S::Deploy),
+        ),
+        C::EntrypointNeedsCapability => (
+            "Entrypoint needs a Linux capability",
+            "The image's entrypoint binary was marked with setcap, and Temps removes every Linux capability from project containers by default, so the kernel refused to start it. If it needs NET_BIND_SERVICE (listening on a port below 1024), allow it for this project in Container security and redeploy. Or keep full hardening: remove the file capabilities from the image (`setcap -r <binary>`) and listen on a port above 1024.",
+            Some(S::ContainerSecurity),
         ),
         C::StaticDeployFailed => (
             "Static files could not be published",
@@ -1097,6 +1137,11 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         || executor_error.starts_with("internal error executing job '")
     {
         return make(S::Platform, C::PlatformInternal);
+    }
+
+    // The deploy job's own annotation, never the container output.
+    if entrypoint_capability_annotation(raw).is_some() {
+        return make(S::Runtime, C::EntrypointNeedsCapability);
     }
 
     // Persistence failures belong to the platform even when their cause is a
@@ -2010,9 +2055,10 @@ mod tests {
 
     #[test]
     fn container_exit_guidance_covers_startup_diagnostics() {
-        let info = describe_failure(Some(
-            "Container exited during startup (exit code 1) after 2s",
-        ))
+        let info = describe_failure(
+            Some("Container exited during startup (exit code 1) after 2s"),
+            None,
+        )
         .unwrap();
         assert_eq!(info.code, C::ContainerExited);
         for hint in [
@@ -2208,7 +2254,7 @@ mod tests {
         let reason = wrapped("build_image", COPY_NODE_MODULES);
         assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
 
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.code.as_str(), "dockerfile_copy_not_found");
         assert_eq!(info.failed_job.as_deref(), Some("build_image"));
         assert_eq!(info.settings_section, Some(FailureSettingsSection::Build));
@@ -2334,7 +2380,7 @@ mod tests {
             "build_image",
             "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c make release\" did not complete successfully: exit code: 2",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.stage, S::Build);
         assert_eq!(info.code, C::BuildError);
         assert!(!info.remediation.contains("disk space"));
@@ -2348,7 +2394,7 @@ mod tests {
             "Failed to build image: Built image not found",
         );
         assert_class(&built, S::Image, C::ImageMissing);
-        let info = describe_failure(Some(&built)).unwrap();
+        let info = describe_failure(Some(&built), None).unwrap();
         assert!(info.remediation.contains("disk space"));
 
         // Docker no longer has the image when the deploy job needs it.
@@ -2541,7 +2587,7 @@ mod tests {
             "deploy_compose",
             "Compose deploy failed: Compose stack 'temps-1-2' did not become ready within 300s: service 'web' is starting",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.code, C::HealthCheckTimeout);
         assert_eq!(info.stage, S::HealthCheck);
         assert_eq!(info.timeout_limit_seconds, Some(300));
@@ -2607,7 +2653,7 @@ mod tests {
             "deploy_compose",
             "Compose prepare/pull failed: Compose command failed for project 'temps-1-2': docker compose build timed out after 1800 seconds",
         );
-        let info = describe_failure(Some(&build)).unwrap();
+        let info = describe_failure(Some(&build), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Build, C::BuildTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(1800));
 
@@ -2647,7 +2693,7 @@ mod tests {
             "Docker responded with status code 404: failed to resolve reference \"docker.io/library/app:missing\": docker.io/library/app:missing: not found",
         );
         assert_class(&reason, S::Image, C::ImageNotFound);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
         assert_eq!(info.settings_section, Some(FailureSettingsSection::Source));
     }
@@ -2717,7 +2763,7 @@ mod tests {
     fn unrecognised_external_pull_failure_never_mentions_a_from_line() {
         let reason = external_pull_failure("Docker responded with status code 400: something new");
         assert_class(&reason, S::Image, C::ImagePullFailed);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
     }
 
@@ -2738,7 +2784,7 @@ mod tests {
             "Failed to build image: Build failed: failed to solve: docker.io/library/debian:no-such-tag: failed to resolve source metadata for docker.io/library/debian:no-such-tag: docker.io/library/debian:no-such-tag: not found",
         );
         assert_class(&reason, S::Image, C::BaseImagePull);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(info.remediation.contains("FROM"));
     }
 
@@ -2821,7 +2867,7 @@ mod tests {
             "deploy_container",
             "Application never accepted connections on port 3000 within the readiness limit of 300s (waited 302s; last check: connection refused)",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(
             (info.stage, info.code),
             (S::HealthCheck, C::AppNotListening)
@@ -2853,7 +2899,7 @@ mod tests {
             "deploy_container",
             "Application readiness timed out on port 8080: health checks did not pass within the readiness limit of 120s (waited 121s; last check: request timed out)",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(
             (info.stage, info.code),
             (S::HealthCheck, C::HealthCheckTimeout)
@@ -2907,7 +2953,7 @@ mod tests {
             "download_repo",
             "Git sparse clone of example/repo timed out after 300s",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Source, C::SourceTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(300));
     }
@@ -2918,7 +2964,7 @@ mod tests {
             "deploy_container",
             "Image pull 'team/app:1' exceeded the 30-minute worker deadline",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Image, C::ImagePullTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(1800));
     }
@@ -2948,16 +2994,19 @@ mod tests {
     #[test]
     fn describe_failure_never_echoes_the_reason() {
         let secret = "ghp_shouldNeverLeak123";
-        let info = describe_failure(Some(&wrapped(
-            "build_image",
-            &format!("Build failed with token {secret}"),
-        )))
+        let info = describe_failure(
+            Some(&wrapped(
+                "build_image",
+                &format!("Build failed with token {secret}"),
+            )),
+            None,
+        )
         .unwrap();
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains(secret));
         assert_eq!(info.classifier_version, FAILURE_CLASSIFIER_VERSION);
-        assert!(describe_failure(None).is_none());
-        assert!(describe_failure(Some("   ")).is_none());
+        assert!(describe_failure(None, None).is_none());
+        assert!(describe_failure(Some("   "), None).is_none());
     }
 
     // ── Static-site deploy jobs ─────────────────────────────────────────
@@ -3132,5 +3181,89 @@ mod tests {
     fn disk_exhaustion_during_static_extraction_stays_disk_exhausted() {
         let reason = static_extract("IO error: No space left on device (os error 28)");
         assert_class(&reason, S::Resource, C::DiskExhausted);
+    }
+
+    #[test]
+    fn an_annotated_deploy_failure_needs_a_capability_and_carries_the_fix() {
+        let reason = wrapped(
+            "deploy_container",
+            "Container keeps restarting during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] (restarted 5 times; last exit: exit code 126)",
+        );
+        assert_class(&reason, S::Runtime, C::EntrypointNeedsCapability);
+        let info = describe_failure(Some(&reason), Some(7)).unwrap();
+        assert_eq!(
+            info.settings_section,
+            Some(FailureSettingsSection::ContainerSecurity)
+        );
+        let fix = info.suggested_fix.clone().expect("a suggested fix");
+        assert_eq!(fix.required_capabilities, vec!["NET_BIND_SERVICE"]);
+        assert!(fix.verified);
+        assert_eq!(
+            fix.allow_capabilities,
+            vec![temps_workload::ContainerCapability::NetBindService]
+        );
+        assert_eq!(fix.setting, "allowed_capabilities");
+        assert_eq!(
+            fix.setting_path.as_deref(),
+            Some("/projects/7/container-security")
+        );
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["code"], "entrypoint_needs_capability");
+        assert_eq!(
+            json["suggested_fix"]["allow_capabilities"][0],
+            "NET_BIND_SERVICE"
+        );
+
+        let exited = wrapped(
+            "deploy_container",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE inferred] (exit code 1) after 2s",
+        );
+        let info = describe_failure(Some(&exited), None).unwrap();
+        assert_eq!(info.code, C::EntrypointNeedsCapability);
+        assert!(!info.suggested_fix.unwrap().verified);
+    }
+
+    #[test]
+    fn only_the_deploy_jobs_own_annotation_counts() {
+        // A plain 126 exit or crash loop stays a container exit.
+        for inner in [
+            "Container exited during startup (exit code 126) after 2s",
+            "Container keeps restarting during startup (restarted 5 times; last exit: exit code 126)",
+            // The image printing the marker into Docker's error text.
+            "Container exited during startup (exit code 1: [entrypoint_needs_capability: NET_BIND_SERVICE verified]) after 2s",
+            // ... or into the log tail.
+            "Container exited during startup (exit code 1). Last log lines: Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified]",
+        ] {
+            let reason = wrapped("deploy_container", inner);
+            assert_class(&reason, S::Runtime, C::ContainerExited);
+            assert!(describe_failure(Some(&reason), Some(1)).unwrap().suggested_fix.is_none());
+        }
+        // Another job's error cannot claim it.
+        let other = wrapped(
+            "deploy_compose",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] (exit code 1)",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&other)).code,
+            C::EntrypointNeedsCapability
+        );
+        assert!(describe_failure(Some(&other), Some(1))
+            .unwrap()
+            .suggested_fix
+            .is_none());
+    }
+
+    #[test]
+    fn a_capability_no_project_can_allow_offers_only_the_image_fix() {
+        let reason = wrapped(
+            "deploy_container",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE,NET_RAW verified] (exit code 1) after 1s",
+        );
+        let fix = describe_failure(Some(&reason), Some(3))
+            .unwrap()
+            .suggested_fix
+            .unwrap();
+        assert!(fix.allow_capabilities.is_empty());
+        assert_eq!(fix.not_allowed_capabilities, vec!["NET_RAW"]);
     }
 }

@@ -382,6 +382,7 @@ pub(super) fn environment_preview_project(id: i32) -> projects::Model {
         cloud_analytics_write_mode: Default::default(),
         analytics_identity_mode: Default::default(),
         instantiation_token: None,
+        allowed_capabilities: Vec::new(),
     }
 }
 

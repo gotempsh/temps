@@ -351,6 +351,10 @@ impl DeployImageJob {
             // second field carries. Both halves must agree.
             project_slug: self.config.project_slug.clone(),
             control_plane_grants_socket: self.config.control_plane_grants_socket,
+            // The project's container security opt-in, read when the job
+            // was built. The executing host applies it in the one hardened
+            // host-config function every project container goes through.
+            allowed_capabilities: self.config.allowed_capabilities.clone(),
         };
 
         Ok(PreparedReplica {
@@ -843,14 +847,21 @@ impl DeployImageJob {
             };
 
             if container_info.restart_count.unwrap_or(0) >= CRASH_LOOP_RESTART_THRESHOLD {
-                self.write_startup_log_excerpt(context, deployer.as_ref(), container_id)
+                let finding = self
+                    .diagnose_startup_failure(
+                        context,
+                        deployer.as_ref(),
+                        container_id,
+                        container_info.exit_code,
+                    )
                     .await;
-                return Err(WorkflowError::JobExecutionFailed(
+                return Err(WorkflowError::JobExecutionFailed(annotated(
+                    finding,
                     container_crash_loop_message(
                         &container_info,
                         container_info.restart_count.unwrap_or(0),
                     ),
-                ));
+                )));
             }
             match container_info.status {
                 DeployerContainerStatus::Running => {
@@ -859,10 +870,18 @@ impl DeployImageJob {
                     return Ok(());
                 }
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
-                    self.write_startup_log_excerpt(context, deployer.as_ref(), container_id)
+                    let finding = self
+                        .diagnose_startup_failure(
+                            context,
+                            deployer.as_ref(),
+                            container_id,
+                            container_info.exit_code,
+                        )
                         .await;
-                    let message =
-                        container_exit_failure_message(&container_info, clock.elapsed_secs());
+                    let message = annotated(
+                        finding,
+                        container_exit_failure_message(&container_info, clock.elapsed_secs()),
+                    );
                     self.log(context, format!("❌ {message}")).await?;
                     return Err(WorkflowError::JobExecutionFailed(message));
                 }
@@ -993,23 +1012,49 @@ impl DeployImageJob {
             );
             url.trim_start_matches("http://").to_string()
         });
-        if let Err(error) = wait_for_non_http_probe(
+        let mut observed_exit_code = None;
+        if let Err(error) = wait_for_non_http_probe_observing(
             replica.deployer.as_ref(),
             &replica.result.container_id,
             health,
             address.as_deref(),
             clock.remaining(),
             Some((self, replica.context)),
+            &mut observed_exit_code,
         )
         .await
         {
-            self.write_startup_log_excerpt(
-                replica.context,
-                replica.deployer.as_ref(),
-                &replica.result.container_id,
-            )
-            .await;
-            return Err(error);
+            // Recognise an entrypoint exec failure from the exit code of the
+            // inspection that failed the probe: a later one can already see
+            // the next attempt. Only a failure without one (a probe timeout,
+            // an exec failure) reads it again, best-effort.
+            let exit_code = match observed_exit_code {
+                Some(code) => Some(code),
+                None => tokio::time::timeout(
+                    Duration::from_secs(10),
+                    replica
+                        .deployer
+                        .get_container_info(&replica.result.container_id),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|info| info.exit_code),
+            };
+            let finding = self
+                .diagnose_startup_failure(
+                    replica.context,
+                    replica.deployer.as_ref(),
+                    &replica.result.container_id,
+                    exit_code,
+                )
+                .await;
+            return Err(match error {
+                WorkflowError::JobExecutionFailed(message) => {
+                    WorkflowError::JobExecutionFailed(annotated(finding, message))
+                }
+                other => other,
+            });
         }
         Ok(())
     }
@@ -1165,16 +1210,34 @@ impl DeployImageJob {
         let restarts = container_info.restart_count.unwrap_or(0);
         match container_info.status {
             DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
-                self.write_startup_log_excerpt(context, replica.deployer.as_ref(), container_id)
+                let finding = self
+                    .diagnose_startup_failure(
+                        context,
+                        replica.deployer.as_ref(),
+                        container_id,
+                        container_info.exit_code,
+                    )
                     .await;
-                let message = container_exit_failure_message(&container_info, clock.elapsed_secs());
+                let message = annotated(
+                    finding,
+                    container_exit_failure_message(&container_info, clock.elapsed_secs()),
+                );
                 self.log(context, format!("❌ {message}")).await?;
                 Err(WorkflowError::JobExecutionFailed(message))
             }
             _ if restarts >= CRASH_LOOP_RESTART_THRESHOLD => {
-                self.write_startup_log_excerpt(context, replica.deployer.as_ref(), container_id)
+                let finding = self
+                    .diagnose_startup_failure(
+                        context,
+                        replica.deployer.as_ref(),
+                        container_id,
+                        container_info.exit_code,
+                    )
                     .await;
-                let message = container_crash_loop_message(&container_info, restarts);
+                let message = annotated(
+                    finding,
+                    container_crash_loop_message(&container_info, restarts),
+                );
                 self.log(context, format!("❌ {message}")).await?;
                 Err(WorkflowError::JobExecutionFailed(message))
             }
@@ -1212,6 +1275,11 @@ mod tests {
         /// (instead of repeating the last one).
         stall_after_inspections: bool,
         logs: Option<String>,
+        /// What reading the entrypoint's file capabilities returns; `None`
+        /// answers like a deployer that cannot read them.
+        file_capabilities: Option<Result<Option<temps_workload::FileCapabilities>, String>>,
+        /// Paths whose file capabilities were read.
+        capability_reads: Mutex<Vec<String>>,
         created: Arc<AtomicBool>,
         requests: Mutex<Vec<DeployRequest>>,
         removed: Mutex<Vec<String>>,
@@ -1334,11 +1402,37 @@ mod tests {
                 .ok_or_else(|| DeployerError::Other("no logs scripted".to_string()))
         }
 
+        async fn file_capabilities(
+            &self,
+            container_id: &str,
+            path: &str,
+        ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+            self.capability_reads.lock().unwrap().push(path.to_string());
+            match &self.file_capabilities {
+                Some(Ok(found)) => Ok(found.clone()),
+                Some(Err(_)) | None => Err(DeployerError::file_capabilities(
+                    container_id,
+                    path,
+                    "scripted",
+                    reason_or_unsupported(self.file_capabilities.as_ref()),
+                )),
+            }
+        }
+
         async fn stream_container_logs(
             &self,
             _: &str,
         ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
             Err(DeployerError::Other("not scripted".to_string()))
+        }
+    }
+
+    fn reason_or_unsupported(
+        scripted: Option<&Result<Option<temps_workload::FileCapabilities>, String>>,
+    ) -> String {
+        match scripted {
+            Some(Err(reason)) => reason.clone(),
+            _ => "not supported".to_string(),
         }
     }
 
@@ -1916,6 +2010,143 @@ mod tests {
         assert_tracked_and_removable(&job, &context, &deployer).await;
     }
 
+    const TINI_EPERM: &str = "[FATAL tini (7)] exec /app/server failed: Operation not permitted";
+
+    fn net_bind_service() -> temps_workload::FileCapabilities {
+        temps_workload::FileCapabilities {
+            permitted: vec!["NET_BIND_SERVICE".to_string()],
+            effective: true,
+        }
+    }
+
+    fn crash_looping(
+        logs: &str,
+        exit_code: i32,
+        file_capabilities: Option<Result<Option<temps_workload::FileCapabilities>, String>>,
+    ) -> Arc<ScriptedDeployer> {
+        Arc::new(ScriptedDeployer {
+            logs: Some(logs.to_string()),
+            file_capabilities,
+            ..ScriptedDeployer::inspecting([Ok(ContainerInfo {
+                status: DeployerContainerStatus::Running,
+                exit_code: Some(exit_code),
+                restart_count: Some(CRASH_LOOP_RESTART_THRESHOLD),
+                ..Default::default()
+            })])
+        })
+    }
+
+    #[tokio::test]
+    async fn an_entrypoint_needing_a_capability_is_annotated_and_explained() {
+        let deployer = crash_looping(TINI_EPERM, 1, Some(Ok(Some(net_bind_service()))));
+        let job = builder().build(deployer.clone()).unwrap();
+        let writer = Arc::new(RecordingLogWriter::default());
+        let context = context_writing_to(&writer);
+
+        let message = execution_message(
+            deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.starts_with(
+                "Container keeps restarting during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] ("
+            ),
+            "{message}"
+        );
+        assert!(!message.contains("/app/server"), "{message}");
+        assert_eq!(
+            deployer.capability_reads.lock().unwrap().as_slice(),
+            ["/app/server"]
+        );
+        let lines = writer.lines.lock().unwrap().clone();
+        assert!(
+            lines.iter().any(|line| line.contains(
+                "The image's entrypoint /app/server needs the Linux capability NET_BIND_SERVICE (set with setcap), which Temps removes by default. Allow it for this project and redeploy, or remove it from the image (`setcap -r /app/server`) and listen on a port above 1024."
+            )),
+            "{lines:?}"
+        );
+
+        // The classifier reads the annotation from the persisted reason.
+        let reason = format!(
+            "Job execution failed: Required job 'deploy_container' failed: {:?}",
+            Some(format!("Job execution failed: {message}"))
+        );
+        let info = crate::services::describe_failure(Some(&reason), Some(7)).unwrap();
+        assert_eq!(
+            info.code,
+            crate::services::DeploymentFailureCode::EntrypointNeedsCapability
+        );
+        assert!(info.suggested_fix.is_some());
+    }
+
+    #[tokio::test]
+    async fn unreadable_file_capabilities_infer_net_bind_service() {
+        let deployer = crash_looping(TINI_EPERM, 1, Some(Err("archive refused".to_string())));
+        let job = builder().build(deployer.clone()).unwrap();
+        let context = context_writing_to(&Arc::default());
+        let message = execution_message(
+            deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("[entrypoint_needs_capability: NET_BIND_SERVICE inferred]"),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn other_crash_loops_and_binaries_without_file_capabilities_are_not_annotated() {
+        for (logs, exit_code, caps) in [
+            // A 126 that is EACCES, not EPERM: never probes the binary.
+            ("sh: /app/server: Permission denied", 126, None),
+            // An ordinary crash loop.
+            ("Error: Cannot find module '/app/server.js'", 1, None),
+            // EPERM, but the binary has no file capabilities.
+            (TINI_EPERM, 1, Some(Ok(None))),
+        ] {
+            let deployer = crash_looping(logs, exit_code, caps);
+            let job = builder().build(deployer.clone()).unwrap();
+            let context = context_writing_to(&Arc::default());
+            let message = execution_message(
+                deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                    .await
+                    .unwrap_err(),
+            );
+            assert!(
+                message.starts_with("Container keeps restarting during startup ("),
+                "{logs}: {message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_capability_the_project_already_allows_is_not_suggested_again() {
+        let deployer = crash_looping(TINI_EPERM, 1, Some(Ok(Some(net_bind_service()))));
+        let job = builder()
+            .allowed_capabilities(vec![temps_workload::ContainerCapability::NetBindService])
+            .build(deployer.clone())
+            .unwrap();
+        let writer = Arc::new(RecordingLogWriter::default());
+        let context = context_writing_to(&writer);
+        let message = execution_message(
+            deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            !message.contains("entrypoint_needs_capability"),
+            "{message}"
+        );
+        assert!(writer
+            .lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|line| line.contains("which this project already allows")));
+    }
+
     #[tokio::test]
     async fn a_crash_loop_during_startup_fails_and_stays_tracked() {
         let deployer = Arc::new(ScriptedDeployer::inspecting([Ok(ContainerInfo {
@@ -2013,6 +2244,53 @@ mod tests {
             assert!(message.contains(expected), "{message}");
             assert_tracked_and_removable(&job, &context, &deployer).await;
         }
+    }
+
+    #[tokio::test]
+    async fn a_process_probe_diagnoses_the_exit_it_saw_not_the_next_attempt() {
+        // The probe sees the 126 exit; by the time the failure is diagnosed
+        // the container has restarted and reports Running with exit code 0.
+        let deployer = Arc::new(ScriptedDeployer {
+            logs: Some("sh: /app/server: Operation not permitted".to_string()),
+            file_capabilities: Some(Ok(Some(net_bind_service()))),
+            ..ScriptedDeployer::inspecting([
+                state(DeployerContainerStatus::Running),
+                Ok(ContainerInfo {
+                    status: DeployerContainerStatus::Exited,
+                    exit_code: Some(126),
+                    restart_count: Some(1),
+                    ..Default::default()
+                }),
+                Ok(ContainerInfo {
+                    status: DeployerContainerStatus::Running,
+                    exit_code: Some(0),
+                    restart_count: Some(1),
+                    ..Default::default()
+                }),
+            ])
+        });
+        let job = builder()
+            .health(Some(HealthCheckConfig {
+                probe_type: Some("process".to_string()),
+                ..Default::default()
+            }))
+            .build(deployer.clone())
+            .unwrap();
+        let context = context_writing_to(&Arc::default());
+
+        let message = execution_message(
+            deploy(&job, &context, &deployer, &NodeAssignment::Local, false)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            message.contains("[entrypoint_needs_capability: NET_BIND_SERVICE verified]"),
+            "{message}"
+        );
+        assert_eq!(
+            deployer.capability_reads.lock().unwrap().as_slice(),
+            ["/app/server"]
+        );
     }
 
     // Readiness phase.

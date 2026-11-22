@@ -326,6 +326,42 @@ pub enum DeployerError {
     /// `temps join`.
     #[error(transparent)]
     DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
+    /// The file capabilities of `path` in container `container_id` could
+    /// not be read on `location`. Diagnostic only: the deploy that asked
+    /// has already failed for its own reason.
+    #[error(transparent)]
+    FileCapabilities(Box<FileCapabilitiesError>),
+}
+
+/// Why the file capabilities of a path in a container could not be read.
+/// Boxed in [`DeployerError::FileCapabilities`] to keep the error small.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "Cannot read the file capabilities of '{path}' in container {container_id} on {location}: {reason}"
+)]
+pub struct FileCapabilitiesError {
+    pub container_id: String,
+    pub path: String,
+    pub location: String,
+    pub reason: String,
+}
+
+impl DeployerError {
+    /// A [`DeployerError::FileCapabilities`] for `path` in `container_id`.
+    pub fn file_capabilities(
+        container_id: &str,
+        path: &str,
+        location: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::FileCapabilities(Box::new(FileCapabilitiesError {
+            container_id: container_id.to_string(),
+            path: path.to_string(),
+            location: location.into(),
+            reason: reason.into(),
+        }))
+    }
 }
 
 /// Why a deploy refused to replace an existing container of the same name:
@@ -618,6 +654,18 @@ pub struct DeployRequest {
     /// socket is mounted.
     #[serde(default)]
     pub control_plane_grants_socket: bool,
+    /// Linux capabilities the project allowed back on top of the hardened
+    /// host config (`projects.allowed_capabilities`), read when the deploy
+    /// job was built. Only allow-listed values are representable, so a
+    /// request cannot carry `SYS_ADMIN` or `privileged`.
+    ///
+    /// `#[serde(default)]`: a request from a control plane built before
+    /// this field is fully hardened. An agent built before it ignores the
+    /// field and starts the container without the capability, so the
+    /// image fails exactly as it did before the opt-in (and is diagnosed
+    /// the same way) rather than running with anything extra.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<temps_workload::ContainerCapability>,
 }
 
 /// Docker container log rotation configuration
@@ -1378,6 +1426,26 @@ pub trait ContainerDeployer: Send + Sync {
     /// Get container logs
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError>;
 
+    /// The Linux file capabilities (`security.capability`) set on `path` in
+    /// container `container_id`'s filesystem, following symlinks. Works on a
+    /// stopped or crash-looping container and never downloads the file.
+    ///
+    /// `Ok(None)`: the file has none. `Err`: they could not be read, which
+    /// is what this default says for a runtime that cannot look; callers
+    /// treat that as "unknown", never as "none".
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        Err(DeployerError::file_capabilities(
+            container_id,
+            path,
+            "this runtime",
+            "it cannot read files from containers",
+        ))
+    }
+
     /// Stream container logs
     async fn stream_container_logs(
         &self,
@@ -1835,6 +1903,7 @@ mod tests {
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -2168,6 +2237,7 @@ CMD ["echo", "Hello from container"]
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         assert_eq!(request.environment_vars.len(), 3);

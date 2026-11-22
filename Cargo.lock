@@ -14992,6 +14992,7 @@ dependencies = [
  "temps-providers",
  "temps-shield",
  "temps-test-utils",
+ "temps-workload",
  "thiserror 2.0.21",
  "tokio",
  "tower",

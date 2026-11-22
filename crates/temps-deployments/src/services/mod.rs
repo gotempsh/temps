@@ -93,6 +93,7 @@ pub use sensitive_envelope::*;
 pub mod log_redaction;
 pub use log_redaction::*;
 
+pub mod entrypoint_capability;
 pub mod failure_classifier;
 pub use failure_classifier::{
     describe_failure, DeploymentFailureCode, DeploymentFailureInfo, DeploymentFailureStage,

@@ -1223,6 +1223,7 @@ pub(crate) async fn plane_with_micro_vm_replica(
         labels: HashMap::new(),
         project_slug: Some("shop".into()),
         control_plane_grants_socket: false,
+        allowed_capabilities: Vec::new(),
     };
     let spec = deployment_workload_spec(
         &request,

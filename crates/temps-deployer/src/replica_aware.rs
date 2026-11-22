@@ -165,6 +165,16 @@ impl ContainerDeployer for ReplicaAwareDeployer {
         self.local.get_container_logs(container_id).await
     }
 
+    /// A microVM replica's files live in its guest and are never read from
+    /// here; every other container is the local runtime's.
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        self.local.file_capabilities(container_id, path).await
+    }
+
     async fn stream_container_logs(
         &self,
         container_id: &str,

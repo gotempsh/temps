@@ -158,6 +158,10 @@ pub fn build_router(
             get(handlers::stream_container_logs),
         )
         .route(
+            temps_deployer::remote::FILE_CAPABILITIES_PATH,
+            get(handlers::get_file_capabilities),
+        )
+        .route(
             "/agent/containers/{id}/stats",
             get(handlers::get_container_stats),
         )
@@ -2392,6 +2396,7 @@ pub(crate) mod tests {
                 labels: Default::default(),
                 project_slug: None,
                 control_plane_grants_socket: false,
+                allowed_capabilities: Vec::new(),
             })
             .await
             .expect("the sealed deploy should succeed end to end");

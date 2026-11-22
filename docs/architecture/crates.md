@@ -55,7 +55,7 @@ Self-contained libraries, leaf types and wire protocols with few or no internal 
 | [`temps-service-protocol`](../../crates/temps-service-protocol) | Managed-service types the control plane and node agents exchange, and the engine interface a worker calls without building the engines | **3**: node-agent, providers, providers-core |  |
 | [`temps-signatures`](../../crates/temps-signatures) | Known exploit request signatures, shared by Shield and netwatch (ADR 066, D8) | **1**: shield |  |
 | [`temps-workflows-sdk`](../../crates/temps-workflows-sdk) | Rust durable workflow client and authenticated executor for Temps | none |  |
-| [`temps-workload`](../../crates/temps-workload) | Workload plane leaf types: identity, spec, conditions, events and the runtime driver trait (ADR-052, ADR-055) | **18**: ai-agents, backup, cli, deployer, deployments, entities, netpol-probe, network-policy, node-agent, nodes, providers-core, sandbox-providers, workload-docker, workload-env, workload-netpol, workload-node, workload-plane, workload-volumes |  |
+| [`temps-workload`](../../crates/temps-workload) | Workload plane leaf types: identity, spec, conditions, events and the runtime driver trait (ADR-052, ADR-055) | **19**: ai-agents, backup, cli, deployer, deployments, entities, netpol-probe, network-policy, node-agent, nodes, projects, providers-core, sandbox-providers, workload-docker, workload-env, workload-netpol, workload-node, workload-plane, workload-volumes |  |
 
 ## foundation
 

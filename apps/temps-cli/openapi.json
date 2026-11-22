@@ -15906,6 +15906,40 @@
         ],
         "type": "object"
       },
+      "ContainerCapability": {
+        "description": "A Linux capability a project may add back to its containers.\n\nWire and Docker name are the same: `NET_BIND_SERVICE`, without the\n`CAP_` prefix, the form Docker's `cap_add` takes.",
+        "enum": [
+          "NET_BIND_SERVICE"
+        ],
+        "type": "string"
+      },
+      "ContainerCapabilityOption": {
+        "description": "One capability a project may allow, explained for the console.",
+        "properties": {
+          "description": {
+            "description": "What allowing it does, in plain words.",
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/ContainerCapability"
+          },
+          "label": {
+            "description": "Short label, e.g. \"Bind ports below 1024\".",
+            "type": "string"
+          },
+          "trade_off": {
+            "description": "What it costs in isolation.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "description",
+          "trade_off"
+        ],
+        "type": "object"
+      },
       "ContainerDetailResponse": {
         "description": "Detailed container information with environment variables and metrics",
         "properties": {
@@ -16771,6 +16805,47 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "ContainerSecurityResponse": {
+        "properties": {
+          "allowed_capabilities": {
+            "description": "Capabilities this project's containers get back after `cap_drop:\nALL`. Empty: fully hardened (the default). Applies from the next\ndeployment.",
+            "items": {
+              "$ref": "#/components/schemas/ContainerCapability"
+            },
+            "type": "array"
+          },
+          "always_enforced": {
+            "description": "Hardening every project container keeps whatever is allowed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "can_edit": {
+            "description": "Whether the caller may change the setting.",
+            "type": "boolean"
+          },
+          "edit_requirement": {
+            "description": "Who may change it, for a caller who cannot.",
+            "type": "string"
+          },
+          "options": {
+            "description": "Every capability a project may allow. Nothing outside this list can\nbe granted.",
+            "items": {
+              "$ref": "#/components/schemas/ContainerCapabilityOption"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "allowed_capabilities",
+          "options",
+          "always_enforced",
+          "can_edit",
+          "edit_requirement"
+        ],
         "type": "object"
       },
       "ContainerStatsSample": {
@@ -24454,6 +24529,7 @@
           "static_output_rejected",
           "build_node_unreachable",
           "static_deploy_failed",
+          "entrypoint_needs_capability",
           "unknown"
         ],
         "type": "string"
@@ -24496,6 +24572,17 @@
           "stage": {
             "$ref": "#/components/schemas/DeploymentFailureStage",
             "description": "Pipeline stage the deployment failed in."
+          },
+          "suggested_fix": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/SuggestedFix",
+                "description": "A concrete fix Temps can describe precisely, for failures that have\none (`entrypoint_needs_capability`). Never applied automatically."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "timeout_elapsed_seconds": {
             "description": "How long the timed-out step ran, in seconds, when the reason states it.",
@@ -35273,7 +35360,8 @@
           "environment_variables",
           "git",
           "docker_registry",
-          "build_limits"
+          "build_limits",
+          "container_security"
         ],
         "type": "string"
       },
@@ -80663,6 +80751,60 @@
         },
         "type": "object"
       },
+      "SuggestedFix": {
+        "description": "How to fix a deployment whose entrypoint needs a Linux capability. Temps\nnever applies it on its own: a person, or an agent they confirmed,\nchanges the setting and redeploys.",
+        "properties": {
+          "allow_capabilities": {
+            "description": "What to allow in the project's container security setting to fix it.\nEmpty when the binary needs a capability no project can allow.",
+            "items": {
+              "$ref": "#/components/schemas/ContainerCapability"
+            },
+            "type": "array"
+          },
+          "image_fix": {
+            "description": "The fix in the image instead, which keeps full hardening.",
+            "type": "string"
+          },
+          "not_allowed_capabilities": {
+            "description": "Required capabilities no project can allow; only changing the image\nfixes those.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "required_capabilities": {
+            "description": "Capabilities the entrypoint binary carries, kernel names without\n`CAP_` (e.g. `NET_BIND_SERVICE`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "setting": {
+            "description": "The project setting that fixes it.",
+            "type": "string"
+          },
+          "setting_path": {
+            "description": "The API path that reads and changes the setting, when the project is\nknown (`/projects/{id}/container-security`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "verified": {
+            "description": "Whether Temps read them from the binary (true) or inferred them\nbecause it could not read its file capabilities (false).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "required_capabilities",
+          "verified",
+          "allow_capabilities",
+          "not_allowed_capabilities",
+          "setting",
+          "image_fix"
+        ],
+        "type": "object"
+      },
       "SuggestionDefault": {
         "description": "The user's default for chats that do not set their own mode.",
         "properties": {
@@ -85811,6 +85953,34 @@
             ]
           }
         },
+        "type": "object"
+      },
+      "UpdateContainerSecurityRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "acknowledge_risks": {
+            "description": "Required (true) when the change allows a capability that was not\nallowed before.",
+            "type": "boolean"
+          },
+          "allowed_capabilities": {
+            "description": "The capabilities to allow, as Docker names (`NET_BIND_SERVICE`).\nAnything outside `options` is rejected with 400.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "expected_allowed_capabilities": {
+            "description": "The value the editor loaded; the save fails with 409 if it changed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "allowed_capabilities",
+          "expected_allowed_capabilities"
+        ],
         "type": "object"
       },
       "UpdateCronMonitor": {
@@ -150223,6 +150393,119 @@
             "description": "Policy changed; refresh before retrying"
           }
         },
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/container-security": {
+      "get": {
+        "operationId": "get_container_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerSecurityResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ]
+      },
+      "put": {
+        "operationId": "update_container_security",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateContainerSecurityRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerSecurityResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "A capability outside the allow-list, or a missing acknowledgement"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Instance administrator required, or the assistant tried to allow a capability without the owner's confirmation"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "409": {
+            "description": "The setting changed since it was loaded; refresh before retrying"
+          },
+          "428": {
+            "description": "Recent MFA verification required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "tags": [
           "Projects"
         ]

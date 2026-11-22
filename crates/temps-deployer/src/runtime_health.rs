@@ -473,6 +473,7 @@ mod tests {
             .into(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
         record_creation(&docker, root_a.path(), container.id(), &request).await?;
         record_creation(&docker, root_b.path(), container.id(), &request).await?;

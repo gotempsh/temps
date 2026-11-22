@@ -54,16 +54,19 @@ import {
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import {
   failedDeploymentImageRef,
+  containerSecurityHref,
   failureSettingsLink,
   failureStageLabel,
   failureTimeoutSummary,
 } from '@/lib/deployment-failure-guidance'
+import { EntrypointCapabilityFix } from '@/components/deployments/EntrypointCapabilityFix'
 import { deploymentFailureSummary } from '@/lib/deployment-failure-summary'
 import {
   canRollbackTo,
   deploymentMenuHasActions,
 } from '@/lib/deployment-rollback'
 import {
+  canRedeploySameSource,
   deploymentRedeployPlan,
   resolveDeploymentSourceType,
 } from '@/lib/deployment-source-summary'
@@ -502,11 +505,14 @@ export function CancelledReason({
   deployment,
   projectSlug,
   onEditImage,
+  onRedeploySameSource,
 }: {
   deployment: DeploymentResponse
   projectSlug: string
   /** Opens the redeploy dialog, where a registry image can be edited. */
   onEditImage?: () => void
+  /** Redeploys this deployment's source unchanged, for a one-click fix. */
+  onRedeploySameSource?: () => Promise<void>
 }) {
   // The user's choice belongs to the deployment it was made on: opening a
   // different deployment falls back to that failure's own default, while
@@ -595,6 +601,15 @@ export function CancelledReason({
                   {failedImageRef}
                 </code>
               </p>
+            )}
+            {failure.suggested_fix && (
+              <EntrypointCapabilityFix
+                key={deployment.id}
+                projectId={deployment.project_id}
+                fix={failure.suggested_fix}
+                settingsHref={containerSecurityHref(projectSlug)}
+                onRedeploy={onRedeploySameSource}
+              />
             )}
             <div className="flex flex-wrap gap-2">
               {failedImageRef && onEditImage && (
@@ -1269,10 +1284,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     environmentId: number
     imageRef?: string
     staticBundleId?: number
-  }) => {
+  }): Promise<boolean> => {
     if (!redeployPlan) {
       toast.error('This deployment is no longer available')
-      return
+      return false
     }
     switch (redeployPlan.kind) {
       case 'docker_image': {
@@ -1281,7 +1296,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           editedImageRef?.trim() || deployment?.metadata?.externalImageRef
         if (!ref) {
           toast.error('No image reference found for this deployment')
-          return
+          return false
         }
         await redeployImage.mutateAsync({
           path: { project_id: project.id, environment_id: environmentId },
@@ -1291,12 +1306,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
-        return
+        return true
       }
       case 'static_files':
         if (!staticBundleId || staticBundleId !== redeployPlan.staticBundleId) {
           toast.error('The stored static bundle is no longer available')
-          return
+          return false
         }
         await redeployStatic.mutateAsync({
           path: { project_id: project.id, environment_id: environmentId },
@@ -1306,14 +1321,14 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
-        return
+        return true
       case 'unsupported':
         toast.error(
           redeployPlan.sourceType === 'uploaded_source'
             ? 'Upload the source archive again to redeploy it'
             : 'This manual deployment has no reusable source artifact'
         )
-        return
+        return false
       case 'git':
         await createDeployment.mutateAsync({
           path: {
@@ -1327,6 +1342,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           },
         })
         navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        return true
     }
   }
 
@@ -1585,6 +1601,27 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         <CancelledReason
           deployment={deployment}
           projectSlug={project.slug}
+          onRedeploySameSource={
+            redeployPlan && canRedeploySameSource(deployment, redeployPlan)
+              ? async () => {
+                  const started = await handleRedeploy({
+                    branch: deployment.branch || undefined,
+                    commit: deployment.commit_hash || undefined,
+                    tag: deployment.tag || undefined,
+                    environmentId: deployment.environment_id,
+                    staticBundleId:
+                      redeployPlan.kind === 'static_files'
+                        ? redeployPlan.staticBundleId
+                        : undefined,
+                  })
+                  if (!started) {
+                    throw new Error(
+                      'The source of this deployment can no longer be redeployed'
+                    )
+                  }
+                }
+              : undefined
+          }
           onEditImage={
             redeployPlan?.kind === 'docker_image'
               ? () => setIsRedeployModalOpen(true)
@@ -1739,7 +1776,9 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
           project={project}
           isOpen={isRedeployModalOpen}
           onClose={() => setIsRedeployModalOpen(false)}
-          onConfirm={handleRedeploy}
+          onConfirm={async (reference) => {
+            await handleRedeploy(reference)
+          }}
           mode="redeploy"
           defaultBranch={deployment.branch || ''}
           defaultCommit={deployment.commit_hash || ''}

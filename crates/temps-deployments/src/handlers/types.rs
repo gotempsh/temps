@@ -339,7 +339,10 @@ pub struct DeploymentEnvironmentResponse {
 impl DeploymentResponse {
     pub fn from_service_deployment(deployment: Deployment) -> Self {
         let failure = if deployment.status == "failed" {
-            crate::services::describe_failure(deployment.cancelled_reason.as_deref())
+            crate::services::describe_failure(
+                deployment.cancelled_reason.as_deref(),
+                Some(deployment.project_id),
+            )
         } else {
             None
         };

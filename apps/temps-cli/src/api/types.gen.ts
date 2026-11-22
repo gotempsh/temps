@@ -7538,6 +7538,33 @@ export type ContainerActionResponse = {
 };
 
 /**
+ * A Linux capability a project may add back to its containers.
+ *
+ * Wire and Docker name are the same: `NET_BIND_SERVICE`, without the
+ * `CAP_` prefix, the form Docker's `cap_add` takes.
+ */
+export type ContainerCapability = 'NET_BIND_SERVICE';
+
+/**
+ * One capability a project may allow, explained for the console.
+ */
+export type ContainerCapabilityOption = {
+    /**
+     * What allowing it does, in plain words.
+     */
+    description: string;
+    id: ContainerCapability;
+    /**
+     * Short label, e.g. "Bind ports below 1024".
+     */
+    label: string;
+    /**
+     * What it costs in isolation.
+     */
+    trade_off: string;
+};
+
+/**
  * Detailed container information with environment variables and metrics
  */
 export type ContainerDetailResponse = {
@@ -8016,6 +8043,32 @@ export type ContainerRuntimeOverrides = {
      * send null to restore the image default, or [] to clear the entrypoint.
      */
     entrypoint?: Array<string> | null;
+};
+
+export type ContainerSecurityResponse = {
+    /**
+     * Capabilities this project's containers get back after `cap_drop:
+     * ALL`. Empty: fully hardened (the default). Applies from the next
+     * deployment.
+     */
+    allowed_capabilities: Array<ContainerCapability>;
+    /**
+     * Hardening every project container keeps whatever is allowed.
+     */
+    always_enforced: Array<string>;
+    /**
+     * Whether the caller may change the setting.
+     */
+    can_edit: boolean;
+    /**
+     * Who may change it, for a caller who cannot.
+     */
+    edit_requirement: string;
+    /**
+     * Every capability a project may allow. Nothing outside this list can
+     * be granted.
+     */
+    options: Array<ContainerCapabilityOption>;
 };
 
 /**
@@ -11797,7 +11850,7 @@ export type DeploymentEnvironmentResponse = {
  * Allowlisted failure codes. Wire values are `snake_case` and stable; add new
  * variants rather than renaming existing ones.
  */
-export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'unknown';
+export type DeploymentFailureCode = 'out_of_memory' | 'disk_exhausted' | 'timeout' | 'health_check_failed' | 'repository_authentication' | 'repository_not_found' | 'repository_clone' | 'dns_resolution' | 'network_connection' | 'dependency_lockfile_out_of_sync' | 'dependency_resolution' | 'dependency_download' | 'runtime_version_unsupported' | 'missing_build_script' | 'compile_error' | 'dockerfile_invalid' | 'base_image_pull' | 'image_missing' | 'static_output_missing' | 'port_unavailable' | 'permission_denied' | 'invalid_configuration' | 'container_start' | 'build_error' | 'platform_internal' | 'cancelled' | 'build_timeout' | 'source_timeout' | 'image_pull_timeout' | 'health_check_timeout' | 'app_not_listening' | 'container_exited' | 'image_not_found' | 'registry_authentication' | 'registry_rate_limited' | 'image_platform_mismatch' | 'compose_file_invalid' | 'compose_variable_missing' | 'compose_policy_rejected' | 'compose_build_failed' | 'compose_up_failed' | 'compose_unavailable' | 'volume_mount' | 'route_activation' | 'registry_unavailable' | 'image_pull_failed' | 'dockerfile_copy_not_found' | 'static_output_rejected' | 'build_node_unreachable' | 'static_deploy_failed' | 'entrypoint_needs_capability' | 'unknown';
 
 /**
  * API view of a failed deployment's classification.
@@ -11824,6 +11877,7 @@ export type DeploymentFailureInfo = {
      * Pipeline stage the deployment failed in.
      */
     stage: DeploymentFailureStage;
+    suggested_fix?: SuggestedFix | null;
     /**
      * How long the timed-out step ran, in seconds, when the reason states it.
      */
@@ -16520,7 +16574,7 @@ export type FailureReportPreviewResponse = {
  * Settings surface that fixes a given failure. The console maps each value to
  * a deep link; the API stays independent of console routes.
  */
-export type FailureSettingsSection = 'source' | 'build' | 'deploy' | 'environment_variables' | 'git' | 'docker_registry' | 'build_limits';
+export type FailureSettingsSection = 'source' | 'build' | 'deploy' | 'environment_variables' | 'git' | 'docker_registry' | 'build_limits' | 'container_security';
 
 export type FeatureMaturity = {
     docs_path: string;
@@ -37395,6 +37449,47 @@ export type SuggestNextStepsRequest = {
 };
 
 /**
+ * How to fix a deployment whose entrypoint needs a Linux capability. Temps
+ * never applies it on its own: a person, or an agent they confirmed,
+ * changes the setting and redeploys.
+ */
+export type SuggestedFix = {
+    /**
+     * What to allow in the project's container security setting to fix it.
+     * Empty when the binary needs a capability no project can allow.
+     */
+    allow_capabilities: Array<ContainerCapability>;
+    /**
+     * The fix in the image instead, which keeps full hardening.
+     */
+    image_fix: string;
+    /**
+     * Required capabilities no project can allow; only changing the image
+     * fixes those.
+     */
+    not_allowed_capabilities: Array<string>;
+    /**
+     * Capabilities the entrypoint binary carries, kernel names without
+     * `CAP_` (e.g. `NET_BIND_SERVICE`).
+     */
+    required_capabilities: Array<string>;
+    /**
+     * The project setting that fixes it.
+     */
+    setting: string;
+    /**
+     * The API path that reads and changes the setting, when the project is
+     * known (`/projects/{id}/container-security`).
+     */
+    setting_path?: string | null;
+    /**
+     * Whether Temps read them from the binary (true) or inferred them
+     * because it could not read its file capabilities (false).
+     */
+    verified: boolean;
+};
+
+/**
  * The user's default for chats that do not set their own mode.
  */
 export type SuggestionDefault = {
@@ -39851,6 +39946,23 @@ export type UpdateConnectorRequest = {
      * hostnames chosen for this tunnel (false).
      */
     auto_publish?: boolean | null;
+};
+
+export type UpdateContainerSecurityRequest = {
+    /**
+     * Required (true) when the change allows a capability that was not
+     * allowed before.
+     */
+    acknowledge_risks?: boolean;
+    /**
+     * The capabilities to allow, as Docker names (`NET_BIND_SERVICE`).
+     * Anything outside `options` is rejected with 400.
+     */
+    allowed_capabilities: Array<string>;
+    /**
+     * The value the editor loaded; the save fails with 409 if it changed.
+     */
+    expected_allowed_capabilities: Array<string>;
 };
 
 export type UpdateCronMonitor = {
@@ -76965,6 +77077,92 @@ export type UpdateComposeSecurityResponses = {
 };
 
 export type UpdateComposeSecurityResponse = UpdateComposeSecurityResponses[keyof UpdateComposeSecurityResponses];
+
+export type GetContainerSecurityData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/container-security';
+};
+
+export type GetContainerSecurityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetContainerSecurityResponses = {
+    200: ContainerSecurityResponse;
+};
+
+export type GetContainerSecurityResponse = GetContainerSecurityResponses[keyof GetContainerSecurityResponses];
+
+export type UpdateContainerSecurityData = {
+    body: UpdateContainerSecurityRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/container-security';
+};
+
+export type UpdateContainerSecurityErrors = {
+    /**
+     * A capability outside the allow-list, or a missing acknowledgement
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Instance administrator required, or the assistant tried to allow a capability without the owner's confirmation
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * The setting changed since it was loaded; refresh before retrying
+     */
+    409: unknown;
+    /**
+     * Recent MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateContainerSecurityResponses = {
+    200: ContainerSecurityResponse;
+};
+
+export type UpdateContainerSecurityResponse = UpdateContainerSecurityResponses[keyof UpdateContainerSecurityResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;

@@ -546,6 +546,24 @@ pub struct RemoveImagesRequest {
 /// Path of the agent's image removal endpoint.
 pub const REMOVE_IMAGES_PATH: &str = "/agent/images/remove";
 
+/// Path of the agent's file-capability lookup for one container.
+pub const FILE_CAPABILITIES_PATH: &str = "/agent/containers/{id}/file-capabilities";
+
+/// Query of `GET /agent/containers/{id}/file-capabilities`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCapabilitiesQuery {
+    /// Absolute path inside the container (symlinks are followed).
+    pub path: String,
+}
+
+/// Answer of `GET /agent/containers/{id}/file-capabilities`. A struct, not
+/// a bare `Option`, so "the file has none" (`capabilities: null`) is not
+/// read as "the agent sent no data".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCapabilitiesAnswer {
+    pub capabilities: Option<temps_workload::FileCapabilities>,
+}
+
 /// How long one removal batch may take on a node before the control plane
 /// gives up on it. Generous: deleting layers of large images is slow, and a
 /// timeout only leaves the images for the node's housekeeping.
@@ -1614,6 +1632,31 @@ impl ContainerDeployer for RemoteNodeDeployer {
             container_id,
         )
         .await
+    }
+
+    /// An agent built before this endpoint answers 404 without a JSON body,
+    /// which is an `Err`: the caller treats it as "unknown", never "none".
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        let route = FILE_CAPABILITIES_PATH.replace("{id}", &urlencoding::encode(container_id));
+        let answer: FileCapabilitiesAnswer = self
+            .agent_get_container(
+                &format!("{route}?path={}", urlencoding::encode(path)),
+                container_id,
+            )
+            .await
+            .map_err(|error| {
+                DeployerError::file_capabilities(
+                    container_id,
+                    path,
+                    format!("node {}", self.node_name),
+                    error.to_string(),
+                )
+            })?;
+        Ok(answer.capabilities)
     }
 
     async fn stream_container_logs(
@@ -4077,6 +4120,7 @@ mod tests {
             labels: std::collections::HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         let result = deployer
@@ -4606,6 +4650,7 @@ mod tests {
             labels: Default::default(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         }
     }
 
@@ -4686,6 +4731,7 @@ mod tests {
             labels: std::collections::HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         let result = deployer.deploy_container(request).await;

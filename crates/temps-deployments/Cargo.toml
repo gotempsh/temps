@@ -41,7 +41,7 @@ temps-docker-housekeeping = { path = "../temps-docker-housekeeping" }
 temps-ci-tokens = { path = "../temps-ci-tokens" }
 temps-traefik-discovery = { path = "../temps-traefik-discovery" }
 temps-otel = { path = "../temps-otel" }
-temps-workload = { path = "../temps-workload" }
+temps-workload = { path = "../temps-workload", features = ["openapi"] }
 temps-workload-docker = { path = "../temps-workload-docker" }
 temps-workload-env = { path = "../temps-workload-env" }
 temps-workload-plane = { path = "../temps-workload-plane" }
