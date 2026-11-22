@@ -14561,6 +14561,13 @@
             "description": "Whether every `docker compose config` option Temps needs is present.",
             "type": "boolean"
           },
+          "unsupported_reason": {
+            "description": "Set when this installation cannot deploy Compose projects at all\n(Temps itself runs in a container), as opposed to a host whose Compose\nCLI is missing or old. `applicable` is false then: there is nothing to\ninstall or upgrade, and clients should explain the limit where a\nCompose project would be created instead of warning about the CLI.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "version": {
             "type": [
               "string",
@@ -24262,6 +24269,7 @@
           "compose_build_failed",
           "compose_up_failed",
           "compose_unavailable",
+          "compose_unsupported_environment",
           "volume_mount",
           "route_activation",
           "registry_unavailable",
@@ -58912,6 +58920,10 @@
       },
       "PresetResponse": {
         "properties": {
+          "available": {
+            "description": "Whether this instance can deploy projects that use the preset. A\npreset stays in the catalog when it cannot, so a client can show it\nwith the reason instead of hiding it.",
+            "type": "boolean"
+          },
           "default_port": {
             "description": "Default port the application listens on (None for static sites)",
             "example": 3000,
@@ -58941,6 +58953,13 @@
           "slug": {
             "description": "Unique identifier slug for the preset",
             "type": "string"
+          },
+          "unavailable_reason": {
+            "description": "Why the preset cannot be used on this instance, when `available` is\nfalse.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -58948,7 +58967,8 @@
           "label",
           "icon_url",
           "project_type",
-          "description"
+          "description",
+          "available"
         ],
         "type": "object"
       },
