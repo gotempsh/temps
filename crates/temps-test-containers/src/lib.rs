@@ -65,9 +65,67 @@ pub trait TestContainerExt<I: Image> {
 
 impl<I: Image, T: ImageExt<I>> TestContainerExt<I> for T {
     fn with_test_labels(self) -> ContainerRequest<I> {
+        // `TESTCONTAINERS_COMMAND=keep` asks testcontainers to leave the
+        // container behind for inspection. Labelling it would hand it to the
+        // exit hook and the startup sweep, which would delete it anyway.
+        if keep_mode(env_value("TESTCONTAINERS_COMMAND").as_deref()) {
+            return self.with_labels(Vec::<(String, String)>::new());
+        }
         init();
         self.with_labels(process_labels(unix_now()))
     }
+}
+
+#[allow(
+    clippy::disallowed_methods,
+    reason = "test-only crate: reads the same Docker/testcontainers variables testcontainers itself reads, before any application configuration exists"
+)]
+fn env_value(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Whether the testcontainers command variable asks to keep containers.
+fn keep_mode(command: Option<&str>) -> bool {
+    command.is_some_and(|value| value.trim().eq_ignore_ascii_case("keep"))
+}
+
+/// Unix socket paths testcontainers tries, in order, when `DOCKER_HOST` is
+/// unset and `/var/run/docker.sock` is absent.
+fn fallback_sockets(xdg_runtime_dir: Option<&str>, home: Option<&str>) -> Vec<String> {
+    let mut sockets = Vec::new();
+    if let Some(dir) = xdg_runtime_dir {
+        sockets.push(format!("{dir}/.docker/run/docker.sock"));
+    }
+    if let Some(home) = home {
+        sockets.push(format!("{home}/.docker/run/docker.sock"));
+        sockets.push(format!("{home}/.docker/desktop/docker.sock"));
+    }
+    sockets
+}
+
+/// Connects to the daemon testcontainers talks to: an explicit `DOCKER_HOST`
+/// wins, then `/var/run/docker.sock`, then the per-user sockets testcontainers
+/// falls back to. bollard's own defaults stop at the second step.
+fn connect_docker() -> Option<Docker> {
+    let use_defaults =
+        env_value("DOCKER_HOST").is_some() || std::path::Path::new("/var/run/docker.sock").exists();
+    if !use_defaults {
+        let xdg = env_value("XDG_RUNTIME_DIR");
+        let home = env_value("HOME");
+        for socket in fallback_sockets(xdg.as_deref(), home.as_deref()) {
+            if !std::path::Path::new(&socket).exists() {
+                continue;
+            }
+            if let Ok(docker) = Docker::connect_with_socket(
+                &socket,
+                DOCKER_TIMEOUT.as_secs(),
+                bollard::API_DEFAULT_VERSION,
+            ) {
+                return Some(docker);
+            }
+        }
+    }
+    Docker::connect_with_defaults().ok()
 }
 
 fn unix_now() -> u64 {
@@ -153,7 +211,7 @@ where
             else {
                 return;
             };
-            let Ok(docker) = Docker::connect_with_defaults() else {
+            let Some(docker) = connect_docker() else {
                 return;
             };
             runtime.block_on(async {
@@ -287,6 +345,27 @@ pub async fn reap_stale(docker: &Docker, now: u64) -> usize {
 mod tests {
     use super::*;
     use testcontainers::{runners::AsyncRunner, GenericImage};
+
+    #[test]
+    fn keep_mode_is_recognised_case_insensitively() {
+        assert!(keep_mode(Some("keep")));
+        assert!(keep_mode(Some(" Keep ")));
+        assert!(!keep_mode(Some("remove")));
+        assert!(!keep_mode(None));
+    }
+
+    #[test]
+    fn fallback_sockets_follow_testcontainers_order() {
+        assert_eq!(
+            fallback_sockets(Some("/run/user/1"), Some("/home/u")),
+            vec![
+                "/run/user/1/.docker/run/docker.sock",
+                "/home/u/.docker/run/docker.sock",
+                "/home/u/.docker/desktop/docker.sock",
+            ]
+        );
+        assert!(fallback_sockets(None, None).is_empty());
+    }
 
     fn candidate(pid: Option<u32>, host: &str, age: u64, now: u64) -> Candidate {
         Candidate {
