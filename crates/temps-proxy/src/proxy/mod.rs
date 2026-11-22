@@ -29,8 +29,8 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
-    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
+    preview_cookie_needs_refresh, preview_request_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
 };
 use crate::service::acme_challenge_cache::AcmeChallengeCache;
 use crate::service::cert_host_cache::CertHostCache;
@@ -413,9 +413,9 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
-    /// The previewed sandbox runs on a worker node: `upstream_peer` sends the
-    /// request to this process's worker preview relay instead of the gateway.
-    pub preview_on_worker: bool,
+    /// For a local preview, the gateway port from the same settings snapshot as
+    /// its token. A worker preview uses the worker relay.
+    pub preview_gateway_port: Option<u16>,
     /// The admin gate denied this request, so `upstream_peer` must send it to
     /// the listener that serves only the console's public routes (ADR-051)
     /// instead of resolving a peer. A non-allowlisted client can therefore
@@ -2649,7 +2649,14 @@ impl LoadBalancer {
                     port = host.port,
                     "preview-auth: allowed"
                 );
-                ctx.preview_on_worker = on_worker;
+                if !on_worker {
+                    if !settings.preview_gateway.enabled {
+                        ctx.routing_status = "preview_disabled".to_string();
+                        session.respond_error(503).await?;
+                        return Ok(true);
+                    }
+                    ctx.preview_gateway_port = Some(settings.preview_gateway.effective_host_port());
+                }
                 ctx.preview_route = Some(host);
                 ctx.routing_status = "preview".to_string();
 
@@ -2678,7 +2685,7 @@ impl LoadBalancer {
                 // settings row (reloaded on NOTIFY, so a rotated secret is
                 // picked up without a restart), never from a per-request
                 // environment read.
-                if ctx.preview_on_worker {
+                if on_worker {
                     if let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() {
                         session
                             .req_header_mut()
@@ -3732,7 +3739,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
-            preview_on_worker: false,
+            preview_gateway_port: None,
             path_route: None,
             gated_host: false,
             gate_identity: None,
@@ -4401,7 +4408,9 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let gateway_peer = if ctx.preview_on_worker {
+            let gateway_peer = if let Some(port) = ctx.preview_gateway_port {
+                format!("127.0.0.1:{port}")
+            } else {
                 // A sandbox on a worker is reached through the relay the
                 // sandbox plugin runs in the console process; a proxy
                 // running on its own has none.
@@ -4413,8 +4422,6 @@ impl ProxyHttp for LoadBalancer {
                     ));
                 };
                 relay.address.to_string()
-            } else {
-                preview_gateway_peer()
             };
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_request_group_key(host, &ctx.request_id);

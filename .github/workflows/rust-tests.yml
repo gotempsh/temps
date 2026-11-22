@@ -1522,7 +1522,8 @@ jobs:
             filter: >-
               (package(temps-providers*) and kind(=lib) and test(backup_and_restore_to_s3)) or
               (package(temps-backup) and (binary(workload_job_proof) or
-               (kind(=lib) and test(resolve_backup_location_from_s3_finds_mariadb))))
+               (kind(=lib) and (test(resolve_backup_location_from_s3_finds_mariadb) or
+                test(bundled_database_stops_retaining_wal_after_the_reconcile)))))
             extra_args: --no-capture
             test_threads: "1"
             redis_image: true

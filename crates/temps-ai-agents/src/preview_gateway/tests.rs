@@ -1121,7 +1121,7 @@ fn a_recorded_setup_error_never_carries_the_shared_secret() {
     // Its own record: the gateway's Docker tests in this module write the
     // process-wide one concurrently.
     let record = FailureRecord::new();
-    record_outcome_in(&record, &Err(error), &spec);
+    record_outcome_in(&record, &Err::<(), _>(error), &spec);
     let failure = record.get().expect("recorded");
     assert!(
         failure
