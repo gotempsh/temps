@@ -10,6 +10,7 @@ import type {
   SetupField,
 } from '@/api/client'
 import {
+  addressAccessLabel,
   applyValues,
   idList,
   textList,
@@ -33,6 +34,9 @@ import {
   wayInLabel,
   planGate,
   accessPolicyMissing,
+  dnsProviderSetupPath,
+  dnsProviderTypeLabel,
+  visitUrl,
 } from './reachability'
 
 const address = (
@@ -123,11 +127,33 @@ describe('reachability headline', () => {
   })
 })
 
+test('an unknown address with no way in on record is not said to have none', () => {
+  const address = {
+    audience: 'public',
+    network: null,
+    way_in: null,
+  } as const
+  expect(addressAccessLabel({ ...address, state: 'unknown' })).toBe('Anyone')
+  expect(addressAccessLabel({ ...address, state: 'not_reachable' })).toBe(
+    'Anyone · No way in yet'
+  )
+  expect(
+    addressAccessLabel({
+      ...address,
+      state: 'reachable',
+      way_in: 'cdn:cloudflare',
+    })
+  ).toBe('Anyone · Through Cloudflare')
+})
+
 test('ways in read as words', () => {
   expect(wayInLabel('tunnel:homelab')).toBe('Tunnel homelab')
   expect(wayInLabel('direct:edge-1')).toBe('Straight to edge-1')
   expect(wayInLabel('direct:control-plane')).toBe('This server')
   expect(wayInLabel(null)).toBe('No way in yet')
+  expect(wayInLabel('cdn:cloudflare')).toBe('Through Cloudflare')
+  expect(wayInLabel('cdn:bunny')).toBe('Through bunny.net')
+  expect(wayInLabel('forwarded')).toBe('Through a proxy')
 })
 
 describe('runs', () => {
@@ -345,14 +371,15 @@ describe('certificate choices', () => {
       })
     ).toEqual({ showHttp01: true, recommended: 'http-01', http01Note: null })
     // Port forwarding can bring port 80 to a server Temps sees listening
-    // elsewhere: still listed, not recommended, and the note says why.
+    // elsewhere: HTTP-01 is still listed, DNS-01 is the recommendation, and
+    // the note says why.
     const noPort80 = certificateChoices({
       coveringTunnels: 0,
       wildcard: false,
       http01Available: false,
     })
     expect(noPort80.showHttp01).toBe(true)
-    expect(noPort80.recommended).toBeNull()
+    expect(noPort80.recommended).toBe('dns-01')
     expect(noPort80.http01Note).toContain('port 80')
   })
 
@@ -456,6 +483,25 @@ describe('conflicts (ADR 064 D4)', () => {
     expect(conflictChoices(record, false).map((c) => c.decision)).toEqual([
       'keep',
       'overwrite',
+    ])
+  })
+
+  test('an edited Cloudflare rule is kept unless they say delete it (ADR 070 D2)', () => {
+    const rule = entry({
+      key: 'run-1/edge_rule/app.example.com/https_redirect',
+      intent: {
+        type: 'edge_rule',
+        hostname: 'app.example.com',
+        purpose: 'https_redirect',
+      },
+      conflict: 'it is now `(http.host eq "app.example.com")`',
+    })
+    expect(conflictSubject(rule)).toBe(
+      'The Cloudflare redirect rule for app.example.com'
+    )
+    expect(conflictChoices(rule, true)).toEqual([
+      { decision: 'keep', label: 'Keep the rule' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
     ])
   })
 
@@ -702,5 +748,93 @@ describe('tailnet users (ADR 065 D6)', () => {
     expect(audienceLabel({ audience: 'tailnet_users', network: null })).toBe(
       'Listed tailnet users'
     )
+  })
+})
+
+describe('DNS provider setup', () => {
+  test('names the account type that is missing', () => {
+    expect(dnsProviderTypeLabel('cloudflare')).toBe('Cloudflare')
+    expect(dnsProviderTypeLabel('Route53')).toBe('Route 53')
+    expect(dnsProviderTypeLabel('unknown-kind')).toBe('unknown-kind')
+    expect(dnsProviderTypeLabel(null)).toBe('')
+  })
+
+  test('links to adding one and comes back', () => {
+    const back = '/projects/shop/environments/4/reachability?audience=public'
+    const path = dnsProviderSetupPath('cloudflare', back)
+    const url = new URL(path, 'http://console.test')
+    expect(url.pathname).toBe('/dns-providers/add')
+    expect(url.searchParams.get('provider')).toBe('cloudflare')
+    expect(url.searchParams.get('return')).toBe(back)
+    expect(
+      new URL(
+        dnsProviderSetupPath(null, back),
+        'http://console.test'
+      ).searchParams.has('provider')
+    ).toBe(false)
+  })
+})
+
+describe('Visit button', () => {
+  const generated = 'http://hello-temps-production.localho.st'
+
+  test('opens the reachable custom domain, not the generated address', () => {
+    const url = visitUrl(
+      environment({
+        state: 'reachable',
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+            state: 'reachable',
+          }),
+          address({
+            address: 'app12.autoship.so',
+            state: 'reachable',
+            way_in: 'tunnel:autoship-so',
+          }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBe('https://app12.autoship.so')
+  })
+
+  test('opens a configured domain even before it reaches the app', () => {
+    const url = visitUrl(
+      environment({
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+          }),
+          address({ address: 'app12.autoship.so' }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBe('https://app12.autoship.so')
+  })
+
+  test('offers no Visit when nothing reaches it and no domain is set', () => {
+    const url = visitUrl(
+      environment({
+        addresses: [
+          address({
+            address: 'hello-temps-production.localho.st',
+            source: 'generated',
+          }),
+        ],
+      }),
+      generated
+    )
+    expect(url).toBeUndefined()
+  })
+
+  test('uses the environment URL until the check answers', () => {
+    expect(visitUrl(undefined, generated)).toBe(generated)
+    expect(
+      visitUrl(environment({ state: 'checking', addresses: [] }), generated)
+    ).toBe(generated)
   })
 })

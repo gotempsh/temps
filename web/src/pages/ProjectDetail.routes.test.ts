@@ -7,14 +7,14 @@ import { join } from 'node:path'
 import { matchRoutes, type RouteObject } from 'react-router'
 import ts from 'typescript'
 
-import { autopilotPaths } from '@/components/agents/AutopilotPage'
 import {
   projectNavItems,
   projectNavItemsFor,
 } from '@/components/command/CommandPalette'
 import {
   isExternalProjectPage,
-  PROJECT_SECTION_LINKS,
+  PROJECT_NAV_SECTIONS,
+  projectNavGroupsFor,
 } from '@/lib/project-navigation'
 import { LEGACY_PROJECT_ROUTES } from '@/lib/project-settings-sections'
 
@@ -186,7 +186,7 @@ const PROJECT_ROUTES = {
  * `:param` (how `errors/alert-rules` used to render an error group).
  */
 function resolveUrl(routes: ParsedRoute[], url: string): string {
-  const pathname = url.split('?')[0]
+  const pathname = url.split(/[?#]/)[0]
   const matches = matchRoutes(routes, `/${pathname}`)
   if (!matches) return `${pathname}: no route`
   const leaf = matches[matches.length - 1]
@@ -220,7 +220,7 @@ function resolveLeaf(
   routes: ParsedRoute[],
   url: string
 ): { route: ParsedRoute; pattern: string } | undefined {
-  const pathname = url.split('?')[0]
+  const pathname = url.split(/[?#]/)[0]
   const matches = matchRoutes(routes, `/${pathname}`)
   if (!matches) return undefined
   const leaf = matches[matches.length - 1]
@@ -270,14 +270,11 @@ function duplicatePaths(routes: ParsedRoute[], prefix = ''): string[] {
   return duplicates
 }
 
-/** The section-nav links ProjectSectionLayout renders for an external project. */
+/** Every menu entry and tab a monitoring-only project is offered. */
 function externalSectionUrls(): string[] {
-  const hidden = ['analytics/api-traffic', 'ai-crawlers']
-  return (['analytics', 'errors', 'traces', 'monitoring'] as const)
-    .flatMap((section) => PROJECT_SECTION_LINKS[section] ?? [])
-    .map((link) => link.url)
-    .filter((url) => !hidden.includes(url))
-    .concat(['settings/general', 'settings/telemetry'])
+  return projectNavGroupsFor({ source_type: 'external' }).flatMap((group) =>
+    group.sections.flatMap((section) => section.tabs.map((tab) => tab.url))
+  )
 }
 
 describe('project route tables', () => {
@@ -303,10 +300,11 @@ describe('project route tables', () => {
 })
 
 describe('section navigation', () => {
-  test('every hosted section link opens a registered page', () => {
-    const urls = Object.values(PROJECT_SECTION_LINKS).flatMap((links) =>
-      links.map((link) => link.url)
+  test('every menu entry and tab opens a registered page', () => {
+    const urls = PROJECT_NAV_SECTIONS.flatMap((section) =>
+      section.tabs.map((tab) => tab.url)
     )
+    expect(urls).toContain('build-deploy')
     expect(
       urls
         .map((url) => resolveUrl(PROJECT_ROUTES.hosted, url))
@@ -376,7 +374,7 @@ describe('command palette project pages', () => {
       // settings entry must land on its own route, not on that fallback.
       if (item.url.startsWith('settings/'))
         expect(resolveLeaf(PROJECT_ROUTES.external, item.url)?.route.path).toBe(
-          item.url.split('?')[0]
+          item.url.split(/[?#]/)[0]
         )
     }
   })
@@ -389,12 +387,28 @@ describe('command palette project pages', () => {
       // page standing in for a hosting-only settings page.
       expect([`*`, 'settings/*']).toContain(leaf?.route.path ?? '*')
     }
-    expect(projectNavItemsFor({ source_type: 'git' })).toEqual(projectNavItems)
+    expect(
+      projectNavItemsFor({ source_type: 'git', preset: 'docker-compose' })
+    ).toEqual(projectNavItems.filter((item) => item.preset !== 'dockerfile'))
+  })
+
+  test('preset-specific settings are offered only for that preset', () => {
+    const titles = (preset: string) =>
+      projectNavItemsFor({ source_type: 'git', preset }).map(
+        (item) => item.title
+      )
+    expect(titles('nextjs')).not.toContain('Docker Compose')
+    expect(titles('nextjs')).not.toContain('Dockerfile path')
+    expect(titles('nextjs')).toContain('Health checks')
+    expect(titles('dockerfile')).toContain('Dockerfile path')
+    expect(titles('dockerfile')).not.toContain('Compose file')
+    expect(titles('dockercompose')).toContain('Compose file')
+    expect(titles('dockercompose')).not.toContain('Container startup')
   })
 
   test('Build & Deploy opens the combined delivery settings', () => {
     expect(
-      projectNavItems.find((item) => item.title === 'Build & Deploy')?.url
+      projectNavItems.find((item) => item.title === 'Build & deploy')?.url
     ).toBe('settings/delivery')
   })
 })
@@ -451,21 +465,48 @@ describe('legacy routes', () => {
   })
 })
 
-describe('autopilot links', () => {
-  test('land on the agent routes', () => {
-    const paths = autopilotPaths('demo')
-    const prefix = '/projects/demo/'
-    for (const [url, pattern] of [
-      [paths.agent('nightly'), 'agents/detail/:agentSlug'],
-      [paths.editAgent('nightly'), 'agents/detail/:agentSlug/edit'],
-      [paths.run(42), 'agents/:runId'],
+describe('agent run links', () => {
+  test('autofix runs still open at agents/:runId', () => {
+    const match = matchRoutes(PROJECT_ROUTES.hosted, '/agents/42')
+    expect((match ?? []).slice(-1)[0]?.route.path).toBe('agents/:runId')
+  })
+
+  test('retired workflow definition pages land on the redirect', () => {
+    for (const url of [
+      '/agents/detail/nightly',
+      '/agents/detail/nightly/edit',
     ]) {
-      expect(url.startsWith(prefix)).toBe(true)
-      const match = matchRoutes(
-        PROJECT_ROUTES.hosted,
-        url.slice(prefix.length - 1)
-      )
-      expect((match ?? []).slice(-1)[0]?.route.path).toBe(pattern)
+      const match = matchRoutes(PROJECT_ROUTES.hosted, url)
+      expect((match ?? []).slice(-1)[0]?.route.path).toBe('agents/detail/*')
     }
+  })
+})
+
+describe('project-scoped pages', () => {
+  test('analytics remounts per project so no selection follows a switch', () => {
+    // A cached project switch keeps ProjectDetail mounted. Without a key, the
+    // analytics page's chosen referrer and open "Exclude" dialog would carry
+    // over and could add the previous project's target to the next one.
+    const file = join(SRC, 'pages/ProjectDetail.tsx')
+    const source = ts.createSourceFile(
+      file,
+      readFileSync(file, 'utf8'),
+      ts.ScriptTarget.Latest,
+      true,
+      ts.ScriptKind.TSX
+    )
+    const keys: (string | undefined)[] = []
+    const visit = (node: ts.Node) => {
+      const opening = openingOf(node)
+      if (opening?.tagName.getText() === 'ProjectAnalytics') {
+        const key = attribute(opening, 'key')?.initializer
+        keys.push(
+          key && ts.isJsxExpression(key) ? key.expression?.getText() : undefined
+        )
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(source)
+    expect(keys).toEqual(['project.id', 'project.id'])
   })
 })

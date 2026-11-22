@@ -21,7 +21,6 @@ const FILES = [
   'docs/features/ai-gateway/page.mdx',
   'docs/features/ai-tracing/page.mdx',
   'docs/howto/admin-listener/page.mdx',
-  'web/src/pages/AiGatewaySetupPage.tsx',
   'web/src/pages/AiGateway.tsx',
 ]
 
@@ -46,10 +45,10 @@ test('the quick-start documents the /api/ai/v1 base URL', () => {
   expect(source).toContain('https://your-temps-instance.com/api/ai/v1')
 })
 
-test.each([
-  'web/src/pages/AiGatewaySetupPage.tsx',
-  'web/src/pages/AiGateway.tsx',
-])('%s derives its endpoint from the /api prefix', (file) => {
-  const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
-  expect(source).toContain('`${externalUrl}/api/ai/v1`')
-})
+test.each(['web/src/pages/AiGateway.tsx'])(
+  '%s derives its endpoint from the /api prefix',
+  (file) => {
+    const source = readFileSync(path.join(REPO_ROOT, file), 'utf8')
+    expect(source).toContain('`${externalUrl}/api/ai/v1`')
+  }
+)

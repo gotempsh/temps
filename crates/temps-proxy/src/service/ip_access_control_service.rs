@@ -19,6 +19,13 @@ use utoipa::ToSchema;
 /// fresh. An admin block list changing within this window is acceptable.
 const BLOCKLIST_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Shortest prefix a block rule may have without an explicit confirmation.
+/// A /8 is 16 million IPv4 addresses; an IPv6 /16 is far larger than any
+/// allocation a single operator would block on purpose. Anything broader is
+/// almost always a typo or a catch-all that takes every visitor offline.
+pub const MIN_BLOCK_PREFIX_V4: u8 = 8;
+pub const MIN_BLOCK_PREFIX_V6: u8 = 16;
+
 #[derive(Error, Debug)]
 pub enum IpAccessControlError {
     #[error("Database error: {0}")]
@@ -35,6 +42,31 @@ pub enum IpAccessControlError {
 
     #[error("Internal error: {0}")]
     Internal(String),
+
+    #[error(
+        "Block rule {rule} covers a /{prefix_len} range, wider than the /{min_prefix_len} minimum \
+         for {family}; resubmit with confirm_broad_range=true if you mean to block this much of \
+         the internet"
+    )]
+    RangeTooBroad {
+        rule: String,
+        prefix_len: u8,
+        min_prefix_len: u8,
+        family: &'static str,
+    },
+
+    #[error(
+        "Block rule {rule} matches your own address {caller_ip}, so you and every other visitor \
+         from it would be refused by the proxy, the console included; resubmit with \
+         acknowledge_lockout=true if that is intended"
+    )]
+    WouldLockOutCaller { rule: String, caller_ip: String },
+
+    #[error(
+        "IP access control rule {rule_id} was changed by another request while this update was \
+         being checked; reload the rule and apply the change again"
+    )]
+    RuleChanged { rule_id: i32 },
 }
 
 /// Response model for IP access control rules
@@ -78,6 +110,13 @@ pub struct CreateIpAccessControlRequest {
     /// Optional reason for the action
     #[schema(example = "Malicious activity detected")]
     pub reason: Option<String>,
+    /// Required to save a block rule broader than /8 (IPv4) or /16 (IPv6).
+    #[serde(default)]
+    pub confirm_broad_range: bool,
+    /// Required to save a block rule that matches the address this request
+    /// came from.
+    #[serde(default)]
+    pub acknowledge_lockout: bool,
 }
 
 /// Request to update an IP access control rule
@@ -89,6 +128,59 @@ pub struct UpdateIpAccessControlRequest {
     pub action: Option<String>,
     /// Optional new reason
     pub reason: Option<String>,
+    /// Required when the resulting block rule is broader than /8 (IPv4) or
+    /// /16 (IPv6).
+    #[serde(default)]
+    pub confirm_broad_range: bool,
+    /// Required when the resulting block rule matches the address this
+    /// request came from.
+    #[serde(default)]
+    pub acknowledge_lockout: bool,
+}
+
+/// Refuse a block rule that is unreasonably broad, or that would cut off the
+/// caller, unless the caller said so. Allow rules block nothing and are not
+/// checked. Pure: no database access.
+fn check_block_rule_safety(
+    network: &IpNetwork,
+    action: &str,
+    caller_ip: Option<IpAddr>,
+    confirm_broad_range: bool,
+    acknowledge_lockout: bool,
+) -> Result<(), IpAccessControlError> {
+    if action != "block" {
+        return Ok(());
+    }
+
+    let (min_prefix_len, family) = match network {
+        IpNetwork::V4(_) => (MIN_BLOCK_PREFIX_V4, "IPv4"),
+        IpNetwork::V6(_) => (MIN_BLOCK_PREFIX_V6, "IPv6"),
+    };
+    if network.prefix() < min_prefix_len && !confirm_broad_range {
+        return Err(IpAccessControlError::RangeTooBroad {
+            rule: network.to_string(),
+            prefix_len: network.prefix(),
+            min_prefix_len,
+            family,
+        });
+    }
+
+    if let Some(caller) = caller_ip {
+        // The proxy matches the address it sees; a caller reaching the console
+        // over IPv6 as an IPv4-mapped address is the same visitor.
+        let mapped = match caller {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        let covered = network.contains(caller) || mapped.is_some_and(|ip| network.contains(ip));
+        if covered && !acknowledge_lockout {
+            return Err(IpAccessControlError::WouldLockOutCaller {
+                rule: network.to_string(),
+                caller_ip: mapped.unwrap_or(caller).to_string(),
+            });
+        }
+    }
+    Ok(())
 }
 
 pub struct IpAccessControlService {
@@ -144,13 +236,13 @@ impl IpAccessControlService {
         &self,
         request: CreateIpAccessControlRequest,
         created_by: Option<i32>,
+        caller_ip: Option<IpAddr>,
     ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Validate IP address format (basic validation)
-        if !Self::is_valid_ip_or_cidr(&request.ip_address) {
-            return Err(IpAccessControlError::InvalidIpAddress(
-                request.ip_address.clone(),
-            ));
-        }
+        let network = request
+            .ip_address
+            .parse::<IpNetwork>()
+            .map_err(|_| IpAccessControlError::InvalidIpAddress(request.ip_address.clone()))?;
 
         // Validate action
         if request.action != "block" && request.action != "allow" {
@@ -159,6 +251,14 @@ impl IpAccessControlService {
                 request.action
             )));
         }
+
+        check_block_rule_safety(
+            &network,
+            &request.action,
+            caller_ip,
+            request.confirm_broad_range,
+            request.acknowledge_lockout,
+        )?;
 
         // Check for duplicates and insert using raw SQL with proper inet casting
         use sea_orm::{ConnectionTrait, Statement};
@@ -333,10 +433,28 @@ impl IpAccessControlService {
         &self,
         id: i32,
         request: UpdateIpAccessControlRequest,
+        caller_ip: Option<IpAddr>,
     ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Verify the rule exists
-        let _ = self.get_by_id(id).await?;
+        let existing = self.get_by_id(id).await?;
+        self.update_checked_against(id, &existing, request, caller_ip)
+            .await
+    }
 
+    /// Apply `request` to rule `id`, judging it against `existing` -- the rule
+    /// as it was read. When the change can widen what is blocked, the write
+    /// only lands if the stored address and action are still the ones that
+    /// were judged; otherwise it is refused with [`IpAccessControlError::RuleChanged`].
+    /// Without that, two overlapping edits (one setting `block`, one setting
+    /// a catch-all address) could each pass the check alone and together
+    /// store a catch-all block nobody confirmed.
+    async fn update_checked_against(
+        &self,
+        id: i32,
+        existing: &ip_access_control::Model,
+        request: UpdateIpAccessControlRequest,
+        caller_ip: Option<IpAddr>,
+    ) -> Result<ip_access_control::Model, IpAccessControlError> {
         // Validate inputs
         if let Some(ref ip_address) = request.ip_address {
             if !Self::is_valid_ip_or_cidr(ip_address) {
@@ -351,6 +469,28 @@ impl IpAccessControlService {
                     action
                 )));
             }
+        }
+
+        // Judge the rule as it will be stored, but only when the change can
+        // widen what is blocked. Editing a reason must not be refused because
+        // of a rule that was saved before these checks existed.
+        let judged = request.ip_address.is_some() || request.action.is_some();
+        if judged {
+            let ip = request
+                .ip_address
+                .as_deref()
+                .unwrap_or(&existing.ip_address);
+            let action = request.action.as_deref().unwrap_or(&existing.action);
+            let network = ip
+                .parse::<IpNetwork>()
+                .map_err(|_| IpAccessControlError::InvalidIpAddress(ip.to_string()))?;
+            check_block_rule_safety(
+                &network,
+                action,
+                caller_ip,
+                request.confirm_broad_range,
+                request.acknowledge_lockout,
+            )?;
         }
 
         // Build UPDATE query with proper inet casting
@@ -386,11 +526,24 @@ impl IpAccessControlService {
 
         // Add id for WHERE clause
         values.push(id.into());
+        let mut condition = format!("id = ${}", param_counter);
+        param_counter += 1;
+
+        // Only write over the address and action that were judged above.
+        if judged {
+            condition.push_str(&format!(
+                " AND ip_address = ${}::inet AND action = ${}",
+                param_counter,
+                param_counter + 1
+            ));
+            values.push(existing.ip_address.clone().into());
+            values.push(existing.action.clone().into());
+        }
 
         let sql = format!(
-            "UPDATE ip_access_control SET {} WHERE id = ${} RETURNING id, ip_address::text, action, reason, created_by, created_at, updated_at",
+            "UPDATE ip_access_control SET {} WHERE {} RETURNING id, ip_address::text, action, reason, created_by, created_at, updated_at",
             updates.join(", "),
-            param_counter
+            condition
         );
 
         let result = self
@@ -415,16 +568,43 @@ impl IpAccessControlService {
             self.refresh_blocklist_after_write().await;
             Ok(rule)
         } else {
-            Err(IpAccessControlError::NotFound(id.to_string()))
+            // Nothing matched: the rule is gone, or it changed since it was
+            // judged.
+            match self.get_by_id(id).await {
+                Ok(_) if judged => Err(IpAccessControlError::RuleChanged { rule_id: id }),
+                Ok(_) => Err(IpAccessControlError::NotFound(id.to_string())),
+                Err(error) => Err(error),
+            }
         }
     }
 
-    /// Delete an IP access control rule
-    pub async fn delete(&self, id: i32) -> Result<(), IpAccessControlError> {
-        let rule = self.get_by_id(id).await?;
-        rule.delete(self.db.as_ref()).await?;
+    /// Delete an IP access control rule, returning the row the database
+    /// removed -- not one read before, which a concurrent update may have
+    /// changed -- so the deletion is audited as what was actually deleted.
+    pub async fn delete(&self, id: i32) -> Result<ip_access_control::Model, IpAccessControlError> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "DELETE FROM ip_access_control WHERE id = $1 RETURNING id, ip_address::text, \
+                 action, reason, created_by, created_at, updated_at",
+                [id.into()],
+            ))
+            .await?
+            .ok_or_else(|| IpAccessControlError::NotFound(id.to_string()))?;
+        let rule = ip_access_control::Model {
+            id: row.try_get("", "id")?,
+            ip_address: row.try_get("", "ip_address")?,
+            action: row.try_get("", "action")?,
+            reason: row.try_get("", "reason")?,
+            created_by: row.try_get("", "created_by")?,
+            created_at: row.try_get("", "created_at")?,
+            updated_at: row.try_get("", "updated_at")?,
+        };
         self.refresh_blocklist_after_write().await;
-        Ok(())
+        Ok(rule)
     }
 
     /// Validates an IP address or CIDR range for either IPv4 or IPv6, using the
@@ -464,6 +644,262 @@ mod tests {
         assert!(!service.is_blocked("8.8.8.8").await.unwrap());
         // Unparsable IP fails open (not blocked)
         assert!(!service.is_blocked("not-an-ip").await.unwrap());
+    }
+
+    fn update_request(
+        ip_address: Option<&str>,
+        action: Option<&str>,
+    ) -> UpdateIpAccessControlRequest {
+        UpdateIpAccessControlRequest {
+            ip_address: ip_address.map(str::to_string),
+            action: action.map(str::to_string),
+            reason: None,
+            confirm_broad_range: false,
+            acknowledge_lockout: false,
+        }
+    }
+
+    /// Two overlapping edits -- one turns an allow rule into a block, the
+    /// other widens its address to everything -- each pass the safety check
+    /// against the rule they read. The second must not land on the row the
+    /// first changed, or a catch-all block is stored unconfirmed.
+    #[tokio::test]
+    async fn an_update_judged_against_a_stale_rule_is_refused() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(test_db) => test_db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let service = IpAccessControlService::new(test_db.db.clone());
+        let created = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "198.51.100.0/24".to_string(),
+                    action: "allow".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                None,
+                None,
+            )
+            .await
+            .expect("create rule");
+        let read_by_second_request = service.get_by_id(created.id).await.expect("read rule");
+
+        service
+            .update(created.id, update_request(None, Some("block")), None)
+            .await
+            .expect("first edit");
+        let refused = service
+            .update_checked_against(
+                created.id,
+                &read_by_second_request,
+                update_request(Some("0.0.0.0/0"), None),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(refused, Err(IpAccessControlError::RuleChanged { rule_id }) if rule_id == created.id),
+            "{refused:?}"
+        );
+        let stored = service.get_by_id(created.id).await.expect("read rule");
+        assert_eq!(
+            (stored.ip_address.as_str(), stored.action.as_str()),
+            ("198.51.100.0/24", "block")
+        );
+
+        // Judged against the current rule, the same edit gets the check.
+        let checked = service
+            .update(created.id, update_request(Some("0.0.0.0/0"), None), None)
+            .await;
+        assert!(
+            matches!(checked, Err(IpAccessControlError::RangeTooBroad { .. })),
+            "{checked:?}"
+        );
+
+        // A reason-only edit judges nothing and is not refused.
+        let mut reason_only = update_request(None, None);
+        reason_only.reason = Some("note".to_string());
+        assert!(service
+            .update_checked_against(created.id, &read_by_second_request, reason_only, None)
+            .await
+            .is_ok());
+
+        let deleted = service.delete(created.id).await.expect("delete rule");
+        assert_eq!(
+            (
+                deleted.ip_address.as_str(),
+                deleted.action.as_str(),
+                deleted.reason.as_deref()
+            ),
+            ("198.51.100.0/24", "block", Some("note")),
+            "the deleted row is reported as it was stored"
+        );
+        assert!(matches!(
+            service.delete(created.id).await,
+            Err(IpAccessControlError::NotFound(_))
+        ));
+    }
+
+    fn net(value: &str) -> IpNetwork {
+        value.parse().unwrap()
+    }
+
+    fn ip(value: &str) -> Option<IpAddr> {
+        Some(value.parse().unwrap())
+    }
+
+    #[test]
+    fn a_catch_all_or_very_broad_block_needs_confirmation() {
+        for broad in ["0.0.0.0/0", "::/0", "10.0.0.0/7", "0.0.0.0/1", "2000::/15"] {
+            assert!(
+                matches!(
+                    check_block_rule_safety(&net(broad), "block", None, false, false),
+                    Err(IpAccessControlError::RangeTooBroad { .. })
+                ),
+                "{broad}"
+            );
+            assert!(
+                check_block_rule_safety(&net(broad), "block", None, true, false).is_ok(),
+                "{broad} with confirmation and no caller"
+            );
+        }
+        // The floor itself and anything narrower pass untouched.
+        for fine in [
+            "10.0.0.0/8",
+            "203.0.113.0/24",
+            "198.51.100.7",
+            "2001:db8::/16",
+            "2001:db8::1",
+        ] {
+            assert!(
+                check_block_rule_safety(&net(fine), "block", None, false, false).is_ok(),
+                "{fine}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_that_matches_the_caller_needs_an_acknowledgement() {
+        let caller = ip("203.0.113.9");
+        for covering in ["203.0.113.9", "203.0.113.0/24", "203.0.0.0/16"] {
+            let refused = check_block_rule_safety(&net(covering), "block", caller, false, false);
+            assert!(
+                matches!(
+                    refused,
+                    Err(IpAccessControlError::WouldLockOutCaller { .. })
+                ),
+                "{covering}: {refused:?}"
+            );
+            assert!(check_block_rule_safety(&net(covering), "block", caller, false, true).is_ok());
+        }
+        assert!(
+            check_block_rule_safety(&net("198.51.100.0/24"), "block", caller, false, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn an_ipv4_caller_seen_as_a_mapped_ipv6_address_is_still_the_caller() {
+        let refused = check_block_rule_safety(
+            &net("203.0.113.0/24"),
+            "block",
+            ip("::ffff:203.0.113.9"),
+            false,
+            false,
+        );
+        assert!(
+            matches!(&refused, Err(IpAccessControlError::WouldLockOutCaller { caller_ip, .. })
+                if caller_ip == "203.0.113.9"),
+            "{refused:?}"
+        );
+    }
+
+    #[test]
+    fn a_broad_range_is_reported_before_the_lockout() {
+        // 0.0.0.0/0 covers the caller too; the confirmation comes first so the
+        // operator sees both questions one after the other, not a lockout for a
+        // rule they have not yet agreed is meant to be that wide.
+        assert!(matches!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), false, false),
+            Err(IpAccessControlError::RangeTooBroad { .. })
+        ));
+        assert!(matches!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), true, false),
+            Err(IpAccessControlError::WouldLockOutCaller { .. })
+        ));
+        assert!(
+            check_block_rule_safety(&net("0.0.0.0/0"), "block", ip("203.0.113.9"), true, true)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_blocks_nothing_and_is_not_second_guessed() {
+        assert!(check_block_rule_safety(
+            &net("0.0.0.0/0"),
+            "allow",
+            ip("203.0.113.9"),
+            false,
+            false
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_catch_all_before_it_touches_the_database() {
+        // A MockDatabase with no queued results fails any query, so reaching
+        // the error below proves nothing was read or written.
+        let service = IpAccessControlService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let result = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "0.0.0.0/0".to_string(),
+                    action: "block".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                Some(1),
+                ip("203.0.113.9"),
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(IpAccessControlError::RangeTooBroad { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_refuses_a_rule_that_blocks_the_caller() {
+        let service = IpAccessControlService::new(Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres).into_connection(),
+        ));
+        let result = service
+            .create(
+                CreateIpAccessControlRequest {
+                    ip_address: "203.0.113.0/24".to_string(),
+                    action: "block".to_string(),
+                    reason: None,
+                    confirm_broad_range: false,
+                    acknowledge_lockout: false,
+                },
+                Some(1),
+                ip("203.0.113.9"),
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(IpAccessControlError::WouldLockOutCaller { caller_ip, .. })
+                if caller_ip == "203.0.113.9"),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]

@@ -102,6 +102,21 @@ pub struct Model {
     pub last_dropped_series_count: i32,
     /// When the evaluator last evaluated this rule.
     pub last_evaluated_at: Option<DBDateTime>,
+    /// What the rule watches: `metric` (an OTel metric, the default) or
+    /// `logs` (the number of log lines matching `saved_search_id` per
+    /// window; ADR 108 D1). Kept as a column, not in the blob, so the
+    /// evaluator dispatches without decoding anything.
+    pub source: String,
+    /// FK to `log_saved_searches(id)`, set when `source = 'logs'`. The FK is
+    /// `ON DELETE CASCADE`, so deleting the project (which cascades to its
+    /// saved searches) removes its log rules too. The saved-search service
+    /// refuses a direct delete while a rule counts the search.
+    pub saved_search_id: Option<i32>,
+    /// Bumped by a database trigger whenever an edit changes what the rule
+    /// decides (series, detector, window, duration, enabled). The evaluator
+    /// writes a verdict only while the revision it read is current, so an
+    /// older result never lands over a newer configuration.
+    pub config_revision: i64,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

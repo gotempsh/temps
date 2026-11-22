@@ -171,8 +171,8 @@ impl AuditOperation for CloudTelemetryActivationStartedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -189,8 +189,8 @@ impl AuditOperation for CloudLinkAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -227,6 +227,7 @@ fn problem(error: CloudServiceError) -> Problem {
         ) => StatusCode::FORBIDDEN,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
+            | temps_cloud_client::CloudError::RouteUnavailable { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
             | temps_cloud_client::CloudError::InvalidBackupTarget { .. },
         ) => StatusCode::BAD_GATEWAY,
@@ -805,8 +806,8 @@ impl AuditOperation for CloudBackendUrlBootstrappedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -911,8 +912,8 @@ impl AuditOperation for CloudConsoleAccessBootstrapFailedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -980,8 +981,8 @@ impl AuditOperation for CloudConsoleOidcBootstrapAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -1145,13 +1146,19 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation.operation_type());
             if self.fail {
-                anyhow::bail!("audit store is unavailable");
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit store is unavailable",
+                ));
             }
             Ok(())
         }
@@ -1639,7 +1646,10 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for ActorRecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

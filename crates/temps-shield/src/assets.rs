@@ -7,6 +7,38 @@
 
 /// Where the challenge page posts its solution. Answered by the ingress on
 /// every project host; it never reaches the console or the application.
+pub const NEUTRAL_VERIFY_PATH: &str = "/.well-known/security-check/verify";
+pub const NEUTRAL_SOLVER_JS_PATH: &str = "/.well-known/security-check/solver.js";
+pub const NEUTRAL_SOLVER_WASM_PATH: &str = "/.well-known/security-check/solver_bg.wasm";
+// Equal-width names preserve WASM section lengths and instruction offsets.
+const ORIGINAL_SOLVER_NAME: &[u8; 18] = b"temps_captcha_wasm";
+const NEUTRAL_SOLVER_NAME: &[u8; 18] = b"proof_work_runtime";
+
+pub static NEUTRAL_SOLVER_JS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    SOLVER_JS
+        .replace("temps_captcha_wasm", "proof_work_runtime")
+        .replace(
+            "new URL('proof_work_runtime_bg.wasm'",
+            "new URL('solver_bg.wasm'",
+        )
+});
+
+/// Rename the embedded module/import/debug names together with the JS glue.
+/// This fixed-size embedded artifact is transformed once, never per request.
+pub static NEUTRAL_SOLVER_WASM: std::sync::LazyLock<Vec<u8>> = std::sync::LazyLock::new(|| {
+    let mut bytes = SOLVER_WASM.to_vec();
+    let mut offset = 0;
+    while offset + ORIGINAL_SOLVER_NAME.len() <= bytes.len() {
+        if &bytes[offset..offset + ORIGINAL_SOLVER_NAME.len()] == ORIGINAL_SOLVER_NAME {
+            bytes[offset..offset + ORIGINAL_SOLVER_NAME.len()].copy_from_slice(NEUTRAL_SOLVER_NAME);
+            offset += ORIGINAL_SOLVER_NAME.len();
+        } else {
+            offset += 1;
+        }
+    }
+    bytes
+});
+
 pub const VERIFY_PATH: &str = "/api/_temps/captcha/verify";
 
 /// The solver's JavaScript glue and its WebAssembly, as the page imports
@@ -27,7 +59,12 @@ const CHALLENGE_HTML: &str = include_str!("../assets/challenge.html");
 /// Whether `path` is one of the paths Shield answers itself and never
 /// challenges: the verify endpoint and the solver.
 pub fn is_shield_path(path: &str) -> bool {
-    path == VERIFY_PATH || path == SOLVER_JS_PATH || path == SOLVER_WASM_PATH
+    path == VERIFY_PATH
+        || path == SOLVER_JS_PATH
+        || path == SOLVER_WASM_PATH
+        || path == NEUTRAL_VERIFY_PATH
+        || path == NEUTRAL_SOLVER_JS_PATH
+        || path == NEUTRAL_SOLVER_WASM_PATH
 }
 
 /// The challenge page for `token`. Every inserted value is escaped, though
@@ -37,6 +74,27 @@ pub fn challenge_page(token: &str, difficulty: u8, client_ip: &str) -> String {
         .replace("{{TOKEN}}", &escape_html(token))
         .replace("{{DIFFICULTY}}", &difficulty.to_string())
         .replace("{{IP_ADDRESS}}", &escape_html(client_ip))
+}
+
+/// Preserve the challenge protocol while omitting its visible product title.
+pub fn challenge_page_with_identity(
+    token: &str,
+    difficulty: u8,
+    client_ip: &str,
+    hide: bool,
+) -> String {
+    let page = challenge_page(token, difficulty, client_ip);
+    if hide {
+        page.replace("Temps Security Checkpoint", "Security checkpoint")
+            .replace(
+                "<!-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors -->",
+                "",
+            )
+            .replace(SOLVER_JS_PATH, NEUTRAL_SOLVER_JS_PATH)
+            .replace(VERIFY_PATH, NEUTRAL_VERIFY_PATH)
+    } else {
+        page
+    }
 }
 
 pub fn escape_html(text: &str) -> String {
@@ -56,6 +114,52 @@ pub fn escape_html(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn neutral_solver_glue_and_binary_use_the_same_import_name() {
+        use super::*;
+        assert!(!NEUTRAL_SOLVER_JS.contains("temps_captcha_wasm"));
+        assert!(NEUTRAL_SOLVER_JS.contains("\"./proof_work_runtime_bg.js\": import0"));
+        assert!(NEUTRAL_SOLVER_JS.contains("SPDX-FileCopyrightText: 2024-2026 Temps Contributors"));
+        assert!(NEUTRAL_SOLVER_JS.contains("SPDX-License-Identifier: MIT OR Apache-2.0"));
+        assert_eq!(NEUTRAL_SOLVER_WASM.len(), SOLVER_WASM.len());
+        assert_eq!(&NEUTRAL_SOLVER_WASM[..8], &SOLVER_WASM[..8]);
+        let original_count = SOLVER_WASM
+            .windows(ORIGINAL_SOLVER_NAME.len())
+            .filter(|name| *name == ORIGINAL_SOLVER_NAME)
+            .count();
+        assert!(original_count > 0);
+        assert_eq!(
+            NEUTRAL_SOLVER_WASM
+                .windows(ORIGINAL_SOLVER_NAME.len())
+                .filter(|name| *name == NEUTRAL_SOLVER_NAME)
+                .count(),
+            original_count
+        );
+        assert!(!NEUTRAL_SOLVER_WASM
+            .windows(ORIGINAL_SOLVER_NAME.len())
+            .any(|name| name == ORIGINAL_SOLVER_NAME));
+    }
+
+    #[test]
+    fn hidden_identity_keeps_challenge_protocol_and_omits_branding() {
+        let page = super::challenge_page_with_identity("token", 20, "127.0.0.1", true);
+        assert!(!page.to_lowercase().contains("temps"));
+        for path in [
+            super::NEUTRAL_VERIFY_PATH,
+            super::NEUTRAL_SOLVER_JS_PATH,
+            super::NEUTRAL_SOLVER_WASM_PATH,
+        ] {
+            assert!(super::is_shield_path(path));
+        }
+        assert!(page.contains(super::NEUTRAL_VERIFY_PATH));
+        assert!(page.contains(super::NEUTRAL_SOLVER_JS_PATH));
+        assert!(super::NEUTRAL_SOLVER_JS.contains("new URL('solver_bg.wasm'"));
+        assert_eq!(
+            super::challenge_page_with_identity("token", 20, "127.0.0.1", false),
+            super::challenge_page("token", 20, "127.0.0.1")
+        );
+    }
+
     use super::*;
 
     #[test]

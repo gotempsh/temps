@@ -37,6 +37,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use sea_orm::{Database, DatabaseBackend, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     /// Existing rows gain no JA4, a new one stores it, and `down` then `up`
@@ -56,6 +57,7 @@ mod tests {
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_PASSWORD", "ja4-test")
+            .with_test_labels()
             .start()
             .await?;
         let port = container.get_host_port_ipv4(5432).await?;

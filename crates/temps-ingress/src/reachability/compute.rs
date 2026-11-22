@@ -148,6 +148,103 @@ pub struct DirectIngress {
     pub check_failed: Option<String>,
 }
 
+/// A host the control plane is reached at (its edge target, or its console
+/// URL's host), and every address it resolved to. None of them public is
+/// why the control plane is no direct ingress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneHost {
+    pub host: String,
+    pub ips: Vec<IpAddr>,
+}
+
+/// The address the control plane is reached at directly, as the server
+/// knows it (never what the console's hostname resolves to), or why there
+/// is none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlPlaneOrigin {
+    /// A public address of this server DNS can point at.
+    Address { ip: IpAddr, source: OriginSource },
+    /// The only candidate cannot be an origin, and why.
+    Refused(String),
+    /// Neither an edge target address nor a detected one.
+    Unknown,
+}
+
+/// Where a [`ControlPlaneOrigin::Address`] came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginSource {
+    /// The operator set the edge target to this address.
+    EdgeTarget,
+    /// The server found its own public address.
+    Detected,
+}
+
+/// Choose the control plane's origin address (the one `A` records of a
+/// direct way in point at), from what the server itself knows:
+///
+/// 1. the edge target, when the operator set it to an address;
+/// 2. the public address the server detected for itself.
+///
+/// The console's hostname is never resolved for this: behind a CDN or a
+/// reverse proxy it resolves to the proxy's edge. An address inside a known
+/// proxy's published ranges is refused with the reason, whichever source
+/// gave it; so is a non-public edge target, which the operator chose.
+pub fn control_plane_origin(
+    edge_target: Option<&str>,
+    detected: Option<IpAddr>,
+) -> ControlPlaneOrigin {
+    let configured = edge_target
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .and_then(|t| {
+            t.trim_start_matches('[')
+                .trim_end_matches(']')
+                .parse::<IpAddr>()
+                .ok()
+        });
+    if let Some(ip) = configured {
+        if let Some(why) = temps_core::known_proxies::origin_refusal(ip) {
+            return ControlPlaneOrigin::Refused(format!(
+                "the edge target is {ip}. {why} Set the edge target to this server's own \
+                 public address"
+            ));
+        }
+        if address_scope(ip) != AddressScope::Public {
+            return ControlPlaneOrigin::Refused(format!(
+                "the edge target {ip} is {}",
+                match address_scope(ip) {
+                    AddressScope::Private => "a private network address",
+                    AddressScope::Cgnat => "a carrier-grade NAT address, such as Tailscale's",
+                    AddressScope::Local | AddressScope::Public => "a local address",
+                }
+            ));
+        }
+        return ControlPlaneOrigin::Address {
+            ip,
+            source: OriginSource::EdgeTarget,
+        };
+    }
+    match detected {
+        Some(ip) => {
+            if let Some(why) = temps_core::known_proxies::origin_refusal(ip) {
+                return ControlPlaneOrigin::Refused(format!(
+                    "the server's outbound address is {ip}, which reaches the internet through \
+                     a proxy. {why} Set the edge target to this server's own public address"
+                ));
+            }
+            if address_scope(ip) == AddressScope::Public {
+                ControlPlaneOrigin::Address {
+                    ip,
+                    source: OriginSource::Detected,
+                }
+            } else {
+                ControlPlaneOrigin::Unknown
+            }
+        }
+        None => ControlPlaneOrigin::Unknown,
+    }
+}
+
 /// ADR 058 D9's per-hostname tunnel state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelState {
@@ -233,6 +330,7 @@ pub fn address_reachability(
         action,
         network: None,
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     // ADR 068 D4: only these verdicts may read as "no address"; every other
     // not-reachable one is a way in that broke.
@@ -314,15 +412,16 @@ pub fn address_reachability(
                 )
             }
             "error" => {
+                // A DNS write can fail while an existing record still serves traffic.
                 return verdict(
-                    ReachState::NotReachable,
+                    ReachState::Unknown,
                     way_in,
                     tunnel.detail.clone(),
                     Some(
                         ReachAction::new(ActionKind::OpenIngress, "Open the tunnel")
                             .with_href(INGRESS_SETUP_PATH),
                     ),
-                )
+                );
             }
             // A tunnel covers it but does not publish it: that is the reason
             // if nothing else serves it either.
@@ -377,6 +476,22 @@ pub fn address_reachability(
             };
         }
     };
+
+    // A private DNS answer can work for a LAN or VPN client. A DNS
+    // lookup here cannot verify that client's route or the listener.
+    if ips.iter().all(|ip| {
+        matches!(
+            address_scope(*ip),
+            AddressScope::Private | AddressScope::Cgnat
+        )
+    }) {
+        return verdict(
+            ReachState::Unknown,
+            None,
+            format!("{address} resolves to {}. Clients on the private network may be able to connect. Public access needs a public address or tunnel.", ip_list(ips)),
+            Some(make_reachable()),
+        );
+    }
 
     if let Some(direct) = directs
         .iter()
@@ -558,6 +673,7 @@ fn private_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         action,
         network,
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     let listener = binding
         .listener
@@ -832,6 +948,7 @@ fn tailnet_reachability(facts: &AddressFacts, environment_name: &str) -> Address
         // A tailnet name exists once a run made it: set up, so never
         // `no_address` (ADR 068 D4), like a private listener.
         nothing_set_up: false,
+        findings: Vec::new(),
     };
     let (Some(private), Some(tailnet)) = (
         &facts.private,
@@ -1122,6 +1239,66 @@ pub fn summary(
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_origin_is_the_edge_target_address_before_the_detected_one() {
+        assert_eq!(
+            control_plane_origin(Some(" 93.184.215.7 "), Some(ip("93.184.215.4"))),
+            ControlPlaneOrigin::Address {
+                ip: ip("93.184.215.7"),
+                source: OriginSource::EdgeTarget
+            }
+        );
+        // A hostname edge target is a CNAME target, not an address: the
+        // server's own detected address is used, never its resolution.
+        assert_eq!(
+            control_plane_origin(Some("console.example.com"), Some(ip("93.184.215.4"))),
+            ControlPlaneOrigin::Address {
+                ip: ip("93.184.215.4"),
+                source: OriginSource::Detected
+            }
+        );
+        assert_eq!(
+            control_plane_origin(None, Some(ip("192.0.2.5"))),
+            ControlPlaneOrigin::Unknown,
+            "a detected address nobody on the internet can reach is no origin"
+        );
+        assert_eq!(
+            control_plane_origin(None, None),
+            ControlPlaneOrigin::Unknown
+        );
+    }
+
+    #[test]
+    fn a_cloudflare_address_is_never_the_origin() {
+        let ControlPlaneOrigin::Refused(why) =
+            control_plane_origin(Some("104.16.0.1"), Some(ip("93.184.215.4")))
+        else {
+            panic!("a Cloudflare edge target must be refused");
+        };
+        assert!(
+            why.contains("104.16.0.1") && why.contains("Cloudflare"),
+            "{why}"
+        );
+        assert!(why.contains("edge target"), "{why}");
+
+        let ControlPlaneOrigin::Refused(why) =
+            control_plane_origin(None, Some(ip("2606:4700:3030::6815:1")))
+        else {
+            panic!("a detected Cloudflare address must be refused");
+        };
+        assert!(why.contains("Cloudflare"), "{why}");
+    }
+
+    #[test]
+    fn a_private_edge_target_is_refused_not_replaced() {
+        let ControlPlaneOrigin::Refused(why) =
+            control_plane_origin(Some("10.0.0.5"), Some(ip("93.184.215.4")))
+        else {
+            panic!("the operator's private edge target must win over detection");
+        };
+        assert!(why.contains("private network address"), "{why}");
+    }
+
     fn input(address: &str, source: AddressSource) -> AddressInput {
         AddressInput {
             address: address.to_string(),
@@ -1244,8 +1421,10 @@ mod tests {
             ReachState::Checking
         );
         let error = address_reachability(&tunneled("error"), &[], true, "production");
-        assert_eq!(error.state, ReachState::NotReachable);
+        assert_eq!(error.state, ReachState::Unknown);
         assert_eq!(error.reason, "error detail");
+        assert!(summary(&[error], true, "production", &[])
+            .contains("cannot tell whether app.example.com is reachable"));
         assert!(!needs_lookup(
             "app.example.com",
             true,
@@ -1320,8 +1499,9 @@ mod tests {
             true,
             "production",
         );
-        assert_eq!(private.state, ReachState::NotReachable);
-        assert!(private.reason.contains("private address"));
+        assert_eq!(private.state, ReachState::Unknown);
+        assert!(private.reason.contains("private network"));
+        assert!(!summary(&[private], true, "production", &[]).contains("nobody"));
 
         let elsewhere = address_reachability(
             &facts(
@@ -1371,6 +1551,7 @@ mod tests {
             action: None,
             network: None,
             nothing_set_up: false,
+            findings: Vec::new(),
         };
         let both = vec![
             reachable("app-production.example.com", AddressSource::Generated),

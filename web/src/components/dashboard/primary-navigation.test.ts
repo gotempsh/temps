@@ -99,3 +99,9 @@ describe('settings sidebar swap', () => {
     expect(isSettingsSidebarRoute('/email')).toBe(false)
   })
 })
+
+test('Get started stays reachable after the first project exists', () => {
+  expect(find('Get started').url).toBe('/get-started')
+  expect(find('Get started').featureKey).toBeUndefined()
+  expect(activeTitles('/get-started')).toEqual(['Get started'])
+})

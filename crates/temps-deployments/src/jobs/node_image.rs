@@ -8,7 +8,7 @@
 //! the image -- source maps, static assets, vulnerability scans, and replicas
 //! placed on the control plane -- need it in the control plane's daemon.
 
-use temps_core::WorkflowError;
+use crate::workflow::WorkflowError;
 
 /// Outcome of [`copy_node_built_image`].
 #[derive(Debug, PartialEq, Eq)]

@@ -24,20 +24,21 @@ use axum::{
         IntoResponse,
     },
     routing::{get, post, put},
-    Json, Router,
+    Extension, Json, Router,
 };
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures::stream::{self, Stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::convert::Infallible;
 use std::time::Duration;
-use temps_agents::sandbox::ExecStream;
+use temps_sandbox_providers::ExecStream;
 use tokio_stream::wrappers::BroadcastStream;
 use utoipa::ToSchema;
 
 use temps_auth::{permissions::Permission, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::secret_string::SecretString;
+use temps_entities::ingress_mode::SandboxPreviewAccess;
 
 use crate::error::SandboxError;
 use crate::handlers::SandboxAppState;
@@ -67,6 +68,12 @@ pub(crate) fn require_sandbox_admin(
             .value("user_role", auth.effective_role.to_string())
             .build(),
     )
+}
+
+/// Gate a read of sandbox state: `sandboxes:read`, or `projects:read` for
+/// tokens minted before the sandbox scopes existed.
+pub(crate) fn require_sandbox_read(auth: &temps_auth::context::AuthContext) -> Result<(), Problem> {
+    sandbox_permission_guard(auth, Permission::SandboxesRead, Permission::ProjectsRead)
 }
 
 pub(crate) fn sandbox_permission_guard(
@@ -113,6 +120,15 @@ impl From<SandboxError> for Problem {
             SandboxError::JobNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Job Not Found")
                 .with_detail(error.to_string()),
+            SandboxError::CreationNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
+                .with_title("Sandbox Create Not Found")
+                .with_detail(error.to_string()),
+            SandboxError::CreationIdInvalid { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Creation Id")
+                .with_detail(error.to_string()),
+            SandboxError::CreationIdInUse { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Creation Id In Use")
+                .with_detail(error.to_string()),
             SandboxError::CreateFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Creation Failed")
@@ -155,9 +171,11 @@ impl From<SandboxError> for Problem {
             SandboxError::FileOp { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Sandbox FS Operation Failed")
                 .with_detail(error.to_string()),
-            SandboxError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Validation Error")
-                .with_detail(error.to_string()),
+            SandboxError::CpuLimit { .. } | SandboxError::Validation { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Validation Error")
+                    .with_detail(error.to_string())
+            }
             SandboxError::InvalidState { .. } => problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Invalid Sandbox State")
                 .with_detail(error.to_string()),
@@ -194,6 +212,12 @@ impl From<SandboxError> for Problem {
                     .with_title("Not Available For Sandboxes On Worker Nodes")
                     .with_detail(error.to_string())
             }
+            SandboxError::EgressPolicyUnsupported { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_type("https://temps.sh/probs/sandbox-egress-policy-unsupported")
+                    .with_title("Egress Policy Not Supported By This Backend")
+                    .with_detail(error.to_string())
+            }
             SandboxError::NodeNotFound { .. } => {
                 problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
                     .with_type("https://temps.sh/probs/sandbox-node-not-found")
@@ -215,12 +239,12 @@ impl From<SandboxError> for Problem {
             // ADR 063. No `setup_path`: a worker does not make the control
             // plane able to run this; the message says what does.
             SandboxError::NoLocalHost { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_type(temps_agents::error::NO_LOCAL_SANDBOX_HOST_TYPE)
-                .with_title(temps_agents::error::NO_LOCAL_SANDBOX_HOST_TITLE)
+                .with_type(temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_TYPE)
+                .with_title(temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_TITLE)
                 .with_detail(error.to_string())
                 .with_value(
                     "error_code",
-                    temps_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE,
+                    temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE,
                 ),
             // ADR 063: the same problem every "needs a worker" path returns,
             // so the console offers the same Add worker node action.
@@ -551,6 +575,13 @@ pub struct ResourcesBody {
 
 #[derive(Debug, Deserialize, ToSchema, Default)]
 pub struct CreateSandboxBody {
+    /// Id the client gives this create, so it can read the create's steps
+    /// from `GET /v1/sandboxes/creations/{creation_id}` while it waits for
+    /// this request: 8 to 64 letters, digits, `-` or `_`, new for every
+    /// create (a UUID works). Optional.
+    #[serde(default)]
+    #[schema(example = "6f1c2a9e-3b7d-4e0a-9c55-0d2f8a1b7e43")]
+    pub creation_id: Option<String>,
     /// Permit installing/running Docker with normal guest-root privileges.
     /// Requires backend="microsandbox". Does not install Docker or expose the host socket.
     #[serde(default)]
@@ -570,8 +601,8 @@ pub struct CreateSandboxBody {
     /// Extra env vars baked into the container on create.
     #[serde(default)]
     pub env: HashMap<String, String>,
-    /// CPU cores, `[0.01, 16]` (lower if an administrator set a maximum).
-    /// Omit for the operator's default.
+    /// CPU cores, `[0.01, 16]`, bounded by the placement host and any
+    /// administrator maximum. Omit for the effective placement default.
     #[schema(minimum = 0.01, maximum = 16.0)]
     #[serde(default)]
     pub cpu_limit: Option<f64>,
@@ -664,6 +695,17 @@ pub struct CreateSandboxBody {
     #[schema(example = "worker-1")]
     pub node: Option<String>,
 
+    /// Which outside destinations the sandbox may reach (temps-native).
+    /// Omit for `{"mode": "internet"}`: any public destination on ports 80
+    /// and 443. `{"mode": "restricted", "rules": [...]}` allows only the
+    /// listed hosts (`api.example.com`, or `*.example.com` for subdomains)
+    /// and CIDR blocks, each on its `ports` (default 80 and 443). Private,
+    /// loopback, link-local and metadata addresses are never reachable.
+    /// A restricted policy needs the docker backend; elsewhere the create
+    /// fails with 422. Change it later with `PUT /v1/sandboxes/{id}/egress-policy`.
+    #[serde(default)]
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
+
     // ── `@vercel/sandbox` fields accepted for compatibility and ignored.
     // We accept them so SDK calls don't 422 on `deny_unknown_fields`; we
     // don't act on them because temps has no equivalent concept today.
@@ -703,36 +745,26 @@ impl From<CreateSandboxBody> for CreateSandboxRequest {
             from_snapshot_artifact: None,
             host_work_dir_override: None,
             node: b.node,
+            egress_policy: b.egress_policy,
+            creation_id: b.creation_id,
         }
     }
 }
 
-/// Ceilings for the resource limits a caller may request on create. The
-/// provider treats a request value as authoritative (the operator's
-/// `agent_sandbox` settings are only the defaults for omitted fields), so
-/// without a ceiling here any `sandboxes:write` key could ask for no process
-/// cap (`pids_limit <= 0` means "unlimited" to Docker) or for more memory than
-/// the host has. Generous enough for real workloads, finite so the host's
-/// pid table and memory stay protected from untrusted code.
-pub const MAX_SANDBOX_CPU_CORES: f64 = 16.0;
-/// Floors below which the request cannot be enforced. Docker takes CPU as
-/// integer NanoCPUs, so a tiny positive value truncates to 0, which Docker
-/// reads as "no CPU quota"; it also rejects memory limits under 6 MB.
-pub const MIN_SANDBOX_CPU_CORES: f64 = 0.01;
-pub const MIN_SANDBOX_MEMORY_MB: u64 = 6;
-pub const MAX_SANDBOX_MEMORY_MB: u64 = 32 * 1024;
-pub const MAX_SANDBOX_PIDS_LIMIT: i64 = 4096;
-pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
+pub use crate::services::create_policy::{
+    MAX_SANDBOX_CPU_CORES, MAX_SANDBOX_DISK_MB, MAX_SANDBOX_MEMORY_MB, MAX_SANDBOX_PIDS_LIMIT,
+    MIN_SANDBOX_CPU_CORES, MIN_SANDBOX_MEMORY_MB,
+};
 
 /// Reject caller-supplied resource limits that are non-positive, non-finite
 /// or above the ceilings. `None` is always accepted: it selects the
 /// operator's defaults.
 fn validate_resource_limits(req: &CreateSandboxRequest) -> Result<(), SandboxError> {
     if let Some(cpu) = req.cpu_limit {
-        if !cpu.is_finite() || !(MIN_SANDBOX_CPU_CORES..=MAX_SANDBOX_CPU_CORES).contains(&cpu) {
+        if !cpu.is_finite() || cpu < MIN_SANDBOX_CPU_CORES {
             return Err(SandboxError::Validation {
                 message: format!(
-                    "cpu_limit/vcpus must be between {MIN_SANDBOX_CPU_CORES} and {MAX_SANDBOX_CPU_CORES}, got {cpu}"
+                    "cpu_limit/vcpus must be finite and at least {MIN_SANDBOX_CPU_CORES}, got {cpu}"
                 ),
             });
         }
@@ -826,6 +858,13 @@ pub struct SandboxInner {
     pub preview_url_template: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub preview_password_hint: Option<String>,
+    /// Who may open the preview URLs: `temps_login` (a signed-in Temps user
+    /// who may read this sandbox; the default), `password` (whoever knows the
+    /// preview password) or `public` (anyone).
+    pub preview_access: SandboxPreviewAccess,
+    /// Client networks allowed to open the preview URLs, as normalised
+    /// CIDRs. Checked before `preview_access`; empty = any address.
+    pub preview_allowed_cidrs: Vec<String>,
     /// Agent run this sandbox executes (autofixer / workflow agent).
     /// `None` for sandboxes created via this API.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -845,6 +884,8 @@ pub struct SandboxInner {
     /// Name of the hosting node; `"control-plane"` for control-plane
     /// sandboxes.
     pub node_name: String,
+    /// Which outside destinations the sandbox may reach (temps-native).
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 }
 
 /// `@vercel/sandbox` wraps every single-sandbox response as
@@ -874,23 +915,17 @@ impl SandboxResponse {
             .strip_prefix("sbx_")
             .unwrap_or(&s.public_id)
             .to_string();
-        // Preview URLs only route to control-plane sandboxes today; a worker
-        // sandbox advertising one would hand out a URL that never answers
-        // (ADR-048 phase 2). Clients read the empty template as "no preview".
-        let (template, routes) = if s.node_id.is_some() {
-            (String::new(), Vec::new())
-        } else {
-            let routes = s
-                .ports
-                .iter()
-                .map(|port| SandboxRoute {
-                    url: parts.url_for(&s.public_id, *port),
-                    subdomain: format!("ws-{}-{}", label, port),
-                    port: *port as u32,
-                })
-                .collect();
-            (template, routes)
-        };
+        // Worker sandboxes are served too: the proxy relays their previews
+        // through the worker's agent.
+        let routes = s
+            .ports
+            .iter()
+            .map(|port| SandboxRoute {
+                url: parts.url_for(&s.public_id, *port),
+                subdomain: format!("ws-{}-{}", label, port),
+                port: *port as u32,
+            })
+            .collect();
         Self {
             sandbox: SandboxInner {
                 id: s.public_id,
@@ -911,12 +946,15 @@ impl SandboxResponse {
                 disk_size_mb: s.disk_size_mb,
                 preview_url_template: template,
                 preview_password_hint: s.preview_password_hint,
+                preview_access: s.preview_access,
+                preview_allowed_cidrs: s.preview_allowed_cidrs,
                 agent_run_id: s.agent_run_id,
                 lifecycle: s.lifecycle,
                 project_id: s.project_id,
                 source_repo_url: s.source_repo_url,
                 node_id: s.node_id,
                 node_name: s.node_name,
+                egress_policy: s.egress_policy,
             },
             routes,
         }
@@ -1371,8 +1409,21 @@ pub async fn create_sandbox(
         req.from_snapshot_artifact = Some(artifact);
     }
 
-    let row = state.sandbox_service.create_sandbox(user_id, req).await?;
-    drop(artifact_lifecycle_guard);
+    // Detached: a client or proxy that gives up must not cancel the create
+    // halfway (see `spawn_create`).
+    let row = state
+        .sandbox_service
+        .spawn_create(user_id, req, artifact_lifecycle_guard)
+        .await
+        .map_err(|join_error| {
+            tracing::error!(user_id, error = %join_error, "sandbox create task stopped unexpectedly");
+            temps_core::error_builder::ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Sandbox Create Failed")
+                .detail(format!(
+                    "The sandbox create for user {user_id} stopped unexpectedly: {join_error}"
+                ))
+                .build()
+        })??;
     let resp = build_response(&state, row).await;
     Ok((StatusCode::CREATED, Json(resp)))
 }
@@ -1514,6 +1565,109 @@ pub async fn resize_sandbox(
         .sandbox_service
         .resize_sandbox(&id, auth.user_id(), body.disk_size_mb)
         .await?;
+    let envelopes = build_summary_responses(&state, vec![SandboxSummary::from(&model)]).await;
+    Ok(Json(envelopes.into_iter().next()))
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct SandboxEgressPolicyUpdatedAudit {
+    context: temps_core::AuditContext,
+    sandbox_id: String,
+    egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
+}
+
+impl temps_core::AuditOperation for SandboxEgressPolicyUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "SANDBOX_EGRESS_POLICY_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!(
+                    "SandboxEgressPolicyUpdatedAudit for sandbox {}",
+                    self.sandbox_id
+                ),
+                source,
+            )
+        })
+    }
+}
+
+/// Replace which outside destinations the sandbox may reach.
+///
+/// `{"mode": "internet"}` allows any public destination on ports 80 and 443;
+/// `{"mode": "restricted", "rules": [{"host": "api.example.com", "ports": [443]},
+/// {"cidr": "1.1.1.0/24"}]}` allows only what a rule lists (`*.example.com`
+/// matches subdomains; `ports` defaults to 80 and 443). Private, loopback,
+/// link-local and metadata destinations are refused in every mode, and the
+/// Temps model, MCP and git relays keep working whatever the policy. A
+/// refused request gets a 403 from the sandbox's proxy naming the
+/// destination and the policy.
+///
+/// Applied before it is stored: on a running Docker sandbox the egress proxy
+/// is replaced, which interrupts outbound connections for a second or two
+/// and closes open tunnels; a stopped sandbox gets it on its next start.
+#[utoipa::path(
+    tag = "Sandboxes",
+    put,
+    path = "/v1/sandboxes/{id}/egress-policy",
+    params(("id" = String, Path, description = "Sandbox id (`sbx_...`)")),
+    request_body = temps_sandbox_providers::SandboxEgressPolicy,
+    responses(
+        (status = 200, description = "Policy applied and stored", body = SandboxResponse),
+        (status = 400, description = "Invalid policy (the detail names the rule and value)", body = temps_core::problemdetails::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 404, description = "Sandbox not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 409, description = "Sandbox is not running or stopped, or belongs to an agent run", body = temps_core::problemdetails::ProblemDetails),
+        (status = 422, description = "The sandbox's backend cannot enforce a restricted policy", body = temps_core::problemdetails::ProblemDetails),
+        (status = 503, description = "The sandbox's backend or node is unavailable", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_egress_policy(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<SandboxAppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    Path(id): Path<String>,
+    Json(policy): Json<temps_sandbox_providers::SandboxEgressPolicy>,
+) -> Result<impl IntoResponse, Problem> {
+    sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    let user_id = auth.user_id();
+    let model = state
+        .sandbox_service
+        .set_egress_policy(&id, user_id, policy)
+        .await?;
+
+    if let Some(ref audit) = state.audit_service {
+        let event = SandboxEgressPolicyUpdatedAudit {
+            context: temps_core::AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            sandbox_id: id.clone(),
+            egress_policy: model.egress_policy.0.clone(),
+        };
+        if let Err(e) = audit.create_audit_log(&event).await {
+            tracing::error!(
+                user_id = %user_id,
+                sandbox_id = %id,
+                "sandbox egress policy: failed to write audit log: {}",
+                e
+            );
+        }
+    }
+
     let envelopes = build_summary_responses(&state, vec![SandboxSummary::from(&model)]).await;
     Ok(Json(envelopes.into_iter().next()))
 }
@@ -2816,14 +2970,21 @@ pub struct SetPreviewPasswordResponse {
 pub async fn set_preview_password(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(id): Path<String>,
     Json(body): Json<SetPreviewPasswordBody>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    let user_id = auth.user_id();
     let hint = state
         .sandbox_service
-        .set_preview_password(&id, auth.user_id(), body.password.expose())
+        .set_preview_password(&id, user_id, body.password.expose())
         .await?;
+    let event = super::preview_access::SandboxPreviewPasswordAudit::set(
+        super::preview_access::audit_context(user_id, &metadata),
+        &id,
+    );
+    super::preview_access::write_audit(&state, &event, &id).await;
     Ok(Json(SetPreviewPasswordResponse {
         preview_password_hint: hint,
     }))
@@ -2834,7 +2995,7 @@ pub async fn set_preview_password(
     delete,
     path = "/v1/sandboxes/{id}/preview-password",
     responses(
-        (status = 204, description = "Preview password removed (sandbox is now URL-only protected)"),
+        (status = 204, description = "Preview password removed; a sandbox in `password` access returns to `temps_login`"),
         (status = 404, description = "Sandbox not found")
     ),
     security(("bearer_auth" = []))
@@ -2842,13 +3003,21 @@ pub async fn set_preview_password(
 pub async fn clear_preview_password(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<SandboxAppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
-    state
+    let user_id = auth.user_id();
+    let access = state
         .sandbox_service
-        .clear_preview_password(&id, auth.user_id())
+        .clear_preview_password(&id, user_id)
         .await?;
+    let event = super::preview_access::SandboxPreviewPasswordAudit::cleared(
+        super::preview_access::audit_context(user_id, &metadata),
+        &id,
+        access,
+    );
+    super::preview_access::write_audit(&state, &event, &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3014,6 +3183,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         // Rootfs management. Registered before `/{id}` — a static segment so
         // it never collides with the id capture.
         .route("/v1/sandboxes/rootfs", get(rootfs_report))
+        .route(
+            "/v1/sandboxes/resource-defaults",
+            get(super::placement::get_sandbox_resource_defaults),
+        )
         // Sandbox placement (ADR-048) — static segment, same reason.
         .route(
             "/v1/sandboxes/placement",
@@ -3029,6 +3202,24 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
             post(super::placement::evict_node_sandboxes),
         )
         .route("/v1/sandboxes/rootfs/gc", post(rootfs_gc))
+        // Host image preparation and create progress — static segments.
+        .route(
+            "/v1/sandboxes/image-preparation",
+            get(super::image_preparation::get_sandbox_image_preparation)
+                .post(super::image_preparation::prepare_sandbox_images),
+        )
+        .route(
+            "/v1/sandboxes/image-preparation/nodes/{node_id}",
+            put(super::image_preparation::update_host_image_preparation),
+        )
+        .route(
+            "/v1/sandboxes/creations/{creation_id}",
+            get(super::creation::get_sandbox_creation),
+        )
+        .route(
+            "/v1/sandboxes/{id}/creation",
+            get(super::creation::get_sandbox_creation_by_sandbox),
+        )
         .route("/v1/sandboxes/{id}", get(get_sandbox))
         .route(
             "/v1/sandboxes/{id}/terminal",
@@ -3038,6 +3229,7 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route("/v1/sandboxes/{id}/destroy", post(destroy_sandbox))
         .route("/v1/sandboxes/{id}/events", get(list_events))
         .route("/v1/sandboxes/{id}/resize", post(resize_sandbox))
+        .route("/v1/sandboxes/{id}/egress-policy", put(set_egress_policy))
         .route("/v1/sandboxes/{id}/pause", post(pause_sandbox))
         .route("/v1/sandboxes/{id}/resume", post(resume_sandbox))
         .route("/v1/sandboxes/{id}/restart", post(restart_sandbox))
@@ -3082,6 +3274,10 @@ pub fn routes() -> Router<Arc<SandboxAppState>> {
         .route(
             "/v1/sandboxes/{id}/preview-password",
             put(set_preview_password).delete(clear_preview_password),
+        )
+        .route(
+            "/v1/sandboxes/{id}/preview-access",
+            put(super::preview_access::update_preview_access),
         )
         .route("/v1/sandboxes/{id}/preview-link", post(create_preview_link))
 }
@@ -3134,6 +3330,24 @@ mod tests {
             let problem = require_sandbox_admin(&auth).expect_err("non-admin must be refused");
             assert_eq!(problem.status_code, StatusCode::FORBIDDEN, "{role:?}");
         }
+    }
+
+    #[test]
+    fn sandbox_host_capacity_error_maps_to_bad_request() {
+        let problem = Problem::from(crate::error::from_agent_error(
+            "sandbox-example",
+            temps_agent_core::error::AgentError::SandboxCpuLimit {
+                run_id: 12,
+                requested: 4.0,
+                host: 2.0,
+            },
+        ));
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("requested 4 CPU cores") && detail.contains("0.01 to 2"),
+            "{detail}"
+        );
     }
 
     #[test]
@@ -3219,6 +3433,45 @@ mod tests {
                 .expect_err("PlatformAdmin must not be allowed to create a sandbox");
 
         assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
+
+    /// Changing what a sandbox may reach is a write: readers are refused the
+    /// guard `set_egress_policy` runs, users pass it.
+    #[test]
+    fn only_writers_may_change_a_sandbox_egress_policy() {
+        for role in [Role::Reader, Role::ApiReader, Role::PlatformAdmin] {
+            let auth = AuthContext::new_session(test_user(), role.clone());
+            let problem = sandbox_permission_guard(
+                &auth,
+                Permission::SandboxesWrite,
+                Permission::ProjectsWrite,
+            )
+            .expect_err("a reader must not change egress");
+            assert_eq!(problem.status_code, StatusCode::FORBIDDEN, "{role:?}");
+        }
+        let user = AuthContext::new_session(test_user(), Role::User);
+        assert!(sandbox_permission_guard(
+            &user,
+            Permission::SandboxesWrite,
+            Permission::ProjectsWrite
+        )
+        .is_ok());
+    }
+
+    /// The request body is the policy itself; a typo in it is a 400, not
+    /// a silently wider policy.
+    #[test]
+    fn the_egress_policy_body_rejects_unknown_fields() {
+        let typo = r#"{"mode":"restricted","rulez":[{"host":"api.example.com"}]}"#;
+        assert!(
+            serde_json::from_str::<temps_sandbox_providers::SandboxEgressPolicy>(typo).is_err()
+        );
+        let body: temps_sandbox_providers::SandboxEgressPolicy = serde_json::from_str(
+            r#"{"mode":"restricted","rules":[{"host":"api.example.com","ports":[443]},{"cidr":"1.1.1.0/24"}]}"#,
+        )
+        .expect("documented shape");
+        assert!(body.is_restricted());
+        assert_eq!(body.rules.len(), 2);
     }
 
     // ── Tar extraction (SDK fs/write path) ─────────────────────────────────
@@ -3332,6 +3585,7 @@ mod tests {
             public_id: "sbx_abc".into(),
             node_id: None,
             node_name: "control-plane".into(),
+            egress_policy: Default::default(),
             name: "name".into(),
             status: "running".into(),
             image: None,
@@ -3339,6 +3593,8 @@ mod tests {
             created_at: now,
             expires_at: now,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             ports: vec![],
             backend: None,
             disk_size_mb: None,
@@ -3365,6 +3621,7 @@ mod tests {
             public_id: "sbx_abcd1234ef567890".into(),
             node_id: None,
             node_name: "control-plane".into(),
+            egress_policy: Default::default(),
             name: "name".into(),
             status: "running".into(),
             image: None,
@@ -3372,6 +3629,8 @@ mod tests {
             created_at: now,
             expires_at: now,
             preview_password_hint: None,
+            preview_access: Default::default(),
+            preview_allowed_cidrs: Vec::new(),
             ports: vec![3000, 5173],
             backend: None,
             disk_size_mb: None,
@@ -3491,7 +3750,6 @@ mod tests {
             MIN_SANDBOX_CPU_CORES / 2.0,
             f64::NAN,
             f64::INFINITY,
-            MAX_SANDBOX_CPU_CORES + 0.5,
         ] {
             let err = validate_resource_limits(&request_with_limits(Some(cpu), None, None, None))
                 .unwrap_err();
@@ -3562,24 +3820,83 @@ mod tests {
         std::collections::BTreeMap::from([("num_items".to_string(), count.into())])
     }
 
-    /// Router over `db`, authenticated as a default-role user.
-    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+    fn sandbox_router(db: sea_orm::DatabaseConnection) -> axum::Router {
         let service = Arc::new(
             crate::services::sandbox_service::tests::preview_test_service_with_db(Arc::new(db)),
         );
+        let image_preparation =
+            crate::services::sandbox_service::tests::image_preparation_for(&service);
         let state = Arc::new(SandboxAppState {
             sandbox_service: service,
             snapshot_service: None,
             project_access_checker: None,
             audit_service: None,
             sensitive_action_authorizer: Arc::new(AllowAll),
+            image_preparation,
         });
-        crate::handlers::configure_routes()
-            .with_state(state)
-            .layer(axum::Extension(AuthContext::new_session(
-                test_user(),
-                Role::User,
-            )))
+        crate::handlers::configure_routes().with_state(state)
+    }
+
+    /// Router over `db`, authenticated as a default-role user.
+    fn create_app(db: sea_orm::DatabaseConnection) -> axum::Router {
+        sandbox_router(db).layer(axum::Extension(AuthContext::new_session(
+            test_user(),
+            Role::User,
+        )))
+    }
+
+    #[tokio::test]
+    async fn sandbox_host_capacity_requires_read_access() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let router = sandbox_router(db);
+        let request = || {
+            axum::http::Request::builder()
+                .uri("/v1/sandboxes/resource-defaults")
+                .body(axum::body::Body::empty())
+        };
+        let response = router.clone().oneshot(request()?).await?;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let auth =
+            AuthContext::new_api_key(test_user(), None, Some(vec![]), "sandbox-test".into(), 7);
+        let response = router
+            .layer(axum::Extension(auth))
+            .oneshot(request()?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_host_capacity_endpoint_reports_operator_limits_for_auto_placement(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use tower::ServiceExt;
+        let row = settings_row(
+            serde_json::json!({"cpu_limit": 2.0, "memory_limit_mb": 1024, "max_cpu_limit": 1.5, "max_memory_limit_mb": 512, "max_pids_limit": 100}),
+        );
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![row.clone()], vec![row]])
+            .into_connection();
+        let response = create_app(db)
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri("/v1/sandboxes/resource-defaults")
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 4096).await?;
+        let body: serde_json::Value = serde_json::from_slice(&bytes)?;
+        assert!(body["node_id"].is_null());
+        assert_eq!(body["agent_cpu"], 2.0);
+        assert_eq!(body["agent_memory_mb"], 1024);
+        assert_eq!(body["max_cpu"], 1.5);
+        assert_eq!(body["max_memory_mb"], 512);
+        assert_eq!(body["max_pids"], 100);
+        assert_eq!(body["timeout_secs"], 3600);
+        Ok(())
     }
 
     /// Status and parsed Problem body of `POST /v1/sandboxes`.

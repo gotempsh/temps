@@ -37,7 +37,7 @@
 //!   passed via a bound `?` param using the deferred-bind [`Bv`] enum — never
 //!   string-interpolated.
 //! - The four substring filters (host, path, user_agent, upstream_host) and the
-//!   bot_name substring filter use `ILIKE ?` with `escape_like_pattern` so
+//!   bot_name substring filter use `ILIKE ?` with `escape_like` so
 //!   `%`/`_`/`\` in user input cannot widen the match.
 //! - The only interpolated tokens are: the ORDER BY column (from a fixed
 //!   allowlist `match`, mirroring the TimescaleDB sort), the ASC/DESC direction,
@@ -48,6 +48,7 @@
 //!   `ai_agent_detector::known_agents()` and is bound as an array regardless.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
@@ -132,19 +133,6 @@ impl ClickHouseProxyLogConfig {
 }
 
 // ── LIKE pattern escaping ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character. We escape
-/// `\` → `\\` first, then `%` → `\%` and `_` → `\_`. The caller wraps the
-/// result with `%{escaped}%` for a case-insensitive substring search via ILIKE.
-/// (Copied from `temps-otel`'s helper — verified against live CH 26.2.)
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
 
 /// Convert a validated `"N unit"` interval string (already passed through
 /// [`ProxyLogService::is_valid_interval`]) into a whole number of seconds for
@@ -863,11 +851,11 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref host) = filters.host {
             clauses.push("host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(host))));
         }
         if let Some(ref path) = filters.path {
             clauses.push("path ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(path))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(path))));
         }
         if let Some(ref path) = filters.path_exact {
             clauses.push("path = ?".into());
@@ -909,7 +897,7 @@ impl ClickHouseProxyLogStore {
         // User agent
         if let Some(ref ua) = filters.user_agent {
             clauses.push("user_agent ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(ua))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(ua))));
         }
         if let Some(ref browser) = filters.browser {
             clauses.push("browser = ?".into());
@@ -939,7 +927,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref bot_name) = filters.bot_name {
             clauses.push("bot_name ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(bot_name))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(bot_name))));
         }
 
         // AI agent filters (canonical names persisted at ingest; equality / IN).
@@ -1007,7 +995,7 @@ impl ClickHouseProxyLogStore {
         }
         if let Some(ref upstream_host) = filters.upstream_host {
             clauses.push("upstream_host ILIKE ?".into());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(upstream_host))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(upstream_host))));
         }
 
         // Error presence. The CH column stores '' for "no error" (the Postgres
@@ -1180,7 +1168,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // case is one retried request showing twice on a page until the next
         // merge, versus merge-on-read over every part on every page load.
         let order_by = order_by_clause(filters.sort_by.as_deref(), filters.sort_order.as_deref());
-        let offset = (page.saturating_sub(1)) * page_size;
+        let offset = temps_core::config::page_offset(page, page_size);
 
         let select_sql = format!(
             "SELECT \
@@ -1970,6 +1958,7 @@ fn ch_dimension_expression(dimension: TrafficDimension) -> &'static str {
         TrafficDimension::OperatingSystem => "nullIf(operating_system, '')",
         TrafficDimension::DeviceType => "nullIf(device_type, '')",
         TrafficDimension::CacheStatus => "nullIf(cache_status, '')",
+        TrafficDimension::Referrer => "nullIf(referrer, '')",
     }
 }
 
@@ -2937,17 +2926,6 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn escape_like_pattern_escapes_metacharacters() {
-        assert_eq!(escape_like_pattern("a%b"), "a\\%b");
-        assert_eq!(escape_like_pattern("a_b"), "a\\_b");
-        assert_eq!(escape_like_pattern("a\\b"), "a\\\\b");
-        // backslash must be escaped first so we don't double-escape.
-        assert_eq!(escape_like_pattern("%_\\"), "\\%\\_\\\\");
-        // plain text is unchanged.
-        assert_eq!(escape_like_pattern("/api/users"), "/api/users");
-    }
-
-    #[test]
     fn interval_to_seconds_maps_common_units() {
         assert_eq!(interval_to_seconds("1 hour"), Some(3_600));
         assert_eq!(interval_to_seconds("5 minutes"), Some(300));
@@ -3446,6 +3424,39 @@ pub(crate) mod tests {
             .expect("impossible query => empty, no round-trip");
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+
+    /// ClickHouse stores a missing `Referer` as `''`; it must group as null,
+    /// exactly as on TimescaleDB, for the not-found report (ADR 109 D1).
+    #[test]
+    fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::days(7),
+            end_time: Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::Path, TrafficDimension::Referrer],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![
+                TrafficFilter {
+                    dimension: TrafficDimension::StatusCode,
+                    operator: TrafficFilterOperator::Eq,
+                    values: vec!["404".to_string()],
+                },
+                TrafficFilter {
+                    dimension: TrafficDimension::Referrer,
+                    operator: TrafficFilterOperator::NotEq,
+                    values: vec![String::new()],
+                },
+            ],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("toNullable(toString(nullIf(referrer, ''))) AS d1"));
+        assert!(sql.contains("nullIf(referrer, '') != ?"));
+        assert_eq!(binds.len(), 5);
     }
 
     #[test]

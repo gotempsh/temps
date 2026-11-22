@@ -15,7 +15,7 @@ use temps_core::AuditLogger;
 
 pub struct AppState {
     pub deployment_service: Arc<DeploymentService>,
-    pub log_service: Arc<temps_logs::LogService>,
+    pub log_service: Arc<temps_deployment_logs::LogService>,
     pub cron_service: Arc<DatabaseCronConfigService>,
     pub external_deployment_manager: Arc<ExternalDeploymentManager>,
     /// Starts on-demand screenshot captures (`take_screenshot` operation)
@@ -40,9 +40,6 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Node service for listing/getting worker nodes (UI-facing)
     pub node_service: Arc<NodeService>,
-    /// A worker's direct-ingress settings and last reachability check.
-    pub node_public_ingress_service:
-        Arc<crate::services::node_public_ingress::NodePublicIngressService>,
     /// Placement policy for this process, used by the node capability
     /// endpoint to answer "can anything run here?" with the same rules the
     /// deploy path applies.
@@ -56,9 +53,6 @@ pub struct AppState {
     /// Resolved lazily via `.require()` at point of use so a control-plane
     /// process (no local daemon) fails typed rather than panicking at boot.
     pub docker: Arc<temps_core::DockerHandle>,
-    /// On-demand `docker system df` for the control-plane host (server
-    /// monitoring page). See [`crate::services::DockerDiskUsageService`].
-    pub docker_disk_usage: Arc<crate::services::DockerDiskUsageService>,
     /// Optional gate checked before manual-deploy handlers transition a
     /// deployment to `Running` (e.g. a plugin implementing manual
     /// approvals). `None` when no such plugin is registered — deploys
@@ -85,11 +79,6 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
-    /// Single-use enrollment tokens that `temps join` redeems (ADR-020 WS-1.1).
-    pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Starts and cancels node pairings (ADR 048 D2b); shared with the admin
-    /// pairing routes so SSH enrollment pairs nodes the same way.
-    pub node_pairing_admin: Arc<crate::services::node_pairing_admin::NodePairingAdminService>,
     /// Central policy evaluator for sensitive mutations (e.g. draining a
     /// node) -- challenges with MFA step-up when the acting user has one
     /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
@@ -312,6 +301,18 @@ pub struct DeploymentResponse {
     /// deployment itself stays successful.
     #[serde(default)]
     pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
+    /// Whether this deployment's image runs its process as root (uid 0).
+    /// Resolved once by the deploy pipeline, before any replica started,
+    /// against the image's own `/etc/passwd`. `false` when the image runs as
+    /// another user, its user could not be resolved, or the deployment
+    /// predates the check. Advisory: a root image still deploys.
+    #[serde(default)]
+    pub runs_as_root: bool,
+    /// The `USER` the image declares, as written (`nodejs`, `10001:10001`).
+    /// `null` when it declares none (it then runs as root) or the deployment
+    /// was not checked.
+    #[serde(default)]
+    pub image_user: Option<String>,
 }
 
 // Add new struct for environment info in response
@@ -380,6 +381,8 @@ impl DeploymentResponse {
             failure,
             deployment_config: deployment.deployment_config,
             metadata: deployment.metadata,
+            runs_as_root: deployment.runs_as_root,
+            image_user: deployment.image_user,
         }
     }
 }
@@ -597,6 +600,13 @@ pub struct UpdateCustomDomainRequest {
     pub branch: Option<String>,
 }
 
+/// Result of purging cached static assets.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AssetCachePurgeResponse {
+    /// How many cached asset entries were removed (0 when the cache was empty).
+    pub deleted: u64,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentStateResponse {
     pub id: i32,
@@ -786,6 +796,11 @@ pub struct ContainerInfoResponse {
     pub container_name: String,
     pub image_name: String,
     pub status: String,
+    /// What runs this container: `docker` for a Docker container,
+    /// `firecracker` for a microVM replica (`micro_vm` isolation).
+    #[schema(example = "docker")]
+    #[serde(default = "default_container_runtime")]
+    pub runtime: String,
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub created_at: String,
     /// Node name where this container is running. None for local (single-node) deployments.
@@ -846,6 +861,10 @@ pub struct ServicePublicUrl {
     pub url: String,
 }
 
+fn default_container_runtime() -> String {
+    "docker".to_string()
+}
+
 impl ContainerInfoResponse {
     pub fn from_info(
         info: temps_deployer::ContainerInfo,
@@ -861,6 +880,7 @@ impl ContainerInfoResponse {
             health_state: "unknown".to_string(),
             health_checked_at: None,
             health_detail: None,
+            runtime: temps_deployer::container_runtime(&info.labels).to_string(),
             container_id: info.container_id,
             container_name: info.container_name,
             image_name: info.image_name,
@@ -1010,6 +1030,14 @@ pub struct ContainerMetricsResponse {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices. Null when the runtime does
+    /// not report it.
+    #[schema(nullable = true)]
+    pub block_write_bytes: Option<u64>,
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
@@ -1166,5 +1194,105 @@ mod health_probe_openapi_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_container_reports_docker_unless_the_plane_names_another_runtime() {
+        let docker = super::ContainerInfoResponse::from(temps_deployer::ContainerInfo::default());
+        assert_eq!(docker.runtime, "docker");
+
+        let labelled = |runtime: &str| temps_deployer::ContainerInfo {
+            labels: std::collections::HashMap::from([(
+                temps_deployer::RUNTIME_LABEL.to_string(),
+                runtime.to_string(),
+            )]),
+            ..Default::default()
+        };
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("firecracker")).runtime,
+            "firecracker"
+        );
+        assert_eq!(
+            super::ContainerInfoResponse::from(labelled("")).runtime,
+            "docker",
+            "an empty label is no runtime"
+        );
+
+        let doc = super::super::deployments::DeploymentsApiDoc::openapi();
+        let json = serde_json::to_value(&doc).unwrap();
+        assert!(
+            !json["components"]["schemas"]["ContainerInfoResponse"]["properties"]["runtime"]
+                .is_null(),
+            "the console reads runtime from the OpenAPI client"
+        );
+    }
+}
+
+#[cfg(test)]
+mod deployment_response_tests {
+    use super::*;
+    use crate::services::types::DeploymentEnvironment;
+
+    fn deployment(runs_as_root: bool, image_user: Option<&str>) -> Deployment {
+        Deployment {
+            id: 7,
+            project_id: 1,
+            environment_id: 2,
+            environment: DeploymentEnvironment {
+                id: 2,
+                name: "Production".to_string(),
+                slug: "production".to_string(),
+                domains: vec!["my-app.example.com".to_string()],
+                primary_url: None,
+                no_address_reason: None,
+                reachability_warning: None,
+            },
+            status: "completed".to_string(),
+            url: "https://my-app.example.com".to_string(),
+            commit_hash: None,
+            commit_message: None,
+            branch: None,
+            tag: None,
+            created_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+            screenshot_location: None,
+            commit_author: None,
+            commit_date: None,
+            is_current: true,
+            cancelled_reason: None,
+            deployment_config: None,
+            metadata: None,
+            runs_as_root,
+            image_user: image_user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_response_reports_whether_the_image_runs_as_root() {
+        let root = DeploymentResponse::from_service_deployment(deployment(true, None));
+        let json = serde_json::to_value(&root).unwrap();
+        assert_eq!(json["runs_as_root"], serde_json::json!(true));
+        assert_eq!(json["image_user"], serde_json::Value::Null);
+
+        let non_root =
+            DeploymentResponse::from_service_deployment(deployment(false, Some("nodejs")));
+        let json = serde_json::to_value(&non_root).unwrap();
+        assert_eq!(json["runs_as_root"], serde_json::json!(false));
+        assert_eq!(json["image_user"], serde_json::json!("nodejs"));
+    }
+
+    #[test]
+    fn a_response_from_an_older_server_reads_as_not_root() {
+        let mut json = serde_json::to_value(DeploymentResponse::from_service_deployment(
+            deployment(true, Some("0")),
+        ))
+        .unwrap();
+        let object = json.as_object_mut().unwrap();
+        object.remove("runs_as_root");
+        object.remove("image_user");
+        let parsed: DeploymentResponse = serde_json::from_value(json).unwrap();
+        assert!(!parsed.runs_as_root);
+        assert_eq!(parsed.image_user, None);
     }
 }

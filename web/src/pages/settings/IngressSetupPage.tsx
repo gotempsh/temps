@@ -62,15 +62,21 @@ import {
   type SetupPlan,
   type SetupStep,
   type UndoResult,
+  exampleHost,
+  hostSuffixFor,
   runTunnelSetup,
+  schemeLabelError,
   sdkIngressSetupApi,
-  subdomainLabelError,
   tunnelDomainFor,
   undoSetup,
   uniqueProviderName,
   uniqueTunnelName,
   workerEligibility,
   type WorkerEligibility,
+  CONTROL_PLANE_NAME,
+  CONTROL_PLANE_NODE_ID,
+  controlPlaneEligibility,
+  pickedNodeName,
 } from '@/components/nodes/ingress-setup'
 import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -103,11 +109,13 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { allTunnelsOptions, baseHost } from '@/lib/tunnel-domains'
+import { publishEnvironmentsHref, suffixedHost } from '@/lib/tunnel-host-suffix'
 import { addressScope } from '@/lib/worker-ingress'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 import { cn } from '@/lib/utils'
 
-const EXAMPLE_APP = 'app'
+/** A concrete app name for the hostname examples; the pattern says `<app-name>`. */
+const EXAMPLE_APP = 'shop'
 
 function workerUrl(id: number) {
   return `${WORKER_NODES_URL}/${id}#public-ingress`
@@ -117,7 +125,7 @@ export function IngressSetupPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Worker Nodes', href: WORKER_NODES_URL },
+      { label: 'Worker nodes', href: WORKER_NODES_URL },
       { label: 'Expose your apps' },
     ])
   }, [setBreadcrumbs])
@@ -128,10 +136,26 @@ export function IngressSetupPage() {
     searchParams.get('via') === 'ports' ? 'ports' : 'tunnel'
   const preferredWorker = Number(searchParams.get('worker')) || null
 
-  const nodesQuery = useQuery(adminListNodesOptions())
+  // Polled, so a worker that stops while the page is open stops being
+  // offered; the run checks the picked ones again before creating anything.
+  const nodesQuery = useQuery({
+    ...adminListNodesOptions(),
+    refetchInterval: 15_000,
+  })
   const workers = (nodesQuery.data?.nodes ?? []).filter(
     (n) => n.role === 'worker'
   )
+  // Once the page has shown workers it keeps the wizard mounted, even if a
+  // later poll finds none: unmounting it would lose a run in progress, its
+  // result and the undo it offers.
+  const [hadWorkers, setHadWorkers] = useState(false)
+  if (workers.length > 0 && !hadWorkers) setHadWorkers(true)
+  const loaded =
+    !nodesQuery.isLoading && !(nodesQuery.isError && !nodesQuery.data)
+  // A tunnel can run on the control plane itself (ADR-107), so it needs no
+  // worker; open ports are set up on a worker.
+  const showWizard =
+    loaded && (via === 'tunnel' || workers.length > 0 || hadWorkers)
   const anyPublic = workers.some((w) => addressScope(w.address) === 'public')
 
   const choose = (next: IngressWay) => {
@@ -162,9 +186,9 @@ export function IngressSetupPage() {
             title="Cloudflare Tunnel"
             badge={!anyPublic ? 'Recommended' : undefined}
           >
-            The worker connects out to Cloudflare, and visitors come in through
-            Cloudflare&apos;s network. No public IP, open port or router change;
-            Cloudflare serves HTTPS. Best when the worker has no public IP.
+            This server or a worker connects out to Cloudflare, and visitors
+            come in through Cloudflare&apos;s network. No public IP, open port
+            or router change; Cloudflare serves HTTPS. Best behind NAT.
           </WayCard>
           <WayCard
             value="ports"
@@ -183,7 +207,7 @@ export function IngressSetupPage() {
           <Skeleton className="h-24 w-full" />
           <Skeleton className="h-24 w-full" />
         </div>
-      ) : nodesQuery.isError ? (
+      ) : nodesQuery.isError && !nodesQuery.data ? (
         <Alert variant="destructive">
           <AlertTitle>Could not load the worker nodes</AlertTitle>
           <AlertDescription>
@@ -197,9 +221,28 @@ export function IngressSetupPage() {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : workers.length === 0 ? (
+      ) : via === 'ports' && workers.length === 0 && !hadWorkers ? (
         <NoWorkers />
-      ) : via === 'ports' ? (
+      ) : null}
+      {showWizard && workers.length === 0 && hadWorkers && (
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          This cluster has no worker nodes any more.{' '}
+          {via === 'tunnel'
+            ? 'A new tunnel can still run on the control plane.'
+            : 'Open ports need a worker, so nothing new can be set up here.'}{' '}
+          What this page reported is kept below.
+        </p>
+      )}
+      {/* A failed poll keeps the last list: replacing the wizard here would
+          abort a run in progress and lose what it reported. */}
+      {nodesQuery.isError && nodesQuery.data && (
+        <p className="text-xs text-amber-700 dark:text-amber-300">
+          The worker list may be out of date: the last refresh failed (
+          {deliveryError(nodesQuery.error)}). Creating a tunnel checks the
+          workers again first.
+        </p>
+      )}
+      {!showWizard ? null : via === 'ports' ? (
         <OpenPortsPanel workers={workers} />
       ) : (
         <TunnelSetup workers={workers} preferredWorker={preferredWorker} />
@@ -369,14 +412,31 @@ function TunnelSetup({
       workerEligibility(node, settingsQueries[index]?.data?.mode, tunnels),
     ])
   )
+  const workerDefaults = workers
+    .filter((n) => eligibility.get(n.id)?.defaultOn)
+    .map((n) => n.id)
+  const controlPlane = controlPlaneEligibility(tunnels, workerDefaults.length)
+  eligibility.set(CONTROL_PLANE_NODE_ID, controlPlane)
   const defaults =
     preferredWorker != null && eligibility.get(preferredWorker)?.selectable
       ? [preferredWorker]
-      : workers.filter((n) => eligibility.get(n.id)?.defaultOn).map((n) => n.id)
+      : controlPlane.defaultOn
+        ? [CONTROL_PLANE_NODE_ID]
+        : workerDefaults
   const nodeIds = (picked ?? defaults).filter(
     (id) => eligibility.get(id)?.selectable
   )
-  const chosenNodes = workers.filter((n) => nodeIds.includes(n.id))
+  const chosenNodes = [
+    ...(nodeIds.includes(CONTROL_PLANE_NODE_ID)
+      ? [{ id: CONTROL_PLANE_NODE_ID, name: CONTROL_PLANE_NAME }]
+      : []),
+    ...workers.filter((n) => nodeIds.includes(n.id)),
+  ]
+  // Workers the operator picked that a later poll made unavailable (offline,
+  // removed): the run would quietly use fewer, so it waits for a decision.
+  const droppedPicks = (picked ?? [])
+    .filter((id) => !eligibility.get(id)?.selectable)
+    .map((id) => workers.find((n) => n.id === id)?.name ?? `node ${id}`)
 
   const managedQuery = useQuery({
     ...listManagedDomainsOptions({ path: { id: account?.id ?? 0 } }),
@@ -386,9 +446,8 @@ function TunnelSetup({
     (d) => d.domain.toLowerCase() === zone.toLowerCase()
   )
   const schemeValue: HostnameScheme =
-    scheme === 'zone' ? { kind: 'zone' } : { kind: 'subdomain', label }
-  const labelError =
-    scheme === 'subdomain' ? subdomainLabelError(label) : undefined
+    scheme === 'zone' ? { kind: 'zone' } : { kind: scheme, label }
+  const labelError = schemeLabelError(schemeValue)
   const tunnelDomain =
     zone && !labelError ? tunnelDomainFor(zone, schemeValue) : ''
   const conflict = tunnelDomain
@@ -475,6 +534,7 @@ function TunnelSetup({
     !!zone &&
     !labelError &&
     nodeIds.length > 0 &&
+    droppedPicks.length === 0 &&
     !conflict &&
     tunnelsQuery.isSuccess &&
     !managedQuery.isLoading
@@ -492,6 +552,7 @@ function TunnelSetup({
       zone,
       managed,
       tunnelDomain,
+      hostSuffix: hostSuffixFor(schemeValue),
       tunnelName,
       nodes: chosenNodes.map((n) => ({ id: n.id, name: n.name })),
     })
@@ -595,18 +656,30 @@ function TunnelSetup({
 
         <Card className="shadow-none">
           <CardHeader>
-            <CardTitle className="text-base">4. Workers</CardTitle>
+            <CardTitle className="text-base">4. Where it runs</CardTitle>
             <CardDescription>
-              Every worker picked runs the tunnel. With more than one, apps stay
-              reachable when a worker goes down.
+              Every node picked runs the tunnel. With more than one, apps stay
+              reachable when one goes down.
             </CardDescription>
           </CardHeader>
           <CardContent>
             <WorkerPicker
+              controlPlane={controlPlane}
               workers={workers}
               eligibility={eligibility}
               selected={nodeIds}
-              onChange={setPicked}
+              onChange={(ids) =>
+                // The picker only knows the selectable workers; a pick that
+                // became unavailable stays until the operator decides on it
+                // (Continue, or the worker coming back), so changing another
+                // box cannot quietly drop it.
+                setPicked((current) => [
+                  ...(current ?? []).filter(
+                    (id) => !eligibility.get(id)?.selectable
+                  ),
+                  ...ids,
+                ])
+              }
             />
           </CardContent>
         </Card>
@@ -617,11 +690,38 @@ function TunnelSetup({
           <CardTitle className="text-base">5. Create</CardTitle>
           <CardDescription>
             {ready
-              ? `Creates tunnel ${tunnelName} in Cloudflare for ${tunnelDomain}, running on ${chosenNodes.map((n) => n.name).join(', ')}.${managed ? '' : ` Adds ${zone} to Temps first.`}`
-              : 'Pick an account, a domain and at least one worker.'}
+              ? `Creates tunnel ${tunnelName} in Cloudflare for ${tunnelDomain}, running on ${chosenNodes.map(pickedNodeName).join(', ')}.${managed ? '' : ` Adds ${zone} to Temps first.`}`
+              : 'Pick an account, a domain and where it runs.'}
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">
+          {droppedPicks.length > 0 && !run.data && !run.isPending && (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                {droppedPicks.join(', ')}{' '}
+                {droppedPicks.length === 1 ? 'is' : 'are'} no longer available
+              </AlertTitle>
+              <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                <p>
+                  You picked {droppedPicks.length === 1 ? 'it' : 'them'} under
+                  Workers, but {droppedPicks.length === 1 ? 'it' : 'they'} can
+                  no longer run a tunnel (see why there). Bring{' '}
+                  {droppedPicks.length === 1 ? 'it' : 'them'} back, or go on
+                  without.
+                </p>
+                {nodeIds.length > 0 && (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setPicked(nodeIds)}
+                  >
+                    Continue with {chosenNodes.map((n) => n.name).join(', ')}
+                  </Button>
+                )}
+              </AlertDescription>
+            </Alert>
+          )}
           {steps && <StepList steps={steps} />}
           {outcome && (
             <OutcomePanel
@@ -1105,7 +1205,13 @@ function SchemePicker({
   const sub = label.trim().toLowerCase() || 'lab'
   return (
     <div className="space-y-3">
-      <p className="text-sm font-medium">Hostnames</p>
+      <div className="space-y-1">
+        <p className="text-sm font-medium">Hostnames</p>
+        <p className="text-xs text-muted-foreground">
+          Each app gets its own hostname from a pattern: the tunnel serves every
+          name it matches.
+        </p>
+      </div>
       <RadioGroup
         value={scheme}
         onValueChange={(value) => onScheme(value as HostnameScheme['kind'])}
@@ -1117,12 +1223,52 @@ function SchemePicker({
           className="flex cursor-pointer items-start gap-2 font-normal"
         >
           <RadioGroupItem id="scheme-zone" value="zone" className="mt-0.5" />
-          <span className="text-sm">
-            <code>
-              {EXAMPLE_APP}.{zone}
-            </code>{' '}
-            <span className="text-muted-foreground">
-              (recommended: Cloudflare&apos;s free certificate covers it)
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              <code>&lt;app-name&gt;.{zone}</code>{' '}
+              <span className="text-muted-foreground">
+                (recommended: Cloudflare&apos;s free certificate covers it)
+              </span>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {EXAMPLE_APP}.{zone}
+              </code>
+            </span>
+          </span>
+        </Label>
+        <Label
+          htmlFor="scheme-suffix"
+          className="flex cursor-pointer items-start gap-2 font-normal"
+        >
+          <RadioGroupItem
+            id="scheme-suffix"
+            value="suffix"
+            className="mt-0.5"
+          />
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              With a label, one level deep:{' '}
+              <code>
+                &lt;app-name&gt;-{sub}.{zone}
+              </code>{' '}
+              <span className="text-muted-foreground">
+                (the free certificate covers it too)
+              </span>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {exampleHost(EXAMPLE_APP, zone, { kind: 'suffix', label: sub })}
+              </code>
+              , instead of{' '}
+              <code>
+                {exampleHost(EXAMPLE_APP, zone, {
+                  kind: 'subdomain',
+                  label: sub,
+                })}
+              </code>
             </span>
           </span>
         </Label>
@@ -1135,19 +1281,34 @@ function SchemePicker({
             value="subdomain"
             className="mt-0.5"
           />
-          <span className="text-sm">
-            Under a subdomain, such as{' '}
-            <code>
-              {EXAMPLE_APP}.{sub}.{zone}
-            </code>
+          <span className="grid gap-0.5 text-sm">
+            <span>
+              Under a subdomain:{' '}
+              <code>
+                &lt;app-name&gt;.{sub}.{zone}
+              </code>
+            </span>
+            <span className="text-xs text-muted-foreground">
+              For example{' '}
+              <code>
+                {EXAMPLE_APP}.{sub}.{zone}
+              </code>
+            </span>
           </span>
         </Label>
       </RadioGroup>
-      {scheme === 'subdomain' && (
+      {scheme !== 'zone' && (
         <div className="space-y-3 pl-6">
           <div className="space-y-1">
-            <Label htmlFor="scheme-label">Subdomain</Label>
+            <Label htmlFor="scheme-label">
+              {scheme === 'suffix' ? 'Label' : 'Subdomain'}
+            </Label>
             <div className="flex items-center gap-2">
+              {scheme === 'suffix' && (
+                <span className="text-sm text-muted-foreground">
+                  &lt;app-name&gt;-
+                </span>
+              )}
               <Input
                 id="scheme-label"
                 className="w-40"
@@ -1163,27 +1324,47 @@ function SchemePicker({
               <p className="text-sm text-destructive">{labelError}</p>
             )}
           </div>
-          <Alert className="border-amber-500/30 bg-amber-500/5">
-            <AlertTriangle className="h-4 w-4 text-amber-500" />
-            <AlertTitle className="text-amber-700 dark:text-amber-400">
-              HTTPS fails without Advanced Certificate Manager
-            </AlertTitle>
-            <AlertDescription className="text-amber-700 dark:text-amber-300">
-              Cloudflare&apos;s free Universal SSL covers {zone} and one level
-              below it (<code>*.{zone}</code>). Names such as{' '}
-              <code>
-                {EXAMPLE_APP}.{sub}.{zone}
-              </code>{' '}
-              are two levels down, so visitors get a certificate error unless
-              the zone has Advanced Certificate Manager (or Total TLS) covering{' '}
-              <code>
-                *.{sub}.{zone}
-              </code>
-              .
-            </AlertDescription>
-          </Alert>
+          {scheme === 'suffix' ? (
+            <div className="space-y-1 text-xs text-muted-foreground">
+              <p>
+                The tunnel serves {zone}, and each environment it publishes gets
+                a name such as{' '}
+                <code>
+                  {EXAMPLE_APP}-{sub}.{zone}
+                </code>
+                : one level below {zone}, which Cloudflare&apos;s free Universal
+                SSL (<code>*.{zone}</code>) covers.
+              </p>
+            </div>
+          ) : (
+            <Alert className="border-amber-500/30 bg-amber-500/5">
+              <AlertTriangle className="h-4 w-4 text-amber-500" />
+              <AlertTitle className="text-amber-700 dark:text-amber-400">
+                HTTPS fails without Advanced Certificate Manager
+              </AlertTitle>
+              <AlertDescription className="text-amber-700 dark:text-amber-300">
+                Cloudflare&apos;s free Universal SSL covers {zone} and one level
+                below it (<code>*.{zone}</code>). Names such as{' '}
+                <code>
+                  {EXAMPLE_APP}.{sub}.{zone}
+                </code>{' '}
+                are two levels down, so visitors get a certificate error unless
+                the zone has Advanced Certificate Manager (or Total TLS)
+                covering{' '}
+                <code>
+                  *.{sub}.{zone}
+                </code>
+                .
+              </AlertDescription>
+            </Alert>
+          )}
         </div>
       )}
+      <p className="text-xs text-muted-foreground">
+        Creating the tunnel gives no environment a name yet: you choose{' '}
+        <strong>Publish environments</strong> for it afterwards, once you have
+        seen the list of names it would make public.
+      </p>
     </div>
   )
 }
@@ -1203,10 +1384,7 @@ function ConflictNote({ tunnel }: { tunnel: ConnectorView }) {
           <>
             {' '}
             (it runs on{' '}
-            <Link className="underline" to={workerUrl(first.node_id)}>
-              {first.node_name}
-            </Link>
-            )
+            <NodeLink nodeId={first.node_id} name={first.node_name} />)
           </>
         )}
         .
@@ -1216,31 +1394,60 @@ function ConflictNote({ tunnel }: { tunnel: ConnectorView }) {
 }
 
 function WorkerPicker({
+  controlPlane,
   workers,
   eligibility,
   selected,
   onChange,
 }: {
+  controlPlane: WorkerEligibility
   workers: NodeInfoResponse[]
   eligibility: Map<number, WorkerEligibility>
   selected: number[]
   onChange: (ids: number[]) => void
 }) {
-  const allServed = workers.every(
-    (n) =>
-      !eligibility.get(n.id)?.selectable || eligibility.get(n.id)?.hasIngress
-  )
+  const allServed =
+    controlPlane.hasIngress &&
+    workers.every(
+      (n) =>
+        !eligibility.get(n.id)?.selectable || eligibility.get(n.id)?.hasIngress
+    )
   const toggle = (id: number, on: boolean) =>
     onChange(on ? [...selected, id] : selected.filter((n) => n !== id))
   return (
     <div className="space-y-3">
       {allServed && selected.length === 0 && (
         <p className="text-sm text-muted-foreground">
-          Every worker that can take a tunnel already has a way in. Pick the
-          ones that should also run this one.
+          Every node that can take a tunnel already has a way in. Pick the ones
+          that should also run this one.
         </p>
       )}
       <ul className="divide-y rounded-md border">
+        <li className="space-y-2 p-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <Checkbox
+              id="worker-control-plane"
+              checked={selected.includes(CONTROL_PLANE_NODE_ID)}
+              onCheckedChange={(on) =>
+                toggle(CONTROL_PLANE_NODE_ID, on === true)
+              }
+            />
+            <Label htmlFor="worker-control-plane" className="font-medium">
+              {CONTROL_PLANE_NAME}
+            </Label>
+            <span className="text-xs text-muted-foreground">This server</span>
+            {controlPlane.hasIngress && (
+              <Badge variant="secondary">Runs a tunnel</Badge>
+            )}
+          </div>
+          {selected.includes(CONTROL_PLANE_NODE_ID) &&
+            selected.some((id) => id !== CONTROL_PLANE_NODE_ID) && (
+              <p className="pl-6 text-xs text-muted-foreground">
+                With a worker too, the tunnel publishes only the apps the
+                workers serve.
+              </p>
+            )}
+        </li>
         {workers.map((node) => {
           const state = eligibility.get(node.id)
           const id = `worker-${node.id}`
@@ -1382,8 +1589,18 @@ function OutcomePanel({
       <Alert variant="destructive">
         <AlertTitle>Setup failed: {outcome.error}</AlertTitle>
         <AlertDescription className="space-y-2">
-          <p>What this page had created is undone:</p>
-          <UndoList results={outcome.undo} />
+          {outcome.stoppedBeforeChanges ? (
+            <p>
+              Nothing was created.
+              {addedAccount &&
+                ` The Cloudflare account ${addedAccount} you added stays, so you can try again.`}
+            </p>
+          ) : (
+            <>
+              <p>What this page had created is undone:</p>
+              <UndoList results={outcome.undo} />
+            </>
+          )}
           {leftovers && (
             <p>
               Remove what is left from its{' '}
@@ -1418,6 +1635,23 @@ function OutcomePanel({
             </Link>
             .
           </p>
+          {domain && (
+            <p>
+              To give every environment a name such as{' '}
+              <code>
+                {suffixedHost(
+                  EXAMPLE_APP,
+                  outcome.connector.host_suffix,
+                  domain
+                )}
+              </code>
+              ,{' '}
+              <Link className="underline" to={publishEnvironmentsHref(domain)}>
+                publish environments through this tunnel
+              </Link>
+              . No environment gets a name until you do.
+            </p>
+          )}
           <WorkerLinks nodes={workers} />
         </AlertDescription>
       </Alert>
@@ -1492,14 +1726,25 @@ function OutcomePanel({
   )
 }
 
+/**
+ * A worker's name links to its tunnel controls. The control plane has no
+ * such page section (its tunnels are managed here), so it is named only.
+ */
+function NodeLink({ nodeId, name }: { nodeId: number; name: string }) {
+  if (nodeId === CONTROL_PLANE_NODE_ID) return <span>{name}</span>
+  return (
+    <Link className="underline" to={workerUrl(nodeId)}>
+      {name}
+    </Link>
+  )
+}
+
 function WorkerLinks({ nodes }: { nodes: ConnectorView['nodes'] }) {
   return (
     <p className="flex flex-wrap gap-x-3 gap-y-1">
-      <span>Workers:</span>
+      <span>Runs on:</span>
       {nodes.map((n) => (
-        <Link key={n.node_id} className="underline" to={workerUrl(n.node_id)}>
-          {n.node_name}
-        </Link>
+        <NodeLink key={n.node_id} nodeId={n.node_id} name={n.node_name} />
       ))}
     </p>
   )

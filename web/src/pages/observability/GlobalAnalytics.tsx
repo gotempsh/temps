@@ -4,8 +4,11 @@
 import { useState, type ReactNode } from 'react'
 import { Button } from '@/components/ui/button'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
-import { getGlobalAnalyticsOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getGlobalAnalyticsOptions,
+  getGlobalAnalyticsQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   AnalyticsTrafficChart,
   type AnalyticsMetric,
@@ -26,9 +29,9 @@ import {
 import { useGlobalView } from '@/hooks/useGlobalView'
 import type { GlobalView } from '@/hooks/useGlobalView'
 import type { AnalyticsFacet } from '@/api/client/types.gen'
-import { EmptyState } from '@/components/ui/empty-state'
-import { BarChart3 } from 'lucide-react'
-import { Link } from 'react-router'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 function Breakdown({
   title,
@@ -45,8 +48,8 @@ function Breakdown({
   totalVisitors: number
   expanded?: boolean
 }) {
-  const query = useQuery(
-    getGlobalAnalyticsOptions({
+  const query = useWindowQuery({
+    ...getGlobalAnalyticsOptions({
       query: {
         project_id: view.projectId,
         start_date: view.from,
@@ -59,7 +62,14 @@ function Breakdown({
         search: view.search || undefined,
         page: expanded ? view.page : 1,
       },
-    })
+    }),
+  })
+  // Only the expanded breakdown pages; the others always show page 1.
+  useGlobalPageInRange(
+    view,
+    expanded && query.data && !query.isPlaceholderData
+      ? { rows: query.data.rows.length, total: query.data.total }
+      : undefined
   )
   return (
     <DataSection
@@ -123,24 +133,23 @@ function Breakdown({
 }
 export default function GlobalAnalytics() {
   const view = useGlobalView()
-  const queryClient = useQueryClient()
   const [metric, setMetric] = useState<AnalyticsMetric>('visitors')
   const common = {
     project_id: view.projectId,
     start_date: view.from,
     end_date: view.to,
   }
-  const summary = useQuery(
-    getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } })
-  )
-  const traffic = useQuery(
-    getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } })
-  )
-  const pages = useQuery(
-    getGlobalAnalyticsOptions({
+  const summary = useWindowQuery({
+    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'summary' } }),
+  })
+  const traffic = useWindowQuery({
+    ...getGlobalAnalyticsOptions({ query: { ...common, facet: 'traffic' } }),
+  })
+  const pages = useWindowQuery({
+    ...getGlobalAnalyticsOptions({
       query: { ...common, facet: 'pages', per_page: 1 },
-    })
-  )
+    }),
+  })
   const totals = summary.data?.rows[0]
   const grid = (children: ReactNode) => (
     <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
@@ -171,6 +180,8 @@ export default function GlobalAnalytics() {
   const expandedTitle = selectedBreakdown
     ? breakdowns[selectedBreakdown]
     : undefined
+  // A search narrows breakdowns, not the totals, so it never explains an
+  // empty page; this is a page that has received nothing in the window.
   const hasNoAnalytics =
     !summary.isPending &&
     !traffic.isPending &&
@@ -184,14 +195,7 @@ export default function GlobalAnalytics() {
       title="Analytics"
       description="Traffic, audience, and engagement across your services."
       view={view}
-      fetching={summary.isFetching || traffic.isFetching || pages.isFetching}
-      refresh={() => {
-        void queryClient.invalidateQueries({
-          predicate: (query) =>
-            (query.queryKey[0] as { _id?: string })?._id ===
-            'getGlobalAnalytics',
-        })
-      }}
+      refreshQueryKeys={[queryKeyPrefix(getGlobalAnalyticsQueryKey)]}
       searchLabel="Search analytics breakdowns"
     >
       {expandedTitle && selectedBreakdown ? (
@@ -231,19 +235,10 @@ export default function GlobalAnalytics() {
             />
           </QueryContent>
           {hasNoAnalytics ? (
-            <DataSection title="Traffic">
-              <EmptyState
-                size="compact"
-                icon={BarChart3}
-                title="No analytics data yet"
-                description="Open a service to finish analytics setup and start collecting page views, sessions, and visitors."
-                action={
-                  <Button asChild size="sm">
-                    <Link to="/projects">Open projects</Link>
-                  </Button>
-                }
-              />
-            </DataSection>
+            <ObservabilitySetupGuide
+              kind="analytics"
+              projectId={view.projectId}
+            />
           ) : (
             <AnalyticsTrafficChart
               data={traffic.data?.rows.map((row) => ({
@@ -275,7 +270,7 @@ export default function GlobalAnalytics() {
               traffic={grid(
                 <>
                   <Breakdown
-                    title="Top Pages"
+                    title="Top pages"
                     facet="pages"
                     view={view}
                     totalVisitors={totals?.visitors ?? 0}

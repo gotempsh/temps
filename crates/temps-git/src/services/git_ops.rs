@@ -396,22 +396,35 @@ fn is_missing_remote_ref(fetch_error: &str) -> bool {
 }
 
 /// Resolve `git rev-parse --verify <rev>` in `target`.
-async fn rev_parse(target: &Path, rev: &str) -> Result<String, String> {
+async fn rev_parse(
+    target: &Path,
+    rev: &str,
+    credentials: Option<(&str, &str)>,
+) -> Result<String, String> {
     let mut command = git_command();
     command
         .arg("-C")
         .arg(target)
         .args(["rev-parse", "--verify", "--quiet"])
         .arg(rev);
+    // Resolution can trigger a promisor fetch in a partial clone.
+    command.env("GIT_TERMINAL_PROMPT", "0");
+    apply_git_http_credentials(&mut command, credentials);
     run_git_stdout(command, &format!("resolve {rev}")).await
+}
+
+/// Full SHA-1 object IDs are immutable targets; SHA-shaped branch names must
+/// be requested explicitly through refs/heads/.
+fn is_full_commit_id(reference: &str) -> bool {
+    reference.len() == 40 && reference.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Check out a branch, a tag or a commit of `url` into `target`, fetching as
 /// little history as the remote allows.
 ///
-/// A plain name is tried as a branch first, then as a tag, then (when it is
-/// 7 to 40 hexadecimal characters) as a commit, so a branch always wins over
-/// a tag or abbreviated id of the same spelling. `refs/heads/x` and
+/// Full 40-character hexadecimal IDs select an immutable commit. Other plain
+/// names are tried as a branch first, then as a tag, then (when they are 4 to
+/// 39 hexadecimal characters) as an abbreviated commit ID. `refs/heads/x` and
 /// `refs/tags/x` pin the kind; any other `refs/...` is fetched as given and
 /// checked out detached.
 ///
@@ -472,6 +485,8 @@ pub async fn clone_ref(
         (Some(ClonedRefKind::Tag), name)
     } else if reference.starts_with("refs/") {
         (Some(ClonedRefKind::Other), reference)
+    } else if is_full_commit_id(reference) {
+        (Some(ClonedRefKind::Commit), reference)
     } else {
         (None, reference)
     };
@@ -483,7 +498,7 @@ pub async fn clone_ref(
         let refspec = format!("+refs/heads/{name}:{remote_branch}");
         match fetch_refspecs(target, credentials, true, &[refspec]).await {
             Ok(()) => {
-                let sha = rev_parse(target, &format!("{remote_branch}^{{commit}}"))
+                let sha = rev_parse(target, &format!("{remote_branch}^{{commit}}"), credentials)
                     .await
                     .map_err(|e| clone_failed(url, e))?;
                 let mut checkout = git_command();
@@ -509,7 +524,7 @@ pub async fn clone_ref(
         let refspec = format!("+{local_tag}:{local_tag}");
         match fetch_refspecs(target, credentials, true, &[refspec]).await {
             Ok(()) => {
-                let sha = rev_parse(target, &format!("{local_tag}^{{commit}}"))
+                let sha = rev_parse(target, &format!("{local_tag}^{{commit}}"), credentials)
                     .await
                     .map_err(|e| clone_failed(url, e))?;
                 let mut checkout = git_command();
@@ -531,7 +546,7 @@ pub async fn clone_ref(
         let refspec = format!("+{name}:refs/temps/fetched");
         match fetch_refspecs(target, credentials, true, &[refspec]).await {
             Ok(()) => {
-                let sha = rev_parse(target, "refs/temps/fetched^{commit}")
+                let sha = rev_parse(target, "refs/temps/fetched^{commit}", credentials)
                     .await
                     .map_err(|e| clone_failed(url, e))?;
                 let mut checkout = git_command();
@@ -550,8 +565,11 @@ pub async fn clone_ref(
     }
 
     let is_commit_like =
-        (7..=40).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit());
-    if resolved.is_none() && pinned.is_none() && is_commit_like {
+        (4..=40).contains(&name.len()) && name.bytes().all(|b| b.is_ascii_hexdigit());
+    if resolved.is_none()
+        && pinned.is_none_or(|kind| kind == ClonedRefKind::Commit)
+        && is_commit_like
+    {
         // A full id can be requested directly, which keeps the fetch shallow.
         // Anything else (an abbreviated id, or a server that will not serve
         // unadvertised objects) needs every advertised ref to find the commit.
@@ -569,7 +587,7 @@ pub async fn clone_ref(
                 .await
                 .map_err(|e| clone_failed(url, e))?;
         }
-        match rev_parse(target, &format!("{name}^{{commit}}")).await {
+        match rev_parse(target, &format!("{name}^{{commit}}"), credentials).await {
             Ok(sha) if !sha.is_empty() => {
                 let mut checkout = git_command();
                 checkout
@@ -592,7 +610,12 @@ pub async fn clone_ref(
         ));
     };
 
-    let head = rev_parse(target, "HEAD")
+    let expected = if is_full_commit_id(reference) {
+        reference.to_ascii_lowercase()
+    } else {
+        expected
+    };
+    let head = rev_parse(target, "HEAD", credentials)
         .await
         .map_err(|e| clone_failed(url, e))?;
     if head != expected {
@@ -764,6 +787,9 @@ pub async fn sparse_clone_repo(
     credentials: Option<(&str, &str)>,
 ) -> Result<Repository, GitOpsError> {
     let subdirectory = validate_sparse_subdirectory(subdirectory)?;
+    if let Some(reference) = checkout_ref {
+        validate_clone_ref(url, reference)?;
+    }
     let redacted_url = temps_core::url_validation::redact_url_password(url);
     let target = target_dir.display().to_string();
 
@@ -804,22 +830,62 @@ pub async fn sparse_clone_repo(
         .await
         .map_err(fail)?;
 
+    let reference = checkout_ref.unwrap_or("HEAD");
+    let mut expected = None;
+    let branch = reference.strip_prefix("refs/heads/");
+    if (!reference.starts_with("refs/") && reference != "HEAD" && !is_full_commit_id(reference))
+        || branch.is_some()
+    {
+        for prefix in ["refs/heads/", "refs/remotes/origin/", "refs/tags/"] {
+            if branch.is_some() && prefix == "refs/tags/" {
+                continue;
+            }
+            let name = branch.unwrap_or(reference);
+            if let Ok(sha) = rev_parse(
+                target_dir,
+                &format!("{prefix}{name}^{{commit}}"),
+                credentials,
+            )
+            .await
+            {
+                expected = Some(sha);
+                break;
+            }
+        }
+    }
+    let expected = match expected {
+        Some(sha) => sha,
+        None => rev_parse(target_dir, &format!("{reference}^{{commit}}"), credentials)
+            .await
+            .map_err(fail)?,
+    };
+    if is_full_commit_id(reference) && !expected.eq_ignore_ascii_case(reference) {
+        return Err(fail(format!(
+            "ref {reference} resolved to {expected} instead of the requested commit"
+        )));
+    }
+    // Only pass a resolved commit to checkout: a ref matching a tracked path
+    // must fail resolution rather than succeed as a path checkout.
     let mut checkout = git_command();
     checkout
         .env("GIT_TERMINAL_PROMPT", "0")
         .arg("-C")
         .arg(target_dir)
-        .arg("checkout");
-    if let Some(reference) = checkout_ref.filter(|value| !value.is_empty()) {
-        checkout.arg(reference);
-    }
+        .args(["checkout", "--detach", &expected]);
     apply_git_http_credentials(&mut checkout, credentials);
-    run_git(
-        checkout,
-        &format!("checkout {}", checkout_ref.unwrap_or("HEAD")),
-    )
-    .await
-    .map_err(fail)?;
+    run_git(checkout, &format!("checkout {reference}"))
+        .await
+        .map_err(fail)?;
+    let actual = rev_parse(target_dir, "HEAD", credentials)
+        .await
+        .map_err(fail)?;
+    if actual != expected
+        || (is_full_commit_id(reference) && !actual.eq_ignore_ascii_case(reference))
+    {
+        return Err(fail(format!(
+            "checkout of {reference} produced {actual}, expected {expected}"
+        )));
+    }
 
     Repository::open(target_dir).map_err(|e| fail(e.message().to_string()))
 }
@@ -975,14 +1041,33 @@ pub fn checkout_ref(repo: &Repository, ref_name: &str) -> Result<(), GitOpsError
         });
     }
 
-    // Try to resolve as a commit SHA first (full or abbreviated)
-    let object = repo
-        .revparse_single(ref_name)
-        .map_err(|e| GitOpsError::CheckoutFailed {
-            ref_name: ref_name.to_string(),
-            repo_path: repo_path.clone(),
-            reason: e.message().to_string(),
-        })?;
+    // Match clone_ref's branch-before-tag policy, including remote-only
+    // branches in a full clone. Qualified refs retain their exact meaning.
+    let resolve = || {
+        if is_full_commit_id(ref_name) {
+            return repo.find_object(git2::Oid::from_str(ref_name)?, None);
+        }
+        let branch = ref_name.strip_prefix("refs/heads/");
+        if (!ref_name.starts_with("refs/") && ref_name != "HEAD") || branch.is_some() {
+            for prefix in ["refs/heads/", "refs/remotes/origin/", "refs/tags/"] {
+                if branch.is_some() && prefix == "refs/tags/" {
+                    continue;
+                }
+                let name = branch.unwrap_or(ref_name);
+                match repo.revparse_single(&format!("{prefix}{name}")) {
+                    Ok(object) => return Ok(object),
+                    Err(error) if error.code() == git2::ErrorCode::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        repo.revparse_single(ref_name)
+    };
+    let object = resolve().map_err(|e| GitOpsError::CheckoutFailed {
+        ref_name: ref_name.to_string(),
+        repo_path: repo_path.clone(),
+        reason: e.message().to_string(),
+    })?;
 
     let commit = object
         .peel_to_commit()
@@ -1147,6 +1232,129 @@ mod tests {
 
         // Verify file.txt doesn't exist (first commit had no files)
         assert!(!temp_dir.path().join("file.txt").exists());
+    }
+
+    #[test]
+    fn checkout_ref_prefers_hex_branch_over_same_named_tag() {
+        let (dir, repo) = create_test_repo();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        repo.branch("deadbee", &first, false).unwrap();
+        repo.tag_lightweight("deadbee", tip.as_object(), false)
+            .unwrap();
+
+        checkout_ref(&repo, "deadbee").unwrap();
+        assert_eq!(repo.head().unwrap().target(), Some(first.id()));
+        assert!(!dir.path().join("file.txt").exists());
+
+        checkout_ref(&repo, "refs/tags/deadbee").unwrap();
+        assert_eq!(repo.head().unwrap().target(), Some(tip.id()));
+        assert!(dir.path().join("file.txt").exists());
+    }
+
+    #[test]
+    fn checkout_ref_resolves_remote_branch_before_same_named_tag() {
+        let (_dir, repo) = create_test_repo();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        repo.reference("refs/remotes/origin/deadbee", first.id(), false, "fixture")
+            .unwrap();
+        repo.tag_lightweight("deadbee", tip.as_object(), false)
+            .unwrap();
+
+        for reference in ["deadbee", "refs/heads/deadbee"] {
+            checkout_ref(&repo, reference).unwrap();
+            assert_eq!(repo.head().unwrap().target(), Some(first.id()));
+        }
+    }
+
+    #[test]
+    fn checkout_full_sha_wins_over_sha_named_branch() {
+        let (_dir, repo) = create_test_repo();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        let first = tip.parent(0).unwrap();
+        let sha = first.id().to_string();
+        repo.branch(&sha, &tip, false).unwrap();
+        checkout_ref(&repo, &sha).unwrap();
+        assert_eq!(repo.head().unwrap().target(), Some(first.id()));
+    }
+
+    #[tokio::test]
+    async fn clone_full_sha_wins_over_sha_named_branch_including_sparse() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        let repo = Repository::open(origin.url.strip_prefix("file://").unwrap()).unwrap();
+        let tip = repo.head().unwrap().peel_to_commit().unwrap();
+        repo.branch(&origin.commits[0], &tip, false).unwrap();
+        let (target, cloned) = checkout(&origin, &origin.commits[0]).await;
+        assert_eq!(cloned.commit_sha, origin.commits[0]);
+        assert_eq!(file(&target, "file.txt").as_deref(), Some("one"));
+        let target = TempDir::new().unwrap();
+        let sparse = sparse_clone_repo(
+            &origin.url,
+            target.path(),
+            "subdir",
+            Some(&origin.commits[0]),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            sparse.head().unwrap().target().unwrap().to_string(),
+            origin.commits[0]
+        );
+        // A SHA-shaped branch is still available through its qualified name.
+        let (_, branch) = checkout(&origin, &format!("refs/heads/{}", origin.commits[0])).await;
+        assert_eq!(branch.commit_sha, origin.commits[2]);
+        let absent_sha = "1111111111111111111111111111111111111111";
+        repo.branch(absent_sha, &tip, false).unwrap();
+        let target = TempDir::new().unwrap();
+        assert!(
+            sparse_clone_repo(&origin.url, target.path(), "subdir", Some(absent_sha), None)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn partial_revision_resolution_authenticates_lazy_fetch() {
+        let mut server = mockito::Server::new_async().await;
+        let auth = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("example:fixture-token")
+        );
+        let request = server
+            .mock("GET", "/info/refs?service=git-upload-pack")
+            .match_header("authorization", auth.as_str())
+            .with_status(503)
+            .expect_at_least(1)
+            .create_async()
+            .await;
+        let (dir, repo) = create_test_repo();
+        repo.remote("origin", &server.url()).unwrap();
+        let mut config = repo.config().unwrap();
+        config.set_i64("core.repositoryformatversion", 1).unwrap();
+        config.set_str("extensions.partialClone", "origin").unwrap();
+        config.set_bool("remote.origin.promisor", true).unwrap();
+        config
+            .set_str("remote.origin.partialclonefilter", "blob:none")
+            .unwrap();
+        // Resolving a missing commit causes Git to fetch from the promisor.
+        // Even a failed fetch must carry authentication and never expose it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            rev_parse(
+                dir.path(),
+                "2222222222222222222222222222222222222222^{commit}",
+                Some(("example", "fixture-token")),
+            ),
+        )
+        .await
+        .unwrap();
+        let error = result.unwrap_err();
+        assert!(!error.contains("fixture-token"));
+        request.assert_async().await;
     }
 
     #[test]
@@ -1462,7 +1670,7 @@ mod tests {
             .head_detached()
             .unwrap());
 
-        for length in [7, 12] {
+        for length in [4, 6, 7, 12] {
             let short = &origin.commits[1][..length];
             let (target, cloned) = checkout(&origin, short).await;
             assert_eq!(cloned.kind, ClonedRefKind::Commit, "{short}");
@@ -1665,6 +1873,37 @@ mod tests {
         assert_eq!(sparse_checkout_pattern("apps/web?"), r"/apps/web\?/");
         assert_eq!(sparse_checkout_pattern("apps/*"), r"/apps/\*/");
         assert_eq!(sparse_checkout_pattern(r"apps/web]"), r"/apps/web\]/");
+    }
+
+    #[tokio::test]
+    async fn sparse_clone_resolves_remote_branch_before_tag_and_rejects_missing_ref() {
+        let Some(origin) = origin_fixture() else {
+            return;
+        };
+        for (reference, expected) in [
+            ("dual", origin.commits[2].as_str()),
+            ("refs/tags/dual", origin.commits[0].as_str()),
+            ("refs/heads/feature", origin.feature_commit.as_str()),
+            (&origin.feature_commit[..10], origin.feature_commit.as_str()),
+        ] {
+            let target = TempDir::new().unwrap();
+            let repo =
+                sparse_clone_repo(&origin.url, target.path(), "subdir", Some(reference), None)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                repo.head().unwrap().target().unwrap().to_string(),
+                expected,
+                "{reference}"
+            );
+        }
+        // A path in the repository must not turn a missing ref into a successful path checkout.
+        let target = TempDir::new().unwrap();
+        assert!(
+            sparse_clone_repo(&origin.url, target.path(), "subdir", Some("file.txt"), None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

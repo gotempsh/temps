@@ -492,7 +492,9 @@ impl AiLimitsService {
             .order_by_desc(Column::UpdatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let rows = paginator.fetch_page(page - 1).await?;
+        let rows = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         let overrides = rows
             .iter()
             .filter_map(|row| {

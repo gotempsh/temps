@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Errors returned by the `temps-network` crate.
 ///
 /// Variants are split by *what* failed and *where*. Callers (e.g. a future
-/// `temps-agent` integration) match on these to decide whether to retry, log
+/// `temps-node-agent` integration) match on these to decide whether to retry, log
 /// and continue, or propagate to the control plane.
 #[derive(Debug, Error)]
 pub enum NetworkError {
@@ -45,6 +45,18 @@ pub enum NetworkError {
     /// VXLAN device creation or FDB management failed.
     #[error("vxlan transport error on '{device}': {reason}")]
     Vxlan { device: String, reason: String },
+
+    /// Another VXLAN device on this host holds the network ID and port this
+    /// overlay needs (ADR 062). `diagnosis` names the holder, what is
+    /// attached to it, the commands that remove it and the alternative.
+    #[error("{diagnosis}")]
+    VxlanIdInUse {
+        device: String,
+        holder: String,
+        vni: u32,
+        port: u16,
+        diagnosis: String,
+    },
 
     // ----- routes -----
     /// Adding or removing a route failed.
@@ -141,6 +153,11 @@ pub enum NetworkError {
         existing_cidr: Ipv4Net,
         device: String,
     },
+
+    /// A macOS worker's operation in the Docker app's VM, run through the
+    /// mesh sidecar (ADR 090), failed or could not run.
+    #[error("'{operation}' in the Docker app's VM (mesh sidecar) failed: {reason}")]
+    VmExec { operation: String, reason: String },
 
     // ----- config / validation -----
     /// The provided config was internally inconsistent (e.g. peer CIDR

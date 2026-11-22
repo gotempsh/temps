@@ -5,6 +5,8 @@ import { describe, expect, test } from 'bun:test'
 import type { NodeCapabilityResponse as NodeCapability } from '@/api/client/types.gen'
 import {
   canAddWorkerNode,
+  CLUSTER_DNS_URL,
+  nodesAdvancedSection,
   isWorkerNodeRequiredProblem,
   NODE_CAPABILITY_POLL_MS,
   NODE_HEARTBEAT_STALE_SECS,
@@ -20,6 +22,8 @@ import {
   shouldShowWorkerNodeBanner,
   unremovedNodeContainers,
   WORKER_NODES_URL,
+  macWorkerHost,
+  nodeStatusLabel,
 } from './worker-nodes'
 
 function capability(overrides: Partial<NodeCapability> = {}): NodeCapability {
@@ -395,5 +399,57 @@ describe('nodeRemoval', () => {
     expect(nodeRemovalBlocker({ kind: 'remove' })).toBeNull()
     expect(nodeRemovalBlocker({ kind: 'none' })).toBeNull()
     expect(nodeRemovalBlocker({ kind: 'unknown' })).toBeNull()
+  })
+})
+
+describe('nodesAdvancedSection', () => {
+  test('names the advanced card a hash links to', () => {
+    expect(nodesAdvancedSection('#cluster-dns')).toBe('cluster-dns')
+    expect(nodesAdvancedSection('cluster-trust')).toBe('cluster-trust')
+    expect(CLUSTER_DNS_URL).toBe('/settings/nodes#cluster-dns')
+  })
+
+  test('ignores hashes that are not an advanced card', () => {
+    expect(nodesAdvancedSection('')).toBeNull()
+    expect(nodesAdvancedSection('#ci-builder')).toBeNull()
+    expect(nodesAdvancedSection('#cluster-dns-x')).toBeNull()
+  })
+})
+
+describe('macWorkerHost', () => {
+  test('recognises the heartbeat of a Mac worker and names its Docker app', () => {
+    expect(
+      macWorkerHost({ host: { os: 'macos', docker_app: 'colima' }, cpu: 3 })
+    ).toEqual({ dockerApp: 'colima' })
+    expect(macWorkerHost({ host: { os: 'macos', docker_app: 'orb_stack' } })).toEqual(
+      { dockerApp: 'OrbStack' }
+    )
+    expect(macWorkerHost({ host: { os: 'macos' } })).toEqual({ dockerApp: null })
+  })
+
+  test('is null for Linux workers and malformed capacity', () => {
+    expect(macWorkerHost({ cpu_percent: 2 })).toBeNull()
+    expect(macWorkerHost({ host: { os: 'linux' } })).toBeNull()
+    expect(macWorkerHost(null)).toBeNull()
+    expect(macWorkerHost('macos')).toBeNull()
+  })
+})
+
+describe('nodeStatusLabel', () => {
+  test('an offline Mac worker reads as asleep, with why', () => {
+    const shown = nodeStatusLabel('offline', { dockerApp: 'colima' })
+    expect(shown.label).toBe('Asleep or offline')
+    expect(shown.hint).toContain('reconnects on its own')
+  })
+
+  test('other statuses and other workers keep their status', () => {
+    expect(nodeStatusLabel('active', { dockerApp: null })).toEqual({
+      label: 'active',
+      hint: null,
+    })
+    expect(nodeStatusLabel('offline', null)).toEqual({
+      label: 'offline',
+      hint: null,
+    })
   })
 })

@@ -58,7 +58,7 @@ impl TempsPlugin for AiChatPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let encryption = context.require_service::<temps_core::EncryptionService>();
             let ai = context.require_service::<dyn temps_ai::AiService>();
-            let log_service = context.require_service::<temps_logs::LogService>();
+            let log_service = context.require_service::<temps_deployment_logs::LogService>();
             // Audit logger for chat write operations (registered by AuditPlugin,
             // which loads well before this plugin).
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
@@ -106,6 +106,8 @@ impl TempsPlugin for AiChatPlugin {
             );
             context.register_service(pending_actions.clone());
 
+            let watch_tools = Arc::new(crate::watches::WatchTools::default());
+            context.register_service(watch_tools.clone());
             let goals = Arc::new(crate::goals::GoalService::new(db.clone()));
             context.register_service(goals.clone());
 
@@ -263,6 +265,7 @@ impl TempsPlugin for AiChatPlugin {
                     slots: secret_slots.as_ref().clone(),
                     write_api: write_handle_for_secrets,
                 })
+                .with_watch_tools(watch_tools.as_ref().clone())
                 .with_goal_support(crate::goals::GoalToolSupport {
                     goals: goals.clone(),
                     read_api: api_tools_handle_for_goals,
@@ -451,13 +454,17 @@ impl TempsPlugin for AiChatPlugin {
             .application_sandboxes
             .as_ref()
             .zip(context.get_service::<dyn temps_core::SensitiveActionAuthorizer>())
-            .map(|(sandbox_service, sensitive_action_authorizer)| {
+            .zip(context.get_service::<
+                temps_sandbox::services::image_preparation::ImagePreparationService,
+            >())
+            .map(|((sandbox_service, sensitive_action_authorizer), image_preparation)| {
                 Arc::new(temps_sandbox::handlers::SandboxAppState {
                     sandbox_service: sandbox_service.clone(),
                     snapshot_service: None,
                     project_access_checker: project_access_checker.clone(),
                     audit_service: None,
                     sensitive_action_authorizer,
+                    image_preparation,
                 })
             });
         let app_state = Arc::new(AppState {

@@ -15,6 +15,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
+use temps_presets::stored_preset::StoredPresetExt;
 
 use chrono::{DateTime, Utc};
 use sea_orm::{

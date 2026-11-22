@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::{DateTime, Utc};
-use sea_orm::{DatabaseConnection, EntityTrait};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::sync::Arc;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, error_groups, projects};
@@ -12,6 +12,9 @@ use super::error_alert_service::{AlertNotification, ErrorAlertService};
 use super::error_analytics_service::{ErrorAnalyticsService, ErrorDashboardStats};
 use super::error_crud_service::ErrorCRUDService;
 use super::error_ingestion_service::ErrorIngestionService;
+use super::group_workflow::{
+    BulkGroupAction, BulkGroupOutcome, BulkGroupSelector, GroupWorkflowService, IgnoreConditions,
+};
 use super::source_map_service::SourceMapService;
 use super::types::*;
 
@@ -37,27 +40,63 @@ pub struct ErrorTrackingService {
     pub feedback: super::feedback_service::FeedbackService,
     pub client_outcomes: super::client_outcome_service::ClientOutcomeService,
     pub releases: super::release_service::ReleaseService,
+    /// Crash-free sessions and users per release (ADR 111, D3).
+    pub release_health: Arc<super::release_health::ReleaseHealthService>,
+    /// Files sent with events and feedback (ADR 111, D4).
+    pub attachments: Arc<super::attachments::AttachmentService>,
+    /// Issues, suspect commits and ownership rules (ADR 111, D5).
+    pub source_control: Arc<super::source_control::SourceControlService>,
+    pub workflow: GroupWorkflowService,
+    /// Inbound filter rules (ADR 111, D1.4).
+    pub inbound_filters: super::inbound_filters::InboundFilterService,
+    inbound_filter_registry: Arc<super::inbound_filters::InboundFilterRegistry>,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     notification_callback: OnceCell<NotificationCallback>,
     autopilot_callback: OnceCell<NotificationCallback>,
     job_queue: OnceCell<Arc<dyn temps_core::JobQueue>>,
+    /// Sends the email that tells a user a group was assigned to them
+    /// (ADR 111, D1.6). Unset, assignments are not mailed.
+    assignment_mailer: OnceCell<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Decides which assignees may be mailed: the email names the group and
+    /// links it, so only users who can open the project receive it. Unset
+    /// when no access control is installed, in which case every assignee can.
+    project_access: OnceCell<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
 
 impl ErrorTrackingService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        let inbound_filter_registry =
+            Arc::new(super::inbound_filters::InboundFilterRegistry::new());
+        let ownership = Arc::new(super::source_control::ownership::OwnershipService::new(
+            db.clone(),
+        ));
         Self {
             db: db.clone(),
-            ingestion: ErrorIngestionService::new(db.clone()),
+            ingestion: ErrorIngestionService::new(db.clone()).with_ownership(ownership.clone()),
             crud: ErrorCRUDService::new(db.clone()),
             analytics: ErrorAnalyticsService::new(db.clone()),
             feedback: super::feedback_service::FeedbackService::new(db.clone()),
             client_outcomes: super::client_outcome_service::ClientOutcomeService::new(db.clone()),
             releases: super::release_service::ReleaseService::new(db.clone()),
+            release_health: Arc::new(super::release_health::ReleaseHealthService::new(db.clone())),
+            attachments: Arc::new(super::attachments::AttachmentService::new(db.clone())),
+            source_control: Arc::new(super::source_control::SourceControlService::new(
+                db.clone(),
+                ownership.clone(),
+            )),
+            workflow: GroupWorkflowService::new(db.clone()),
+            inbound_filters: super::inbound_filters::InboundFilterService::new(
+                db.clone(),
+                inbound_filter_registry.clone(),
+            ),
+            inbound_filter_registry,
             alerts: ErrorAlertService::new(db),
             source_map_service: OnceCell::new(),
             notification_callback: OnceCell::new(),
             autopilot_callback: OnceCell::new(),
             job_queue: OnceCell::new(),
+            assignment_mailer: OnceCell::new(),
+            project_access: OnceCell::new(),
         }
     }
 
@@ -79,6 +118,164 @@ impl ErrorTrackingService {
     /// Only notifications with trigger_type "new_issue" or "regression" are forwarded.
     pub fn set_autopilot_callback(&self, callback: NotificationCallback) {
         let _ = self.autopilot_callback.set(callback);
+    }
+
+    /// The attachments of an error event of `group_id` (ADR 111, D4). An
+    /// event that is not in the group or project is not found.
+    pub async fn list_event_attachments(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        event_id: i64,
+    ) -> Result<Vec<super::attachments::AttachmentView>, ErrorTrackingError> {
+        self.crud
+            .get_error_event_by_ids(event_id, group_id, project_id)
+            .await?;
+        self.attachments
+            .list(
+                project_id,
+                super::attachments::AttachmentOwner::Error(event_id),
+            )
+            .await
+    }
+
+    /// The attachments of a feedback, such as its screenshot (ADR 111, D4).
+    pub async fn list_feedback_attachments(
+        &self,
+        project_id: i32,
+        feedback_id: i64,
+    ) -> Result<Vec<super::attachments::AttachmentView>, ErrorTrackingError> {
+        self.feedback.get(project_id, feedback_id).await?;
+        self.attachments
+            .list(
+                project_id,
+                super::attachments::AttachmentOwner::Feedback(feedback_id),
+            )
+            .await
+    }
+
+    /// Delete a feedback and its attachments (ADR 111, D4). A failure to
+    /// delete the attachments never fails the delete: the sweeper removes
+    /// those of a feedback that is gone.
+    pub async fn delete_feedback(
+        &self,
+        project_id: i32,
+        feedback_id: i64,
+    ) -> Result<(), ErrorTrackingError> {
+        self.feedback.delete(project_id, feedback_id).await?;
+        if let Err(error) = self
+            .attachments
+            .delete_owner(
+                project_id,
+                super::attachments::AttachmentOwner::Feedback(feedback_id),
+            )
+            .await
+        {
+            tracing::warn!(
+                project_id,
+                feedback_id,
+                "could not delete the attachments of feedback {feedback_id} in project {project_id}, leaving them to the sweeper: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Mail assignees through this service (ADR 111, D1.6).
+    pub fn set_assignment_mailer(
+        &self,
+        mailer: Arc<dyn temps_core::notifications::NotificationService>,
+    ) {
+        let _ = self.assignment_mailer.set(mailer);
+    }
+
+    /// Check project access before mailing an assignee (ADR 111, D1.6).
+    pub fn set_project_access_checker(&self, checker: Arc<dyn temps_core::ProjectAccessChecker>) {
+        let _ = self.project_access.set(checker);
+    }
+
+    /// Assign a group to a user or team, or unassign it (ADR 111, D1.6).
+    ///
+    /// The status is untouched. A new assignee triggers the `status_change`
+    /// alert rules that list `assigned` (the status assignment used to be),
+    /// and is mailed in the background when an email provider is set up; a
+    /// failed or missing mail never fails the assignment. `base_url` is the
+    /// console origin, used to link the group's page in the email.
+    pub async fn assign_error_group(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        assignee: Option<super::group_workflow::Assignee>,
+        assigned_by: Option<String>,
+        base_url: Option<String>,
+    ) -> Result<super::group_workflow::AssignmentOutcome, ErrorTrackingError> {
+        let outcome = self
+            .workflow
+            .set_assignee(project_id, group_id, assignee)
+            .await?;
+        let changed = outcome.previous != assignee;
+        if changed && assignee.is_some() {
+            if let Some(group) = self.load_group(group_id).await {
+                let notifications = self.alerts.evaluate_status_change(&group, "assigned").await;
+                let enriched = self.enrich_notifications(notifications, project_id).await;
+                self.send_alert_notifications(enriched).await;
+            }
+        }
+        if let Some(mailer) = self.assignment_mailer.get() {
+            if outcome.recipients.is_empty() {
+                return Ok(outcome);
+            }
+            let mailer = mailer.clone();
+            let checker = self.project_access.get().cloned();
+            let slug = temps_entities::projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await?
+                .map(|project| project.slug);
+            let console_url = match (base_url, slug) {
+                (Some(base), Some(slug)) => Some(format!(
+                    "{}/projects/{slug}/errors/{group_id}",
+                    base.trim_end_matches('/')
+                )),
+                _ => None,
+            };
+            let outcome = outcome.clone();
+            // The access check and the mail run after the assignment has
+            // answered: neither may slow it down or fail it.
+            tokio::spawn(async move {
+                let to = recipients_with_access(
+                    checker.as_deref(),
+                    project_id,
+                    group_id,
+                    &outcome.recipients,
+                )
+                .await;
+                if to.is_empty() {
+                    return;
+                }
+                let message = assignment_email(&outcome, to, group_id, assigned_by, console_url);
+                match mailer.is_email_provider_configured().await {
+                    Ok(true) => {
+                        if let Err(error) = mailer.send_transactional_email(message).await {
+                            tracing::warn!(
+                                project_id,
+                                group_id,
+                                "failed to mail the assignee of error group {group_id}: {error}"
+                            );
+                        }
+                    }
+                    Ok(false) => tracing::debug!(
+                        project_id,
+                        group_id,
+                        "no email provider; assignment of error group {group_id} not mailed"
+                    ),
+                    Err(error) => tracing::warn!(
+                        project_id,
+                        group_id,
+                        "could not check the email provider for error group {group_id}: {error}"
+                    ),
+                }
+            });
+        }
+        Ok(outcome)
     }
 
     /// Announce new and regressed groups on the job queue (ADR-054), so
@@ -157,6 +354,36 @@ impl ErrorTrackingService {
             .flatten()
     }
 
+    /// The inbound filter rule that drops this Sentry error event, if any
+    /// (ADR 111, D1.4). Called at ingest before anything is stored: an
+    /// in-memory lookup with no lock and no database call. The drop is
+    /// counted against the rule.
+    pub fn inbound_filter_drop(&self, error_data: &CreateErrorEventData) -> Option<i32> {
+        self.inbound_filter_registry.evaluate(error_data)
+    }
+
+    /// Flush the inbound filters' drop counters and reload the rules if any
+    /// changed. Run by the plugin's cleanup loop; failures are logged and
+    /// retried on the next tick, and the rules in memory stay in force.
+    pub async fn refresh_inbound_filters(&self) {
+        if let Err(error) = self.inbound_filter_registry.flush(self.db.as_ref()).await {
+            tracing::warn!(
+                error = %error,
+                "Failed to flush inbound filter drop counts; they are kept for the next attempt"
+            );
+        }
+        if let Err(error) = self
+            .inbound_filter_registry
+            .refresh_if_changed(self.db.as_ref())
+            .await
+        {
+            tracing::warn!(
+                error = %error,
+                "Failed to refresh inbound filters; the rules in memory stay in force"
+            );
+        }
+    }
+
     // Convenience methods that delegate to specialized services
 
     /// Process a new error event.
@@ -194,14 +421,70 @@ impl ErrorTrackingService {
         self.ingestion.cleanup_source_keys().await
     }
 
+    /// Write the activity entry for an event that reopened a group. Runs
+    /// once per reopening: the reopen is claimed in the ingest transaction
+    /// and a retried event is not stored again. A failed write is logged.
+    async fn record_regression(
+        &self,
+        project_id: i32,
+        group_id: i32,
+        previous_status: &str,
+        release: Option<String>,
+    ) {
+        let release = release
+            .filter(|release| !release.is_empty())
+            .map(|release| {
+                release
+                    .chars()
+                    .take(super::group_workflow::MAX_RELEASE_CHARS)
+                    .collect()
+            });
+        if let Err(error) = self
+            .workflow
+            .record_activity(
+                project_id,
+                &[group_id],
+                super::group_workflow::ActivityKind::Regressed,
+                None,
+                super::group_workflow::ActivityDetails {
+                    status: Some(previous_status.to_string()),
+                    release,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            tracing::error!(
+                project_id,
+                group_id,
+                "Failed to record the regression of an error group: {}",
+                error
+            );
+        }
+    }
+
+    /// What the performance scanner last did for a project (ADR 111, D2).
+    pub async fn performance_scan_state(
+        &self,
+        project_id: i32,
+    ) -> Result<Option<super::performance::ScanState>, ErrorTrackingError> {
+        super::performance::scan_state(self.db.as_ref(), project_id).await
+    }
+
     pub async fn process_error_event_with_receipt(
         &self,
-        mut error_data: CreateErrorEventData,
+        error_data: CreateErrorEventData,
     ) -> Result<super::types::ErrorIngestReceipt, ErrorTrackingError> {
+        let mut error_data = error_data.without_nul();
         // Artifact availability and symbolication admission must never change
         // the identity of the same SDK-submitted stack.
-        let submitted_fingerprint = (error_data.source.as_deref() == Some("sentry"))
-            .then(|| self.ingestion.generate_fingerprint(&error_data));
+        let submitted_fingerprint = match error_data.grouping_key.as_deref() {
+            Some(key) => Some(super::error_ingestion_service::keyed_hex(&format!(
+                "group:{key}"
+            ))),
+            None => (error_data.source.as_deref() == Some("sentry"))
+                .then(|| self.ingestion.generate_fingerprint(&error_data)),
+        };
         // Symbolicate stack traces if source maps are available
         if let Some(sm_service) = self.source_map_service.get() {
             if let Err(e) = sm_service.symbolicate_error_event(&mut error_data).await {
@@ -217,6 +500,7 @@ impl ErrorTrackingService {
             || error_data.visitor_id.is_some();
 
         let project_id = error_data.project_id;
+        let event_release = error_data.release_version.clone();
         let outcome = match submitted_fingerprint {
             Some(fingerprint) => {
                 self.ingestion
@@ -226,19 +510,46 @@ impl ErrorTrackingService {
             None => self.ingestion.process_with_outcome(error_data).await?,
         };
         let group_id = outcome.group_id;
+        // An ownership rule matched the event that created the group
+        // (ADR 111, D5): assign it, unless someone already did.
+        if let Some(owner) = outcome.owner.as_ref() {
+            if let Err(error) = self
+                .source_control
+                .ownership
+                .assign_matched(project_id, group_id, owner)
+                .await
+            {
+                tracing::warn!(project_id, group_id, %error, "Ownership rules could not assign a new error group");
+            }
+        }
         if !outcome.inserted {
             return Ok(super::types::ErrorIngestReceipt {
                 group_id,
                 stored: false,
             });
         }
-        let pre_ingestion_status = outcome.previous_status;
+        // A group that stays ignored (its ignore conditions are not met yet,
+        // ADR 111 D1.3) or stays resolved is silent: counting the event is
+        // all that happens. Alerts and the regression announcement are for
+        // groups that are open after this event.
+        if outcome.current_status == "ignored" || outcome.current_status == "resolved" {
+            return Ok(super::types::ErrorIngestReceipt {
+                group_id,
+                stored: true,
+            });
+        }
+        let reopened = outcome.previous_status != outcome.current_status;
+        let pre_ingestion_status = if reopened {
+            outcome.previous_status
+        } else {
+            outcome.current_status
+        };
 
         // Evaluate alert rules (fire-and-forget, don't fail the ingestion)
         if let Some(group) = self.load_group(group_id).await {
             let is_new_group = outcome.created;
-            let is_regression =
-                pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored";
+            let is_regression = reopened
+                && (pre_ingestion_status == "resolved" || pre_ingestion_status == "ignored");
 
             tracing::debug!(
                 "Evaluating alert rules for group {} (project={}, is_new={}, is_regression={})",
@@ -252,6 +563,10 @@ impl ErrorTrackingService {
             // event and count, so concurrent requests cannot each claim one.
             if is_new_group || is_regression {
                 self.announce_group_opened(&group, is_regression).await;
+            }
+            if is_regression {
+                self.record_regression(project_id, group_id, &pre_ingestion_status, event_release)
+                    .await;
             }
 
             let notifications = if is_new_group {
@@ -296,6 +611,7 @@ impl ErrorTrackingService {
         sort_order: Option<String>,
         start_date: Option<DateTime<Utc>>,
         end_date: Option<DateTime<Utc>>,
+        refine: &super::types::GroupListRefinement,
     ) -> Result<(Vec<ErrorGroupDomain>, u64), ErrorTrackingError> {
         self.crud
             .list_error_groups(
@@ -308,6 +624,7 @@ impl ErrorTrackingService {
                 sort_order,
                 start_date,
                 end_date,
+                refine,
             )
             .await
     }
@@ -347,10 +664,17 @@ impl ErrorTrackingService {
         group_id: i32,
         project_id: i32,
         status: String,
-        assigned_to: Option<String>,
+        ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
     ) -> Result<(), ErrorTrackingError> {
         self.crud
-            .update_error_group_status(group_id, project_id, status.clone(), assigned_to)
+            .update_error_group_status(
+                group_id,
+                project_id,
+                status.clone(),
+                ignore,
+                in_next_release,
+            )
             .await?;
 
         // Evaluate status change alert rules
@@ -361,6 +685,50 @@ impl ErrorTrackingService {
         }
 
         Ok(())
+    }
+
+    /// Change the status of many error groups of one project (ADR 111, D1).
+    ///
+    /// Delegates the write to the workflow service, then evaluates
+    /// `status_change` alert rules for the groups that actually changed. The
+    /// alert work is bounded by the project's rule count, and its delivery by
+    /// `BULK_STATUS_CHANGE_NOTIFICATION_LIMIT`.
+    pub async fn bulk_update_error_group_status(
+        &self,
+        project_id: i32,
+        selector: BulkGroupSelector,
+        action: BulkGroupAction,
+        ignore: Option<IgnoreConditions>,
+        in_next_release: bool,
+    ) -> Result<BulkGroupOutcome, ErrorTrackingError> {
+        let outcome = self
+            .workflow
+            .bulk_update_status(project_id, selector, action, ignore, in_next_release)
+            .await?;
+        if outcome.updated_ids.is_empty() {
+            return Ok(outcome);
+        }
+        // One read for the page of groups that changed, never one per group.
+        let groups = error_groups::Entity::find()
+            .filter(error_groups::Column::Id.is_in(outcome.updated_ids.clone()))
+            .filter(error_groups::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await
+            .unwrap_or_else(|error| {
+                tracing::error!(
+                    project_id,
+                    "Failed to load bulk-updated error groups for alert evaluation: {}",
+                    error
+                );
+                Vec::new()
+            });
+        let notifications = self
+            .alerts
+            .evaluate_status_change_many(project_id, &groups, action.target_status())
+            .await;
+        let enriched = self.enrich_notifications(notifications, project_id).await;
+        self.send_alert_notifications(enriched).await;
+        Ok(outcome)
     }
 
     /// List error events (delegates to CRUD service)
@@ -545,5 +913,184 @@ impl ErrorTrackingService {
             .ok()
             .flatten()
             .map(|e| e.name)
+    }
+}
+
+/// The emails of the `recipients` who can open `project_id`.
+///
+/// A team can be assigned to a group of a project only some of its members
+/// can access, and the email carries the group's title and link, so the rest
+/// are left out. Every member is checked in one batch; if the check fails,
+/// nobody is mailed. Without a checker (no access control installed)
+/// everyone can access the project.
+async fn recipients_with_access(
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+    project_id: i32,
+    group_id: i32,
+    recipients: &[super::group_workflow::AssignmentRecipient],
+) -> Vec<String> {
+    let Some(checker) = checker else {
+        return recipients.iter().map(|r| r.email.clone()).collect();
+    };
+    let user_ids: Vec<i32> = recipients.iter().map(|r| r.user_id).collect();
+    let access = match checker
+        .users_can_access_project(&user_ids, project_id)
+        .await
+    {
+        Ok(access) => access,
+        Err(error) => {
+            tracing::warn!(
+                project_id,
+                group_id,
+                "could not check which of {} assignees can access project {project_id}, so nobody is mailed about error group {group_id}: {error}",
+                user_ids.len()
+            );
+            return Vec::new();
+        }
+    };
+    recipients
+        .iter()
+        .filter(|recipient| {
+            let allowed = access.get(&recipient.user_id).copied().unwrap_or(false);
+            if !allowed {
+                tracing::debug!(
+                    project_id,
+                    group_id,
+                    user_id = recipient.user_id,
+                    "user {} cannot access project {project_id}; not mailed about error group {group_id}",
+                    recipient.user_id
+                );
+            }
+            allowed
+        })
+        .map(|recipient| recipient.email.clone())
+        .collect()
+}
+
+/// The email telling an assignee about a group. Plain text plus a link.
+fn assignment_email(
+    outcome: &super::group_workflow::AssignmentOutcome,
+    to: Vec<String>,
+    group_id: i32,
+    assigned_by: Option<String>,
+    console_url: Option<String>,
+) -> temps_core::notifications::EmailMessage {
+    let to_whom = outcome
+        .current
+        .as_ref()
+        .map(|a| {
+            if a.kind == "team" {
+                format!("your team {}", a.name)
+            } else {
+                "you".to_string()
+            }
+        })
+        .unwrap_or_else(|| "you".to_string());
+    let by = assigned_by
+        .map(|who| format!(" by {who}"))
+        .unwrap_or_default();
+    let link = console_url
+        .map(|url| format!("\n\nOpen it: {url}"))
+        .unwrap_or_default();
+    temps_core::notifications::EmailMessage {
+        to,
+        subject: format!(
+            "Error #{group_id} assigned to {to_whom}: {}",
+            outcome.group_title
+        ),
+        body: format!(
+            "Error group #{group_id} \"{}\" was assigned to {to_whom}{by}.{link}",
+            outcome.group_title
+        ),
+        html_body: None,
+        from: None,
+        reply_to: None,
+    }
+}
+
+#[cfg(test)]
+mod assignment_mail_tests {
+    use super::recipients_with_access;
+    use crate::services::group_workflow::AssignmentRecipient;
+    use async_trait::async_trait;
+
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Grants project 7 to user 1 only. With `failing`, the check fails.
+    /// Answers in batches only, and counts them.
+    #[derive(Default)]
+    struct OneMemberChecker {
+        failing: bool,
+        single: AtomicUsize,
+        batches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl temps_core::ProjectAccessChecker for OneMemberChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.single.fetch_add(1, Ordering::SeqCst);
+            Err("the recipient filter must check users in one batch".into())
+        }
+
+        async fn users_can_access_project(
+            &self,
+            user_ids: &[i32],
+            project_id: i32,
+        ) -> Result<BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>> {
+            self.batches.fetch_add(1, Ordering::SeqCst);
+            if self.failing {
+                return Err("access store unavailable".into());
+            }
+            Ok(user_ids
+                .iter()
+                .map(|&user_id| (user_id, user_id == 1 && project_id == 7))
+                .collect())
+        }
+    }
+
+    fn team() -> Vec<AssignmentRecipient> {
+        (1..=3)
+            .map(|user_id| AssignmentRecipient {
+                user_id,
+                email: format!("member{user_id}@example.test"),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn only_members_who_can_open_the_project_are_mailed_in_one_batched_check() {
+        let checker = OneMemberChecker::default();
+        let to = recipients_with_access(Some(&checker), 7, 42, &team()).await;
+        assert_eq!(to, vec!["member1@example.test".to_string()]);
+        assert_eq!(checker.batches.load(Ordering::SeqCst), 1);
+        assert_eq!(checker.single.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_check_mails_nobody() {
+        let checker = OneMemberChecker {
+            failing: true,
+            ..Default::default()
+        };
+        let to = recipients_with_access(Some(&checker), 7, 42, &team()).await;
+        assert!(to.is_empty(), "{to:?}");
+    }
+
+    #[tokio::test]
+    async fn a_project_none_of_them_can_open_mails_nobody() {
+        let checker = OneMemberChecker::default();
+        let to = recipients_with_access(Some(&checker), 8, 42, &team()).await;
+        assert!(to.is_empty(), "{to:?}");
+    }
+
+    #[tokio::test]
+    async fn without_access_control_every_member_is_mailed() {
+        let to = recipients_with_access(None, 7, 42, &team()).await;
+        assert_eq!(to.len(), 3);
     }
 }

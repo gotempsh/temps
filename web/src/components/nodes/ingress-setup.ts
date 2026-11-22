@@ -7,6 +7,7 @@
 
 import {
   addManagedDomain,
+  adminListNodes,
   createIngressConnector,
   deleteDnsProvider,
   deleteIngressConnector,
@@ -29,6 +30,7 @@ import {
 } from '@/components/domains/delivery-errors'
 import { tunnelNameFor } from '@/components/domains/ZoneTunnelChoice'
 import { replicaState } from '@/components/nodes/WorkerTunnels'
+import { hostSuffixError } from '@/lib/tunnel-host-suffix'
 import { ALLOW_INGRESS_COMMANDS, workerIngressWay } from '@/lib/worker-ingress'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
 
@@ -51,9 +53,15 @@ export function ingressSetupUrl(
 /** `temps_ingress::cloudflare::KIND`. */
 export const CLOUDFLARE_TUNNEL_KIND = 'cloudflare_tunnel'
 
-/** Apps directly under the zone, or under one label below it. */
+/**
+ * Apps directly under the zone (`shop.example.com`), one level under it with
+ * a label appended (`shop-lab.example.com`, the tunnel's `host_suffix`), or
+ * under a subdomain (`shop.lab.example.com`, two levels down).
+ */
 export type HostnameScheme =
-  { kind: 'zone' } | { kind: 'subdomain'; label: string }
+  | { kind: 'zone' }
+  | { kind: 'suffix'; label: string }
+  | { kind: 'subdomain'; label: string }
 
 const DNS_LABELS =
   /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/
@@ -72,11 +80,39 @@ export function subdomainLabelError(label: string): string | undefined {
   return undefined
 }
 
-/** The domain the tunnel serves: the zone, or `label.zone`. */
+/** Why the scheme's label is unusable, or `undefined` when it is fine. */
+export function schemeLabelError(scheme: HostnameScheme): string | undefined {
+  if (scheme.kind === 'suffix') return hostSuffixError(scheme.label)
+  if (scheme.kind === 'subdomain') return subdomainLabelError(scheme.label)
+  return undefined
+}
+
+/**
+ * The domain the tunnel serves: the zone (also with a suffix, whose hosts
+ * sit directly under it), or `label.zone` for a subdomain.
+ */
 export function tunnelDomainFor(zone: string, scheme: HostnameScheme): string {
   const base = zone.trim().toLowerCase().replace(/\.$/, '')
-  if (scheme.kind === 'zone') return base
+  if (scheme.kind !== 'subdomain') return base
   return `${normalizeLabel(scheme.label)}.${base}`
+}
+
+/** The tunnel's `host_suffix` for the scheme, if it has one. */
+export function hostSuffixFor(scheme: HostnameScheme): string | undefined {
+  return scheme.kind === 'suffix' ? normalizeLabel(scheme.label) : undefined
+}
+
+/** An example app hostname under the scheme: `shop-lab.example.com`. */
+export function exampleHost(
+  app: string,
+  zone: string,
+  scheme: HostnameScheme
+): string {
+  const base = zone.trim().toLowerCase().replace(/\.$/, '')
+  const label = scheme.kind === 'zone' ? '' : normalizeLabel(scheme.label)
+  if (scheme.kind === 'suffix') return `${app}-${label || 'lab'}.${base}`
+  if (scheme.kind === 'subdomain') return `${app}.${label || 'lab'}.${base}`
+  return `${app}.${base}`
 }
 
 /** A tunnel name from the domain that no existing tunnel uses. */
@@ -139,7 +175,10 @@ export function workerEligibility(
       selectable: false,
       hasIngress,
       defaultOn: false,
-      reason: `It is ${node.status}: its agent must be running and connected.`,
+      reason: offlineWorkerReason(node.status),
+      // Only a stopped agent is fixed by starting it; a drained or disabled
+      // worker is brought back from its page.
+      command: node.status === 'offline' ? START_AGENT_COMMAND : undefined,
     }
   }
   // Agents that report no mode predate the rule and are accepted (ADR 058 D7).
@@ -156,6 +195,49 @@ export function workerEligibility(
     }
   }
   return { selectable: true, hasIngress, defaultOn: !hasIngress }
+}
+
+/**
+ * The control plane in a tunnel's `node_ids` (ADR-107): this server, which
+ * runs the tunnel itself next to its own proxy.
+ */
+export const CONTROL_PLANE_NODE_ID = 0
+export const CONTROL_PLANE_NAME = 'Control plane'
+
+/**
+ * Whether the control plane can take a tunnel, and whether to pick it by
+ * default: always offered, since the server says when it cannot run one,
+ * and picked when no worker is, so a single-server install needs no worker.
+ */
+export function controlPlaneEligibility(
+  tunnels: { provider: string; nodes: { node_id: number }[] }[],
+  workersPickedByDefault: number
+): WorkerEligibility {
+  const hasIngress = tunnels.some(
+    (t) =>
+      t.provider === CLOUDFLARE_TUNNEL_KIND &&
+      t.nodes.some((n) => n.node_id === CONTROL_PLANE_NODE_ID)
+  )
+  return {
+    selectable: true,
+    hasIngress,
+    defaultOn: workersPickedByDefault === 0 && !hasIngress,
+  }
+}
+
+/** A picked node's name, with the control plane named as such. */
+export function pickedNodeName(node: { id: number; name: string }): string {
+  return node.id === CONTROL_PLANE_NODE_ID ? CONTROL_PLANE_NAME : node.name
+}
+
+/** Starts a worker's agent where `temps agent service install` set it up. */
+export const START_AGENT_COMMAND = 'sudo systemctl start temps-agent'
+
+/** Why a worker that is not active cannot run a tunnel, and how to fix it. */
+export function offlineWorkerReason(status: string): string {
+  return status === 'offline'
+    ? 'It is offline, so it cannot run a tunnel. Start its agent on that machine: with the systemd service run the command below, otherwise start `temps agent` under its supervisor again. It shows as active here within a minute.'
+    : `It is ${status}, so it cannot run a tunnel. Bring it back from its page under Worker nodes.`
 }
 
 // ----- the run --------------------------------------------------------------
@@ -176,6 +258,8 @@ export interface SetupPlan {
   /** The zone's managed-domain row under this provider, if it has one. */
   managed: ManagedDomainResponse | undefined
   tunnelDomain: string
+  /** Environment hosts become `<label>-<hostSuffix>.<tunnelDomain>`. */
+  hostSuffix?: string
   tunnelName: string
   nodes: { id: number; name: string }[]
 }
@@ -205,6 +289,11 @@ export type SetupOutcome =
       error: string
       created: SetupCreated
       undo: UndoResult[]
+      /**
+       * The run stopped before it changed anything (the workers check), so
+       * nothing was undone: an account added on this page stays for a retry.
+       */
+      stoppedBeforeChanges?: boolean
     }
   | { kind: 'aborted'; created: SetupCreated }
 
@@ -225,6 +314,10 @@ export interface IngressSetupApi {
   ): Promise<ManagedDomainResponse>
   removeManagedDomain(providerId: number, domain: string): Promise<void>
   createConnector(request: CreateConnectorRequest): Promise<ConnectorView>
+  /** The nodes as they are now, to re-check the workers before creating. */
+  listNodes(): Promise<
+    Pick<NodeInfoResponse, 'id' | 'name' | 'role' | 'status'>[]
+  >
   findConnectorByName(name: string): Promise<ConnectorView | undefined>
   getConnector(id: number): Promise<ConnectorView>
   deleteConnector(id: number): Promise<void>
@@ -274,6 +367,7 @@ export const sdkIngressSetupApi: IngressSetupApi = {
   },
   getConnector: async (id) =>
     requireDeliveryData(await getIngressConnector({ path: { id } })),
+  listNodes: async () => requireDeliveryData(await adminListNodes()).nodes,
   deleteConnector: (id) => noContent(deleteIngressConnector({ path: { id } })),
   deleteDnsProvider: (id) => noContent(deleteDnsProvider({ path: { id } })),
   sleep: (ms, signal) =>
@@ -349,6 +443,51 @@ export async function undoSetup(
 
 class StepFailure extends Error {}
 
+/** The first step's label: the workers checked, and the control plane. */
+export function availabilityLabel(
+  nodes: { id: number; name: string }[]
+): string {
+  const workers = nodes
+    .filter((n) => n.id !== CONTROL_PLANE_NODE_ID)
+    .map((n) => n.name)
+  const onControlPlane = workers.length < nodes.length
+  if (!onControlPlane) return `Workers ${workers.join(', ')} online`
+  if (workers.length === 0) return `${CONTROL_PLANE_NAME} ready`
+  return `${CONTROL_PLANE_NAME} ready, workers ${workers.join(', ')} online`
+}
+
+/**
+ * The first of `chosen` that cannot run a tunnel now, and why. The page's
+ * node list can be minutes old, so the run reads it again before it creates
+ * anything: a worker that went offline would otherwise fail only at the
+ * tunnel, after the domain was added.
+ */
+export function unavailableWorker(
+  chosen: { id: number; name: string }[],
+  nodes: Pick<NodeInfoResponse, 'id' | 'name' | 'role' | 'status'>[]
+): string | undefined {
+  for (const pick of chosen) {
+    // The control plane is not in the node list; creating the tunnel says
+    // when this server cannot run it.
+    if (pick.id === CONTROL_PLANE_NODE_ID) continue
+    const node = nodes.find((n) => n.id === pick.id)
+    if (!node) {
+      return `Worker '${pick.name}' is no longer in this cluster. Untick it under Workers and try again.`
+    }
+    if (node.role !== 'worker') {
+      return `Node '${node.name}' is a ${node.role}, not a worker; only workers run tunnels.`
+    }
+    if (node.status !== 'active') {
+      const fix =
+        node.status === 'offline'
+          ? `Start its agent on that machine (${START_AGENT_COMMAND} with the systemd service, otherwise \`temps agent\` under its supervisor)`
+          : 'Bring it back from its page under Worker nodes'
+      return `Worker '${node.name}' is ${node.status}, so it cannot run a tunnel. ${fix} or untick it under Workers, then try again.`
+    }
+  }
+  return undefined
+}
+
 /**
  * Domain, tunnel, then each worker's connection, reporting every change.
  * A failure undoes what the run created; a worker that is merely slow is
@@ -373,6 +512,11 @@ export async function runTunnelSetup(
         ? 'Added with the token you pasted; Cloudflare accepted it.'
         : 'Already in Temps.',
     },
+    {
+      key: 'workers',
+      label: availabilityLabel(plan.nodes),
+      status: 'pending',
+    },
     { key: 'domain', label: `Domain ${plan.zone}`, status: 'pending' },
     {
       key: 'tunnel',
@@ -381,7 +525,7 @@ export async function runTunnelSetup(
     },
     ...plan.nodes.map((node) => ({
       key: `node-${node.id}`,
-      label: `Connected on ${node.name}`,
+      label: `Connected on ${pickedNodeName(node)}`,
       status: 'pending' as StepStatus,
     })),
   ]
@@ -398,7 +542,36 @@ export async function runTunnelSetup(
     const undo = await undoSetup(created, api)
     return { kind: 'failed', error, created, undo }
   }
+  // Nothing is undone here: the run has changed nothing yet, and an account
+  // added with a pasted token stays so the user can fix the worker and retry.
+  const stopBeforeChanges = (error: string): SetupOutcome => {
+    set('workers', 'failed', error)
+    return {
+      kind: 'failed',
+      error,
+      created,
+      undo: [],
+      stoppedBeforeChanges: true,
+    }
+  }
   report(steps.map((s) => ({ ...s })))
+
+  // 0. The workers, read again: nothing is created for a tunnel that
+  // cannot run.
+  set('workers', 'running', 'Checking they are connected…')
+  try {
+    const unavailable = unavailableWorker(plan.nodes, await api.listNodes())
+    if (unavailable) return stopBeforeChanges(unavailable)
+  } catch (error) {
+    return stopBeforeChanges(message(error))
+  }
+  set('workers', 'done', 'Connected.')
+
+  // A page that went away (or a new run) stops this one before it creates
+  // anything, so nothing is made without a page to show it and undo it.
+  // Past this point the run finishes what it started rather than stopping
+  // halfway with a domain and no tunnel.
+  if (signal?.aborted) return { kind: 'aborted', created }
 
   // 1. The domain, managed and verified: a tunnel only takes one.
   set('domain', 'running', 'Adding it to Temps…')
@@ -449,6 +622,9 @@ export async function runTunnelSetup(
       name: plan.tunnelName,
       provider: CLOUDFLARE_TUNNEL_KIND,
       values: { dns_provider_id: plan.provider.id, domain: plan.tunnelDomain },
+      // Sent only with one, so a tunnel without a suffix asks exactly what
+      // it asked before suffixes existed.
+      ...(plan.hostSuffix ? { host_suffix: plan.hostSuffix } : {}),
       node_ids: plan.nodes.map((n) => n.id),
     })
     created.connectorId = connector.id
@@ -501,7 +677,13 @@ export async function runTunnelSetup(
       const replica = connector.nodes.find((n) => n.node_id === node.id)
       const key = `node-${node.id}`
       if (!replica) {
-        set(key, 'running', 'Waiting for the worker to pick it up')
+        set(
+          key,
+          'running',
+          node.id === CONTROL_PLANE_NODE_ID
+            ? 'Waiting for the control plane to start it'
+            : 'Waiting for the worker to pick it up'
+        )
         continue
       }
       const state = replicaState(replica)
@@ -547,7 +729,10 @@ export async function runTunnelSetup(
     const reasons = view.nodes
       .map((n) => n.last_error)
       .filter((r): r is string => !!r)
-    const error = `No worker could run the tunnel${reasons.length ? `: ${reasons.join('; ')}` : '.'}`
+    const where = plan.nodes.some((n) => n.id === CONTROL_PLANE_NODE_ID)
+      ? 'No node'
+      : 'No worker'
+    const error = `${where} could run the tunnel${reasons.length ? `: ${reasons.join('; ')}` : '.'}`
     const undo = await undoSetup(created, api)
     return { kind: 'failed', error, created, undo }
   }

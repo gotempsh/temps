@@ -27,11 +27,10 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import {
   InsightsPanel,
   InsightsToggleButton,
@@ -45,7 +44,9 @@ import {
   type DimensionListProps,
   type Row,
   type DimensionSortKey,
+  dimensionRowHref,
 } from './DimensionList-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 /**
  * Maximum rows fetched from the backend. The property-breakdown and
@@ -91,29 +92,10 @@ export function DimensionList({
     React.useState<SortDirection>('desc')
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
 
-  /**
-   * Only the `events` dimension currently has a per-value detail page
-   * (`/analytics/events/:eventName`) that lists the visitors who triggered it.
-   * Other dimensions don't have a segment-detail route yet, so their rows stay
-   * non-clickable. The active date filter is propagated so the detail page
-   * opens on the same range.
-   */
-  const getRowHref = (value: string): string | undefined => {
-    if (dimension !== 'events') return undefined
+  const getRowHref = (value: string): string | undefined =>
+    dimensionRowHref(project.slug, dimension, value, searchParams)
 
-    const params = new URLSearchParams()
-    const filter = searchParams.get('filter')
-    const from = searchParams.get('from')
-    const to = searchParams.get('to')
-    if (filter) params.set('filter', filter)
-    if (from) params.set('from', from)
-    if (to) params.set('to', to)
-    const qs = params.toString()
-
-    return `/projects/${project.slug}/analytics/events/${encodeURIComponent(value)}${qs ? `?${qs}` : ''}`
-  }
-
-  const breakdownQuery = useQuery({
+  const breakdownQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -129,7 +111,7 @@ export function DimensionList({
       !!startDate && !!endDate && !!config.groupBy && !config.useEventsCount,
   })
 
-  const eventsQuery = useQuery({
+  const eventsQuery = useWindowQuery({
     ...getEventsCountOptions({
       path: { project_id: project.id },
       query: {
@@ -146,6 +128,10 @@ export function DimensionList({
     ? eventsQuery.isLoading
     : breakdownQuery.isLoading
   const error = config.useEventsCount ? eventsQuery.error : breakdownQuery.error
+  // The previous window's rows while a moved one loads: not for the AI.
+  const isPreviousWindow = config.useEventsCount
+    ? eventsQuery.isPlaceholderData
+    : breakdownQuery.isPlaceholderData
 
   const rows: Row[] = React.useMemo(() => {
     if (config.useEventsCount) {
@@ -220,7 +206,7 @@ export function DimensionList({
   )
 
   const aiContext = React.useMemo<AiInsightContext | undefined>(() => {
-    if (rows.length === 0) return undefined
+    if (rows.length === 0 || isPreviousWindow) return undefined
     return {
       surface: config.title.toLowerCase(),
       rangeStart: startDate?.toISOString(),
@@ -232,7 +218,7 @@ export function DimensionList({
           .map((row) => ({ name: row.value, visitors: row.count })),
       },
     }
-  }, [rows, config.title, config.plural, startDate, endDate])
+  }, [rows, isPreviousWindow, config.title, config.plural, startDate, endDate])
 
   return (
     <div className="flex flex-col gap-4 sm:gap-6">
@@ -241,6 +227,7 @@ export function DimensionList({
           insights={insights}
           isLoading={isLoading}
           aiContext={aiContext}
+          aiPending={isPreviousWindow}
           project={{ id: project.id, slug: project.slug, name: project.name }}
         />
       )}
@@ -353,7 +340,9 @@ export function DimensionList({
                           clickable ? 'cursor-pointer hover:bg-muted/50' : ''
                         }
                         onClick={(e) => {
-                          if (!href) return
+                          // The value's own link handles its clicks.
+                          if (!href || (e.target as HTMLElement).closest('a'))
+                            return
                           if (e.metaKey || e.ctrlKey) {
                             window.open(href, '_blank')
                           } else {
@@ -365,12 +354,20 @@ export function DimensionList({
                           {rank}
                         </TableCell>
                         <TableCell className="font-medium break-all">
-                          <span className="inline-flex items-center gap-1">
-                            {row.value}
-                            {clickable && (
-                              <ChevronRight className="h-3 w-3 text-muted-foreground" />
-                            )}
-                          </span>
+                          {href ? (
+                            <Link
+                              to={href}
+                              className="inline-flex items-center gap-1 hover:underline"
+                            >
+                              {row.value}
+                              <ChevronRight
+                                className="h-3 w-3 text-muted-foreground"
+                                aria-hidden="true"
+                              />
+                            </Link>
+                          ) : (
+                            row.value
+                          )}
                         </TableCell>
                         <TableCell className="text-right font-mono tabular-nums">
                           {row.count.toLocaleString()}

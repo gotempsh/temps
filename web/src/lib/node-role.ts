@@ -5,7 +5,7 @@
  * Scheduling role of a worker node, read from its `temps.sh/role` label.
  *
  * Mirrors `NODE_ROLE_LABEL` / `BUILDER_NODE_ROLE` / `DEDICATED_NODE_ROLE` in
- * `crates/temps-deployments/src/services/node_scheduler.rs`. The nodes API
+ * `crates/temps-nodes/src/services/node_scheduler.rs`. The nodes API
  * already returns every label, so the console derives the role instead of
  * the server shipping a second copy of the same fact.
  */
@@ -34,12 +34,12 @@ export const NODE_ROLE_BADGE: Record<
   dedicated: {
     label: 'Dedicated',
     description:
-      'Dedicated node (temps.sh/role=dedicated): only runs environments that pin it in Target Nodes. Unpinned deployments, label selectors and automatic sandbox placement skip it.',
+      'Dedicated node (temps.sh/role=dedicated): only runs environments that pin it in Target nodes. Unpinned deployments, label selectors and automatic sandbox placement skip it.',
   },
 }
 
 /**
- * Help text for the environment's Target Nodes picker. Says what an empty
+ * Help text for the environment's Target nodes picker. Says what an empty
  * selection means given the nodes that are actually there, so an operator
  * with a dedicated node learns it will not be used unless it is ticked.
  */
@@ -53,4 +53,16 @@ export function targetNodesHint(
     return 'Restrict deployments to specific nodes. Leave empty to use all active nodes.'
   }
   return 'Restrict deployments to specific nodes. Leave empty to use all active nodes except dedicated ones: a dedicated node only runs environments that select it here, and label selectors never match it.'
+}
+
+/**
+ * The command, run on the worker, that changes its role (ADR-091): labels
+ * are set by the node itself, so the console can only say how. A dedicated
+ * or builder node is shown how to go back to an ordinary worker; any other
+ * node how to become dedicated.
+ */
+export function nodeRoleChangeCommand(labels: unknown): string {
+  return nodeSchedulingRole(labels)
+    ? `temps agent labels unset ${NODE_ROLE_LABEL}`
+    : `temps agent labels set ${NODE_ROLE_LABEL}=dedicated`
 }

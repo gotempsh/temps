@@ -10,6 +10,14 @@
 //!
 //! Uses a real TimescaleDB via Docker. Skips gracefully when Docker is unavailable.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::sync::Arc;
 
 use axum::body::Body;
@@ -39,7 +47,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
@@ -103,11 +111,11 @@ const TEST_API_KEY: &str = "tk_test_e2e_integration_key_12345";
 ///
 /// Returns None if Docker is unavailable.
 async fn setup_e2e() -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
 )> {
-    setup_e2e_as(Some(temps_auth::Role::Admin)).await
+    setup_e2e_as(Some(temps_authz::Role::Admin)).await
 }
 
 /// [`setup_e2e`] with control over the caller's identity, for testing the
@@ -123,9 +131,9 @@ async fn setup_e2e() -> Option<(
 /// Always builds the app with `metrics_store: None` — see
 /// [`setup_e2e_with_metrics_store`] for the variant that wires a real one in.
 async fn setup_e2e_as(
-    role: Option<temps_auth::Role>,
+    role: Option<temps_authz::Role>,
 ) -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
 )> {
@@ -146,13 +154,13 @@ async fn setup_e2e_as(
 /// wired test harness — unlike the full plugin registration path — never
 /// starts).
 async fn setup_e2e_with_metrics_store() -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
     std::sync::Arc<dyn temps_metrics::MetricsStore>,
 )> {
     let (db, router, project_id, store) =
-        setup_e2e_as_full(Some(temps_auth::Role::Admin), true).await?;
+        setup_e2e_as_full(Some(temps_authz::Role::Admin), true).await?;
     Some((
         db,
         router,
@@ -166,15 +174,15 @@ async fn setup_e2e_with_metrics_store() -> Option<(
 /// `OtelAppState::metrics_store` is `Some(..)` (backed by a real
 /// `TimescaleMetricsStore` on the same test database) or `None`.
 async fn setup_e2e_as_full(
-    role: Option<temps_auth::Role>,
+    role: Option<temps_authz::Role>,
     with_metrics_store: bool,
 ) -> Option<(
-    temps_database::test_utils::TestDatabase,
+    temps_test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
     Option<std::sync::Arc<dyn temps_metrics::MetricsStore>>,
 )> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!(
@@ -267,22 +275,21 @@ async fn setup_e2e_as_full(
     let notify: Arc<dyn temps_core::notifications::NotificationService> =
         Arc::new(NoOpNotificationService);
     let queue: Arc<dyn temps_core::JobQueue> = Arc::new(NoOpJobQueue);
-    let alarm_service = Arc::new(temps_monitoring::AlarmService::new(
+    let alarm_service = Arc::new(temps_alarms::AlarmService::new(
         db.clone(),
         notify.clone(),
         queue.clone(),
     ));
-    let alarm_service_dynamic = Arc::new(temps_monitoring::AlarmService::new(
-        db.clone(),
-        notify,
-        queue,
-    ));
+    let alarm_service_dynamic =
+        Arc::new(temps_alarms::AlarmService::new(db.clone(), notify, queue));
     let metric_alert_evaluator = Arc::new(temps_otel::services::MetricAlertEvaluator::new(
         metric_alert_service.clone(),
         otel_service.clone(),
         alarm_service,
         alarm_service_dynamic,
         db.clone(),
+        None,
+        // No log series source: these tests exercise metric rules only.
         None,
     ));
     let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
@@ -307,6 +314,10 @@ async fn setup_e2e_as_full(
     };
 
     let app_state = OtelAppState {
+        operation_trends: Arc::new(temps_otel::services::OperationTrendService::new(
+            db.clone(),
+            Arc::new(TimescaleDbStorage::new(db.clone(), None)),
+        )),
         otel_service,
         metrics_store: metrics_store.clone(),
         metrics_write_tx: None,
@@ -345,7 +356,7 @@ async fn setup_e2e_as_full(
     //
     // `role: None` injects nothing, which is how the unauthenticated case is
     // reproduced — RequireAuth then finds no AuthContext and returns 401.
-    let auth_context = role.map(|r| temps_auth::AuthContext::new_session(user.clone(), r));
+    let auth_context = role.map(|r| temps_authz::AuthContext::new_session(user.clone(), r));
     let auth_middleware = middleware::from_fn(
         move |mut req: axum::extract::Request, next: middleware::Next| {
             let auth_ctx = auth_context.clone();
@@ -1037,7 +1048,7 @@ async fn test_e2e_otel_reports_require_authentication() {
 #[tokio::test]
 async fn test_e2e_otel_reports_require_otel_read_permission() {
     let Some((_db, router, _project_id)) =
-        setup_e2e_as(Some(temps_auth::Role::MetricsIngest)).await
+        setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await
     else {
         return;
     };
@@ -1484,5 +1495,101 @@ async fn test_e2e_trace_summaries_include_total_contract() {
         body.get("total").is_none(),
         "include_total=false must omit `total` entirely (a 0 would be read as \
          'no traces' by a client doing `total ?? 0`), got: {body}"
+    );
+}
+
+/// Operation trends and regressions (ADR 111, D2): 401 without a token, 403
+/// without `OtelRead`, a Problem 404 for a deployment the project does not
+/// have, and a 200 trend that explains an untracked project.
+#[tokio::test]
+async fn test_e2e_operation_trends_authorize_and_explain() {
+    async fn get(router: &axum::Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    let Some((_db, router, project_id)) = setup_e2e().await else {
+        return;
+    };
+    let trend_uri = format!(
+        "/otel/operations/trend?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
+    );
+    let regressions_uri =
+        format!("/otel/operations/regressions?project_id={project_id}&deployment_id=987654");
+
+    let (status, body) = get(&router, &trend_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["points"], serde_json::json!([]));
+    assert_eq!(body["tracking"]["configured"], false);
+    assert_eq!(body["tracking"]["setup_path"], "traces");
+
+    let (status, body) = get(&router, &regressions_uri).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("987654")),
+        "the problem names the deployment: {body}"
+    );
+
+    let (status, _) = get(
+        &router,
+        &format!("/otel/operations/trend?project_id={project_id}&service_name=&span_name=x"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let breakdown_uri = format!(
+        "/otel/operations/breakdown?project_id={project_id}&service_name=checkout-api&span_name=GET%20%2Fcart"
+    );
+    let (status, body) = get(&router, &breakdown_uri).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["instances"], 0);
+    assert_eq!(body["sample"], "recent");
+    assert_eq!(body["max_traces"], 20);
+    let (status, body) = get(&router, &format!("{breakdown_uri}&sample=fastest")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        body["detail"]
+            .as_str()
+            .is_some_and(|d| d.contains("fastest")),
+        "{body}"
+    );
+
+    let Some((_db, anonymous, _)) = setup_e2e_as(None).await else {
+        return;
+    };
+    assert_eq!(
+        get(&anonymous, &trend_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        get(&anonymous, &breakdown_uri).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let Some((_db, ingest_only, _)) = setup_e2e_as(Some(temps_authz::Role::MetricsIngest)).await
+    else {
+        return;
+    };
+    assert_eq!(
+        get(&ingest_only, &regressions_uri).await.0,
+        StatusCode::FORBIDDEN
     );
 }

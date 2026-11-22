@@ -25,7 +25,6 @@ import {
 import type { WireguardMeshStatusResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
-import { CopyButton } from '@/components/ui/copy-button'
 import {
   Collapsible,
   CollapsibleContent,
@@ -46,12 +45,22 @@ import { MeshCaRotationRequired } from '@/components/nodes/RotateClusterCaDialog
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
 import { cn } from '@/lib/utils'
-import { type JoinIngressChoice, joinIngressFlag } from '@/lib/worker-ingress'
+import {
+  type JoinIngressChoice,
+  joinIngressFlag,
+  joinIngressUnavailable,
+} from '@/lib/worker-ingress'
+import { type WorkerOs, workerJoinScript } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import {
+  ForceJoinOption,
+  WorkerJoinScript,
+  WorkerOsChoice,
+} from '@/components/nodes/WorkerJoinScript'
 import {
   controlPlaneMeshPort,
   joinUrl,
   offersOutboundJoin,
-  outboundJoinCommand,
   outboundPeerReach,
 } from '@/lib/wireguard-mesh'
 
@@ -89,8 +98,9 @@ export function AddWorkerNode({ otherWays }: { otherWays: ReactNode }) {
       <div>
         <p className="text-sm font-medium">Add a worker node</p>
         <p className="text-sm text-muted-foreground">
-          Any Linux machine, on any provider or at home. It connects to this
-          server over an encrypted private network and needs no public IP.
+          Any Linux machine, on any provider or at home, or a Mac for
+          development. It connects to this server over an encrypted private
+          network and needs no public IP.
         </p>
       </div>
 
@@ -472,25 +482,47 @@ function JoinCommandStep({ url }: { url: string }) {
     : []
   const [created, setCreated] = useState(0)
   const [ingress, setIngress] = useState<JoinIngressChoice>('delegated')
-  const ingressQuestion = (
-    <IngressQuestion value={ingress} onChange={setIngress} />
+  const [force, setForce] = useState(false)
+  const [os, setOs] = useState<WorkerOs>('linux')
+  // The install step takes the release this server runs (the newest nightly
+  // for a build between releases); a worker on an older version may not
+  // speak its protocol.
+  const release = usePlaneRelease()
+  const selectOs = (next: WorkerOs) => {
+    setOs(next)
+    // A Mac cannot take every ingress choice: fall back to the default one.
+    if (joinIngressUnavailable(next, ingress)) setIngress('delegated')
+  }
+  const choices = (
+    <>
+      <WorkerOsChoice value={os} onChange={selectOs} />
+      <IngressQuestion value={ingress} onChange={setIngress} os={os} />
+      <ForceJoinOption checked={force} onChange={setForce} />
+    </>
   )
 
-  const create = () => {
+  const create = ({ another }: { another: boolean }) => {
     setKnownNodes(new Set((nodeList?.nodes ?? []).map((n) => n.id)))
     setCreated((n) => n + 1)
+    // Another command is for another machine: moving one is not a standing
+    // choice. The first command keeps what was ticked before creating it.
+    if (another) setForce(false)
     mint.mutate({ body: { max_uses: 1, ttl_secs: ENROLLMENT_TOKEN_TTL_SECS } })
   }
 
   if (!mint.data) {
     return (
-      <div className="space-y-2">
-        {ingressQuestion}
+      <div className="space-y-3">
+        {choices}
         <p className="text-sm text-muted-foreground">
-          Creates a command to run as root on the new machine. It installs
-          Temps, joins this cluster and starts the agent.
+          Creates the commands to run on the new machine. They install the Temps
+          version this server runs, join this cluster and start the agent.
         </p>
-        <Button size="sm" onClick={create} disabled={mint.isPending}>
+        <Button
+          size="sm"
+          onClick={() => create({ another: false })}
+          disabled={mint.isPending}
+        >
           {mint.isPending ? (
             <Loader2 className="mr-1 h-4 w-4 animate-spin" />
           ) : (
@@ -503,34 +535,31 @@ function JoinCommandStep({ url }: { url: string }) {
     )
   }
 
-  const command = [
-    'curl -fsSL https://temps.sh/install.sh | bash',
-    outboundJoinCommand(url, mint.data.token) + joinIngressFlag(ingress),
-    'temps agent service install',
-  ].join('\n')
+  const script = workerJoinScript({
+    url,
+    token: mint.data.token,
+    install: release.install,
+    joinFlags: joinIngressFlag(ingress),
+    force,
+    os,
+  })
 
   return (
-    <div className="space-y-2" key={created}>
-      {ingressQuestion}
-      <p className="text-sm text-muted-foreground">
-        Run this as root on the new machine:
-      </p>
-      <div className="flex items-start gap-2 rounded-md bg-muted px-3 py-2 font-mono text-xs">
-        <pre
-          tabIndex={0}
-          className="min-w-0 flex-1 overflow-x-auto whitespace-pre"
-        >
-          {command}
-        </pre>
-        <CopyButton minimal className="h-6 w-6 shrink-0" value={command} />
-      </div>
+    <div className="space-y-3" key={created}>
+      {choices}
+      <WorkerJoinScript
+        command={script.command}
+        install={script.install}
+        pending={release.pending}
+        os={os}
+      />
       <p className="text-xs text-muted-foreground">
         Shown once. It adds one machine and expires{' '}
         <TimeAgo date={mint.data.expires_at} />.{' '}
         <button
           type="button"
           className="font-medium underline"
-          onClick={create}
+          onClick={() => create({ another: true })}
           disabled={mint.isPending}
         >
           Create another
@@ -589,9 +618,11 @@ const INGRESS_CHOICES: {
 function IngressQuestion({
   value,
   onChange,
+  os,
 }: {
   value: JoinIngressChoice
   onChange: (value: JoinIngressChoice) => void
+  os: WorkerOs
 }) {
   return (
     <fieldset className="space-y-2">
@@ -603,24 +634,34 @@ function IngressQuestion({
         onValueChange={(next) => onChange(next as JoinIngressChoice)}
         className="gap-2"
       >
-        {INGRESS_CHOICES.map((choice) => (
-          <div key={choice.value} className="flex items-start gap-2">
-            <RadioGroupItem
-              id={`join-ingress-${choice.value}`}
-              value={choice.value}
-              className="mt-0.5"
-            />
-            <Label
-              htmlFor={`join-ingress-${choice.value}`}
-              className="grid gap-0.5 font-normal"
-            >
-              <span className="text-sm">{choice.label}</span>
-              <span className="text-xs text-muted-foreground">
-                {choice.description}
-              </span>
-            </Label>
-          </div>
-        ))}
+        {INGRESS_CHOICES.map((choice) => {
+          const unavailable = joinIngressUnavailable(os, choice.value)
+          return (
+            <div key={choice.value} className="flex items-start gap-2">
+              <RadioGroupItem
+                id={`join-ingress-${choice.value}`}
+                value={choice.value}
+                disabled={unavailable !== null}
+                className="mt-0.5"
+              />
+              <Label
+                htmlFor={`join-ingress-${choice.value}`}
+                className="grid gap-0.5 font-normal"
+              >
+                <span
+                  className={
+                    unavailable ? 'text-sm text-muted-foreground' : 'text-sm'
+                  }
+                >
+                  {choice.label}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {unavailable ?? choice.description}
+                </span>
+              </Label>
+            </div>
+          )
+        })}
       </RadioGroup>
       <p className="text-xs text-muted-foreground">
         Change it later on the worker with <code>temps agent ingress</code>.

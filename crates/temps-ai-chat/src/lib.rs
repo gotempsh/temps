@@ -50,6 +50,7 @@ pub mod suggestion_handlers;
 pub mod suggestions;
 pub mod thread_kind;
 pub mod usage;
+pub mod watches;
 pub mod workspace_chats;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};
@@ -69,12 +70,19 @@ pub use service::{ChatStreamEvent, ConversationService, HarnessMcpError, Pending
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
-    #[error("conversation '{0}' not found")]
-    NotFound(String),
+    #[error("conversation '{conversation_id}' not found")]
+    NotFound { conversation_id: String },
     #[error("project {0} not found")]
     ProjectNotFound(i32),
-    #[error("no AI context provider registered for type '{0}'")]
-    NoProvider(String),
+    #[error("no AI context provider registered for type '{context_type}'")]
+    NoProvider { context_type: String },
+    #[error(
+        "Watch preparation timed out for turn '{turn_id}' in conversation '{conversation_id}'"
+    )]
+    WatchPreparationTimeout {
+        conversation_id: String,
+        turn_id: String,
+    },
     #[error("AI is not configured for this project")]
     AiUnavailable,
     #[error("context not found or not accessible")]
@@ -145,8 +153,8 @@ pub enum ToolAuthorizationRefreshError {
     PrincipalInactive,
     #[error("deployment credentials cannot execute conversation tools")]
     UnsupportedCredential,
-    #[error("stored API-key role '{0}' is invalid")]
-    InvalidRole(String),
+    #[error("stored API-key role '{role}' is invalid")]
+    InvalidRole { role: String },
     #[error("stored API-key permissions are invalid")]
     InvalidPermissions,
     #[error("permission to execute in the harness workspace has been revoked")]
@@ -220,6 +228,12 @@ impl ChatError {
                 code: "proposal_not_staged",
                 title: "Proposal was not staged",
                 detail: "The AI described a proposal but did not submit it to Temps, so no approval card exists and no change was made. Retry the request to create a fresh proposal.".to_string(),
+                retryable: true,
+            },
+            Self::WatchPreparationTimeout { .. } => PublicChatFailure {
+                code: "watch_preparation_timeout",
+                title: "Watch preparation timed out",
+                detail: "The watch is still pending. Temps will retry it when chat dependencies are available.".to_string(),
                 retryable: true,
             },
             Self::Db(_) | Self::ProjectLookup { .. } => PublicChatFailure {

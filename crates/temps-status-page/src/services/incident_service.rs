@@ -2,18 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use futures::future::BoxFuture;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, status_incident_updates, status_incidents, status_monitors};
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
 
+use super::db_retry::with_db_retry;
 use super::types::{
     CreateIncidentRequest, IncidentResponse, IncidentUpdateResponse, StatusPageError,
     UpdateIncidentStatusRequest,
@@ -33,6 +30,34 @@ fn validate_incident_update_message(message: &str) -> Result<(), StatusPageError
     Ok(())
 }
 
+/// Longest public incident heading, in characters (the column is
+/// `VARCHAR(200)`).
+pub const MAX_INCIDENT_PUBLIC_TITLE_CHARS: usize = 200;
+
+const INCIDENT_STATUSES: [&str; 4] = ["investigating", "identified", "monitoring", "resolved"];
+
+/// Trim a public heading; `None` for a missing or blank one. Rejects control
+/// characters (it is rendered on one line of a public page) and overlong text.
+pub(crate) fn normalize_public_title(
+    public_title: Option<&str>,
+) -> Result<Option<String>, StatusPageError> {
+    let Some(title) = public_title.map(str::trim).filter(|t| !t.is_empty()) else {
+        return Ok(None);
+    };
+    let length = title.chars().count();
+    if length > MAX_INCIDENT_PUBLIC_TITLE_CHARS {
+        return Err(StatusPageError::Validation(format!(
+            "Public incident title is {length} characters; the limit is {MAX_INCIDENT_PUBLIC_TITLE_CHARS}"
+        )));
+    }
+    if title.chars().any(char::is_control) {
+        return Err(StatusPageError::Validation(
+            "Public incident title cannot contain control characters".to_string(),
+        ));
+    }
+    Ok(Some(title.to_string()))
+}
+
 /// Service for managing status page incidents
 pub struct IncidentService {
     db: Arc<DatabaseConnection>,
@@ -41,82 +66,6 @@ pub struct IncidentService {
 impl IncidentService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
-    }
-
-    /// Execute a database operation with retry logic
-    async fn with_retry<F, T>(operation_name: &str, mut operation: F) -> Result<T, StatusPageError>
-    where
-        F: FnMut() -> BoxFuture<'static, Result<T, sea_orm::DbErr>>,
-    {
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 50;
-
-        let mut last_error = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = INITIAL_DELAY_MS * (2_u64.pow(attempt - 1));
-                debug!(
-                    "Retrying {} (attempt {}/{}), waiting {}ms",
-                    operation_name, attempt, MAX_RETRIES, delay
-                );
-                sleep(Duration::from_millis(delay)).await;
-            }
-
-            match operation().await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        debug!(
-                            "{} succeeded after {} attempts",
-                            operation_name,
-                            attempt + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    // Check if it's a transient error that we should retry
-                    let should_retry = match &e {
-                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
-                        sea_orm::DbErr::Query(runtime_err) => {
-                            let err_str = runtime_err.to_string();
-                            err_str.contains("deadlock")
-                                || err_str.contains("timeout")
-                                || err_str.contains("connection")
-                        }
-                        _ => false,
-                    };
-
-                    if should_retry && attempt < MAX_RETRIES {
-                        warn!(
-                            "{} failed (attempt {}), will retry: {:?}",
-                            operation_name,
-                            attempt + 1,
-                            e
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-
-                    // Non-retryable error or final attempt
-                    error!(
-                        "{} failed after {} attempts: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        e
-                    );
-                    return Err(StatusPageError::Database(e));
-                }
-            }
-        }
-
-        // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "{} failed after all retry attempts",
-                operation_name
-            ))
-        })))
     }
 
     /// Create a new incident with retry logic
@@ -172,16 +121,38 @@ impl IncidentService {
             }
         }
 
+        let status = request
+            .status
+            .clone()
+            .unwrap_or_else(|| "investigating".to_string());
+        if !INCIDENT_STATUSES.contains(&status.as_str()) {
+            return Err(StatusPageError::Validation(format!(
+                "Invalid status '{status}'. Must be one of: investigating, identified, monitoring, resolved"
+            )));
+        }
+        let public_title = normalize_public_title(request.public_title.as_deref())?;
+        let message = request
+            .message
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string);
+        if let Some(message) = &message {
+            validate_incident_update_message(message)?;
+        }
+
+        let now = Utc::now();
         let incident = status_incidents::ActiveModel {
             project_id: Set(project_id),
             environment_id: Set(request.environment_id),
             monitor_id: Set(request.monitor_id),
             title: Set(request.title.clone()),
+            public_title: Set(public_title),
             description: Set(request.description.clone()),
             severity: Set(request.severity.clone()),
-            status: Set("investigating".to_string()),
-            started_at: Set(Utc::now()),
-            resolved_at: Set(None),
+            status: Set(status.clone()),
+            started_at: Set(now),
+            resolved_at: Set((status == "resolved").then_some(now)),
             ..Default::default()
         };
 
@@ -189,7 +160,7 @@ impl IncidentService {
         let title = request.title.clone();
 
         // Create incident with retry
-        let result = Self::with_retry(
+        let result = with_db_retry(
             &format!("create_incident for project {}", project_id),
             || {
                 let incident = incident.clone();
@@ -201,16 +172,29 @@ impl IncidentService {
 
         let incident_id = result.id;
 
-        // Create initial update with retry
-        let initial_update = status_incident_updates::ActiveModel {
-            incident_id: Set(incident_id),
-            status: Set("investigating".to_string()),
-            message: Set(format!("Incident created: {}", title)),
-            is_system: Set(true),
-            ..Default::default()
+        // The first update: the operator's own message when they wrote one
+        // (it may be public), otherwise the automatic entry, which embeds the
+        // internal title and so can never be public.
+        let initial_update = match message {
+            Some(message) => status_incident_updates::ActiveModel {
+                incident_id: Set(incident_id),
+                status: Set(status),
+                message: Set(message),
+                is_public: Set(request.is_public),
+                is_system: Set(false),
+                published_at: Set(request.is_public.then(chrono::Utc::now)),
+                ..Default::default()
+            },
+            None => status_incident_updates::ActiveModel {
+                incident_id: Set(incident_id),
+                status: Set(status),
+                message: Set(format!("Incident created: {}", title)),
+                is_system: Set(true),
+                ..Default::default()
+            },
         };
 
-        Self::with_retry(
+        with_db_retry(
             &format!("create_incident_update for incident {}", incident_id),
             || {
                 let update = initial_update.clone();
@@ -276,7 +260,9 @@ impl IncidentService {
 
         let paginator = query.paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items.into_iter().map(|i| i.into()).collect(), total))
     }
@@ -320,6 +306,7 @@ impl IncidentService {
             status: Set(request.status),
             message: Set(request.message),
             is_public: Set(request.is_public),
+            published_at: Set(request.is_public.then(chrono::Utc::now)),
             ..Default::default()
         };
 
@@ -354,10 +341,32 @@ impl IncidentService {
                 update_id,
             });
         }
+        let becomes_public = is_public && !update.is_public;
         let mut update: status_incident_updates::ActiveModel = update.into();
         update.is_public = Set(is_public);
+        if becomes_public {
+            // Subscribers hear of it from now, however old the draft is.
+            update.published_at = Set(Some(chrono::Utc::now()));
+        }
         let update = update.update(self.db.as_ref()).await?;
         Ok(update.into())
+    }
+
+    /// Set or clear (empty string) the heading published status pages show
+    /// for an incident.
+    pub async fn set_public_title(
+        &self,
+        incident_id: i32,
+        public_title: &str,
+    ) -> Result<IncidentResponse, StatusPageError> {
+        let public_title = normalize_public_title(Some(public_title))?;
+        let incident = status_incidents::Entity::find_by_id(incident_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(StatusPageError::IncidentNotFound { incident_id })?;
+        let mut incident: status_incidents::ActiveModel = incident.into();
+        incident.public_title = Set(public_title);
+        Ok(incident.update(self.db.as_ref()).await?.into())
     }
 
     /// Get incident updates
@@ -552,8 +561,8 @@ impl IncidentService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, status_monitors, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests
@@ -618,6 +627,7 @@ mod tests {
             severity: "minor".to_string(),
             environment_id: None,
             monitor_id: None,
+            ..Default::default()
         }
     }
 
@@ -792,5 +802,171 @@ mod tests {
 
         let result = service.get_incident(99999).await;
         assert!(matches!(result, Err(StatusPageError::NotFound)));
+    }
+
+    #[test]
+    fn normalize_public_title_trims_clears_and_bounds() {
+        assert_eq!(normalize_public_title(None).unwrap(), None);
+        assert_eq!(normalize_public_title(Some("   ")).unwrap(), None);
+        assert_eq!(
+            normalize_public_title(Some("  Delayed email delivery ")).unwrap(),
+            Some("Delayed email delivery".to_string())
+        );
+        let too_long = "x".repeat(MAX_INCIDENT_PUBLIC_TITLE_CHARS + 1);
+        assert!(matches!(
+            normalize_public_title(Some(&too_long)),
+            Err(StatusPageError::Validation(message)) if message.contains("201 characters")
+        ));
+        assert!(matches!(
+            normalize_public_title(Some("line\nbreak")),
+            Err(StatusPageError::Validation(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn create_custom_incident_writes_a_public_human_update() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+
+        let incident = service
+            .create_incident(
+                project.id,
+                CreateIncidentRequest {
+                    public_title: Some("  Delayed email delivery ".to_string()),
+                    message: Some("Emails are arriving up to 10 minutes late.".to_string()),
+                    is_public: true,
+                    status: Some("identified".to_string()),
+                    ..sample_incident_request()
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            incident.public_title.as_deref(),
+            Some("Delayed email delivery")
+        );
+        assert_eq!(incident.status, "identified");
+        assert!(incident.resolved_at.is_none());
+        let updates = service.get_incident_updates(incident.id).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].message,
+            "Emails are arriving up to 10 minutes late."
+        );
+        assert_eq!(updates[0].status, "identified");
+        assert!(updates[0].is_public);
+        assert!(!updates[0].is_system);
+    }
+
+    #[tokio::test]
+    async fn create_incident_without_message_keeps_the_private_system_update() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+
+        // `is_public` without a message has nothing to publish.
+        let incident = service
+            .create_incident(
+                project.id,
+                CreateIncidentRequest {
+                    is_public: true,
+                    ..sample_incident_request()
+                },
+            )
+            .await
+            .unwrap();
+
+        let updates = service.get_incident_updates(incident.id).await.unwrap();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0].is_system);
+        assert!(!updates[0].is_public);
+    }
+
+    #[tokio::test]
+    async fn create_incident_already_resolved_records_resolution_time() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+
+        let incident = service
+            .create_incident(
+                project.id,
+                CreateIncidentRequest {
+                    status: Some("resolved".to_string()),
+                    message: Some("Brief outage during maintenance.".to_string()),
+                    ..sample_incident_request()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(incident.status, "resolved");
+        assert!(incident.resolved_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn create_incident_rejects_unknown_status_and_long_message() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+
+        let bad_status = service
+            .create_incident(
+                project.id,
+                CreateIncidentRequest {
+                    status: Some("exploded".to_string()),
+                    ..sample_incident_request()
+                },
+            )
+            .await;
+        assert!(matches!(
+            bad_status,
+            Err(StatusPageError::Validation(message)) if message.contains("exploded")
+        ));
+
+        let long_message = service
+            .create_incident(
+                project.id,
+                CreateIncidentRequest {
+                    message: Some("x".repeat(MAX_INCIDENT_UPDATE_MESSAGE_CHARS + 1)),
+                    ..sample_incident_request()
+                },
+            )
+            .await;
+        assert!(matches!(long_message, Err(StatusPageError::Validation(_))));
+    }
+
+    #[tokio::test]
+    async fn set_public_title_sets_clears_and_reports_missing_incident() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = IncidentService::new(db.clone());
+        let project = create_test_project(&db).await;
+        let incident = service
+            .create_incident(project.id, sample_incident_request())
+            .await
+            .unwrap();
+
+        let titled = service
+            .set_public_title(incident.id, "Slow dashboard")
+            .await
+            .unwrap();
+        assert_eq!(titled.public_title.as_deref(), Some("Slow dashboard"));
+        assert_eq!(titled.title, "Test Incident");
+
+        let cleared = service.set_public_title(incident.id, "  ").await.unwrap();
+        assert_eq!(cleared.public_title, None);
+
+        assert!(matches!(
+            service.set_public_title(999_999, "x").await,
+            Err(StatusPageError::IncidentNotFound {
+                incident_id: 999_999
+            })
+        ));
     }
 }

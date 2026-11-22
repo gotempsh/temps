@@ -3,6 +3,7 @@
 
 import { getProjectsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { Button, Callout } from '@temps-sdk/ds'
+import { Skeleton } from '@/components/ui/skeleton'
 import { Button as LinkButton } from '@/components/ui/button'
 import { useNodeCapability } from '@/hooks/useNodeCapability'
 import { problemDetail } from '@/lib/api-problem'
@@ -93,7 +94,11 @@ export function SampleDeployCard({ className }: { className?: string }) {
             </p>
           </div>
         </div>
-        {cannotSchedule && !canAddWorkerNode(capability.data) ? (
+        {capability.isPending ? (
+          <div role="status" aria-label="Checking deployment availability">
+            <Skeleton className="h-9 w-40" />
+          </div>
+        ) : cannotSchedule && !canAddWorkerNode(capability.data) ? (
           <p className="text-sm text-muted-foreground">
             {WORKER_NODE_ASK_ADMIN_MESSAGE}
           </p>

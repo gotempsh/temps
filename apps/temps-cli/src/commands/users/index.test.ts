@@ -3,6 +3,8 @@
 
 import { test, expect, describe } from 'bun:test'
 import { parseRolesInput, parseUserId } from './index.js'
+import { registerUsersCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 describe('parseRolesInput', () => {
   test('defaults to user when no roles were given', () => {
@@ -54,5 +56,36 @@ describe('parseUserId', () => {
     for (const raw of ['0', '-3', '', '   ', '007', '2147483648']) {
       expect(parseUserId(raw)).toBeNull()
     }
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('users create credential sources', () => {
+  test('--password-stdin sends the piped password exactly', async () => {
+    const run = await runWithApi(registerUsersCommands,
+      ['users', 'create', '-u', 'alice', '-e', 'alice@example.com', '--password-stdin', '-y'],
+      { 'POST /users': (_url: URL, body: unknown) => ({ id: 2, username: 'alice', email: 'alice@example.com', roles: [], ...(body as object) }) },
+      { stdin: CREDENTIAL_SENTINEL })
+    expect(run.error).toBeUndefined()
+    expect(credentialBody(run, 'POST /users').password).toBe(CREDENTIAL_SENTINEL)
   })
 })

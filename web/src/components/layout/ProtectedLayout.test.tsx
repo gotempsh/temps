@@ -25,4 +25,14 @@ test('server connection failure links to the public documentation', () => {
   expect(html).toContain('Cannot reach the server')
   expect(html).toContain('href="https://temps.sh/docs"')
   expect(html).not.toContain('href="https://docs.temps.sh"')
+  const container = document.createElement('div')
+  container.innerHTML = html
+  const help = container.querySelector('a[href*="discord.com"]')
+  expect(help?.getAttribute('href')).toBe(
+    'https://discord.com/invite/ZunrteG6JX'
+  )
+  expect(help?.textContent).toContain('Ask on Discord')
+  expect(help?.getAttribute('target')).toBe('_blank')
+  expect(help?.getAttribute('rel')).toBe('noopener noreferrer')
+  expect(html).toContain('href="https://github.com/gotempsh/temps/issues"')
 })

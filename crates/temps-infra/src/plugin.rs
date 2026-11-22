@@ -157,6 +157,11 @@ impl TempsPlugin for InfraPlugin {
                 PlatformInfoService::with_handle(Arc::new(docker_handle)).with_features(features),
             );
             context.register_service(platform_info_service.clone());
+            // Make it reachable asks the server for its public address
+            // instead of resolving the console's hostname.
+            let public_address: Arc<dyn temps_core::server_public_address::ServerPublicAddress> =
+                platform_info_service.clone();
+            context.register_service(public_address);
 
             // Create DnsService
             let dns_service = Arc::new(DnsService::new());

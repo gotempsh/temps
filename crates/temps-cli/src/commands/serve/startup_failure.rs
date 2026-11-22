@@ -5,7 +5,7 @@
 //!
 //! `start_console_api` returns `anyhow::Result` because it glues together
 //! dozens of plugin and service errors. The checks an operator can actually
-//! fix on a first run (Docker, GeoLite2, logs directory, log storage, the
+//! fix on a first run (Docker, logs directory, log storage, the
 //! initial admin, the listener address) raise a typed error from this module
 //! instead of a formatted string, so [`summarize`] can recover *which* check
 //! failed from the `anyhow` chain and pair it with concrete remediation. The
@@ -30,16 +30,6 @@ pub enum ConsoleStartupError {
         /// Endpoint description, e.g. `unix:///var/run/docker.sock (from DOCKER_HOST)`.
         endpoint: String,
         reason: String,
-    },
-
-    #[error("{message}")]
-    GeoDatabase {
-        /// Where the database was looked for, in order.
-        checked: Vec<PathBuf>,
-        /// Why the automatic download failed.
-        reason: String,
-        /// Full operator guidance, logged as-is.
-        message: String,
     },
 
     #[error("{}", logs_directory_message(.path, .data_dir, .reason))]
@@ -82,8 +72,10 @@ fn docker_message(endpoint: &str, reason: &str) -> String {
         1. Ensure Docker daemon is running\n\
            - macOS: Check Docker Desktop application\n\
            - Linux: Run 'sudo systemctl start docker'\n\n\
-        2. Verify Docker socket permissions\n\
-           - Linux: Run 'sudo usermod -aG docker $USER'\n\n\
+        2. Verify Docker socket permissions (\"permission denied\" above)\n\
+           - Linux: Run 'sudo usermod -aG docker <user running temps>'\n\
+           - systemd service: add a drop-in with SupplementaryGroups=docker\n\
+             under [Service] ('sudo systemctl edit temps'), then restart it\n\n\
         3. Check Docker environment variables\n\
            - DOCKER_HOST may need to be set\n\n\
         4. Run this control plane without local workloads\n\
@@ -116,6 +108,46 @@ fn logs_directory_message(
         data_dir.display(),
         data_dir.display()
     )
+}
+
+/// The fix for "the socket exists but this user may not open it", the usual
+/// cause on a Linux host where Temps runs as a dedicated service user.
+const SOCKET_ACCESS_STEP: &str =
+    "On Linux, give the user running Temps access to the Docker socket: \
+     `sudo usermod -aG docker <user>`, or for a systemd service add a drop-in with \
+     `SupplementaryGroups=docker` under [Service] (`sudo systemctl edit temps`). \
+     Then restart the service.";
+
+/// Does this Docker connection error mean the socket refused this user?
+/// Matches the OS error text (`Permission denied (os error 13)`) anywhere
+/// in the error chain the reason was built from.
+fn is_permission_denied(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("permission denied") || reason.contains("os error 13")
+}
+
+/// Render an error with every `source()` in its chain. A bollard connection
+/// failure's own `Display` is only "client error (Connect)"; the cause that
+/// tells a missing socket from a permission problem is further down.
+pub(crate) fn error_chain_text(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    // Bounded: error chains are short, but a cyclic or pathological chain
+    // must not loop forever on the startup path.
+    let mut depth = 0;
+    while let Some(cause) = source {
+        if depth >= 8 {
+            break;
+        }
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+        depth += 1;
+    }
+    text
 }
 
 /// Turn a console startup error into the summary shown on the status page.
@@ -151,34 +183,31 @@ pub fn summarize(error: &anyhow::Error) -> ConsoleStartupFailure {
 
 fn summarize_typed(error: &ConsoleStartupError) -> ConsoleStartupFailure {
     match error {
-        ConsoleStartupError::DockerUnavailable { endpoint, reason } => ConsoleStartupFailure::new(
-            ConsoleStartupCheck::Docker,
-            format!("Docker is not reachable at {endpoint}"),
-            reason,
-            vec![
+        ConsoleStartupError::DockerUnavailable { endpoint, reason } => {
+            let permission_denied = is_permission_denied(reason);
+            let summary = if permission_denied {
+                format!(
+                    "Docker socket not reachable at {endpoint}: permission denied for the user running Temps"
+                )
+            } else {
+                format!("Docker socket not reachable at {endpoint}")
+            };
+            let mut remediation = Vec::with_capacity(6);
+            if permission_denied {
+                remediation.push(SOCKET_ACCESS_STEP.to_string());
+            }
+            remediation.extend([
                 "Start the Docker daemon (Docker Desktop on macOS, `sudo systemctl start docker` on Linux).".to_string(),
                 "If Docker runs elsewhere (Colima, OrbStack, rootless Docker), set DOCKER_HOST to its socket, e.g. DOCKER_HOST=unix:///path/to/docker.sock, or select it with `docker context use <name>`.".to_string(),
-                "On Linux, make sure the user running Temps can use the socket: `sudo usermod -aG docker <user>`, then log in again.".to_string(),
+            ]);
+            if !permission_denied {
+                remediation.push(SOCKET_ACCESS_STEP.to_string());
+            }
+            remediation.extend([
                 "To run this server without local workloads, start it with `temps serve --profile control-plane` and add worker nodes with `temps join`.".to_string(),
-                "Check with `temps doctor`, then restart `temps serve`.".to_string(),
-            ],
-        ),
-        ConsoleStartupError::GeoDatabase { checked, reason, .. } => {
-            let locations = checked
-                .iter()
-                .map(|path| path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            ConsoleStartupFailure::new(
-                ConsoleStartupCheck::GeoDatabase,
-                "GeoLite2-City.mmdb is missing and could not be downloaded",
-                format!("Checked: {locations}. Download error: {reason}"),
-                vec![
-                    "Check that this server can reach the internet over HTTPS; the database is downloaded automatically on startup.".to_string(),
-                    "Or download GeoLite2-City from MaxMind (free account) and copy GeoLite2-City.mmdb into the data directory.".to_string(),
-                    "Restart `temps serve`.".to_string(),
-                ],
-            )
+                "Restart `temps serve` and check its log. `sudo -u <user> temps doctor` tests the account's own groups; it does not see a group added only by a systemd SupplementaryGroups= drop-in.".to_string(),
+            ]);
+            ConsoleStartupFailure::new(ConsoleStartupCheck::Docker, summary, reason, remediation)
         }
         ConsoleStartupError::LogsDirectory {
             path,
@@ -305,10 +334,72 @@ mod tests {
         assert_eq!(failure.check, ConsoleStartupCheck::Docker);
         assert!(failure.summary.contains("unix:///tmp/nonexistent.sock"));
         assert_eq!(failure.detail, "Socket not found: /tmp/nonexistent.sock");
+        assert!(failure.summary.starts_with("Docker socket not reachable"));
         assert!(failure
             .remediation
             .iter()
             .any(|step| step.contains("DOCKER_HOST")));
+        // A missing socket leads with starting the daemon, not permissions.
+        assert!(failure.remediation[0].contains("Start the Docker daemon"));
+    }
+
+    #[test]
+    fn docker_permission_denied_leads_with_socket_access() {
+        let error = anyhow::Error::new(ConsoleStartupError::DockerUnavailable {
+            endpoint: "unix:///var/run/docker.sock (default)".to_string(),
+            reason: "Error in the hyper legacy client: client error (Connect): \
+                     Permission denied (os error 13)"
+                .to_string(),
+        });
+        let logged = error.to_string();
+        assert!(logged.contains("SupplementaryGroups=docker"));
+
+        let failure = summarize(&error);
+        assert_eq!(failure.check, ConsoleStartupCheck::Docker);
+        assert!(
+            failure
+                .summary
+                .contains("Docker socket not reachable at unix:///var/run/docker.sock"),
+            "{}",
+            failure.summary
+        );
+        assert!(failure.summary.contains("permission denied"));
+        assert!(failure.remediation[0].contains("usermod -aG docker"));
+        assert!(failure.remediation[0].contains("SupplementaryGroups=docker"));
+        // The access step appears once, not twice.
+        assert_eq!(
+            failure
+                .remediation
+                .iter()
+                .filter(|step| step.contains("usermod -aG docker"))
+                .count(),
+            1
+        );
+        // The verification step warns that sudo does not see a group the
+        // systemd drop-in grants only to the service.
+        let last = failure.remediation.last().expect("remediation steps");
+        assert!(last.contains("account's own groups"), "{last}");
+    }
+
+    #[test]
+    fn error_chain_text_includes_os_cause() {
+        #[derive(Debug)]
+        struct Outer(std::io::Error);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("client error (Connect)")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let error = Outer(std::io::Error::from_raw_os_error(13));
+        let text = error_chain_text(&error);
+        assert!(text.starts_with("client error (Connect): "), "{text}");
+        assert!(is_permission_denied(&text), "{text}");
+        assert!(!is_permission_denied("Socket not found: /tmp/x.sock"));
     }
 
     #[test]

@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import { adminListNodesQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { IngressSetupPage } from './IngressSetupPage'
 
 afterEach(cleanup)
@@ -72,8 +73,29 @@ const cloudflareAccount = (id: number, name: string) => ({
   updated_at: '2026-01-01T00:00:00Z',
 })
 
-function setup() {
+function setup({
+  nodes = () => [
+    worker(1, 'worker-a'),
+    worker(2, 'worker-b'),
+    worker(3, 'worker-c', 'offline'),
+  ],
+  entry = '/settings/nodes/ingress',
+}: {
+  nodes?: () => ReturnType<typeof worker>[] | Response
+  entry?: string
+} = {}) {
   const posted: { path: string; body: unknown }[] = []
+  // The tunnel comes back with the suffix and placement it was created with.
+  let hostSuffix: string | null = null
+  let placed: number[] = [1]
+  const nodesOf = (state: string) =>
+    placed.map((node_id) => ({
+      node_id,
+      node_name:
+        node_id === 0 ? 'Control plane' : `worker-${'abc'[node_id - 1]}`,
+      state,
+      ready_connections: 4,
+    }))
   // A pasted token adds account 2 next to the existing account 1.
   const accounts = [cloudflareAccount(1, 'Cloudflare')]
   const perAccount = (id: number) => ({
@@ -94,14 +116,12 @@ function setup() {
   const api = mockApi({
     ...perAccount(1),
     ...perAccount(2),
-    'GET /internal/nodes': () =>
-      jsonResponse({
-        nodes: [
-          worker(1, 'worker-a'),
-          worker(2, 'worker-b'),
-          worker(3, 'worker-c', 'offline'),
-        ],
-      }),
+    'GET /internal/nodes': () => {
+      const answer = nodes()
+      return answer instanceof Response
+        ? answer
+        : jsonResponse({ nodes: answer })
+    },
     'GET /internal/nodes/1/public-ingress/settings': () =>
       jsonResponse(settings(1, 'delegated')),
     'GET /internal/nodes/2/public-ingress/settings': () =>
@@ -132,24 +152,42 @@ function setup() {
       return new Response(null, { status: 204 })
     },
     'POST /ingress/connectors': async (request) => {
-      posted.push({ path: 'connectors', body: await request.json() })
-      return jsonResponse(tunnel('pending'), 201)
+      const body = (await request.json()) as {
+        host_suffix?: string
+        node_ids?: number[]
+      }
+      posted.push({ path: 'connectors', body })
+      hostSuffix = body.host_suffix ?? null
+      placed = body.node_ids ?? placed
+      return jsonResponse(
+        {
+          ...tunnel('pending'),
+          nodes: nodesOf('pending'),
+          host_suffix: hostSuffix,
+        },
+        201
+      )
     },
-    'GET /ingress/connectors/9': () => jsonResponse(tunnel('ready')),
+    'GET /ingress/connectors/9': () =>
+      jsonResponse({
+        ...tunnel('ready'),
+        nodes: nodesOf('ready'),
+        host_suffix: hostSuffix,
+      }),
   })
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
   })
   render(
     <QueryClientProvider client={client}>
-      <MemoryRouter initialEntries={['/settings/nodes/ingress']}>
+      <MemoryRouter initialEntries={[entry]}>
         <BreadcrumbProvider>
           <IngressSetupPage />
         </BreadcrumbProvider>
       </MemoryRouter>
     </QueryClientProvider>
   )
-  return { api, posted }
+  return { api, posted, client }
 }
 
 function managedDomain(verified: boolean) {
@@ -181,6 +219,11 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   await waitFor(() => expect(b.hasAttribute('disabled')).toBe(true))
   expect(c.hasAttribute('disabled')).toBe(true)
   expect(screen.getByText('temps agent ingress delegated')).toBeTruthy()
+  // The offline worker says why, and how to start it.
+  expect(
+    screen.getByText(/It is offline, so it cannot run a tunnel/)
+  ).toBeTruthy()
+  expect(screen.getByText('sudo systemctl start temps-agent')).toBeTruthy()
 
   fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
   // The subdomain scheme warns about Universal SSL before it can be used.
@@ -188,13 +231,47 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
   expect(
     screen.getByText('HTTPS fails without Advanced Certificate Manager')
   ).toBeTruthy()
-  fireEvent.click(screen.getByRole('radio', { name: /app\.example\.com/ }))
+  // One level deep with a label: the free certificate covers it, no warning.
+  fireEvent.click(screen.getByRole('radio', { name: /With a label/ }))
+  expect(screen.getAllByText('shop-lab.example.com').length).toBeGreaterThan(0)
+  expect(
+    screen.queryByText('HTTPS fails without Advanced Certificate Manager')
+  ).toBeNull()
+  // Setup alone names no environment, and says so.
+  expect(
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
+  ).toBeTruthy()
+  fireEvent.change(screen.getByLabelText('Label'), {
+    target: { value: 'lab.eu' },
+  })
+  expect(
+    screen.getByText(
+      'Use 1-20 letters, digits or single hyphens, with no dots.'
+    )
+  ).toBeTruthy()
+  // Hostnames read as a pattern, with a concrete example.
+  fireEvent.click(
+    screen.getByRole('radio', { name: /<app-name>\.example\.com/ })
+  )
+  expect(screen.getByText('shop.example.com')).toBeTruthy()
+  // Without a label, setup still names no environment, and still says so.
+  expect(
+    screen.getByText(/Creating the tunnel gives no environment a name yet/)
+  ).toBeTruthy()
 
   const create = screen.getByRole('button', { name: 'Create tunnel' })
   await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
   fireEvent.click(create)
 
   await screen.findByText('Visitors can reach apps under example.com')
+  // Every layout points to the step that names environments.
+  const done = screen.getByText(/No environment gets a name until you do/)
+  expect(done.textContent).toContain('shop.example.com')
+  expect(
+    screen
+      .getByRole('link', { name: 'publish environments through this tunnel' })
+      .getAttribute('href')
+  ).toBe('/domains/tunnel/*.example.com')
   expect(screen.getByText('Connected on worker-a')).toBeTruthy()
   expect(screen.getByText('4 connections to Cloudflare')).toBeTruthy()
   expect(posted).toEqual([
@@ -209,6 +286,41 @@ test('defaults to a tunnel on the workers with no way in, and sets it up step by
       },
     },
   ])
+})
+
+test('a one-level label creates the tunnel with its suffix and points to publishing environments', async () => {
+  const { posted } = setup()
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  fireEvent.click(screen.getByRole('radio', { name: /With a label/ }))
+  fireEvent.change(screen.getByLabelText('Label'), {
+    target: { value: 'lab' },
+  })
+
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(posted[1]).toEqual({
+    path: 'connectors',
+    body: {
+      name: 'example-com',
+      provider: 'cloudflare_tunnel',
+      values: { dns_provider_id: 1, domain: 'example.com' },
+      host_suffix: 'lab',
+      node_ids: [1],
+    },
+  })
+  // The names are not live yet: the panel links to the step that makes them.
+  const done = screen.getByText(/No environment gets a name until you do/)
+  expect(done.textContent).toContain('shop-lab.example.com')
+  const link = screen.getByRole('link', {
+    name: 'publish environments through this tunnel',
+  })
+  expect(link.getAttribute('href')).toBe('/domains/tunnel/*.example.com')
 })
 
 test('open ports hands over to each worker’s own page', async () => {
@@ -275,4 +387,160 @@ test('after a run, the account its tunnel uses is no longer offered for removal'
     screen.queryByRole('button', { name: 'Use a different token' })
   ).toBeNull()
   expect(api.called('DELETE', '/dns-providers/2')).toBe(false)
+})
+
+test('a worker that went offline after the page loaded stops the run before anything is created', async () => {
+  let reads = 0
+  const { posted } = setup({
+    // Active when the page loads, offline when Create re-checks it.
+    nodes: () => [worker(1, 'worker-a', reads++ === 0 ? 'active' : 'offline')],
+  })
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+
+  await screen.findByText(/Setup failed: Worker 'worker-a' is offline/)
+  expect(screen.getByText('Nothing was created.')).toBeTruthy()
+  // No domain, no tunnel.
+  expect(posted).toEqual([])
+})
+
+test('a failed refresh of the worker list keeps the wizard and says the list may be stale', async () => {
+  let fail = false
+  const { client } = setup({
+    nodes: () =>
+      fail
+        ? jsonResponse(
+            { title: 'Service Unavailable', status: 503, detail: 'down' },
+            503
+          )
+        : [worker(1, 'worker-a')],
+  })
+  await screen.findByText('example.com')
+  expect(screen.getByRole('button', { name: 'Create tunnel' })).toBeTruthy()
+
+  fail = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText(/The worker list may be out of date/)
+  // Still the wizard, not the full-page error that would abort a run.
+  expect(screen.getByRole('button', { name: 'Create tunnel' })).toBeTruthy()
+  expect(screen.queryByText('Could not load the worker nodes')).toBeNull()
+})
+
+test('a run\u2019s result stays when a later poll finds no workers', async () => {
+  let gone = false
+  const { client } = setup({
+    nodes: () => (gone ? [] : [worker(1, 'worker-a')]),
+  })
+  await screen.findByText('example.com')
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+
+  gone = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText(/This cluster has no worker nodes any more/)
+  // The tunnel wizard still works without one: it says so.
+  expect(
+    screen.getByText(/A new tunnel can still run on the control plane/)
+  ).toBeTruthy()
+  // The result, not the empty-cluster onboarding that would replace it.
+  expect(
+    screen.getByText('Visitors can reach apps under example.com')
+  ).toBeTruthy()
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+})
+
+test('a picked worker that goes offline holds Create until the operator decides', async () => {
+  let cOffline = false
+  const { client, posted } = setup({
+    nodes: () => [
+      worker(1, 'worker-a'),
+      worker(3, 'worker-c', cOffline ? 'offline' : 'active'),
+    ],
+  })
+  await screen.findByText('example.com')
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  const c = screen.getByRole('checkbox', { name: 'worker-c' })
+  await waitFor(() => expect(c.getAttribute('data-state')).toBe('checked'))
+  // An explicit selection of both.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+
+  cOffline = true
+  await client.refetchQueries({ queryKey: adminListNodesQueryKey() })
+
+  await screen.findByText('worker-c is no longer available')
+  expect(create.hasAttribute('disabled')).toBe(true)
+  // Changing another box does not quietly drop the unavailable pick.
+  fireEvent.click(a)
+  fireEvent.click(a)
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(screen.getByText('worker-c is no longer available')).toBeTruthy()
+  expect(create.hasAttribute('disabled')).toBe(true)
+  fireEvent.click(
+    screen.getByRole('button', { name: 'Continue with worker-a' })
+  )
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  expect(screen.queryByText('worker-c is no longer available')).toBeNull()
+
+  fireEvent.click(create)
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+    node_ids: [1],
+  })
+})
+
+test('with no worker the tunnel runs on the control plane', async () => {
+  const { posted } = setup({ nodes: () => [] })
+  await screen.findByText('example.com')
+  expect(screen.queryByText('No worker node yet')).toBeNull()
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  await waitFor(() =>
+    expect(controlPlane.getAttribute('data-state')).toBe('checked')
+  )
+  fireEvent.click(screen.getByRole('radio', { name: /example\.com/ }))
+  const create = screen.getByRole('button', { name: 'Create tunnel' })
+  await waitFor(() => expect(create.hasAttribute('disabled')).toBe(false))
+  fireEvent.click(create)
+  await waitFor(() =>
+    expect(posted.find((p) => p.path === 'connectors')?.body).toMatchObject({
+      node_ids: [0],
+    })
+  )
+  // The run follows the control plane's connector to the end.
+  await screen.findByText('Visitors can reach apps under example.com')
+  expect(screen.getByText('Connected on Control plane')).toBeTruthy()
+  // The control plane has no worker page to link to.
+  expect(screen.getAllByText('Control plane').length).toBeGreaterThan(0)
+  expect(screen.queryByRole('link', { name: 'Control plane' })).toBeNull()
+})
+
+test('with a worker picked the control plane is offered but not picked', async () => {
+  setup()
+  await screen.findByText('example.com')
+  const controlPlane = screen.getByRole('checkbox', { name: 'Control plane' })
+  const a = screen.getByRole('checkbox', { name: 'worker-a' })
+  await waitFor(() => expect(a.getAttribute('data-state')).toBe('checked'))
+  expect(controlPlane.getAttribute('data-state')).toBe('unchecked')
+  expect(controlPlane.hasAttribute('disabled')).toBe(false)
+})
+
+test('open ports still need a worker', async () => {
+  setup({ nodes: () => [], entry: '/settings/nodes/ingress?via=ports' })
+  await screen.findByText('No worker node yet')
+  expect(screen.queryByRole('checkbox', { name: 'Control plane' })).toBeNull()
 })

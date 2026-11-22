@@ -32,6 +32,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   HostnameChoice,
+  RetryHostnameDns,
   TunnelHostnames,
 } from '@/components/domains/TunnelHostnames'
 import { TunnelEnvironmentHosts } from '@/components/domains/TunnelEnvironmentHosts'
@@ -71,7 +72,7 @@ function hostnameVerdict(view: HostnameView): {
     case 'pending':
       return { tone: 'running', label: 'Publishing…' }
     case 'error':
-      return { tone: 'error', label: 'Failed' }
+      return { tone: 'error', label: 'Publication failed' }
     default:
       return { tone: 'idle', label: 'Not through a tunnel' }
   }
@@ -222,6 +223,11 @@ function HostnameDetail({
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
+          <RetryHostnameDns
+            key={view.hostname}
+            hostname={view.hostname}
+            connectorId={view.retry_dns_connector_id}
+          />
           {view.state === 'published' && (
             <Button variant="outline" asChild>
               <a
@@ -291,7 +297,7 @@ export function TunnelDomainDetail() {
     <Button variant="outline" asChild>
       <Link to="/domains">
         <ArrowLeft className="mr-2 size-4" />
-        Back to Domains
+        Back to domains
       </Link>
     </Button>
   )

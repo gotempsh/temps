@@ -367,7 +367,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
           <div>
             <h2 className="text-xl font-semibold flex items-center gap-2">
               <GlobeIcon className="h-5 w-5" />
-              Live View
+              Live view
             </h2>
             <p className="text-sm text-muted-foreground">
               Real-time visitor activity on {project.name}
@@ -474,7 +474,7 @@ export function LiveGlobePage({ project }: LiveGlobePageProps) {
           {/* Feed header */}
           <div className="px-4 py-3 border-b flex items-center justify-between flex-shrink-0">
             <p className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Activity Feed
+              Activity feed
             </p>
             <span className="text-xs text-muted-foreground">
               {activityEvents.length} events

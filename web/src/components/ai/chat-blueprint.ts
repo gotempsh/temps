@@ -44,6 +44,7 @@ export const CHAT_CONTINUE_EVENT = 'temps:chat-continue'
 export interface ChatContinueDetail {
   conversationPublicId: string
   message: string
+  respond?: (accepted: Promise<boolean>) => void
 }
 
 export function continueChat(conversationPublicId: string, message: string) {
@@ -54,6 +55,25 @@ export function continueChat(conversationPublicId: string, message: string) {
   )
 }
 
+/** Ask the mounted conversation to send now, retaining the caller's draft on refusal. */
+export function requestChatContinuation(
+  conversationPublicId: string,
+  message: string
+): Promise<boolean> {
+  let response: Promise<boolean> | undefined
+  window.dispatchEvent(
+    new CustomEvent<ChatContinueDetail>(CHAT_CONTINUE_EVENT, {
+      detail: {
+        conversationPublicId,
+        message,
+        respond: (result) => {
+          response = result
+        },
+      },
+    })
+  )
+  return response ?? Promise.resolve(false)
+}
 /** Asks the assistant page to start a new chat inside an application. */
 export const NEW_CHAT_IN_EVENT = 'temps:new-chat-in'
 
@@ -69,6 +89,9 @@ export function startChatIn(application: NewChatInDetail) {
     })
   )
 }
+
+/** Refresh the open transcript after the host appends a notification. */
+export const CHAT_WATCH_DELIVERY_EVENT = 'temps:chat-watch-delivery'
 
 /**
  * Tells the chat list to read itself again: a chat moved between
@@ -306,4 +329,26 @@ export function proposalState(
     blueprint.accepted?.version ?? 0
   )
   return newest > version ? 'superseded' : 'rejected'
+}
+
+export interface WatchRefreshDetail {
+  conversationPublicId: string
+  respond: (applied: Promise<boolean>) => void
+}
+
+export function refreshWatchTranscript(
+  conversationPublicId: string
+): Promise<boolean> {
+  let reply: Promise<boolean> | undefined
+  window.dispatchEvent(
+    new CustomEvent<WatchRefreshDetail>(CHAT_WATCH_DELIVERY_EVENT, {
+      detail: {
+        conversationPublicId,
+        respond: (applied) => {
+          reply = applied
+        },
+      },
+    })
+  )
+  return reply ?? Promise.resolve(false)
 }

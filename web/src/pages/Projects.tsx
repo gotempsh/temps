@@ -12,7 +12,7 @@ import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboa
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { markReadFailureHandled } from '@/lib/route-query-failures'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
-import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
+import { PROJECT_GRID_CLASS } from '@/components/dashboard/project-grid'
 import { WorkerNodeRequiredBanner } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
@@ -29,9 +29,7 @@ import {
   ArrowRight,
   Boxes,
   Download,
-  ExternalLink,
   RefreshCw,
-  X,
 } from 'lucide-react'
 import { Link } from 'react-router'
 import { useComposedSearchParams } from '@temps-sdk/ds'
@@ -44,11 +42,13 @@ import { CreateProjectGroupDialog } from '@/components/project-groups/CreateProj
 import { ProjectGroupCard } from '@/components/project-groups/ProjectGroupCard'
 import { projectListItems } from '@/components/project-groups/project-list-items'
 import { useProjectGroups } from '@/components/project-groups/useProjectGroups'
+import { groupServiceLive } from '@/components/project-groups/group-service-live'
 import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
 import {
   PROJECT_PAGE_SIZE_OPTIONS,
   projectPageCount,
   readProjectPagination,
+  showsProjectPagination,
   withProjectPagination,
   withProjectSearch,
 } from '@/lib/project-list-pagination'
@@ -56,8 +56,6 @@ import { serviceCount } from '@/lib/terminology'
 
 /** `/projects?new=project` opens the new-project dialog (command palette). */
 const CREATE_PARAM = 'new'
-const RENAME_NOTICE_KEY = 'temps.servicesRenameNoticeDismissed'
-const PROJECTS_DOCS_URL = 'https://temps.sh/docs/concepts/projects'
 
 function groupMatches(group: ProjectGroupResponse, needle: string): boolean {
   return (
@@ -81,17 +79,6 @@ export function Projects() {
   }
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
   const [creatingGroup, setCreatingGroup] = useState(false)
-  const [renameNoticeDismissed, setRenameNoticeDismissed] = useState(
-    readRenameNoticeDismissed
-  )
-  const dismissRenameNotice = () => {
-    setRenameNoticeDismissed(true)
-    try {
-      window.localStorage.setItem(RENAME_NOTICE_KEY, '1')
-    } catch {
-      // Private mode: hidden for this page only.
-    }
-  }
 
   // Opened from elsewhere (the command palette's "New project"): the request
   // lives in the URL, so the dialog is open while it is there and the
@@ -249,9 +236,20 @@ export function Projects() {
     }
   }, [])
 
+  // Services inside the projects on this page are read in the same batches,
+  // so a project card shows each service's health and traffic too.
+  const shownGroupMembers = useMemo(
+    () =>
+      grouped && page === 1 ? visibleGroups.flatMap((g) => g.projects) : [],
+    [grouped, page, visibleGroups]
+  )
+
   const projectIds = useMemo(
-    () => standaloneProjects.map((project) => project.id),
-    [standaloneProjects]
+    () => [
+      ...standaloneProjects.map((project) => project.id),
+      ...shownGroupMembers.map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
   )
 
   const dashboardAnalytics = useDashboardAnalytics(
@@ -262,11 +260,15 @@ export function Projects() {
 
   // External (telemetry-only) projects have no deployments to report on.
   const hostedProjectIds = useMemo(
-    () =>
-      standaloneProjects
+    () => [
+      ...standaloneProjects
         .filter((project) => project.source_type !== 'external')
         .map((project) => project.id),
-    [standaloneProjects]
+      ...shownGroupMembers
+        .filter((service) => service.source_type !== 'external')
+        .map((service) => service.id),
+    ],
+    [standaloneProjects, shownGroupMembers]
   )
   const dashboardHealth = useDashboardHealth(
     hostedProjectIds,
@@ -277,6 +279,29 @@ export function Projects() {
   // traffic-derived health cannot. See project-card-health.ts.
   const monitorHealth = useProjectsMonitorHealth(projectIds)
   const latestDeploymentMedia = useLatestDeploymentMedia(hostedProjectIds)
+
+  const groupLive = useMemo(() => {
+    const sources = {
+      analytics: dashboardAnalytics.data?.projects,
+      health: dashboardHealth.data?.projects,
+      monitors: monitorHealth.data?.projects,
+      healthLoading: dashboardHealth.isLoading,
+      healthError: dashboardHealth.isError,
+    }
+    return Object.fromEntries(
+      shownGroupMembers.map((service) => [
+        service.id,
+        groupServiceLive(service.id, sources),
+      ])
+    )
+  }, [
+    shownGroupMembers,
+    dashboardAnalytics.data?.projects,
+    dashboardHealth.data?.projects,
+    dashboardHealth.isLoading,
+    dashboardHealth.isError,
+    monitorHealth.data?.projects,
+  ])
 
   const renderProjectCard = (project: ProjectResponse) => (
     <ProjectCard
@@ -311,52 +336,32 @@ export function Projects() {
   })
 
   const isLoading = groupsQuery.isLoading || servicesLoading || isPageOutOfRange
-
-  // Announcements and the onboarding checklist are secondary to the list.
-  // On a phone each one is a full card of its own, so stacked above the list
-  // they push every project off the first screen: below `md` they follow the
-  // list (and its pagination) instead. That reorder is CSS-only (`order` in
-  // the flex column below), so each card mounts exactly once and keeps its
-  // state (e.g. the selected onboarding step) across a rotate or resize.
-  const groupingHint = !grouped &&
-    groupsLoaded &&
-    renameNoticeDismissed &&
-    !normalizedProjectSearch &&
-    standaloneTotal >= 2 && (
-      <GroupingHint onCreate={() => setCreatingGroup(true)} />
-    )
-  const notices = serviceTotal > 0 && (
-    <div className="flex flex-col gap-4 sm:gap-6 max-md:order-last">
-      {!renameNoticeDismissed && (
-        <ServicesRenameNotice
-          onCreateProject={() => setCreatingGroup(true)}
-          onDismiss={dismissRenameNotice}
-        />
-      )}
-
-      <OnboardingNextStepCard />
-    </div>
-  )
+  const firstProject = !isLoading && !isError && isEmptyInstall
 
   return (
     <PageContainer
       className="max-sm:py-4"
-      innerClassName="flex flex-col gap-4 space-y-0 sm:gap-6"
+      innerClassName="@container flex flex-col gap-4 space-y-0 sm:gap-6"
     >
       {/* Header */}
       <ProjectsHeader
-        firstProject={!isLoading && !isError && isEmptyInstall}
+        firstProject={firstProject}
         actions={
           <>
             {serviceTotal > 0 && <PlatformStrip />}
-            <Button
-              variant="outline"
-              className="max-sm:flex-1"
-              onClick={() => setCreatingGroup(true)}
-            >
-              <Boxes className="size-4" />
-              New project
-            </Button>
+            {/* A project groups services, so on an install with none there
+                is nothing to put in one yet; the page below is about the
+                first service. */}
+            {!firstProject && (
+              <Button
+                variant="outline"
+                className="max-sm:flex-1"
+                onClick={() => setCreatingGroup(true)}
+              >
+                <Boxes className="size-4" />
+                New project
+              </Button>
+            )}
             <CreateActionButton
               to="/projects/new"
               label="Create service"
@@ -373,8 +378,6 @@ export function Projects() {
 
       {/* Nothing here can be built or deployed until something can run it. */}
       <WorkerNodeRequiredBanner />
-
-      {notices}
 
       {groupsQuery.isError && (
         <div
@@ -447,7 +450,7 @@ export function Projects() {
       {isLoading ? (
         <div
           role="status"
-          className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3"
+          className={PROJECT_GRID_CLASS}
           aria-label="Loading projects and services"
           aria-busy="true"
         >
@@ -479,13 +482,14 @@ export function Projects() {
         ) : null
       ) : (
         <>
-          {groupingHint && (
-            <div className="max-md:order-[9998]">{groupingHint}</div>
-          )}
-          <div className="grid gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
+          <div className={PROJECT_GRID_CLASS}>
             {listItems.map((item) =>
               item.kind === 'group' ? (
-                <ProjectGroupCard key={item.key} group={item.group} />
+                <ProjectGroupCard
+                  key={item.key}
+                  group={item.group}
+                  live={groupLive}
+                />
               ) : (
                 renderProjectCard(item.project)
               )
@@ -495,20 +499,22 @@ export function Projects() {
       )}
 
       {/* Pagination of the services listed on their own. */}
-      {projectsData && standaloneTotal > 0 && !isPageOutOfRange && (
-        <ResponsivePagination
-          page={page}
-          pageSize={pageSize}
-          total={standaloneTotal}
-          totalPages={totalPages}
-          pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
-          ariaLabel="Service list pagination"
-          pageSizeAriaLabel="Services per page"
-          className="pt-2"
-          onPageChange={(nextPage) => setPagination(nextPage)}
-          onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
-        />
-      )}
+      {projectsData &&
+        showsProjectPagination(standaloneTotal, page) &&
+        !isPageOutOfRange && (
+          <ResponsivePagination
+            page={page}
+            pageSize={pageSize}
+            total={standaloneTotal}
+            totalPages={totalPages}
+            pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
+            ariaLabel="Service list pagination"
+            pageSizeAriaLabel="Services per page"
+            className="pt-2"
+            onPageChange={(nextPage) => setPagination(nextPage)}
+            onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
+          />
+        )}
     </PageContainer>
   )
 }
@@ -543,61 +549,6 @@ function listSummary({
   return serviceCount(standaloneTotal)
 }
 
-function readRenameNoticeDismissed(): boolean {
-  try {
-    return window.localStorage.getItem(RENAME_NOTICE_KEY) === '1'
-  } catch {
-    return false
-  }
-}
-
-/**
- * Shown once to installs that had apps before the rename: they are Services
- * now, and a Project is a new, optional grouping of them.
- */
-function ServicesRenameNotice({
-  onCreateProject,
-  onDismiss,
-}: {
-  onCreateProject: () => void
-  onDismiss: () => void
-}) {
-  return (
-    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 lg:flex-row lg:items-center">
-      <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-        <Boxes className="size-4" />
-      </div>
-      <p className="flex-1 text-sm text-muted-foreground">
-        <span className="font-medium text-foreground">
-          Your apps are now called Services.
-        </span>{' '}
-        A Project groups the services that ship together (frontend, API,
-        workers) so they share a repository, variables and routes.
-      </p>
-      <div className="flex flex-wrap items-center gap-2">
-        <Button variant="outline" size="sm" onClick={onCreateProject}>
-          Create a project
-        </Button>
-        <Button variant="ghost" size="sm" asChild>
-          <a href={PROJECTS_DOCS_URL} target="_blank" rel="noopener noreferrer">
-            Learn more
-            <ExternalLink className="size-3.5" />
-          </a>
-        </Button>
-        <Button
-          variant="ghost"
-          size="icon"
-          className="size-8"
-          aria-label="Dismiss this notice"
-          onClick={onDismiss}
-        >
-          <X className="size-4" />
-        </Button>
-      </div>
-    </div>
-  )
-}
-
 /**
  * Projects page header. The title block is fixed; `actions` is what the
  * migration-entry-point variants swap out.
@@ -611,6 +562,8 @@ function ProjectsHeader({
 }) {
   return (
     <PageHeader
+      // The description can wrap; the actions stay on one row beside it.
+      className="sm:[&>:last-child]:shrink-0"
       title={firstProject ? 'Deploy your first application' : 'Projects'}
       description={
         firstProject
@@ -630,7 +583,7 @@ function ProjectsHeader({
  */
 function PlatformStrip() {
   return (
-    <div className="hidden items-center gap-1 rounded-md border p-1 sm:flex">
+    <div className="hidden items-center gap-1 rounded-md border p-1 @4xl:flex">
       <span className="px-1.5 text-xs text-muted-foreground">Migrate from</span>
       {TOP_MIGRATION_SOURCES.map((p) => (
         <Link
@@ -656,17 +609,17 @@ function PlatformStrip() {
 }
 
 /**
- * Phone form of {@link PlatformStrip}: five brand marks plus a label would
- * take a row of the header on their own, so below `sm` the migration entry
- * point is one icon button on the same row as the create actions. It opens the
- * import wizard, which lists every platform.
+ * Narrow form of {@link PlatformStrip}: five brand marks plus a label would
+ * take a row of the header on their own, so on a narrow page the migration
+ * entry point is one icon button on the same row as the create actions. It
+ * opens the import wizard, which lists every platform.
  */
 function PlatformMenuLink() {
   return (
     <Button
       variant="outline"
       size="icon"
-      className="sm:hidden"
+      className="@4xl:hidden"
       asChild
       title="Migrate from another platform"
     >
@@ -677,29 +630,5 @@ function PlatformMenuLink() {
         <Download className="size-4" />
       </Link>
     </Button>
-  )
-}
-
-/**
- * Introduces grouping where the services are, before any project exists.
- * Shown only with two or more services, where grouping can do something.
- */
-function GroupingHint({ onCreate }: { onCreate: () => void }) {
-  return (
-    <div className="flex flex-col gap-3 rounded-lg border px-4 py-3 lg:flex-row lg:items-center">
-      <div className="flex size-8 shrink-0 items-center justify-center rounded-md bg-muted text-muted-foreground">
-        <Boxes className="size-4" />
-      </div>
-      <p className="flex-1 text-sm text-muted-foreground">
-        <span className="font-medium text-foreground">
-          Services that ship together?
-        </span>{' '}
-        Group a frontend, API and worker into one project to see them side by
-        side and share environment variables between them.
-      </p>
-      <Button variant="outline" size="sm" onClick={onCreate}>
-        Create a project
-      </Button>
-    </div>
   )
 }

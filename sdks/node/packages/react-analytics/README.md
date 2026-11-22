@@ -311,6 +311,10 @@ function PricingSection() {
 | `once` | `boolean` | `true` | Track only the first time |
 | `enabled` | `boolean` | `true` | Enable/disable tracking |
 
+### `useFlag(key, fallback)` / `useFlagVariant(key)` / `useFeatureFlags()`
+
+Feature flag reads; see [Feature Flags](#feature-flags).
+
 ### `useSessionRecording()`
 
 Control session recording programmatically from within the provider.
@@ -360,6 +364,73 @@ const track = useAnalytics({
   defaultContext: { app: 'my-app' },
 });
 ```
+
+## Feature Flags
+
+Read Temps feature flags marked **Expose to browsers**. The server evaluates
+them for the visitor (targeting rules, percentage rollouts, variants) and sends
+only the results to your own origin (`POST /api/_temps/flags`). Nothing is
+fetched until a component first reads a flag.
+
+```tsx
+import { useFlag, useFlagVariant, useFeatureFlags } from "@temps-sdk/react-analytics";
+
+function Checkout() {
+  // The fallback until flags arrive, or if the flag is unknown or of another type.
+  const newCheckout = useFlag("checkout.v2", false);
+  const pricing = useFlagVariant("pricing.page"); // "control" | "test" | null
+  const { status, reload } = useFeatureFlags();   // "idle" | "loading" | "ready" | "error"
+  return newCheckout ? <CheckoutV2 /> : <CheckoutV1 />;
+}
+```
+
+Target a signed-in user instead of the anonymous visitor, and avoid a flash of
+the wrong value by passing server-rendered values:
+
+```tsx
+<TempsAnalyticsProvider
+  flags={{
+    key: user.id,
+    attributes: { plan: user.plan },
+    bootstrap: { "checkout.v2": true },
+  }}
+>
+```
+
+or call `reload({ key: user.id })` from `useFeatureFlags()` after sign-in.
+
+When a flag has exposure recording turned on, the first read of each served
+variant on a page sends a `flag_exposure` event (`flag_key`, `variant`,
+`reason`). Flags keep working when analytics is off for localhost; only
+`disabled` turns them off.
+
+## Surveys
+
+Show in-app surveys defined in the Temps console (**Analytics → Surveys**).
+Place `<TempsSurveys />` once inside the provider; it fetches the surveys this
+visitor should see from your own origin (`POST /api/_temps/surveys`) and opens
+the built-in widget when one's page, event and once-per-visitor conditions
+are met.
+
+```tsx
+import { TempsAnalyticsProvider, TempsSurveys } from "@temps-sdk/react-analytics";
+import { usePathname } from "next/navigation";
+
+export function Providers({ children }: { children: React.ReactNode }) {
+  return (
+    <TempsAnalyticsProvider>
+      {children}
+      {/* visitorKey and attributes feed sampling and flag conditions. */}
+      <TempsSurveys pathname={usePathname()} visitorKey={user?.id} />
+    </TempsAnalyticsProvider>
+  );
+}
+```
+
+A survey with a triggering event opens when you call `trackEvent` with that
+name. Answers are recorded as `survey_shown`, `survey_dismissed` and
+`survey_sent` events, so surveys only appear where analytics is enabled (not
+on localhost unless `ignoreLocalhost={false}`).
 
 ## Session Recording
 

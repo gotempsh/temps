@@ -20,6 +20,8 @@ Browse the data inside a service (tables, collections, keys, objects) — read-o
 
 Show what a service supports and how its containers nest
 
+**Usage:** `data info <service> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -29,6 +31,8 @@ Show what a service supports and how its containers nest
 ### `data containers` (alias: `databases`)
 
 List top-level containers (databases, or buckets for S3)
+
+**Usage:** `data containers <service> [options]`
 
 **Options:**
 
@@ -40,6 +44,8 @@ List top-level containers (databases, or buckets for S3)
 ### `data tables` (alias: `entities`)
 
 List tables, collections, keys or objects in a container
+
+**Usage:** `data tables <service> [options]`
 
 **Options:**
 
@@ -53,6 +59,8 @@ List tables, collections, keys or objects in a container
 
 Show an entity's columns, types and row count
 
+**Usage:** `data schema <service> <entity> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -63,6 +71,8 @@ Show an entity's columns, types and row count
 ### `data rows` (alias: `select`)
 
 Read rows from an entity
+
+**Usage:** `data rows <service> <entity> [options]`
 
 **Options:**
 

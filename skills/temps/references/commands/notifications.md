@@ -6,7 +6,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, Webhook, etc.)
+Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 
 **Subcommands:**
 
@@ -38,7 +38,7 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-t, --type <type>` | Provider type (slack, email, webhook, telegram) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
 | `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
@@ -51,7 +51,18 @@ Add a new notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications update`
 
@@ -75,8 +86,19 @@ Update a notification provider
 | `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | No |
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
+| `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications enable`
 

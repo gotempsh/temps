@@ -1,7 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useLayoutEffect, useRef, useState, type ReactNode } from 'react'
+import {
+  useLayoutEffect,
+  useRef,
+  useState,
+  type ReactNode,
+  type RefObject,
+} from 'react'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -50,6 +56,13 @@ export interface ConfirmDeleteDialogProps {
    * confirms.
    */
   isPending?: boolean
+  /**
+   * Where focus goes when the dialog closes. Pass it when the dialog is
+   * opened from a menu item: the item is gone by then, so the control that
+   * opened the menu (the row's "More actions" button) is the place to return
+   * to. Defaults to whatever had focus when the dialog opened.
+   */
+  returnFocusRef?: RefObject<HTMLElement | null>
   onConfirm: () => void
 }
 
@@ -66,7 +79,7 @@ const UNNAMED = 'this item'
  * build when a file that fires such a mutation does not.
  */
 export function ConfirmDeleteDialog(props: ConfirmDeleteDialogProps) {
-  const { open, onOpenChange, isPending } = props
+  const { open, onOpenChange, isPending, returnFocusRef } = props
   // Callers open this from a plain button rather than an AlertDialogTrigger,
   // so Radix has no trigger to hand focus back to on close. Remember what had
   // focus before the dialog took it (layout effects run before Radix's focus
@@ -93,7 +106,10 @@ export function ConfirmDeleteDialog(props: ConfirmDeleteDialogProps) {
         className="grid-cols-[minmax(0,1fr)]"
         onCloseAutoFocus={(event) => {
           event.preventDefault()
-          if (opener.current?.isConnected) opener.current.focus()
+          const target = returnFocusRef?.current?.isConnected
+            ? returnFocusRef.current
+            : opener.current
+          if (target?.isConnected) target.focus()
         }}
       >
         <ConfirmDeleteBody {...props} />

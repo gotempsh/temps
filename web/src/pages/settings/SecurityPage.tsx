@@ -1,50 +1,35 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SaveRow } from '@temps-sdk/ds'
 import { SettingsFormSkeleton } from '@/components/settings/SettingsFormSkeleton'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
+import {
+  validateProxyRanges,
+  parseProxyRanges,
+} from '@/lib/trusted-proxy-ranges'
 import { validateLoopbackJa4Header } from '@/lib/loopback-ja4-header'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
-import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { Input } from '@/components/ui/input'
 import { Switch } from '@/components/ui/switch'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
 import { AdminGateCard } from '@/components/settings/AdminGateCard'
-import { SecuritySettings } from '@/components/settings/SecuritySettings'
+import {
+  SecuritySettings,
+  type SecuritySettingsFormData as SecurityFormData,
+} from '@/components/settings/SecuritySettings'
+import { DEFAULT_RATE_LIMITING } from '@/components/settings/rate-limiting'
 import { ShieldPlatformSettings } from '@/components/settings/ShieldPlatformSettings'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
-import { useOpenSectionFromHash } from '@/hooks/useOpenSectionFromHash'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSettingsPage, useUpdateSettings } from '@/hooks/useSettings'
-import {
-  AlertCircle,
-  LockKeyhole,
-  Loader2,
-  Network,
-  Save,
-  Shield,
-} from 'lucide-react'
+import { AlertCircle, LockKeyhole, Network, Shield } from 'lucide-react'
 import { useEffect } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
-import type {
-  SecurityHeadersSettings as SecurityHeadersType,
-  RateLimitSettings as RateLimitType,
-} from '@/api/platformSettings'
-
-interface SecurityFormData {
-  security_headers: SecurityHeadersType
-  rate_limiting: RateLimitType
-  trust_loopback_forwarded_ip: boolean
-  /** Blank means none; sent as null. */
-  loopback_ja4_header: string
-  /** One network per line; split into `trusted_private_networks` on save. */
-  trusted_private_networks_text: string
-}
-
 function parseNetworkLines(text: string): string[] {
   return text
     .split(/[\n,]/)
@@ -52,22 +37,20 @@ function parseNetworkLines(text: string): string[] {
     .filter((entry) => entry.length > 0)
 }
 
-const LINKED_SECTIONS = ['shield'] as const
-
 export function SecurityPage() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const { data: settings, isLoading, error, refetch } = useSettingsPage()
   const updateSettings = useUpdateSettings()
-  useOpenSectionFromHash(LINKED_SECTIONS, !isLoading && !error)
 
   const {
     register,
     handleSubmit,
     control,
-    formState: { errors, isDirty, isSubmitting },
+    formState: { errors, isDirty, isSubmitting, isValid, dirtyFields },
     reset,
     setValue,
   } = useForm<SecurityFormData>({
+    mode: 'onChange',
     defaultValues: {
       security_headers: {
         enabled: true,
@@ -80,19 +63,19 @@ export function SecurityPage() {
         referrer_policy: 'strict-origin-when-cross-origin',
         permissions_policy: null,
       },
-      rate_limiting: {
-        enabled: false,
-        max_requests_per_minute: 60,
-        max_requests_per_hour: 1000,
-        whitelist_ips: [],
-        blacklist_ips: [],
-      },
+      rate_limiting: DEFAULT_RATE_LIMITING,
+      expose_platform_identity: false,
       trust_loopback_forwarded_ip: false,
       loopback_ja4_header: '',
       trusted_private_networks_text: '',
+      trusted_proxy_cidrs_text: '',
     },
   })
 
+  const exposePlatformIdentity = useWatch({
+    control,
+    name: 'expose_platform_identity',
+  })
   const securityHeaders = useWatch({ control, name: 'security_headers' })
   const rateLimiting = useWatch({ control, name: 'rate_limiting' })
   const trustLoopbackForwardedIp = useWatch({
@@ -126,15 +109,13 @@ export function SecurityPage() {
             referrer_policy: 'strict-origin-when-cross-origin',
             permissions_policy: null,
           },
-          rate_limiting: settings.rate_limiting || {
-            enabled: false,
-            max_requests_per_minute: 60,
-            max_requests_per_hour: 1000,
-            whitelist_ips: [],
-            blacklist_ips: [],
-          },
+          rate_limiting: settings.rate_limiting || DEFAULT_RATE_LIMITING,
+          expose_platform_identity: settings.expose_platform_identity,
           trust_loopback_forwarded_ip: settings.trust_loopback_forwarded_ip,
           loopback_ja4_header: settings.loopback_ja4_header ?? '',
+          trusted_proxy_cidrs_text: (settings.trusted_proxy_cidrs ?? []).join(
+            '\n'
+          ),
           trusted_private_networks_text: (
             settings.trusted_private_networks ?? []
           ).join('\n'),
@@ -145,10 +126,18 @@ export function SecurityPage() {
   }, [settings, reset])
 
   const onSubmit = async (data: SecurityFormData) => {
-    const { trusted_private_networks_text, loopback_ja4_header, ...rest } = data
+    const {
+      trusted_private_networks_text,
+      trusted_proxy_cidrs_text,
+      loopback_ja4_header,
+      ...rest
+    } = data
     try {
       const saved = await updateSettings.mutateAsync({
         ...rest,
+        ...(dirtyFields.trusted_proxy_cidrs_text
+          ? { trusted_proxy_cidrs: parseProxyRanges(trusted_proxy_cidrs_text) }
+          : {}),
         loopback_ja4_header: loopback_ja4_header.trim() || null,
         trusted_private_networks: parseNetworkLines(
           trusted_private_networks_text
@@ -160,6 +149,7 @@ export function SecurityPage() {
       // the textarea ends up showing what is enforced.
       reset({
         ...data,
+        trusted_proxy_cidrs_text: (saved.trusted_proxy_cidrs ?? []).join('\n'),
         loopback_ja4_header: saved.loopback_ja4_header ?? '',
         trusted_private_networks_text: (
           saved.trusted_private_networks ?? []
@@ -186,9 +176,10 @@ export function SecurityPage() {
 
   return (
     <div className="space-y-6">
+      <PageHeader title="Security" />
       <SettingsSection
         title="Admin access gate"
-        description="Require additional verification for sensitive administrative actions"
+        description="Choose which hostnames and IP addresses can reach the console"
         icon={LockKeyhole}
       >
         <AdminGateCard />
@@ -202,7 +193,37 @@ export function SecurityPage() {
       >
         <ShieldPlatformSettings />
       </SettingsSection>
-      <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      {/* The rule a group draws above itself is dropped for the first group in
+          a container, so the form draws the one between Shield and its groups. */}
+      <form
+        onSubmit={handleSubmit(onSubmit)}
+        className="space-y-6 border-t pt-8"
+      >
+        <SettingsSection
+          id="setting-response-branding"
+          title="Response privacy"
+          icon={Shield}
+        >
+          <div className="flex items-center justify-between gap-4">
+            <Label htmlFor="expose-platform-identity">
+              Show Temps branding in responses
+            </Label>
+            <Switch
+              id="expose-platform-identity"
+              checked={exposePlatformIdentity}
+              onCheckedChange={(checked) =>
+                setValue('expose_platform_identity', checked, {
+                  shouldDirty: true,
+                })
+              }
+            />
+          </div>
+          <p className="text-sm text-muted-foreground">
+            When off, omits proxy-added branding, keeping required protocol
+            names and license notices. Existing policies for application headers
+            still apply.
+          </p>
+        </SettingsSection>
         <SettingsSection
           title="Proxy client IP"
           description="Choose when Temps trusts forwarding headers from a local reverse proxy"
@@ -231,6 +252,46 @@ export function SecurityPage() {
               analytics and IP-based controls. Changes reach proxy processes
               within a few seconds.
             </p>
+            <div
+              id="setting-trusted-proxy-cidrs"
+              className="space-y-3 scroll-mt-24"
+            >
+              <Label htmlFor="trusted-proxy-cidrs">
+                Trusted proxy addresses and CIDRs
+              </Label>
+              <Textarea
+                id="trusted-proxy-cidrs"
+                placeholder={'10.20.0.0/16\n2001:db8:1::/48'}
+                className="font-mono text-sm"
+                aria-invalid={
+                  errors.trusted_proxy_cidrs_text ? true : undefined
+                }
+                aria-describedby={
+                  errors.trusted_proxy_cidrs_text
+                    ? 'trusted-proxy-error'
+                    : undefined
+                }
+                {...register('trusted_proxy_cidrs_text', {
+                  validate: validateProxyRanges,
+                })}
+              />
+              {errors.trusted_proxy_cidrs_text && (
+                <p
+                  id="trusted-proxy-error"
+                  className="text-xs text-destructive"
+                >
+                  {errors.trusted_proxy_cidrs_text.message}
+                </p>
+              )}
+              <p className="text-sm text-muted-foreground">
+                One address or range per line, up to 64. Leave empty when
+                clients connect directly. Only list proxies you operate and
+                configure to append or overwrite X-Forwarded-For. Temps walks
+                trusted hops from right to left and ignores addresses before the
+                first untrusted hop. Changes are audited and reach every process
+                within a few seconds.
+              </p>
+            </div>
             <Label htmlFor="loopback-ja4-header">
               JA4 fingerprint header (optional)
             </Label>
@@ -258,6 +319,7 @@ export function SecurityPage() {
           </div>
         </SettingsSection>
         <SettingsSection
+          id="trusted-private-network-settings"
           title="Trusted private networks"
           description="Let webhooks, notifications, uptime checks, AI providers, self-hosted git, OIDC and importers reach services on your private network"
           icon={Network}
@@ -315,28 +377,12 @@ export function SecurityPage() {
           securityHeaders={securityHeaders}
           rateLimiting={rateLimiting}
         />
-        {isDirty && (
-          <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-            <div className="flex justify-between items-center">
-              <p className="text-sm text-muted-foreground">
-                You have unsaved changes
-              </p>
-              <Button type="submit" disabled={isSubmitting}>
-                {isSubmitting ? (
-                  <>
-                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                    Saving...
-                  </>
-                ) : (
-                  <>
-                    <Save className="mr-2 h-4 w-4" />
-                    Save Changes
-                  </>
-                )}
-              </Button>
-            </div>
-          </div>
-        )}
+        <SaveRow
+          sticky
+          dirty={isDirty}
+          saving={isSubmitting}
+          disabled={!isValid}
+        />
       </form>
     </div>
   )

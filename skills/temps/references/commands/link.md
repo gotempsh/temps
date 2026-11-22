@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Link current directory to a Temps project
 
+**Usage:** `link [project-slug] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

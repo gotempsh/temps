@@ -37,21 +37,24 @@ import {
   pluginReloadFailures,
 } from '@/lib/plugin-registry'
 import {
+  Activity,
   AlertCircle,
+  ArrowUpRight,
+  Compass,
+  GitPullRequest,
+  MoreHorizontal,
   Plus,
   Puzzle,
   RefreshCw,
   Shield,
-  MoreHorizontal,
-  ArrowUpRight,
-  GitPullRequest,
-  Trash2,
   Tag,
+  Trash2,
 } from 'lucide-react'
 import { createElement, useEffect, useState } from 'react'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { LocalFileInstall } from '@/components/plugins/LocalFileInstall'
 import { RepositoryCatalog } from '@/components/plugins/RepositoryCatalog'
 import {
   RepositoryUpdate,
@@ -72,6 +75,7 @@ export function PluginsPage() {
   const { data: plugins = [], isLoading: pluginsLoading } = usePlugins()
   const reloadPlugins = useReloadPlugins()
   const uninstallPlugin = useUninstallPlugin()
+  const [fileName, setFileName] = useState<string | null>(null)
   const [uninstallName, setUninstallName] = useState<string | null>(null)
   const [updateName, setUpdateName] = useState<string | null>(null)
   const [updatePending, setUpdatePending] = useState(false)
@@ -172,6 +176,12 @@ export function PluginsPage() {
         }}
         onSensitiveError={handleSensitiveActionError}
       />
+      <LocalFileInstall
+        open={canManagePlugins && fileName !== null}
+        expectedName={fileName ?? ''}
+        onOpenChange={() => setFileName(null)}
+        onSensitiveError={handleSensitiveActionError}
+      />
       {canManagePlugins && verificationDialog}
       <ConfirmDeleteDialog
         open={canManagePlugins && uninstallName !== null}
@@ -193,25 +203,37 @@ export function PluginsPage() {
         description="Extend Temps with tools for your deployments."
         actions={
           canManagePlugins && (
-            <Button
-              onClick={() => {
-                navigate('/settings/plugins/install')
-              }}
-              disabled={managementPending}
-            >
-              <Plus className="mr-2 size-4" /> Install from GitHub
-            </Button>
+            <div className="flex flex-wrap gap-2">
+              <Button
+                variant="outline"
+                disabled={managementPending}
+                onClick={() => setFileName('')}
+              >
+                Install from file
+              </Button>
+              <Button
+                onClick={() => {
+                  navigate('/settings/plugins/install')
+                }}
+                disabled={managementPending}
+              >
+                <Plus className="mr-2 size-4" /> Install from GitHub
+              </Button>
+            </div>
           )
         }
       />
       <Tabs value={tab} onValueChange={setTab} className="space-y-6">
         <TabsList aria-label="Plugin views">
-          <TabsTrigger value="browse">Browse</TabsTrigger>
-          <TabsTrigger value="running">
-            Running{' '}
-            <span className="ml-2 text-xs tabular-nums">
-              {pluginsLoading ? '…' : plugins.length}
-            </span>
+          <TabsTrigger value="browse" icon={Compass}>
+            Browse
+          </TabsTrigger>
+          <TabsTrigger
+            value="running"
+            icon={Activity}
+            count={pluginsLoading ? undefined : plugins.length}
+          >
+            Running
           </TabsTrigger>
         </TabsList>
         {canManagePlugins && reloadFailures.length > 0 && (
@@ -343,6 +365,7 @@ export function PluginsPage() {
                         <RepositoryUpdateButton
                           name={plugin.name}
                           onClick={() => setUpdateName(plugin.name)}
+                          onFileUpdate={() => setFileName(plugin.name)}
                           disabled={managementPending}
                         />
                       )}

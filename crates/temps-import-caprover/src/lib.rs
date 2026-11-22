@@ -29,6 +29,13 @@
 //! - `credentials.base_url` — the CapRover instance URL (e.g. `http://1.2.3.4:3000`)
 //! - `credentials.token` — the CapRover admin password
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod client;
 pub mod error;
 pub mod importer;

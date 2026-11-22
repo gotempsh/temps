@@ -6,14 +6,17 @@
 //! Downloads repository source code using git provider manager
 
 use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_git::GitProviderManagerTrait;
-use temps_logs::{LogLevel, LogService};
 
 /// Process-wide debug toggle: when set, deployment temp directories under
 /// `/tmp/temps-deployments` are left on disk instead of being removed, so an
@@ -29,6 +32,10 @@ use temps_logs::{LogLevel, LogService};
 /// in a single deployment's log.
 fn keep_deployment_temp_files() -> bool {
     static WARNED: std::sync::Once = std::sync::Once::new();
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_DEPLOYMENT_KEEP_TEMP_FILES debug toggle (docs/reference/environment-variables.md)"
+    )]
     let keep = std::env::var("TEMPS_DEPLOYMENT_KEEP_TEMP_FILES").is_ok();
     if keep {
         WARNED.call_once(|| {
@@ -441,8 +448,11 @@ impl DownloadRepoJob {
     }
 
     /// Create temporary directory for repository
-    /// Uses deployment ID + timestamp to guarantee uniqueness across concurrent deployments
-    /// and across reinstalls with reused deployment IDs
+    /// Uses deployment ID + timestamp + a random suffix. ID + timestamp alone
+    /// is not unique: two processes that share `/tmp` -- a reinstall reusing
+    /// deployment IDs, or parallel test processes that all deploy ID 1 --
+    /// can start a download in the same second and then clone into, and
+    /// remove, each other's directory.
     fn create_temp_dir(&self, context: &WorkflowContext) -> Result<PathBuf, WorkflowError> {
         use std::time::SystemTime;
 
@@ -450,10 +460,13 @@ impl DownloadRepoJob {
             .duration_since(SystemTime::UNIX_EPOCH)
             .map_err(|e| WorkflowError::Other(format!("Failed to get unix timestamp: {}", e)))?
             .as_secs();
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
 
         let temp_dir = std::path::PathBuf::from(DEPLOYMENT_TEMP_ROOT).join(format!(
-            "deployment-{}-{}",
-            context.deployment_id, unix_epoch
+            "deployment-{}-{}-{}",
+            context.deployment_id,
+            unix_epoch,
+            &nonce[..12]
         ));
         std::fs::create_dir_all(&temp_dir).map_err(WorkflowError::IoError)?;
         Ok(temp_dir)
@@ -782,8 +795,9 @@ impl DownloadRepoJob {
         // download — which can take minutes on a slow link for a large repo —
         // shows steady movement in the deployment log instead of appearing stuck.
         let archive_path = temp_dir.join("source.tar.gz");
-        let (progress_tx, mut progress_rx) =
-            tokio::sync::mpsc::unbounded_channel::<temps_git::ArchiveProgress>();
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<temps_git::ArchiveProgress>(
+            temps_git::ARCHIVE_PROGRESS_CHANNEL_CAPACITY,
+        );
         let progress_logger = {
             let log_writer = context.log_writer.clone();
             let log_id = self.log_id.clone();
@@ -1987,6 +2001,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: now,
             updated_at: now,
         }

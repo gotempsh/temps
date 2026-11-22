@@ -10,7 +10,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::{problemdetails::Problem, AuditContext, AuditOperation, RequestMetadata};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -87,8 +87,8 @@ impl AuditOperation for FeedbackTriagedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -147,7 +147,7 @@ pub async fn get_project_feedback(
     ))
 }
 
-#[utoipa::path(delete,path="/projects/{project_id}/feedback/{feedback_id}",params(("project_id"=i32,Path),("feedback_id"=i64,Path)),responses((status=204,description="Feedback permanently deleted"),(status=404,description="Feedback not found")),tag="feedback")]
+#[utoipa::path(delete,path="/projects/{project_id}/feedback/{feedback_id}",params(("project_id"=i32,Path),("feedback_id"=i64,Path)),responses((status=204,description="Feedback and its attachments permanently deleted"),(status=404,description="Feedback not found")),tag="feedback")]
 pub async fn delete_project_feedback(
     State(state): State<Arc<AppState>>,
     RequireAuth(auth): RequireAuth,
@@ -159,8 +159,7 @@ pub async fn delete_project_feedback(
     project_access_guard!(auth, project_id, state.project_access_checker);
     state
         .error_tracking_service
-        .feedback
-        .delete(project_id, feedback_id)
+        .delete_feedback(project_id, feedback_id)
         .await?;
     let audit = FeedbackTriagedAudit {
         context: AuditContext {

@@ -346,8 +346,14 @@ mod tests {
             container_name: None,
             continuous_archive_s3_source_id: pinned,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -368,6 +374,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,

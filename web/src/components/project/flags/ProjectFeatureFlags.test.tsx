@@ -113,6 +113,8 @@ test('cached flags stay visible when a refresh fails', () => {
         value_type: 'bool',
         default_value: false,
         client_visible: false,
+        variants: [],
+        exposure_sample_rate: 0,
         environments: [],
         created_at: '2026-01-01T00:00:00Z',
         updated_at: '2026-01-01T00:00:00Z',

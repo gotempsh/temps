@@ -13,7 +13,6 @@
 //! credential, so it is never recorded -- only the DSN row id, its project and
 //! its environment/deployment scope.
 
-use anyhow::Result;
 use serde::Serialize;
 pub use temps_core::AuditContext;
 use temps_core::AuditOperation;
@@ -37,9 +36,8 @@ impl AuditOperation for SentryArtifactBundleUploadedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Artifact audit serialization failed: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -62,6 +60,236 @@ pub struct SourceFilesDeletedAudit {
     pub deleted_count: u64,
 }
 
+/// Audit event for a bulk triage update on many error groups at once.
+/// Records the selection as requested and the groups that actually changed,
+/// so a filter that matched more than the caller expected is reconstructible.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupsBulkUpdatedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub action: crate::handlers::group_workflow_handler::BulkErrorGroupAction,
+    /// `error_groups.status` the action wrote.
+    pub status: String,
+    /// Explicit ids the request named, when it used them.
+    pub requested_group_ids: Option<Vec<i32>>,
+    /// Filter the request used, when it used one.
+    pub filter: Option<crate::handlers::group_workflow_handler::BulkErrorGroupFilter>,
+    /// Ignore conditions the request set, when it set any.
+    pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
+    /// Resolved in the next release.
+    pub in_next_release: bool,
+    /// Groups whose status actually changed.
+    pub updated_group_ids: Vec<i32>,
+    /// Selected groups already in the target status.
+    pub skipped: u64,
+    /// Matching groups left for a follow-up request.
+    pub remaining: u64,
+}
+
+impl AuditOperation for ErrorGroupsBulkUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUPS_BULK_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for merging error groups into one.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupsMergedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    /// The group that survived the merge.
+    pub target_group_id: i32,
+    pub merged_group_ids: Vec<i32>,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupsMergedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUPS_MERGED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for taking an error group back out of a merge.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupUnmergedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The group it had been merged into.
+    pub target_group_id: i32,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupUnmergedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_UNMERGED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for splitting fingerprints out of an error group.
+///
+/// The fingerprints themselves are hashes of a stack signature, not user
+/// data, but they are not needed to understand the change: the group ids and
+/// the number moved are.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupSplitAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The group created for the fingerprints that were moved out.
+    pub new_group_id: i32,
+    pub moved_fingerprints: u64,
+}
+
+impl AuditOperation for ErrorGroupSplitAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_SPLIT".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for assigning an error group (ADR 111, D1.6).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupAssignedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    /// The assignee before the request; `None` when unassigned.
+    pub previous: Option<crate::services::group_workflow::Assignee>,
+    /// The assignee the request set; `None` unassigns.
+    pub assignee: Option<crate::services::group_workflow::Assignee>,
+    pub changed: bool,
+}
+
+impl AuditOperation for ErrorGroupAssignedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_GROUP_ASSIGNED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for a comment on an error group (ADR 111, D1.7). Records the
+/// comment's id, never its text.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorGroupCommentAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    pub comment_id: i64,
+    /// `created`, `edited` or `deleted`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorGroupCommentAudit {
+    fn operation_type(&self) -> String {
+        format!("ERROR_GROUP_COMMENT_{}", self.action.to_ascii_uppercase())
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for a saved search over error groups (ADR 111, D1.8).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorSavedSearchAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub saved_search_id: i32,
+    pub name: String,
+    pub shared: bool,
+    /// `created`, `updated` or `deleted`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorSavedSearchAudit {
+    fn operation_type(&self) -> String {
+        format!("ERROR_SAVED_SEARCH_{}", self.action.to_ascii_uppercase())
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
 /// Audit event for a triage update on an error group (status and/or assignee).
 #[derive(Debug, Clone, Serialize)]
 pub struct ErrorGroupUpdatedAudit {
@@ -73,6 +301,10 @@ pub struct ErrorGroupUpdatedAudit {
     /// Assignee change as requested: `None` leaves it unchanged, `Some("")`
     /// clears it, any other value sets it.
     pub assigned_to: Option<String>,
+    /// Ignore conditions set with an `ignored` status.
+    pub ignore: Option<crate::handlers::group_workflow_handler::IgnoreConditionsRequest>,
+    /// Resolved in the next release.
+    pub in_next_release: bool,
 }
 
 impl AuditOperation for ErrorGroupUpdatedAudit {
@@ -92,9 +324,8 @@ impl AuditOperation for ErrorGroupUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -115,9 +346,8 @@ impl AuditOperation for SourceFileUploadedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -138,9 +368,8 @@ impl AuditOperation for SourceFilesDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -165,10 +394,9 @@ macro_rules! impl_user_audit_operation {
                 &self.context.user_agent
             }
 
-            fn serialize(&self) -> Result<String> {
-                serde_json::to_string(self).map_err(|e| {
-                    anyhow::anyhow!("Failed to serialize {} audit operation: {}", $operation, e)
-                })
+            fn serialize(&self) -> temps_core::AuditResult<String> {
+                serde_json::to_string(self)
+                    .map_err(|source| temps_core::AuditError::serialize($operation, source))
             }
         }
     };
@@ -344,12 +572,11 @@ impl AuditOperation for SentryCliReleaseAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize sentry-cli release audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("sentry-cli release for project {}", self.project_id),
+                source,
             )
         })
     }
@@ -384,12 +611,11 @@ impl AuditOperation for SentryCliReleaseFileUploadedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to serialize sentry-cli release file audit for project {}: {}",
-                self.project_id,
-                e
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("sentry-cli release file for project {}", self.project_id),
+                source,
             )
         })
     }
@@ -411,6 +637,8 @@ mod tests {
             group_id: 42,
             status: "resolved".to_string(),
             assigned_to: Some(String::new()),
+            ignore: None,
+            in_next_release: false,
         };
 
         assert_eq!(audit.operation_type(), "ERROR_GROUP_UPDATED");
@@ -640,5 +868,137 @@ mod tests {
             ["id", "type"],
             "only the credential row id is recorded"
         );
+    }
+}
+
+/// Audit event for deleting an attachment (ADR 111, D4). Identifiers and
+/// size only: the file name is what the SDK sent and may name a user.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentDeletedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub attachment_id: i64,
+    /// `error` or `feedback`.
+    pub owner_kind: String,
+    pub owner_id: i64,
+    pub size_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentDeletedAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_DELETED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for changing a project's attachment quota (ADR 111, D4).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorAttachmentQuotaAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_quota_bytes: i64,
+    pub quota_bytes: i64,
+}
+
+impl AuditOperation for ErrorAttachmentQuotaAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_ATTACHMENT_QUOTA_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Audit event for opening an issue from an error group or linking one to
+/// it (ADR 111, D5). The issue's provider, repository and number; not its
+/// title, which repeats the error message.
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorIssueLinkAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub group_id: i32,
+    pub link_id: i64,
+    /// `github`, `gitlab` or `link`.
+    pub provider: String,
+    pub repository: Option<String>,
+    pub number: Option<i64>,
+    /// `opened` (Temps opened the issue), `linked` or `unlinked`.
+    pub action: &'static str,
+}
+
+impl AuditOperation for ErrorIssueLinkAudit {
+    fn operation_type(&self) -> String {
+        match self.action {
+            "opened" => "ERROR_GROUP_ISSUE_OPENED",
+            "unlinked" => "ERROR_GROUP_ISSUE_UNLINKED",
+            _ => "ERROR_GROUP_ISSUE_LINKED",
+        }
+        .into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// One ownership rule as audited.
+#[derive(Debug, Clone, Serialize)]
+pub struct AuditedOwnershipRule {
+    pub pattern: String,
+    pub owner_user_id: i32,
+}
+
+/// Audit event for replacing a project's ownership rules (ADR 111, D5).
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorOwnershipRulesAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous: Vec<AuditedOwnershipRule>,
+    pub rules: Vec<AuditedOwnershipRule>,
+}
+
+impl AuditOperation for ErrorOwnershipRulesAudit {
+    fn operation_type(&self) -> String {
+        "ERROR_OWNERSHIP_RULES_UPDATED".into()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }

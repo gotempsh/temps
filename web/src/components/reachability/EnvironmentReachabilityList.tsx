@@ -3,7 +3,8 @@
 
 // The project Domains page's answer to "who can open this, and how?"
 // (ADR 064 D2, D3): per environment, each address with its audience, way
-// in, state, the reason and the fix, and Make it reachable.
+// in, state, the reason and the fix, a link to Make it reachable, and the
+// environment's newest setup run (ADR 069 D5).
 
 import { useQuery } from '@tanstack/react-query'
 import { ExternalLink } from 'lucide-react'
@@ -17,6 +18,7 @@ import type {
 import {
   getEnvironmentReachabilityOptions,
   getEnvironmentsOptions,
+  listReachabilityRunsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -24,9 +26,18 @@ import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { problemDetail } from '@/lib/api-problem'
-import { addressUrl, audienceLabel, wayInLabel } from '@/lib/reachability'
-import { MakeReachableDialog } from './MakeReachableDialog'
-import { useMakeReachableDialog } from './ReachabilityStatus'
+import {
+  addressAccessLabel,
+  addressUrl,
+  audienceLabel,
+} from '@/lib/reachability'
+import {
+  isEnvironmentSettled,
+  isUnfinishedRun,
+  PAGE_AUDIENCES,
+  reachabilityPath,
+  RUN_STATE_LABELS,
+} from '@/lib/reachability-page'
 
 const STATE_BADGES: Record<
   ReachState,
@@ -47,8 +58,10 @@ const STATE_BADGES: Record<
 
 export function EnvironmentReachabilityList({
   projectId,
+  projectSlug,
 }: {
   projectId: number
+  projectSlug: string
 }) {
   const environments = useQuery({
     ...getEnvironmentsOptions({ path: { project_id: projectId } }),
@@ -84,6 +97,7 @@ export function EnvironmentReachabilityList({
             <EnvironmentReachabilityCard
               key={environment.id}
               projectId={projectId}
+              projectSlug={projectSlug}
               environment={environment}
             />
           ))}
@@ -95,12 +109,22 @@ export function EnvironmentReachabilityList({
 
 function EnvironmentReachabilityCard({
   projectId,
+  projectSlug,
   environment,
 }: {
   projectId: number
+  projectSlug: string
   environment: EnvironmentResponse
 }) {
-  const dialog = useMakeReachableDialog()
+  const href = reachabilityPath(projectSlug, environment.id)
+  const runs = useQuery({
+    ...listReachabilityRunsOptions({
+      path: { project_id: projectId, environment_id: environment.id },
+    }),
+    staleTime: 30_000,
+    retry: false,
+  })
+  const newestRun = runs.data?.[0]
   const reachability = useQuery({
     ...getEnvironmentReachabilityOptions({
       path: { project_id: projectId, environment_id: environment.id },
@@ -110,6 +134,18 @@ function EnvironmentReachabilityCard({
   })
   const data = reachability.data
   const reachable = data?.state === 'reachable'
+  if (
+    data &&
+    !reachability.isError &&
+    isEnvironmentSettled(data.addresses, newestRun?.state)
+  )
+    return (
+      <SettledEnvironmentRow
+        name={environment.name}
+        addresses={data.addresses}
+        href={href}
+      />
+    )
   return (
     <div className="space-y-3 rounded-lg border p-4">
       <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
@@ -123,12 +159,10 @@ function EnvironmentReachabilityCard({
             )
           )}
         </div>
-        <Button
-          size="sm"
-          variant={reachable ? 'outline' : 'default'}
-          onClick={dialog.show}
-        >
-          {reachable ? 'Make another address reachable' : 'Make it reachable'}
+        <Button size="sm" variant={reachable ? 'outline' : 'default'} asChild>
+          <Link to={href}>
+            {reachable ? 'Make another address reachable' : 'Make it reachable'}
+          </Link>
         </Button>
       </div>
       {reachability.isError && (
@@ -150,7 +184,10 @@ function EnvironmentReachabilityCard({
             <AddressRow
               key={address.address}
               address={address}
-              onMakeReachable={dialog.show}
+              makeReachableHref={reachabilityPath(projectSlug, environment.id, {
+                address: address.address,
+                audience: PAGE_AUDIENCES.find((a) => a === address.audience),
+              })}
             />
           ))}
         </ul>
@@ -160,41 +197,92 @@ function EnvironmentReachabilityCard({
           No address yet. Make it reachable gives it one.
         </p>
       )}
-      <MakeReachableDialog
-        key={dialog.session}
-        open={dialog.open}
-        onOpenChange={dialog.onOpenChange}
-        projectId={projectId}
-        environmentId={environment.id}
-        environmentName={environment.name}
-      />
+      {newestRun && (
+        <p className="text-sm text-muted-foreground">
+          {isUnfinishedRun(newestRun.state)
+            ? 'Setup in progress'
+            : 'Last setup'}
+          : {newestRun.address ?? 'an address'} ·{' '}
+          {RUN_STATE_LABELS[newestRun.state]} ·{' '}
+          <Link
+            className="text-foreground underline"
+            to={reachabilityPath(projectSlug, environment.id, {
+              run: newestRun.id,
+            })}
+          >
+            {isUnfinishedRun(newestRun.state) ? 'Open it' : 'View it'}
+          </Link>
+        </p>
+      )}
     </div>
+  )
+}
+
+/** An environment with nothing to report: its addresses, on one line. */
+function SettledEnvironmentRow({
+  name,
+  addresses,
+  href,
+}: {
+  name: string
+  addresses: AddressReachability[]
+  href: string
+}) {
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border px-4 py-3 text-sm sm:flex-row sm:items-center sm:justify-between">
+      <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-medium">{name}</span>
+        <Badge variant={STATE_BADGES.reachable.variant}>
+          {STATE_BADGES.reachable.label}
+        </Badge>
+        {addresses.map((address) => (
+          <span
+            key={address.address}
+            className="inline-flex min-w-0 flex-wrap items-center gap-x-1.5"
+          >
+            <AddressLink address={address.address} />
+            <span className="text-xs text-muted-foreground">
+              {audienceLabel(address)}
+            </span>
+          </span>
+        ))}
+      </div>
+      <Button size="sm" variant="ghost" className="shrink-0" asChild>
+        <Link to={href}>Make another address reachable</Link>
+      </Button>
+    </div>
+  )
+}
+
+function AddressLink({ address }: { address: string }) {
+  return (
+    <a
+      href={addressUrl(address)}
+      target="_blank"
+      rel="noreferrer"
+      className="inline-flex items-center gap-1 break-all font-medium underline-offset-4 hover:underline"
+    >
+      {address}
+      <ExternalLink aria-hidden="true" className="h-3 w-3" />
+    </a>
   )
 }
 
 function AddressRow({
   address,
-  onMakeReachable,
+  makeReachableHref,
 }: {
   address: AddressReachability
-  onMakeReachable: () => void
+  makeReachableHref: string
 }) {
   const badge = STATE_BADGES[address.state]
   return (
     <li className="space-y-1 p-3 text-sm">
       <div className="flex flex-wrap items-center gap-2">
-        <a
-          href={addressUrl(address.address)}
-          target="_blank"
-          rel="noreferrer"
-          className="inline-flex items-center gap-1 break-all font-medium underline-offset-4 hover:underline"
-        >
-          {address.address}
-          <ExternalLink aria-hidden="true" className="h-3 w-3" />
-        </a>
+        <AddressLink address={address.address} />
         <Badge variant={badge.variant}>{badge.label}</Badge>
         <span className="text-xs text-muted-foreground">
-          {audienceLabel(address)} · {wayInLabel(address.way_in)}
+          {addressAccessLabel(address)}
         </span>
       </div>
       {address.state !== 'reachable' && (
@@ -203,7 +291,7 @@ function AddressRow({
       {address.action && address.state !== 'reachable' && (
         <AddressAction
           action={address.action}
-          onMakeReachable={onMakeReachable}
+          makeReachableHref={makeReachableHref}
         />
       )}
     </li>
@@ -212,20 +300,15 @@ function AddressRow({
 
 function AddressAction({
   action,
-  onMakeReachable,
+  makeReachableHref,
 }: {
   action: ReachAction
-  onMakeReachable: () => void
+  makeReachableHref: string
 }) {
   if (action.kind === 'make_reachable')
     return (
-      <Button
-        size="sm"
-        variant="link"
-        className="h-auto p-0"
-        onClick={onMakeReachable}
-      >
-        {action.label}
+      <Button size="sm" variant="link" className="h-auto p-0" asChild>
+        <Link to={makeReachableHref}>{action.label}</Link>
       </Button>
     )
   if (action.command)

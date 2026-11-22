@@ -4,15 +4,14 @@
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::secret_string::SecretString;
-use temps_core::{
-    AuditLogger, DeploymentCanceller, DeploymentContainerCleaner, ProjectEnvVarsProvider,
-};
+use temps_core::{AuditLogger, ProjectEnvVarsProvider};
 use temps_entities::deployment_config::DeploymentConfig;
 use temps_shield::ShieldMode;
 use utoipa::ToSchema;
 
 use crate::services::env_var_service::EnvVarService;
 use crate::services::environment_service::EnvironmentService;
+use crate::services::environment_teardown::EnvironmentTeardownService;
 use crate::services::secret_service::SecretService;
 
 pub struct AppState {
@@ -20,8 +19,7 @@ pub struct AppState {
     pub env_var_service: Arc<EnvVarService>,
     pub secret_service: Arc<SecretService>,
     pub audit_service: Arc<dyn AuditLogger>,
-    pub deployment_service: Arc<dyn DeploymentCanceller>,
-    pub deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
+    pub environment_teardown: Arc<EnvironmentTeardownService>,
     /// Optional on-demand waker for starting/stopping containers during wake/sleep.
     /// Only available when the proxy's OnDemandManager is registered.
     pub on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
@@ -43,8 +41,7 @@ pub fn create_environment_app_state(
     env_var_service: Arc<EnvVarService>,
     secret_service: Arc<SecretService>,
     audit_service: Arc<dyn AuditLogger>,
-    deployment_service: Arc<dyn DeploymentCanceller>,
-    deployment_container_cleaner: Arc<dyn DeploymentContainerCleaner>,
+    environment_teardown: Arc<EnvironmentTeardownService>,
     on_demand_waker: Option<Arc<dyn temps_core::OnDemandWaker>>,
     integration_env_provider: Option<Arc<dyn ProjectEnvVarsProvider>>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -56,8 +53,7 @@ pub fn create_environment_app_state(
         env_var_service,
         secret_service,
         audit_service,
-        deployment_service,
-        deployment_container_cleaner,
+        environment_teardown,
         on_demand_waker,
         integration_env_provider,
         telemetry,
@@ -122,6 +118,31 @@ pub struct EnvironmentVariableResponse {
     /// Whether the stored value is write-only. Marked secrets always have
     /// `value: None` in API responses and cannot be revealed.
     pub is_secret: bool,
+    /// Set when this regular variable's value looks like a credential and
+    /// should probably be stored as a secret. Advice only: nothing is changed
+    /// automatically. Absent for secrets and once dismissed.
+    pub secret_suggestion: Option<SecretSuggestionResponse>,
+}
+
+/// Why a regular environment variable should probably be a secret.
+#[derive(Serialize, Deserialize, ToSchema, Clone, Debug, PartialEq, Eq)]
+pub struct SecretSuggestionResponse {
+    pub reason: crate::services::secret_suggestion::SecretSuggestionReason,
+    /// One sentence for the operator, e.g. "DATABASE_URL contains a password
+    /// in its connection string".
+    pub message: String,
+}
+
+impl SecretSuggestionResponse {
+    pub fn for_variable(
+        reason: Option<crate::services::secret_suggestion::SecretSuggestionReason>,
+        key: &str,
+    ) -> Option<Self> {
+        reason.map(|reason| Self {
+            reason,
+            message: reason.message(key),
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]
@@ -198,6 +219,12 @@ pub struct EnvironmentResponse {
     /// based on last activity + idle timeout. NULL when sleeping or on-demand disabled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub estimated_sleep_at: Option<i64>,
+    /// Set when the settings can't be honoured as written: anti-affinity is on, but
+    /// there are fewer eligible nodes than replicas, so some replicas will share a
+    /// node. Deploys still go ahead. Reported when reading one environment and when
+    /// saving its settings, not in lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement_warning: Option<String>,
 }
 
 impl From<temps_entities::environments::Model> for EnvironmentResponse {
@@ -240,6 +267,7 @@ impl From<temps_entities::environments::Model> for EnvironmentResponse {
             force_https: env.force_https,
             last_activity_at,
             estimated_sleep_at,
+            placement_warning: None,
         }
     }
 }
@@ -388,6 +416,18 @@ where
     }
 }
 
+fn deserialize_load_balancing<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
+fn deserialize_optional_branch<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::deserialize(d).map(Some)
+}
+
 fn deserialize_optional_optional_shield_mode<'de, D>(
     deserializer: D,
 ) -> Result<Option<Option<ShieldMode>>, D::Error>
@@ -417,6 +457,13 @@ where
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateEnvironmentSettingsRequest {
+    /// Null restores project inheritance; an object replaces the routing policy.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_load_balancing",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub load_balancing: Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>,
     /// Deploy-time probe override. Null restores project inheritance; omitted leaves it unchanged.
     #[serde(
         default,
@@ -426,6 +473,13 @@ pub struct UpdateEnvironmentSettingsRequest {
     pub health: Option<Option<temps_core::repo_config::HealthCheckConfig>>,
     #[serde(default)]
     pub health_check_timeout_seconds: Option<i32>,
+    /// Override how long, in seconds (1-3600), this environment's previous
+    /// deployment gets to finish in-flight requests after SIGTERM, once a new
+    /// deployment is live, before it is killed. Absent leaves the current
+    /// value unchanged. Send JSON `null` to clear the override (inherit the
+    /// project value, else 10 seconds).
+    #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
+    pub stop_timeout_seconds: Option<Option<i32>>,
     /// Minimum (request) CPU in microcores. Send JSON `null` to clear (no request).
     /// Absent leaves the current value unchanged.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
@@ -442,7 +496,13 @@ pub struct UpdateEnvironmentSettingsRequest {
     /// Absent leaves the current value unchanged.
     #[serde(default, deserialize_with = "deserialize_optional_optional_i32")]
     pub memory_limit: Option<Option<i32>>,
-    pub branch: Option<String>,
+    /// Absent preserves the tracked branch; null explicitly clears it.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_branch",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub branch: Option<Option<String>>,
     pub replicas: Option<i32>,
     /// Port exposed by the container (overrides project-level port for this environment)
     ///
@@ -695,6 +755,18 @@ pub struct GetProjectSecretsQuery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_balancing_distinguishes_inheritance_reset_and_override() {
+        let absent: UpdateEnvironmentSettingsRequest = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.load_balancing, None);
+        let reset: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"load_balancing":null}"#).unwrap();
+        assert_eq!(reset.load_balancing, Some(None));
+        let explicit: UpdateEnvironmentSettingsRequest =
+            serde_json::from_str(r#"{"load_balancing":{"strategy":"round_robin"}}"#).unwrap();
+        assert_eq!(explicit.load_balancing, Some(Some(Default::default())));
+    }
 
     #[test]
     fn env_var_preview_inclusion_requires_explicit_opt_in() {

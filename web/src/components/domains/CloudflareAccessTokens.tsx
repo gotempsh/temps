@@ -71,6 +71,7 @@ import {
 } from '@/lib/cloudflare-access'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { cn } from '@/lib/utils'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 const permissionIcons = {
   present: CheckCircle2,
@@ -351,10 +352,7 @@ export function CloudflareAccessTokens({ canManage }: { canManage: boolean }) {
   const { hash } = useLocation()
   const loaded = providers.isSuccess
   useEffect(() => {
-    if (hash === '#cloudflare-access')
-      document
-        .getElementById('cloudflare-access')
-        ?.scrollIntoView({ block: 'start' })
+    if (hash === '#cloudflare-access') scrollToElementId('cloudflare-access')
   }, [hash, loaded])
   const remove = useMutation({
     ...deleteAccessProviderMutation(),
@@ -423,7 +421,7 @@ export function CloudflareAccessTokens({ canManage }: { canManage: boolean }) {
           ) : (
             <Button variant="outline" size="sm" onClick={() => setAdding(true)}>
               <Plus className="mr-2 h-4 w-4" aria-hidden="true" />
-              Add an Access token
+              Add an access token
             </Button>
           ))}
       </CardContent>

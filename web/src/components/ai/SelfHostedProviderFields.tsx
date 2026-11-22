@@ -213,7 +213,7 @@ export function SelfHostedProviderFields({
                 Lets this key reach the exact address and port in the base URL
                 (for example <code>10.0.0.5:8000</code>) without adding it to{' '}
                 <Link
-                  to="/settings/security"
+                  to="/settings/security#trusted-private-network-settings"
                   className="underline hover:text-foreground"
                 >
                   Trusted private networks

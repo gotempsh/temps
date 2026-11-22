@@ -49,10 +49,29 @@ test('plugins without a repository source show manual update status instead of a
         name="manual"
         disabled={false}
         onClick={() => {}}
+        onFileUpdate={() => {}}
       />
     </QueryClientProvider>
   )
   expect(markup).toContain('Manual update')
   expect(markup).toContain('no GitHub source')
   expect(markup).not.toContain('<button')
+})
+
+test('file-backed plugins offer an upload for updates', () => {
+  const client = new QueryClient()
+  client.setQueryData([...PLUGINS_QUERY_KEY, 'local', 'source'], {
+    source: { kind: 'local-file' },
+  })
+  const markup = renderToStaticMarkup(
+    <QueryClientProvider client={client}>
+      <RepositoryUpdateButton
+        name="local"
+        disabled={false}
+        onClick={() => {}}
+        onFileUpdate={() => {}}
+      />
+    </QueryClientProvider>
+  )
+  expect(markup).toContain('Update from file')
 })

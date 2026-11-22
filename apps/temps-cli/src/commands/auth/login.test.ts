@@ -7,6 +7,7 @@ import {
   serverBaseUrl,
   absoluteVerificationUri,
   pollForDeviceApproval,
+  resolveLoginMethod,
   retryAfterMs,
   type DeviceStartResponse,
 } from './login.js'
@@ -231,5 +232,21 @@ describe('retryAfterMs', () => {
   test('returns null for a missing or garbage header', () => {
     expect(retryAfterMs(null, 0)).toBeNull()
     expect(retryAfterMs('soon', 0)).toBeNull()
+  })
+})
+
+describe('resolveLoginMethod', () => {
+  test('uses the browser device flow when no --api-key is passed', () => {
+    expect(resolveLoginMethod({})).toBe('device')
+  })
+
+  test('uses the supplied key when --api-key has a value', () => {
+    expect(resolveLoginMethod({ apiKey: 'tk_example' })).toBe('api-key')
+  })
+
+  // A copied `--api-key "$TEMPS_API_KEY"` whose variable was never set must
+  // not quietly become a browser login that mints a different key.
+  test.each(['', '   '])('refuses an empty --api-key (%p) instead of falling back to the browser', (apiKey) => {
+    expect(() => resolveLoginMethod({ apiKey })).toThrow('--api-key was passed an empty value')
   })
 })

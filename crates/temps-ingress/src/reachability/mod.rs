@@ -13,7 +13,14 @@
 //! - [`run`] carries one out step by step, recording what it creates so
 //!   undo removes exactly that.
 //! - [`token_check`] tells which Cloudflare permissions a token has (D8).
+//! - [`edge_rules`] keeps a tunnel address on HTTPS and standard ports at
+//!   Cloudflare's edge, and [`http_check`] flags one that answers plain
+//!   HTTP (ADR 070).
+//! - [`forward_check`] asks an address behind a CDN or proxy whether Temps
+//!   is what answers there.
 //! - [`service`] gathers the facts and owns runs; [`handlers`] serves them.
+//! - [`certificate_methods`] says which ways to give one domain HTTPS work
+//!   here: a tunnel covering it, or a certificate by HTTP-01 or DNS-01.
 //! - [`gate_handlers`] is the console's half of the signed-in gate (ADR 065),
 //!   and [`gate_check`] checks that it is in front of an address (D10).
 
@@ -22,12 +29,16 @@ pub mod access_handlers;
 pub mod access_service;
 pub mod address_handlers;
 pub mod addresses;
+pub mod certificate_methods;
 pub mod compute;
+pub mod edge_rules;
 pub mod environment_address;
 pub mod environment_hosts;
+pub mod forward_check;
 pub mod gate_check;
 pub mod gate_handlers;
 pub mod handlers;
+pub mod http_check;
 pub mod model;
 pub mod plan;
 pub mod principals;

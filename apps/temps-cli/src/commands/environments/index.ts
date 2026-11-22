@@ -4,6 +4,7 @@
 import type { Command } from 'commander'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
+import * as tty from 'node:tty'
 import { requireAuth } from '../../config/store.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -26,9 +27,27 @@ import {
 import type { EnvironmentResponse, EnvironmentVariableResponse, CronInfo, CronExecutionInfo } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
-import { promptText, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
+import { promptText, promptPassword, promptConfirm, promptSelect, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, warning, keyValue, info, error as errorOutput } from '../../ui/output.js'
 import { formatMicrocores, parseMillicores } from '../../lib/cpu.js'
+import { registerEnvironmentWorkloadCommands } from './workload.js'
+import { addValueSourceOptions, resolveValueSource, valueSourceInput, type ValueSourceIO } from '../../lib/value-source.js'
+
+const SET_VAR_EXAMPLES = `
+Examples:
+  # Store a secret from a file (recommended: nothing lands in shell history)
+  $ temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt
+
+  # Pipe a secret from a password manager (\`op read -n\` omits its trailing
+  # newline; environments are picked on the terminal, or pass --environments in CI)
+  $ op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin
+
+  # A file written by an editor or echo usually ends in a newline; drop it
+  $ temps environments vars set API_TOKEN --secret --value-file ./token.txt --trim-trailing-newline
+
+  # A plain, non-secret value can still be passed inline
+  $ temps environments vars set LOG_LEVEL debug --environments production
+`
 
 export function registerEnvironmentsCommands(program: Command): void {
   const environments = program
@@ -89,14 +108,19 @@ export function registerEnvironmentsCommands(program: Command): void {
       return getEnvVar(projectSlug, key, options)
     })
 
-  vars
+  const setVar = vars
     .command('set <key> [value]')
-    .description('Set an environment variable')
+    .description(
+      'Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it'
+    )
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--preview', 'Also include in current and future preview environments')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
     .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
+  addValueSourceOptions(setVar, { what: 'the value' })
+  setVar
+    .addHelpText('after', SET_VAR_EXAMPLES)
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -176,8 +200,12 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <env>', 'Environment name or slug', 'production')
     .option('-r, --replicas <count>', 'Number of replicas to set')
+    .option('--load-balancing <json>', 'Replica routing policy as JSON; null restores project inheritance')
     .option('--json', 'Output in JSON format')
     .action(scaleCmd)
+
+  // Placement, isolation, volumes and ingress login (ADR-055)
+  registerEnvironmentWorkloadCommands(environments)
 
   // Cron jobs subcommand
   const crons = environments
@@ -569,12 +597,53 @@ async function getEnvVar(
   }
 }
 
+export interface SetEnvVarOptions {
+  environments?: string
+  preview?: boolean
+  update?: boolean
+  secret?: boolean
+  valueFile?: string
+  valueStdin?: boolean
+  trimTrailingNewline?: boolean
+}
+
+/**
+ * The value for `vars set` from its argument, `--value-file` or
+ * `--value-stdin`; `undefined` when none was given (the caller prompts).
+ */
+export async function resolveSetVarValue(
+  key: string,
+  value: string | undefined,
+  options: SetEnvVarOptions,
+  io?: ValueSourceIO
+): Promise<string | undefined> {
+  const resolved = await resolveValueSource(
+    valueSourceInput(value, options as Record<string, unknown>),
+    {
+      subject: `the value for ${key}`,
+      flags: { inline: '<value>', file: '--value-file', stdin: '--value-stdin' },
+      newlineHint: true,
+    },
+    io
+  )
+  return resolved?.value
+}
+
 async function setEnvVar(
   projectFlag: string | undefined,
   key: string,
   value: string | undefined,
-  options: { environments?: string; preview?: boolean; update?: boolean; secret?: boolean }
+  options: SetEnvVarOptions
 ): Promise<void> {
+  // Read the value before anything else, so a bad file or an empty pipe
+  // fails fast, and stdin is consumed before any prompt could want it.
+  const sourcedValue = await resolveSetVarValue(key, value, options)
+  if (sourcedValue === undefined && !process.stdin.isTTY) {
+    throw new Error(
+      `Missing the value for ${key}: pass --value-file <path>, --value-stdin, or <value> (stdin is not a terminal, so it cannot be prompted for)`
+    )
+  }
+
   await requireAuth()
   await setupClient()
 
@@ -613,11 +682,10 @@ async function setEnvVar(
   // Check if variable already exists
   const existingVar = existingVars.find(v => v.key === key)
 
-  // Get value if not provided
-  const actualValue = value ?? await promptText({
-    message: `Value for ${key}`,
-    required: true,
-  })
+  // Prompt only when no source was given; mask the input for a secret.
+  const actualValue = sourcedValue ?? (options.secret
+    ? await promptPassword({ message: `Value for ${key} (secret)` })
+    : await promptText({ message: `Value for ${key}`, required: true }))
 
   // Determine which environments to use
   let environmentIds: number[]
@@ -647,21 +715,18 @@ async function setEnvVar(
     if (existingVar && options.update) {
       environmentIds = existingVar.environments.map(e => e.id)
     } else {
-      const selected = await promptCheckbox({
-        message: 'Select environments',
-        choices,
-      })
-      environmentIds = selected
+      environmentIds = await pickEnvironments(choices)
     }
   }
 
   const projectId = await getProjectId(project)
   const includeInPreview = resolvePreviewInclusion(options.preview, options.update, existingVar?.include_in_preview)
 
+  let saved: EnvironmentVariableResponse | undefined
   if (existingVar && options.update) {
     // Update existing variable
     await withSpinner(`Updating ${key}...`, async () => {
-      const { error } = await updateEnvironmentVariable({
+      const { data, error } = await updateEnvironmentVariable({
         client,
         path: { project_id: projectId, var_id: existingVar.id },
         body: {
@@ -676,12 +741,13 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Updated ${key}${options.secret ? ' (secret)' : ''}`)
   } else {
     // Create new variable
     await withSpinner(`Setting ${key}...`, async () => {
-      const { error } = await createEnvironmentVariable({
+      const { data, error } = await createEnvironmentVariable({
         client,
         path: { project_id: projectId },
         body: {
@@ -693,14 +759,48 @@ async function setEnvVar(
         },
       })
       if (error) throw new Error(getErrorMessage(error))
+      saved = data
     })
     success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
+  }
+
+  if (saved?.secret_suggestion) {
+    warning(
+      `${saved.secret_suggestion.message}. Consider rotating it and storing it as a secret: ` +
+        `temps environments vars set ${key} --update --secret --value-file <path>`
+    )
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
   info(includeInPreview
     ? 'Current and future preview environments are also included.'
     : 'Other and future preview environments are excluded (use --preview to include them).')
+}
+
+/**
+ * The interactive environment picker. When stdin is not a terminal (the value
+ * was piped in, e.g. `op read … | temps environments vars set KEY --value-stdin`)
+ * it prompts on the controlling terminal instead; with no terminal at all it
+ * fails, since an unanswerable prompt would otherwise end the command silently.
+ */
+export async function pickEnvironments(
+  choices: Array<{ name: string; value: number }>,
+  openTerminal: () => tty.ReadStream = () => new tty.ReadStream(fs.openSync('/dev/tty', 'r'))
+): Promise<number[]> {
+  if (process.stdin.isTTY) return promptCheckbox({ message: 'Select environments', choices })
+  let input: tty.ReadStream
+  try {
+    input = openTerminal()
+  } catch {
+    throw new Error(
+      'stdin is not a terminal, so the environments cannot be picked interactively: pass --environments <names>'
+    )
+  }
+  try {
+    return await promptCheckbox({ message: 'Select environments', choices }, { input, output: process.stderr })
+  } finally {
+    input.destroy()
+  }
 }
 
 export function resolvePreviewInclusion(
@@ -1068,7 +1168,7 @@ async function exportEnvVars(
   if (failed.length > 0) {
     errorOutput(
       `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
-        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'Reading plaintext needs the secrets:read or environments:write permission. Nothing was written — ' +
         'a partial export would silently blank these variables.'
     )
     // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
@@ -1585,8 +1685,20 @@ export function parseReplicaCount(
 }
 
 async function scaleCmd(
-  options: { project?: string; environment: string; replicas?: string; json?: boolean }
+  options: { project?: string; environment: string; replicas?: string; loadBalancing?: string; json?: boolean }
 ): Promise<void> {
+  let routing: NonNullable<Parameters<typeof updateEnvironmentSettings>[0]>['body'] = {}
+  if (options.loadBalancing !== undefined) {
+    try {
+      const parsed = JSON.parse(options.loadBalancing)
+      if (parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) throw new Error('Expected a policy object or null')
+      routing = { load_balancing: parsed }
+    } catch {
+      errorOutput('Invalid --load-balancing JSON: expected a policy object or null')
+      process.exitCode = 1
+      return
+    }
+  }
   // Validate before any network call so a bad count fails fast and non-zero.
   const parsedReplicas = options.replicas !== undefined ? parseReplicaCount(options.replicas) : undefined
   if (parsedReplicas && 'error' in parsedReplicas) {
@@ -1627,18 +1739,18 @@ async function scaleCmd(
     return
   }
 
-  if (parsedReplicas) {
+  if (parsedReplicas || options.loadBalancing !== undefined) {
     // Set replicas
-    const replicaCount = parsedReplicas.replicas
-    if (parsedReplicas.warning) {
+    const replicaCount = parsedReplicas?.replicas
+    if (parsedReplicas?.warning) {
       warning(parsedReplicas.warning)
     }
 
-    const updatedEnv = await withSpinner(`Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {
+    const updatedEnv = await withSpinner(options.loadBalancing !== undefined ? 'Updating replica routing...' : `Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {
       const { data, error } = await updateEnvironmentSettings({
         client,
         path: { project_id: projectId, env_id: targetEnv.id },
-        body: { replicas: replicaCount },
+        body: { ...routing, ...(replicaCount !== undefined ? { replicas: replicaCount } : {}) },
       })
       if (error) throw new Error(getErrorMessage(error))
       return data
@@ -1648,14 +1760,15 @@ async function scaleCmd(
       json({
         environment: updatedEnv?.slug,
         replicas: updatedEnv?.deployment_config?.replicas ?? 1,
+        load_balancing: updatedEnv?.deployment_config?.loadBalancing ?? null,
       })
       return
     }
 
     newline()
-    success(`Scaled ${resolved.slug}/${environment} to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}`)
+    success(options.loadBalancing !== undefined ? `Updated routing for ${resolved.slug}/${environment}` : `Scaled ${resolved.slug}/${environment} to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}`)
     newline()
-    info(`Note: Scaling takes effect on the next deployment or restart`)
+    info(options.loadBalancing !== undefined ? 'Routing changes apply on the next route-table refresh.' : 'Note: Scaling takes effect on the next deployment or restart')
   } else {
     // Display current replicas
     const currentReplicas = targetEnv.deployment_config?.replicas ?? 1
@@ -1664,6 +1777,7 @@ async function scaleCmd(
       json({
         environment: targetEnv.slug,
         replicas: currentReplicas,
+        load_balancing: targetEnv.deployment_config?.loadBalancing ?? null,
       })
       return
     }

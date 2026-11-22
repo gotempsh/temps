@@ -23,8 +23,9 @@ use sea_orm::{
 
 use temps_entities::metric_alert_rules::{ActiveModel, Column, Entity, Model};
 
-use crate::detectors::DetectionConfig;
+use crate::detectors::{Comparator, DetectionConfig};
 use crate::error::OtelError;
+use temps_core::log_series::{LOG_ALERT_COUNT_CAP, LOG_ALERT_MAX_WINDOW_SECS};
 
 /// Metric alert rules one project may create through the API (#1210). Each
 /// rule is a recurring query against the metrics store, so the count is a
@@ -63,6 +64,72 @@ pub const ALLOWED_SEVERITIES: &[&str] = &["info", "warning", "critical"];
 
 const MAX_NAME_LEN: usize = 200;
 pub const MAX_METRIC_NAME_LEN: usize = 256;
+
+/// The series name a log alert reports (ADR 108 D1). A log rule is not
+/// defined on an OTel metric, but every notification, alarm payload and
+/// chart axis expects a series name, so it gets one that says what it is.
+/// Set by this service, never by the caller.
+pub const LOG_ALERT_METRIC_NAME: &str = "logs.matched_lines";
+
+/// The only aggregation a log alert can have: a window's matching lines are
+/// counted, never averaged.
+pub const LOG_ALERT_AGGREGATION: &str = "count";
+
+/// What series a rule is evaluated on (ADR 108 D1).
+///
+/// A log rule carries its saved search in the same value, so "a log alert
+/// with nothing to count" cannot be constructed.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    utoipa::ToSchema,
+)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AlertSeriesSource {
+    /// The OTel metric the rule names. Every rule before ADR 108.
+    #[default]
+    Metric,
+    /// The number of log lines matching a saved search per window.
+    Logs {
+        /// `log_saved_searches.id`, in the rule's own project.
+        saved_search_id: i32,
+    },
+}
+
+impl AlertSeriesSource {
+    /// The stored `metric_alert_rules.source` discriminator.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metric => "metric",
+            Self::Logs { .. } => "logs",
+        }
+    }
+
+    /// Rebuild the source from a stored row's two columns. An unknown
+    /// discriminator, or `logs` with no saved search, reads as `None` so the
+    /// evaluator can skip the rule loudly instead of evaluating the wrong
+    /// series.
+    pub fn from_columns(source: &str, saved_search_id: Option<i32>) -> Option<Self> {
+        match (source, saved_search_id) {
+            ("metric", _) => Some(Self::Metric),
+            ("logs", Some(saved_search_id)) => Some(Self::Logs { saved_search_id }),
+            _ => None,
+        }
+    }
+
+    pub fn saved_search_id(self) -> Option<i32> {
+        match self {
+            Self::Metric => None,
+            Self::Logs { saved_search_id } => Some(saved_search_id),
+        }
+    }
+}
 
 /// Validate `label_filters` pairs: at most [`MAX_LABEL_FILTERS`] pairs, each
 /// key passing the OTel metric-name character allowlist `[a-zA-Z0-9_.:-]`, each
@@ -118,6 +185,130 @@ pub fn validate_group_by(group_by: &[String]) -> Result<(), OtelError> {
     Ok(())
 }
 
+/// Validate the parts of a log alert that differ from a metric alert
+/// (ADR 108 D1).
+///
+/// Deliberately narrow in this phase. A log alert counts lines in one
+/// bounded window and compares the count against a threshold:
+///
+/// - **Static detectors only.** An anomaly band is built from the metrics
+///   store's history, which holds no log counts, so an anomaly log rule
+///   would score against a baseline that does not exist.
+/// - **No breakdowns.** Splitting a line count into per-label series needs
+///   a grouped count the saved search does not express yet.
+/// - **A bounded window.** Counting walks the log store, so the window is
+///   capped rather than left to reach back arbitrarily on a small host.
+/// - **A reachable threshold.** Counting stops at
+///   [`LOG_ALERT_COUNT_CAP`] and reports a lower bound, so a
+///   "more than the cap" rule could never fire and is refused instead of
+///   silently never alerting.
+fn validate_log_rule(
+    aggregation: &str,
+    window_secs: i32,
+    detection_config: &DetectionConfig,
+    label_filters: &[(String, String)],
+    group_by: &[String],
+    dynamic_alerts: bool,
+) -> Result<(), OtelError> {
+    // Stored and returned but never applied, a label filter would make the
+    // rule look narrower than what it counts.
+    if !label_filters.is_empty() {
+        return Err(OtelError::Validation {
+            message: "A log alert counts what its saved search matches, so it takes no \
+                      label_filters; put the filter in the saved search instead"
+                .to_string(),
+        });
+    }
+    if aggregation.trim().to_ascii_lowercase() != LOG_ALERT_AGGREGATION {
+        return Err(OtelError::Validation {
+            message: format!(
+                "A log alert counts matching lines, so its aggregation must be \
+                 '{LOG_ALERT_AGGREGATION}' (got '{aggregation}')"
+            ),
+        });
+    }
+    if window_secs > LOG_ALERT_MAX_WINDOW_SECS {
+        return Err(OtelError::Validation {
+            message: format!(
+                "A log alert's window must be at most {LOG_ALERT_MAX_WINDOW_SECS} seconds \
+                 (got {window_secs}); counting lines reads the log store, so the window is \
+                 bounded"
+            ),
+        });
+    }
+    if !group_by.is_empty() || dynamic_alerts {
+        return Err(OtelError::Validation {
+            message: "A log alert counts one series, so it takes no group_by keys and no \
+                      per-series alerting"
+                .to_string(),
+        });
+    }
+    match detection_config {
+        DetectionConfig::Static(params) => {
+            if !params.threshold.is_finite() || params.threshold < 0.0 {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "A log alert's threshold is a number of lines, so it must be finite \
+                         and not negative (got {})",
+                        params.threshold
+                    ),
+                });
+            }
+            let cap = LOG_ALERT_COUNT_CAP as f64;
+            if matches!(params.comparator, Comparator::Gt | Comparator::Gte)
+                && params.threshold >= cap
+            {
+                return Err(OtelError::Validation {
+                    message: format!(
+                        "A log alert counts at most {LOG_ALERT_COUNT_CAP} lines per window, so \
+                         a threshold of {} lines could never be exceeded. Use a shorter window \
+                         or a lower threshold",
+                        params.threshold
+                    ),
+                });
+            }
+            Ok(())
+        }
+        other => Err(OtelError::Validation {
+            message: format!(
+                "A log alert compares a line count against a threshold, so it needs a static \
+                 detector, not '{}'",
+                other.kind_str()
+            ),
+        }),
+    }
+}
+
+/// The result of [`MetricAlertService::update`].
+#[derive(Debug, Clone)]
+pub struct RuleUpdate {
+    pub model: Model,
+    /// The rule now watches a different series (source or saved search):
+    /// its stored state was reset, and the caller must resolve the alarms
+    /// the previous series left open.
+    pub series_changed: bool,
+}
+
+/// The series name and aggregation a rule is stored with.
+///
+/// A metric rule keeps what the caller sent. A log rule gets
+/// [`LOG_ALERT_METRIC_NAME`] and [`LOG_ALERT_AGGREGATION`], so a log alert
+/// is never labelled with a metric that does not exist and never claims to
+/// average anything.
+fn normalize_series(
+    series_source: AlertSeriesSource,
+    metric_name: String,
+    aggregation: String,
+) -> (String, String) {
+    match series_source {
+        AlertSeriesSource::Metric => (metric_name, aggregation),
+        AlertSeriesSource::Logs { .. } => (
+            LOG_ALERT_METRIC_NAME.to_string(),
+            LOG_ALERT_AGGREGATION.to_string(),
+        ),
+    }
+}
+
 /// Validate the cross-cutting rule fields against the allowlists and sane bounds,
 /// then delegate detector-specific validation to the typed [`DetectionConfig`].
 ///
@@ -137,6 +328,7 @@ fn validate_rule(
     dynamic_alerts: bool,
     max_series: i32,
     grouped_notification_threshold: i32,
+    series_source: AlertSeriesSource,
 ) -> Result<(), OtelError> {
     let trimmed_name = name.trim();
     if trimmed_name.is_empty() {
@@ -149,31 +341,47 @@ fn validate_rule(
             message: format!("Alert rule name exceeds {MAX_NAME_LEN} characters"),
         });
     }
+    // A log rule has no metric: its series is the count of lines matching a
+    // saved search, and this service names it (`LOG_ALERT_METRIC_NAME`), so
+    // a caller cannot label a log alert with a misleading metric.
+    let is_log_rule = matches!(series_source, AlertSeriesSource::Logs { .. });
     let trimmed_metric = metric_name.trim();
-    if trimmed_metric.is_empty() {
+    if is_log_rule {
+        validate_log_rule(
+            aggregation,
+            window_secs,
+            detection_config,
+            label_filters,
+            group_by,
+            dynamic_alerts,
+        )?;
+    } else if trimmed_metric.is_empty() {
         return Err(OtelError::Validation {
-            message: "Alert rule metric_name cannot be empty".to_string(),
+            message: "Alert rule metric_name cannot be empty (required unless the rule's source is a saved log search)"
+                .to_string(),
         });
     }
-    if trimmed_metric.len() > MAX_METRIC_NAME_LEN {
-        return Err(OtelError::Validation {
-            message: format!("Alert rule metric_name exceeds {MAX_METRIC_NAME_LEN} characters"),
-        });
-    }
-    // Same allowlist the label-filter and group_by keys already use. Length
-    // alone was not enough: `metric_name` is interpolated into the alert
-    // summary prompt (`purpose: alert.summary`), and when the configured
-    // summary provider is an agent CLI that prompt is handed to a host
-    // process. A metric name is a machine identifier, so restricting it to
-    // `[a-zA-Z0-9_.:-]` costs nothing and removes the injection surface
-    // (newlines, quotes and instruction-shaped prose can no longer appear).
-    if temps_metrics::validate_metric_name(trimmed_metric).is_err() {
-        return Err(OtelError::Validation {
-            message: format!(
-                "Alert rule metric_name '{trimmed_metric}' contains characters outside the \
+    if !is_log_rule {
+        if trimmed_metric.len() > MAX_METRIC_NAME_LEN {
+            return Err(OtelError::Validation {
+                message: format!("Alert rule metric_name exceeds {MAX_METRIC_NAME_LEN} characters"),
+            });
+        }
+        // Same allowlist the label-filter and group_by keys already use. Length
+        // alone was not enough: `metric_name` is interpolated into the alert
+        // summary prompt (`purpose: alert.summary`), and when the configured
+        // summary provider is an agent CLI that prompt is handed to a host
+        // process. A metric name is a machine identifier, so restricting it to
+        // `[a-zA-Z0-9_.:-]` costs nothing and removes the injection surface
+        // (newlines, quotes and instruction-shaped prose can no longer appear).
+        if temps_metrics::validate_metric_name(trimmed_metric).is_err() {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Alert rule metric_name '{trimmed_metric}' contains characters outside the \
                  allowed set [a-zA-Z0-9_.:-]"
-            ),
-        });
+                ),
+            });
+        }
     }
     let agg = aggregation.trim().to_ascii_lowercase();
     if !ALLOWED_AGGREGATIONS.contains(&agg.as_str()) {
@@ -257,6 +465,38 @@ impl MetricAlertService {
         Self { db }
     }
 
+    /// A log rule may only count a saved search of its own project.
+    ///
+    /// The evaluator's lookup is project-scoped too, so a foreign id could
+    /// never read another project's lines; this refuses it at write time
+    /// instead of storing a rule that silently never evaluates.
+    ///
+    /// It runs on `conn`, so `update` reuses the connection its transaction
+    /// already holds instead of taking a second one from the pool.
+    async fn ensure_saved_search_in_project<C: sea_orm::ConnectionTrait>(
+        conn: &C,
+        project_id: i32,
+        source: AlertSeriesSource,
+    ) -> Result<(), OtelError> {
+        use temps_entities::log_saved_searches;
+        let Some(saved_search_id) = source.saved_search_id() else {
+            return Ok(());
+        };
+        let found = log_saved_searches::Entity::find_by_id(saved_search_id)
+            .filter(log_saved_searches::Column::ProjectId.eq(project_id))
+            .count(conn)
+            .await?;
+        if found == 0 {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Saved log search {saved_search_id} not found in project {project_id}; a log \
+                     alert can only count a saved search of its own project"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// List rules for a project, newest first, paginated.
     ///
     /// Returns `(items, total)` where `total` is the unpaginated count.
@@ -273,7 +513,9 @@ impl MetricAlertService {
             .order_by_desc(Column::CreatedAt)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok((items, total))
     }
 
@@ -296,7 +538,11 @@ impl MetricAlertService {
         dynamic_alerts: bool,
         max_series: i32,
         grouped_notification_threshold: i32,
+        series_source: AlertSeriesSource,
     ) -> Result<Model, OtelError> {
+        // A log rule's series name and aggregation are ours to set, not the
+        // caller's: there is no metric behind them.
+        let (metric_name, aggregation) = normalize_series(series_source, metric_name, aggregation);
         validate_rule(
             &name,
             &metric_name,
@@ -310,13 +556,17 @@ impl MetricAlertService {
             dynamic_alerts,
             max_series,
             grouped_notification_threshold,
+            series_source,
         )?;
+        Self::ensure_saved_search_in_project(self.db.as_ref(), project_id, series_source).await?;
 
         let model = ActiveModel {
             project_id: Set(project_id),
             name: Set(name.trim().to_string()),
             metric_name: Set(metric_name.trim().to_string()),
             aggregation: Set(aggregation.trim().to_ascii_lowercase()),
+            source: Set(series_source.as_str().to_string()),
+            saved_search_id: Set(series_source.saved_search_id()),
             detection_kind: Set(detection_config.kind_str().to_string()),
             detection_config: Set(detection_config.to_value()?),
             window_secs: Set(window_secs),
@@ -394,9 +644,21 @@ impl MetricAlertService {
         dynamic_alerts: Option<bool>,
         max_series: Option<i32>,
         grouped_notification_threshold: Option<i32>,
-    ) -> Result<Model, OtelError> {
-        // Ensure the row exists AND belongs to the project (typed 404 otherwise).
-        let existing = self.get(project_id, id).await?;
+        series_source: Option<AlertSeriesSource>,
+    ) -> Result<RuleUpdate, OtelError> {
+        // Read, validate and write under a lock on the row, so a concurrent
+        // update reads this one's result instead of writing back the values
+        // it read before (a severity-only edit must not undo a source change).
+        let txn = self.db.begin().await?;
+        let Some(existing) = Entity::find_by_id(id)
+            .filter(Column::ProjectId.eq(project_id))
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+        else {
+            txn.rollback().await?;
+            return Err(OtelError::MetricAlertNotFound { rule_id: id });
+        };
 
         // Validate the merged effective field set so partial updates can't leave
         // the row in an un-evaluable state. A detector is replaced wholesale: the
@@ -429,6 +691,41 @@ impl MetricAlertService {
         let eff_max_series = max_series.unwrap_or(existing.max_series);
         let eff_grouped_threshold =
             grouped_notification_threshold.unwrap_or(existing.grouped_notification_threshold);
+        // An unreadable stored source (a `logs` row whose saved search id
+        // went missing) is refused rather than silently re-validated as a
+        // metric rule, which would let an update "fix" it into a rule that
+        // watches a metric nobody asked for.
+        let eff_source = match series_source {
+            Some(source) => source,
+            None => AlertSeriesSource::from_columns(&existing.source, existing.saved_search_id)
+                .ok_or_else(|| OtelError::Validation {
+                    message: format!(
+                        "Alert rule {id} has source '{}' with saved_search_id {:?}, which is not \
+                         a series this binary can evaluate; set the source explicitly to repair it",
+                        existing.source, existing.saved_search_id
+                    ),
+                })?,
+        };
+        // A log rule's stored metric name is the placeholder this service
+        // gives it. Becoming a metric rule must name the metric to watch, or
+        // the rule would quietly query that placeholder.
+        let was_log_rule = existing.saved_search_id.is_some() || existing.source == "logs";
+        if was_log_rule
+            && matches!(eff_source, AlertSeriesSource::Metric)
+            && metric_name
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            txn.rollback().await?;
+            return Err(OtelError::Validation {
+                message: format!(
+                    "Alert rule {id} counts a saved log search; switching it to a metric needs                      metric_name (and aggregation) for the metric to watch"
+                ),
+            });
+        }
+        let (eff_metric, eff_agg) = normalize_series(eff_source, eff_metric, eff_agg);
         validate_rule(
             &eff_name,
             &eff_metric,
@@ -442,18 +739,37 @@ impl MetricAlertService {
             eff_dynamic,
             eff_max_series,
             eff_grouped_threshold,
+            eff_source,
         )?;
+        if series_source.is_some() {
+            Self::ensure_saved_search_in_project(&txn, project_id, eff_source).await?;
+        }
 
+        // A rule that now watches a different series (another source or
+        // saved search) starts from a clean state: the previous series' verdict
+        // and per-series snapshot say nothing about the new one. The caller
+        // resolves the alarms the old series left open.
+        let series_changed = existing.source != eff_source.as_str()
+            || existing.saved_search_id != eff_source.saved_search_id();
         let mut active: ActiveModel = existing.into();
+        if series_changed {
+            active.last_state = Set("ok".to_string());
+            active.last_value = Set(None);
+            active.series_states = Set(serde_json::json!({}));
+            active.last_dropped_series_count = Set(0);
+        }
+        // The source is set from the merged value either way: a rule that
+        // becomes a log rule must get its saved search, and one that becomes
+        // a metric rule must lose it, or the two columns disagree.
+        active.source = Set(eff_source.as_str().to_string());
+        active.saved_search_id = Set(eff_source.saved_search_id());
+        active.metric_name = Set(eff_metric.trim().to_string());
+        active.aggregation = Set(eff_agg.trim().to_ascii_lowercase());
         if let Some(n) = name {
             active.name = Set(n.trim().to_string());
         }
-        if let Some(m) = metric_name {
-            active.metric_name = Set(m.trim().to_string());
-        }
-        if let Some(a) = aggregation {
-            active.aggregation = Set(a.trim().to_ascii_lowercase());
-        }
+        // `metric_name` and `aggregation` were applied above through the
+        // merged values, which a log rule overrides with its own series.
         if let Some(c) = detection_config {
             active.detection_kind = Set(c.kind_str().to_string());
             active.detection_config = Set(c.to_value()?);
@@ -485,8 +801,69 @@ impl MetricAlertService {
         if let Some(gt) = grouped_notification_threshold {
             active.grouped_notification_threshold = Set(gt);
         }
-        let model = active.update(self.db.as_ref()).await?;
-        Ok(model)
+        let model = active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(RuleUpdate {
+            model,
+            series_changed,
+        })
+    }
+
+    /// Whether `evaluated` is still the rule's current configuration: the
+    /// row exists and its `config_revision` is the one the evaluation read.
+    /// Asked just before an alarm is opened, so an edit made while the
+    /// series was being read does not page anyone with the old verdict.
+    pub async fn is_current(&self, evaluated: &Model) -> Result<bool, OtelError> {
+        let found = Entity::find_by_id(evaluated.id)
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
+            .count(self.db.as_ref())
+            .await?;
+        Ok(found > 0)
+    }
+
+    /// Persist an evaluation only while the rule still has the configuration
+    /// the evaluation read: the same `config_revision` (bumped by any edit
+    /// that changes a verdict, a threshold included) and the same series.
+    /// Returns `false` when the rule changed underneath the tick, so its
+    /// result is stale and must not be written over the newer
+    /// configuration's state.
+    pub async fn persist_evaluation_if_current(
+        &self,
+        evaluated: &Model,
+        last_state: &str,
+        last_value: Option<f64>,
+        last_evaluated_at: DateTime<Utc>,
+    ) -> Result<bool, OtelError> {
+        let saved_search = match evaluated.saved_search_id {
+            Some(id) => Column::SavedSearchId.eq(id),
+            None => Column::SavedSearchId.is_null(),
+        };
+        let result = Entity::update_many()
+            .col_expr(
+                Column::LastState,
+                sea_orm::sea_query::Expr::value(last_state),
+            )
+            .col_expr(
+                Column::LastValue,
+                sea_orm::sea_query::Expr::value(last_value),
+            )
+            .col_expr(
+                Column::LastEvaluatedAt,
+                sea_orm::sea_query::Expr::value(last_evaluated_at),
+            )
+            .col_expr(
+                Column::UpdatedAt,
+                sea_orm::sea_query::Expr::value(Utc::now()),
+            )
+            .filter(Column::Id.eq(evaluated.id))
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
+            .filter(Column::Source.eq(evaluated.source.clone()))
+            .filter(saved_search)
+            .filter(Column::MetricName.eq(evaluated.metric_name.clone()))
+            .filter(Column::Aggregation.eq(evaluated.aggregation.clone()))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 
     /// Delete a rule (scoped to `project_id`). Returns
@@ -537,33 +914,45 @@ impl MetricAlertService {
     }
 
     /// Persist a DYNAMIC (per-series) rule's evaluation: the aggregate-view columns
-    /// (`last_state`/`last_value`/`last_evaluated_at`, exactly as
-    /// [`Self::persist_evaluation`]) PLUS the full per-series snapshot
+    /// (`last_state`/`last_value`/`last_evaluated_at`, as
+    /// [`Self::persist_evaluation_if_current`]) PLUS the full per-series snapshot
     /// (`series_states`) and the latest tick's cardinality-cap drop count
     /// (`last_dropped_series_count`). The static/aggregate path keeps using the
-    /// narrower `persist_evaluation`, so those two columns stay at their DB
-    /// defaults (`{}` / `0`) for non-dynamic rules.
-    pub async fn persist_dynamic_evaluation(
+    /// narrower write, so those two columns stay at their DB defaults (`{}` /
+    /// `0`) for non-dynamic rules.
+    ///
+    /// Written only while the rule's `config_revision` is the one the tick
+    /// read; returns `false` otherwise, so a tick that read the old
+    /// configuration never overwrites the state an edit reset.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one guarded UPDATE of the rule row; each argument is a column it writes"
+    )]
+    pub async fn persist_dynamic_evaluation_if_current(
         &self,
-        id: i32,
+        evaluated: &Model,
         last_state: &str,
         last_value: Option<f64>,
         last_evaluated_at: DateTime<Utc>,
         series_states: serde_json::Value,
         dropped_series_count: i32,
-    ) -> Result<(), OtelError> {
-        let existing = Entity::find_by_id(id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(OtelError::MetricAlertNotFound { rule_id: id })?;
-        let mut active: ActiveModel = existing.into();
-        active.last_state = Set(last_state.to_string());
-        active.last_value = Set(last_value);
-        active.last_evaluated_at = Set(Some(last_evaluated_at));
-        active.series_states = Set(series_states);
-        active.last_dropped_series_count = Set(dropped_series_count);
-        active.update(self.db.as_ref()).await?;
-        Ok(())
+    ) -> Result<bool, OtelError> {
+        use sea_orm::sea_query::Expr;
+        let result = Entity::update_many()
+            .col_expr(Column::LastState, Expr::value(last_state))
+            .col_expr(Column::LastValue, Expr::value(last_value))
+            .col_expr(Column::LastEvaluatedAt, Expr::value(last_evaluated_at))
+            .col_expr(Column::SeriesStates, Expr::value(series_states))
+            .col_expr(
+                Column::LastDroppedSeriesCount,
+                Expr::value(dropped_series_count),
+            )
+            .col_expr(Column::UpdatedAt, Expr::value(Utc::now()))
+            .filter(Column::Id.eq(evaluated.id))
+            .filter(Column::ConfigRevision.eq(evaluated.config_revision))
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(result.rows_affected > 0)
     }
 }
 
@@ -617,7 +1006,10 @@ mod tests {
             last_value: None,
             series_states: serde_json::json!({}),
             last_dropped_series_count: 0,
+            config_revision: 0,
             last_evaluated_at: None,
+            source: "metric".to_string(),
+            saved_search_id: None,
             created_at: now,
             updated_at: now,
         }
@@ -655,6 +1047,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await
     }
@@ -664,7 +1057,7 @@ mod tests {
     /// and reports a missing project as not found.
     #[tokio::test]
     async fn create_persists_and_stops_at_the_per_project_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
@@ -746,6 +1139,92 @@ mod tests {
         );
     }
 
+    /// An operator may run with one database connection. Switching a rule to
+    /// a saved search checks the search inside the update's transaction, on
+    /// the connection it already holds, instead of waiting for a second one.
+    #[tokio::test]
+    async fn switching_to_a_saved_search_works_on_a_single_connection_pool() {
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping single-pool metric alert test: {error}");
+                return;
+            }
+            Err(error) => panic!("single-pool metric alert test database setup failed: {error}"),
+        };
+        let mut options = sea_orm::ConnectOptions::new(test_db.database_url.clone());
+        options
+            .max_connections(1)
+            .min_connections(1)
+            .acquire_timeout(std::time::Duration::from_secs(5));
+        let single = Arc::new(
+            sea_orm::Database::connect(options)
+                .await
+                .expect("single-connection pool"),
+        );
+        let now = chrono::Utc::now();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Single pool".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            slug: Set(format!("single-pool-{}", uuid::Uuid::new_v4())),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(single.as_ref())
+        .await
+        .expect("insert project");
+        let search = temps_entities::log_saved_searches::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Errors".to_string()),
+            query: Set(serde_json::json!({})),
+            time_range: Set("1h".to_string()),
+            pinned: Set(false),
+            ..Default::default()
+        }
+        .insert(single.as_ref())
+        .await
+        .expect("insert saved search");
+        let service = MetricAlertService::new(single);
+        let rule = create_rule(&service, project.id, "Latency")
+            .await
+            .expect("metric rule");
+
+        let update = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            service.update(
+                project.id,
+                rule.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(AlertSeriesSource::Logs {
+                    saved_search_id: search.id,
+                }),
+            ),
+        )
+        .await
+        .expect("the update finishes")
+        .expect("the rule switches to the saved search");
+        assert!(update.series_changed);
+        assert_eq!(update.model.saved_search_id, Some(search.id));
+    }
+
     #[tokio::test]
     async fn test_create_empty_name_validation() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
@@ -767,6 +1246,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -793,6 +1273,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -826,6 +1307,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -852,6 +1334,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -883,6 +1366,7 @@ mod tests {
                 7,
                 999,
                 Some("New Name".to_string()),
+                None,
                 None,
                 None,
                 None,
@@ -999,6 +1483,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1025,6 +1510,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1052,6 +1538,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1083,6 +1570,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1109,6 +1597,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1135,6 +1624,7 @@ mod tests {
                 false,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1162,6 +1652,7 @@ mod tests {
                 true,
                 0,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(too_low.unwrap_err(), OtelError::Validation { .. }));
@@ -1183,6 +1674,7 @@ mod tests {
                 true,
                 101,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(
@@ -1218,6 +1710,7 @@ mod tests {
                 true,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1250,6 +1743,7 @@ mod tests {
                 true,
                 20,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(result.unwrap_err(), OtelError::Validation { .. }));
@@ -1278,6 +1772,7 @@ mod tests {
                 true,
                 50,
                 5,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1307,6 +1802,7 @@ mod tests {
                 true,
                 20,
                 250,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert_passes_validation(result);
@@ -1334,6 +1830,7 @@ mod tests {
                 true,
                 20,
                 0,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(too_low.unwrap_err(), OtelError::Validation { .. }));
@@ -1355,6 +1852,7 @@ mod tests {
                 true,
                 20,
                 1001,
+                AlertSeriesSource::Metric,
             )
             .await;
         assert!(matches!(
@@ -1365,27 +1863,472 @@ mod tests {
 
     #[tokio::test]
     async fn test_persist_dynamic_evaluation() {
-        let db = MockDatabase::new(DatabaseBackend::Postgres)
-            // get-by-id load, then the update returns the row again
-            .append_query_results(vec![vec![sample_model(1)]])
-            .append_query_results(vec![vec![sample_model(1)]])
-            .into_connection();
-        let service = MetricAlertService::new(Arc::new(db));
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 0,
+                    },
+                ])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
 
         let series_states = serde_json::json!({
             "method=GET": {"state": "firing", "value": 12.5, "alarm_id": 259},
             "method=POST": {"state": "ok", "value": 3.1, "alarm_id": null},
         });
-        let result = service
-            .persist_dynamic_evaluation(
-                1,
+        let mut evaluated = sample_model(1);
+        evaluated.config_revision = 4;
+        let persist = |states: serde_json::Value| {
+            service.persist_dynamic_evaluation_if_current(
+                &evaluated,
                 "firing",
                 Some(12.5),
                 chrono::Utc::now(),
-                series_states,
+                states,
                 2,
             )
-            .await;
-        assert!(result.is_ok());
+        };
+        assert!(persist(series_states.clone()).await.expect("written"));
+        assert!(
+            !persist(series_states).await.expect("refused"),
+            "an edited rule refuses the stale snapshot"
+        );
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        )
+        .replace(['\\', '"'], "");
+        assert!(log.contains("config_revision = $"), "guarded: {log}");
+        assert!(
+            log.contains("BigInt(Some(4))"),
+            "by the read revision: {log}"
+        );
+    }
+
+    // ── Log alerts (ADR 108 D1) ─────────────────────────────────────────
+
+    /// A log rule's validator input: the fields a caller controls.
+    fn validate_log(
+        aggregation: &str,
+        window_secs: i32,
+        detection: DetectionConfig,
+        group_by: Vec<String>,
+        dynamic: bool,
+    ) -> Result<(), OtelError> {
+        validate_rule(
+            "Payment failures",
+            "",
+            aggregation,
+            "warning",
+            window_secs,
+            60,
+            &detection,
+            &[],
+            &group_by,
+            dynamic,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+        )
+    }
+
+    fn log_threshold(comparator: Comparator, threshold: f64) -> DetectionConfig {
+        DetectionConfig::Static(StaticParams {
+            comparator,
+            threshold,
+        })
+    }
+
+    #[test]
+    fn a_log_rule_needs_no_metric_name() {
+        // The whole point: a log alert watches a saved search, so requiring
+        // a metric would make it unconstructible.
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_metric_rule_still_requires_a_metric_name() {
+        let error = validate_rule(
+            "High latency",
+            "   ",
+            "p95",
+            "warning",
+            300,
+            60,
+            &static_cfg(),
+            &[],
+            &[],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Metric,
+        )
+        .expect_err("a metric rule with no metric is rejected");
+        assert!(
+            error.to_string().contains("metric_name cannot be empty"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rules_series_name_and_aggregation_are_set_by_the_server() {
+        let (metric, aggregation) = normalize_series(
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+            "something.misleading".to_string(),
+            "p95".to_string(),
+        );
+        assert_eq!(metric, LOG_ALERT_METRIC_NAME);
+        assert_eq!(aggregation, LOG_ALERT_AGGREGATION);
+
+        // A metric rule keeps exactly what the caller sent.
+        let (metric, aggregation) = normalize_series(
+            AlertSeriesSource::Metric,
+            "http.server.duration".to_string(),
+            "p95".to_string(),
+        );
+        assert_eq!(metric, "http.server.duration");
+        assert_eq!(aggregation, "p95");
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_window_wider_than_the_cap() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            LOG_ALERT_MAX_WINDOW_SECS,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+        let error = validate_log(
+            LOG_ALERT_AGGREGATION,
+            LOG_ALERT_MAX_WINDOW_SECS + 1,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .expect_err("a wider window is rejected");
+        assert!(
+            error
+                .to_string()
+                .contains(&LOG_ALERT_MAX_WINDOW_SECS.to_string()),
+            "the message names the limit: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_threshold_the_count_cap_can_never_reach() {
+        // Counting stops at the cap and reports a lower bound, so
+        // "more than the cap" would be an alert that can never fire.
+        let error = validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, LOG_ALERT_COUNT_CAP as f64),
+            vec![],
+            false,
+        )
+        .expect_err("an unreachable threshold is rejected");
+        assert!(
+            error.to_string().contains("could never be exceeded"),
+            "unexpected: {error}"
+        );
+        // Below the cap is fine, and so is a "fewer than" rule at any value:
+        // a low count is always observable.
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, LOG_ALERT_COUNT_CAP as f64 - 1.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Lt, LOG_ALERT_COUNT_CAP as f64 + 10.0),
+            vec![],
+            false,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_a_negative_threshold() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, -1.0),
+            vec![],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_detectors_with_no_log_baseline() {
+        // An anomaly band is built from the metrics store, which holds no
+        // log counts, so scoring against it would be meaningless.
+        let anomaly = DetectionConfig::Anomaly(crate::detectors::AnomalyParams {
+            algorithm: Default::default(),
+            deviations: 3.0,
+            direction: Default::default(),
+            seasonality: Default::default(),
+            pct_anomalous: 1.0,
+            baseline_lookback_days: Some(14),
+        });
+        let error = validate_log(LOG_ALERT_AGGREGATION, 300, anomaly, vec![], false)
+            .expect_err("an anomaly log rule is rejected");
+        assert!(
+            error.to_string().contains("static detector"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn a_log_rule_refuses_breakdowns_and_an_aggregation_other_than_count() {
+        assert!(validate_log(
+            LOG_ALERT_AGGREGATION,
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec!["service".to_string()],
+            false,
+        )
+        .is_err());
+        assert!(validate_log(
+            "avg",
+            300,
+            log_threshold(Comparator::Gt, 20.0),
+            vec![],
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_log_rule_refuses_label_filters_it_would_never_apply() {
+        let error = validate_rule(
+            "Payment failures",
+            "",
+            LOG_ALERT_AGGREGATION,
+            "warning",
+            300,
+            60,
+            &log_threshold(Comparator::Gt, 20.0),
+            &[("region".to_string(), "eu-west".to_string())],
+            &[],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id: 3 },
+        )
+        .expect_err("a label filter on a log rule is refused");
+        assert!(error.to_string().contains("saved search"), "{error}");
+        assert!(
+            !error.to_string().contains("  "),
+            "one message line: {error}"
+        );
+    }
+
+    fn log_model(id: i32) -> Model {
+        let mut model = sample_model(id);
+        model.source = "logs".to_string();
+        model.saved_search_id = Some(3);
+        model.metric_name = LOG_ALERT_METRIC_NAME.to_string();
+        model.aggregation = LOG_ALERT_AGGREGATION.to_string();
+        model.last_state = "firing".to_string();
+        model
+    }
+
+    /// `update` with only the fields a test sets.
+    async fn update_with(
+        service: &MetricAlertService,
+        metric_name: Option<String>,
+        severity: Option<String>,
+        source: Option<AlertSeriesSource>,
+    ) -> Result<RuleUpdate, OtelError> {
+        service
+            .update(
+                7,
+                1,
+                None,
+                metric_name,
+                None,
+                None,
+                None,
+                None,
+                severity,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                source,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn switching_a_log_rule_to_a_metric_needs_the_metric() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_model(1)]])
+            .into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+        let error = update_with(&service, None, None, Some(AlertSeriesSource::Metric))
+            .await
+            .expect_err("no metric named");
+        assert!(error.to_string().contains("metric_name"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_new_source_resets_the_rule_state_and_says_so() {
+        let mut after = log_model(1);
+        after.last_state = "ok".to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // The rule, locked: a metric rule that is firing.
+                .append_query_results([vec![{
+                    let mut m = sample_model(1);
+                    m.last_state = "firing".to_string();
+                    m
+                }]])
+                // The saved search exists in the project.
+                .append_query_results([vec![std::collections::BTreeMap::from([(
+                    "num_items".to_string(),
+                    sea_orm::Value::BigInt(Some(1)),
+                )])]])
+                .append_query_results([vec![after]])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
+        let update = update_with(
+            &service,
+            None,
+            None,
+            Some(AlertSeriesSource::Logs { saved_search_id: 3 }),
+        )
+        .await
+        .expect("updated");
+        assert!(update.series_changed);
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        );
+        // Debug output escapes quotes; compare without them.
+        let log = log.replace(['\\', '"'], "");
+        assert!(log.contains("FOR UPDATE"), "the row is locked: {log}");
+        assert!(
+            log.contains("SET metric_name = $1, aggregation = $2, last_state = $3"),
+            "{log}"
+        );
+        assert!(log.contains("String(Some(ok))"), "state reset: {log}");
+    }
+
+    #[tokio::test]
+    async fn a_severity_edit_keeps_the_rule_state() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![log_model(1)]])
+            .append_query_results([vec![log_model(1)]])
+            .into_connection();
+        let service = MetricAlertService::new(Arc::new(db));
+        let update = update_with(&service, None, Some("critical".to_string()), None)
+            .await
+            .expect("updated");
+        assert!(!update.series_changed);
+    }
+
+    #[tokio::test]
+    async fn a_stale_evaluation_is_not_written_over_a_changed_rule() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 0,
+                }])
+                .into_connection(),
+        );
+        let service = MetricAlertService::new(db.clone());
+        let written = service
+            .persist_evaluation_if_current(&log_model(1), "firing", Some(42.0), chrono::Utc::now())
+            .await
+            .expect("query ran");
+        assert!(!written, "zero rows means the rule changed");
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("sole owner")
+                .into_transaction_log()
+        );
+        let log = log.replace(['\\', '"'], "");
+        for column in ["source", "saved_search_id", "metric_name", "aggregation"] {
+            assert!(
+                log.contains(&format!("metric_alert_rules.{column} = $")),
+                "guarded on {column}: {log}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_stored_source_columns_round_trip() {
+        let logs = AlertSeriesSource::Logs { saved_search_id: 3 };
+        assert_eq!(logs.as_str(), "logs");
+        assert_eq!(logs.saved_search_id(), Some(3));
+        assert_eq!(AlertSeriesSource::from_columns("logs", Some(3)), Some(logs));
+        assert_eq!(
+            AlertSeriesSource::as_str(AlertSeriesSource::Metric),
+            "metric"
+        );
+        assert_eq!(
+            AlertSeriesSource::from_columns("metric", None),
+            Some(AlertSeriesSource::Metric)
+        );
+        // A metric rule that still carries an old saved search id reads as a
+        // metric rule: the discriminator decides.
+        assert_eq!(
+            AlertSeriesSource::from_columns("metric", Some(3)),
+            Some(AlertSeriesSource::Metric)
+        );
+        // Columns that disagree, or a discriminator this binary does not
+        // know, are refused rather than guessed.
+        assert_eq!(AlertSeriesSource::from_columns("logs", None), None);
+        assert_eq!(AlertSeriesSource::from_columns("traces", None), None);
+    }
+
+    #[test]
+    fn the_wire_form_of_a_source_is_tagged_by_kind() {
+        let logs: AlertSeriesSource =
+            serde_json::from_value(serde_json::json!({ "kind": "logs", "saved_search_id": 3 }))
+                .expect("a log source parses");
+        assert_eq!(logs, AlertSeriesSource::Logs { saved_search_id: 3 });
+        let metric: AlertSeriesSource =
+            serde_json::from_value(serde_json::json!({ "kind": "metric" }))
+                .expect("a metric source parses");
+        assert_eq!(metric, AlertSeriesSource::Metric);
+        // A log source with no saved search cannot be expressed at all.
+        assert!(
+            serde_json::from_value::<AlertSeriesSource>(serde_json::json!({ "kind": "logs" }))
+                .is_err()
+        );
     }
 }

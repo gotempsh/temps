@@ -90,7 +90,7 @@ function AuthorizePreview() {
             </Button>
           )}
           <Button asChild variant="outline">
-            <a href="/workspaces">Back to workspaces</a>
+            <a href="/sandboxes">Back to sandboxes</a>
           </Button>
         </div>
       )}

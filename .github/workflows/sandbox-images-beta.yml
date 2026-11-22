@@ -43,15 +43,15 @@ on:
       # lock-step with what `print_dockerfile` + `print_bundle` actually
       # depend on, otherwise main pushes that change image-affecting code
       # won't republish and hosts will see stale images.
-      - 'crates/temps-agents/src/sandbox/**'
-      - 'crates/temps-agents/examples/print_dockerfile.rs'
-      - 'crates/temps-agents/examples/print_bundle.rs'
+      - 'crates/temps-sandbox-providers/src/**'
+      - 'crates/temps-sandbox-providers/examples/print_dockerfile.rs'
+      - 'crates/temps-sandbox-providers/examples/print_bundle.rs'
       - 'crates/temps-pty-agent/**'
       - 'crates/temps-git-credential/**'
       - 'crates/temps-preview-gateway/**'
       - 'scripts/build-sandbox-images.sh'
       - 'tools/sandbox-runtime/**'
-      - 'crates/temps-sandbox/src/services/sandbox_service.rs'
+      - 'crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs'
       - '.github/workflows/daemon-images.yml'
       - '.github/workflows/sandbox-images-beta.yml'
   # Manual fire for testing the workflow itself or rebuilding without a
@@ -101,16 +101,17 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
         with:
-          toolchain: stable
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
 
       - name: Install build dependencies
-        # `temps-agents` -> `temps-deployments` -> `temps-otel`, whose
-        # build script runs `prost-build` and shells out to `protoc`.
-        # The dependency is transitive and invisible from this workflow's
-        # `paths` filter, so a PR that never touches a sandbox path can
-        # still break this job. `release.yml`'s identical
+        # A workspace crate whose build script runs `prost-build` shells out
+        # to `protoc`. `temps-sandbox-providers` has none in its tree today,
+        # but the dependency would be transitive and invisible from this
+        # workflow's `paths` filter, so a PR that never touches a sandbox path
+        # could still break this job. `release.yml`'s identical
         # `prepare-sandbox-context` job installs the same package — keep
         # the two in lock-step.
         run: |
@@ -131,20 +132,20 @@ jobs:
           cargo build \
             --example print_dockerfile \
             --example print_bundle \
-            -p temps-agents
+            -p temps-sandbox-providers
 
       - name: Extract versions
         id: version
         run: |
-          # Sandbox image version: pinned constant in docker.rs. The
+          # Sandbox image version: pinned constant in docker/image.rs. The
           # runtime pulls images at this exact tag, so the workflow MUST
           # publish under the same string. A drift between the two is the
           # bug the channel split was designed to prevent.
           IMAGE_VERSION=$(grep -E '^pub const SANDBOX_IMAGE_VERSION' \
-            crates/temps-agents/src/sandbox/docker.rs \
+            crates/temps-sandbox-providers/src/docker/image.rs \
             | sed -E 's/.*"([^"]+)".*/\1/')
           if [ -z "$IMAGE_VERSION" ]; then
-            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker.rs"
+            echo "::error::Failed to extract SANDBOX_IMAGE_VERSION from docker/image.rs"
             exit 1
           fi
           echo "sandbox_image_version=$IMAGE_VERSION" >> $GITHUB_OUTPUT
@@ -243,7 +244,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -299,7 +300,7 @@ jobs:
   # ─────────────────────────────────────────────────────────────────────
       - name: Set up Cosign for runtime image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign published runtime image digest
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
@@ -330,7 +331,7 @@ jobs:
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -370,7 +371,7 @@ jobs:
           cache-to: type=gha,scope=preview-gateway,mode=max
       - name: Set up Cosign for runtime image
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}
-        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign published runtime image digest
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.dry_run != true }}

@@ -3,6 +3,7 @@
 
 import { describe, it, expect, mock } from "bun:test";
 import { createFailureReportsRoutes } from "./failure-reports.js";
+import { createRateLimiter } from "../rate-limit.js";
 import type { Pool } from "pg";
 
 function makePool(queryFn: () => unknown = () => ({ rows: [] })) {
@@ -171,5 +172,54 @@ describe("POST /v1/deploy-failure-reports rate limiting", () => {
       const res = await postReport(makeReq({ report_text: "trace", failed_job_id: "x", failed_job_type: "y" }));
       expect(res.status).toBe(201);
     }
+  });
+});
+
+describe("POST /v1/deploy-failure-reports with an injected limiter", () => {
+  it("uses the limiter it is given", async () => {
+    const pool = makePool();
+    const { postReport } = createFailureReportsRoutes(pool, { rateLimiter: createRateLimiter(1) });
+    const req = () =>
+      new Request("http://localhost/v1/deploy-failure-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-forwarded-for": "203.0.113.20" },
+        body: JSON.stringify({ report_text: "trace", failed_job_id: "x", failed_job_type: "y" }),
+      });
+    expect((await postReport(req())).status).toBe(201);
+    const limited = await postReport(req());
+    expect(limited.status).toBe(429);
+    expect(limited.headers.get("Retry-After")).toBe("60");
+  });
+});
+
+describe("POST /v1/deploy-failure-reports report size", () => {
+  it("uses the configured report_text cap", async () => {
+    const pool = makePool();
+    const { postReport } = createFailureReportsRoutes(pool, {
+      rateLimiter: createRateLimiter(100),
+      maxTextChars: 10,
+    });
+    const report = (text: string) =>
+      makeReq({ report_text: text, failed_job_id: "build_image", failed_job_type: "BuildImageJob" });
+
+    expect((await postReport(report("0123456789"))).status).toBe(201);
+    const tooLong = await postReport(report("0123456789a"));
+    expect(tooLong.status).toBe(422);
+    expect((await tooLong.json()).error).toBe("report_text exceeds 10 chars");
+  });
+});
+
+describe("POST /v1/deploy-failure-reports rate-limit key", () => {
+  it("ignores X-Real-IP and keys on the TCP peer", async () => {
+    const pool = makePool();
+    const { postReport } = createFailureReportsRoutes(pool, { rateLimiter: createRateLimiter(1) });
+    const req = (realIp: string) =>
+      new Request("http://localhost/v1/deploy-failure-reports", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-real-ip": realIp },
+        body: JSON.stringify({ report_text: "trace", failed_job_id: "x", failed_job_type: "y" }),
+      });
+    expect((await postReport(req("192.0.2.1"), "10.0.0.7")).status).toBe(201);
+    expect((await postReport(req("192.0.2.2"), "10.0.0.7")).status).toBe(429);
   });
 });

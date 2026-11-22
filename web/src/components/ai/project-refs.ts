@@ -6,6 +6,8 @@ export interface ProjectRef {
   id: number
   slug: string
   name: string
+  service_template_image_url?: string | null
+  source_type?: string | null
 }
 
 /**

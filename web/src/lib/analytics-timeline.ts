@@ -44,3 +44,15 @@ export function formatAnalyticsTick(
     hour: 'numeric',
   })
 }
+
+/**
+ * Whether the chart's last hourly bucket is the hour still under way, whose
+ * count is partial: drawn as a solid line it reads as traffic collapsing.
+ */
+export function hourInProgress(
+  rows: { timestamp: number }[],
+  now = Date.now()
+): boolean {
+  const last = rows[rows.length - 1]
+  return last != null && last.timestamp + HOUR > now
+}

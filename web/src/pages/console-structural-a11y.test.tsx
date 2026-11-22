@@ -321,20 +321,6 @@ const CASES: RouteCase[] = [
     },
   },
   {
-    name: '/workspaces',
-    path: '/workspaces',
-    pattern: '/workspaces',
-    element: <Sandboxes key="workspaces" workspacesOnly />,
-    routes: {
-      'GET /platform/features': () => jsonResponse(FEATURES),
-      'GET /ai/applications': () => jsonResponse([APPLICATION]),
-      'GET /ai/workspace': () => jsonResponse(WORKSPACE),
-      'GET /ai/workspace-activity': () => jsonResponse({ workspaces: [] }),
-      'GET /ai/applications/ws-1/workspace': () => jsonResponse(WORKSPACE),
-    },
-    ready: 'Example workspace',
-  },
-  {
     name: '/sandboxes',
     path: '/sandboxes',
     pattern: '/sandboxes',
@@ -448,10 +434,10 @@ const SECTION_READY: Record<
   (typeof MONITORING_SECTIONS)[number]['id'],
   string
 > = {
-  alerts: 'Route Monitoring',
-  rules: 'Monitoring & Alerts',
-  alarms: 'Monitoring & Alerts',
-  notifications: 'Weekly Digest',
+  alerts: 'Route monitoring',
+  rules: 'Monitoring & alerts',
+  alarms: 'Monitoring & alerts',
+  notifications: 'Weekly digest',
 }
 
 for (const section of MONITORING_SECTIONS) {

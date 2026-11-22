@@ -48,9 +48,27 @@ repos:
         types: [rust]
         pass_filenames: false # This makes it a lot faster
 
+      # Commit time stays fast: clippy on the crates that own the staged
+      # files only. The full-workspace `--all-features` run happens at push
+      # time (and in CI); it took minutes per commit and got bypassed.
+      - id: cargo-clippy-changed
+        name: cargo clippy (changed crates)
+        language: system
+        types: [rust]
+        stages: [pre-commit]
+        entry: python3 scripts/hooks/clippy-changed-crates.py
+
+      - id: rule-drift
+        name: CLAUDE.md rule drift vs scripts/rule-baseline.json
+        entry: python3 scripts/rule_drift.py
+        language: system
+        files: (\.rs$|^scripts/rule_drift\.py$|^scripts/rule-baseline\.json$)
+        pass_filenames: false
+
       - id: cargo-clippy
-        name: cargo clippy
+        name: cargo clippy (workspace, all features)
         language: system
         types: [rust]
         pass_filenames: false
-        entry: cargo clippy --all-targets --all-features -- -D warnings
+        stages: [pre-push]
+        entry: cargo clippy --workspace --all-targets --all-features -- -D warnings

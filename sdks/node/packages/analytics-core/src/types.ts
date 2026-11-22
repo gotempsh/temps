@@ -1,6 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import type { AutoTrackOptions } from "./AutoTracking";
+import type { FeatureFlags, FeatureFlagsOptions } from "./FeatureFlags";
+import type { Surveys, SurveysOptions } from "./Surveys";
+
 export type JsonPrimitive = string | number | boolean | null;
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue };
 
@@ -113,9 +117,37 @@ export interface AnalyticsClientOptions {
    * not work on this endpoint.
    */
   ingestKey?: string;
+  /**
+   * Store nothing on the visitor's device (ADR 109 D3). No visitor or session
+   * id is written to `localStorage`, ids an earlier visit stored are deleted,
+   * and session recording does not start. Turn it on together with the
+   * project's "Cookieless" identity mode in the Temps Console, which makes
+   * the server count visitors by a hash that changes every day: a returning
+   * visitor counts as new the next day. Defaults to false.
+   */
+  cookieless?: boolean;
 }
 
-export interface AnalyticsOptions extends AnalyticsClientOptions {
+export interface AnalyticsOptions extends AnalyticsClientOptions, AutoTrackOptions {
+  /**
+   * Feature-flag context and server-rendered bootstrap values. Flags are read
+   * lazily from `{basePath}/flags`; see `AnalyticsApi.flags`.
+   */
+  flags?: Pick<FeatureFlagsOptions, "key" | "attributes" | "bootstrap" | "onError">;
+  /**
+   * In-app surveys defined in the Temps console (ADR 110 D1). Off unless
+   * `enabled` is true, so sites without surveys make no extra request. Needs
+   * analytics to be on: answers are recorded as analytics events.
+   */
+  surveys?: Pick<SurveysOptions, "key" | "attributes" | "onError"> & {
+    enabled?: boolean;
+    /**
+     * Render the built-in widget when a survey's conditions are met: on load,
+     * on client-side navigation and on a triggering `trackEvent`. Defaults to
+     * true. Set false to draw your own UI with `analytics.surveys`.
+     */
+    autoShow?: boolean;
+  };
   /** Auto track pageviews on route changes. Defaults to true. */
   autoTrackPageviews?: boolean;
   /** Auto track page leave events. Defaults to true. */
@@ -139,6 +171,18 @@ export interface AnalyticsOptions extends AnalyticsClientOptions {
 }
 
 export interface AnalyticsApi {
+  /**
+   * Feature flags marked client-visible, evaluated by Temps for this visitor.
+   * `flags.get("checkout.v2", false)` is synchronous and returns the fallback
+   * until the flags arrive; nothing is fetched until the first read.
+   */
+  readonly flags: FeatureFlags;
+  /**
+   * Surveys this visitor may see. Disabled (empty) unless
+   * `surveys.enabled` was set; with `autoShow` off, render them yourself
+   * from `eligible()` and record answers with `submit()`.
+   */
+  readonly surveys: Surveys;
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
   /**
@@ -153,8 +197,37 @@ export interface AnalyticsApi {
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */
   trackPageview(): void;
-  /** Identify a user. No-op placeholder for now. */
-  identify(userId: string, traits?: Record<string, JsonValue>): Promise<void> | void;
+  /**
+   * Report the current page as missing: emits a `not_found` event whose
+   * `path` property is the current path. For apps that answer `200` for an
+   * unknown route, call it from the "not found" view, or put the
+   * `data-temps-404` attribute on that view and let the tracker do it.
+   */
+  trackNotFound(data?: Record<string, JsonValue>): Promise<void>;
+  /**
+   * Attach your app's user id (and optional traits) to this visitor, e.g.
+   * right after signup or sign-in. The server labels the visitor this
+   * browser already is; it cannot name another one. Repeating the same call
+   * sends nothing. In cookieless mode it sends nothing and resolves to
+   * `cookieless_project`.
+   */
+  identify(userId: string, traits?: Record<string, JsonValue>): Promise<IdentifyResult>;
+  /**
+   * Forget the identity on sign-out: the next event belongs to a new,
+   * anonymous visitor. Rejects with `ResetFailedError` when the server did
+   * not confirm it (its tracking cookie still names the old visitor), so
+   * retry; the ids stored in the browser are cleared either way.
+   */
+  reset(): Promise<void>;
+  /**
+   * The visitor id this tracker stored. `undefined` in cookieless mode,
+   * before the first event, or when storage is blocked. A backend on Temps
+   * does not need it: the Node SDK's `analytics.identify(request, …)` reads
+   * the proxy's `_temps_visitor_id` cookie from the request. It is for a
+   * backend calling with a personal API key (`visitorId` option), since
+   * deployment tokens only accept that sealed cookie value.
+   */
+  getVisitorId(): string | undefined;
   /** Enable session recording at runtime. */
   enableSessionRecording(): void;
   /** Disable session recording at runtime. */
@@ -177,4 +250,19 @@ export interface SpeedMetric {
   inp?: number | null;
   path?: string | null;
   query?: string | null;
+}
+
+/** What `identify()` did. */
+export interface IdentifyResult {
+  /** Whether the visitor now carries this identity. */
+  applied: boolean;
+  /**
+   * The server's outcome (`updated`, `unchanged`, `visitor_not_found`,
+   * `cookieless_project`, `browser_identify_refused`,
+   * `server_identity_kept`), or a local one when nothing was sent:
+   * `already_sent`, `invalid_user_id`, `network_error`, `http_<status>`,
+   * or `reset` when `reset()` ran while it waited for the page view.
+   */
+  outcome: string;
+  message: string;
 }

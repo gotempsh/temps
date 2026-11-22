@@ -54,7 +54,7 @@ export interface ImportEnvDialogProps {
   existingKeys?: Set<string>
   /**
    * Title for the dialog
-   * @default "Import Environment Variables"
+   * @default "Import environment variables"
    */
   title?: string
   /**
@@ -101,7 +101,7 @@ export function ImportEnvDialog({
   onImport,
   allEnvironments,
   existingKeys,
-  title = 'Import Environment Variables',
+  title = 'Import environment variables',
   description = 'Upload a .env file or paste its contents to import multiple variables at once.',
   showEnvironmentSelection = !!allEnvironments,
   disabledReason,
@@ -334,7 +334,7 @@ export function ImportEnvDialog({
               onClick={handlePasteContent}
               className="w-full"
             >
-              Parse Content
+              Parse content
             </Button>
           </div>
 
@@ -400,7 +400,7 @@ export function ImportEnvDialog({
               {showEnvironmentSelection && allEnvironments && (
                 <div className="space-y-2">
                   <label className="text-sm font-medium">
-                    Target Environments
+                    Target environments
                   </label>
                   <div className="flex flex-wrap gap-2">
                     {allEnvironments.map((env) => (

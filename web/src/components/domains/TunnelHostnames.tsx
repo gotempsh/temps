@@ -9,12 +9,15 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ExternalLink } from 'lucide-react'
 import { toast } from 'sonner'
 import {
+  getIngressHostnameOptions,
+  retryIngressHostnameDnsMutation,
   listIngressConnectorsOptions,
   listIngressHostnamesOptions,
   setIngressHostnameChoiceMutation,
   updateIngressConnectorMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { ConnectorView, HostnameView } from '@/api/client/types.gen'
+import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import {
   Select,
@@ -46,6 +49,60 @@ function useRefreshIngress() {
     ])
 }
 
+export function RetryHostnameDns({
+  hostname,
+  connectorId,
+}: {
+  hostname: string
+  connectorId?: number | null
+}) {
+  const queries = useQueryClient()
+  const refresh = useRefreshIngress()
+  const detail = getIngressHostnameOptions({
+    path: { hostname },
+  })
+  const retry = useMutation({
+    ...retryIngressHostnameDnsMutation(),
+    onSuccess: (result) => {
+      queries.setQueryData(detail.queryKey, result)
+      if (result.state === 'published') {
+        toast.success(`DNS setup completed for ${result.hostname}`)
+      } else {
+        toast.error(`DNS setup failed for ${result.hostname}`, {
+          description: result.detail,
+        })
+      }
+    },
+    onError: (error) =>
+      toast.error(`Could not retry DNS setup for ${hostname}`, {
+        description: problemDetail(
+          error,
+          'Refresh the hostname status and try again.'
+        ),
+      }),
+    onSettled: () =>
+      Promise.all([
+        refresh(),
+        queries.invalidateQueries({ queryKey: detail.queryKey }),
+      ]),
+  })
+  if (connectorId == null && !retry.isPending) return null
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      disabled={retry.isPending}
+      onClick={(event) => {
+        event.stopPropagation()
+        if (connectorId != null)
+          retry.mutate({ path: { id: connectorId, hostname } })
+      }}
+    >
+      {retry.isPending ? 'Retrying DNS setup…' : 'Retry DNS setup'}
+    </Button>
+  )
+}
+
 export function StateBadge({ view }: { view: HostnameView }) {
   switch (view.state) {
     case 'published':
@@ -53,7 +110,7 @@ export function StateBadge({ view }: { view: HostnameView }) {
     case 'pending':
       return <Badge variant="secondary">Publishing…</Badge>
     case 'error':
-      return <Badge variant="destructive">Failed</Badge>
+      return <Badge variant="destructive">Publication failed</Badge>
     default:
       return <Badge variant="outline">Not through a tunnel</Badge>
   }
@@ -116,7 +173,13 @@ export function HostnameChoice({ view }: { view: HostnameView }) {
   )
 }
 
-export function HostnameRow({ view }: { view: HostnameView }) {
+function HostnameRow({
+  view,
+  connectorId,
+}: {
+  view: HostnameView
+  connectorId: number
+}) {
   return (
     <li className="space-y-1 py-1.5">
       <div className="flex flex-wrap items-center justify-between gap-2">
@@ -134,6 +197,12 @@ export function HostnameRow({ view }: { view: HostnameView }) {
             <span className="break-all text-sm">{view.hostname}</span>
           )}
           <StateBadge view={view} />
+          <RetryHostnameDns
+            hostname={view.hostname}
+            connectorId={
+              view.retry_dns_connector_id === connectorId ? connectorId : null
+            }
+          />
         </div>
         <HostnameChoice view={view} />
       </div>
@@ -207,7 +276,11 @@ export function TunnelHostnames({ connector }: { connector: ConnectorView }) {
       ) : (
         <ul className="divide-y">
           {hosts.map((view) => (
-            <HostnameRow key={view.hostname} view={view} />
+            <HostnameRow
+              key={view.hostname}
+              view={view}
+              connectorId={connector.id}
+            />
           ))}
         </ul>
       )}

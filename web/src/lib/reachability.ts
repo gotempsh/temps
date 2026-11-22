@@ -3,7 +3,7 @@
 
 // What the console says about whether a project's addresses reach their
 // audience (ADR 064 D3), and the small decisions the Make it reachable
-// dialog makes from a plan and a run (D4).
+// page makes from a plan and a run (D4, ADR 069).
 
 import type {
   AddressReachability,
@@ -43,9 +43,7 @@ export function bestAddress(
 ): AddressReachability | undefined {
   const reachable = addresses.filter((a) => a.state === 'reachable')
   const named = primary
-    ? reachable.find(
-        (a) => a.address.toLowerCase() === primary.toLowerCase()
-      )
+    ? reachable.find((a) => a.address.toLowerCase() === primary.toLowerCase())
     : undefined
   return (
     named ??
@@ -55,6 +53,35 @@ export function bestAddress(
     reachable.find((a) => a.audience !== 'private') ??
     reachable[0]
   )
+}
+
+/**
+ * Where the project bar's Visit button goes. A reachable address comes first
+ * (a custom domain before the generated one, as `bestAddress` orders them).
+ * Without one, a domain someone configured is still the place to go, since
+ * it is where the app is meant to live. Once the check says nothing reaches
+ * the environment, its generated address (`localho.st` with no ingress) leads
+ * nowhere, so there is no Visit. Until the check answers, the environment's
+ * own URL stands in.
+ */
+export function visitUrl(
+  reachability: EnvironmentReachability | undefined,
+  mainUrl: string | null | undefined
+): string | undefined {
+  if (reachability) {
+    const best = bestAddress(
+      reachability.addresses,
+      reachability.primary_address?.address
+    )
+    if (best) return addressUrl(best.address)
+    const configured =
+      reachability.addresses.find((a) => a.source === 'custom_domain') ??
+      reachability.addresses.find((a) => a.source === 'environment_domain') ??
+      reachability.addresses.find((a) => a.source === 'tunnel_host')
+    if (configured) return addressUrl(configured.address)
+    if (reachability.state === 'not_reachable') return undefined
+  }
+  return mainUrl ?? undefined
 }
 
 /** The header line: "Public at …" or "Not reachable yet — <reason>". */
@@ -89,17 +116,69 @@ export function reachabilityHeadline(
   }
 }
 
+const DNS_PROVIDER_LABELS: Record<string, string> = {
+  cloudflare: 'Cloudflare',
+  bunny: 'bunny.net',
+  namecheap: 'Namecheap',
+  route53: 'Route 53',
+  digitalocean: 'DigitalOcean',
+  gcp: 'Google Cloud DNS',
+  azure: 'Azure DNS',
+}
+
+/** A DNS provider type in words; empty for "any type". */
+export function dnsProviderTypeLabel(
+  providerType: string | null | undefined
+): string {
+  if (!providerType) return ''
+  return DNS_PROVIDER_LABELS[providerType.toLowerCase()] ?? providerType
+}
+
+/** Where to connect a DNS provider of `providerType`, coming back to `back`. */
+export function dnsProviderSetupPath(
+  providerType: string | null | undefined,
+  back: string
+): string {
+  const params = new URLSearchParams()
+  if (providerType) params.set('provider', providerType.toLowerCase())
+  params.set('return', back)
+  return `/dns-providers/add?${params.toString()}`
+}
+
+const CDN_LABELS: Record<string, string> = {
+  cloudflare: 'Cloudflare',
+  bunny: 'bunny.net',
+}
+
 /** How traffic gets in, in words. */
 export function wayInLabel(wayIn: string | null | undefined): string {
   if (!wayIn) return 'No way in yet'
   if (wayIn === 'direct') return 'Direct'
   if (wayIn === 'tunnel:new') return 'A new tunnel'
+  if (wayIn === 'forwarded') return 'Through a proxy'
   const [kind, name] = wayIn.split(':', 2)
   if (kind === 'tunnel') return `Tunnel ${name}`
+  if (kind === 'cdn') return `Through ${CDN_LABELS[name] ?? name}`
   if (kind === 'private') return `Private listener on ${name}`
   if (kind === 'direct')
     return name === 'control-plane' ? 'This server' : `Straight to ${name}`
   return wayIn
+}
+
+/**
+ * Who an address is for and how they get in. An unknown address has no way in
+ * on record, which does not mean it has none, so it is not said to lack one.
+ */
+export function addressAccessLabel(
+  address: Pick<
+    AddressReachability,
+    'audience' | 'network' | 'state' | 'way_in'
+  >
+): string {
+  const audience = audienceLabel(address)
+  return address.state === 'unknown' && !address.way_in
+    ? audience
+    : `${audience} · ${wayInLabel(address.way_in)}`
 }
 
 /**
@@ -178,6 +257,10 @@ export function conflictSubject(entry: JournalEntry): string {
       return `Tunnel ${intent.name}`
     case 'access_app':
       return `Cloudflare Access app ${intent.name}`
+    case 'edge_rule':
+      return intent.purpose === 'https_redirect'
+        ? `The Cloudflare redirect rule for ${intent.hostname}`
+        : `The Cloudflare port rule for ${intent.hostname}`
     case 'tailscale_serve':
       return `${intent.hostname} on ${intent.node_name}`
     case 'tailscale_service':
@@ -216,6 +299,12 @@ export function conflictChoices(
   if (type === 'access_app')
     return [
       { decision: 'keep', label: 'Keep the app' },
+      { decision: 'overwrite', label: 'Delete it anyway' },
+    ]
+  // ADR 070 D2: a Cloudflare rule someone edited is kept unless they say so.
+  if (type === 'edge_rule')
+    return [
+      { decision: 'keep', label: 'Keep the rule' },
       { decision: 'overwrite', label: 'Delete it anyway' },
     ]
   if (type === 'dns_record') return [{ decision: 'keep', label: 'Leave it' }]
@@ -445,7 +534,12 @@ export function certificateChoices({
         ? 'dns-01'
         : http01Available === true
           ? 'http-01'
-          : null
+          : // Nothing answers publicly on port 80: DNS-01 is the method that
+            // surely works. HTTP-01 stays listed, since port forwarding or a
+            // private CA can still reach this server.
+            http01Available === false
+            ? 'dns-01'
+            : null
   return {
     showHttp01: !wildcard,
     recommended,

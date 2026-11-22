@@ -10,6 +10,7 @@
 //! code relocated behind the trait.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -111,24 +112,27 @@ fn parent_key(entry: &CreateProxyLogRequest) -> ParentKey {
 /// Indices of `entries` in the order their rows must be inserted.
 ///
 /// Each inserted row makes Postgres run one `SELECT 1 FROM <parent> WHERE id =
-/// $n FOR KEY SHARE` per foreign key (`projects`, `environments`,
-/// `deployments`, ...), in row order, and hold every lock until the statement
-/// ends. A batch in request-arrival order therefore pins parents in an
-/// arbitrary, per-batch order. Any transaction that takes a stronger lock on
-/// two of those rows in a different order (an environment or project edit,
-/// say) can then close a lock cycle with the batch: Postgres aborts the
-/// batch with `40P01 deadlock detected` and the whole batch was lost
-/// (issue #1425).
+/// $n FOR KEY SHARE` per foreign key, in row order, and hold every lock until
+/// the statement ends. Those keys are `request_sessions`, `visitor` and
+/// `ip_geolocations`; the project, environment and deployment ones were
+/// dropped so a project delete no longer cascades into the log, and an edit
+/// of those rows no longer contends with log writes at all. A batch in
+/// request-arrival order therefore pins sessions, visitors and addresses in
+/// an arbitrary, per-batch order. Any transaction that takes a stronger lock
+/// on two of those rows in a different order can then close a lock cycle with
+/// the batch: Postgres aborts the batch with `40P01 deadlock detected` and
+/// the whole batch was lost (issue #1425).
 ///
-/// Sorting by (project, environment, deployment, ...) gives every batch --
-/// from this process, another proxy node, or the next flush -- one consistent
-/// lock order for any given set of parents, which removes most of the
-/// batch-against-batch cycles. It does not make environment ids globally
-/// ascending across rows (the project is the leading key), so it narrows the
-/// window rather than closing it. The sort is stable, so rows that share all
-/// parents keep their arrival order. What remains, including an unrelated
-/// transaction taking its own locks in the opposite order, cannot be fixed from
-/// here and is covered by the bounded retry in `ProxyLogBatchWriter`.
+/// Sorting by the parent key gives every batch -- from this process, another
+/// proxy node, or the next flush -- one consistent lock order for any given
+/// set of parents, which removes most of the batch-against-batch cycles. The
+/// leading project/environment/deployment components no longer take locks;
+/// they only group rows, so session ids are not globally ascending across
+/// rows and the sort narrows the window rather than closing it. The sort is
+/// stable, so rows that share all parents keep their arrival order. What
+/// remains, including an unrelated transaction taking its own locks in the
+/// opposite order, cannot be fixed from here and is covered by the bounded
+/// retry in `ProxyLogBatchWriter`.
 pub(crate) fn fk_lock_order(entries: &[CreateProxyLogRequest]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..entries.len()).collect();
     order.sort_by_key(|&index| parent_key(&entries[index]));
@@ -504,6 +508,7 @@ fn pg_dimension_expression(dimension: TrafficDimension) -> &'static str {
         TrafficDimension::OperatingSystem => "NULLIF(operating_system, '')",
         TrafficDimension::DeviceType => "NULLIF(device_type, '')",
         TrafficDimension::CacheStatus => "NULLIF(cache_status, '')",
+        TrafficDimension::Referrer => "NULLIF(referrer, '')",
     }
 }
 
@@ -593,12 +598,6 @@ fn bind_filter_value(
         }),
         _ => Ok(raw.to_owned().into()),
     }
-}
-
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn append_pg_filter(
@@ -983,6 +982,43 @@ mod tests {
         let _store = make_store();
     }
 
+    /// The not-found report (ADR 109 D1) groups 404s by path and by the page
+    /// that linked to them. An empty `Referer` must group as null so that
+    /// "no referrer" can be filtered out rather than ranked as a source.
+    #[test]
+    fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
+        let request = TrafficAggregationRequest {
+            start_time: chrono::Utc::now() - chrono::Duration::days(7),
+            end_time: chrono::Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::Path, TrafficDimension::Referrer],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![
+                TrafficFilter {
+                    dimension: TrafficDimension::StatusCode,
+                    operator: TrafficFilterOperator::Eq,
+                    values: vec!["404".to_string()],
+                },
+                TrafficFilter {
+                    dimension: TrafficDimension::Referrer,
+                    operator: TrafficFilterOperator::NotEq,
+                    values: vec![String::new()],
+                },
+            ],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, values, count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("CAST(NULLIF(referrer, '') AS TEXT) AS d1"));
+        assert!(sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert!(sql.contains("status_code = $4"));
+        assert!(sql.contains("NULLIF(referrer, '') <> $5"));
+        assert!(count_sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert_eq!(values.len(), 5);
+    }
+
     #[test]
     fn traffic_query_supports_multi_dimension_metrics_and_excludes_monitor() {
         let mut request = TrafficAggregationRequest {
@@ -1036,7 +1072,7 @@ mod tests {
     /// whole-batch retry cannot insert them a second time.
     #[tokio::test]
     async fn a_multi_statement_batch_lands_whole_or_not_at_all() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1081,17 +1117,16 @@ mod tests {
         };
 
         // A full first chunk for the existing project, then -- last in lock
-        // order, so in the second statement -- a row whose project does not
-        // exist and fails its foreign key.
+        // order, so in the second statement -- a row whose session does not
+        // exist and fails its foreign key. (`proxy_logs` holds no foreign key
+        // to `projects`: a deleted project's rows are purged in the
+        // background, so an unknown project id no longer fails an insert.)
         let mut entries: Vec<CreateProxyLogRequest> = (0..TIMESCALE_ROWS_PER_INSERT)
             .map(|i| entry_with_parents(&format!("atomic-{i}"), Some(7002), None, None))
             .collect();
-        entries.push(entry_with_parents(
-            "atomic-orphan",
-            Some(999_999),
-            None,
-            None,
-        ));
+        let mut orphan = entry_with_parents("atomic-orphan", Some(7002), None, None);
+        orphan.session_id = Some(999_999);
+        entries.push(orphan);
         assert!(store.write_batch(&entries).await.is_err());
         assert_eq!(
             count("atomic-").await,
@@ -1109,7 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn timescale_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

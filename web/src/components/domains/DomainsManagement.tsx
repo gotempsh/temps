@@ -7,11 +7,18 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import {
   deleteDomainMutation,
+  listDomainsQueryKey,
   listIngressHostnamesOptions,
+  listIngressHostnamesQueryKey,
   renewDomainMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
-import { DomainResponse } from '@/api/client/types.gen'
+import type {
+  ConnectorView,
+  DomainResponse,
+  HostnameView,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
@@ -25,6 +32,8 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
   Collapsible,
@@ -41,7 +50,6 @@ import {
   Cloud,
   EllipsisVertical,
   Globe,
-  Info,
   Plus,
   RefreshCw,
   Search,
@@ -56,17 +64,21 @@ import {
   isServingCert,
 } from '@/lib/domain-status'
 import { DNSConfigurationHelper } from './DNSConfigurationHelper'
-import { StateBadge } from './TunnelHostnames'
+import { RetryHostnameDns, StateBadge } from './TunnelHostnames'
 import {
   domainRowHref,
   mergeDomainRows,
   tunnelRows,
   type DomainRow,
 } from './domain-rows'
-import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
-import { Link, useNavigate } from 'react-router'
-import { DataTable, useUrlBoundText, type DataTableColumn } from '@temps-sdk/ds'
+import { useNavigate } from 'react-router'
+import {
+  DataTable,
+  RecordLink,
+  useUrlBoundText,
+  type DataTableColumn,
+} from '@temps-sdk/ds'
 import type { DomainSort } from './domain-sort'
 import { hasUrgentCertificate } from './domain-expiry'
 
@@ -117,9 +129,6 @@ export function DomainsManagement({
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
-
-  const { canManageCertificates, canCreateDomains, isUsingCloudflare } =
-    usePlatformCapabilities()
 
   const deleteDomain = useMutation({
     ...deleteDomainMutation(),
@@ -183,11 +192,15 @@ export function DomainsManagement({
   const connectorsQuery = useQuery({
     ...allTunnelsOptions(),
     retry: false,
+    // Optional context: a role without settings access is refused and sees
+    // certificates only, which is not a failure of this page.
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const hostnamesQuery = useQuery({
     ...listIngressHostnamesOptions(),
     refetchInterval: 15_000,
     retry: false,
+    meta: { routeFailure: ROUTE_FAILURE_IGNORE_REFUSAL },
   })
   const tunnels = tunnelRows(
     connectorsQuery.data ?? [],
@@ -195,6 +208,11 @@ export function DomainsManagement({
     searchQuery
   )
   const rows = mergeDomainRows(domains ?? [], tunnels, page, sort, direction)
+  const retries = new Map(
+    (hostnamesQuery.data ?? [])
+      .filter((host) => host.retry_dns_connector_id != null)
+      .map((host) => [host.hostname, host.retry_dns_connector_id])
+  )
   const failingTunnels = tunnels.filter(
     (r) => r.kind === 'tunnel' && r.view.state === 'error'
   ).length
@@ -241,12 +259,8 @@ export function DomainsManagement({
     {
       ...sortable('domain', 'Domain'),
       render: (row) => (
-        <Link
-          to={domainRowHref(row)}
-          className="font-medium hover:underline focus-visible:underline"
-        >
-          {row.name}
-        </Link>
+        // The row follows this link (RecordRow, DESIGN.md).
+        <RecordLink to={domainRowHref(row)}>{row.name}</RecordLink>
       ),
     },
     {
@@ -278,26 +292,35 @@ export function DomainsManagement({
       key: 'actions',
       header: <span className="sr-only">Actions</span>,
       className: 'w-12',
-      render: (row) =>
-        row.kind === 'certificate' ? (
-          <DomainRowMenu
-            domain={row.domain}
-            onOpen={(id) => navigate(`/domains/${id}`)}
-            onRenew={handleRenewDomain}
-            onDelete={setDomainToDelete}
-            canManageCertificates={canManageCertificates}
-          />
-        ) : (
-          <Button
-            variant="ghost"
-            size="icon"
-            className="h-8 w-8"
-            aria-label={`Details for ${row.name}`}
-            onClick={() => navigate(domainRowHref(row))}
-          >
-            <ChevronRight className="h-4 w-4" />
-          </Button>
-        ),
+      render: (row) => {
+        // A certificate and a tunnel publication can share a single row.
+        const connectorId = retries.get(row.name)
+        return (
+          <div className="flex items-center justify-end gap-1">
+            <RetryHostnameDns hostname={row.name} connectorId={connectorId} />
+            {row.kind === 'certificate' ? (
+              <DomainRowMenu
+                domain={row.domain}
+                onOpen={(id) => navigate(`/domains/${id}`)}
+                onRenew={handleRenewDomain}
+                onDelete={setDomainToDelete}
+              />
+            ) : (
+              connectorId == null && (
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-8 w-8"
+                  aria-label={`Details for ${row.name}`}
+                  onClick={() => navigate(domainRowHref(row))}
+                >
+                  <ChevronRight className="h-4 w-4" />
+                </Button>
+              )
+            )}
+          </div>
+        )
+      },
     },
   ]
 
@@ -308,19 +331,20 @@ export function DomainsManagement({
         description="Every domain this install serves, and how each gets HTTPS: its own certificate or a tunnel"
         actions={
           <>
-            {' '}
-            {canCreateDomains ? (
-              <CreateActionButton
-                to="/domains/add"
-                label="Add Domain"
-                icon={<Globe className="h-4 w-4" />}
-              />
-            ) : (
-              <Button disabled>
-                <Globe className="mr-2 h-4 w-4" />
-                Managed by Cloudflare
-              </Button>
-            )}{' '}
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(listDomainsQueryKey),
+                allTunnelsOptions().queryKey,
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+              ]}
+            />
+            {/* Always offered: a tunnel covers its own names only, and any
+                other domain can get a Temps certificate (ADR 058 D10). */}
+            <CreateActionButton
+              to="/domains/add"
+              label="Add domain"
+              icon={<Globe className="h-4 w-4" />}
+            />
           </>
         }
       />
@@ -342,16 +366,10 @@ export function DomainsManagement({
         </CollapsibleContent>
       </Collapsible>
 
-      {isUsingCloudflare() && (
-        <Alert className="border-purple-200 bg-purple-50/50 dark:bg-purple-950/10">
-          <Info className="h-4 w-4 text-purple-600" />
-          <AlertDescription>
-            Domain and certificate management is handled automatically by
-            Cloudflare Tunnel. Add or remove domains through your Cloudflare
-            dashboard.
-          </AlertDescription>
-        </Alert>
-      )}
+      <TunnelCoverage
+        connectors={connectorsQuery.data ?? []}
+        hostnames={hostnamesQuery.data ?? []}
+      />
 
       {failingTunnels > 0 && (
         <Alert variant="destructive">
@@ -365,7 +383,7 @@ export function DomainsManagement({
       )}
 
       {pendingProvisioningCount > 0 && (
-        <Alert className="border-yellow-200 bg-yellow-50/50 dark:bg-yellow-950/10">
+        <Alert className="border-yellow-200 dark:border-yellow-900 bg-yellow-50/50 dark:bg-yellow-950/10">
           <AlertTriangle className="h-4 w-4 text-yellow-600" />
           <AlertTitle className="flex items-center gap-2">
             <span>TLS Certificates Pending</span>
@@ -443,7 +461,7 @@ export function DomainsManagement({
             action={
               <Button onClick={() => navigate('/domains/add')}>
                 <Plus className="mr-2 h-4 w-4" />
-                Add Domain
+                Add domain
               </Button>
             }
           />
@@ -501,13 +519,11 @@ function DomainRowMenu({
   onOpen,
   onRenew,
   onDelete,
-  canManageCertificates,
 }: {
   domain: DomainResponse
   onOpen: (id: number) => void
   onRenew: (domain: string) => void
   onDelete: (domain: DomainResponse) => void
-  canManageCertificates: boolean
 }) {
   return (
     <div
@@ -535,7 +551,7 @@ function DomainRowMenu({
             <Globe className="mr-2 h-4 w-4" />
             View details
           </DropdownMenuItem>
-          {isServingCert(domain.status) && canManageCertificates && (
+          {isServingCert(domain.status) && (
             <DropdownMenuItem
               onSelect={(e) => {
                 e.preventDefault()
@@ -644,5 +660,48 @@ function TunnelZoneStatus({
           : 'publishing picked'
         : 'tunnel down'}
     </Badge>
+  )
+}
+
+/**
+ * What each tunnel serves: the names under its domain, and nothing else.
+ * Every other domain gets HTTPS from a Temps certificate.
+ */
+export function TunnelCoverage({
+  connectors,
+  hostnames,
+}: {
+  connectors: ConnectorView[]
+  hostnames: HostnameView[]
+}) {
+  if (connectors.length === 0) return null
+  return (
+    <ul
+      aria-label="Tunnels"
+      className="space-y-1 text-sm text-muted-foreground"
+    >
+      {connectors.map((connector) => {
+        const published = hostnames.filter(
+          (h) => h.connector_id === connector.id && h.state === 'published'
+        ).length
+        return (
+          <li
+            key={connector.id}
+            className="flex min-w-0 items-start gap-2 [overflow-wrap:anywhere]"
+          >
+            <Cloud className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Tunnel <span className="text-foreground">{connector.name}</span>{' '}
+              serves names under{' '}
+              <span className="text-foreground">{connector.domain}</span>
+              {published > 0 && ` · ${published} published`}
+            </span>
+          </li>
+        )
+      })}
+      <li className="pl-5">
+        Other domains get HTTPS from a Temps certificate.
+      </li>
+    </ul>
   )
 }

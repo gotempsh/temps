@@ -16,10 +16,11 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
     const socketPath = `${directory}/plugin.sock`;
     const secret = "d3a13e4c-0d28-4ccf-988f-82ab9f454c8a";
     const runtimeUrl = new URL("./index.ts", import.meta.url).href;
-    const source = `import {runPlugin,createManifest} from ${JSON.stringify(runtimeUrl)};
+    const source = `import {runPlugin,createManifest,createToolPlugin} from ${JSON.stringify(runtimeUrl)};
+    const {z}=await import("zod");
     process.argv=["bun","fixture","--socket-path",${JSON.stringify(socketPath)},"--data-dir",${JSON.stringify(directory)}];
     let startup;
-    await runPlugin({
+    await runPlugin(createToolPlugin({
       manifest:()=>createManifest("ai-fixture","1.0.0").requestPermissions("ai_generate").build(),
       onStart:async ctx=>{startup=await ctx.permissions();},
       handler:ctx=>async(req,res)=>{
@@ -29,7 +30,8 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
           res.writeHead(200,{"Content-Type":"application/json"}); res.end(JSON.stringify({startup,current,result}));
         } catch {res.writeHead(503);res.end("Host call failed");}
       }
-    });`;
+    }).tool({name:"create",description:"Create report",input:z.object({title:z.string()}),handler:async input=>input})
+      .tool({name:"fail",description:"Fail report",method:"GET",input:z.object({}),handler:async()=>{throw new Error("private failure");}}));`;
     const child = spawn("bun", ["-e", source], {
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -41,12 +43,14 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
     async function http(
       path: string,
       authenticated = true,
+      body?: string,
     ): Promise<{ status: number; body: string }> {
       return new Promise((resolve, reject) => {
         const req = request(
           {
             socketPath,
             path,
+            method: body === undefined ? "GET" : "POST",
             headers: authenticated ? { "x-temps-auth-signature": secret } : {},
           },
           (res) => {
@@ -58,7 +62,7 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
           },
         );
         req.on("error", reject);
-        req.end();
+        req.end(body);
       });
     }
     try {
@@ -75,7 +79,17 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
         }) + "\n",
       );
       expect(JSON.parse((await iterator.next()).value ?? "null")).toMatchObject(
-        { type: "ready", protocol_version: 2 },
+        {
+          type: "ready",
+          protocol_version: 2,
+          openapi: {
+            paths: {
+              "/tools/create": {
+                post: { "x-temps-ai-tool": { access: "write" } },
+              },
+            },
+          },
+        },
       );
       expect((await http("/_temps/channel", false)).status).toBe(401);
       expect((await http("/_events", false)).status).toBe(401);
@@ -124,6 +138,16 @@ it.skipIf(spawnSync("bun", ["--version"]).status !== 0)(
       expect(calls.filter((method) => method === "generate_ai")).toHaveLength(
         1,
       );
+      const created = await http(
+        "/tools/create",
+        true,
+        JSON.stringify({ title: "Report" }),
+      );
+      expect(created.status).toBe(200);
+      expect(JSON.parse(created.body)).toEqual({ title: "Report" });
+      const failed = await http("/tools/fail");
+      expect(failed.status).toBe(500);
+      expect(failed.body).not.toContain("private failure");
       approved = false;
       const revoked = await http("/");
       expect(JSON.parse(revoked.body)).toMatchObject({

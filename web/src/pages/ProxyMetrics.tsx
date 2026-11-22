@@ -24,9 +24,16 @@ import {
   getEnvironmentsOptions,
   getProjectOptions,
   getProjectsHealthOptions,
+  getProjectsHealthQueryKey,
   getProjectsOptions,
+  getProjectsQueryKey,
   getTimeBucketStatsOptions,
+  getTimeBucketStatsQueryKey,
+  nodeMetricsGetClusterRangeQueryKey,
+  nodeMetricsGetRangeQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { keepPreviousWindow, queryKeyPrefix } from '@/lib/refresh'
 import {
   NodeReportingNotice,
   NodeScopeSelect,
@@ -76,7 +83,7 @@ import {
   type ResolvedProxyWindow,
 } from '@/lib/proxy-metrics-window'
 import { useQueries, useQuery } from '@tanstack/react-query'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useReducer, useRef, useState } from 'react'
 import type { DateRange } from 'react-day-picker'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import {
@@ -88,6 +95,7 @@ import {
   XAxis,
   YAxis,
 } from 'recharts'
+import { useWindowMoves, useWindowQuery } from '@/hooks/useWindowQuery'
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -413,18 +421,22 @@ function proxySeriesQuery(
   window: ResolvedProxyWindow,
   scope: NodeScope
 ) {
+  const options = nodeRangeQuery(
+    scope,
+    window.rangeParam
+      ? { metric, range: window.rangeParam }
+      : {
+          metric,
+          start_time: window.startIso,
+          end_time: window.endIso,
+        }
+  )
   return {
-    ...nodeRangeQuery(
-      scope,
-      window.rangeParam
-        ? { metric, range: window.rangeParam }
-        : {
-            metric,
-            start_time: window.startIso,
-            end_time: window.endIso,
-          }
-    ),
+    ...options,
     staleTime: 15_000,
+    // Refresh moves a preset window: keep the chart on screen meanwhile, but
+    // not across another node scope.
+    placeholderData: keepPreviousWindow(options.queryKey),
     // A refused read (a role without settings:read) is neither retried nor
     // polled again: the answer cannot change until the role does.
     refetchInterval: refetchUnlessRefused(30_000),
@@ -433,15 +445,19 @@ function proxySeriesQuery(
   }
 }
 
-/** Memoized window bounds for the selected range (stable query keys). */
+/**
+ * Memoized window bounds for the selected range (stable query keys). A new
+ * `moves` (Refresh) resolves a preset again from now.
+ */
 function useResolvedWindow(
   range: ProxyRangeValue,
-  custom: DateRange | undefined
+  custom: DateRange | undefined,
+  moves: number
 ) {
-  return useMemo(
-    () => resolveProxyWindow(range, custom, new Date()),
-    [range, custom]
-  )
+  return useMemo(() => {
+    void moves
+    return resolveProxyWindow(range, custom, new Date())
+  }, [range, custom, moves])
 }
 
 /**
@@ -449,7 +465,7 @@ function useResolvedWindow(
  * stat cards and every chart panel, so React Query dedupes to one request.
  */
 function useBucketStats(window: ResolvedProxyWindow, filter: ProxyFilter) {
-  return useQuery({
+  return useWindowQuery({
     ...getTimeBucketStatsOptions({
       query: {
         start_time: window.startIso,
@@ -599,9 +615,11 @@ function NodeMetricPanel({
   scope: NodeScope
   emptyText?: string
 }) {
-  const results = useQueries({
-    queries: panel.series.map((s) => proxySeriesQuery(s.metric, window, scope)),
-  })
+  const queries = panel.series.map((s) =>
+    proxySeriesQuery(s.metric, window, scope)
+  )
+  useWindowMoves(queries.map((q) => q.queryKey))
+  const results = useQueries({ queries })
 
   const isPending = results.some((r) => r.isPending)
   const errors = results.filter((r) => r.isError).map((r) => r.error)
@@ -819,19 +837,19 @@ function NodeSummaryStats({
   scope: NodeScope
 }) {
   // Same query keys the chart panels use — React Query dedupes the fetches.
+  const queries = [
+    proxySeriesQuery('proxy.requests', window, scope),
+    proxySeriesQuery('proxy.requests_5xx', window, scope),
+    proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
+    // Destination split — same options the "Requests by destination"
+    // panel uses, so React Query dedupes the fetches.
+    proxySeriesQuery('proxy.requests_project', window, scope),
+    proxySeriesQuery('proxy.requests_console', window, scope),
+    proxySeriesQuery('proxy.requests_other', window, scope),
+  ]
+  useWindowMoves(queries.map((q) => q.queryKey))
   const [requests, errors5xx, p95, destProject, destConsole, destOther] =
-    useQueries({
-      queries: [
-        proxySeriesQuery('proxy.requests', window, scope),
-        proxySeriesQuery('proxy.requests_5xx', window, scope),
-        proxySeriesQuery('proxy.request_duration_p95_ms', window, scope),
-        // Destination split — same options the "Requests by destination"
-        // panel uses, so React Query dedupes the fetches.
-        proxySeriesQuery('proxy.requests_project', window, scope),
-        proxySeriesQuery('proxy.requests_console', window, scope),
-        proxySeriesQuery('proxy.requests_other', window, scope),
-      ],
-    })
+    useQueries({ queries })
 
   const totalRequests = (requests.data ?? []).reduce(
     (acc, p) => acc + (p.value ?? 0),
@@ -1143,7 +1161,7 @@ function TrafficByProject({
   const totalPages = Math.max(1, Math.ceil(total / TRAFFIC_PAGE_SIZE))
 
   const idsParam = projects.map((p) => p.id).join(',')
-  const healthQ = useQuery({
+  const healthQ = useWindowQuery({
     ...getProjectsHealthOptions({
       query: {
         project_ids: idsParam,
@@ -1322,7 +1340,8 @@ export default function ProxyMetrics() {
     projectId: null,
     environmentId: null,
   })
-  const resolved = useResolvedWindow(range, customRange)
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const resolved = useResolvedWindow(range, customRange, windowMoves)
   const isFiltered = filter.projectId != null
   const tooWide = proxyWindowTooWide(resolved, isFiltered)
   const maxDays = isFiltered
@@ -1349,6 +1368,18 @@ export default function ProxyMetrics() {
           description="Hot-path traffic and latency metrics for the Temps proxy"
           actions={
             <div className="flex w-full flex-col gap-2 sm:w-auto sm:flex-row sm:flex-wrap sm:items-center">
+              <RefreshButton
+                queryKeys={[
+                  queryKeyPrefix(nodeMetricsGetClusterRangeQueryKey),
+                  queryKeyPrefix(nodeMetricsGetRangeQueryKey),
+                  queryKeyPrefix(getTimeBucketStatsQueryKey),
+                  queryKeyPrefix(getProjectsHealthQueryKey),
+                  queryKeyPrefix(getProjectsQueryKey, {
+                    query: { per_page: TRAFFIC_PAGE_SIZE },
+                  }),
+                ]}
+                onRefresh={moveWindow}
+              />
               {/* Per-project views read the control plane's request logs,
                   so the node choice only applies to the unfiltered view. */}
               {!isFiltered && canReadNodeMetrics && (

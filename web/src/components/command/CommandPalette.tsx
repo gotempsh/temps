@@ -1,15 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import {
   getProjectsInfiniteOptions,
-  listGlobalMcpsOptions,
-  listGlobalSkillsOptions,
   listProjectGroupsOptions,
   listServicesInfiniteOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { GROUP_PAGE_SIZE } from '@/components/project-groups/useProjectGroups'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   Command,
   CommandDialog,
@@ -27,6 +26,13 @@ import { normalizeFrecency } from '@/lib/frecency'
 import { projectHasPage } from '@/lib/project-navigation'
 import { settingsSectionPath } from '@/lib/project-settings-sections'
 import {
+  PROJECT_SETTINGS_INDEX,
+  pluginAiToolSetting,
+  projectHasSetting,
+  projectSettingUrl,
+  type SettingPreset,
+} from '@/lib/project-settings-index'
+import {
   buildCommandSampleQueries,
   dedupeCommandDestinations,
   hoistResultFirst,
@@ -43,11 +49,12 @@ import {
   indexSettingsNavigationGroups,
   mergeNavigationItems,
   platformToolNavigationItems,
+  platformSettingNavigationItems,
   settingsPageNavigationItems,
 } from '@/lib/command-navigation-catalog'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { TERMS, groupHref } from '@/lib/terminology'
-import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { CLUSTER_DNS_URL, WORKER_NODES_URL } from '@/lib/worker-nodes'
 import {
   mergeSettingsNavigationGroups,
   type SettingsNavigationIcon,
@@ -55,8 +62,12 @@ import {
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 import { useInfiniteQuery, useQuery } from '@tanstack/react-query'
 import Fuse from 'fuse.js'
+import { NAV_FUSE_OPTIONS } from './nav-search'
 import {
   Activity,
+  CalendarCheck,
+  Clock,
+  HeartPulse,
   BadgeCheck,
   BarChart3,
   Bell,
@@ -94,6 +105,7 @@ import {
   Settings2,
   Shield,
   ShieldCheck,
+  ShieldOff,
   Sparkles,
   SquareTerminal,
   SunMoon,
@@ -118,6 +130,8 @@ interface NavigationItem {
   url: string
   icon: SettingsNavigationIcon
   keywords?: string[]
+  /** Offered only for services built with this preset. */
+  preset?: SettingPreset
 }
 
 export function CommandPaletteSuggestions({
@@ -215,7 +229,7 @@ function titleBoost(title: string, query: string): number {
 const commandActions: CommandAction[] = [
   {
     id: 'toggle-theme',
-    title: 'Toggle Theme',
+    title: 'Toggle theme',
     icon: SunMoon,
     keywords: ['toggle', 'theme', 'dark', 'light', 'mode'],
     run: () => document.body.classList.toggle('dark'),
@@ -255,13 +269,7 @@ const mainNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Workspaces',
-    url: '/workspaces',
-    icon: Folder,
-    keywords: ['workspace', 'context', 'persistent'],
-  },
-  {
-    title: 'Deploy your first app',
+    title: 'Get started',
     url: '/get-started',
     icon: Rocket,
     keywords: [
@@ -270,6 +278,11 @@ const mainNavItems: NavigationItem[] = [
       'sample',
       'demo',
       'first deploy',
+      'templates',
+      'sandbox',
+      'email',
+      'analytics',
+      'otel',
       'onboarding',
       'hello',
     ],
@@ -365,18 +378,34 @@ const mainNavItems: NavigationItem[] = [
       'deploy',
     ],
   },
+  // A card in the Worker Nodes page's collapsed Advanced section; the anchor
+  // opens the section and scrolls to it.
+  {
+    title: 'Cluster DNS',
+    url: CLUSTER_DNS_URL,
+    icon: Globe,
+    keywords: [
+      'cluster',
+      'dns',
+      'temps.local',
+      'service discovery',
+      'resolver',
+      'internal dns',
+      'name resolution',
+    ],
+  },
 ]
 
 const settingsNavItems: NavigationItem[] = [
   // General
   {
-    title: 'Platform Settings',
+    title: 'Platform settings',
     url: '/settings',
     icon: Settings2,
     keywords: ['preferences', 'configuration', 'config', 'platform', 'general'],
   },
   {
-    title: 'Notification Providers',
+    title: 'Notification providers',
     url: '/settings/notifications',
     icon: Bell,
     keywords: [
@@ -389,7 +418,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Add Notification Provider',
+    title: 'Add notification provider',
     url: '/settings/notifications/new',
     icon: BellPlus,
     keywords: [
@@ -424,7 +453,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Create Team',
+    title: 'Create team',
     url: '/settings/teams?new=1',
     icon: UsersRound,
     keywords: ['new', 'create', 'add', 'team', 'group', 'access'],
@@ -436,19 +465,19 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['sso', 'oidc', 'openid', 'identity', 'login', 'saml'],
   },
   {
-    title: 'Add SSO Provider',
+    title: 'Add SSO provider',
     url: '/settings/auth/new',
     icon: KeyRound,
     keywords: ['sso', 'oidc', 'create', 'connect', 'okta', 'auth0', 'keycloak'],
   },
   {
-    title: 'API Keys',
+    title: 'API keys',
     url: '/settings/keys',
     icon: Key,
     keywords: ['tokens', 'auth', 'authentication', 'api'],
   },
   {
-    title: 'Create API Key',
+    title: 'Create API key',
     url: '/settings/keys/new',
     icon: Key,
     keywords: ['new', 'create', 'add', 'token', 'api', 'key'],
@@ -461,7 +490,7 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['dns', 'urls', 'websites', 'custom domain'],
   },
   {
-    title: 'Provision Domain',
+    title: 'Provision domain',
     url: '/domains/add',
     icon: Globe,
     keywords: ['new', 'create', 'add', 'domain', 'dns', 'custom domain'],
@@ -509,19 +538,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Chat',
+    title: 'AI chat',
     url: '/chat',
     icon: MessageSquare,
     keywords: ['ai', 'chat', 'assistant', 'conversation', 'ask'],
   },
   {
-    title: 'AI Usage',
+    title: 'AI usage',
     url: '/ai-gateway/usage',
     icon: BarChart3,
     keywords: ['ai', 'usage', 'credits', 'cost', 'tokens', 'spend', 'billing'],
   },
   {
-    title: 'AI Limits',
+    title: 'AI limits',
     url: '/ai-gateway/limits',
     icon: Gauge,
     keywords: [
@@ -536,42 +565,26 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Activity',
+    title: 'AI activity',
     url: '/ai-gateway/activity',
     icon: Activity,
     keywords: ['ai', 'activity', 'traces', 'telemetry', 'otel', 'spans'],
   },
   {
-    title: 'AI Gateway Setup',
-    url: '/ai-gateway/setup',
-    icon: Sparkles,
+    // Always listed: the sidebar's setup card can be hidden, and this is the
+    // way back to the checklist.
+    title: 'Finish setting up',
+    url: '/setup',
+    icon: BadgeCheck,
     keywords: [
-      'ai',
-      'setup',
-      'quickstart',
-      'code examples',
-      'curl',
-      'sdk',
-      'endpoint',
-      'byok',
+      'platform setup',
+      'setup checklist',
+      'onboarding checklist',
+      'setup steps',
     ],
   },
   {
-    title: 'Workflows',
-    url: '/ai-workflows',
-    icon: Bot,
-    keywords: [
-      'ai',
-      'ai workflows',
-      'workflows',
-      'agents',
-      'sandbox',
-      'automation',
-      'autopilot',
-    ],
-  },
-  {
-    title: 'Connect AI Harness',
+    title: 'Connect AI harness',
     url: '/setup/ai',
     icon: Wand2,
     keywords: [
@@ -587,36 +600,6 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Skills',
-    url: '/skills',
-    icon: Wand2,
-    keywords: [
-      'skills',
-      'ai',
-      'agents',
-      'claude',
-      'instructions',
-      'prompts',
-      'global',
-    ],
-  },
-  {
-    title: 'MCP Servers',
-    url: '/mcp-servers',
-    icon: Server,
-    keywords: [
-      'mcp',
-      'model',
-      'context',
-      'protocol',
-      'tools',
-      'servers',
-      'agents',
-      'claude',
-      'global',
-    ],
-  },
-  {
     title: 'Git connections',
     url: '/git-providers',
     icon: GitBranch,
@@ -629,7 +612,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Add Git Provider',
+    title: 'Add Git provider',
     url: '/git-providers/add',
     icon: GitBranch,
     keywords: [
@@ -644,7 +627,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'DNS Providers',
+    title: 'DNS providers',
     url: '/dns-providers',
     icon: Cloud,
     keywords: [
@@ -658,13 +641,13 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Delivery Profiles',
+    title: 'Delivery profiles',
     url: '/delivery-profiles',
     icon: Cloud,
     keywords: ['delivery', 'cdn', 'cloudflare', 'direct', 'domains'],
   },
   {
-    title: 'Add DNS Provider',
+    title: 'Add DNS provider',
     url: '/dns-providers/add',
     icon: Cloud,
     keywords: [
@@ -679,19 +662,19 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Load Balancer',
+    title: 'Load balancer',
     url: '/settings/load-balancer',
     icon: Server,
     keywords: ['lb', 'balancing', 'proxy', 'routes'],
   },
   {
-    title: 'Docker Registry',
+    title: 'Docker registry',
     url: '/settings/docker-registry',
     icon: Boxes,
     keywords: ['docker', 'registry', 'container', 'image'],
   },
   {
-    title: 'Build Limits',
+    title: 'Build limits',
     url: '/settings/build-limits',
     icon: Gauge,
     keywords: ['build', 'limits', 'concurrency', 'resources', 'cpu', 'memory'],
@@ -719,7 +702,7 @@ const settingsNavItems: NavigationItem[] = [
   },
   // Security
   {
-    title: 'Security Headers',
+    title: 'Security headers',
     url: '/settings/security',
     icon: Shield,
     keywords: ['security', 'headers', 'csp', 'cors', 'protection'],
@@ -731,13 +714,13 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['shield', 'learning', 'attackers', 'approve', 'block', 'review'],
   },
   {
-    title: 'Rate Limiting',
+    title: 'Rate limiting',
     url: '/settings/rate-limiting',
     icon: Monitor,
     keywords: ['rate', 'limit', 'throttle', 'ip', 'access'],
   },
   {
-    title: 'Disk Monitoring',
+    title: 'Disk monitoring',
     url: '/settings/disk-monitoring',
     icon: HardDrive,
     keywords: ['disk', 'space', 'storage', 'alerts', 'monitoring'],
@@ -763,7 +746,7 @@ const settingsNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Metrics Monitoring',
+    title: 'Metrics monitoring',
     url: '/settings/metrics-monitoring',
     icon: BarChart3,
     keywords: [
@@ -780,13 +763,13 @@ const settingsNavItems: NavigationItem[] = [
 
 const observeNavItems: NavigationItem[] = [
   {
-    title: 'Proxy Logs',
+    title: 'Proxy logs',
     url: '/proxy-logs',
     icon: Activity,
     keywords: ['logs', 'proxy', 'requests', 'traffic'],
   },
   {
-    title: 'Audit Logs',
+    title: 'Audit logs',
     url: '/audit-logs',
     icon: ScrollText,
     keywords: ['logs', 'audit', 'history', 'activity'],
@@ -795,13 +778,14 @@ const observeNavItems: NavigationItem[] = [
 
 const indexedSettingsNavItems = mergeNavigationItems(
   settingsNavItems.filter((item) => isSettingsNavigationUrl(item.url)),
-  settingsPageNavigationItems
+  settingsPageNavigationItems,
+  platformSettingNavigationItems
 )
 const secondaryNavigationUrls = new Set([
   ...observeNavItems.map((item) => item.url),
   ...indexedSettingsNavItems.map((item) => item.url),
 ])
-const indexedMainNavItems = excludeNavigationUrls(
+export const indexedMainNavItems = excludeNavigationUrls(
   mergeNavigationItems(
     mainNavItems,
     settingsNavItems.filter((item) => !isSettingsNavigationUrl(item.url)),
@@ -840,6 +824,12 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['stats', 'metrics', 'analytics', 'overview'],
   },
   {
+    title: 'Traffic filters',
+    url: 'analytics/settings',
+    icon: ShieldOff,
+    keywords: ['bots', 'datacenter', 'cloud', 'exclude', 'filter', 'spam'],
+  },
+  {
     title: 'Revenue',
     url: 'revenue',
     icon: CreditCard,
@@ -863,13 +853,13 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['users', 'visitors', 'traffic', 'analytics'],
   },
   {
-    title: 'Live Visitors',
+    title: 'Live visitors',
     url: 'analytics/live-visitors',
     icon: Users,
     keywords: ['live', 'realtime', 'online', 'active', 'now', 'analytics'],
   },
   {
-    title: 'Live Globe',
+    title: 'Live globe',
     url: 'analytics/live',
     icon: Globe,
     keywords: ['live', 'globe', 'map', 'realtime', 'world', 'analytics'],
@@ -887,13 +877,13 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['pages', 'views', 'pageviews', 'analytics'],
   },
   {
-    title: 'AI Agents',
+    title: 'AI agents',
     url: 'analytics/ai-agents',
     icon: Bot,
     keywords: ['ai', 'agents', 'bots', 'llm', 'analytics', 'traffic'],
   },
   {
-    title: 'Session Replays',
+    title: 'Session replays',
     url: 'analytics/replays',
     icon: Monitor,
     keywords: ['session', 'replays', 'recordings', 'analytics'],
@@ -905,13 +895,19 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['funnels', 'conversion', 'flow', 'analytics'],
   },
   {
-    title: 'Analytics Setup',
+    title: 'Surveys',
+    url: 'analytics/surveys',
+    icon: MessageSquare,
+    keywords: ['surveys', 'nps', 'feedback', 'questions', 'analytics'],
+  },
+  {
+    title: 'Analytics setup',
     url: 'analytics/setup',
     icon: Settings,
     keywords: ['setup', 'configuration', 'install', 'analytics'],
   },
   {
-    title: 'API Traffic',
+    title: 'API traffic',
     url: 'analytics/api-traffic',
     icon: Server,
     keywords: ['api', 'traffic', 'requests', 'analytics'],
@@ -929,19 +925,19 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['logs', 'runtime', 'console', 'output', 'live'],
   },
   {
-    title: 'Log History',
+    title: 'Log history',
     url: 'runtime?tab=history',
     icon: History,
     keywords: ['logs', 'history', 'search', 'archive', 'past'],
   },
   {
-    title: 'Speed Insights',
+    title: 'Speed insights',
     url: 'speed',
     icon: Monitor,
     keywords: ['performance', 'speed', 'insights', 'vitals'],
   },
   {
-    title: 'Error Tracking',
+    title: 'Error tracking',
     url: 'errors',
     icon: Shield,
     keywords: ['errors', 'exceptions', 'bugs', 'tracking'],
@@ -949,14 +945,8 @@ export const projectNavItems: NavigationItem[] = [
   {
     title: 'Uptime',
     url: 'monitors',
-    icon: Activity,
+    icon: HeartPulse,
     keywords: ['monitoring', 'uptime', 'health', 'monitors'],
-  },
-  {
-    title: 'Status Pages',
-    url: 'status-pages',
-    icon: Globe,
-    keywords: ['status page', 'public status', 'uptime', 'outage', 'publish'],
   },
   {
     title: 'Traces',
@@ -972,7 +962,7 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'AI Crawlers',
+    title: 'AI crawlers',
     url: 'ai-crawlers',
     icon: Bot,
     keywords: [
@@ -992,7 +982,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['settings', 'configuration', 'general', 'service'],
   },
   {
-    title: 'Feature Flags',
+    title: 'Feature flags',
     url: settingsSectionPath('delivery', 'feature-flags'),
     icon: Flag,
     keywords: ['flags', 'feature flags', 'toggles', 'rollout'],
@@ -1010,7 +1000,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['environments', 'env', 'staging', 'production'],
   },
   {
-    title: 'Environment Variables',
+    title: 'Environment variables',
     url: 'environment-variables',
     icon: Key,
     keywords: ['variables', 'env', 'config'],
@@ -1022,8 +1012,8 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['secrets', 'secret files', 'mounted secrets', '/run/secrets'],
   },
   {
-    title: 'Deployment Tokens',
-    url: settingsSectionPath('variables', 'deployment-tokens'),
+    title: 'Deployment tokens',
+    url: settingsSectionPath('deployment-tokens', 'deployment-tokens'),
     icon: Key,
     keywords: ['tokens', 'deployment tokens', 'TEMPS_API_TOKEN', 'api'],
   },
@@ -1034,7 +1024,7 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['git', 'repository', 'repo', 'source'],
   },
   {
-    title: 'Build & Deploy',
+    title: 'Build & deploy',
     url: 'settings/delivery',
     icon: Settings,
     keywords: ['build', 'framework', 'compose', 'docker', 'root directory'],
@@ -1046,16 +1036,74 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['security', 'headers', 'rate limiting', 'protection'],
   },
   {
+    title: 'Vulnerability scanning',
+    url: 'settings/security#vulnerability-scanning',
+    icon: ShieldCheck,
+    keywords: ['scan', 'scans', 'cve', 'trivy', 'vulnerabilities', 'image'],
+  },
+  {
+    title: 'Security headers',
+    url: 'settings/security#security-headers',
+    icon: Shield,
+    keywords: ['headers', 'csp', 'hsts', 'content security policy'],
+  },
+  {
+    title: 'Rate limiting',
+    url: 'settings/security#rate-limiting',
+    icon: Gauge,
+    keywords: ['rate limit', 'throttle', 'requests per minute'],
+  },
+  {
+    title: 'Shield',
+    url: 'settings/security#shield',
+    icon: Shield,
+    keywords: ['shield', 'waf', 'bots', 'firewall', 'block'],
+  },
+  {
+    title: 'Internal access',
+    url: 'settings/security#internal-access',
+    icon: Network,
+    keywords: [
+      'internal access',
+      'temps.local',
+      'sandbox',
+      'allow',
+      'grant',
+      'project to project',
+      'private network',
+    ],
+  },
+  {
     title: 'Access',
     url: 'settings/access',
     icon: Users,
     keywords: ['access', 'permissions', 'members', 'roles', 'team'],
   },
   {
-    title: 'Cron Jobs',
-    url: settingsSectionPath('automation', 'cron-jobs'),
-    icon: Activity,
-    keywords: ['cron', 'jobs', 'scheduled', 'tasks'],
+    title: 'Cron jobs',
+    url: 'cron-jobs',
+    icon: Clock,
+    keywords: [
+      'cron',
+      'jobs',
+      'scheduled',
+      'tasks',
+      '.temps.yaml',
+      'temps.yaml',
+    ],
+  },
+  {
+    title: 'Check-ins',
+    url: 'check-ins',
+    icon: CalendarCheck,
+    keywords: [
+      'check-in',
+      'cron monitor',
+      'heartbeat',
+      'missed job',
+      'sentry',
+      'withMonitor',
+    ],
   },
   {
     title: 'Webhooks',
@@ -1064,33 +1112,10 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['webhooks', 'hooks', 'events', 'callbacks', 'integrations'],
   },
   {
-    title: 'Service skills',
-    url: settingsSectionPath('integrations', 'skills'),
-    icon: Wand2,
-    keywords: [
-      'skills',
-      'ai',
-      'agents',
-      'claude',
-      'instructions',
-      'service',
-      'project',
-    ],
-  },
-  {
-    title: 'Service MCP Servers',
-    url: settingsSectionPath('integrations', 'mcp-servers'),
-    icon: Server,
-    keywords: [
-      'mcp',
-      'model',
-      'context',
-      'protocol',
-      'tools',
-      'servers',
-      'service',
-      'project',
-    ],
+    title: 'Linked vaults',
+    url: settingsSectionPath('integrations', 'vaults'),
+    icon: KeyRound,
+    keywords: ['vault', 'vaults', 'access', 'sessions', 'bundles', 'services'],
   },
   {
     title: 'Metrics',
@@ -1120,7 +1145,7 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Telemetry Logs',
+    title: 'Telemetry logs',
     url: 'telemetry-logs',
     icon: ScrollText,
     keywords: ['logs', 'opentelemetry', 'otel', 'observe'],
@@ -1132,19 +1157,19 @@ export const projectNavItems: NavigationItem[] = [
     keywords: ['services', 'kv', 'blob', 'storage', 'redis', 's3'],
   },
   {
-    title: 'Services - KV Store',
+    title: 'Services - KV store',
     url: 'services/kv',
     icon: Database,
     keywords: ['kv', 'key-value', 'redis', 'cache', 'storage'],
   },
   {
-    title: 'Services - Blob Storage',
+    title: 'Services - Blob storage',
     url: 'services/blob',
     icon: HardDrive,
     keywords: ['blob', 's3', 'files', 'storage', 'uploads', 'objects'],
   },
   {
-    title: 'AI Traces',
+    title: 'AI traces',
     url: 'ai-gateway',
     icon: Bot,
     keywords: [
@@ -1161,62 +1186,90 @@ export const projectNavItems: NavigationItem[] = [
     ],
   },
   {
-    title: 'Agents',
-    url: settingsSectionPath('automation', 'agents'),
+    title: 'Automations',
+    url: settingsSectionPath('automation', 'automations'),
     icon: Bot,
-    keywords: ['agents', 'autopilot', 'ai', 'automation', 'workflows'],
+    keywords: [
+      'automation',
+      'agents',
+      'autopilot',
+      'ai',
+      'chat',
+      'workflows',
+      'prompt',
+      'schedule',
+    ],
   },
   {
     title: 'Crash autofix',
     url: settingsSectionPath('automation', 'crash-autofix'),
     icon: Wand2,
-    keywords: ['autofix', 'crash', 'errors', 'fix', 'incident', 'confidence'],
+    keywords: [
+      'autofix',
+      'autofixer',
+      'crash',
+      'errors',
+      'fix',
+      'repair',
+      'incident',
+      'confidence',
+    ],
   },
   {
-    title: 'Autofixer',
-    url: settingsSectionPath('automation', 'autofixer'),
-    icon: Wand2,
-    keywords: ['autofix', 'autofixer', 'ai', 'errors', 'repair'],
-  },
-  {
-    title: 'Error Alert Rules',
+    title: 'Error alert rules',
     url: 'errors/alert-rules',
     icon: Bell,
     keywords: ['errors', 'alerts', 'rules', 'notifications'],
   },
   {
-    title: 'Security Scans',
+    title: 'Security scans',
     url: 'security',
     icon: Shield,
     keywords: ['security', 'scans', 'vulnerabilities', 'cve'],
   },
   {
-    title: 'Request Logs',
+    title: 'Request logs',
     url: 'request-logs',
     icon: Network,
     keywords: ['logs', 'requests', 'http', 'traffic'],
   },
+  // Single settings inside the settings pages ("Docker Compose", "Health
+  // checks"), each opening its page scrolled to that setting.
+  ...PROJECT_SETTINGS_INDEX.map((entry) => ({
+    title: entry.title,
+    url: projectSettingUrl(entry),
+    icon: Settings2,
+    keywords: ['setting', 'settings', ...entry.keywords],
+    preset: entry.preset,
+  })),
 ]
 
 /**
- * The project pages `project` actually has: a monitoring-only (external)
- * project registers no hosting pages, so offering them would land on
- * "Add hosting" or, for settings, on the wrong page.
+ * The project pages and settings `project` actually has: a monitoring-only
+ * (external) project registers no hosting pages, so offering them would land
+ * on "Add hosting" or, for settings, on the wrong page; and a setting specific
+ * to one build preset (the Compose file) is not offered to services built
+ * another way.
  */
 export function projectNavItemsFor(project: {
   source_type?: string | null
+  preset?: string | null
 }): NavigationItem[] {
-  return projectNavItems.filter((item) => projectHasPage(project, item.url))
+  return projectNavItems.filter(
+    (item) =>
+      projectHasPage(project, item.url) && projectHasSetting(project, item)
+  )
 }
 
 export function CommandPalette() {
+  const isAdmin = useIsInstanceAdmin()
   const [open, setOpen] = useState(false)
   const [search, setSearch] = useState('')
   // The highlighted row, controlled so it always matches the ranked list.
   const [activeValue, setActiveValue] = useState('')
   const navigate = useNavigate()
   const location = useLocation()
-  const { platformNavEntries, settingsNavEntries, projectNavEntries } =
+  const { platformNavEntries, settingsNavEntries, projectNavEntries, plugins } =
     usePluginsContext()
   const showFullBrowseCatalog =
     localStorage.getItem('temps:show-full-command-catalog') === 'true'
@@ -1249,26 +1302,6 @@ export function CommandPalette() {
     enabled: open,
   })
   const groups = useMemo(() => groupsData?.groups ?? [], [groupsData])
-
-  const { data: globalSkillsData, refetch: refetchSkills } = useQuery({
-    ...listGlobalSkillsOptions(),
-    enabled: open,
-    staleTime: 60_000,
-  })
-  const globalSkills = useMemo(
-    () => globalSkillsData?.items ?? [],
-    [globalSkillsData]
-  )
-
-  const { data: globalMcpServersData, refetch: refetchMcp } = useQuery({
-    ...listGlobalMcpsOptions(),
-    enabled: open,
-    staleTime: 60_000,
-  })
-  const globalMcpServers = useMemo(
-    () => globalMcpServersData?.items ?? [],
-    [globalMcpServersData]
-  )
 
   const {
     data: serviceResponse,
@@ -1339,18 +1372,9 @@ export function CommandPalette() {
     if (open) {
       refetchProjects()
       refetchGroups()
-      refetchSkills()
-      refetchMcp()
       refetchServices()
     }
-  }, [
-    open,
-    refetchProjects,
-    refetchGroups,
-    refetchSkills,
-    refetchMcp,
-    refetchServices,
-  ])
+  }, [open, refetchProjects, refetchGroups, refetchServices])
 
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
@@ -1402,14 +1426,24 @@ export function CommandPalette() {
   // route, so mapping the manifests here sent every plugin command to a 404
   // while the sidebar, which uses the resolved entries, worked.
   const pluginNavItems: NavigationItem[] = useMemo(
-    () =>
-      [...platformNavEntries, ...settingsNavEntries].map((entry) => ({
+    () => [
+      ...[...platformNavEntries, ...settingsNavEntries].map((entry) => ({
         title: entry.label,
         url: entry.path,
         icon: resolvePluginIcon(entry.icon),
         keywords: ['plugin', entry.pluginName, entry.label.toLowerCase()],
       })),
-    [platformNavEntries, settingsNavEntries]
+      ...(isAdmin ? plugins : []).map((plugin) => {
+        const setting = pluginAiToolSetting(plugin.name)
+        return {
+          title: setting.title,
+          url: projectSettingUrl(setting),
+          icon: resolvePluginIcon('bot'),
+          keywords: setting.keywords,
+        }
+      }),
+    ],
+    [platformNavEntries, settingsNavEntries, plugins, isAdmin]
   )
 
   // Project-scoped plugin nav entries (relative URLs, prefixed at render time)
@@ -1479,17 +1513,7 @@ export function CommandPalette() {
       allNavItems.push(...projectSpecificItems)
     }
 
-    return new Fuse(allNavItems, {
-      keys: [
-        { name: 'title', weight: 2 },
-        { name: 'url', weight: 1 },
-        { name: 'keywords', weight: 1.5 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
+    return new Fuse(allNavItems, NAV_FUSE_OPTIONS)
   }, [
     currentProjectSlug,
     currentProject,
@@ -1524,20 +1548,6 @@ export function CommandPalette() {
       minMatchCharLength: 1,
     })
   }, [groups])
-
-  const skillsFuse = useMemo(() => {
-    return new Fuse(globalSkills, {
-      keys: [
-        { name: 'name', weight: 2 },
-        { name: 'slug', weight: 1.5 },
-        { name: 'description', weight: 1 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
-  }, [globalSkills])
 
   // Every project x a bounded set of its pages, so the palette can jump
   // straight to "<project> Deployments" from anywhere instead of only offering
@@ -1577,20 +1587,6 @@ export function CommandPalette() {
     })
   }, [crossProjectItems])
 
-  const mcpFuse = useMemo(() => {
-    return new Fuse(globalMcpServers, {
-      keys: [
-        { name: 'name', weight: 2 },
-        { name: 'slug', weight: 1.5 },
-        { name: 'description', weight: 1 },
-      ],
-      threshold: 0.3,
-      includeScore: true,
-      shouldSort: true,
-      minMatchCharLength: 1,
-    })
-  }, [globalMcpServers])
-
   // Browse mode: the full, sectioned lists shown when the input is empty.
   // Once the user types, `rankedResults` takes over — see the comment there.
   const browseResults = useMemo(() => {
@@ -1613,15 +1609,11 @@ export function CommandPalette() {
       projectNav: projectNavigation,
       groups,
       projects,
-      skills: globalSkills,
-      mcpServers: globalMcpServers,
       actions: commandActions,
     }
   }, [
     groups,
     projects,
-    globalSkills,
-    globalMcpServers,
     pluginNavItems,
     projectPluginNavItems,
     currentProjectSlug,
@@ -1738,40 +1730,13 @@ export function CommandPalette() {
       ],
     }))
 
-    const skillPages: CommandDestination[] = globalSkills.map((skill) => ({
-      id: `skill:${skill.slug}`,
-      title: skill.name,
-      description: skill.description || `Open skill ${skill.name}`,
-      url: `/skills/${skill.slug}`,
-      category: 'Skill',
-      keywords: ['skill', skill.name, skill.slug],
-    }))
-    const mcpPages: CommandDestination[] = globalMcpServers.map((mcp) => ({
-      id: `mcp:${mcp.slug}`,
-      title: mcp.name,
-      description: mcp.description || `Open MCP server ${mcp.name}`,
-      url: `/mcp-servers/${mcp.slug}`,
-      category: 'MCP Server',
-      keywords: ['mcp', 'server', mcp.name, mcp.slug],
-    }))
-
     return dedupeCommandDestinations([
       ...instancePages,
       ...groupPages,
       ...projectPages,
       ...servicePages,
-      ...skillPages,
-      ...mcpPages,
     ])
-  }, [
-    browseResults,
-    currentProject,
-    groups,
-    projects,
-    services,
-    globalSkills,
-    globalMcpServers,
-  ])
+  }, [browseResults, currentProject, groups, projects, services])
 
   const commandDestinationFuse = useMemo(
     () =>
@@ -1843,7 +1808,7 @@ export function CommandPalette() {
         key: `project:${project.id}`,
         title: project.slug,
         category: TERMS.service.singular,
-        icon: <ProjectAvatar name={project.name} className="size-5" />,
+        icon: <ServiceIcon service={project} size="xs" />,
         score: rank(`project:${project.id}`, project.name, result.score),
         run: () => navigate(`/projects/${project.slug}`),
       })
@@ -1866,32 +1831,6 @@ export function CommandPalette() {
           run: () => navigate(item.url),
         })
       }
-    }
-
-    for (const result of skillsFuse.search(search)) {
-      const skill = result.item
-      out.push({
-        key: `skill:${skill.slug}`,
-        title: skill.name,
-        subtitle: skill.slug,
-        category: 'Skill',
-        icon: <Wand2 className="h-4 w-4" />,
-        score: rank(`skill:${skill.slug}`, skill.name, result.score),
-        run: () => navigate(`/skills/${skill.slug}`),
-      })
-    }
-
-    for (const result of mcpFuse.search(search)) {
-      const mcp = result.item
-      out.push({
-        key: `mcp:${mcp.slug}`,
-        title: mcp.name,
-        subtitle: mcp.slug,
-        category: 'MCP Server',
-        icon: <Server className="h-4 w-4" />,
-        score: rank(`mcp:${mcp.slug}`, mcp.name, result.score),
-        run: () => navigate(`/mcp-servers/${mcp.slug}`),
-      })
     }
 
     for (const action of commandActions) {
@@ -1929,8 +1868,6 @@ export function CommandPalette() {
     groupsFuse,
     projectsFuse,
     crossProjectFuse,
-    skillsFuse,
-    mcpFuse,
     currentProject,
     rank,
     navigate,
@@ -2044,8 +1981,6 @@ export function CommandPalette() {
     )
     const groupsById = new Map(groups.map((g) => [String(g.id), g]))
     const projectsById = new Map(projects.map((p) => [String(p.id), p]))
-    const skillsBySlug = new Map(globalSkills.map((s) => [s.slug, s]))
-    const mcpBySlug = new Map(globalMcpServers.map((m) => [m.slug, m]))
 
     const out: RecentEntry[] = []
     for (const key of recent(7)) {
@@ -2065,28 +2000,8 @@ export function CommandPalette() {
         out.push({
           key,
           title: project.slug,
-          icon: <ProjectAvatar name={project.name} className="size-5" />,
+          icon: <ServiceIcon service={project} size="xs" />,
           run: () => navigate(`/projects/${project.slug}`),
-        })
-      } else if (key.startsWith('skill:')) {
-        const skill = skillsBySlug.get(key.slice('skill:'.length))
-        if (!skill) continue
-        out.push({
-          key,
-          title: skill.name,
-          subtitle: skill.slug,
-          icon: <Wand2 className="h-4 w-4" />,
-          run: () => navigate(`/skills/${skill.slug}`),
-        })
-      } else if (key.startsWith('mcp:')) {
-        const mcp = mcpBySlug.get(key.slice('mcp:'.length))
-        if (!mcp) continue
-        out.push({
-          key,
-          title: mcp.name,
-          subtitle: mcp.slug,
-          icon: <Server className="h-4 w-4" />,
-          run: () => navigate(`/mcp-servers/${mcp.slug}`),
         })
       } else if (key.startsWith('action:')) {
         const action = commandActions.find(
@@ -2123,8 +2038,6 @@ export function CommandPalette() {
     currentProject,
     groups,
     projects,
-    globalSkills,
-    globalMcpServers,
     canViewAuditLogs,
     visibleObserveNavItems,
     extensionSettingsNavItems,
@@ -2170,7 +2083,7 @@ export function CommandPalette() {
             }
             className="flex items-center gap-2"
           >
-            <ProjectAvatar name={project.name} className="size-6" />
+            <ServiceIcon service={project} size="sm" />
             <span>{project.slug}</span>
           </CommandItem>
         ))}
@@ -2431,62 +2344,6 @@ export function CommandPalette() {
                     >
                       <item.icon className="h-4 w-4" />
                       <span>{item.title}</span>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-                <CommandSeparator />
-              </>
-            )}
-
-          {/* Skills */}
-          {showFullBrowseCatalog &&
-            !search &&
-            browseResults.skills.length > 0 && (
-              <>
-                <CommandGroup heading="Skills">
-                  {browseResults.skills.slice(0, 10).map((skill) => (
-                    <CommandItem
-                      key={`skill-${skill.id}`}
-                      onSelect={() =>
-                        runWithFrecency(`skill:${skill.slug}`, () =>
-                          navigate(`/skills/${skill.slug}`)
-                        )
-                      }
-                      className="flex items-center gap-2"
-                    >
-                      <Wand2 className="h-4 w-4" />
-                      <span className="truncate">{skill.name}</span>
-                      <span className="text-xs text-muted-foreground font-mono truncate">
-                        {skill.slug}
-                      </span>
-                    </CommandItem>
-                  ))}
-                </CommandGroup>
-                <CommandSeparator />
-              </>
-            )}
-
-          {/* MCP Servers */}
-          {showFullBrowseCatalog &&
-            !search &&
-            browseResults.mcpServers.length > 0 && (
-              <>
-                <CommandGroup heading="MCP Servers">
-                  {browseResults.mcpServers.slice(0, 10).map((mcp) => (
-                    <CommandItem
-                      key={`mcp-${mcp.id}`}
-                      onSelect={() =>
-                        runWithFrecency(`mcp:${mcp.slug}`, () =>
-                          navigate(`/mcp-servers/${mcp.slug}`)
-                        )
-                      }
-                      className="flex items-center gap-2"
-                    >
-                      <Server className="h-4 w-4" />
-                      <span className="truncate">{mcp.name}</span>
-                      <span className="text-xs text-muted-foreground font-mono truncate">
-                        {mcp.slug}
-                      </span>
                     </CommandItem>
                   ))}
                 </CommandGroup>

@@ -26,7 +26,10 @@ use temps_core::environment_address::{
 use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
-use temps_entities::{deployment_containers, deployments, ingress_connectors, node_public_ingress};
+use temps_entities::{
+    deployment_containers, deployments, ingress_connector_nodes, ingress_connectors,
+    node_public_ingress,
+};
 use tracing::{info, warn};
 use utoipa::ToSchema;
 
@@ -218,19 +221,32 @@ impl EnvironmentAddressService {
         let warning = if no_address.is_some() && gathered.deployed {
             let preview = self.preview_domain_status().await?.status;
             let db = reach.deps.db.as_ref();
-            // A tunnel only carries what workers serve (ADR 058), so it is
-            // offered only for an environment running on workers.
-            let connectors = if gathered.on_workers {
-                ingress_connectors::Entity::find()
-                    .filter(ingress_connectors::Column::Status.eq(CONNECTOR_READY))
-                    .all(db)
-                    .await?
+            // A tunnel carries what every one of its replicas serves
+            // (ADR-107 D4): any tunnel for an environment on workers, only
+            // one running on the control plane alone for one that is not.
+            let ready = ingress_connectors::Entity::find()
+                .filter(ingress_connectors::Column::Status.eq(CONNECTOR_READY))
+                .all(db)
+                .await?;
+            let connectors = if gathered.on_workers || ready.is_empty() {
+                ready
             } else {
-                Vec::new()
+                let placements = ingress_connector_nodes::Entity::find()
+                    .filter(
+                        ingress_connector_nodes::Column::ConnectorId
+                            .is_in(ready.iter().map(|c| c.id)),
+                    )
+                    .all(db)
+                    .await?;
+                let carriers = control_plane_only(&placements);
+                ready
+                    .into_iter()
+                    .filter(|c| carriers.contains(&c.id))
+                    .collect()
             };
             // The host a tunnel's environment hosts would give it (D3). A
-            // tunnel that already has them on is the only one offered (at
-            // most one may), and an environment with a private or
+            // tunnel that already has them on is preferred, and an environment
+            // with a private or
             // signed-in address is never offered a public tunnel host.
             let restricted = addresses.iter().any(|a| a.audience != Audience::Public);
             let label = super::environment_hosts::environment_host_label(
@@ -238,21 +254,18 @@ impl EnvironmentAddressService {
                 &scope.environment,
                 settings.production_hostname_template.as_deref(),
             );
-            let connectors: Vec<_> = if restricted {
-                Vec::new()
-            } else if connectors.iter().any(|c| c.environment_hosts) {
-                connectors
-                    .into_iter()
-                    .filter(|c| c.environment_hosts)
-                    .collect()
-            } else {
-                connectors
-            };
+            let mut connectors = if restricted { Vec::new() } else { connectors };
+            // Keep the configured environment-host tunnel first, but offer the
+            // other zones too: adding one domain does not change that opt-in.
+            connectors.sort_by_key(|c| (!c.environment_hosts, c.id));
             let tunnels: Vec<TunnelOffer> = connectors
                 .into_iter()
                 .map(|c| TunnelOffer {
                     connector_id: c.id,
-                    hostname: super::environment_hosts::natural_host(&label, &c.domain),
+                    hostname: super::environment_hosts::natural_host(
+                        &super::environment_hosts::tunnel_label(&label, c.host_suffix.as_deref()),
+                        &c.domain,
+                    ),
                     name: c.name,
                 })
                 .collect();
@@ -375,11 +388,11 @@ fn notification(project_id: i32, warning: &ReachabilityWarning) -> NotificationD
     );
     metadata.insert("kind".to_string(), "reachability_warning".to_string());
     NotificationData {
-        title: format!("Nobody can reach {} yet", warning.environment),
+        title: format!("Make {} reachable", warning.environment),
         message: warning.message(),
-        notification_type: NotificationType::Warning,
+        notification_type: NotificationType::Info,
         priority: NotificationPriority::Normal,
-        severity: Some("warning".to_string()),
+        severity: Some("info".to_string()),
         metadata,
         ..Default::default()
     }
@@ -442,10 +455,59 @@ impl EnvironmentAddresses for EnvironmentAddressService {
     }
 }
 
+/// Connectors that run on the control plane and on no worker: the only
+/// ones that carry an environment the control plane serves alone
+/// (ADR-107 D4).
+fn control_plane_only(
+    placements: &[ingress_connector_nodes::Model],
+) -> std::collections::HashSet<i32> {
+    let mut on_workers = std::collections::HashSet::new();
+    let mut on_control_plane = std::collections::HashSet::new();
+    for row in placements {
+        if row.node_id == temps_core::CONTROL_PLANE_NODE_ID {
+            on_control_plane.insert(row.connector_id);
+        } else {
+            on_workers.insert(row.connector_id);
+        }
+    }
+    on_control_plane
+        .into_iter()
+        .filter(|id| !on_workers.contains(id))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use temps_core::environment_address::{ReachabilityFix, ReachabilityFixKind};
+
+    fn placement(connector_id: i32, node_id: i32) -> ingress_connector_nodes::Model {
+        ingress_connector_nodes::Model {
+            id: connector_id * 100 + node_id,
+            connector_id,
+            node_id,
+            driver: None,
+            state: "ready".into(),
+            ready_connections: None,
+            connector_ref: None,
+            last_error: None,
+            reported_at: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    /// ADR-107 D4: an environment the control plane serves alone is offered
+    /// only a tunnel no worker runs a replica of.
+    #[test]
+    fn only_tunnels_on_the_control_plane_alone_carry_a_control_plane_environment() {
+        let carriers = control_plane_only(&[
+            placement(1, temps_core::CONTROL_PLANE_NODE_ID),
+            placement(2, temps_core::CONTROL_PLANE_NODE_ID),
+            placement(2, 7),
+            placement(3, 7),
+        ]);
+        assert_eq!(carriers, std::collections::HashSet::from([1]));
+    }
 
     #[test]
     fn the_episode_key_is_per_environment() {
@@ -469,8 +531,10 @@ mod tests {
             }],
         };
         let data = notification(3, &warning);
-        assert_eq!(data.title, "Nobody can reach shop-production yet");
-        assert!(data.message.contains("only resolves to this computer"));
+        assert_eq!(data.title, "Make shop-production reachable");
+        assert!(matches!(data.notification_type, NotificationType::Info));
+        assert_eq!(data.severity.as_deref(), Some("info"));
+        assert!(!data.message.contains("only resolves to this computer"));
         assert!(data.message.contains("add a domain to this environment"));
         assert_eq!(
             data.metadata.get("environment_id").map(String::as_str),

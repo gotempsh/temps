@@ -5,7 +5,7 @@
 
 // Shared display components for the email management UI.
 // Extracted from EmailsSentList / EmailDetail (StatusBadge) and
-// EmailEventTimeline / EmailAnalytics (EventIcon / EventBadge) to avoid
+// EmailEventTimeline / EmailEventLog (EventIcon / EventBadge) to avoid
 // copy-pasted logic drifting out of sync.
 
 import { Badge } from '@/components/ui/badge'

@@ -16,11 +16,14 @@ use utoipa::{OpenApi, ToSchema};
 
 use super::permission_guard;
 use super::RequireAuth;
+use crate::ai_harness::{
+    AiHarnessCredential, AiHarnessCredentialKind, AiHarnessState, AiHarnessStatusResponse,
+};
 use crate::apikey_handler_types::{
     ApiKeyListResponse, ApiKeyResponse, CreateApiKeyRequest, CreateApiKeyResponse,
     UpdateApiKeyRequest,
 };
-use crate::audit::{ApiKeyCreatedAudit, ApiKeyRotatedAudit};
+use crate::audit::{ApiKeyCreatedAudit, ApiKeyDeletedAudit, ApiKeyRotatedAudit};
 use crate::{
     apikey_service::ApiKeyService,
     apikey_types::{get_available_permissions, AvailablePermissions},
@@ -177,6 +180,8 @@ pub async fn create_api_key(
         },
         api_key_id: api_key.id,
         api_key_name: api_key.name.clone(),
+        project_id: api_key.project_id,
+        environment_id: api_key.environment_id,
         role_type,
         permissions,
     };
@@ -268,7 +273,7 @@ pub async fn get_api_key(
 }
 
 #[utoipa::path(
-    put,
+    patch,
     path = "/api-keys/{id}",
     params(
         ("id" = i32, Path, description = "API key ID")
@@ -329,18 +334,35 @@ pub async fn update_api_key(
 pub async fn delete_api_key(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<ApiKeyState>>,
+    Extension(metadata): Extension<RequestMetadata>,
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysDelete);
 
-    match state
+    let deleted = state
         .api_key_service
         .delete_api_key(auth.user_id(), api_key_id)
         .await
-    {
-        Ok(()) => Ok(StatusCode::NO_CONTENT),
-        Err(e) => Err(e.to_problem()),
+        .map_err(|e| e.to_problem())?;
+
+    let audit = ApiKeyDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        api_key_id: deleted.id,
+        api_key_name: deleted.name,
+        key_prefix: deleted.key_prefix,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for API key {} deletion: {}",
+            deleted.id, e
+        );
     }
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
@@ -498,6 +520,42 @@ pub async fn get_api_key_permissions(RequireAuth(_auth): RequireAuth) -> impl In
     Json(get_available_permissions())
 }
 
+/// Whether the caller's external AI harness has connected.
+///
+/// Backs the console's "Let your AI operate Temps" onboarding and its
+/// app-wide "finish connecting" banner. `connected` when the dedicated
+/// `Temps AI harness` key has authenticated a request, or when a key minted
+/// by a browser-approved `temps login` after it has: the CLI falls back to
+/// that flow when it is not handed a usable key, so the harness works
+/// without ever sending the dedicated key.
+#[utoipa::path(
+    get,
+    path = "/api-keys/ai-harness/status",
+    responses(
+        (status = 200, description = "AI harness connection status for the caller", body = AiHarnessStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "API Keys",
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+pub async fn get_ai_harness_status(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<ApiKeyState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ApiKeysRead);
+
+    let status = state
+        .api_key_service
+        .ai_harness_status(auth.user_id())
+        .await
+        .map_err(|e| e.to_problem())?;
+    Ok(Json(status))
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -510,6 +568,7 @@ pub async fn get_api_key_permissions(RequireAuth(_auth): RequireAuth) -> impl In
         deactivate_api_key,
         rotate_api_key,
         get_api_key_permissions,
+        get_ai_harness_status,
     ),
     components(
         schemas(
@@ -520,6 +579,10 @@ pub async fn get_api_key_permissions(RequireAuth(_auth): RequireAuth) -> impl In
             ApiKeyListResponse,
             ListApiKeysQuery,
             AvailablePermissions,
+            AiHarnessStatusResponse,
+            AiHarnessState,
+            AiHarnessCredential,
+            AiHarnessCredentialKind,
         )
     ),
     tags(
@@ -565,7 +628,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -674,6 +737,8 @@ mod tests {
 
     fn custom_request(permissions: Vec<&str>) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "test-key".to_string(),
             role_type: "custom".to_string(),
             permissions: Some(permissions.into_iter().map(String::from).collect()),
@@ -712,6 +777,8 @@ mod tests {
 
     fn predefined_request(role_type: &str) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             name: "test-key".to_string(),
             role_type: role_type.to_string(),
             permissions: None,
@@ -800,6 +867,8 @@ mod tests {
         permissions: Vec<&str>,
     ) -> CreateApiKeyRequest {
         CreateApiKeyRequest {
+            project_id: None,
+            environment_id: None,
             permissions: Some(permissions.into_iter().map(String::from).collect()),
             ..predefined_request(role_type)
         }
@@ -889,5 +958,182 @@ mod tests {
         assert!(enforce_explicit_permission_ceiling(&auth, within.permissions.as_deref()).is_ok());
         let absent = update_request(None);
         assert!(enforce_explicit_permission_ceiling(&auth, absent.permissions.as_deref()).is_ok());
+    }
+
+    fn harness_key_model(last_used: bool) -> temps_entities::api_keys::Model {
+        let now = Utc::now();
+        temps_entities::api_keys::Model {
+            id: 12,
+            name: crate::ai_harness::AI_HARNESS_KEY_NAME.to_string(),
+            key_hash: "stored-hash-never-returned".to_string(),
+            key_prefix: "tk_abc12".to_string(),
+            user_id: 42,
+            role_type: "admin".to_string(),
+            permissions: None,
+            is_active: true,
+            expires_at: None,
+            last_used_at: last_used.then_some(now),
+            created_at: now,
+            updated_at: now,
+            service_id: None,
+            project_id: None,
+            environment_id: None,
+        }
+    }
+
+    fn state_over(
+        db: sea_orm::DatabaseConnection,
+    ) -> (Arc<ApiKeyState>, Arc<RecordingAuditLogger>) {
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(ApiKeyState {
+            api_key_service: Arc::new(ApiKeyService::new(Arc::new(db))),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(RequireVerificationAuthorizer),
+        });
+        (state, audit)
+    }
+
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        entries: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl temps_core::AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let payload = operation.serialize()?;
+            self.entries
+                .lock()
+                .unwrap()
+                .push((operation.operation_type(), payload));
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_route_requires_authentication() {
+        use axum::{body::Body, http::Request, routing::get, Router};
+        use tower::ServiceExt;
+
+        let router = Router::new()
+            .route("/api-keys/ai-harness/status", get(get_ai_harness_status))
+            .with_state(guarded_state());
+        let response = router
+            .oneshot(
+                Request::get("/api-keys/ai-harness/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_requires_api_key_read_permission() {
+        let result =
+            get_ai_harness_status(RequireAuth(user_auth(Role::Reader)), State(guarded_state()))
+                .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("a reader without api_keys:read must be refused"),
+        };
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_returns_the_typed_status_without_secrets() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![harness_key_model(false)]])
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+        let (state, _) = state_over(db);
+
+        let response = get_ai_harness_status(RequireAuth(user_auth(Role::Admin)), State(state))
+            .await
+            .unwrap_or_else(|_| panic!("status lookup succeeds"))
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["status"], "waiting");
+        assert_eq!(json["key_id"], 12);
+        assert_eq!(json["setup_path"], "/setup/ai");
+        assert!(!String::from_utf8_lossy(&body).contains("stored-hash"));
+    }
+
+    #[tokio::test]
+    async fn ai_harness_status_database_failure_is_a_problem_document() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("api_keys unavailable".into())])
+            .into_connection();
+        let (state, _) = state_over(db);
+
+        let error =
+            match get_ai_harness_status(RequireAuth(user_auth(Role::Admin)), State(state)).await {
+                Err(error) => error,
+                Ok(_) => panic!("a database failure must surface"),
+            };
+        assert_eq!(error.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.body.contains_key("title"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_key_is_audit_logged_without_its_secret() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![harness_key_model(false)]])
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let (state, audit) = state_over(db);
+
+        let response = delete_api_key(
+            RequireAuth(user_auth(Role::Admin)),
+            State(state),
+            Extension(request_metadata()),
+            Path(12),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("delete succeeds"))
+        .into_response();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let (operation, payload) = &entries[0];
+        assert_eq!(operation, "API_KEY_DELETED");
+        assert!(payload.contains("\"api_key_id\":12"), "{payload}");
+        assert!(payload.contains(crate::ai_harness::AI_HARNESS_KEY_NAME));
+        assert!(!payload.contains("stored-hash"));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_missing_key_is_404_and_not_audited() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<temps_entities::api_keys::Model>::new()])
+            .into_connection();
+        let (state, audit) = state_over(db);
+
+        let error = match delete_api_key(
+            RequireAuth(user_auth(Role::Admin)),
+            State(state),
+            Extension(request_metadata()),
+            Path(77),
+        )
+        .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("deleting a missing key must fail"),
+        };
+        assert_eq!(error.status_code, StatusCode::NOT_FOUND);
+        assert!(audit.entries.lock().unwrap().is_empty());
     }
 }

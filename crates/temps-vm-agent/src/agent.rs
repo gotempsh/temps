@@ -32,14 +32,16 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use temps_vm_agent::logging::{self, Level};
 use temps_vm_agent::mounts::{MountArgs, MountError};
+use temps_vm_agent::restart::RestartBackoff;
+use temps_vm_agent::sandbox_user::{self as sandbox_user, FileOp, SandboxUser, AS_USER_FLAG};
+use temps_vm_agent::stats;
+use temps_vm_agent::supervisor::{ProcessSpec, Supervision, DEFAULT_PATH};
+use temps_vm_agent::workload_log::{self, read_tail, LogLimits, LogPipeline, RotatingLog};
 use temps_vm_agent::{
-    read_frame, relay, write_frame, Request, Response, AGENT_PORT, MAX_PTY_RELAYS, PTY_AGENT_BIN,
-    PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
+    read_frame, relay, write_frame, Request, Response, SandboxUserStatus, SpawnRestartPolicy,
+    AGENT_PORT, DEFAULT_SPAWN_LOG, MAX_FRAME_BYTES, MAX_PTY_RELAYS, MAX_READ_LOG_LINES,
+    MAX_SPAWNED_PROCESSES, PTY_AGENT_BIN, PTY_AGENT_SOCKET, PTY_PORT, WORK_DIR,
 };
-
-/// `PATH` for processes this agent starts: PID 1's own environment is empty
-/// and guest images vary, so every child gets the same sane default.
-const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /// Pause between PTY agent restarts, so a binary that dies at once cannot
 /// turn PID 1 into a hot loop.
@@ -47,6 +49,25 @@ const PTY_RESTART_DELAY: Duration = Duration::from_secs(1);
 
 /// Relays currently being served; bounded by [`MAX_PTY_RELAYS`].
 static ACTIVE_PTY_RELAYS: AtomicUsize = AtomicUsize::new(0);
+
+/// The sandbox user this boot prepared, set once by the preparation thread.
+/// Unset while it runs: RPCs are served meanwhile, so a long first-boot walk
+/// of the rootfs never delays the agent's readiness.
+static SANDBOX_USER: std::sync::OnceLock<SandboxUserStatus> = std::sync::OnceLock::new();
+
+const PREPARING: SandboxUserStatus = SandboxUserStatus::Preparing;
+
+fn sandbox_user_status() -> &'static SandboxUserStatus {
+    SANDBOX_USER.get().unwrap_or(&PREPARING)
+}
+
+/// The sandbox user, when it is ready to run commands.
+fn ready_sandbox_user() -> Option<&'static SandboxUser> {
+    match sandbox_user_status() {
+        SandboxUserStatus::Ready { user } => Some(user),
+        _ => None,
+    }
+}
 
 pub fn run() {
     let is_init = std::process::id() == 1;
@@ -61,7 +82,21 @@ pub fn run() {
             ("pty_port", json!(PTY_PORT)),
         ],
     );
-    start_terminal_support();
+    // The user is prepared beside the RPC server. Terminals start once it is
+    // settled and before it is published, so the host never sees `ready`
+    // while the terminal listener is still missing.
+    let spawned = std::thread::Builder::new()
+        .name("sandbox-user".to_string())
+        .spawn(|| {
+            sandbox_user::settle(prepare_sandbox_user, start_terminal_support, |status| {
+                let _ = SANDBOX_USER.set(status);
+            })
+        });
+    if let Err(e) = spawned {
+        let reason = format!("start the sandbox user preparation: {e}");
+        error("sandbox_user_thread_failed", &[("error", json!(reason))]);
+        let _ = SANDBOX_USER.set(SandboxUserStatus::Failed { reason });
+    }
     serve();
 }
 
@@ -90,8 +125,24 @@ const BOOT_MOUNTS: &[MountSpec] = &[
         "devpts",
         Some("mode=0620,ptmxmode=0666"),
     ),
+    // Container images expect a writable `/dev/shm`; size it like Docker's
+    // default so a guest cannot fill half its RAM through it.
+    ("tmpfs", "/dev/shm", "tmpfs", Some("mode=1777,size=65536k")),
     ("tmpfs", "/tmp", "tmpfs", None),
     ("tmpfs", "/run", "tmpfs", None),
+];
+
+/// Symlinks every container runtime creates in `/dev` and devtmpfs does not.
+///
+/// Images log by pointing files at these (nginx's `access.log` is a link to
+/// `/dev/stdout`). Without them the link dangles, the first open creates a
+/// regular file at `/dev/stdout`, and the workload's output never reaches its
+/// log stream.
+const DEV_LINKS: &[(&str, &str)] = &[
+    ("/proc/self/fd", "/dev/fd"),
+    ("/proc/self/fd/0", "/dev/stdin"),
+    ("/proc/self/fd/1", "/dev/stdout"),
+    ("/proc/self/fd/2", "/dev/stderr"),
 ];
 
 /// Minimal boot-time setup when running as PID 1.
@@ -111,6 +162,20 @@ fn setup_system() {
                     ("error", json!(e.to_string())),
                 ],
             );
+        }
+    }
+    for (target, link) in DEV_LINKS {
+        match std::os::unix::fs::symlink(target, link) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => warn(
+                "dev_link_failed",
+                &[
+                    ("link", json!(link)),
+                    ("target", json!(target)),
+                    ("error", json!(e.to_string())),
+                ],
+            ),
         }
     }
     unsafe {
@@ -289,13 +354,117 @@ fn serve() {
     }
 }
 
+// ── Sandbox user ────────────────────────────────────────────────────────
+
+/// Prepare the sandbox user the host named on the kernel command line, as
+/// root and before anything runs as it (see [`sandbox_user`]).
+fn prepare_sandbox_user() -> SandboxUserStatus {
+    let cmdline = match std::fs::read_to_string("/proc/cmdline") {
+        Ok(cmdline) => cmdline,
+        Err(e) => {
+            warn(
+                "sandbox_user_cmdline_unreadable",
+                &[("error", json!(e.to_string()))],
+            );
+            return SandboxUserStatus::NotRequested;
+        }
+    };
+    let user = match SandboxUser::from_cmdline(&cmdline) {
+        None => return SandboxUserStatus::NotRequested,
+        Some(Err(e)) => {
+            error("sandbox_user_invalid", &[("error", json!(e.to_string()))]);
+            return SandboxUserStatus::Failed {
+                reason: e.to_string(),
+            };
+        }
+        Some(Ok(user)) => user,
+    };
+    // The host extracts the rootfs unprivileged, so its files carry the
+    // host account's uid, which this binary (injected with them) shows. Hand
+    // them back to root before anything runs as the sandbox user, who would
+    // otherwise own the system if the two uids match. Which owner to hand
+    // back is recorded before the walk starts and `done` only after it
+    // finishes, so a walk cut short resumes at the next boot.
+    let exe_owner = match std::fs::metadata("/proc/self/exe") {
+        Ok(meta) => {
+            use std::os::unix::fs::MetadataExt;
+            (meta.uid(), meta.gid())
+        }
+        Err(e) => {
+            let reason = format!("inspect /proc/self/exe: {e}");
+            error("rootfs_owner_unknown", &[("error", json!(reason))]);
+            return SandboxUserStatus::Failed { reason };
+        }
+    };
+    let home = Path::new(&user.home).to_path_buf();
+    let work = Path::new(WORK_DIR).to_path_buf();
+    let normalized = sandbox_user::normalize_rootfs_owner(
+        Path::new(sandbox_user::NORMALIZATION_RECORD),
+        exe_owner,
+        |converter| {
+            sandbox_user::normalize_converter_owner(Path::new("/"), converter, &[&home, &work])
+        },
+    );
+    match normalized {
+        Ok(None) => {}
+        Ok(Some(changed)) => info("rootfs_owner_normalized", &[("changed", json!(changed))]),
+        Err(e) => {
+            error(
+                "rootfs_owner_normalize_failed",
+                &[("error", json!(e.to_string()))],
+            );
+            return SandboxUserStatus::Failed {
+                reason: e.to_string(),
+            };
+        }
+    }
+    match sandbox_user::prepare(Path::new("/"), &user, WORK_DIR) {
+        Ok(report) => {
+            info(
+                "sandbox_user_ready",
+                &[
+                    ("uid", json!(user.uid)),
+                    ("gid", json!(user.gid)),
+                    ("home", json!(user.home)),
+                    ("added_user", json!(report.added_user)),
+                    ("added_group", json!(report.added_group)),
+                    ("existing_name", json!(report.existing_name)),
+                    ("chowned", json!(report.chowned)),
+                ],
+            );
+            SandboxUserStatus::Ready { user }
+        }
+        Err(e) => {
+            error(
+                "sandbox_user_prepare_failed",
+                &[("uid", json!(user.uid)), ("error", json!(e.to_string()))],
+            );
+            SandboxUserStatus::Failed {
+                reason: e.to_string(),
+            }
+        }
+    }
+}
+
 // ── Interactive terminals (ADR-029 §5) ──────────────────────────────────
 
 /// Start the PTY agent supervisor and the terminal relay listener. Both are
 /// best effort: a guest without the PTY agent (an older rootfs, or a host
 /// that never staged the binary) still serves exec/fs RPCs normally, it just
 /// has no terminals.
-fn start_terminal_support() {
+fn start_terminal_support(status: &SandboxUserStatus) {
+    if let SandboxUserStatus::Failed { reason } = status {
+        // A terminal must not fall back to root for a sandbox meant to run
+        // as its user; the host fails the create with this reason.
+        warn(
+            "terminals_disabled",
+            &[(
+                "reason",
+                json!(format!("sandbox user not prepared: {reason}")),
+            )],
+        );
+        return;
+    }
     if !Path::new(PTY_AGENT_BIN).exists() {
         warn(
             "terminals_disabled",
@@ -306,9 +475,14 @@ fn start_terminal_support() {
         );
         return;
     }
+    // The terminals' user, as settled; the published status is not set yet.
+    let user = match status {
+        SandboxUserStatus::Ready { user } => Some(user.clone()),
+        _ => None,
+    };
     if let Err(e) = std::thread::Builder::new()
         .name("pty-supervisor".to_string())
-        .spawn(supervise_pty_agent)
+        .spawn(move || supervise_pty_agent(user))
     {
         error(
             "pty_supervisor_spawn_failed",
@@ -339,26 +513,55 @@ fn start_terminal_support() {
 /// terminal feature is dead without it: a crash is retried after a short
 /// pause rather than leaving the guest with a listener that has nobody to
 /// talk to.
-fn supervise_pty_agent() {
+fn supervise_pty_agent(user: Option<SandboxUser>) {
     let socket_dir = Path::new(PTY_AGENT_SOCKET)
         .parent()
         .unwrap_or_else(|| Path::new("/run"));
+    let user = user.as_ref();
     loop {
         secure_pty_agent_binary();
-        // 0700 root: the agent's socket is the trust boundary (ADR-008), and
-        // /run is tmpfs so this directory has to be re-created each boot.
+        // 0700 and owned by whoever runs the PTY agent (the sandbox user, as
+        // in a Docker sandbox, or root): the socket is the trust boundary
+        // (ADR-008), and /run is tmpfs so this is re-created each boot. PID 1
+        // still reaches it as root to relay the host's terminals.
         let _ = std::fs::create_dir_all(socket_dir);
         let _ = std::fs::set_permissions(socket_dir, std::fs::Permissions::from_mode(0o700));
+        if let Some(user) = user {
+            if let Err(e) = std::os::unix::fs::chown(socket_dir, Some(user.uid), Some(user.gid)) {
+                warn(
+                    "pty_socket_dir_chown_failed",
+                    &[
+                        ("path", json!(socket_dir.display().to_string())),
+                        ("error", json!(e.to_string())),
+                    ],
+                );
+            }
+        }
 
         let started = Instant::now();
-        let spawned = std::process::Command::new(PTY_AGENT_BIN)
+        let mut command = std::process::Command::new(PTY_AGENT_BIN);
+        command
             .args(["--socket", PTY_AGENT_SOCKET])
             .env_clear()
             .env("PATH", DEFAULT_PATH)
-            .env("HOME", "/root")
             .current_dir("/")
-            .stdin(Stdio::null())
-            .spawn();
+            .stdin(Stdio::null());
+        match user {
+            Some(user) => {
+                use std::os::unix::process::CommandExt;
+                command
+                    .env("HOME", &user.home)
+                    .env("USER", &user.name)
+                    .env("LOGNAME", &user.name)
+                    .current_dir(WORK_DIR)
+                    .uid(user.uid)
+                    .gid(user.gid);
+            }
+            None => {
+                command.env("HOME", "/root");
+            }
+        }
+        let spawned = command.spawn();
         match spawned {
             Ok(mut child) => {
                 let pid = child.id();
@@ -547,6 +750,10 @@ fn handle_connection(mut stream: UnixStream) {
     };
 
     let shutdown = matches!(request, Request::Shutdown);
+    if shutdown {
+        // A deliberate stop: nothing is restarted on its way down.
+        stop_all_supervised();
+    }
     let response = handle_request(request);
     respond(&mut stream, &response);
 
@@ -583,6 +790,7 @@ fn handle_request(request: Request) -> Response {
             data_hex,
             mode,
         } => write_file(&path, &data_hex, mode),
+        Request::SandboxUser => Response::SandboxUser(sandbox_user_status().clone()),
         Request::ReadFile { path } => match std::fs::read(&path) {
             Ok(data) => Response::File {
                 data_hex: hex::encode(data),
@@ -592,6 +800,15 @@ fn handle_request(request: Request) -> Response {
             },
         },
         Request::Mkdir { path, mode } => {
+            if let Some(response) = as_sandbox_user(
+                FileOp::Mkdir {
+                    path: path.clone(),
+                    mode,
+                },
+                &[],
+            ) {
+                return response;
+            }
             match std::fs::create_dir_all(&path).and_then(|_| {
                 std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
             }) {
@@ -602,6 +819,226 @@ fn handle_request(request: Request) -> Response {
             }
         }
         Request::Kill { pattern, signal } => kill_matching(&pattern, signal),
+        Request::Spawn {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+            restart,
+            log_max_bytes,
+            log_max_files,
+            limits,
+        } => spawn(SpawnArgs {
+            cmd,
+            env,
+            cwd,
+            uid,
+            gid,
+            log_path,
+            restart,
+            log_limits: LogLimits::from_request(log_max_bytes, log_max_files),
+            limits,
+        }),
+        Request::ProcessStatus { pid } => process_status(pid),
+        Request::ReadLog { path, tail_lines } => read_log(path, tail_lines),
+        Request::ReadLogSince {
+            path,
+            cursor,
+            max_bytes,
+            include_partial,
+        } => read_log_since(path, cursor, max_bytes, include_partial),
+        Request::ReadStats { pid } => read_stats(pid),
+    }
+}
+
+// ── Spawn (a workload's main process) ───────────────────────────────────
+
+/// Processes started by [`spawn`], each under a [`Supervision`] that reaps
+/// it, restarts it per its policy and bounds its log. Bounded by
+/// [`MAX_SPAWNED_PROCESSES`].
+static SPAWNED: std::sync::Mutex<Vec<Supervision>> = std::sync::Mutex::new(Vec::new());
+
+/// The process table; plain data, usable whatever a panicking holder did.
+fn spawned_table() -> std::sync::MutexGuard<'static, Vec<Supervision>> {
+    SPAWNED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A deliberate shutdown: no supervised process may be restarted between
+/// the acknowledgement and the reboot.
+fn stop_all_supervised() {
+    for supervision in spawned_table().iter() {
+        supervision.mark_stopped();
+    }
+}
+
+struct SpawnArgs {
+    cmd: Vec<String>,
+    env: HashMap<String, String>,
+    cwd: Option<String>,
+    uid: Option<u32>,
+    gid: Option<u32>,
+    log_path: Option<String>,
+    restart: SpawnRestartPolicy,
+    log_limits: LogLimits,
+    limits: temps_vm_agent::SpawnLimits,
+}
+
+fn spawn(args: SpawnArgs) -> Response {
+    let Some(program) = args.cmd.first().cloned() else {
+        return Response::Err {
+            message: "spawn: empty command".to_string(),
+        };
+    };
+    let mut spawned = spawned_table();
+    // Forget supervisions that ended: nothing of theirs runs any more.
+    spawned.retain(|supervision| !supervision.is_finished());
+    if spawned.len() >= MAX_SPAWNED_PROCESSES {
+        return Response::Err {
+            message: format!(
+                "spawn {program}: {} processes already run (limit {MAX_SPAWNED_PROCESSES})",
+                spawned.len(),
+            ),
+        };
+    }
+    let log_path = args
+        .log_path
+        .unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let log = match RotatingLog::open(&log_path, args.log_limits) {
+        Ok(log) => log,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {program}: open log {log_path}: {e}"),
+            }
+        }
+    };
+    let error_path = log_path.clone();
+    let pipeline = match LogPipeline::start(log, move |e: &std::io::Error| {
+        warn(
+            "workload_log_write_failed",
+            &[("path", json!(error_path)), ("error", json!(e.to_string()))],
+        );
+    }) {
+        Ok(pipeline) => pipeline,
+        Err(e) => {
+            return Response::Err {
+                message: format!("spawn {program}: start the log writer for {log_path}: {e}"),
+            }
+        }
+    };
+    let spec = ProcessSpec {
+        cmd: args.cmd,
+        env: args.env,
+        cwd: args.cwd.unwrap_or_else(|| "/".to_string()),
+        uid: args.uid,
+        gid: args.gid,
+        limits: args.limits,
+    };
+    match Supervision::start(spec, args.restart, RestartBackoff::default(), pipeline) {
+        Ok(supervision) => {
+            let pid = supervision.id();
+            spawned.push(supervision);
+            info(
+                "spawned",
+                &[
+                    ("pid", json!(pid)),
+                    ("cmd", json!(program)),
+                    ("restart", json!(args.restart)),
+                    ("log_path", json!(log_path)),
+                    ("log_max_bytes", json!(args.log_limits.max_bytes)),
+                    ("log_max_files", json!(args.log_limits.max_files)),
+                ],
+            );
+            Response::Spawned { pid }
+        }
+        Err(e) => Response::Err {
+            message: e.to_string(),
+        },
+    }
+}
+
+fn process_status(pid: u32) -> Response {
+    let spawned = spawned_table();
+    // Newest first: a pid number can be reused by a later spawn.
+    let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+        return Response::Err {
+            message: format!("process status: pid {pid} was not started by spawn"),
+        };
+    };
+    let status = supervision.status();
+    Response::ProcessStatus {
+        running: status.running(),
+        exit_code: if status.running() {
+            None
+        } else {
+            status.last_exit
+        },
+        restart_count: status.restart_count,
+        restarting: status.restarting,
+    }
+}
+
+fn read_log_since(
+    path: Option<String>,
+    cursor: Option<temps_vm_agent::LogCursor>,
+    max_bytes: Option<u32>,
+    include_partial: bool,
+) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let limit = max_bytes
+        .unwrap_or(temps_vm_agent::DEFAULT_LOG_CHUNK_BYTES)
+        .clamp(1, temps_vm_agent::MAX_LOG_CHUNK_BYTES) as usize;
+    match workload_log::read_since(Path::new(&path), cursor, limit, include_partial) {
+        Ok(read) => Response::LogChunk {
+            data: String::from_utf8_lossy(&read.data).into_owned(),
+            cursor: read.cursor,
+            skipped: read.skipped,
+            more: read.more,
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
+    }
+}
+
+/// Sample the guest. With a `pid`, CPU and memory are those of the tree of
+/// the process spawn started as that pid, rooted at its *current* process (the
+/// supervised pid changes when it restarts); a process that is down between
+/// restarts reports an empty tree rather than the whole VM.
+fn read_stats(pid: Option<u32>) -> Response {
+    let root = match pid {
+        None => None,
+        Some(pid) => {
+            let spawned = spawned_table();
+            let Some(supervision) = spawned.iter().rev().find(|s| s.matches(pid)) else {
+                return Response::Err {
+                    message: format!("read stats: pid {pid} was not started by spawn"),
+                };
+            };
+            // No live pid: a root no process has, so the tree is empty.
+            Some(supervision.status().current_pid.unwrap_or(0))
+        }
+    };
+    Response::Stats(stats::collect(
+        Path::new("/proc"),
+        root,
+        stats::ProcUnits::from_system(),
+    ))
+}
+
+fn read_log(path: Option<String>, tail_lines: u32) -> Response {
+    let path = path.unwrap_or_else(|| DEFAULT_SPAWN_LOG.to_string());
+    let lines = tail_lines.min(MAX_READ_LOG_LINES) as usize;
+    match read_tail(Path::new(&path), lines) {
+        Ok(bytes) => Response::Log {
+            data: String::from_utf8_lossy(&bytes).into_owned(),
+        },
+        Err(e) => Response::Err {
+            message: format!("read log {path}: {e}"),
+        },
     }
 }
 
@@ -636,13 +1073,23 @@ fn exec(
             "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
         );
     }
-    command.env("HOME", "/root");
+    // Only read when the uid is neither root nor the sandbox user.
+    let passwd = match user {
+        // Bounded like every account file the agent reads; anything it
+        // cannot read gives the `/` home.
+        Some(uid) if uid != 0 && ready_sandbox_user().is_none_or(|u| u.uid != uid) => {
+            sandbox_user::read_account_file(Path::new("/etc/passwd")).unwrap_or_default()
+        }
+        _ => String::new(),
+    };
+    let (identity, home) = sandbox_user::exec_identity(user, ready_sandbox_user(), &passwd);
+    command.env("HOME", home);
     for (k, v) in &env {
         command.env(k, v);
     }
-    if let Some(uid) = user {
+    if let Some((uid, gid)) = identity {
         use std::os::unix::process::CommandExt;
-        command.uid(uid).gid(uid);
+        command.uid(uid).gid(gid);
     }
 
     let mut child = match command.spawn() {
@@ -655,8 +1102,14 @@ fn exec(
     };
 
     // Drain both pipes on threads so neither side can fill and deadlock.
-    let mut stdout_pipe = child.stdout.take().expect("stdout piped");
-    let mut stderr_pipe = child.stderr.take().expect("stderr piped");
+    let (Some(mut stdout_pipe), Some(mut stderr_pipe)) = (child.stdout.take(), child.stderr.take())
+    else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Response::Err {
+            message: format!("spawn {}: stdout/stderr pipes were not captured", cmd[0]),
+        };
+    };
     let stdout_thread = std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = stdout_pipe.read_to_end(&mut buf);
@@ -704,6 +1157,15 @@ fn write_file(path: &str, data_hex: &str, mode: u32) -> Response {
             }
         }
     };
+    if let Some(response) = as_sandbox_user(
+        FileOp::Write {
+            path: path.to_string(),
+            mode,
+        },
+        &data,
+    ) {
+        return response;
+    }
     if let Some(parent) = Path::new(path).parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -714,6 +1176,90 @@ fn write_file(path: &str, data_hex: &str, mode: u32) -> Response {
         Err(e) => Response::Err {
             message: format!("write {}: {}", path, e),
         },
+    }
+}
+
+/// Run a file operation as the sandbox user when it targets that user's
+/// files, so they end up owned by it and a symlink it planted cannot turn
+/// a root write against the rest of the guest. `None` when the operation
+/// stays root's (no sandbox user, or a path outside its files).
+fn as_sandbox_user(op: FileOp, input: &[u8]) -> Option<Response> {
+    let user = ready_sandbox_user()?;
+    let path = match &op {
+        FileOp::Write { path, .. } | FileOp::Mkdir { path, .. } => path.as_str(),
+    };
+    match sandbox_user::is_user_file(path, user, WORK_DIR) {
+        Ok(false) => return None,
+        Ok(true) => {}
+        Err(e) => {
+            return Some(Response::Err {
+                message: e.to_string(),
+            })
+        }
+    }
+    use std::os::unix::process::CommandExt;
+    let spawned = std::process::Command::new("/proc/self/exe")
+        .arg(AS_USER_FLAG)
+        .args(op.args())
+        .env_clear()
+        .env("HOME", &user.home)
+        .current_dir("/")
+        .uid(user.uid)
+        .gid(user.gid)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn();
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            return Some(Response::Err {
+                message: format!("{path}: start the write as uid {}: {e}", user.uid),
+            })
+        }
+    };
+    let written = child
+        .stdin
+        .take()
+        .map(|mut stdin| stdin.write_all(input))
+        .unwrap_or(Ok(()));
+    let output = match child.wait_with_output() {
+        Ok(output) => output,
+        Err(e) => {
+            return Some(Response::Err {
+                message: format!("{path}: wait for the write as uid {}: {e}", user.uid),
+            })
+        }
+    };
+    Some(if output.status.success() && written.is_ok() {
+        Response::Ok
+    } else {
+        Response::Err {
+            message: format!(
+                "{path} as uid {}: {}",
+                user.uid,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        }
+    })
+}
+
+/// Entry point of the child [`as_sandbox_user`] starts: run one file
+/// operation as the uid it was started with and exit.
+pub fn run_as_user(args: &[String]) -> i32 {
+    let op = match FileOp::parse(args) {
+        Ok(op) => op,
+        Err(e) => {
+            eprintln!("{e}");
+            return 2;
+        }
+    };
+    match sandbox_user::run_file_op(&op, std::io::stdin().lock(), u64::from(MAX_FRAME_BYTES)) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("{e}");
+            1
+        }
     }
 }
 
@@ -751,6 +1297,30 @@ fn kill_matching(pattern: &str, signal: i32) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_guest_dev_gives_images_the_links_and_shm_a_container_would() {
+        // An image that logs through `/dev/stdout` must reach the log stream,
+        // not a regular file the dangling link would create.
+        let links: Vec<_> = DEV_LINKS.iter().map(|(_, link)| *link).collect();
+        assert_eq!(
+            links,
+            ["/dev/fd", "/dev/stdin", "/dev/stdout", "/dev/stderr"]
+        );
+        for (target, link) in DEV_LINKS {
+            assert!(target.starts_with("/proc/self/fd"), "{link} -> {target}");
+        }
+
+        let mounted_at = |dir: &str| BOOT_MOUNTS.iter().position(|(_, t, _, _)| *t == dir);
+        let shm = mounted_at("/dev/shm").expect("/dev/shm is mounted at boot");
+        assert!(shm > mounted_at("/dev").expect("/dev is mounted"));
+        let (_, _, fstype, data) = BOOT_MOUNTS[shm];
+        assert_eq!(fstype, "tmpfs");
+        assert!(
+            data.is_some_and(|d| d.contains("size=")),
+            "bounded: {data:?}"
+        );
+    }
 
     #[test]
     fn boot_mounts_provide_devpts_after_devtmpfs() {
@@ -798,6 +1368,96 @@ mod tests {
     fn mount_rejects_an_argument_with_a_nul_byte_without_panicking() {
         let err = mount("tmpfs", "/run\0x", "tmpfs", None).unwrap_err();
         assert!(matches!(err, MountError::InvalidArgument { .. }), "{err}");
+    }
+
+    fn spawn_args(cmd: &[&str], log: &Path, restart: SpawnRestartPolicy) -> SpawnArgs {
+        SpawnArgs {
+            cmd: cmd.iter().map(|part| part.to_string()).collect(),
+            env: HashMap::new(),
+            cwd: None,
+            uid: None,
+            gid: None,
+            log_path: Some(log.display().to_string()),
+            restart,
+            log_limits: LogLimits::default(),
+            limits: temps_vm_agent::SpawnLimits::default(),
+        }
+    }
+
+    fn wait_for_exit(pid: u32) -> (Option<i32>, u32) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match process_status(pid) {
+                Response::ProcessStatus {
+                    running: false,
+                    restarting: false,
+                    exit_code,
+                    restart_count,
+                } => return (exit_code, restart_count),
+                _ if Instant::now() > deadline => panic!("process {pid} did not exit"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    }
+
+    #[test]
+    fn spawned_process_status_reports_running_then_its_exit_code() {
+        let dir = std::env::temp_dir().join(format!("temps-vm-agent-spawn-{}", std::process::id()));
+        let log = dir.join("out.log");
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", "echo started; sleep 0.3; exit 7"],
+            &log,
+            SpawnRestartPolicy::Never,
+        ));
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        assert!(matches!(
+            process_status(pid),
+            Response::ProcessStatus {
+                running: true,
+                exit_code: None,
+                ..
+            }
+        ));
+        assert_eq!(wait_for_exit(pid), (Some(7), 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match read_log(Some(log.display().to_string()), 10) {
+                Response::Log { data } if data.contains("started") => break,
+                _ if Instant::now() > deadline => panic!("the log never showed the output"),
+                _ => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(process_status(999_999), Response::Err { .. }));
+        assert!(matches!(
+            spawn(spawn_args(&[], &log, SpawnRestartPolicy::Never)),
+            Response::Err { .. }
+        ));
+    }
+
+    #[test]
+    fn a_spawned_process_is_restarted_per_its_policy_under_the_same_pid_handle() {
+        let dir =
+            std::env::temp_dir().join(format!("temps-vm-agent-restart-{}", std::process::id()));
+        let marker = dir.join("ran-once");
+        let _ = std::fs::create_dir_all(&dir);
+        let script = format!(
+            "if [ -e {m} ]; then exit 0; else touch {m}; exit 1; fi",
+            m = marker.display()
+        );
+        let response = spawn(spawn_args(
+            &["/bin/sh", "-c", &script],
+            &dir.join("out.log"),
+            SpawnRestartPolicy::OnFailure { max_retries: None },
+        ));
+        let Response::Spawned { pid } = response else {
+            panic!("unexpected {response:?}");
+        };
+        // The first run fails, the restart (after the 1s backoff) succeeds.
+        assert_eq!(wait_for_exit(pid), (Some(0), 1));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

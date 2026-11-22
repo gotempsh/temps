@@ -84,6 +84,18 @@ pub trait ProjectIpGate: Send + Sync {
     ) -> bool {
         true
     }
+
+    /// Whether this gate decides from the `project_ip_access_rules` table
+    /// and nothing else (ADR-055 §11).
+    ///
+    /// The compiled ingress endpoints derive their IP policy from that
+    /// table. Only when the registered gate reads the same rows can an
+    /// endpoint stand in for the gate; behind any other gate the proxy keeps
+    /// the legacy chain, whatever the environment's ingress mode. The
+    /// default is `false`, so an unknown gate is never bypassed.
+    fn reads_project_ip_access_rules(&self) -> bool {
+        false
+    }
 }
 
 /// Default [`ProjectIpGate`] that allows every IP unconditionally.
@@ -227,6 +239,13 @@ impl ProjectIpGate for ProjectIpGateSlot {
             .load()
             .is_explicitly_denied(project_id, environment_id, ip)
     }
+
+    fn reads_project_ip_access_rules(&self) -> bool {
+        if self.registration.load(std::sync::atomic::Ordering::Acquire) != REGISTRATION_READY {
+            return false;
+        }
+        self.gate.load().reads_project_ip_access_rules()
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +308,33 @@ mod tests {
         assert!(!slot.has_active_policy(1, 1));
         assert!(!slot.set(std::sync::Arc::new(DenyAll)));
         assert!(!slot.has_active_policy(1, 1));
+    }
+
+    struct RuleTableGate;
+    impl ProjectIpGate for RuleTableGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+
+        fn reads_project_ip_access_rules(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn only_a_ready_rule_table_gate_lets_ingress_endpoints_stand_in() {
+        assert!(!OpenIpGate.reads_project_ip_access_rules());
+        assert!(!DenyAll.reads_project_ip_access_rules());
+
+        let slot = ProjectIpGateSlot::new_default();
+        // Pending: never bypass a gate that has not been published yet.
+        assert!(!slot.reads_project_ip_access_rules());
+        assert!(slot.set(std::sync::Arc::new(RuleTableGate)));
+        assert!(slot.reads_project_ip_access_rules());
+
+        let open = ProjectIpGateSlot::new_default();
+        open.finish_registration();
+        assert!(!open.reads_project_ip_access_rules());
     }
 
     #[test]

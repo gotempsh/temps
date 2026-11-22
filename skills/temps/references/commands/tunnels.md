@@ -72,6 +72,8 @@ List hostnames tunnels publish or could publish, with their state and why
 
 Explain how a hostname reaches visitors: which tunnel carries it, or why none does
 
+**Usage:** `tunnels explain <hostname> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -81,6 +83,8 @@ Explain how a hostname reaches visitors: which tunnel carries it, or why none do
 ### `tunnels route`
 
 Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whichever tunnel covers it (--automatic), or no tunnel (--off)
+
+**Usage:** `tunnels route <hostname> [options]`
 
 **Options:**
 
@@ -95,6 +99,8 @@ Choose how a hostname reaches visitors: through a tunnel (--tunnel <id>), whiche
 
 Set what a tunnel publishes: every app under its domain (--all) or only chosen hostnames (--chosen)
 
+**Usage:** `tunnels publish <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -106,6 +112,8 @@ Set what a tunnel publishes: every app under its domain (--all) or only chosen h
 
 Set the workers a tunnel runs on (an empty list stops it everywhere)
 
+**Usage:** `tunnels nodes <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -116,6 +124,8 @@ Set the workers a tunnel runs on (an empty list stops it everywhere)
 
 Show a tunnel's live connections to the provider: data centre, age, worker
 
+**Usage:** `tunnels links <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -125,3 +135,5 @@ Show a tunnel's live connections to the provider: data centre, age, worker
 ### `tunnels sync`
 
 Re-check a tunnel with its provider and recreate it if it was deleted there
+
+**Usage:** `tunnels sync <id>`

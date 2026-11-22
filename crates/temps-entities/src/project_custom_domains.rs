@@ -70,6 +70,13 @@ pub struct Model {
     /// For `tailscale_service`: the Service's `svc:` name.
     #[serde(default)]
     pub private_service: Option<String>,
+    /// What the address answers at Cloudflare's edge when it is published
+    /// through a tunnel (ADR 070): `https_only`, `allow_http` (plain HTTP
+    /// on port 80, Cloudflare's other ports refused) or `allow_all`. `None`
+    /// until a *Make it reachable* run records the user's choice; nothing
+    /// changes for an address until then.
+    #[serde(default)]
+    pub http_policy: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

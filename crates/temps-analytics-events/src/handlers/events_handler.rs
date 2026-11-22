@@ -35,12 +35,12 @@ use temps_analytics::ingest_keys::{
     stamp_retry_after_on_rate_limited, wildcard_ingest_cors, AnalyticsIngestKeyService,
     AnalyticsIngestRateLimiter, IngestBranch, IngestJson, KeyedIngestCors,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
-use temps_proxy::CachedPeerTable;
+use temps_routes::CachedPeerTable;
 use tracing::error;
 
 pub struct AppState {
@@ -65,6 +65,13 @@ pub struct AppState {
     /// Lock-free per-project limiter for the Host-resolved ingest path, which
     /// is the per-event hot path for every deployed site.
     pub host_ingest_rate_limiter: Arc<super::HostIngestRateLimiter>,
+    /// ADR 109 D3: visitor and session ids of cookieless projects, shared
+    /// with the identity settings endpoint so a mode change applies at once.
+    pub cookieless_identity: Arc<temps_analytics::cookieless::CookielessIdentity>,
+    /// ADR 109 D4: identify from the browser.
+    pub visitor_identity: Arc<temps_analytics::visitor_identity::VisitorIdentityService>,
+    /// Visitor-changing browser identify calls per project per minute.
+    pub browser_identify_budget: Arc<temps_analytics::visitor_audit::EnrichWriteBudget>,
 }
 
 /// Per-project ceiling applied to the Host-resolved (keyless) ingest branch
@@ -745,6 +752,345 @@ fn primary_accept_language(header: &str) -> Option<String> {
     Some(tag.to_ascii_lowercase())
 }
 
+/// 503 for an event whose cookieless identity could not be derived (the
+/// salt or session lookup failed). The event is not stored under a made-up
+/// id; the tracker retries it like any other failed send.
+fn identity_unavailable_response(
+    project_id: i32,
+    error: &temps_analytics::cookieless::CookielessIdentityError,
+) -> axum::response::Response {
+    ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+        .title("Visitor identity unavailable")
+        .detail(format!(
+            "Could not derive the cookieless visitor of an event for project {}: {}",
+            project_id, error
+        ))
+        .build()
+        .into_response()
+}
+
+/// The project an ingest request is for, resolved from its ingest key or its
+/// `Host` header (ADR-040), with what the event and identify handlers need.
+struct ResolvedIngest {
+    project_id: i32,
+    environment_id: Option<i32>,
+    deployment_id: Option<i32>,
+    site_hostname: Option<String>,
+    branch: IngestBranch,
+    identity_mode: temps_entities::analytics_identity_mode::AnalyticsIdentityMode,
+}
+
+/// Resolve the project of a public ingest request, applying the per-key or
+/// per-project rate limit. `Err` is the response to send as is: 401 for an
+/// unknown key, 404 for an unknown host, 429 when limited, 204 for a route
+/// without a project (sandbox/orphan), 503 when a cookieless mode is unknown.
+#[allow(
+    clippy::result_large_err,
+    reason = "the error is the finished response, sent as is; boxing it would add an allocation to every rejected request"
+)]
+async fn resolve_ingest(
+    state: &AppState,
+    host: &str,
+    headers: &HeaderMap,
+    raw_query: Option<&str>,
+) -> Result<ResolvedIngest, axum::response::Response> {
+    use tracing::{error, info};
+
+    // ADR-040 §3. A presented ingest key resolves the scope outright; `Host` is
+    // never consulted for resolution in that branch, and an unresolvable key is
+    // a 401 rather than a silent fall-through to `Host` (which would either
+    // mis-attribute a typo'd key's data or 404 confusingly).
+    //
+    // `site_hostname` is resolved alongside the scope, because what the Host
+    // header *means* differs per branch. On the Host-resolved branch it is the
+    // tracked site itself. On the keyed branch the request terminates at the
+    // Temps server, so `metadata.host` is *Temps'* own hostname and has nothing
+    // to do with the customer's site.
+    if let Some(key) = extract_analytics_key(headers, raw_query) {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        match resolve_keyed_ingest_scope(
+            state.ingest_key_service.as_ref(),
+            state.ingest_rate_limiter.as_ref(),
+            &key,
+            origin,
+        )
+        .await
+        {
+            Ok(scope) => {
+                info!(
+                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                    scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
+                );
+                // No route-table entry carries this project's row, so its
+                // identity mode comes from a short-lived cache.
+                let identity_mode = match state
+                    .cookieless_identity
+                    .identity_mode(scope.project_id)
+                    .await
+                {
+                    Ok(mode) => mode,
+                    Err(e) => {
+                        error!("{}", e);
+                        return Err(identity_unavailable_response(scope.project_id, &e));
+                    }
+                };
+                // No site hostname from this branch — see above. The service
+                // falls back to what the SDK put in the payload.
+                Ok(ResolvedIngest {
+                    project_id: scope.project_id,
+                    environment_id: scope.environment_id,
+                    deployment_id: scope.deployment_id,
+                    site_hostname: None,
+                    branch: IngestBranch::keyed(headers),
+                    identity_mode,
+                })
+            }
+            Err(problem) => Err(problem.into_response()),
+        }
+    } else {
+        if host.is_empty() {
+            error!("Missing Host header");
+            return Err(StatusCode::BAD_REQUEST.into_response());
+        }
+
+        // Look up project/environment/deployment from route table o(1)
+        match state.route_table.get_route(host) {
+            Some(route_info) => {
+                // A route without a project is a sandbox/orphaned route — we can't
+                // attribute the event to anything, so silently drop it (204) rather
+                // than falling back to project_id=1 which FK-violates on insert.
+                let Some(project) = route_info.project.as_ref() else {
+                    info!(
+                        "Dropping event for host {} — route has no associated project (sandbox/orphan)",
+                        host
+                    );
+                    return Err(StatusCode::NO_CONTENT.into_response());
+                };
+
+                let project_id = project.id;
+                let environment_id = route_info.environment.as_ref().map(|e| e.id);
+                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
+
+                info!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    host, project_id, environment_id, deployment_id
+                );
+
+                // Without a limit here, anyone who sets `Host` to a tracked
+                // hostname could inject events at an unbounded rate. Checked
+                // before the geolocation lookup and the insert, so a rejected
+                // request costs no DB work; lock-free, so it never serializes
+                // ingest across projects.
+                if !state
+                    .host_ingest_rate_limiter
+                    .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
+                {
+                    tracing::warn!(
+                        project_id,
+                        host = %host,
+                        limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
+                        "Host-resolved analytics ingest rate limit exceeded; dropping event"
+                    );
+                    return Err(ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                        .title("Analytics ingest rate limit exceeded")
+                        .detail(format!(
+                            "Analytics ingest for project {} via host '{}' exceeded {} events \
+                         per minute.",
+                            project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
+                        ))
+                        .build()
+                        .into_response());
+                }
+
+                // Unchanged: on this branch the Host header *is* the tracked
+                // site, so it stays the site hostname exactly as before.
+                Ok(ResolvedIngest {
+                    project_id,
+                    environment_id,
+                    deployment_id,
+                    site_hostname: (!host.is_empty()).then(|| host.to_string()),
+                    branch: IngestBranch::HostResolved,
+                    identity_mode: project.analytics_identity_mode,
+                })
+            }
+            None => {
+                error!("Host {} not found in route table", host);
+                // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
+                Err(StatusCode::NOT_FOUND.into_response())
+            }
+        }
+    }
+}
+
+/// Body of `POST /_temps/identify` (ADR 109 D4).
+#[derive(Debug, Clone, serde::Deserialize, utoipa::ToSchema)]
+pub struct BrowserIdentifyPayload {
+    /// The app's own id for the signed-in person. At most 256 characters.
+    pub user_id: String,
+    /// Traits merged into the visitor's `custom_data`; `null` removes a key.
+    /// At most 32 keys and 8 KB.
+    #[serde(default)]
+    #[schema(value_type = Option<Object>)]
+    pub traits: Option<serde_json::Value>,
+    /// The tracker's stored visitor id. Read only where events read it (a
+    /// keyed request); a proxied site's visitor comes from its cookie.
+    #[serde(default)]
+    pub visitor_id: Option<String>,
+}
+
+/// Request-body cap for `POST /_temps/identify`: a user id and a few traits.
+const IDENTIFY_INGEST_BODY_LIMIT: usize = 16 * 1024;
+
+/// Browser identify calls that change a visitor, per project per minute. A
+/// real app identifies at sign-in, and the tracker skips repeats; this only
+/// bounds the visitor-row writes one abusive page can cause.
+pub const BROWSER_IDENTIFY_WRITES_PER_MINUTE: u32 = 600;
+
+/// Identify the visitor of this browser (ADR 109 D4)
+#[utoipa::path(
+    tag = "Metrics",
+    post,
+    path = "/_temps/identify",
+    request_body = BrowserIdentifyPayload,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key, as for `POST /_temps/event`."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the ingest key, as for `POST /_temps/event`.")
+    ),
+    responses(
+        (status = 200, description = "What identify did. Only the visitor this request already resolves to (its cookie, or the tracker's id on a keyed request) can be identified; the page never names a visitor. `applied: false` with an `outcome` says why nothing was stored: cookieless project, browser identify refused by the project, the backend already identified the visitor as someone else, or no visitor yet.", body = temps_analytics::visitor_identity::IdentifyVisitorResponse),
+        (status = 400, description = "Empty or over-long user id, or traits that are not a JSON object within 32 keys and 8 KB"),
+        (status = 401, description = "Unknown ingest key"),
+        (status = 404, description = "Host not tracked"),
+        (status = 429, description = "Ingest rate limit, or too many visitor-changing identify calls for this project in the last minute"),
+        (status = 500, description = "Internal server error")
+    )
+)]
+pub async fn record_browser_identify(
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
+    IngestJson(payload): IngestJson<BrowserIdentifyPayload>,
+) -> axum::response::Response {
+    use temps_analytics::visitor_identity::{
+        validate_identify_input, IdentifyOutcome, IdentifyVisitorResponse,
+    };
+    use temps_entities::visitor_identity_source::VisitorIdentitySource;
+
+    let resolved =
+        match resolve_ingest(&state, &metadata.host, &headers, raw_query.as_deref()).await {
+            Ok(resolved) => resolved,
+            Err(response) => return response,
+        };
+    let project_id = resolved.project_id;
+    let answer =
+        |outcome: IdentifyOutcome| Json(IdentifyVisitorResponse::from(outcome)).into_response();
+
+    // Nothing is read or stored for a cookieless project: a user id on a
+    // daily visitor would link the days back together.
+    if resolved.identity_mode.is_cookieless() {
+        return answer(IdentifyOutcome::CookielessProject);
+    }
+    let input = match validate_identify_input(project_id, &payload.user_id, payload.traits.as_ref())
+    {
+        Ok(input) => input,
+        Err(error) => return Problem::from(error).into_response(),
+    };
+    let Some(visitor_guid) = resolve_client_identity(
+        metadata.visitor_id_cookie.clone(),
+        payload.visitor_id.clone(),
+        resolved.branch,
+    ) else {
+        return answer(IdentifyOutcome::VisitorNotFound);
+    };
+
+    let reservation = match state.browser_identify_budget.try_reserve(project_id) {
+        Ok(reservation) => reservation,
+        Err(refused) => {
+            if refused.first_in_window {
+                tracing::warn!(
+                    project_id,
+                    limit_per_minute = BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    "Browser identify budget exhausted; refusing identify calls until the window resets"
+                );
+            }
+            return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
+                .title("Identify rate limit exceeded")
+                .detail(format!(
+                    "Project {} received more than {} visitor-changing identify calls from \
+                     browsers in the last minute",
+                    project_id, BROWSER_IDENTIFY_WRITES_PER_MINUTE
+                ))
+                .build()
+                .into_response();
+        }
+    };
+    match state
+        .visitor_identity
+        .identify(
+            project_id,
+            &visitor_guid,
+            VisitorIdentitySource::Browser,
+            &input,
+        )
+        .await
+    {
+        Ok(result) => {
+            if result.outcome == IdentifyOutcome::Updated {
+                reservation.commit();
+            }
+            answer(result.outcome)
+        }
+        Err(error) => {
+            tracing::error!("{}", error);
+            Problem::from(error).into_response()
+        }
+    }
+}
+
+/// Visitor and session cookies the proxy sets (`crates/temps-proxy`).
+const TRACKING_COOKIES: [&str; 2] = ["_temps_visitor_id", "_temps_sid"];
+
+/// `Set-Cookie` values that delete the proxy's tracking cookies. They match
+/// what the proxy sets (host-only, `Path=/`), which is all a browser needs to
+/// replace them.
+fn expired_tracking_cookies(secure: bool) -> Vec<String> {
+    TRACKING_COOKIES
+        .iter()
+        .map(|name| {
+            format!(
+                "{name}=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax{}",
+                if secure { "; Secure" } else { "" }
+            )
+        })
+        .collect()
+}
+
+/// Forget this browser's visitor (ADR 109 D4)
+#[utoipa::path(
+    tag = "Metrics",
+    post,
+    path = "/_temps/reset",
+    responses(
+        (status = 204, description = "The visitor and session cookies are expired, so the next page view starts a new visitor. No visitor row is changed: the previous visitor keeps its identity. The tracker clears its own stored ids itself.")
+    )
+)]
+pub async fn reset_browser_identity(
+    Extension(metadata): Extension<temps_core::RequestMetadata>,
+) -> axum::response::Response {
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    for cookie in expired_tracking_cookies(metadata.is_secure) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&cookie) {
+            response
+                .headers_mut()
+                .append(axum::http::header::SET_COOKIE, value);
+        }
+    }
+    response
+}
+
 /// Record analytics event
 #[utoipa::path(
     tag = "Metrics",
@@ -781,121 +1127,20 @@ pub async fn record_event_metrics(
     // local dev proxy's :8080, which is what the route table never contains.
     let host = metadata.host.clone();
 
-    // ADR-040 §3. A presented ingest key resolves the scope outright; `Host` is
-    // never consulted for resolution in that branch, and an unresolvable key is
-    // a 401 rather than a silent fall-through to `Host` (which would either
-    // mis-attribute a typo'd key's data or 404 confusingly).
-    //
-    // `site_hostname` is resolved alongside the scope, because what the Host
-    // header *means* differs per branch. On the Host-resolved branch it is the
-    // tracked site itself. On the keyed branch the request terminates at the
-    // Temps server, so `metadata.host` is *Temps'* own hostname and has nothing
-    // to do with the customer's site — passing it through would make every
-    // keyed event look like it happened on the analytics backend, and
-    // `get_channel` would classify the customer's real internal navigation as
-    // "Referral" instead of a self-referral.
-    let (project_id, environment_id, deployment_id, site_hostname, branch) = if let Some(key) =
-        extract_analytics_key(&headers, raw_query.as_deref())
-    {
-        let origin = headers
-            .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok());
-        match resolve_keyed_ingest_scope(
-            state.ingest_key_service.as_ref(),
-            state.ingest_rate_limiter.as_ref(),
-            &key,
-            origin,
-        )
-        .await
-        {
-            Ok(scope) => {
-                info!(
-                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
-                    scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
-                );
-                // No site hostname from this branch — see above. The service
-                // falls back to what the SDK put in the payload.
-                (
-                    scope.project_id,
-                    scope.environment_id,
-                    scope.deployment_id,
-                    None,
-                    IngestBranch::keyed(&headers),
-                )
-            }
-            Err(problem) => return problem.into_response(),
-        }
-    } else {
-        if host.is_empty() {
-            error!("Missing Host header");
-            return StatusCode::BAD_REQUEST.into_response();
-        }
-
-        // Look up project/environment/deployment from route table o(1)
-        match state.route_table.get_route(&host) {
-            Some(route_info) => {
-                // A route without a project is a sandbox/orphaned route — we can't
-                // attribute the event to anything, so silently drop it (204) rather
-                // than falling back to project_id=1 which FK-violates on insert.
-                let Some(project) = route_info.project.as_ref() else {
-                    info!(
-                            "Dropping event for host {} — route has no associated project (sandbox/orphan)",
-                            host
-                        );
-                    return StatusCode::NO_CONTENT.into_response();
-                };
-
-                let project_id = project.id;
-                let environment_id = route_info.environment.as_ref().map(|e| e.id);
-                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
-
-                info!(
-                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
-                    host, project_id, environment_id, deployment_id
-                );
-
-                // Without a limit here, anyone who sets `Host` to a tracked
-                // hostname could inject events at an unbounded rate. Checked
-                // before the geolocation lookup and the insert, so a rejected
-                // request costs no DB work; lock-free, so it never serializes
-                // ingest across projects.
-                if !state
-                    .host_ingest_rate_limiter
-                    .check(project_id, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE)
-                {
-                    tracing::warn!(
-                        project_id,
-                        host = %host,
-                        limit_per_minute = HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE,
-                        "Host-resolved analytics ingest rate limit exceeded; dropping event"
-                    );
-                    return ErrorBuilder::new(StatusCode::TOO_MANY_REQUESTS)
-                        .title("Analytics ingest rate limit exceeded")
-                        .detail(format!(
-                            "Analytics ingest for project {} via host '{}' exceeded {} events \
-                             per minute.",
-                            project_id, host, HOST_RESOLVED_INGEST_RATE_LIMIT_PER_MINUTE
-                        ))
-                        .build()
-                        .into_response();
-                }
-
-                // Unchanged: on this branch the Host header *is* the tracked
-                // site, so it stays the site hostname exactly as before.
-                (
-                    project_id,
-                    environment_id,
-                    deployment_id,
-                    (!host.is_empty()).then(|| host.clone()),
-                    IngestBranch::HostResolved,
-                )
-            }
-            None => {
-                error!("Host {} not found in route table", host);
-                // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
-                return StatusCode::NOT_FOUND.into_response();
-            }
-        }
+    // `site_hostname` is `None` on the keyed branch: there the Host header is
+    // Temps' own hostname, and passing it through would make every keyed event
+    // look like it happened on the analytics backend and turn the customer's
+    // internal navigation into "Referral" instead of a self-referral.
+    let ResolvedIngest {
+        project_id,
+        environment_id,
+        deployment_id,
+        site_hostname,
+        branch,
+        identity_mode,
+    } = match resolve_ingest(&state, &host, &headers, raw_query.as_deref()).await {
+        Ok(resolved) => resolved,
+        Err(response) => return response,
     };
 
     // Extract user agent and referrer from headers
@@ -955,8 +1200,10 @@ pub async fn record_event_metrics(
         })
         .and_then(|raw| primary_accept_language(&raw));
 
-    // Lookup IP geolocation
-    let ip_geolocation_id = if !metadata.ip_address.is_empty() {
+    // Lookup IP geolocation. The network attributes (ASN, country, hosting
+    // verdict) ride along from the same (memory-cached) lookup, so datacenter
+    // detection and the project's traffic filters cost no extra I/O.
+    let (ip_geolocation_id, client_network) = if !metadata.ip_address.is_empty() {
         match state
             .ip_address_service
             .get_or_create_ip(&metadata.ip_address)
@@ -964,33 +1211,71 @@ pub async fn record_event_metrics(
         {
             Ok(ip_info) => {
                 info!(
-                    "Resolved IP {} to geolocation: country={:?}, city={:?}",
-                    metadata.ip_address, ip_info.country, ip_info.city
+                    "Resolved IP {} to geolocation: country={:?}, city={:?}, asn={:?}, hosting={:?}",
+                    metadata.ip_address,
+                    ip_info.country,
+                    ip_info.city,
+                    ip_info.asn_number,
+                    ip_info.is_hosting_provider
                 );
-                Some(ip_info.id)
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    asn_number: ip_info.asn_number.and_then(|asn| u32::try_from(asn).ok()),
+                    country_code: ip_info.country_code.clone(),
+                    is_hosting_provider: ip_info.is_hosting_provider,
+                };
+                (Some(ip_info.id), Some(client_network))
             }
             Err(e) => {
                 error!(
                     "Failed to lookup IP geolocation for {}: {}",
                     metadata.ip_address, e
                 );
-                None
+                // IP rules still apply when geolocation is unavailable.
+                let client_network = crate::services::ClientNetwork {
+                    ip: metadata.ip_address.parse().ok(),
+                    ..Default::default()
+                };
+                (None, Some(client_network))
             }
         }
     } else {
-        None
+        (None, None)
     };
 
-    let session_id = resolve_client_identity(
-        metadata.session_id_cookie,
-        payload.session_id.clone(),
-        branch,
-    );
-    let visitor_id = resolve_client_identity(
-        metadata.visitor_id_cookie,
-        payload.visitor_id.clone(),
-        branch,
-    );
+    // ADR 109 D3: a cookieless project's visitor and session come from the
+    // request alone. Any id the browser sends, cookie or payload, is ignored,
+    // so a tracker left in persistent mode cannot bring stored ids back.
+    let (session_id, visitor_id) = if identity_mode.is_cookieless() {
+        match state
+            .cookieless_identity
+            .visit(
+                project_id,
+                &metadata.ip_address,
+                user_agent.as_deref().unwrap_or_default(),
+            )
+            .await
+        {
+            Ok(visit) => (Some(visit.session_id), Some(visit.visitor_id)),
+            Err(e) => {
+                error!("{}", e);
+                return identity_unavailable_response(project_id, &e);
+            }
+        }
+    } else {
+        (
+            resolve_client_identity(
+                metadata.session_id_cookie,
+                payload.session_id.clone(),
+                branch,
+            ),
+            resolve_client_identity(
+                metadata.visitor_id_cookie,
+                payload.visitor_id.clone(),
+                branch,
+            ),
+        )
+    };
 
     // The SDK sends `domain` as a sibling of `event_data`, not nested inside
     // it, but `resolve_site_hostname`'s data-derived fallback (ADR-040 §3)
@@ -1028,6 +1313,7 @@ pub async fn record_event_metrics(
             language,
             payload.page_title,
             ip_geolocation_id,
+            client_network,
             user_agent,
             referrer,
             // Performance metrics (web vitals)
@@ -1107,11 +1393,35 @@ pub async fn record_console_event(
         payload.event_name, project_id, payload.request_path
     );
 
+    // ADR 109 D3: a cookieless project keeps no visitor across days, so the
+    // ids a backend forwards (issued before the switch, or by an old tracker)
+    // are not stored. This path has no client address or user agent to derive
+    // a daily visitor from, so the event is recorded without one.
+    let cookieless = state
+        .cookieless_identity
+        .identity_mode(project_id)
+        .await
+        .map_err(|error| {
+            error!("{error}");
+            ErrorBuilder::new(StatusCode::SERVICE_UNAVAILABLE)
+                .title("Identity Mode Unavailable")
+                .detail(format!(
+                    "Could not read the identity mode of project {project_id}; retry shortly"
+                ))
+                .build()
+        })?
+        .is_cookieless();
+    let (forwarded_visitor, forwarded_session) = if cookieless {
+        (None, None)
+    } else {
+        (payload.visitor_id.as_deref(), payload.session_id.as_deref())
+    };
+
     // Decrypt the encrypted cookie values if provided.
     // Generate fallback UUIDs when cookies are absent or decryption fails,
     // because the events hypertable enforces NOT NULL on session_id.
-    let visitor_id = payload.visitor_id.as_deref().and_then(|encrypted| {
-        match state.cookie_crypto.decrypt(encrypted) {
+    let visitor_id =
+        forwarded_visitor.and_then(|encrypted| match state.cookie_crypto.decrypt(encrypted) {
             Ok(decrypted) => Some(decrypted),
             Err(e) => {
                 warn!(
@@ -1120,12 +1430,9 @@ pub async fn record_console_event(
                 );
                 None
             }
-        }
-    });
+        });
 
-    let session_id = payload
-        .session_id
-        .as_deref()
+    let session_id = forwarded_session
         .and_then(|encrypted| match state.cookie_crypto.decrypt(encrypted) {
             Ok(decrypted) => Some(decrypted),
             Err(e) => {
@@ -1161,6 +1468,7 @@ pub async fn record_console_event(
             None, // language
             None, // page_title
             None, // ip_geolocation_id
+            None, // client_network
             None, // user_agent
             None, // referrer
             None, // ttfb
@@ -1213,7 +1521,7 @@ pub async fn record_console_event(
     ),
     responses(
         (status = 200, description = "Successfully retrieved aggregated buckets", body = AggregatedBucketsResponse),
-        (status = 400, description = "Bad request"),
+        (status = 400, description = "Invalid range, or a bucket size that would return too many points"),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Internal server error")
     ),
@@ -1243,6 +1551,19 @@ pub async fn get_aggregated_buckets(
         aggregation_level: query.aggregation_level,
         bucket_size: query.bucket_size,
     };
+    // Both storage backends build one row per bucket in memory, so this is
+    // checked here rather than in each of them.
+    temps_core::time_window::check_series_points(
+        spec.range.start,
+        spec.range.end,
+        &spec.bucket_size,
+    )
+    .map_err(|e| {
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Time Series Request")
+            .detail(format!("Project {project_id}: {e}"))
+            .build()
+    })?;
     let result = state
         .events_service
         .query_aggregated_buckets(spec)
@@ -1404,6 +1725,13 @@ pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
                 EVENT_INGEST_BODY_LIMIT,
             )),
         )
+        .route(
+            "/_temps/identify",
+            post(record_browser_identify).layer(axum::extract::DefaultBodyLimit::max(
+                IDENTIFY_INGEST_BODY_LIMIT,
+            )),
+        )
+        .route("/_temps/reset", post(reset_browser_identity))
         .layer(axum::middleware::map_response(
             stamp_retry_after_on_rate_limited,
         ))
@@ -1427,6 +1755,8 @@ pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
         get_active_visitors,
         get_hourly_visits,
         record_event_metrics,
+        record_browser_identify,
+        reset_browser_identity,
         record_console_event,
         get_session_events,
         has_analytics_events,
@@ -1455,6 +1785,7 @@ pub fn configure_public_routes(cors: KeyedIngestCors) -> Router<Arc<AppState>> {
             ActiveVisitorsQuery,
             HourlyVisitsQuery,
             EventMetricsPayload,
+            BrowserIdentifyPayload,
             ConsoleEventPayload,
             AnalyticsSessionEventsResponse,
             SessionEventsQuery,
@@ -1475,12 +1806,40 @@ pub struct EventsApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_visitor_identity(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_analytics::visitor_identity::VisitorIdentityService> {
+        Arc::new(
+            temps_analytics::visitor_identity::VisitorIdentityService::new(
+                db,
+                Arc::new(
+                    temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests")
+                        .expect("valid test key"),
+                ),
+            ),
+        )
+    }
+
+    fn test_cookieless_identity(
+        db: Arc<sea_orm::DatabaseConnection>,
+    ) -> Arc<temps_analytics::cookieless::CookielessIdentity> {
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new(
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )
+            .expect("valid test key"),
+        );
+        Arc::new(temps_analytics::cookieless::CookielessIdentity::new(
+            db, encryption,
+        ))
+    }
     use axum::body::Body;
     use axum::http::Request;
     use axum::middleware;
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     #[test]
@@ -1535,7 +1894,7 @@ mod tests {
         );
     }
 
-    fn create_test_auth_context() -> temps_auth::AuthContext {
+    fn create_test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -1556,7 +1915,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     async fn setup_test_app(
@@ -1564,7 +1923,7 @@ mod tests {
     ) -> (axum::Router, Arc<AppState>, Arc<temps_core::CookieCrypto>) {
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -1584,6 +1943,14 @@ mod tests {
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: test_cookieless_identity(db.clone()),
+            visitor_identity: test_visitor_identity(db.clone()),
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -1703,7 +2070,7 @@ mod tests {
     fn setup_deployment_token_app(state: Arc<AppState>, token_project_id: i32) -> axum::Router {
         let auth_middleware = middleware::from_fn(
             move |mut req: Request<Body>, next: axum::middleware::Next| async move {
-                let auth_context = temps_auth::AuthContext::new_deployment_token(
+                let auth_context = temps_authz::AuthContext::new_deployment_token(
                     token_project_id,
                     None,
                     None,
@@ -1949,6 +2316,81 @@ mod tests {
         test_db.cleanup().await;
     }
 
+    /// ADR 109 D3: a backend forwarding a visitor's old cookies to a
+    /// cookieless project does not bring that visitor back.
+    #[tokio::test]
+    async fn test_console_event_for_a_cookieless_project_stores_no_forwarded_ids() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let environment = insert_test_environment(db.as_ref(), project.id).await;
+        let deployment = insert_test_deployment(db.as_ref(), project.id, environment.id).await;
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let (app, _state, cookie_crypto) = setup_test_app(db.clone()).await;
+
+        let visitor_uuid = uuid::Uuid::new_v4().to_string();
+        temps_entities::visitor::ActiveModel {
+            visitor_id: Set(visitor_uuid.clone()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test visitor");
+        let session_uuid = uuid::Uuid::new_v4().to_string();
+        let payload = serde_json::json!({
+            "event_name": "add_to_cart",
+            "visitor_id": cookie_crypto.encrypt(&visitor_uuid).unwrap(),
+            "session_id": cookie_crypto.encrypt(&session_uuid).unwrap(),
+            "environment_id": environment.id,
+            "deployment_id": deployment.id,
+            "request_path": "/products/widget"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/projects/{}/events/ingest", project.id))
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let events: Vec<temps_entities::events::Model> = temps_entities::events::Entity::find()
+            .filter(temps_entities::events::Column::ProjectId.eq(project.id))
+            .all(db.as_ref())
+            .await
+            .expect("Failed to query events");
+        assert_eq!(events.len(), 1);
+        assert!(
+            events[0].visitor_id.is_none(),
+            "the forwarded visitor is not stored"
+        );
+        assert_ne!(events[0].session_id.as_deref(), Some(session_uuid.as_str()));
+
+        test_db.cleanup().await;
+    }
+
     #[tokio::test]
     async fn test_console_event_with_invalid_encrypted_cookies_still_succeeds() {
         let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
@@ -2067,7 +2509,7 @@ mod tests {
 
         let events_writer = Arc::new(crate::services::AnalyticsEventsService::new(db.clone()));
         let events_service: Arc<dyn crate::services::AnalyticsEvents> = events_writer.clone();
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_routes::CachedPeerTable::new(db.clone()));
         let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
             temps_geo::MockGeoIpService::new(),
         ));
@@ -2086,6 +2528,14 @@ mod tests {
             ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
             ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: test_cookieless_identity(db.clone()),
+            visitor_identity: test_visitor_identity(db.clone()),
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
         // No auth middleware — should return 401
@@ -2341,7 +2791,7 @@ mod tests {
     /// Register a host in the route table so the no-key branch can resolve it,
     /// without needing a real deployment to exist.
     fn insert_test_route(
-        route_table: &temps_proxy::CachedPeerTable,
+        route_table: &temps_routes::CachedPeerTable,
         host: &str,
         project: Option<projects::Model>,
     ) {
@@ -3509,5 +3959,240 @@ mod tests {
         assert_eq!(events[0].session_id.as_deref(), Some("cookie-session-0002"));
 
         test_db.cleanup().await;
+    }
+
+    /// ADR 109 D3: for a cookieless project the server derives the visitor
+    /// and session itself. Ids sent by the browser, cookie or payload, never
+    /// decide them, and the same browser stays in one session.
+    #[tokio::test]
+    async fn cookieless_ingest_ignores_sent_ids_and_derives_its_own() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        let send = |user_agent: &'static str| {
+            let mut payload = event_payload();
+            payload["sessionId"] = serde_json::json!("sdk-session-0003");
+            payload["visitorId"] = serde_json::json!("sdk-visitor-0003");
+            let mut request = beacon(&key, "application/json", SITE_ORIGIN, payload.to_string());
+            let headers = request.headers_mut();
+            headers.insert(
+                TEST_SESSION_COOKIE_HEADER,
+                axum::http::HeaderValue::from_static("cookie-session-0003"),
+            );
+            headers.insert(
+                axum::http::header::USER_AGENT,
+                axum::http::HeaderValue::from_static(user_agent),
+            );
+            request
+        };
+        const BROWSER_A: &str = "Mozilla/5.0 (X11; Linux x86_64) Firefox/131.0";
+        const BROWSER_B: &str = "Mozilla/5.0 (Macintosh) Safari/605.1.15";
+
+        for user_agent in [BROWSER_A, BROWSER_A, BROWSER_B] {
+            let response = setup_public_app(state.clone())
+                .oneshot(send(user_agent))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        }
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 3);
+        for event in &events {
+            let session = event.session_id.as_deref().unwrap_or_default();
+            assert_ne!(
+                session, "sdk-session-0003",
+                "the payload id must be ignored"
+            );
+            assert_ne!(session, "cookie-session-0003", "the cookie must be ignored");
+        }
+        let mut by_time = events.clone();
+        by_time.sort_by_key(|event| event.timestamp);
+        assert_eq!(
+            by_time[0].session_id, by_time[1].session_id,
+            "the same browser stays in one session"
+        );
+        assert_ne!(by_time[0].session_id, by_time[2].session_id);
+        assert_eq!(by_time[0].visitor_id, by_time[1].visitor_id);
+        assert_ne!(by_time[0].visitor_id, by_time[2].visitor_id);
+
+        let visitors = temps_entities::visitor::Entity::find()
+            .all(db.as_ref())
+            .await
+            .expect("visitors");
+        assert_eq!(visitors.len(), 2);
+        for visitor in visitors {
+            assert!(
+                visitor
+                    .visitor_id
+                    .starts_with(temps_analytics::cookieless::COOKIELESS_VISITOR_PREFIX),
+                "a cookieless visitor id is derived, not taken from the browser: {}",
+                visitor.visitor_id
+            );
+        }
+
+        test_db.cleanup().await;
+    }
+
+    fn identify_request(key: &str, body: serde_json::Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(format!("/_temps/identify?temps_key={key}"))
+            .header("host", TEMPS_HOST)
+            .header("origin", SITE_ORIGIN)
+            .header("sec-fetch-site", "cross-site")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn identify_outcome(response: axum::response::Response) -> serde_json::Value {
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        serde_json::from_slice(&bytes).expect("json answer")
+    }
+
+    /// ADR 109 D4: the browser labels the visitor its request resolves to,
+    /// and a cookieless project stores nothing.
+    #[tokio::test]
+    async fn browser_identify_labels_the_requesting_visitor_and_never_a_cookieless_one() {
+        use sea_orm::ConnectionTrait;
+        let mut test_db: TestDatabase = test_db_or_skip!();
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        let key = mint_key(&state, project.id, None).await;
+
+        // The visitor exists once it has sent an event.
+        let mut payload = event_payload();
+        payload["visitorId"] = serde_json::json!("sdk-visitor-0101");
+        let response = setup_public_app(state.clone())
+            .oneshot(beacon(
+                &key,
+                "application/json",
+                SITE_ORIGIN,
+                payload.to_string(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let identify = |body: serde_json::Value| {
+            let state = state.clone();
+            let request = identify_request(&key, body);
+            async move { setup_public_app(state).oneshot(request).await.unwrap() }
+        };
+        let answer = identify_outcome(
+            identify(serde_json::json!({
+                "user_id": "u_9",
+                "traits": {"plan": "pro"},
+                "visitor_id": "sdk-visitor-0101"
+            }))
+            .await,
+        )
+        .await;
+        assert_eq!(answer["outcome"], "updated", "{answer}");
+        assert_eq!(answer["applied"], true);
+
+        let visitor = temps_entities::visitor::Entity::find()
+            .filter(temps_entities::visitor::Column::VisitorId.eq("sdk-visitor-0101"))
+            .one(db.as_ref())
+            .await
+            .expect("query")
+            .expect("visitor");
+        assert_eq!(visitor.user_id.as_deref(), Some("u_9"));
+        assert_eq!(
+            visitor.identity_source,
+            Some(temps_entities::visitor_identity_source::VisitorIdentitySource::Browser)
+        );
+        assert_eq!(
+            visitor.trait_sources,
+            Some(serde_json::json!({"plan": "browser"}))
+        );
+
+        // A visitor that never sent an event is not created by identify.
+        let unknown = identify_outcome(
+            identify(serde_json::json!({"user_id": "u_9", "visitor_id": "sdk-visitor-0102"})).await,
+        )
+        .await;
+        assert_eq!(unknown["outcome"], "visitor_not_found");
+
+        // An empty user id is refused before anything is read.
+        let empty =
+            identify(serde_json::json!({"user_id": " ", "visitor_id": "sdk-visitor-0101"})).await;
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+
+        // Cookieless: nothing is stored, whatever the browser sends.
+        db.execute_unprepared(&format!(
+            "UPDATE projects SET analytics_identity_mode = 'cookieless' WHERE id = {}",
+            project.id
+        ))
+        .await
+        .expect("switch the project to cookieless");
+        state
+            .cookieless_identity
+            .forget_identity_mode(project.id)
+            .await;
+        let cookieless = identify_outcome(
+            identify(serde_json::json!({
+                "user_id": "u_other",
+                "traits": {"email": "someone@example.com"},
+                "visitor_id": "sdk-visitor-0101"
+            }))
+            .await,
+        )
+        .await;
+        assert_eq!(cookieless["outcome"], "cookieless_project");
+        assert_eq!(cookieless["applied"], false);
+        let unchanged = temps_entities::visitor::Entity::find_by_id(visitor.id)
+            .one(db.as_ref())
+            .await
+            .expect("query")
+            .expect("visitor");
+        assert_eq!(unchanged.user_id.as_deref(), Some("u_9"));
+        assert_eq!(
+            unchanged.custom_data,
+            Some(serde_json::json!({"plan": "pro"}))
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn reset_expires_both_tracking_cookies() {
+        let response = reset_browser_identity(Extension(test_request_metadata(
+            &axum::http::HeaderMap::new(),
+        )))
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookies: Vec<String> = response
+            .headers()
+            .get_all(axum::http::header::SET_COOKIE)
+            .iter()
+            .filter_map(|value| value.to_str().ok().map(str::to_string))
+            .collect();
+        assert_eq!(cookies.len(), 2);
+        for (cookie, name) in cookies.iter().zip(["_temps_visitor_id", "_temps_sid"]) {
+            assert!(cookie.starts_with(&format!("{name}=;")), "{cookie}");
+            assert!(
+                cookie.contains("Max-Age=0") && cookie.contains("Path=/"),
+                "{cookie}"
+            );
+        }
+        assert!(expired_tracking_cookies(true)
+            .iter()
+            .all(|cookie| cookie.ends_with("; Secure")));
     }
 }

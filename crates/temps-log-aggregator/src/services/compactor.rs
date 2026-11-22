@@ -683,7 +683,6 @@ impl CompactorService {
 
 // Keep `LogStream` referenced for readers of this module: the encoder copies
 // it through from decoded lines unchanged.
-#[allow(dead_code)]
 const _: Option<LogStream> = None;
 
 #[cfg(test)]
@@ -696,6 +695,7 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
     use std::collections::HashSet;
     use std::sync::Mutex;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt,
     };
@@ -769,7 +769,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn compaction_indexes_replacement_before_forgetting_sources() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -972,6 +972,7 @@ mod tests {
             ))
             .with_env_var("POSTGRES_PASSWORD", "gc-test")
             .with_startup_timeout(Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await
         {

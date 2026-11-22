@@ -291,7 +291,7 @@ export function AddEmailProvider() {
   const step = selected && get('step') === 'configure' ? 'configure' : 'type'
   const headingRef = useRef<HTMLHeadingElement>(null)
 
-  usePageTitle('Add Email Provider')
+  usePageTitle('Add email provider')
 
   // Selecting a type (or going back) unmounts the focused button; move focus
   // to the new step's heading so keyboard and screen-reader users aren't
@@ -303,8 +303,7 @@ export function AddEmailProvider() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Email', href: '/email' },
-      { label: 'Providers', href: '/email?tab=providers' },
-      { label: 'Add Provider' },
+      { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
 
@@ -335,7 +334,7 @@ export function AddEmailProvider() {
         description: `${provider.name} is ready to send transactional emails.`,
       })
       queryClient.invalidateQueries({ queryKey: ['email-providers'] })
-      navigate('/email?tab=providers')
+      navigate('/email')
     },
     onError: (error: Error) => {
       toast.error('Failed to create provider', {
@@ -406,7 +405,7 @@ export function AddEmailProvider() {
           ) : (
             <Button
               variant="outline"
-              onClick={() => navigate('/email?tab=providers')}
+              onClick={() => navigate('/email')}
             >
               Cancel
             </Button>
@@ -515,7 +514,7 @@ export function AddEmailProvider() {
                       name="access_key_id"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>Access Key ID</FormLabel>
+                          <FormLabel>Access key ID</FormLabel>
                           <FormControl>
                             <Input
                               placeholder="AKIAIOSFODNN7EXAMPLE"
@@ -536,7 +535,7 @@ export function AddEmailProvider() {
                       name="secret_access_key"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>Secret Access Key</FormLabel>
+                          <FormLabel>Secret access key</FormLabel>
                           <FormControl>
                             <Input
                               type="password"
@@ -586,7 +585,7 @@ export function AddEmailProvider() {
                       name="api_key"
                       render={({ field }) => (
                         <FormItem>
-                          <FormLabel>API Key</FormLabel>
+                          <FormLabel>API key</FormLabel>
                           <FormControl>
                             <Input
                               type="password"
@@ -642,7 +641,7 @@ export function AddEmailProvider() {
                         name="smtp_host"
                         render={({ field }) => (
                           <FormItem>
-                            <FormLabel>SMTP Host</FormLabel>
+                            <FormLabel>SMTP host</FormLabel>
                             <FormControl>
                               <Input
                                 placeholder="email-smtp.eu-west-1.amazonaws.com"

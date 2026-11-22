@@ -54,35 +54,42 @@ use tracing::{info, warn};
 use super::access::{self as access_api, AccessApp, AccessPolicyAnswer, ACCESS_TUNNEL_ONLY};
 use super::access_service::AccessProviderService;
 use super::compute::{
-    address_reachability, is_local_only, needs_lookup, overall_state, summary, AddressFacts,
-    AddressInput, DirectIngress, InsideCheck, PrivateBinding, PrivateFacts, Resolution,
-    ServeEntryState, ServiceHostsState, TailnetFacts, TunnelState, PRIVATE_COMMAND,
+    address_reachability, control_plane_origin, is_local_only, needs_lookup, overall_state,
+    summary, AddressFacts, AddressInput, ControlPlaneHost, ControlPlaneOrigin, DirectIngress,
+    InsideCheck, PrivateBinding, PrivateFacts, Resolution, ServeEntryState, ServiceHostsState,
+    TailnetFacts, TunnelState, PRIVATE_COMMAND,
+};
+use super::edge_rules::{
+    self, EdgeRuleCreated, EdgeRuleError, EdgeRulePurpose, EdgeRuleSeen, HttpPolicy,
 };
 use super::model::{
     AccessBinding, AddressAudience, AddressReachability, AddressSource, ApplyRequest, Audience,
     DecideRequest, DnsRecordState, EnvironmentReachability, GateAllowList, GateKind, Intent,
-    JournalEntry, PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityPlan,
-    ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView, StepKind,
+    JournalEntry, PlanOptionKind, PlanRequest, PlannedRecord, PreviousChoice, ReachabilityChoices,
+    ReachabilityPlan, ResumeRequest, RunResource, RunState, RunStep, RunStepStatus, RunView,
+    StepKind,
 };
 use super::plan::{
     access_choice, access_policy_answer, AccessChoice, AccessProviderFact, FIELD_ACCESS_PROVIDER,
 };
 use super::plan::{
-    address_for_audience, environment_hosts_tunnel, fingerprint, gate_allow_answer, guess_zone,
-    http01_direct, plan, planned_record, private_worker, record_type_of, records_to_read,
-    service_of, service_tag, service_worker, tunnel_domain_for, tunnel_route, unique_tunnel_name,
-    zone_for, NamedId, PlanFacts, PrivateWorkerFact, ServeEntryFact, ServiceSeen,
-    TailnetWorkerFact, TailscaleCredentialFact, ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER,
-    FIELD_TOKEN,
+    address_for_audience, choice, chosen_http_policy, direct_for, environment_hosts_tunnel,
+    fingerprint, gate_allow_answer, guess_zone, place_http_policy_steps, plan, planned_record,
+    private_worker, record_type_of, records_to_read, service_of, service_tag, service_worker,
+    tunnel_domain_for, tunnel_route, unique_tunnel_name, zone_for, NamedId, PlanFacts,
+    PrivateWorkerFact, ServeEntryFact, ServiceSeen, TailnetWorkerFact, TailscaleCredentialFact,
+    ZoneFact, FIELD_ADDRESS, FIELD_DNS_PROVIDER, FIELD_HTTP_POLICY, FIELD_TOKEN,
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
-    AccessRun, NewTunnel, RunInput, RunOps, RunRecord, RunSink, ServeClaim, ServeEntryStatus,
-    ServeRelease, ServeTarget, ServeWish, ServiceDeletion, ServiceEntryHost, ServicePlan, Stop,
-    Timing, TunnelStatus, WriteError, ZoneState,
+    AccessRun, EdgeRuleAt, EdgeRuleMade, NewTunnel, RunInput, RunOps, RunRecord, RunSink,
+    ServeClaim, ServeEntryStatus, ServeRelease, ServeTarget, ServeWish, ServiceDeletion,
+    ServiceEntryHost, ServicePlan, Stop, Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
-use super::token_check::{check_token, TokenCheckRequest, TokenCheckResult};
+use super::token_check::{
+    check_token, check_token_matching, TokenCheckRequest, TokenCheckResult, ZoneMatch,
+};
 use crate::error::IngressError;
 use crate::service::{
     CreateConnectorRequest, CreateError, HostnameMode, IngressConnectorService,
@@ -100,6 +107,17 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_PLANE: &str = "control-plane";
 /// How long a stored plan can be applied.
 pub const PLAN_TTL: chrono::Duration = chrono::Duration::minutes(15);
+
+/// The audiences `choices` judges, in the order the console shows them
+/// (ADR 069 D3): `signed_in` once per gate.
+const CHOICE_ORDER: [(Audience, GateKind); 5] = [
+    (Audience::Public, GateKind::Temps),
+    (Audience::SignedIn, GateKind::Temps),
+    (Audience::SignedIn, GateKind::CloudflareAccess),
+    (Audience::Private, GateKind::Temps),
+    (Audience::TailnetUsers, GateKind::Temps),
+];
+
 /// How often orphaned runs are reconciled and expired plans purged.
 pub const RECONCILE_EVERY: Duration = Duration::from_secs(60);
 const RECOVERING: &str = "Recovering an interrupted setup: Temps is checking what its unfinished \
@@ -178,6 +196,10 @@ pub struct ReachabilityDeps {
     pub config: Arc<ConfigService>,
     /// Saved Cloudflare Access tokens and their apps (ADR 065 D9).
     pub access: Arc<AccessProviderService>,
+    /// The control plane's own public address, as the server detects it:
+    /// what a direct way in points DNS at when the edge target is no
+    /// address. Never the console hostname's resolution.
+    pub public_address: Arc<dyn temps_core::server_public_address::ServerPublicAddress>,
 }
 
 pub struct ReachabilityService {
@@ -406,8 +428,21 @@ impl ReachabilityService {
         let db = self.deps.db.as_ref();
         let id = row.id;
         let was = RunState::parse(&row.state);
-        let mut journal: Vec<JournalEntry> =
-            serde_json::from_value(row.journal.clone()).unwrap_or_default();
+        // A journal or step list this Temps cannot read in full (a newer
+        // one wrote it, then was rolled back) is left exactly as it is:
+        // reconciling the part it reads and saving that would drop the rest.
+        let mut journal = match journal_to_recover(&row) {
+            Ok(journal) => journal,
+            Err(error) => {
+                warn!(
+                    run_id = id,
+                    %error,
+                    "a reachability run was written by a newer Temps; leaving it untouched \
+                     for that version to recover"
+                );
+                return;
+            }
+        };
         let mut active: reachability_runs::ActiveModel = row.clone().into();
         if was != RunState::Recovering {
             active.state = Set(RunState::Recovering.as_str().to_string());
@@ -516,7 +551,7 @@ impl ReachabilityService {
         })
     }
 
-    pub(super) async fn settings(&self) -> Result<temps_core::AppSettings, ReachabilityError> {
+    pub(super) async fn settings(&self) -> Result<temps_config::AppSettings, ReachabilityError> {
         self.deps
             .config
             .get_settings()
@@ -694,9 +729,35 @@ impl ReachabilityService {
         })
     }
 
+    /// The control plane's origin address from what the server knows: the
+    /// edge target when it is an address, else the address it detected for
+    /// itself. Never the console hostname's resolution, which behind a CDN
+    /// is the CDN's edge.
+    pub(super) async fn control_plane_origin(
+        &self,
+        settings: &temps_config::AppSettings,
+    ) -> ControlPlaneOrigin {
+        let edge_is_address = settings
+            .edge_target
+            .as_deref()
+            .map(str::trim)
+            .is_some_and(|t| {
+                t.trim_start_matches('[')
+                    .trim_end_matches(']')
+                    .parse::<IpAddr>()
+                    .is_ok()
+            });
+        let detected = if edge_is_address {
+            None
+        } else {
+            self.deps.public_address.detected_public_ip().await
+        };
+        control_plane_origin(settings.edge_target.as_deref(), detected)
+    }
+
     /// The control plane's proxy and every worker's direct ingress, with the
     /// public addresses DNS would point at.
-    pub(super) async fn directs(&self, settings: &temps_core::AppSettings) -> Vec<DirectIngress> {
+    pub(super) async fn directs(&self, settings: &temps_config::AppSettings) -> Vec<DirectIngress> {
         let mut directs = Vec::new();
         let server = self.deps.config.get_server_config();
         let takes_port_80 = server
@@ -704,35 +765,11 @@ impl ReachabilityService {
             .rsplit_once(':')
             .and_then(|(_, port)| port.parse::<u16>().ok())
             == Some(80);
-        // What generated records point at, else the console's own host
-        // when the console is not reached through Temps Cloud.
-        let mut hosts = Vec::new();
-        if let Some(edge) = settings.edge_target.as_deref() {
-            hosts.push(edge.to_string());
-        }
-        if !settings.cloud.console_access_enabled {
-            if let Some(host) = settings
-                .external_url
-                .as_deref()
-                .and_then(|url| url::Url::parse(url).ok())
-                .and_then(|url| url.host_str().map(str::to_string))
-            {
-                hosts.push(host);
-            }
-        }
-        let mut ips = Vec::new();
-        for host in hosts {
-            for ip in resolve(&host).await.unwrap_or_default() {
-                if address_scope(ip) == AddressScope::Public && !ips.contains(&ip) {
-                    ips.push(ip);
-                }
-            }
-        }
-        if !ips.is_empty() {
+        if let ControlPlaneOrigin::Address { ip, .. } = self.control_plane_origin(settings).await {
             directs.push(DirectIngress {
                 name: CONTROL_PLANE.to_string(),
                 node_id: None,
-                ips,
+                ips: vec![ip],
                 takes_port_80,
                 check_failed: None,
             });
@@ -778,7 +815,10 @@ impl ReachabilityService {
                 row.listen_address.as_deref(),
                 &interfaces,
             )
-            .filter(|ip| address_scope(*ip) == AddressScope::Public) else {
+            .filter(|ip| address_scope(*ip) == AddressScope::Public)
+            // A worker's reported address inside a CDN's edge is the
+            // CDN's, not the worker's: DNS never points at it.
+            .filter(|ip| temps_core::known_proxies::known_proxy(*ip).is_none()) else {
                 continue;
             };
             let check_failed = row.last_check.as_ref().and_then(|check| {
@@ -1066,18 +1106,24 @@ impl ReachabilityService {
             } else {
                 Resolution::Skipped
             };
-            verdicts.push(address_reachability(
-                &AddressFacts {
-                    input: input.clone(),
-                    tunnel,
-                    resolution,
-                    temps_managed_dns: managed.contains(&input.address),
-                    private: privates.get(&input.address).cloned(),
-                },
-                directs,
-                deployed,
-                environment_name,
-            ));
+            let facts = AddressFacts {
+                input: input.clone(),
+                tunnel,
+                resolution,
+                temps_managed_dns: managed.contains(&input.address),
+                private: privates.get(&input.address).cloned(),
+            };
+            let mut verdict = address_reachability(&facts, directs, deployed, environment_name);
+            // DNS cannot tell for an address behind a CDN or proxy: ask it.
+            if super::forward_check::applies(&verdict, &facts.resolution) {
+                let probe = super::forward_check::probe(
+                    &verdict.address,
+                    &self.deps.config.get_server_config().encryption_key,
+                )
+                .await;
+                verdict = super::forward_check::judged(verdict, probe);
+            }
+            verdicts.push(verdict);
         }
         // ADR 065 D10: a signed-in address is reachable only when what
         // answers there is its gate.
@@ -1089,12 +1135,52 @@ impl ReachabilityService {
             if verdict.audience == Audience::SignedIn
                 && verdict.state == super::model::ReachState::Reachable
             {
-                let probe =
-                    super::gate_check::probe(&verdict.address, *gate, team_domain.as_deref()).await;
+                let probe = super::gate_check::probe(
+                    &verdict.address,
+                    *gate,
+                    team_domain.as_deref(),
+                    &self.deps.config.get_server_config().encryption_key,
+                )
+                .await;
                 *verdict = super::gate_check::judged(verdict.clone(), probe);
             }
         }
+        // ADR 070 D4: what a tunnel address answers on plain HTTP, against
+        // what the user chose for it.
+        let policies = self.http_policies(&hosts).await;
+        for verdict in &mut verdicts {
+            if super::http_check::applies(verdict) {
+                let policy = policies.get(&verdict.address).copied();
+                let probe = if super::http_check::wants_probe(policy) {
+                    Some(super::http_check::probe(&verdict.address).await)
+                } else {
+                    None
+                };
+                *verdict = super::http_check::judged(verdict.clone(), policy, probe);
+            }
+        }
         verdicts
+    }
+
+    /// The recorded HTTPS-only choice of each of `hosts` that has one
+    /// (ADR 070).
+    pub(super) async fn http_policies(&self, hosts: &[String]) -> HashMap<String, HttpPolicy> {
+        project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.is_in(hosts.iter().cloned()))
+            .all(self.deps.db.as_ref())
+            .await
+            .unwrap_or_else(|e| {
+                // Read as never chosen: the check then only adds a gentle
+                // note, and a plan offers HTTPS only, the default.
+                warn!("could not read the HTTPS-only choices of {hosts:?}: {e}");
+                Vec::new()
+            })
+            .into_iter()
+            .filter_map(|row| {
+                let policy = row.http_policy.as_deref().and_then(HttpPolicy::parse)?;
+                Some((row.domain, policy))
+            })
+            .collect()
     }
 
     /// The gate of each of `hosts` that is a signed-in address, with the
@@ -1237,6 +1323,46 @@ impl ReachabilityService {
         })
     }
 
+    /// ADR 069 D3: per audience, whether the planner can offer the
+    /// environment a way in before the user asks for an address. The
+    /// facts are gathered once and planned once per audience; nothing is
+    /// stored.
+    pub async fn choices(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<ReachabilityChoices, ReachabilityError> {
+        let scope = self.scope(project_id, environment_id).await?;
+        let settings = self.settings().await?;
+        let gathered = self
+            .gather(&scope.project, &scope.environment, &settings.preview_domain)
+            .await?;
+        let directs = self.directs(&settings).await;
+        let mut audiences = Vec::with_capacity(CHOICE_ORDER.len());
+        for (audience, gate) in CHOICE_ORDER {
+            let facts = self
+                .plan_facts(
+                    &scope,
+                    &gathered,
+                    directs.clone(),
+                    audience,
+                    gate,
+                    None,
+                    Vec::new(),
+                )
+                .await?;
+            audiences.push(choice(&facts));
+        }
+        Ok(ReachabilityChoices {
+            project_id,
+            environment_id,
+            environment_name: scope.environment.name.clone(),
+            deployed: gathered.deployed,
+            running_on: gathered.running_on,
+            audiences,
+        })
+    }
+
     // ----- D4: plan -----------------------------------------------------
 
     // The audience and its two refinements, the gate (signed_in) and the
@@ -1288,6 +1414,7 @@ impl ReachabilityService {
                 domain: z.domain.trim_end_matches('.').to_ascii_lowercase(),
                 verified: z.verified,
                 auto_manage: z.auto_manage,
+                proxied_by_default: z.proxied_by_default,
             }));
         }
         let cloudflare_accounts = providers
@@ -1405,6 +1532,12 @@ impl ReachabilityService {
             .iter()
             .map(|a| a.address.clone())
             .collect();
+        // ADR 070: a re-run offers the HTTPS-only choice the address keeps.
+        let http_policies = {
+            let mut hosts = attached_here.clone();
+            hosts.extend(requested.iter().cloned());
+            self.http_policies(&hosts).await
+        };
         let taken_elsewhere = project_custom_domains::Entity::find()
             .filter(project_custom_domains::Column::EnvironmentId.ne(scope.environment.id))
             .all(db)
@@ -1435,7 +1568,35 @@ impl ReachabilityService {
         } else {
             String::new()
         };
+        let served_by_workers = attached_here.iter().any(|a| served.contains(a));
+        // Only a public or signed-in plan for an environment the control
+        // plane serves alone is stopped by the control plane having no
+        // public address, so only then is it said what its hosts resolve to.
+        let (control_plane, control_plane_refusal) =
+            if matches!(audience, Audience::Public | Audience::SignedIn)
+                && gathered.deployed
+                && !served_by_workers
+                && !directs.iter().any(|d| d.node_id.is_none())
+            {
+                let settings = self.settings().await?;
+                let refusal = match self.control_plane_origin(&settings).await {
+                    ControlPlaneOrigin::Refused(why) => Some(why),
+                    ControlPlaneOrigin::Address { .. } | ControlPlaneOrigin::Unknown => None,
+                };
+                (Some(control_plane_hosts(&settings).await), refusal)
+            } else {
+                (None, None)
+            };
+        // ADR-107 D5: whether a new tunnel can run on the control plane.
+        let control_plane_tunnel_refusal = self
+            .deps
+            .connectors
+            .control_plane_tunnels()
+            .err()
+            .map(|refusal| refusal.to_string());
         let facts = PlanFacts {
+            control_plane_tunnels: control_plane_tunnel_refusal.is_none(),
+            control_plane_tunnel_refusal,
             intents: HashMap::new(),
             choices: tunnel_facts.choices,
             private_rule,
@@ -1448,13 +1609,15 @@ impl ReachabilityService {
             environment_name: scope.environment.name.clone(),
             deployed: gathered.deployed,
             requested,
-            served_by_workers: attached_here.iter().any(|a| served.contains(a)),
+            served_by_workers,
             attached_here,
             taken_elsewhere,
             tunnels: tunnel_facts.tunnels,
             zones,
             cloudflare_accounts,
             directs,
+            control_plane_hosts: control_plane,
+            control_plane_refusal,
             tunnel_workers,
             workers_refusing,
             dns_records: Vec::new(),
@@ -1477,6 +1640,7 @@ impl ReachabilityService {
             principals_now: Vec::new(),
             identity_workers,
             environment_host_label: Some(self.environment_host_label(scope).await?),
+            http_policies,
         };
         let mut dns_records = Vec::new();
         let mut access_providers = Vec::new();
@@ -1640,7 +1804,7 @@ impl ReachabilityService {
         gate: GateKind,
         requested: Option<String>,
         principals: Vec<temps_core::tailnet::TailnetPrincipal>,
-    ) -> Result<(PlanFacts, temps_core::AppSettings), ReachabilityError> {
+    ) -> Result<(PlanFacts, temps_config::AppSettings), ReachabilityError> {
         let settings = self.settings().await?;
         let gathered = self
             .gather(&scope.project, &scope.environment, &settings.preview_domain)
@@ -1887,10 +2051,19 @@ impl ReachabilityService {
             tunnel: None,
             new_tunnel: None,
             route_confirmed: option.confirmation.is_some() && request.confirmed,
+            // The fingerprint above proved the choices are as planned.
+            planned_choice: Some(PreviousChoice::from_choice(
+                facts
+                    .choices
+                    .iter()
+                    .find(|(host, _)| *host == address)
+                    .map(|(_, choice)| *choice),
+            )),
             token: None,
             direct: None,
             dns_before: PlannedRecord::Absent,
             certificate_challenge: None,
+            dns_proxied: None,
             audience: None,
             access: None,
             serve: None,
@@ -1902,7 +2075,16 @@ impl ReachabilityService {
                 .clone()
                 .filter(|e| !e.trim().is_empty())
                 .or(user_email),
+            http_policy: None,
         };
+        // ADR 070 D1: the rules the chosen policy wants, and nothing when
+        // the user chose to also answer plain HTTP.
+        if let Some(policy) = chosen_http_policy(option, text(FIELD_HTTP_POLICY).as_deref())
+            .map_err(ReachabilityError::Validation)?
+        {
+            place_http_policy_steps(&mut input.steps, &address, policy);
+            input.http_policy = Some(policy);
+        }
         match option.kind {
             PlanOptionKind::ExistingTunnel => {
                 let route = tunnel_route(&facts, &address).ok_or_else(|| {
@@ -1914,8 +2096,10 @@ impl ReachabilityService {
                 });
             }
             PlanOptionKind::NewTunnel | PlanOptionKind::NewTunnelWithToken => {
-                let worker = facts.tunnel_workers.first().cloned().ok_or_else(|| {
-                    ReachabilityError::Conflict("No worker can run a tunnel.".into())
+                let worker = super::plan::new_tunnel_node(&facts).ok_or_else(|| {
+                    ReachabilityError::Conflict(
+                        "Neither a worker nor the control plane can run a tunnel.".into(),
+                    )
                 })?;
                 let covering_zone =
                     zone_for(&address, &facts.zones).filter(|z| z.provider_type == "cloudflare");
@@ -2114,11 +2298,26 @@ impl ReachabilityService {
                 ));
             }
             PlanOptionKind::DirectManagedDns | PlanOptionKind::DirectManualDns => {
-                let direct = http01_direct(&facts).ok_or_else(|| {
-                    ReachabilityError::Conflict("No direct ingress takes port 80 any more.".into())
+                let direct = direct_for(&facts, option.kind).ok_or_else(|| {
+                    ReachabilityError::Conflict(
+                        if option.kind == PlanOptionKind::DirectManagedDns {
+                            "No direct ingress has a public address any more.".into()
+                        } else {
+                            "No direct ingress takes port 80 any more.".into()
+                        },
+                    )
                 })?;
                 input.direct = Some((direct.name.clone(), direct.ips[0]));
                 input.dns_before = planned_record(&facts, &address, record_type_of(direct.ips[0]));
+                if option.kind == PlanOptionKind::DirectManagedDns {
+                    // The zone's DNS provider writes the challenge: no port
+                    // 80, and a proxied record is fine.
+                    input.certificate_challenge = Some("dns-01".to_string());
+                    // The record is served as the plan said: the zone's
+                    // proxy default where its provider can proxy (ADR 031).
+                    input.dns_proxied = zone_for(&address, &facts.zones)
+                        .map(|zone| zone.can_proxy() && zone.proxied_by_default);
+                }
             }
             PlanOptionKind::TunnelEnvironmentHosts => {
                 let tunnel = environment_hosts_tunnel(&facts, &address).ok_or_else(|| {
@@ -2553,7 +2752,7 @@ impl ReachabilityService {
                 ))
             }
         }
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2731,7 +2930,7 @@ impl ReachabilityService {
     ) -> Result<RunView, ReachabilityError> {
         let row = self.find_run(project_id, environment_id, run_id).await?;
         let state = RunState::parse(&row.state);
-        let record = record_of(&row);
+        let record = record_to_change(&row)?;
         if state == RunState::Recovering || record.has_pending() {
             return Err(ReachabilityError::Conflict(RECOVERING.into()));
         }
@@ -2857,7 +3056,7 @@ impl ReachabilityService {
                 ))
             }
         };
-        let mut record = record_of(&row);
+        let mut record = record_to_change(&row)?;
         decide(&mut record.journal, &request.key, request.decision, undoing)
             .map_err(ReachabilityError::Validation)?;
         let left = record.conflicts().len();
@@ -2887,7 +3086,19 @@ impl ReachabilityService {
     // ----- D8 ----------------------------------------------------------
 
     pub async fn token_check(&self, request: TokenCheckRequest) -> TokenCheckResult {
-        check_token(&self.http, request.token.expose(), request.zone.as_deref()).await
+        let zone = request.zone.as_deref().filter(|z| !z.trim().is_empty());
+        match (zone, request.hostname.as_deref()) {
+            (None, Some(hostname)) => {
+                check_token_matching(
+                    &self.http,
+                    request.token.expose(),
+                    Some(hostname),
+                    ZoneMatch::Containing,
+                )
+                .await
+            }
+            _ => check_token(&self.http, request.token.expose(), zone).await,
+        }
     }
 
     /// Whether a direct ingress answers on port 80, so HTTP-01 can work.
@@ -2901,7 +3112,46 @@ impl ReachabilityService {
     }
 }
 
-/// The run's progress as stored.
+/// The run's journal exactly as stored, or why this Temps cannot read all
+/// of it: an entry a newer Temps wrote (an edge rule, say, after rolling
+/// back) fails the whole list.
+fn stored_journal(journal: &Value) -> Result<Vec<JournalEntry>, String> {
+    serde_json::from_value(journal.clone()).map_err(|e| e.to_string())
+}
+
+/// The run's progress, for a change that writes it back. A journal or step
+/// list this Temps cannot read in full is refused, never replaced by an
+/// empty one: that would lose what undo needs to remove what the run made.
+fn record_to_change(row: &reachability_runs::Model) -> Result<RunRecord, ReachabilityError> {
+    let unreadable = |what: &str, error: String| {
+        ReachabilityError::Conflict(format!(
+            "This run's {what} was written by a newer version of Temps, and this one cannot \
+             read all of it ({error}). Nothing was changed: upgrade Temps again to resume, \
+             undo or decide on this run."
+        ))
+    };
+    let journal = stored_journal(&row.journal).map_err(|e| unreadable("journal", e))?;
+    let steps = serde_json::from_value::<Vec<RunStep>>(row.steps.clone())
+        .map_err(|e| unreadable("step list", e.to_string()))?;
+    Ok(RunRecord {
+        journal,
+        steps,
+        ..record_of(row)
+    })
+}
+
+/// The journal recovery reconciles, or why it must leave the run alone:
+/// it reads the whole record first, as every change does, so a journal or
+/// step list this Temps cannot read in full is neither marked recovering
+/// nor written back.
+fn journal_to_recover(
+    row: &reachability_runs::Model,
+) -> Result<Vec<JournalEntry>, ReachabilityError> {
+    record_to_change(row).map(|record| record.journal)
+}
+
+/// The run's progress as stored, for showing it: what does not decode
+/// reads as empty. Use [`record_to_change`] before writing any of it back.
 fn record_of(row: &reachability_runs::Model) -> RunRecord {
     RunRecord {
         state: RunState::parse(&row.state),
@@ -2985,6 +3235,36 @@ pub async fn private_rule(
         rule: format!("{whose} IP access allow list ({})", cidrs.join(", ")),
         cidr: cidrs.first().cloned().unwrap_or_default(),
     }))
+}
+
+/// The hosts the control plane is reached at, each with what it resolves
+/// to: what generated records point at (the edge target), else the
+/// console's own host when the console is not reached through Temps Cloud.
+async fn control_plane_hosts(settings: &temps_config::AppSettings) -> Vec<ControlPlaneHost> {
+    let mut hosts = Vec::new();
+    if let Some(edge) = settings.edge_target.as_deref().map(str::trim) {
+        if !edge.is_empty() {
+            hosts.push(edge.to_string());
+        }
+    }
+    if !settings.cloud.console_access_enabled {
+        if let Some(host) = settings
+            .external_url
+            .as_deref()
+            .and_then(|url| url::Url::parse(url).ok())
+            .and_then(|url| url.host_str().map(str::to_string))
+        {
+            if !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    let mut resolved = Vec::with_capacity(hosts.len());
+    for host in hosts {
+        let ips = resolve(&host).await.unwrap_or_default();
+        resolved.push(ControlPlaneHost { host, ips });
+    }
+    resolved
 }
 
 /// Look up `host`. `Ok(empty)` when it has no address record.
@@ -3264,6 +3544,14 @@ impl RunOps for LiveOps {
             Intent::TailscaleService { .. } => {
                 return Err("Tailscale Services are looked up by their marker.".to_string())
             }
+            // Looked up by this run's reference (run.rs `look`).
+            Intent::EdgeRule { .. } => {
+                return Err("Cloudflare rules are looked up by their reference.".to_string())
+            }
+            // Looked up on the address's column (run.rs `look`).
+            Intent::HttpPolicy { .. } => {
+                return Err("A recorded choice is looked up on the address.".to_string())
+            }
             Intent::EnvironmentHosts { connector_id, name } => self
                 .environment_hosts(*connector_id)
                 .await?
@@ -3385,10 +3673,12 @@ impl RunOps for LiveOps {
             name: name.to_string(),
             provider: crate::cloudflare::KIND.to_string(),
             values,
+            secrets: Default::default(),
             node_ids: node_ids.to_vec(),
             // Publish only what runs choose, so a tunnel on a whole zone
             // never puts other apps under it online by surprise.
             auto_publish: Some(false),
+            host_suffix: None,
         };
         match self.deps.connectors.create(request).await {
             Ok(view) => Ok((
@@ -3512,18 +3802,16 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn route_hostname(&self, host: &str, connector_id: i32) -> Result<(), String> {
+    async fn route_hostname(
+        &self,
+        host: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), String> {
         self.deps
             .connectors
-            .set_hostname_choice(
-                host,
-                SetHostnameChoiceRequest {
-                    mode: HostnameMode::Tunnel,
-                    connector_id: Some(connector_id),
-                },
-            )
+            .choose_tunnel_if_unchanged(host, connector_id, expected)
             .await
-            .map(|_| ())
             .map_err(text)
     }
 
@@ -3581,6 +3869,8 @@ impl RunOps for LiveOps {
             modified_on: s.modified_on,
             managed: s.managed,
             run_id: s.run_id,
+            proxied: Some(s.proxied),
+            proxy_toggled_run_id: s.proxy_toggled_run_id,
         }))
     }
 
@@ -3590,6 +3880,7 @@ impl RunOps for LiveOps {
         record_type: &str,
         content: &str,
         run_id: Option<i32>,
+        proxied: Option<bool>,
     ) -> Result<String, WriteError> {
         let label = self.label_of(host).await.map_err(WriteError::refused)?;
         let value = match record_type {
@@ -3608,9 +3899,10 @@ impl RunOps for LiveOps {
                     name: label.clone(),
                     content: value,
                     ttl: Some(300),
-                    proxied: false,
+                    proxied: proxied.unwrap_or(false),
                 },
-                Some(false),
+                // `None` takes the zone's "proxied by default" (ADR 031).
+                proxied,
                 OwnershipScope {
                     run_id,
                     ..self.dns_scope()
@@ -3635,6 +3927,26 @@ impl RunOps for LiveOps {
                 }
             })?;
         Ok(label)
+    }
+
+    async fn reclaim_dns_record(
+        &self,
+        host: &str,
+        record_type: &str,
+        run_id: i32,
+    ) -> Result<(), String> {
+        let label = self.label_of(host).await?;
+        self.deps
+            .records
+            .reclaim_proxy_toggled_record(
+                host,
+                &label,
+                dns_record_type(record_type),
+                self.dns_scope(),
+                run_id,
+            )
+            .await
+            .map_err(text)
     }
 
     async fn remove_dns_record(
@@ -3673,7 +3985,22 @@ impl RunOps for LiveOps {
             .map_err(text)
     }
 
-    async fn finish_certificate(&self, host: &str, email: &str) -> Result<(), String> {
+    async fn finish_certificate(
+        &self,
+        host: &str,
+        email: &str,
+        challenge: &str,
+    ) -> Result<(), String> {
+        if challenge == "dns-01" {
+            // The zone's DNS provider publishes the challenge record, public
+            // resolvers are waited for, and the record is removed after.
+            return self
+                .deps
+                .domains
+                .issue_dns01_through_provider(host, email, &self.deps.dns_providers)
+                .await
+                .map_err(|e| format!("Let's Encrypt could not issue {host} over DNS-01: {e}"));
+        }
         self.deps
             .domains
             .request_challenge(host, email)
@@ -3687,8 +4014,7 @@ impl RunOps for LiveOps {
             .map_err(|e| {
                 format!(
                     "Let's Encrypt could not validate {host}: {e}. Over HTTP-01 its DNS must \
-                     point at this ingress with port 80 open to the internet; over DNS-01 the \
-                     zone's DNS provider in Temps must be able to write TXT records."
+                     point at this ingress with port 80 open to the internet."
                 )
             })
     }
@@ -3758,6 +4084,7 @@ impl RunOps for LiveOps {
                 action: None,
                 network: None,
                 nothing_set_up: false,
+                findings: Vec::new(),
             })
     }
 
@@ -3769,6 +4096,24 @@ impl RunOps for LiveOps {
             .await
             .map(Some)
             .map_err(text)
+    }
+
+    async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String> {
+        Ok(self
+            .own_address(host)
+            .await?
+            .map(|row| row.http_policy.as_deref().and_then(HttpPolicy::parse)))
+    }
+
+    async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String> {
+        let row = self
+            .own_address(host)
+            .await?
+            .ok_or_else(|| format!("{host} is not attached to this environment any more."))?;
+        let mut active: project_custom_domains::ActiveModel = row.into();
+        active.http_policy = Set(policy.map(|p| p.as_str().to_string()));
+        active.update(self.deps.db.as_ref()).await.map_err(text)?;
+        Ok(())
     }
 
     async fn set_address_audience(
@@ -4071,8 +4416,181 @@ impl RunOps for LiveOps {
         Ok(ServiceDeletion::Deleted)
     }
 
+    async fn create_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<EdgeRuleMade, EdgeRuleError> {
+        let refused = |message: String| EdgeRuleError {
+            message,
+            missing_permission: None,
+            provider: None,
+            maybe_applied: false,
+        };
+        let (provider_id, provider_name, token) = self
+            .edge_credentials(connector_id, host)
+            .await
+            .map_err(refused)?;
+        let with_provider = |mut error: EdgeRuleError| {
+            error.provider = Some(provider_name.clone());
+            error
+        };
+        let reference = self.edge_rule_ref(run_id, purpose).await.map_err(refused)?;
+        let (zone, zone_id) = edge_rules::find_zone(&self.http, &token, host)
+            .await
+            .map_err(with_provider)?
+            .ok_or_else(|| {
+                with_provider(refused(format!(
+                    "The token cannot see the Cloudflare zone of {host}."
+                )))
+            })?;
+        if let Some(why) = edge_rules::rule_refusal(host, &zone, purpose) {
+            return Err(with_provider(refused(why)));
+        }
+        let made = edge_rules::add_rule(&self.http, &token, &zone_id, purpose, host, &reference)
+            .await
+            .map_err(with_provider)?;
+        Ok(match made {
+            EdgeRuleCreated::Created {
+                ruleset_id,
+                rule_id,
+                expression,
+            } => {
+                info!(run = run_id, host, %zone, rule = %rule_id, ?purpose, "added a Cloudflare edge rule");
+                EdgeRuleMade::Created(Box::new(RunResource::EdgeRule {
+                    hostname: host.to_string(),
+                    purpose,
+                    provider_id,
+                    zone,
+                    zone_id,
+                    ruleset_id,
+                    rule_id,
+                    expression,
+                }))
+            }
+            EdgeRuleCreated::AlreadyThere { description } => {
+                EdgeRuleMade::AlreadyThere(description)
+            }
+        })
+    }
+
+    async fn find_edge_rule(
+        &self,
+        run_id: i32,
+        connector_id: Option<i32>,
+        host: &str,
+        purpose: EdgeRulePurpose,
+    ) -> Result<Option<RunResource>, String> {
+        let (provider_id, _, token) = self.edge_credentials(connector_id, host).await?;
+        let reference = self.edge_rule_ref(run_id, purpose).await?;
+        let Some((zone, zone_id)) = edge_rules::find_zone(&self.http, &token, host)
+            .await
+            .map_err(|e| e.message)?
+        else {
+            return Ok(None);
+        };
+        Ok(
+            edge_rules::find_rule(&self.http, &token, &zone_id, purpose, &reference)
+                .await?
+                .map(|(ruleset_id, rule)| RunResource::EdgeRule {
+                    hostname: host.to_string(),
+                    purpose,
+                    provider_id,
+                    zone,
+                    zone_id,
+                    ruleset_id,
+                    rule_id: rule.id,
+                    expression: rule.expression,
+                }),
+        )
+    }
+
+    async fn edge_rule(&self, rule: &EdgeRuleAt) -> Result<Option<EdgeRuleSeen>, String> {
+        let token = self.provider_token(rule.provider_id).await?;
+        edge_rules::read_rule(
+            &self.http,
+            &token,
+            &rule.zone_id,
+            &rule.ruleset_id,
+            &rule.rule_id,
+        )
+        .await
+    }
+
+    async fn delete_edge_rule(&self, rule: &EdgeRuleAt) -> Result<(), String> {
+        let token = self.provider_token(rule.provider_id).await?;
+        edge_rules::delete_rule(
+            &self.http,
+            &token,
+            &rule.zone_id,
+            &rule.ruleset_id,
+            &rule.rule_id,
+        )
+        .await
+    }
+
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+}
+
+impl LiveOps {
+    /// The Cloudflare token a run's edge rules for `host` use (ADR 070):
+    /// the tunnel's DNS provider's, else the provider managing the zone.
+    async fn edge_credentials(
+        &self,
+        connector_id: Option<i32>,
+        host: &str,
+    ) -> Result<(i32, String, String), String> {
+        let from_connector = match connector_id {
+            Some(id) => ingress_connectors::Entity::find_by_id(id)
+                .one(self.deps.db.as_ref())
+                .await
+                .map_err(text)?
+                .and_then(|c| c.dns_provider_id),
+            None => None,
+        };
+        let provider = match from_connector {
+            Some(id) => self.deps.dns_providers.get(id).await.map_err(text)?,
+            None => {
+                self.deps
+                    .dns_providers
+                    .find_provider_for_domain(host)
+                    .await
+                    .map_err(text)?
+                    .ok_or_else(|| {
+                        format!("No Cloudflare DNS provider in Temps manages the zone of {host}.")
+                    })?
+                    .0
+            }
+        };
+        let credentials = self
+            .deps
+            .dns_providers
+            .cloudflare_credentials(&provider)
+            .map_err(text)?;
+        Ok((provider.id, provider.name, credentials.api_token))
+    }
+
+    async fn provider_token(&self, provider_id: i32) -> Result<String, String> {
+        let provider = self
+            .deps
+            .dns_providers
+            .get(provider_id)
+            .await
+            .map_err(text)?;
+        self.deps
+            .dns_providers
+            .cloudflare_credentials(&provider)
+            .map(|c| c.api_token)
+            .map_err(text)
+    }
+
+    async fn edge_rule_ref(&self, run_id: i32, purpose: EdgeRulePurpose) -> Result<String, String> {
+        let install = self.deps.records.instance_id().await.map_err(text)?;
+        Ok(edge_rules::rule_ref(&install, run_id, purpose))
     }
 }
 
@@ -4684,6 +5202,72 @@ impl TunnelMoveGuard for WaysIn {
 mod tests {
     use super::*;
 
+    fn run_row(journal: Value, steps: Value) -> reachability_runs::Model {
+        let now = Utc::now();
+        reachability_runs::Model {
+            id: 7,
+            project_id: Some(1),
+            environment_id: Some(1),
+            kind: "apply".into(),
+            audience: "public".into(),
+            address: Some("app.example.com".into()),
+            option: "tunnel".into(),
+            plan_id: None,
+            state: "interrupted".into(),
+            steps,
+            journal,
+            context: serde_json::json!({}),
+            undo: None,
+            error: None,
+            live_url: None,
+            created_by: None,
+            created_at: now,
+            updated_at: now,
+            finished_at: None,
+        }
+    }
+
+    /// A journal or step list a newer Temps wrote is refused before
+    /// anything is written back, never read as empty and saved.
+    #[test]
+    fn a_run_a_newer_temps_wrote_is_refused_not_emptied() {
+        let unknown = serde_json::json!([{
+            "key": "run7/future/app.example.com",
+            "intent": { "type": "a_future_intent", "hostname": "app.example.com" },
+            "state": "done"
+        }]);
+        assert!(stored_journal(&unknown).is_err());
+        let row = run_row(unknown.clone(), serde_json::json!([]));
+        // Shown, it reads as empty; changed, it is refused.
+        assert!(record_of(&row).journal.is_empty());
+        let error = record_to_change(&row).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("newer version of Temps")),
+            "{error}"
+        );
+        let steps =
+            serde_json::json!([{ "kind": "a_future_step", "label": "x", "status": "done" }]);
+        assert!(record_to_change(&run_row(serde_json::json!([]), steps.clone())).is_err());
+        // Recovery refuses either before it marks the run recovering: a
+        // known journal does not carry an unknown step list through.
+        assert!(journal_to_recover(&row).is_err());
+        let known_journal = serde_json::json!([]);
+        assert!(stored_journal(&known_journal).is_ok());
+        let error = journal_to_recover(&run_row(known_journal, steps)).expect_err("refused");
+        assert!(
+            matches!(&error, ReachabilityError::Conflict(m) if m.contains("step list")),
+            "{error}"
+        );
+        // What this Temps wrote reads back.
+        let record = record_to_change(&run_row(serde_json::json!([]), serde_json::json!([])))
+            .expect("readable");
+        assert!(record.journal.is_empty() && record.steps.is_empty());
+        assert!(
+            journal_to_recover(&run_row(serde_json::json!([]), serde_json::json!([])))
+                .is_ok_and(|journal| journal.is_empty())
+        );
+    }
+
     #[test]
     fn a_wildcard_is_never_made_signed_in() {
         let signed_in = AddressAudience::signed_in(GateKind::Temps, None);
@@ -4724,7 +5308,7 @@ mod tests {
     async fn an_access_address_stored_as_a_label_is_not_moved_off_its_tunnel() {
         use sea_orm::{ActiveModelTrait, Set};
 
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::with_migrations().await else {
             eprintln!("Docker/Postgres unavailable; skipping");
             return;
         };

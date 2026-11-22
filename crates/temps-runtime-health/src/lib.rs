@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::{net::SocketAddr, time::Duration};
 use thiserror::Error;
+use tokio::io::{AsyncRead, AsyncWrite};
 use uuid::Uuid;
 
 /// Limits are implementation bounds, independent of any future API settings.
@@ -148,6 +149,41 @@ pub trait RuntimeInspector: Send + Sync {
         Ok(Box::new(()))
     }
     async fn inspect(&self, assignment: &Assignment) -> Result<RuntimeSnapshot, InspectFailure>;
+
+    /// How network probes reach the endpoints [`Self::inspect`] derives.
+    /// Hosts where the probing process shares the network namespace the
+    /// ports are published in keep the default, [`TcpDialer`].
+    fn dialer(&self) -> &dyn ProbeDialer {
+        &TcpDialer
+    }
+}
+
+/// An open connection a network probe runs over.
+pub trait ProbeConnection: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> ProbeConnection for T {}
+
+/// Opens a network probe's connection to a container endpoint.
+///
+/// The endpoint always comes from the trusted inspector, never from a
+/// caller. A dialer only decides the route: a Mac worker publishes ports in
+/// its Docker app's VM, which macOS, where the agent runs, cannot route to,
+/// so its dialer connects from inside that VM. A dialer must resolve only
+/// once the connection is established, and fail if it cannot be: the TCP
+/// probe passes on a connection that stays open.
+#[async_trait]
+pub trait ProbeDialer: Send + Sync {
+    async fn connect(&self, endpoint: SocketAddr) -> std::io::Result<Box<dyn ProbeConnection>>;
+}
+
+/// Dials the endpoint directly, from this process's network namespace.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TcpDialer;
+
+#[async_trait]
+impl ProbeDialer for TcpDialer {
+    async fn connect(&self, endpoint: SocketAddr) -> std::io::Result<Box<dyn ProbeConnection>> {
+        Ok(Box::new(tokio::net::TcpStream::connect(endpoint).await?))
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
@@ -234,6 +270,7 @@ mod docker_tests {
         net::{IpAddr, Ipv4Addr},
         sync::Arc,
     };
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -288,19 +325,23 @@ mod docker_tests {
             eprintln!("Docker unavailable; skipping runtime probe integration");
             return;
         }
+        let request = GenericImage::new("busybox", "1.37.0")
+            .with_entrypoint("sh")
+            .with_exposed_port(8080.tcp())
+            .with_wait_for(WaitFor::message_on_stdout("runtime-probe-fixture-ready"))
+            .with_container_name(format!("temps-runtime-probe-{}", Uuid::new_v4()))
+            .with_cmd(["-c", "mkdir -p /tmp/site; printf ready > /tmp/site/index.html; httpd -f -p 8080 -h /tmp/site & echo runtime-probe-fixture-ready; exec sleep 120"])
+            .with_test_labels();
         // Separate Docker VMs can allocate a published port already occupied
         // on the host. Select a host-free port for this owned fixture.
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let requested_port = listener.local_addr().unwrap().port();
         drop(listener);
-        let fixture = GenericImage::new("busybox", "1.37.0")
-            .with_entrypoint("sh")
-            .with_exposed_port(8080.tcp())
-            .with_wait_for(WaitFor::message_on_stdout("runtime-probe-fixture-ready"))
+        let fixture = request
             .with_mapped_port(requested_port, 8080.tcp())
-            .with_container_name(format!("temps-runtime-probe-{}", Uuid::new_v4()))
-            .with_cmd(["-c", "mkdir -p /tmp/site; printf ready > /tmp/site/index.html; httpd -f -p 8080 -h /tmp/site & echo runtime-probe-fixture-ready; exec sleep 120"])
-            .start().await.unwrap();
+            .start()
+            .await
+            .unwrap();
         let container_id = fixture.id().to_string();
         let host = fixture
             .get_host()

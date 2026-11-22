@@ -28,7 +28,7 @@ class BuildInputsTests(unittest.TestCase):
         return {"FLAVOR": "python", "CHANNEL": "beta", "DRY_RUN": "false", "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "gotempsh/temps", "GITHUB_SHA": "a" * 40, **overrides}
 
     def test_image_version_comes_from_runtime_selection(self):
-        source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service.rs").read_text()
+        source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs").read_text()
         version = image_version(source)
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
         with self.assertRaises(ValueError):
@@ -81,6 +81,9 @@ class BuildInputsTests(unittest.TestCase):
 
     def test_bridge_and_daemon_pin_the_same_public_commit(self):
         bridge = read_toml(ROOT / "crates/temps-ai-agent-cli/Cargo.toml")["dependencies"]["temps-agent-runtime"]
+        if bridge.get("workspace") is True:
+            # The bridge inherits the pin from the workspace table; compare that.
+            bridge = read_toml(ROOT / "Cargo.toml")["workspace"]["dependencies"]["temps-agent-runtime"]
         daemon = read_toml(PACKAGE / "Cargo.toml")["dependencies"]["temps-agent-runtime"]
         self.assertEqual(bridge["git"], "https://github.com/gotempsh/agent-runtime-sdk.git")
         self.assertEqual(daemon["git"], bridge["git"])

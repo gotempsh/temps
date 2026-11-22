@@ -124,7 +124,7 @@ type DialogState =
   | { kind: 'edit'; override: ProjectLimitOverride }
 
 export function AiGatewayLimitsPage() {
-  usePageTitle('AI Limits')
+  usePageTitle('AI limits')
   const queryClient = useQueryClient()
 
   const [page, setPage] = useState(1)
@@ -298,7 +298,7 @@ export function AiGatewayLimitsPage() {
   return (
     <PageContainer>
       <PageHeader
-        title="AI Limits"
+        title="AI limits"
         description="Cap how fast and how much each project can spend through the AI gateway. Callers that exceed a cap get a 429 with a Retry-After header."
       />
 

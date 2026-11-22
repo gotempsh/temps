@@ -3,8 +3,12 @@
 
 import {
   getCronByIdOptions,
+  getCronByIdQueryKey,
   getCronExecutionsOptions,
+  getCronExecutionsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { CronExecutionInfo, ProjectResponse } from '@/api/client'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -28,7 +32,7 @@ import {
 } from '@temps-sdk/ds'
 import { useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'
-import { settingsSectionHref } from '@/lib/project-settings-sections'
+import { executionStatus } from './cronExecutionStatus'
 
 const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
   {
@@ -39,16 +43,7 @@ const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
   {
     key: 'status',
     header: 'Status',
-    render: (execution) => {
-      const succeeded =
-        execution.status_code >= 200 && execution.status_code < 300
-      return (
-        <Status
-          tone={succeeded ? 'ok' : 'error'}
-          label={succeeded ? 'Success' : 'Failed'}
-        />
-      )
-    },
+    render: (execution) => <Status {...executionStatus(execution)} />,
   },
   {
     key: 'duration',
@@ -60,7 +55,16 @@ const executionColumns: DataTableColumn<CronExecutionInfo>[] = [
     header: 'Details',
     render: (execution) => (
       <div className="space-y-1">
-        <div>Status: {execution.status_code}</div>
+        {execution.workflow_run_id ? (
+          <div>
+            Workflow run{' '}
+            <code className="text-xs break-all">
+              {execution.workflow_run_id}
+            </code>
+          </div>
+        ) : execution.state ? null : (
+          <div>Status: {execution.status_code}</div>
+        )}
         {execution.error_message && (
           <div className="text-destructive whitespace-normal break-words">
             {execution.error_message}
@@ -76,30 +80,23 @@ interface CronJobDetailProps {
 }
 
 export function CronJobDetail({ project }: CronJobDetailProps) {
-  const goBack = useGoBack(
-    settingsSectionHref(project.slug, 'automation', 'cron-jobs')
-  )
+  const goBack = useGoBack(`/projects/${project.slug}/cron-jobs`)
   const { environmentId, cronId } = useParams<{
     environmentId: string
     cronId: string
   }>()
+  const cronPath = {
+    project_id: project.id,
+    env_id: Number(environmentId),
+    cron_id: Number(cronId),
+  }
   const cronQuery = useQuery({
-    ...getCronByIdOptions({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId),
-        cron_id: Number(cronId),
-      },
-    }),
+    ...getCronByIdOptions({ path: cronPath }),
   })
 
   const executionsQuery = useQuery({
     ...getCronExecutionsOptions({
-      path: {
-        project_id: project.id,
-        env_id: Number(environmentId),
-        cron_id: Number(cronId),
-      },
+      path: cronPath,
       query: {
         page: 1,
         per_page: 10,
@@ -121,12 +118,18 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
         >
           <ArrowLeft className="size-4" />
         </Button>
-        <div>
-          <h2 className="text-lg font-medium">Cron Job Details</h2>
+        <div className="min-w-0 flex-1">
+          <h2 className="text-lg font-medium">Cron job details</h2>
           <p className="text-sm text-muted-foreground">
             View cron job configuration and execution history
           </p>
         </div>
+        <RefreshButton
+          queryKeys={[
+            getCronByIdQueryKey({ path: cronPath }),
+            queryKeyPrefix(getCronExecutionsQueryKey, { path: cronPath }),
+          ]}
+        />
       </div>
 
       <Card>
@@ -180,12 +183,30 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
             />
           ) : (
             <dl className="grid gap-4 md:grid-cols-2">
-              <div>
-                <dt className="text-sm font-medium">Path</dt>
-                <dd>
-                  <code className="text-sm break-all">{cronJob.path}</code>
-                </dd>
-              </div>
+              {cronJob.mode === 'workflow' ? (
+                <div>
+                  <dt className="text-sm font-medium">Starts workflow</dt>
+                  <dd>
+                    <code className="text-sm break-all">
+                      {cronJob.workflow}
+                    </code>
+                    <span className="block text-xs text-muted-foreground">
+                      Each run is a durable workflow run
+                      {cronJob.has_workflow_input
+                        ? ', with the input set in .temps.yaml'
+                        : ''}
+                      ; concurrency policy {cronJob.concurrency_policy}.
+                    </span>
+                  </dd>
+                </div>
+              ) : (
+                <div>
+                  <dt className="text-sm font-medium">Path</dt>
+                  <dd>
+                    <code className="text-sm break-all">{cronJob.path}</code>
+                  </dd>
+                </div>
+              )}
               <div>
                 <dt className="text-sm font-medium">Schedule</dt>
                 <dd>
@@ -213,7 +234,7 @@ export function CronJobDetail({ project }: CronJobDetailProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Recent Executions</CardTitle>
+          <CardTitle>Recent executions</CardTitle>
           <CardDescription>Last 10 executions of this cron job</CardDescription>
         </CardHeader>
         <CardContent className="space-y-4">

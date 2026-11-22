@@ -2,7 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe } from 'bun:test'
-import { parseSince, formatMs, formatTotal, resolveTimeWindow, MAX_WINDOW_DAYS } from './index.js'
+import {
+  parseSince,
+  formatMs,
+  formatTotal,
+  resolveTimeWindow,
+  MAX_WINDOW_DAYS,
+  parseApdexThreshold,
+  apdexLabel,
+  MAX_APDEX_THRESHOLD_MS,
+} from './index.js'
 
 describe('parseSince', () => {
   test('parses minutes, hours, and days', () => {
@@ -111,5 +120,29 @@ describe('resolveTimeWindow', () => {
     if (result.ok) throw new Error('expected error result')
     expect(result.error).toContain(`the maximum is ${MAX_WINDOW_DAYS}`)
     expect(result.error).toContain('--start-time/--end-time')
+  })
+})
+
+describe('parseApdexThreshold', () => {
+  test('accepts a positive threshold up to the server maximum', () => {
+    expect(parseApdexThreshold('200')).toEqual({ ok: true, ms: 200 })
+    expect(parseApdexThreshold(String(MAX_APDEX_THRESHOLD_MS))).toEqual({ ok: true, ms: MAX_APDEX_THRESHOLD_MS })
+  })
+
+  test('rejects zero, negatives, junk and values over the maximum, naming the flag', () => {
+    for (const bad of ['0', '-5', 'fast', String(MAX_APDEX_THRESHOLD_MS + 1)]) {
+      const result = parseApdexThreshold(bad)
+      expect(result.ok).toBe(false)
+      if (!result.ok) expect(result.error).toContain('--apdex-ms')
+    }
+  })
+})
+
+describe('apdexLabel', () => {
+  test('shows two decimals, or a dash when the row has no score', () => {
+    expect(apdexLabel(0.525)).toBe('0.53')
+    expect(apdexLabel(1)).toBe('1.00')
+    expect(apdexLabel(null)).toBe('-')
+    expect(apdexLabel(undefined)).toBe('-')
   })
 })

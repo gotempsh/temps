@@ -406,6 +406,11 @@ const AGENT_PATTERNS: &[(&str, AiAgentMatch)] = &[
 /// Compiled multi-pattern regex set. `RegexSet::matches` returns the indices of
 /// every pattern that matched, so we can find the most specific entry in a
 /// single pass.
+#[allow(
+    clippy::expect_used,
+    reason = "AGENT_PATTERNS are string literals; the unit tests compile this set, \
+              so an invalid pattern fails `cargo test`, never production"
+)]
 static AGENT_REGEX_SET: Lazy<RegexSet> = Lazy::new(|| {
     let patterns: Vec<&str> = AGENT_PATTERNS.iter().map(|(p, _)| *p).collect();
     RegexSet::new(&patterns).expect("Failed to compile AI agent regex set")

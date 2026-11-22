@@ -26,6 +26,9 @@ use crate::reachability::access_service::AccessProviderService;
 use crate::reachability::address_handlers::{
     configure_routes as address_routes, AddressApiDoc, AddressAppState,
 };
+use crate::reachability::certificate_methods::{
+    certificate_method_routes, CertificateMethodsApiDoc, CertificateMethodsState,
+};
 use crate::reachability::gate_handlers::{
     configure_routes as gate_routes, GateApiDoc, GateConsoleState,
 };
@@ -122,6 +125,9 @@ impl TempsPlugin for IngressPlugin {
             domains: context.require_service::<temps_domains::DomainService>(),
             config: context.require_service::<ConfigService>(),
             access: context.require_service::<AccessProviderService>(),
+            // Registered by the infrastructure plugin.
+            public_address: context
+                .require_service::<dyn temps_core::server_public_address::ServerPublicAddress>(),
         }));
         // Runs a restart left behind are reconciled now and every minute.
         reachability.clone().start_reconciler();
@@ -145,6 +151,11 @@ impl TempsPlugin for IngressPlugin {
             audit_service: audit_service.clone(),
             sensitive_action_authorizer: context
                 .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+        });
+        // Judged per domain (ADR 058 D10): a tunnel on one domain never
+        // blocks a certificate for another.
+        let certificate_methods_state = Arc::new(CertificateMethodsState {
+            source: reachability.clone(),
         });
         let reachability_state = Arc::new(ReachabilityAppState {
             service: reachability,
@@ -172,6 +183,7 @@ impl TempsPlugin for IngressPlugin {
             configure_routes()
                 .with_state(state)
                 .merge(reachability_routes().with_state(reachability_state))
+                .merge(certificate_method_routes().with_state(certificate_methods_state))
                 .merge(gate_routes().with_state(gate_state))
                 .merge(access_routes().with_state(access_state))
                 .merge(address_routes().with_state(address_state)),
@@ -181,6 +193,7 @@ impl TempsPlugin for IngressPlugin {
     fn openapi_schema(&self) -> Option<OpenApi> {
         let mut doc = <IngressApiDoc as OpenApiTrait>::openapi();
         doc.merge(<ReachabilityApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<CertificateMethodsApiDoc as OpenApiTrait>::openapi());
         doc.merge(<GateApiDoc as OpenApiTrait>::openapi());
         doc.merge(<AccessApiDoc as OpenApiTrait>::openapi());
         doc.merge(<AddressApiDoc as OpenApiTrait>::openapi());

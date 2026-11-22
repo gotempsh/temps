@@ -10,11 +10,21 @@
 //! Skips gracefully when Docker is unavailable (CI runners without docker,
 //! local machines without it, etc.) — never marks tests as `#[ignore]`.
 
+// Integration-test crate: clippy's `allow-*-in-tests` only covers `#[test]`
+// fns and `cfg(test)` modules, not the fixture helpers here, where a panic is
+// the intended failure.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test fixtures; a panic fails the test"
+)]
+
 use std::time::Duration;
 
 use temps_providers::externalsvc::postgres_wal_health::{
     self, ArchiveMode, PostgresWalHealth, WalWarning,
 };
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -35,6 +45,7 @@ async fn boot_postgres() -> Option<(String, ContainerAsync<GenericImage>)> {
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
         .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_test_labels()
         .start()
         .await
     {

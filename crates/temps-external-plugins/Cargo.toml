@@ -5,23 +5,25 @@
 name = "temps-external-plugins"
 version.workspace = true
 edition.workspace = true
+description = "External plugin host: discovers, installs, spawns and supervises standalone plugin binaries and proxies HTTP and events to them"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 temps-ai = { path = "../temps-ai" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
-anyhow = { workspace = true }
 base64 = { workspace = true }
-ed25519-dalek = "3.0.0"
+ed25519-dalek = { workspace = true }
 hex = { workspace = true }
 reqwest = { workspace = true }
 sha2 = { workspace = true }
@@ -34,7 +36,7 @@ flate2 = { workspace = true }
 tar = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
-hyper-util = { version = "0.1", features = ["tokio", "client-legacy"] }
+hyper-util = { workspace = true, features = ["default", "client-legacy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 semver = { workspace = true }
@@ -43,13 +45,17 @@ tokio-tungstenite = "0.30"
 tower = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono", "uuid"] }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+temps-test-utils = { path = "../temps-test-utils" }
 tracing-subscriber = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-migrations = { path = "../temps-migrations" }
+
+[lints]
+workspace = true

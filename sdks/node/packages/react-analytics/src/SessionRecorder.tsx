@@ -5,6 +5,9 @@
 import { useEffect, useMemo, useRef } from "react";
 import {
   SessionRecorder as CoreSessionRecorder,
+  isCookielessIdentity,
+  onCookielessIdentity,
+  onIdentityReset,
   type SessionRecorderOptions,
 } from "@temps-sdk/analytics-core";
 
@@ -79,7 +82,9 @@ export function SessionRecorder(props: SessionRecorderProps): null {
   const optionsKey = useMemo(() => JSON.stringify(props), [props]);
 
   useEffect(() => {
-    if (!props.enabled) return;
+    // A replay needs a visitor id stored on the device, which a cookieless page
+    // never writes (ADR 109 D3).
+    if (!props.enabled || isCookielessIdentity()) return;
 
     const { enabled: _enabled, sampling, ...options } = props;
     const recorder = new CoreSessionRecorder({
@@ -88,9 +93,27 @@ export function SessionRecorder(props: SessionRecorderProps): null {
       enabled: true,
     });
     recorderRef.current = recorder;
+    // Another analytics instance switching the page to cookieless after this
+    // mounted ends the replay and drops what was not uploaded yet.
+    let discarded = false;
+    const unsubscribe = onCookielessIdentity(() => {
+      discarded = true;
+      recorder.discard();
+      recorderRef.current = null;
+    });
+    // `reset()` after a sign-out gives the page a new visitor: end this
+    // replay, and record what follows in a new session once the server
+    // confirmed the reset.
+    const unsubscribeReset = onIdentityReset((phase) => {
+      if (discarded) return;
+      if (phase === "started") recorder.endForReset();
+      else recorder.resumeAfterReset();
+    });
 
     return () => {
-      recorder.destroy();
+      unsubscribe();
+      unsubscribeReset();
+      if (!discarded) recorder.destroy();
       recorderRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

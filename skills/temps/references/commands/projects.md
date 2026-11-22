@@ -31,7 +31,7 @@ Manage project secrets — mounted into the deployed container as files at /run/
 **Subcommands:**
 
 - `list` (`ls`) - List secrets for a project (values are never returned)
-- `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+- `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
 
@@ -49,7 +49,7 @@ List secrets for a project (values are never returned)
 
 #### `projects secrets create` (alias: `add`)
 
-Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 
 **Options:**
 
@@ -57,10 +57,14 @@ Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
-| `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
+| `-v, --value <value>` | Secret value on the command line (<=1 MiB; visible in shell history and `ps`). `-v @path` reading a file is deprecated: use --value-file | - | No |
 | `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
 | `-s, --service <name>` | Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container. | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
+| `--value-file <path>` | Read the secret value (<=1 MiB) from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the secret value (<=1 MiB) from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `projects secrets update`
 
@@ -72,16 +76,22 @@ Update a project secret (a redeploy is required for running containers to pick i
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
-| `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
+| `-v, --value <value>` | New value on the command line (<=1 MiB; visible in shell history). `-v @path` is deprecated: use --value-file. Give no value source to keep the existing value. | - | No |
 | `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
 | `-s, --service <name>` | Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service. | `` | No |
 | `--all-services` | Deliver to every Compose service, clearing any per-service scope | - | No |
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
+| `--value-file <path>` | Read the new secret value (<=1 MiB) from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the new secret value (<=1 MiB) from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `projects secrets delete` (alias: `rm`)
 
 Delete a project secret
+
+**Usage:** `projects secrets delete <key> [options]`
 
 **Options:**
 
@@ -229,6 +239,8 @@ Show or change how a service is deployed (primary source, and whether it also ac
 ### `projects hosting`
 
 Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
+
+**Usage:** `projects hosting [hosting] [options]`
 
 **Options:**
 

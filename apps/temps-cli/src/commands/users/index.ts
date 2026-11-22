@@ -20,6 +20,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 // Matches crates/temps-entities/src/types.rs's RoleType enum exactly --
 // the backend's FromStr only ever accepts "admin"/"user" and 400s
@@ -109,7 +110,7 @@ export function registerUsersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listUsersAction)
 
-  users
+  const createCommand = users
     .command('create')
     .alias('add')
     .description('Create a new user')
@@ -119,6 +120,7 @@ export function registerUsersCommands(program: Command): void {
     .option('-r, --roles <roles>', 'Comma-separated roles (admin, user)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createUserAction)
+  addCredentialSources(createCommand, [{ flag: 'password', what: 'the password' }])
 
   users
     .command('me')
@@ -154,7 +156,7 @@ export function registerUsersCommands(program: Command): void {
   users
     .command('reset-mfa')
     .description(
-      "Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session and signs in with their password to enroll again",
+      "Remove another user's MFA (authenticator and recovery codes) after they lost both. The user is signed out of every session. Password sign-in is blocked when require_mfa_for_admins applies; arrange SSO access or a temporary policy change before resetting MFA. Otherwise, sign in with a password to enroll again",
     )
     .requiredOption('--id <id>', 'User ID')
     .option('--json', 'Output in JSON format')

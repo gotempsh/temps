@@ -619,15 +619,13 @@ mod tests {
         use crate::route_sync::{build_snapshot, worker_public_routes, AgentCapabilities};
         use crate::route_table::{BackendEntry, BackendType, CachedPeerTable};
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_database = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping Shield worker test: test database unavailable: {error}");
                 return Ok(());
@@ -688,6 +686,13 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "192.0.2.7:32000".to_string(),
                         container_id: None,
                         container_name: None,

@@ -155,7 +155,7 @@ test('AI activity preserves detail timestamps through reload and back navigation
   await page.getByText(trace.root_span_name, { exact: true }).click()
   expectBounds((await request).url())
   expectBounds(page.url())
-  await expect(page.getByText('Total Spans', { exact: true })).toBeVisible()
+  await expect(page.getByText('Total spans', { exact: true })).toBeVisible()
   const reloaded = page.waitForRequest(
     (req) =>
       new URL(req.url()).pathname ===
@@ -163,7 +163,7 @@ test('AI activity preserves detail timestamps through reload and back navigation
   )
   await page.reload()
   expectBounds((await reloaded).url())
-  await expect(page.getByText('Total Spans', { exact: true })).toBeVisible()
+  await expect(page.getByText('Total spans', { exact: true })).toBeVisible()
   await page.screenshot({
     path: '/tmp/cloud-ai-trace-detail.png',
     fullPage: true,

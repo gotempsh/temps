@@ -64,8 +64,9 @@ use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
     EntityTrait, IntoActiveModel, QueryFilter, Statement,
 };
+use temps_config::AppSettings;
 use temps_core::route_table::RouteTableRefresher;
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::PublicHostnameStrategy;
 use temps_entities::traefik_discovered_routes as discovered;
 use temps_entities::traefik_route_certificates as route_certs;
 // No direct dependency on temps-monitoring here: that crate depends on
@@ -172,6 +173,10 @@ impl TraefikDiscoveryConfig {
     /// run on (the value `temps serve` passes to `DockerRuntime::new`), so an
     /// operator who only sets `TEMPS_TRAEFIK_DISCOVERY_ENABLED=true` watches a
     /// network the proxy can actually reach.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "documented host-level operator policy: TEMPS_TRAEFIK_DISCOVERY_ENABLED / TEMPS_TRAEFIK_DISCOVERY_NETWORK (docs/reference/environment-variables.md)"
+    )]
     pub fn from_env(default_network: &str) -> Self {
         Self::resolve(
             std::env::var(ENABLED_ENV).ok().as_deref(),

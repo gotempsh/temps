@@ -7,6 +7,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::analytics_identity_mode::AnalyticsIdentityMode;
 use super::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
 use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
@@ -259,6 +260,15 @@ pub struct Model {
     /// `project_telemetry_write_intervals` (signal_group = 'analytics').
     #[sea_orm(default_value = "local")]
     pub cloud_analytics_write_mode: CloudAnalyticsWriteMode,
+    /// ADR 109 D3: how this project's visitors are told apart. `persistent`
+    /// (the default for every existing and new project) keeps an id in a
+    /// first-party cookie or `localStorage`; `cookieless` stores nothing on
+    /// the device and counts visitors by a hash with a daily salt. On the
+    /// project row so the proxy reads it from its route table with no lookup
+    /// per request.
+    #[sea_orm(default_value = "persistent")]
+    #[serde(default)]
+    pub analytics_identity_mode: AnalyticsIdentityMode,
     /// Container log ingestion budget for this project's containers, in
     /// lines per second. NULL inherits the platform budget
     /// (`AppSettings.container_logs.ingest_lines_per_sec`); 0 disables it.

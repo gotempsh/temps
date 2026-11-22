@@ -18,6 +18,11 @@
 //! database itself over HTTP; doing so would just be a third, redundant
 //! path to the same `CREATE DATABASE IF NOT EXISTS`.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::sync::Arc;
 
 use chrono::{Duration, Utc};
@@ -84,11 +89,13 @@ async fn start_container() -> Option<ClickHouseConfig> {
     Box::leak(Box::new(container));
 
     let url = format!("http://127.0.0.1:{host_port}");
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     let mut last_err = String::new();
     for _ in 0..30 {

@@ -6,6 +6,7 @@ import {
   listDomainsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { DomainSelector } from '@/components/domains/DomainSelector'
@@ -25,6 +26,7 @@ import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
+import { reportRouteSaveError } from '@/lib/proxy-write-problems'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import {
@@ -43,7 +45,7 @@ import {
 } from '@/components/routes/DomainFieldHint'
 import { useEffect, useMemo } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
-import { useNavigate } from 'react-router'
+import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -112,12 +114,12 @@ export function AddRoute() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Load Balancer', href: '/settings/load-balancer' },
-      { label: 'Add Route' },
+      { label: 'Load balancer', href: '/settings/load-balancer' },
+      { label: 'Add route' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Add Route')
+  usePageTitle('Add route')
 
   const form = useForm<AddRouteFormData>({
     resolver: zodResolver(addRouteSchema),
@@ -147,6 +149,13 @@ export function AddRoute() {
     onSuccess: () => {
       toast.success('Route created successfully!')
       navigate('/settings/load-balancer')
+    },
+    // A refusal about the domain or the backend is shown on that field, where
+    // the operator can change it; anything else gets the failure toast.
+    onError: (error, _variables, _onMutateResult, context) => {
+      reportRouteSaveError(error, context, (field, message) =>
+        form.setError(field, { type: 'server', message })
+      )
     },
   })
 
@@ -207,14 +216,11 @@ export function AddRoute() {
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
-          <div>
-            <h1 className="text-2xl font-semibold tracking-tight">
-              Add New Route
-            </h1>
-            <p className="text-sm text-muted-foreground mt-1">
-              Configure routing rules to direct traffic to your backend services
-            </p>
-          </div>
+          <PageHeader
+            className="min-w-0 flex-1"
+            title="Add route"
+            description="Configure routing rules to direct traffic to your backend services"
+          />
         </div>
 
         <Form {...form}>
@@ -227,7 +233,7 @@ export function AddRoute() {
               <div className="p-6 space-y-4">
                 <div className="flex items-center gap-2">
                   <Router className="h-5 w-5 text-primary" />
-                  <h2 className="text-lg font-semibold">Routing Type</h2>
+                  <h2 className="text-lg font-semibold">Routing type</h2>
                 </div>
                 <p className="text-sm text-muted-foreground">
                   Choose how incoming traffic should be matched and routed to
@@ -264,7 +270,7 @@ export function AddRoute() {
                                   <div className="flex items-center gap-2">
                                     <Globe className="h-5 w-5 text-blue-500" />
                                     <span className="font-semibold">
-                                      HTTP Routing
+                                      HTTP routing
                                     </span>
                                     <span className="text-xs bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300 px-2 py-0.5 rounded">
                                       Recommended
@@ -278,7 +284,7 @@ export function AddRoute() {
                                   <div className="space-y-1 text-sm pt-2">
                                     <div className="flex items-center gap-2 text-muted-foreground">
                                       <Layers className="h-4 w-4" />
-                                      <span>Layer 7 (Application Layer)</span>
+                                      <span>Layer 7 (application layer)</span>
                                     </div>
                                     <div className="flex items-center gap-2 text-muted-foreground">
                                       <Server className="h-4 w-4" />
@@ -315,7 +321,7 @@ export function AddRoute() {
                                   <div className="flex items-center gap-2">
                                     <Lock className="h-5 w-5 text-green-500" />
                                     <span className="font-semibold">
-                                      TLS/SNI Routing
+                                      TLS/SNI routing
                                     </span>
                                     <span className="text-xs bg-green-100 text-green-700 dark:bg-green-900 dark:text-green-300 px-2 py-0.5 rounded">
                                       Passthrough
@@ -329,7 +335,7 @@ export function AddRoute() {
                                   <div className="space-y-1 text-sm pt-2">
                                     <div className="flex items-center gap-2 text-muted-foreground">
                                       <Layers className="h-4 w-4" />
-                                      <span>Layer 4/5 (Transport Layer)</span>
+                                      <span>Layer 4/5 (transport layer)</span>
                                     </div>
                                     <div className="flex items-center gap-2 text-muted-foreground">
                                       <Server className="h-4 w-4" />
@@ -376,7 +382,7 @@ export function AddRoute() {
                 <div className="flex items-center gap-2">
                   <Globe className="h-5 w-5 text-primary" />
                   <h2 className="text-lg font-semibold">
-                    Domain Configuration
+                    Domain configuration
                   </h2>
                 </div>
                 <p className="text-sm text-muted-foreground">
@@ -391,7 +397,7 @@ export function AddRoute() {
                     name="domainInputType"
                     render={({ field }) => (
                       <FormItem className="space-y-3">
-                        <FormLabel>Domain Source</FormLabel>
+                        <FormLabel>Domain source</FormLabel>
                         <FormControl>
                           <RadioGroup
                             onValueChange={(value) => {
@@ -458,6 +464,11 @@ export function AddRoute() {
                           status={managedDomainsStatus}
                           inputType={watchedDomainInputType}
                         />
+                        <span className="mt-1 block">
+                          Names Temps generates for your apps (everything under
+                          the preview domain) and domains a project already uses
+                          cannot be routed here.
+                        </span>
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
@@ -501,7 +512,7 @@ export function AddRoute() {
                 <div className="flex items-center gap-2">
                   <Server className="h-5 w-5 text-primary" />
                   <h2 className="text-lg font-semibold">
-                    Backend Configuration
+                    Backend configuration
                   </h2>
                 </div>
                 <p className="text-sm text-muted-foreground">
@@ -522,7 +533,16 @@ export function AddRoute() {
                           />
                         </FormControl>
                         <FormDescription>
-                          IP address or hostname of your backend service
+                          IP address or hostname of your backend service.
+                          Private, loopback and link-local addresses are refused
+                          unless their network is listed under{' '}
+                          <Link
+                            to="/settings/security"
+                            className="underline underline-offset-2"
+                          >
+                            trusted private networks
+                          </Link>
+                          .
                         </FormDescription>
                         <FormMessage />
                       </FormItem>
@@ -601,10 +621,10 @@ export function AddRoute() {
               </Button>
               <Button type="submit" disabled={createRoute.isPending}>
                 {createRoute.isPending ? (
-                  'Creating Route...'
+                  'Creating route...'
                 ) : (
                   <>
-                    Create Route
+                    Create route
                     <ArrowRight className="ml-2 h-4 w-4" />
                   </>
                 )}

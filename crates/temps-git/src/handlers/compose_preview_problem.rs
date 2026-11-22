@@ -152,7 +152,7 @@ mod tests {
         assert_eq!(problem["title"], "Compose Preview Failed");
         assert_eq!(problem["status"], 400);
         assert_eq!(problem["instance"], "/compose-preview");
-        assert_eq!(problem["extensions"], serde_json::json!({}));
+        assert!(problem.get("extensions").is_none());
         assert!(problem["detail"]
             .as_str()
             .is_some_and(|detail| detail.contains("compose.yaml")));

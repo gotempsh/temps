@@ -67,13 +67,41 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use temps_cloud_protocol::{
-    truncate_status_text, Capability, Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport,
-    StatusRequest, StatusSelfUpdate, PROTOCOL_VERSION,
+    truncate_status_text, Capability, ConsoleLogout, ConsoleLogoutAck, ConsoleLogoutRejected,
+    Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport, StatusRequest, StatusSelfUpdate,
+    CONSOLE_LOGOUT_ACK_KIND, CONSOLE_LOGOUT_KIND, CONSOLE_LOGOUT_REJECTED_KIND,
+    MAX_CONSOLE_LOGOUT_REJECTION_CHARS, PROTOCOL_VERSION,
 };
 
 use crate::link::CloudLink;
 use crate::status_provider::StatusProvider;
 use crate::BackendUrl;
+
+/// Applies a `console_logout` frame (ADR-094): verifies the logout token
+/// against the backend-managed OIDC provider's keys and ends that user's
+/// sessions. Implemented by the host, which owns authentication; this crate
+/// only carries the frame and the answer.
+#[async_trait::async_trait]
+pub trait ConsoleLogoutSink: Send + Sync {
+    async fn apply(&self, logout_token: &str) -> ConsoleLogoutOutcome;
+}
+
+/// What [`ConsoleLogoutSink::apply`] did with one token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleLogoutOutcome {
+    /// Verified; `sessions_ended` sessions (possibly zero) are gone.
+    Applied { jti: Uuid, sessions_ended: u32 },
+    /// Refused for `reason`. The backend stops re-sending it; the host's
+    /// own session re-check still applies.
+    Rejected { jti: Uuid, reason: String },
+    /// Not even a request id could be read. Nothing to answer.
+    Unreadable,
+}
+
+/// Bound on one [`ConsoleLogoutSink::apply`], which runs on this loop like
+/// [`StatusProvider::snapshot`] does, for the same reason. On a timeout no
+/// answer is sent and the backend sends the token again later.
+pub const CONSOLE_LOGOUT_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = SplitSink<WsStream, Message>;
@@ -193,8 +221,21 @@ fn next_reconnect_interval(current: Duration, outcome: CycleOutcome) -> Duration
 /// change beyond the capability appearing in `Hello`.
 pub async fn run(
     link: Arc<CloudLink>,
+    cancel: watch::Receiver<bool>,
+    status_provider: Option<Arc<dyn StatusProvider>>,
+) {
+    run_with_console_logout(link, cancel, status_provider, None).await;
+}
+
+/// [`run`], also applying `console_logout` frames through `console_logout`
+/// (ADR-094). With a sink, the `Hello` advertises
+/// [`Capability::ConsoleSessionLogout`]; without one it does not, and the
+/// backend never sends the frame.
+pub async fn run_with_console_logout(
+    link: Arc<CloudLink>,
     mut cancel: watch::Receiver<bool>,
     status_provider: Option<Arc<dyn StatusProvider>>,
+    console_logout: Option<Arc<dyn ConsoleLogoutSink>>,
 ) {
     tracing::info!("Cloud heartbeat sender started");
     // Approximates process uptime: this task is spawned once, unconditionally,
@@ -220,7 +261,7 @@ pub async fn run(
                     continue;
                 }
                 tracing::debug!("Cloud heartbeat connection cycle starting");
-                let outcome = connection_cycle(&link, &mut cancel, status_provider.as_ref(), started_at, &mut outage).await;
+                let outcome = connection_cycle_with(&link, &mut cancel, status_provider.as_ref(), console_logout.as_ref(), started_at, &mut outage).await;
                 tracing::debug!(outcome = ?outcome, "Cloud heartbeat connection cycle finished");
                 if outcome == CycleOutcome::Cancelled {
                     tracing::info!("Cloud heartbeat sender stopped after shutdown request");
@@ -273,10 +314,22 @@ fn connection_outcome(outcome: CycleOutcome, connected_for: Duration) -> CycleOu
 
 /// Connect, negotiate, then send heartbeats until the connection drops or
 /// shutdown is requested.
+#[cfg(test)]
 async fn connection_cycle(
     link: &Arc<CloudLink>,
     cancel: &mut watch::Receiver<bool>,
     status_provider: Option<&Arc<dyn StatusProvider>>,
+    started_at: Instant,
+    outage: &mut Outage,
+) -> CycleOutcome {
+    connection_cycle_with(link, cancel, status_provider, None, started_at, outage).await
+}
+
+async fn connection_cycle_with(
+    link: &Arc<CloudLink>,
+    cancel: &mut watch::Receiver<bool>,
+    status_provider: Option<&Arc<dyn StatusProvider>>,
+    console_logout: Option<&Arc<dyn ConsoleLogoutSink>>,
     started_at: Instant,
     outage: &mut Outage,
 ) -> CycleOutcome {
@@ -312,7 +365,7 @@ async fn connection_cycle(
         }
     };
 
-    let negotiated = match handshake(link, &mut write, &mut read).await {
+    let negotiated = match handshake(link, &mut write, &mut read, console_logout.is_some()).await {
         Ok(negotiated) => negotiated,
         Err(error) => {
             tracing::warn!(%error, "Cloud heartbeat handshake failed; will retry");
@@ -342,6 +395,7 @@ async fn connection_cycle(
         instance_id,
         &negotiated,
         status_provider,
+        console_logout,
         started_at,
         &mut write,
         &mut read,
@@ -410,6 +464,7 @@ async fn handshake(
     link: &CloudLink,
     write: &mut WsWrite,
     read: &mut WsRead,
+    console_logout: bool,
 ) -> Result<Vec<Capability>, HeartbeatError> {
     let server_hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read.next())
         .await
@@ -423,10 +478,16 @@ async fn handshake(
         Capability::ManagedAiInference,
         Capability::InstanceStatusReporting,
     ];
+    // Advertised, not negotiated: the frame authenticates itself, so the
+    // backend only needs to know this instance will act on it.
+    let mut advertised = our_capabilities.clone();
+    if console_logout {
+        advertised.push(Capability::ConsoleSessionLogout);
+    }
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         agent_version: link.agent_version().to_string(),
-        capabilities: our_capabilities.clone(),
+        capabilities: advertised,
     };
     send_envelope(write, "hello", &hello).await?;
 
@@ -514,6 +575,7 @@ async fn send_status_report(
         deployment_count: snapshot.deployment_count,
         service_count: snapshot.service_count,
         project_count: snapshot.project_count,
+        worker_node_count: snapshot.worker_node_count,
         resources: snapshot.resources,
         self_update: snapshot.self_update.map(cap_self_update_text),
     };
@@ -533,6 +595,7 @@ async fn heartbeat_loop(
     instance_id: Uuid,
     negotiated: &[Capability],
     status_provider: Option<&Arc<dyn StatusProvider>>,
+    console_logout: Option<&Arc<dyn ConsoleLogoutSink>>,
     started_at: Instant,
     write: &mut WsWrite,
     read: &mut WsRead,
@@ -632,6 +695,14 @@ async fn heartbeat_loop(
                                 }
                             }
                         }
+                        else if let Some(logout) = decode_console_logout(&message) {
+                            if let Some(sink) = console_logout {
+                                if let Err(error) = apply_console_logout(write, sink, &logout).await {
+                                    tracing::debug!(%error, "Cloud console logout answer failed; will reconnect");
+                                    return CycleOutcome::Disconnected;
+                                }
+                            }
+                        }
                         // Any other frame kind (a future addition, a ping the
                         // client library already answered) is ignored: this
                         // channel's only obligation is to keep heartbeats
@@ -689,6 +760,72 @@ fn decode_heartbeat_ack(message: &Message) -> Option<HeartbeatAck> {
 
 fn decode_status_request(message: &Message) -> Option<StatusRequest> {
     decode_envelope(message)?.decode::<StatusRequest>("status_request")
+}
+
+fn decode_console_logout(message: &Message) -> Option<ConsoleLogout> {
+    decode_envelope(message)?.decode::<ConsoleLogout>(CONSOLE_LOGOUT_KIND)
+}
+
+/// Apply one logout through `sink`, bounded, and answer it. An `Err` is a
+/// failed send, which ends the connection like any other.
+async fn apply_console_logout(
+    write: &mut WsWrite,
+    sink: &Arc<dyn ConsoleLogoutSink>,
+    logout: &ConsoleLogout,
+) -> Result<(), HeartbeatError> {
+    let outcome = match tokio::time::timeout(
+        CONSOLE_LOGOUT_APPLY_TIMEOUT,
+        sink.apply(&logout.logout_token),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CONSOLE_LOGOUT_APPLY_TIMEOUT.as_secs(),
+                "applying a Cloud console logout timed out; Cloud will send it again"
+            );
+            return Ok(());
+        }
+    };
+    match outcome {
+        ConsoleLogoutOutcome::Applied {
+            jti,
+            sessions_ended,
+        } => {
+            tracing::info!(
+                request_id = %jti,
+                sessions_ended,
+                "ended a user's Temps Cloud console sessions on Cloud's signed request"
+            );
+            send_envelope(
+                write,
+                CONSOLE_LOGOUT_ACK_KIND,
+                &ConsoleLogoutAck {
+                    jti,
+                    sessions_ended,
+                },
+            )
+            .await
+        }
+        ConsoleLogoutOutcome::Rejected { jti, reason } => {
+            let reason: String = reason
+                .chars()
+                .take(MAX_CONSOLE_LOGOUT_REJECTION_CHARS)
+                .collect();
+            tracing::warn!(request_id = %jti, reason = %reason, "refused a Cloud console logout");
+            send_envelope(
+                write,
+                CONSOLE_LOGOUT_REJECTED_KIND,
+                &ConsoleLogoutRejected { jti, reason },
+            )
+            .await
+        }
+        ConsoleLogoutOutcome::Unreadable => {
+            tracing::warn!("ignored an unreadable Cloud console logout frame");
+            Ok(())
+        }
+    }
 }
 
 fn is_close(message: &Message) -> bool {
@@ -848,6 +985,14 @@ mod tests {
         /// "report again on request" path without waiting out
         /// `STATUS_REPORT_INTERVAL`.
         nudge_after_first_status_report: Arc<AtomicBool>,
+        /// Set once the instance's `Hello` arrives: whether it advertised
+        /// `console_session_logout`.
+        client_advertised_console_logout: Arc<Mutex<Option<bool>>>,
+        /// When set, the server sends this `console_logout` token right
+        /// after the instance's `Hello`.
+        console_logout_token: Arc<Mutex<Option<String>>>,
+        console_logout_acks: Arc<Mutex<Vec<ConsoleLogoutAck>>>,
+        console_logout_rejections: Arc<Mutex<Vec<ConsoleLogoutRejected>>>,
     }
 
     async fn management_socket(state: State<Stub>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -887,7 +1032,46 @@ mod tests {
             let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
                 continue;
             };
-            if let Some(heartbeat) = envelope.decode::<Heartbeat>("heartbeat") {
+            if let Some(client_hello) = envelope.decode::<Hello>("hello") {
+                *stub
+                    .client_advertised_console_logout
+                    .lock()
+                    .expect("advertised lock") = Some(
+                    client_hello
+                        .capabilities
+                        .contains(&Capability::ConsoleSessionLogout),
+                );
+                let token = stub
+                    .console_logout_token
+                    .lock()
+                    .expect("console logout token lock")
+                    .clone();
+                if let Some(logout_token) = token {
+                    let frame = Envelope::new(CONSOLE_LOGOUT_KIND, &ConsoleLogout { logout_token })
+                        .expect("console logout must encode");
+                    if socket
+                        .send(AxumMessage::Text(
+                            serde_json::to_string(&frame).unwrap().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            } else if let Some(ack) = envelope.decode::<ConsoleLogoutAck>(CONSOLE_LOGOUT_ACK_KIND) {
+                stub.console_logout_acks
+                    .lock()
+                    .expect("acks lock")
+                    .push(ack);
+            } else if let Some(rejected) =
+                envelope.decode::<ConsoleLogoutRejected>(CONSOLE_LOGOUT_REJECTED_KIND)
+            {
+                stub.console_logout_rejections
+                    .lock()
+                    .expect("rejections lock")
+                    .push(rejected);
+            } else if let Some(heartbeat) = envelope.decode::<Heartbeat>("heartbeat") {
                 stub.last_pending_spool_bytes
                     .store(heartbeat.pending_spool_bytes, Ordering::SeqCst);
                 let count = stub.heartbeats_received.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1207,6 +1391,7 @@ mod tests {
         StatusSnapshot {
             deployment_count: 3,
             service_count: 5,
+            worker_node_count: None,
             project_count: 2,
             resources: None,
             self_update: None,
@@ -1624,5 +1809,153 @@ mod tests {
                  even after a snapshot timeout",
             )
             .expect("connection cycle must not panic");
+    }
+
+    const REQUEST_ID: Uuid = Uuid::from_u128(0x0112);
+
+    /// Records the tokens it is handed and answers with a fixed outcome.
+    struct RecordingLogoutSink {
+        tokens: Mutex<Vec<String>>,
+        reject: bool,
+    }
+
+    #[async_trait]
+    impl ConsoleLogoutSink for RecordingLogoutSink {
+        async fn apply(&self, logout_token: &str) -> ConsoleLogoutOutcome {
+            self.tokens
+                .lock()
+                .expect("tokens lock")
+                .push(logout_token.to_string());
+            if self.reject {
+                ConsoleLogoutOutcome::Rejected {
+                    jti: REQUEST_ID,
+                    reason: "x".repeat(MAX_CONSOLE_LOGOUT_REJECTION_CHARS * 2),
+                }
+            } else {
+                ConsoleLogoutOutcome::Applied {
+                    jti: REQUEST_ID,
+                    sessions_ended: 2,
+                }
+            }
+        }
+    }
+
+    async fn run_console_logout_cycle(
+        stub: &Stub,
+        sink: Option<Arc<dyn ConsoleLogoutSink>>,
+        done: impl Fn(&Stub) -> bool,
+    ) -> bool {
+        let Some(backend_url) = serve(stub.clone()).await else {
+            return false;
+        };
+        let (link, _directory) = linked_test_link(&backend_url).await;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut cancel = cancel_rx;
+        let cycle = tokio::spawn(async move {
+            connection_cycle_with(
+                &link,
+                &mut cancel,
+                None,
+                sink.as_ref(),
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(stub) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the console logout exchange must complete promptly");
+        cancel_tx.send(true).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(5), cycle)
+            .await
+            .expect("connection cycle must stop promptly on cancellation")
+            .expect("connection cycle must not panic");
+        true
+    }
+
+    #[tokio::test]
+    async fn a_console_logout_is_applied_and_acknowledged_when_a_sink_is_registered() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("signed.logout.token".into()))),
+            ..Default::default()
+        };
+        let sink = Arc::new(RecordingLogoutSink {
+            tokens: Mutex::new(Vec::new()),
+            reject: false,
+        });
+        let as_sink: Arc<dyn ConsoleLogoutSink> = sink.clone();
+        if !run_console_logout_cycle(&stub, Some(as_sink), |stub| {
+            !stub.console_logout_acks.lock().unwrap().is_empty()
+        })
+        .await
+        {
+            return;
+        }
+        assert_eq!(
+            *stub.client_advertised_console_logout.lock().unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            *sink.tokens.lock().unwrap(),
+            vec!["signed.logout.token".to_string()]
+        );
+        let acks = stub.console_logout_acks.lock().unwrap();
+        assert_eq!(acks[0].jti, REQUEST_ID);
+        assert_eq!(acks[0].sessions_ended, 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_console_logout_is_answered_with_a_bounded_reason() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("forged.logout.token".into()))),
+            ..Default::default()
+        };
+        let sink: Arc<dyn ConsoleLogoutSink> = Arc::new(RecordingLogoutSink {
+            tokens: Mutex::new(Vec::new()),
+            reject: true,
+        });
+        if !run_console_logout_cycle(&stub, Some(sink), |stub| {
+            !stub.console_logout_rejections.lock().unwrap().is_empty()
+        })
+        .await
+        {
+            return;
+        }
+        let rejections = stub.console_logout_rejections.lock().unwrap();
+        assert_eq!(rejections[0].jti, REQUEST_ID);
+        assert_eq!(
+            rejections[0].reason.chars().count(),
+            MAX_CONSOLE_LOGOUT_REJECTION_CHARS
+        );
+        assert!(stub.console_logout_acks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_the_capability_is_not_advertised_and_the_frame_is_ignored() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("signed.logout.token".into()))),
+            ..Default::default()
+        };
+        if !run_console_logout_cycle(&stub, None, |stub| {
+            stub.client_advertised_console_logout
+                .lock()
+                .unwrap()
+                .is_some()
+                && stub.heartbeats_received.load(Ordering::SeqCst) > 0
+        })
+        .await
+        {
+            return;
+        }
+        assert_eq!(
+            *stub.client_advertised_console_logout.lock().unwrap(),
+            Some(false)
+        );
+        assert!(stub.console_logout_acks.lock().unwrap().is_empty());
+        assert!(stub.console_logout_rejections.lock().unwrap().is_empty());
     }
 }

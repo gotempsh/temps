@@ -267,6 +267,33 @@ Dir.mktmpdir("scanned-server-test-") do |directory|
   end
 end
 dependency_scan = YAML.safe_load(File.read(File.join(repository_root, ".github/workflows/dependency-scan.yml")), aliases: true)
+audit_job = dependency_scan.fetch("jobs").fetch("cargo-audit")
+audit_steps = audit_job.fetch("steps")
+pr_audit = audit_steps.find { |step| step["name"] == "Audit pull request dependencies" }
+abort "PR audit must run without Check API reporting" unless pr_audit &&
+  pr_audit["if"] == "github.event_name == 'pull_request'" && !pr_audit["continue-on-error"]
+report_audit = audit_steps.find { |step| step.fetch("uses", "").start_with?("rustsec/audit-check@") }
+abort "scheduled audit reporting must retain the shared advisory policy" unless report_audit &&
+  report_audit["if"] == "github.event_name != 'pull_request'" &&
+  report_audit.dig("with", "ignore") == '${{ env.AUDIT_IGNORE }}'
+Dir.mktmpdir do |directory|
+  File.write(File.join(directory, "cargo"), <<~SH)
+    #!/bin/bash
+    printf '%s\\n' "$@" > "$AUDIT_ARGS"
+    exit "$AUDIT_EXIT"
+  SH
+  File.chmod(0700, File.join(directory, "cargo"))
+  environment = {"PATH" => directory + File::PATH_SEPARATOR + ENV.fetch("PATH"),
+    "AUDIT_IGNORE" => audit_job.fetch("env").fetch("AUDIT_IGNORE"),
+    "AUDIT_ARGS" => File.join(directory, "args")}
+  [0, 1, 2].each do |exit_code|
+    _, error, status = Open3.capture3(environment.merge("AUDIT_EXIT" => exit_code.to_s),
+      "bash", "-euo", "pipefail", "-c", pr_audit.fetch("run"), chdir: directory)
+    abort "audit exit status was masked: #{error}" unless status.exitstatus == exit_code
+    expected = ["audit", "--file", "Cargo.lock"] + environment["AUDIT_IGNORE"].split(",").flat_map { |id| ["--ignore", id] }
+    abort "audit changed advisory policy" unless File.readlines(environment["AUDIT_ARGS"], chomp: true) == expected
+  end
+end
 channels = dependency_scan.dig("jobs", "container-scan", "strategy", "matrix", "include")
 abort "published channel scans must retain existing SARIF categories and cover nightly" unless
   channels == [
@@ -410,6 +437,8 @@ expected_release_permissions = {
   "runtime-image-manifest" => {"contents" => "read", "packages" => "read"},
   "promote-runtime-images" => publish_packages,
   "build-web-assets" => read_contents,
+  # OIDC uploads plus immutable package tags, isolated from SDK builds.
+  "publish-sdks" => {"contents" => "write", "id-token" => "write"},
   "build-linux-amd64" => read_contents,
   "build-linux-arm64" => read_contents,
   "build-darwin-amd64" => read_contents,
@@ -429,6 +458,41 @@ unless actual_release_permissions == expected_release_permissions
     "expected #{expected_release_permissions.inspect}\nactual #{actual_release_permissions.inspect}"
 end
 
+# A full disk in this job must leave evidence of what filled it.
+unit_test_steps = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").map { |step| step["name"] }
+["Free up disk space", "Start disk usage samples", "Run unit tests", "Report disk usage"].each_cons(2) do |first, second|
+  abort "unit tests must run #{first} before #{second}" unless
+    unit_test_steps.index(first) && unit_test_steps.index(second) &&
+    unit_test_steps.index(first) < unit_test_steps.index(second)
+end
+unit_test_report = rust_tests.fetch("jobs").fetch("unit-tests").fetch("steps").find { |step| step["name"] == "Report disk usage" }
+abort "the unit test disk report must still run after failed tests" unless
+  unit_test_report["if"].to_s.include?("!cancelled()")
+abort "the unit test disk report must not fail the job" unless unit_test_report["continue-on-error"] == true
+abort "the unit test disk report must keep going after a failed command" unless
+  unit_test_report.fetch("run").lines.first.strip == "set +e"
+
+arm64_build = release.fetch("jobs").fetch("build-linux-arm64").fetch("steps").find do |step|
+  step["name"] == "Build release binary"
+end
+abort "the Linux ARM64 release build must exist" unless arm64_build
+# Unrestricted parallelism stopped this runner mid-build on every attempt.
+abort "the Linux ARM64 release build must limit parallel crates to 2" unless
+  arm64_build.fetch("env", {})["CARGO_BUILD_JOBS"] == 2
+arm64_run = arm64_build.fetch("run", "")
+arm64_probes = %w[MemAvailable SwapFree df]
+abort "the Linux ARM64 release build must log memory and disk while it compiles" unless
+  arm64_probes.all? { |probe| arm64_run.include?(probe) }
+arm64_first_sleep = arm64_run.index("sleep 60")
+abort "the Linux ARM64 release build must log resources before its first sleep" unless
+  arm64_first_sleep && arm64_probes.all? { |probe| arm64_run.index(probe) < arm64_first_sleep }
+abort "the Linux ARM64 release build must link with lld (GNU ld overflows AArch64 call range)" unless
+  arm64_build.fetch("env", {})["CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS"].to_s.include?("-fuse-ld=lld") &&
+  arm64_run.match?(/readelf -p \.comment target\/release\/temps \| grep -q 'LLD' \\\n\s*\|\| \{ echo "::error::target\/release\/temps was not linked with lld"; exit 1; \}/) &&
+  release.fetch("jobs").fetch("build-linux-arm64").fetch("steps").any? { |step|
+    step["name"] == "Install build dependencies" && step.fetch("run", "").split.include?("lld")
+  }
+
 otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
 abort "OTEL protobuf compatibility must use the release runner image" unless
   otel_protobuf_compat["runs-on"] == "ubuntu-22.04"
@@ -443,7 +507,7 @@ abort "OTEL protobuf compatibility must compile temps-otel" unless
 release_steps = release.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }
 bun_versions = release_steps.map { |step| step.dig("with", "bun-version") }.compact
 abort "release workflow uses an unpinned Bun version" unless
-  bun_versions == ["1.3.14"]
+  bun_versions == ["1.3.14", "1.4.2"]
 wasm_pack_installs = release_steps.flat_map do |step|
   step.fetch("run", "").lines.map(&:strip).select { |line| line.include?("cargo install wasm-pack") }
 end

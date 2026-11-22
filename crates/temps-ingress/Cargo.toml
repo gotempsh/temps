@@ -5,6 +5,7 @@
 name = "temps-ingress"
 version.workspace = true
 edition.workspace = true
+description = "Ingress connectors (Cloudflare Tunnel, Tailscale): control-plane providers and node-facing handlers for non-public cluster entry"
 license.workspace = true
 authors.workspace = true
 
@@ -18,7 +19,6 @@ temps-config = { path = "../temps-config" }
 temps-domains = { path = "../temps-domains" }
 temps-projects = { path = "../temps-projects" }
 
-anyhow.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
@@ -38,5 +38,9 @@ url.workspace = true
 utoipa.workspace = true
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+tower.workspace = true
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
+
+[lints]
+workspace = true

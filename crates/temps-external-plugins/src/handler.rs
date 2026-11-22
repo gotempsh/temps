@@ -3,6 +3,11 @@
 
 //! HTTP handlers for external plugin management endpoints.
 
+mod ai_tools;
+mod local_file;
+mod watches;
+use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
+
 use std::sync::Arc;
 
 use axum::extract::rejection::JsonRejection;
@@ -12,18 +17,22 @@ use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::external_plugin::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use temps_core::problemdetails::Problem;
+use temps_plugin_protocol::{NavEntry, NavSection, PluginManifest, UiManifest, UiRoute};
 use utoipa::{OpenApi as OpenApiTrait, ToSchema};
 
 use crate::service::ExternalPluginsError;
 use crate::service::ExternalPluginsService;
-use temps_core::external_plugin::channel::{
-    PluginActorInfo, PluginAiCapability, PluginHostPermission,
-};
+use temps_plugin_protocol::channel::{PluginActorInfo, PluginAiCapability, PluginHostPermission};
 
 fn grant_problem(error: crate::grants::GrantError) -> Problem {
     match error {
+        crate::grants::GrantError::AiToolsPublication { .. } => {
+            tracing::error!(error = %error, "Saved plugin AI consent could not be published");
+            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Plugin AI Tools Unavailable")
+                .with_detail("Consent was saved, but AI tools could not be refreshed and remain unavailable. Retry saving this setting or reload plugins after the database recovers.")
+        }
         crate::grants::GrantError::NotFound { .. } => {
             temps_core::problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Plugin Actor Not Found")
@@ -38,6 +47,12 @@ fn grant_problem(error: crate::grants::GrantError) -> Problem {
             temps_core::problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Plugin Actor Changed")
                 .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::ActivationUnconfirmed { .. } => {
+            tracing::error!(%error, "Plugin activation could not be confirmed");
+            temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Plugin Activation Unconfirmed")
+                .with_detail("The verified release was retained. Reload plugins after the database recovers to reconcile its activation.")
         }
         crate::grants::GrantError::Database { .. } => {
             tracing::error!(error = %error, "Plugin grant database operation failed");
@@ -84,10 +99,8 @@ impl temps_core::audit::AuditOperation for PluginInstallGrantApprovalAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize plugin install grant approval audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -104,10 +117,8 @@ impl temps_core::audit::AuditOperation for PluginGrantChangeAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize external-plugin grant audit: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -422,10 +433,8 @@ impl temps_core::audit::AuditOperation for ExternalPluginWriteAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("failed to serialize external-plugin audit event: {error}")
-        })
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -763,14 +772,23 @@ pub struct PluginStatusResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginSourceResponse {
-    pub kind: String,
-    pub repository_url: String,
-    pub ref_name: String,
-    pub path: Option<String>,
-    pub commit: String,
-    pub version: String,
-    pub builder_image: String,
+#[serde(tag = "kind")]
+pub enum PluginSourceResponse {
+    #[serde(rename = "github")]
+    Repository {
+        repository_url: String,
+        ref_name: String,
+        path: Option<String>,
+        commit: String,
+        version: String,
+        builder_image: String,
+    },
+    #[serde(rename = "local-file")]
+    File {
+        version: String,
+        platform: String,
+        sha256: String,
+    },
 }
 
 fn service_problem(error: &ExternalPluginsError) -> Problem {
@@ -938,7 +956,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Install(InstallError::DigestMismatch {
             plugin, version, ..
         }) => format!(
-            "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
+            "Executable for plugin '{plugin}' v{version} did not match its expected SHA-256 digest"
         ),
         ExternalPluginsError::Install(InstallError::InvalidNpmTarball {
             plugin, version, ..
@@ -959,6 +977,8 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::CandidateRejected { name, version, .. } => {
             format!("Plugin '{name}' v{version} did not pass startup verification")
         }
+        ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed { plugin_name, .. }) =>
+            format!("Activation of plugin '{plugin_name}' could not be confirmed. The verified release was retained. Reload plugins after the database recovers."),
         ExternalPluginsError::Grant(_) => {
             "The plugin actor identity could not be committed after activation".to_string()
         }
@@ -1613,20 +1633,29 @@ async fn get_plugin_status(
     crate::install::validate_plugin_name(&name)
         .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
     let configured = state.service.manager().is_running(&name).await;
-    let source = state
+    let source = match state
         .service
-        .repository_source(&name)
+        .active_source(&name)
         .await
-        .map_err(|error| service_problem(&error))?
-        .map(|receipt| PluginSourceResponse {
-            kind: "github".to_string(),
-            repository_url: receipt.repository,
-            ref_name: receipt.ref_name,
-            path: receipt.path,
-            commit: receipt.commit,
+        .map_err(|err| service_problem(&err))?
+    {
+        Some(crate::install::ActiveSource::Repository(receipt)) => {
+            Some(PluginSourceResponse::Repository {
+                repository_url: receipt.repository,
+                ref_name: receipt.ref_name,
+                path: receipt.path,
+                commit: receipt.commit,
+                version: receipt.version,
+                builder_image: receipt.builder,
+            })
+        }
+        Some(crate::install::ActiveSource::File(receipt)) => Some(PluginSourceResponse::File {
             version: receipt.version,
-            builder_image: receipt.builder,
-        });
+            platform: receipt.platform,
+            sha256: receipt.sha256,
+        }),
+        _ => None,
+    };
     Ok(Json(PluginStatusResponse {
         configured,
         reason: (!configured)
@@ -1650,14 +1679,28 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             "/x/plugins/installation-reporting",
             get(get_installation_reporting).put(put_installation_reporting),
         )
+        .route(
+            "/x/plugins/install/file",
+            post(local_file::install_local_file).layer(axum::extract::DefaultBodyLimit::max(
+                crate::install::MAX_BINARY_BYTES as usize + 64 * 1024,
+            )),
+        )
         .route("/x/plugins/install/repository", post(install_repository))
         .route(
             "/x/plugins/install/progress/{id}",
             get(get_repository_install_progress),
         )
         .route("/x/plugins/{name}/update", post(update_repository))
+        .route(
+            "/ai/conversations/{chat}/plugin-watches",
+            get(watches::list_chat_plugin_watches).post(watches::change_chat_plugin_watch),
+        )
         .route("/x/plugins/{name}/uninstall", post(uninstall_plugin))
         .route("/x/plugins/{name}/status", get(get_plugin_status))
+        .route(
+            "/x/plugins/{name}/ai-tools",
+            get(get_plugin_ai_tools).put(put_plugin_ai_tools),
+        )
         .route(
             "/x/plugins/{name}/grants",
             get(get_plugin_grants).put(put_plugin_grants),
@@ -1674,16 +1717,22 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         get_installation_reporting,
         put_installation_reporting,
         install_repository,
+        local_file::install_local_file,
         get_repository_install_progress,
         update_repository,
         uninstall_plugin,
         get_plugin_status,
+        watches::list_chat_plugin_watches,
+        watches::change_chat_plugin_watch,
+        ai_tools::get_plugin_ai_tools,
+        ai_tools::put_plugin_ai_tools,
         get_plugin_grants,
         put_plugin_grants,
     ),
     components(
         schemas(
             PluginManifest,
+            crate::watches::WatchSource, crate::watches::WatchPanel, crate::watches::WatchChange, crate::watches::WatchMode, crate::watches::ChatWatch,
             InstallationReportingSettings,
             NavEntry,
             NavSection,
@@ -1696,6 +1745,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::catalog::PlatformRelease,
             InstallPluginRequest,
             InstallPluginResponse,
+            local_file::FileUpload,
             UninstallPluginResponse,
             PluginCatalogResponse,
             RepositoryCatalogResponse,
@@ -1704,6 +1754,9 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::source_catalog::RepositoryScreenshot,
             crate::source_catalog::RepositoryValidation,
             PluginStatusResponse,
+            crate::ai_tools::PluginAiToolsResponse,
+            crate::ai_tools::UpdatePluginAiTools,
+            crate::ai_tools::AiToolInfo,
             PluginGrantsResponse,
             crate::grants::PluginGrantConfig,
             PluginActorInfo,
@@ -2025,7 +2078,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -2034,10 +2087,11 @@ mod tests {
     impl temps_core::AuditLogger for RejectingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            Err(anyhow::anyhow!(
-                "audit backend unavailable: private-audit-detail-must-not-leak"
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit backend unavailable: private-audit-detail-must-not-leak",
             ))
         }
     }
@@ -2052,7 +2106,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .expect("audit operation lock")
@@ -2492,6 +2546,10 @@ mod tests {
             error.body.get("title").and_then(serde_json::Value::as_str),
             Some("Plugin Installation Audit Unavailable")
         );
+        assert_eq!(
+            error.body.get("detail").and_then(serde_json::Value::as_str),
+            Some("Plugin installation cannot continue until the security audit log is available")
+        );
         let serialized = serde_json::to_string(&error.body).expect("serialize public problem");
         assert!(!serialized.contains("private-audit-detail"));
         assert_eq!(
@@ -2530,6 +2588,48 @@ mod tests {
             .join("\n");
         assert!(logs.contains("EXTERNAL_PLUGIN_INSTALL_REQUESTED"));
         assert!(!logs.contains("private-audit-detail"));
+    }
+
+    #[tokio::test]
+    async fn file_install_requires_admin_digest_step_up_and_durable_audit() {
+        let digest = "ab".repeat(32);
+        for (role, approved, step_up, status) in [
+            (Role::User, true, false, StatusCode::FORBIDDEN),
+            (Role::PlatformAdmin, false, false, StatusCode::BAD_REQUEST),
+            (
+                Role::PlatformAdmin,
+                true,
+                true,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Role::PlatformAdmin,
+                true,
+                false,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut state = test_state_with_audit(Arc::new(RejectingAuditLogger));
+            if step_up {
+                state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+            }
+            let app = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(role).0));
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/x/plugins/install/file?name=fixture&version=1")
+                .header(CONTENT_TYPE, "multipart/form-data; boundary=file");
+            if approved {
+                req = req.header("X-Temps-Trust-Sha256", &digest);
+            }
+            let response = app
+                .oneshot(req.body(Body::empty()).expect("request"))
+                .await
+                .expect("router");
+            assert_eq!(response.status(), status);
+        }
     }
 
     #[tokio::test]
@@ -2858,5 +2958,381 @@ mod tests {
         .expect_err("grant mutation must require sensitive verification");
         assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
         assert!(audit.operations.lock().expect("audit lock").is_empty());
+    }
+    fn ai_actor(enabled: bool) -> temps_entities::external_plugin_actors::Model {
+        temps_entities::external_plugin_actors::Model {
+            id: uuid::Uuid::from_u128(1),
+            plugin_name: "reports".into(),
+            binary_sha256: "fixture".into(),
+            source_identity: "fixture".into(),
+            active: true,
+            ai_tools_enabled: enabled,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn chat_watch_routes_require_a_caller_and_reject_cross_chat_agent_requests() {
+        use tower::ServiceExt;
+        for method in ["GET", "POST"] {
+            for authenticated in [false, true] {
+                let mut router = configure_routes()
+                    .with_state(test_state())
+                    .layer(Extension(metadata().0));
+                if authenticated {
+                    router = router
+                        .layer(Extension(user_auth(Role::Admin).0))
+                        .layer(Extension(temps_core::ai_tool_call::AiToolCall))
+                        .layer(Extension(temps_core::ai_tool_call::ChatWatchScope(
+                            "another-chat".into(),
+                        )));
+                }
+                let response = router
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/ai/conversations/target/plugin-watches")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"action":"pause","id":"a1ab6f89-4446-43a0-93b5-eb48f8047a35"}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if authenticated {
+                        StatusCode::FORBIDDEN
+                    } else {
+                        StatusCode::UNAUTHORIZED
+                    }
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_routes_enforce_auth_and_permissions() {
+        use tower::ServiceExt;
+        for method in ["GET", "PUT"] {
+            for role in [None, Some(Role::User)] {
+                let mut app = configure_routes()
+                    .with_state(test_state())
+                    .layer(Extension(metadata().0));
+                if let Some(role) = role.clone() {
+                    app = app.layer(Extension(user_auth(role).0));
+                }
+                let response = app
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method(method)
+                            .uri("/x/plugins/reports/ai-tools")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                r#"{"actor_id":"fixture","enabled":true}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    if role.is_none() {
+                        StatusCode::UNAUTHORIZED
+                    } else {
+                        StatusCode::FORBIDDEN
+                    }
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "application/problem+json"
+                );
+                let body: serde_json::Value = serde_json::from_slice(
+                    &axum::body::to_bytes(response.into_body(), 8192)
+                        .await
+                        .unwrap(),
+                )
+                .unwrap();
+                assert!(body["title"].is_string());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_toggle_returns_current_consent_and_audits() {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([
+                vec![ai_actor(false)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+                vec![ai_actor(true)],
+            ])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let config = ExternalPluginConfig::new(
+            std::env::temp_dir().join("plugin-ai-test"),
+            "postgres://localhost/test".into(),
+        );
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(
+                config,
+                None,
+                Arc::new(db),
+            )),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let app = configure_routes()
+            .with_state(state)
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0));
+        for method in ["PUT", "GET"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["enabled"], true);
+            assert_eq!(body["actor_id"], uuid::Uuid::from_u128(1).to_string());
+            assert_eq!(body["tools"], serde_json::json!([]));
+        }
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn uncertain_activation_explains_how_to_recover_the_verified_release() {
+        let error = ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed {
+            plugin_name: "fixture".into(),
+            source: sea_orm::DbErr::Custom("private database diagnostic".into()),
+        });
+        let detail = public_error_detail(&error);
+        assert!(detail.contains("fixture"));
+        assert!(detail.contains("verified release was retained"));
+        assert!(detail.contains("Reload plugins"));
+        assert!(!detail.contains("private database diagnostic"));
+    }
+
+    #[tokio::test]
+    async fn saved_ai_consent_publication_failure_is_audited_and_explains_recovery() {
+        use tower::ServiceExt;
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results([vec![ai_actor(false)], vec![ai_actor(true)]])
+            .append_query_errors([sea_orm::DbErr::Custom("private diagnostic".into())])
+            .into_connection();
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = ExternalPluginsAppState {
+            service: Arc::new(ExternalPluginsService::new_empty(
+                ExternalPluginConfig::new(
+                    std::env::temp_dir().join("plugin-ai-publication-test"),
+                    "postgres://localhost/test".into(),
+                ),
+                None,
+                Arc::new(db),
+            )),
+            audit_service: audit.clone(),
+            sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+        };
+        let response = configure_routes()
+            .with_state(state)
+            .layer(Extension(metadata().0))
+            .layer(Extension(user_auth(Role::PlatformAdmin).0))
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("PUT")
+                    .uri("/x/plugins/reports/ai-tools")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"actor_id":uuid::Uuid::from_u128(1),"installation_revision":"fixture","enabled":true})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers()["content-type"],
+            "application/problem+json"
+        );
+        let body: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 8192)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body["title"], "Plugin AI Tools Unavailable");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap()
+            .contains("Consent was saved"));
+        assert!(body["detail"].as_str().unwrap().contains("Retry saving"));
+        assert!(!body.to_string().contains("private diagnostic"));
+        assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_errors_are_problem_details_without_success_audits() {
+        use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
+        use tower::ServiceExt;
+        for (method, db, status, title) in [
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([
+                        Vec::<temps_entities::external_plugin_actors::Model>::new(),
+                    ]),
+                StatusCode::NOT_FOUND,
+                "Plugin Actor Not Found",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_results([vec![ai_actor(false)]]),
+                StatusCode::CONFLICT,
+                "Plugin Actor Changed",
+            ),
+            (
+                "GET",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+            (
+                "PUT",
+                MockDatabase::new(DatabaseBackend::Postgres)
+                    .append_query_errors([DbErr::Custom("private diagnostic".into())]),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Plugin Grants Unavailable",
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let state = ExternalPluginsAppState {
+                service: Arc::new(ExternalPluginsService::new_empty(
+                    ExternalPluginConfig::new(
+                        std::env::temp_dir().join("plugin-ai-contract-test"),
+                        "postgres://localhost/test".into(),
+                    ),
+                    None,
+                    Arc::new(db.into_connection()),
+                )),
+                audit_service: audit.clone(),
+                sensitive_action_authorizer: Arc::new(AllowSensitiveActions),
+            };
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(method)
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"actor_id":uuid::Uuid::from_u128(2),"installation_revision":"fixture","enabled":true})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(body["title"], title);
+            assert!(body["detail"].is_string());
+            assert!(!body.to_string().contains("private diagnostic"));
+            if status != StatusCode::INTERNAL_SERVER_ERROR {
+                assert!(body["detail"].as_str().unwrap().contains("reports"));
+            }
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_ai_tools_invalid_json_and_media_type_are_problem_details() {
+        use tower::ServiceExt;
+        for (body, content_type, status) in [
+            (
+                "untrusted-payload",
+                "application/json",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                r#"{"actor_id":"fixture","enabled":"untrusted-payload"}"#,
+                "application/json",
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                "untrusted-payload",
+                "text/plain",
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            ),
+        ] {
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let mut state = test_state();
+            state.audit_service = audit.clone();
+            let response = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(Role::PlatformAdmin).0))
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method("PUT")
+                        .uri("/x/plugins/reports/ai-tools")
+                        .header("content-type", content_type)
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status);
+            assert_eq!(
+                response.headers()["content-type"],
+                "application/problem+json"
+            );
+            let problem: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(response.into_body(), 8192)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(problem["title"], "Invalid Plugin AI Access Request");
+            assert!(problem["detail"].as_str().unwrap().contains("reports"));
+            assert!(!problem.to_string().contains("untrusted-payload"));
+            assert!(audit.operations.lock().unwrap().is_empty());
+        }
     }
 }

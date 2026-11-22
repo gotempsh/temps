@@ -87,6 +87,7 @@ impl ErrorTrackingPlugin {
                     "Client outcome retention cleanup failed"
                 );
             }
+            tracking.refresh_inbound_filters().await;
             ticks += 1;
             if ticks == 1440 {
                 alert_service.cleanup_old_fires(retention_days).await;
@@ -133,6 +134,10 @@ impl TempsPlugin for ErrorTrackingPlugin {
             // Register core error tracking service (with source map support)
             let error_tracking_service = Arc::new(ErrorTrackingService::new(db.clone()));
             error_tracking_service.set_source_map_service(source_map_service);
+            // Inbound filters apply from the first event after boot. A failed
+            // load is retried by the cleanup loop's refresh every 15 seconds;
+            // until then events are stored, never dropped by mistake.
+            error_tracking_service.refresh_inbound_filters().await;
 
             // AlarmService isn't registered yet at this point (Monitoring
             // registers after Error Tracking) — wired in via
@@ -146,6 +151,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 context.get_service::<temps_notifications::services::NotificationService>()
             {
                 tracing::info!("Error tracking: notification callback wired successfully");
+                error_tracking_service.set_assignment_mailer(notification_service.clone());
                 let ns = notification_service.clone();
                 let notif_db = db.clone();
                 let alarm_slot = alarm_service_slot.clone();
@@ -238,7 +244,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
                                 .await
                                 .ok()
                                 .flatten()
-                                .map(|r| temps_core::AppSettings::from_json(r.data))
+                                .map(|r| temps_config::AppSettings::from_json(r.data))
                                 .and_then(|s| s.external_url);
                             if let Some(base_url) = base_url {
                                 let url = format!(
@@ -406,6 +412,81 @@ impl TempsPlugin for ErrorTrackingPlugin {
                     "AlarmService not available - error tracking alarms will not be persisted"
                 );
             }
+            // Assignment emails (ADR 111, D1.6) go only to users who can
+            // open the project; registered by the teams plugin.
+            match context.get_service::<dyn temps_core::ProjectAccessChecker>() {
+                Some(checker) => context
+                    .require_service::<ErrorTrackingService>()
+                    .set_project_access_checker(checker),
+                None => tracing::debug!(
+                    "Project access checker not available - every assignee can access every \
+                     project, so every assignee is mailed"
+                ),
+            }
+            // Release health (ADR 111, D3): the session flusher always runs;
+            // crash-free rates are published as project metrics, for metric
+            // alert rules, when the OTel metrics store is present.
+            let sink = context.get_service::<dyn temps_core::ProjectMetricsSink>();
+            if sink.is_none() {
+                tracing::warn!(
+                    "Project metrics sink not available - crash-free rates will not be \
+                     published for metric alert rules"
+                );
+            }
+            context
+                .require_service::<ErrorTrackingService>()
+                .release_health
+                .start(sink);
+            // Attachments (ADR 111, D4) live in the project's blob storage.
+            // Without it they are dropped at ingest, and the usage endpoint
+            // says Blob storage is what is missing.
+            let attachments = context
+                .require_service::<ErrorTrackingService>()
+                .attachments
+                .clone();
+            match context.get_service::<dyn temps_core::PayloadBlobStore>() {
+                Some(store) => {
+                    attachments.set_store(store);
+                    attachments.start();
+                    tracing::debug!("Attachment uploader and sweeper started");
+                }
+                None => tracing::info!(
+                    "Blob storage not available - attachments sent by SDKs will be dropped"
+                ),
+            }
+            // Issues, suspect commits and ownership (ADR 111, D5) reach the
+            // project's repository through the git plugin. Without it the
+            // status endpoint says no git provider integration is installed.
+            let source_control = context
+                .require_service::<ErrorTrackingService>()
+                .source_control
+                .clone();
+            match context.get_service::<dyn temps_core::ProjectSourceControl>() {
+                Some(repositories) => source_control.set_source_control(repositories),
+                None => tracing::info!(
+                    "Git provider integration not available - issues cannot be opened from errors"
+                ),
+            }
+            if let Err(error) = source_control.ownership.reload().await {
+                tracing::warn!(%error, "Ownership rules could not be loaded at startup; they load when the first new group arrives");
+            }
+            // Performance issues (ADR 111, D2) read stored traces. Without
+            // the OTel plugin there are no traces, so the scanner does not
+            // start and the status endpoint says why.
+            match context.get_service::<dyn temps_otel::OtelStorage>() {
+                Some(storage) => {
+                    let scanner = crate::services::performance::PerformanceScanner::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                        storage,
+                        context.require_service::<ErrorTrackingService>(),
+                    );
+                    tokio::spawn(scanner.run());
+                    tracing::debug!("Performance issue scanner started");
+                }
+                None => tracing::warn!(
+                    "OTel storage not available - performance issues will not be detected"
+                ),
+            }
             Ok(())
         })
     }
@@ -472,7 +553,7 @@ impl TempsPlugin for ErrorTrackingPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let tunnel_dsn_service = context.require_service::<DSNService>();
 
         let sentry_state = Arc::new(crate::sentry::handlers::AppState {
@@ -492,6 +573,8 @@ impl TempsPlugin for ErrorTrackingPlugin {
             route_table,
             dsn_service: tunnel_dsn_service,
             rate_limiter: crate::sentry::rate_limiter::IngestRateLimiter::new(),
+            cookieless_identity: context
+                .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
         });
         let sentry_routes = crate::sentry::handlers::configure_routes().with_state(sentry_state);
 
@@ -516,7 +599,36 @@ impl TempsPlugin for ErrorTrackingPlugin {
 
         schema
             .merge(<crate::handlers::feedback_handler::FeedbackApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::attachment_handler::AttachmentApiDoc as OpenApiTrait>::openapi(),
+        );
+        schema.merge(
+            <crate::handlers::source_control_handler::SourceControlApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
         schema.merge(<crate::handlers::release_handler::ReleaseApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::release_health_handler::ReleaseHealthApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
+        schema.merge(
+            <crate::handlers::group_workflow_handler::GroupWorkflowApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
+        schema.merge(
+            <crate::handlers::inbound_filter_handler::InboundFilterApiDoc as OpenApiTrait>::openapi(
+            ),
+        );
+        schema
+            .merge(<crate::handlers::assignee_handler::AssigneeApiDoc as OpenApiTrait>::openapi());
+        schema
+            .merge(<crate::handlers::activity_handler::ActivityApiDoc as OpenApiTrait>::openapi());
+        schema.merge(
+            <crate::handlers::saved_search_handler::SavedSearchApiDoc as OpenApiTrait>::openapi(),
+        );
+        schema.merge(
+            <crate::handlers::performance_handler::PerformanceApiDoc as OpenApiTrait>::openapi(),
+        );
         schema.merge(
             <crate::handlers::client_outcome_handler::ClientOutcomeApiDoc as OpenApiTrait>::openapi(
             ),
@@ -589,6 +701,23 @@ mod tests {
     async fn test_error_tracking_plugin_default() {
         let plugin = ErrorTrackingPlugin;
         assert_eq!(plugin.name(), "error-tracking");
+    }
+
+    #[test]
+    fn the_published_schema_documents_the_triage_and_filter_routes() {
+        let schema = ErrorTrackingPlugin::new()
+            .openapi_schema()
+            .expect("the plugin publishes a schema");
+        for path in [
+            "/projects/{project_id}/error-groups/bulk",
+            "/projects/{project_id}/error-inbound-filters",
+            "/projects/{project_id}/error-inbound-filters/{filter_id}",
+        ] {
+            assert!(
+                schema.paths.paths.contains_key(path),
+                "{path} is routed but missing from the OpenAPI schema"
+            );
+        }
     }
 
     /// Minimal `JobQueue` backed by a real `tokio::sync::broadcast` channel

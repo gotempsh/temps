@@ -31,12 +31,14 @@ import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
   providerSchema,
+  telegramConfigFromForm,
 } from '@/components/monitoring/schemas'
 import { returnNavigation, safeReturnTo } from '@/lib/safe-return-to'
 import { cn } from '@/lib/utils'
 
 type Step = 'provider-type' | 'configuration' | 'complete'
-type ProviderType = 'email' | 'slack' | 'webhook' | 'cloudflare' | 'coming-soon'
+type ProviderType =
+  'email' | 'slack' | 'webhook' | 'cloudflare' | 'telegram' | 'coming-soon'
 
 interface ProviderOption {
   id: ProviderType
@@ -51,6 +53,7 @@ const providerLabels: Partial<Record<ProviderType, string>> = {
   slack: 'Slack',
   webhook: 'Webhook',
   cloudflare: 'Cloudflare Email',
+  telegram: 'Telegram',
 }
 
 const providerOptions: ProviderOption[] = [
@@ -82,6 +85,14 @@ const providerOptions: ProviderOption[] = [
     description:
       'Send notification emails through Cloudflare Email Sending (no SMTP required)',
     icon: <NotificationProviderIcon provider="cloudflare" className="size-6" />,
+    available: true,
+  },
+  {
+    id: 'telegram',
+    name: 'Telegram',
+    description:
+      'Send notifications to a Telegram chat, group or channel through your bot',
+    icon: <NotificationProviderIcon provider="telegram" className="size-6" />,
     available: true,
   },
   {
@@ -124,13 +135,13 @@ export function AddNotificationProvider() {
     headingRef.current?.focus()
   }, [currentStep])
 
-  usePageTitle('Add Notification Provider')
+  usePageTitle('Add notification provider')
 
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Notification Providers', href: '/settings/notifications' },
-      { label: 'Add Provider' },
+      { label: 'Notification providers', href: '/settings/notifications' },
+      { label: 'Add provider' },
     ])
   }, [setBreadcrumbs])
 
@@ -213,6 +224,17 @@ export function AddNotificationProvider() {
     ),
   })
 
+  // Telegram also uses the generic endpoint, which validates its config.
+  const createTelegramMutation = useMutation({
+    ...createNotificationProviderMutation(),
+    meta: {
+      errorTitle: 'Failed to add Telegram provider',
+    },
+    onSuccess: onProviderCreated(
+      'Telegram provider added with a route for all notifications.'
+    ),
+  })
+
   const testMutation = useMutation({
     ...testNotificationProviderMutation(),
     // A failed test answers with an error status and the provider's reason,
@@ -231,12 +253,13 @@ export function AddNotificationProvider() {
     if (provider === 'coming-soon') return
     form.setValue(
       'provider_type',
-      provider as 'email' | 'slack' | 'webhook' | 'cloudflare'
+      provider as Exclude<ProviderType, 'coming-soon'>
     )
     createEmailMutation.reset()
     createSlackMutation.reset()
     createWebhookMutation.reset()
     createCloudflareMutation.reset()
+    createTelegramMutation.reset()
     patch({ provider, step: 'configuration' })
   }
 
@@ -285,6 +308,15 @@ export function AddNotificationProvider() {
           },
         },
       })
+    } else if (data.provider_type === 'telegram') {
+      await createTelegramMutation.mutateAsync({
+        body: {
+          name: data.name,
+          provider_type: 'telegram',
+          enabled: true,
+          config: telegramConfigFromForm(data.config),
+        },
+      })
     } else {
       await createEmailMutation.mutateAsync({
         body: {
@@ -314,13 +346,15 @@ export function AddNotificationProvider() {
     createEmailMutation.isPending ||
     createSlackMutation.isPending ||
     createWebhookMutation.isPending ||
-    createCloudflareMutation.isPending
+    createCloudflareMutation.isPending ||
+    createTelegramMutation.isPending
 
   const mutationError =
     createEmailMutation.error ??
     createSlackMutation.error ??
     createWebhookMutation.error ??
-    createCloudflareMutation.error
+    createCloudflareMutation.error ??
+    createTelegramMutation.error
 
   return (
     <Wizard

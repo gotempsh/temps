@@ -17,8 +17,8 @@ use std::{str::FromStr, sync::Arc};
 
 #[derive(Debug, thiserror::Error)]
 pub enum CronMonitorError {
-    #[error("Invalid cron monitor: {0}")]
-    Invalid(String),
+    #[error("Invalid cron monitor: {reason}")]
+    Invalid { reason: String },
     #[error("Cron monitor limit reached")]
     Limit,
     #[error("Cron monitor {monitor_id} was not found in project {project_id}")]
@@ -160,15 +160,17 @@ impl MonitorConfig {
             || !(1..=100).contains(&self.failure_issue_threshold)
             || !(1..=100).contains(&self.recovery_threshold)
         {
-            return Err(CronMonitorError::Invalid(
-                "minute limits must be 1–40320 and thresholds 1–100".into(),
-            ));
+            return Err(CronMonitorError::Invalid {
+                reason: "minute limits must be 1–40320 and thresholds 1–100".into(),
+            });
         }
         self.next_after(now)?;
         Ok(())
     }
     fn next_after(&self, now: DateTime<Utc>) -> Result<DateTime<Utc>, CronMonitorError> {
-        let invalid = || CronMonitorError::Invalid("schedule or timezone is unsupported".into());
+        let invalid = || CronMonitorError::Invalid {
+            reason: "schedule or timezone is unsupported".into(),
+        };
         let tz = chrono_tz::Tz::from_str(&self.timezone).map_err(|_| invalid())?;
         match &self.schedule {
             MonitorSchedule::Crontab { value } => {
@@ -237,9 +239,9 @@ impl MonitorCheckIn {
                     .is_some_and(|s| s.len() > 256 || s.contains('\0'))
             })
         {
-            return Err(CronMonitorError::Invalid(
-                "check-in fields exceed supported limits".into(),
-            ));
+            return Err(CronMonitorError::Invalid {
+                reason: "check-in fields exceed supported limits".into(),
+            });
         }
         for (id, len) in [(&self.trace_id, 32), (&self.span_id, 16)] {
             if id.as_ref().is_some_and(|s| {
@@ -247,7 +249,9 @@ impl MonitorCheckIn {
                     || !s.bytes().all(|c| c.is_ascii_hexdigit())
                     || s.bytes().all(|c| c == b'0')
             }) {
-                return Err(CronMonitorError::Invalid("invalid trace context".into()));
+                return Err(CronMonitorError::Invalid {
+                    reason: "invalid trace context".into(),
+                });
             }
         }
         if let Some(config) = &self.config {
@@ -371,9 +375,7 @@ impl CronMonitorService {
         // The service itself enforces ownership, including callers outside DSN ingress.
         let owned=tx.query_one(sql("SELECT id FROM projects WHERE id=$1 AND is_deleted=FALSE AND deleted_at IS NULL AND ($2::int IS NULL OR EXISTS(SELECT 1 FROM environments WHERE id=$2 AND project_id=$1 AND deleted_at IS NULL)) AND ($3::int IS NULL OR EXISTS(SELECT 1 FROM deployments WHERE id=$3 AND project_id=$1 AND ($2::int IS NULL OR environment_id=$2)))",vec![project.into(),environment.into(),deployment.into()])).await?;
         if owned.is_none() {
-            return Err(CronMonitorError::Invalid(
-                "invalid project/environment/deployment ownership".into(),
-            ));
+            return Err(CronMonitorError::Invalid { reason: "invalid project/environment/deployment ownership".into() });
         }
         let mut pending = std::collections::BTreeMap::<i32, u64>::new();
         for item in &items {
@@ -405,7 +407,7 @@ impl CronMonitorService {
                     }
                     None => (parked, parked),
                 };
-                monitor=CronMonitor::find_by_statement(sql("INSERT INTO cron_monitors(project_id,environment_id,slug,config,next_expected_at,next_check_at,last_check_in_at,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",vec![project.into(),environment.into(),item.slug.clone().into(),serde_json::to_value(item.config.as_ref()).map_err(|_|CronMonitorError::Invalid("configuration".into()))?.into(),next.into(),due.into(),now.into(),(if item.config.is_some(){"unknown"}else{"unconfigured"}).into()])).one(&tx).await?;
+                monitor=CronMonitor::find_by_statement(sql("INSERT INTO cron_monitors(project_id,environment_id,slug,config,next_expected_at,next_check_at,last_check_in_at,status) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *",vec![project.into(),environment.into(),item.slug.clone().into(),serde_json::to_value(item.config.as_ref()).map_err(|_|CronMonitorError::Invalid { reason: "configuration".into() })?.into(),next.into(),due.into(),now.into(),(if item.config.is_some(){"unknown"}else{"unconfigured"}).into()])).one(&tx).await?;
             }
             let mut monitor =
                 monitor.ok_or_else(|| DbErr::Custom("monitor missing after insert".into()))?;
@@ -518,8 +520,9 @@ impl CronMonitorService {
         config: &MonitorConfig,
         now: DateTime<Utc>,
     ) -> Result<(), CronMonitorError> {
-        monitor.config = serde_json::to_value(config)
-            .map_err(|_| CronMonitorError::Invalid("configuration".into()))?;
+        monitor.config = serde_json::to_value(config).map_err(|_| CronMonitorError::Invalid {
+            reason: "configuration".into(),
+        })?;
         monitor.next_expected_at = config.next_after(now)?;
         tx.execute(sql("UPDATE cron_monitors SET config=$2,next_expected_at=$3,alarm_pending=alarm_pending OR status='unconfigured',status=CASE WHEN status='unconfigured' THEN CASE WHEN consecutive_failures >= $4 THEN 'failing' WHEN consecutive_successes >= $5 THEN 'ok' ELSE 'unknown' END ELSE status END WHERE id=$1",vec![monitor.id.into(),monitor.config.clone().into(),monitor.next_expected_at.into(),(config.failure_issue_threshold as i32).into(),(config.recovery_threshold as i32).into()])).await?;
         Ok(())
@@ -842,11 +845,9 @@ mod tests {
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn persisted_check_ins_deadlines_retries_thresholds_and_ownership() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
-            Err(e)
-                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
-            {
+            Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
                 eprintln!("Cron DB integration unavailable: {e}");
                 return;
             }

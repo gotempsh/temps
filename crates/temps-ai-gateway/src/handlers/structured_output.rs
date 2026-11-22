@@ -14,7 +14,7 @@ use futures_util::{Stream, StreamExt};
 use sea_orm::EntityTrait;
 use serde::Deserialize;
 use serde_json::Value;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use utoipa::{OpenApi, ToSchema};
 

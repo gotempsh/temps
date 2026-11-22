@@ -5,8 +5,16 @@ use once_cell::sync::Lazy;
 
 pub const DOCKER_LABEL_PREFIX: &str = "temps.";
 
+/// The control plane's node id. It has no `nodes` row; every node-keyed
+/// table and API uses `0` for it (ADR-107 D1).
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
 /// Docker network name - configurable via TEMPS_NETWORK_NAME environment variable
 /// Defaults to "temps-app-network" if not set
+#[allow(
+    clippy::disallowed_methods,
+    reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_NETWORK_NAME"
+)]
 pub static NETWORK_NAME: Lazy<String> = Lazy::new(|| {
     std::env::var("TEMPS_NETWORK_NAME").unwrap_or_else(|_| "temps-app-network".to_string())
 });

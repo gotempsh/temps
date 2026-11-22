@@ -4,52 +4,28 @@
 //! Shared helper for resolving the true client IP from a request.
 //!
 //! SECURITY: `X-Forwarded-For` and `X-Real-IP` are honored ONLY when the
-//! immediate TCP peer is a trusted proxy (loopback). Otherwise an attacker
+//! immediate TCP peer is a trusted proxy (loopback or a configured CIDR). Otherwise an attacker
 //! connecting directly to the API could spoof any IP they like by setting
 //! these headers, defeating audit logging and IP-based controls.
 //!
-//! When the peer is loopback (Pingora reverse proxy on the same host) we use
-//! the **rightmost** `X-Forwarded-For` entry — that's the one appended by our
-//! trusted proxy and reflects the real client, not a value the client supplied.
-//! When the peer is not loopback we use the peer socket address and ignore all
-//! client-supplied headers.
+//! Loopback peers (the local Pingora proxy) and DB-configured proxy ranges
+//! may supply forwarded headers. The shared resolver walks the chain from
+//! right to left and stops at the first untrusted hop; malformed hops retain
+//! the socket peer. Direct callers cannot override their address.
 
 use axum::http::HeaderMap;
 use std::net::SocketAddr;
 
 /// Resolve the real client IP for a request.
 ///
-/// Rules:
-/// - Peer is loopback → rightmost XFF entry → X-Real-IP → peer IP
-/// - Peer is non-loopback → peer IP (headers ignored)
-/// - Peer is `None` → `"unknown"` (defensive; should not happen in production)
+/// A missing peer produces `"unknown"`. X-Real-IP is used only when XFF is absent.
 pub fn resolve_client_ip(headers: &HeaderMap, peer: Option<SocketAddr>) -> String {
-    let peer_is_trusted = peer.is_some_and(|addr| addr.ip().is_loopback());
-
-    if peer_is_trusted {
-        // Rightmost XFF entry: appended by our trusted proxy, not spoofable.
-        if let Some(ip) = headers
-            .get("x-forwarded-for")
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.rsplit(',').next())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return ip;
-        }
-
-        if let Some(ip) = headers
-            .get("x-real-ip")
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-        {
-            return ip;
-        }
-    }
-
-    peer.map(|p| p.ip().to_string())
-        .unwrap_or_else(|| "unknown".to_string())
+    peer.map(|peer| {
+        crate::trusted_proxies::resolve_trusted_proxy_ip(peer.ip(), headers, true)
+            .unwrap_or(peer.ip())
+            .to_string()
+    })
+    .unwrap_or_else(|| "unknown".to_string())
 }
 
 #[cfg(test)]

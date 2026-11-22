@@ -69,7 +69,7 @@ export function SelfHostedKeySettings({
               <Badge
                 variant="secondary"
                 className="gap-1"
-                title="This key may reach this exact address even though it is not in Trusted private networks"
+                title="This key may reach this exact address even though it is not in trusted private networks"
               >
                 <ShieldCheck className="h-3 w-3" />
                 Trusts {trusted}

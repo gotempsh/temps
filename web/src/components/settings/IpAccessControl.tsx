@@ -1,14 +1,19 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { Button } from '@/components/ui/button'
+import { AdminOnlyNote } from '@/components/ui/admin-only-note'
 import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent } from '@/components/ui/card'
 import {
   Dialog,
   DialogContent,
@@ -41,6 +46,14 @@ import { useForm } from 'react-hook-form'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isForbiddenRead } from '@/lib/read-failure'
+import { problemDetail } from '@/lib/api-problem'
+import {
+  confirmationFlag,
+  ipRuleConfirmation,
+  type IpRuleConfirmation,
+} from '@/lib/proxy-write-problems'
+import { useCurrentUserRole } from '@/hooks/useCurrentUserRole'
+import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { toast } from 'sonner'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { z } from 'zod'
@@ -62,6 +75,31 @@ type IpAccessControlFormData = z.infer<typeof ipAccessControlSchema>
 /** Stable fallback so memoised lists do not recompute on every render. */
 const NO_RULES: IpAccessControlResponse[] = []
 
+/**
+ * A save the server holds back until the operator confirms it: a block range
+ * broader than /8 (IPv4) or /16 (IPv6), or one that matches their own address.
+ * `resubmit` repeats the same request with the flag that answers it.
+ */
+interface PendingConfirmation {
+  kind: IpRuleConfirmation
+  detail: string
+  resubmit: () => void
+}
+
+const CONFIRMATION_COPY: Record<
+  IpRuleConfirmation,
+  { title: string; action: string }
+> = {
+  broad_range: {
+    title: 'Block this much of the internet?',
+    action: 'Block anyway',
+  },
+  lockout: {
+    title: 'This rule would lock you out',
+    action: 'Block my address anyway',
+  },
+}
+
 export function IpAccessControl() {
   const [isCreateDialogOpen, setIsCreateDialogOpen] = useState(false)
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
@@ -69,6 +107,13 @@ export function IpAccessControl() {
     useState<IpAccessControlResponse | null>(null)
   const [deletingRule, setDeletingRule] =
     useState<IpAccessControlResponse | null>(null)
+  const [confirmation, setConfirmation] = useState<PendingConfirmation | null>(
+    null
+  )
+  // Changing the instance-wide block list is an administrator action; other
+  // roles keep the read-only list.
+  const canManageRules = useIsInstanceAdmin()
+  const currentRole = useCurrentUserRole()
 
   const {
     data: cachedRules,
@@ -91,9 +136,26 @@ export function IpAccessControl() {
       await refetch()
       toast.success('IP access control rule created successfully')
       setIsCreateDialogOpen(false)
+      setConfirmation(null)
     },
-    onError: (error: any) => {
-      toast.error(error?.message || 'Failed to create IP access control rule')
+    onError: (error, variables) => {
+      const kind = ipRuleConfirmation(error)
+      if (kind) {
+        setConfirmation({
+          kind,
+          detail: problemDetail(error, 'This rule needs confirmation.'),
+          resubmit: () =>
+            createMutation.mutate({
+              ...variables,
+              body: { ...variables.body, [confirmationFlag(kind)]: true },
+            }),
+        })
+        return
+      }
+      setConfirmation(null)
+      toast.error(
+        problemDetail(error, 'Failed to create IP access control rule')
+      )
     },
   })
 
@@ -104,9 +166,26 @@ export function IpAccessControl() {
       toast.success('IP access control rule updated successfully')
       setIsEditDialogOpen(false)
       setEditingRule(null)
+      setConfirmation(null)
     },
-    onError: (error: any) => {
-      toast.error(error?.message || 'Failed to update IP access control rule')
+    onError: (error, variables) => {
+      const kind = ipRuleConfirmation(error)
+      if (kind) {
+        setConfirmation({
+          kind,
+          detail: problemDetail(error, 'This change needs confirmation.'),
+          resubmit: () =>
+            updateMutation.mutate({
+              ...variables,
+              body: { ...variables.body, [confirmationFlag(kind)]: true },
+            }),
+        })
+        return
+      }
+      setConfirmation(null)
+      toast.error(
+        problemDetail(error, 'Failed to update IP access control rule')
+      )
     },
   })
 
@@ -117,8 +196,10 @@ export function IpAccessControl() {
       toast.success('IP access control rule deleted successfully')
       setDeletingRule(null)
     },
-    onError: (error: any) => {
-      toast.error(error?.message || 'Failed to delete IP access control rule')
+    onError: (error) => {
+      toast.error(
+        problemDetail(error, 'Failed to delete IP access control rule')
+      )
     },
   })
 
@@ -216,30 +297,26 @@ export function IpAccessControl() {
 
   return (
     <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Shield className="h-5 w-5" />
-          IP Access Control
-        </CardTitle>
-        <CardDescription>
-          Block or allow specific IPs from accessing Temps at the infrastructure
-          level (Pingora proxy)
-        </CardDescription>
-      </CardHeader>
       <CardContent className="space-y-6">
-        {!showFailureOnly && (
-          <div className="flex justify-end">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => handleCreateDialogOpen(true)}
-            >
-              <Plus className="h-4 w-4 mr-2" />
-              Add IP Rule
-            </Button>
-          </div>
-        )}
+        {!showFailureOnly &&
+          (canManageRules ? (
+            <div className="flex justify-end">
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => handleCreateDialogOpen(true)}
+              >
+                <Plus className="h-4 w-4 mr-2" />
+                Add IP rule
+              </Button>
+            </div>
+          ) : (
+            <AdminOnlyNote
+              action="add, edit or remove IP rules"
+              role={currentRole}
+            />
+          ))}
 
         {showFailureOnly ? (
           <ReadFailure
@@ -302,25 +379,29 @@ export function IpAccessControl() {
                         )}
                       </div>
                       <div className="flex gap-2">
-                        <Button
-                          aria-label="Edit rule"
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleEdit(rule)}
-                        >
-                          <Edit className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          aria-label="Delete rule"
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleDelete(rule)}
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        {canManageRules && (
+                          <>
+                            <Button
+                              aria-label="Edit rule"
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleEdit(rule)}
+                            >
+                              <Edit className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              aria-label="Delete rule"
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleDelete(rule)}
+                              disabled={deleteMutation.isPending}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))
@@ -362,25 +443,29 @@ export function IpAccessControl() {
                         )}
                       </div>
                       <div className="flex gap-2">
-                        <Button
-                          aria-label="Edit rule"
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleEdit(rule)}
-                        >
-                          <Edit className="h-4 w-4" />
-                        </Button>
-                        <Button
-                          aria-label="Delete rule"
-                          type="button"
-                          variant="ghost"
-                          size="icon"
-                          onClick={() => handleDelete(rule)}
-                          disabled={deleteMutation.isPending}
-                        >
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
+                        {canManageRules && (
+                          <>
+                            <Button
+                              aria-label="Edit rule"
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleEdit(rule)}
+                            >
+                              <Edit className="h-4 w-4" />
+                            </Button>
+                            <Button
+                              aria-label="Delete rule"
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              onClick={() => handleDelete(rule)}
+                              disabled={deleteMutation.isPending}
+                            >
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </div>
                   ))
@@ -401,14 +486,14 @@ export function IpAccessControl() {
               }}
             >
               <DialogHeader>
-                <DialogTitle>Add IP Access Control Rule</DialogTitle>
+                <DialogTitle>Add IP access control rule</DialogTitle>
                 <DialogDescription>
                   Block or allow specific IPs from accessing your platform
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="space-y-2">
-                  <Label htmlFor="create-ip">IP Address</Label>
+                  <Label htmlFor="create-ip">IP address</Label>
                   <Input
                     id="create-ip"
                     placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"
@@ -499,14 +584,14 @@ export function IpAccessControl() {
               }}
             >
               <DialogHeader>
-                <DialogTitle>Edit IP Access Control Rule</DialogTitle>
+                <DialogTitle>Edit IP access control rule</DialogTitle>
                 <DialogDescription>
                   Update the IP address, action, or reason
                 </DialogDescription>
               </DialogHeader>
               <div className="space-y-4 py-4">
                 <div className="space-y-2">
-                  <Label htmlFor="edit-ip">IP Address</Label>
+                  <Label htmlFor="edit-ip">IP address</Label>
                   <Input
                     id="edit-ip"
                     placeholder="192.168.1.1, 10.0.0.0/24, or 2001:db8::/32"
@@ -582,6 +667,32 @@ export function IpAccessControl() {
             </form>
           </DialogContent>
         </Dialog>
+
+        <AlertDialog
+          open={confirmation !== null}
+          onOpenChange={(open) => {
+            if (!open) setConfirmation(null)
+          }}
+        >
+          <AlertDialogContent>
+            <AlertDialogHeader>
+              <AlertDialogTitle>
+                {confirmation ? CONFIRMATION_COPY[confirmation.kind].title : ''}
+              </AlertDialogTitle>
+              <AlertDialogDescription>
+                {confirmation?.detail}
+              </AlertDialogDescription>
+            </AlertDialogHeader>
+            <AlertDialogFooter>
+              <AlertDialogCancel>Keep editing</AlertDialogCancel>
+              <AlertDialogAction onClick={() => confirmation?.resubmit()}>
+                {confirmation
+                  ? CONFIRMATION_COPY[confirmation.kind].action
+                  : ''}
+              </AlertDialogAction>
+            </AlertDialogFooter>
+          </AlertDialogContent>
+        </AlertDialog>
 
         <ConfirmDeleteDialog
           open={deletingRule !== null}

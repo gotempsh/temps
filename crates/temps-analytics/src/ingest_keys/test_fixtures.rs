@@ -93,6 +93,7 @@ pub fn project_model(id: i32) -> projects::Model {
             temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
         cloud_analytics_write_mode:
             temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+        analytics_identity_mode: Default::default(),
         instantiation_token: None,
         cloud_telemetry_attribute_allowlist: Vec::new(),
     }
@@ -127,6 +128,8 @@ pub fn environment_model(
         shield_exempt_paths: Default::default(),
         force_https: None,
         last_activity_at: None,
+        ingress_mode: Default::default(),
+        workload_mode: Default::default(),
     }
 }
 

@@ -59,10 +59,10 @@ impl UpgradeProbe {
     /// neither the previous version nor the pending migrations can be read.
     pub async fn detect(db: &DatabaseConnection, data_dir: &Path) -> Option<Self> {
         let schema_ahead = matches!(
-            temps_database::check_schema_compatibility(db).await,
-            Ok(temps_database::SchemaStatus::NewerThanBinary { .. })
+            temps_schema::check_schema_compatibility(db).await,
+            Ok(temps_schema::SchemaStatus::NewerThanBinary { .. })
         );
-        let pending = temps_database::get_pending_migration_names(db)
+        let pending = temps_schema::get_pending_migration_names(db)
             .await
             .map(|names| names.len())
             .ok();
@@ -71,7 +71,7 @@ impl UpgradeProbe {
             read_last_started_version(data_dir),
             current_version(),
             pending,
-            temps_database::defined_migration_count(),
+            temps_schema::defined_migration_count(),
         )
     }
 
@@ -130,13 +130,13 @@ pub async fn run_migrations_reporting_upgrade(
     data_dir: &Path,
 ) -> Result<Option<UpgradeProbe>, temps_core::ServiceError> {
     let probe = UpgradeProbe::detect(db, data_dir).await;
-    match temps_database::run_migrations(db).await {
+    match temps_schema::run_migrations(db).await {
         Ok(()) => Ok(probe),
         Err(error) => {
             if let Some(probe) = probe {
                 send_before_exit(db, data_dir, probe.failed_event(&error.to_string())).await;
             }
-            Err(error)
+            Err(error.into())
         }
     }
 }
@@ -204,7 +204,7 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         let Ok(stateless_id) = temps_config::stateless_telemetry_anonymous_id(db).await else {
             return;
         };
-        let Ok(reporter) = temps_telemetry::TelemetryService::new_for_installation(
+        let Ok(reporter) = temps_product_telemetry::TelemetryService::new_for_installation(
             data_dir,
             current_version(),
             stateless_id.as_deref(),
@@ -213,7 +213,7 @@ async fn send_before_exit(db: &DatabaseConnection, data_dir: &Path, event: Telem
         };
         // Honour an admin's opt-out from Settings > Telemetry. If the
         // preference cannot be read, send nothing: it may be an opt-out.
-        let Ok(preference) = temps_telemetry::stored_preference(db).await else {
+        let Ok(preference) = temps_product_telemetry::stored_preference(db).await else {
             return;
         };
         reporter.apply_admin_preference(preference);

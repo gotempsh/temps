@@ -16,6 +16,8 @@ import { Globe, Users as UserIcon, RefreshCw, ChevronRight } from 'lucide-react'
 import { Link, useNavigate } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useState } from 'react'
+import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
+import { IpLink } from '@/components/data-display/IpLink'
 
 interface LiveVisitorsListProps {
   project: ProjectResponse
@@ -40,7 +42,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
         <CardHeader>
           <div className="flex items-center justify-between">
             <div>
-              <CardTitle>Live Visitors</CardTitle>
+              <CardTitle>Live visitors</CardTitle>
               <CardDescription>
                 {data
                   ? `${data.visitors.length} visitor${data.visitors.length !== 1 ? 's' : ''} online now`
@@ -153,7 +155,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                           <p className="text-sm font-medium text-foreground mt-1">
                             {visitor.is_crawler ? 'Bot' : 'Human Visitor'}
                             {visitor.crawler_name &&
-                              ` - ${visitor.crawler_name}`}
+                              ` - ${crawlerLabel(visitor.crawler_name, '')}`}
                           </p>
                         </div>
                       </div>
@@ -184,10 +186,14 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground font-medium mb-1">
-                          IP Address
+                          IP address
                         </p>
                         <p className="text-sm font-medium font-mono">
-                          {visitor.ip_address}
+                          {visitor.ip_address ? (
+                            <IpLink ip={visitor.ip_address} />
+                          ) : (
+                            'Unknown'
+                          )}
                         </p>
                       </div>
                     </div>
@@ -223,7 +229,7 @@ export function LiveVisitorsList({ project }: LiveVisitorsListProps) {
                       </div>
                       <div>
                         <p className="text-xs text-muted-foreground font-medium mb-1">
-                          Last Seen
+                          Last seen
                         </p>
                         <p className="text-sm font-medium">
                           {formatRelativeTime(visitor.last_seen)}

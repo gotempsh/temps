@@ -11,11 +11,13 @@ use std::time::Duration;
 use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, DatabaseTransaction,
+    EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
-use temps_core::{DBDateTime, EncryptionService};
+use temps_core::secret_string::SecretString;
+use temps_core::tunnel_origin::TUNNEL_ORIGIN_PORT;
+use temps_core::{DBDateTime, EncryptionService, CONTROL_PLANE_NODE_ID};
 use temps_dns::{
     DnsProviderService, DnsRecordContent, DnsRecordRequest, DnsRecordType, ManagedDnsRecordService,
     OwnershipScope,
@@ -28,14 +30,21 @@ use temps_routes::CachedPeerTable;
 use tracing::{debug, info, warn};
 use utoipa::ToSchema;
 
-use crate::error::IngressError;
-use crate::provider::{DnsIntent, TunnelContext, TunnelHandle, TunnelProvider};
+use crate::error::{ControlPlaneTunnelsUnavailable, IngressError};
+use crate::provider::{DnsIntent, TunnelHandle, TunnelProvider};
 use crate::registry::{FieldKind, ProviderDeps, ProviderInfo, ProviderRegistry, ProviderSetup};
 use crate::wire::{NodeConnectorSpec, NodeConnectorStatusReport, NodeConnectorsResponse};
 
+mod control_plane_ports;
+mod ensure;
+mod retry_hostname;
+pub(crate) use ensure::ConnectorLocks;
+
 /// The DNS controller name stamped on the records this service owns.
 const DNS_CONTROLLER: &str = "ingress-connector";
-const DEFAULT_EDGE_PORT: i32 = 7480;
+/// Every connector's tunnel origin port, on workers and on the control
+/// plane alike (ADR-107 D3).
+const DEFAULT_EDGE_PORT: i32 = TUNNEL_ORIGIN_PORT as i32;
 /// Keys in `settings` that hold the setup answers. Everything else there
 /// belongs to the provider, which rewrites it on every `ensure`.
 const SETUP_KEY: &str = "setup";
@@ -68,6 +77,64 @@ pub fn live_connectors(models: Vec<ingress_connectors::Model>) -> Vec<ingress_co
         .filter(|m| !is_deleting(m) && !crate::registry::is_credential_kind(&m.provider))
         .collect()
 }
+/// `values` with the `secrets` answers added, after checking each names a
+/// credential field of the provider and is not also given in `values`.
+fn merge_secret_answers(
+    info: &ProviderInfo,
+    values: &BTreeMap<String, serde_json::Value>,
+    secrets: &BTreeMap<String, SecretString>,
+) -> Result<BTreeMap<String, serde_json::Value>, IngressError> {
+    let mut merged = values.clone();
+    for (key, secret) in secrets {
+        let Some(field) = info.fields.iter().find(|f| &f.key == key) else {
+            return Err(IngressError::Validation(format!(
+                "{} has no setting '{key}'.",
+                info.name
+            )));
+        };
+        if !matches!(field.kind, FieldKind::Secret) {
+            return Err(IngressError::Validation(format!(
+                "{} ({key}) of {} is not a credential; give it in `values`, not `secrets`.",
+                field.label, info.name
+            )));
+        }
+        if values.contains_key(key) {
+            return Err(IngressError::Validation(format!(
+                "{} ({key}) of {} is given in both `values` and `secrets`; give it once.",
+                field.label, info.name
+            )));
+        }
+        merged.insert(
+            key.clone(),
+            serde_json::Value::String(secret.expose().to_string()),
+        );
+    }
+    Ok(merged)
+}
+
+/// Fail when `values` answers a credential field of the provider. The error
+/// names the field, never its value.
+fn reject_plain_secret_answers(
+    info: &ProviderInfo,
+    values: &BTreeMap<String, serde_json::Value>,
+) -> Result<(), IngressError> {
+    let plain: Vec<String> = info
+        .fields
+        .iter()
+        .filter(|f| matches!(f.kind, FieldKind::Secret) && values.contains_key(&f.key))
+        .map(|f| format!("{} ({})", f.label, f.key))
+        .collect();
+    if plain.is_empty() {
+        return Ok(());
+    }
+    Err(IngressError::Validation(format!(
+        "{} takes {} as a credential: the assistant must pass it in `secrets` as a \
+         `secret_ref:` handle from `request_secret`, never in `values`.",
+        info.name,
+        plain.join(", ")
+    )))
+}
+
 const DEFAULT_PAGE_SIZE: u64 = 20;
 const MAX_PAGE_SIZE: u64 = 100;
 /// Most connectors one cluster may have. The console matches names against
@@ -86,12 +153,33 @@ pub struct CreateConnectorRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub values: BTreeMap<String, serde_json::Value>,
+    /// Answers to the provider's credential fields (kind `secret`, such as an
+    /// OAuth client secret), by field key. Same as giving them in `values`,
+    /// but published as credentials, so the AI assistant passes a
+    /// `secret_ref:` handle here and never sees the value. The assistant may
+    /// not put a credential field in `values`. A key cannot be in both.
+    #[serde(default)]
+    pub secrets: BTreeMap<String, SecretString>,
     /// Nodes that run a connector replica.
     pub node_ids: Vec<i32>,
     /// Publish every worker-served hostname under the domain (the default),
     /// or only the hostnames chosen for this tunnel.
     #[serde(default)]
     pub auto_publish: Option<bool>,
+    /// Name this tunnel's environment hosts `<label>-<host_suffix>.<domain>`
+    /// (ADR 068 D3), e.g. `lab` with domain `example.com` gives
+    /// `shop-production-lab.example.com`: one level under the zone, which
+    /// Cloudflare's free certificate covers. Without it they are
+    /// `<label>.<domain>`. 1-20 lowercase letters, digits or single hyphens,
+    /// starting and ending with a letter or digit; only for a provider set
+    /// up with a domain. Creating the tunnel generates no environment
+    /// hostnames (with `auto_publish` it still publishes the worker-served
+    /// hostnames already under the domain): environment hosts start when
+    /// they are turned on for it
+    /// (`PUT /ingress/connectors/{id}/environment-hosts`).
+    #[serde(default)]
+    #[schema(example = "lab")]
+    pub host_suffix: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -143,6 +231,8 @@ pub struct HostnameView {
     pub chosen_connector_id: Option<i32>,
     /// The tunnel that publishes it, or would once `detail` is dealt with.
     pub connector_id: Option<i32>,
+    /// Connector on which DNS setup for this failed publication can be retried.
+    pub retry_dns_connector_id: Option<i32>,
     pub connector_name: Option<String>,
     /// `published`, `pending`, `error` or `not_published`.
     pub state: String,
@@ -170,9 +260,12 @@ pub struct ConnectorView {
     pub last_error: Option<String>,
     pub edge_port: i32,
     pub auto_publish: bool,
-    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3).
-    /// At most one tunnel does.
+    /// Publishes every environment as `<label>.<domain>` (ADR 068 D3), or
+    /// `<label>-<host_suffix>.<domain>` with a host suffix. At most one
+    /// tunnel does.
     pub environment_hosts: bool,
+    /// Suffix of its environment hosts' first label; `null` for none.
+    pub host_suffix: Option<String>,
     pub nodes: Vec<ConnectorNodeView>,
     pub publications: Vec<PublicationView>,
     #[schema(value_type = String, format = DateTime)]
@@ -214,9 +307,15 @@ pub struct TunnelFact {
     pub zone: Option<String>,
     pub ready: bool,
     pub has_nodes: bool,
+    /// Runs on the control plane (node 0).
+    pub on_control_plane: bool,
+    /// Runs on at least one worker.
+    pub on_workers: bool,
     pub auto_publish: bool,
     /// Publishes every environment's host (ADR 068 D3).
     pub environment_hosts: bool,
+    /// Its environment hosts are `<label>-<suffix>.<domain>`.
+    pub host_suffix: Option<String>,
 }
 
 /// Which tunnel would publish a hostname, by ADR 058 D9's selection (the
@@ -240,8 +339,11 @@ pub enum PublicationIntent {
 #[derive(Debug, Clone, Default)]
 pub struct TunnelFacts {
     pub tunnels: Vec<TunnelFact>,
-    /// Hostnames workers serve, the only ones a tunnel can carry.
+    /// Hostnames workers serve: what a tunnel on any worker can carry.
     pub served: HashSet<String>,
+    /// Hostnames the control plane serves: what a tunnel only on the
+    /// control plane can carry (ADR-107 D4).
+    pub served_by_control_plane: HashSet<String>,
     /// Every hostname choice, sorted.
     pub choices: Vec<(String, Option<i32>)>,
     /// [`PublicationIntent`] of each hostname asked about.
@@ -341,6 +443,12 @@ pub struct IngressConnectorService {
     settings_lock: tokio::sync::Mutex<()>,
     /// See [`Self::set_environment_host_sync`].
     environment_hosts: OnceLock<Arc<dyn EnvironmentHostSync>>,
+    /// Set when this process runs connectors on the control plane
+    /// (ADR-107 D2); see [`Self::attach_control_plane`].
+    control_plane: OnceLock<crate::control_plane::ControlPlaneHandle>,
+    /// Orders configurations of one tunnel when no control-plane handle
+    /// shares the process-wide ones (`service/ensure.rs`).
+    own_locks: Arc<ConnectorLocks>,
 }
 
 impl IngressConnectorService {
@@ -368,6 +476,40 @@ impl IngressConnectorService {
             move_guard: OnceLock::new(),
             settings_lock: tokio::sync::Mutex::new(()),
             environment_hosts: OnceLock::new(),
+            control_plane: OnceLock::new(),
+            own_locks: ConnectorLocks::new(),
+        }
+    }
+
+    /// The per-connector locks every service instance of this process
+    /// shares: the control-plane handle's once attached, otherwise this
+    /// instance's own (it is then the only one configuring tunnels).
+    fn connector_locks(&self) -> &ConnectorLocks {
+        match self.control_plane.get() {
+            Some(handle) => handle.connector_locks(),
+            None => &self.own_locks,
+        }
+    }
+
+    /// This process runs connectors placed on the control plane. Until it
+    /// is called node 0 is refused. Later calls are ignored.
+    pub fn attach_control_plane(&self, handle: crate::control_plane::ControlPlaneHandle) {
+        let _ = self.control_plane.set(handle);
+    }
+
+    /// Whether a connector placed on the control plane runs here; `Err` says
+    /// why not and what to do instead (ADR-107 D2).
+    pub fn control_plane_tunnels(&self) -> Result<(), ControlPlaneTunnelsUnavailable> {
+        match self.control_plane.get() {
+            Some(handle) => handle.ready(),
+            None => Err(ControlPlaneTunnelsUnavailable::SeparateProxy),
+        }
+    }
+
+    /// Make the control plane look at its connectors now.
+    fn wake_control_plane(&self) {
+        if let Some(handle) = self.control_plane.get() {
+            handle.wake();
         }
     }
 
@@ -450,6 +592,21 @@ impl IngressConnectorService {
     /// The providers this control plane offers, for the console.
     pub fn providers(&self) -> Vec<ProviderInfo> {
         self.registry.infos()
+    }
+
+    /// Refuse a credential answer given in plain `values`.
+    ///
+    /// The console may send every answer in `values`. A request the AI
+    /// assistant issued may not: a credential there is a value the model typed,
+    /// so it has already passed through the model provider and the chat. Such a
+    /// request must put it in `secrets` as a `secret_ref:` handle, which the
+    /// tool layer resolves from the user's private form.
+    pub fn ensure_secret_answers_sealed(
+        &self,
+        request: &CreateConnectorRequest,
+    ) -> Result<(), IngressError> {
+        let info = self.registry.get(&request.provider)?.info();
+        reject_plain_secret_answers(&info, &request.values)
     }
 
     /// The credential providers this control plane offers (ADR 065 D2).
@@ -752,6 +909,24 @@ impl IngressConnectorService {
     }
 
     /// The tunnel `id`. A credential row is not one.
+    /// Read connector `id` for a read-modify-write of its row, locked
+    /// (`FOR UPDATE`) until `txn` ends. The in-process `settings_lock` only
+    /// orders writers of one service instance; `temps serve` runs a second
+    /// one for the control plane's connectors (ADR-107 D2), so the row lock
+    /// is what keeps their token-holder and status updates from overwriting
+    /// each other.
+    async fn find_for_update(
+        txn: &DatabaseTransaction,
+        id: i32,
+    ) -> Result<ingress_connectors::Model, IngressError> {
+        ingress_connectors::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(txn)
+            .await?
+            .filter(|m| !crate::registry::is_credential_kind(&m.provider))
+            .ok_or(IngressError::NotFound(id))
+    }
+
     async fn find(&self, id: i32) -> Result<ingress_connectors::Model, IngressError> {
         ingress_connectors::Entity::find_by_id(id)
             .one(self.db.as_ref())
@@ -776,7 +951,9 @@ impl IngressConnectorService {
             .order_by_desc(ingress_connectors::Column::Id)
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
-        let connectors = paginator.fetch_page(page - 1).await?;
+        let connectors = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
         Ok(ConnectorList {
             connectors: self.views(connectors).await?,
             total,
@@ -812,18 +989,11 @@ impl IngressConnectorService {
         {
             node_rows.entry(row.connector_id).or_default().push(row);
         }
-        let node_ids: BTreeSet<i32> = node_rows.values().flatten().map(|n| n.node_id).collect();
-        let names: HashMap<i32, String> = if node_ids.is_empty() {
-            HashMap::new()
-        } else {
-            nodes::Entity::find()
-                .filter(nodes::Column::Id.is_in(node_ids))
-                .all(self.db.as_ref())
-                .await?
-                .into_iter()
-                .map(|n| (n.id, n.name))
-                .collect()
-        };
+        let names = node_names(
+            self.db.as_ref(),
+            node_rows.values().flatten().map(|n| n.node_id),
+        )
+        .await?;
         let mut publications: HashMap<i32, Vec<ingress_publications::Model>> = HashMap::new();
         for row in ingress_publications::Entity::find()
             .filter(ingress_publications::Column::ConnectorId.is_in(ids))
@@ -857,13 +1027,7 @@ impl IngressConnectorService {
             .filter(ingress_connector_nodes::Column::ConnectorId.eq(id))
             .all(self.db.as_ref())
             .await?;
-        let names: HashMap<i32, String> = nodes::Entity::find()
-            .filter(nodes::Column::Id.is_in(node_rows.iter().map(|n| n.node_id)))
-            .all(self.db.as_ref())
-            .await?
-            .into_iter()
-            .map(|n| (n.id, n.name))
-            .collect();
+        let names = node_names(self.db.as_ref(), node_rows.iter().map(|n| n.node_id)).await?;
         let by_ref: HashMap<String, i32> = node_rows
             .into_iter()
             .filter_map(|n| n.connector_ref.map(|r| (r, n.node_id)))
@@ -925,7 +1089,9 @@ impl IngressConnectorService {
         // Whether the workers allow it comes first: no point in answers a
         // worker will refuse.
         self.validate_nodes(&request.node_ids).await?;
-        let setup = self.resolve_setup(&info, &request.values).await?;
+        let values = merge_secret_answers(&info, &request.values, &request.secrets)?;
+        let setup = self.resolve_setup(&info, &values).await?;
+        let host_suffix = host_suffix_for(&info, &setup, request.host_suffix.as_deref())?;
         factory.validate(&self.deps(), &setup).await?;
 
         let mut settings = serde_json::Map::new();
@@ -948,8 +1114,9 @@ impl IngressConnectorService {
             dns_provider_id: Set(setup.dns_provider.as_ref().map(|p| p.id)),
             domain: Set(setup.domain.clone().unwrap_or_default()),
             settings: Set(serde_json::Value::Object(settings)),
-            edge_port: Set(DEFAULT_EDGE_PORT),
+            edge_port: Set(self.edge_port_for(&request.node_ids)),
             auto_publish: Set(request.auto_publish.unwrap_or(true)),
+            host_suffix: Set(host_suffix),
             status: Set("pending".into()),
             created_at: Set(now),
             updated_at: Set(now),
@@ -970,10 +1137,11 @@ impl IngressConnectorService {
         let id = connector.id;
         let name = connector.name.clone();
         let setup = match self.replace_nodes(id, &request.node_ids).await {
-            Ok(()) => self.ensure(connector).await.map(|_| ()),
+            Ok(()) => self.ensure(id, None).await,
             Err(error) => Err(error),
         };
         if setup.is_ok() {
+            self.wake_control_plane();
             let service = Arc::clone(self);
             tokio::spawn(async move { service.reconcile_all().await });
         }
@@ -996,6 +1164,7 @@ impl IngressConnectorService {
         self.find(id).await?;
         self.validate_nodes(&node_ids).await?;
         self.replace_nodes(id, &node_ids).await?;
+        self.wake_control_plane();
         let service = Arc::clone(self);
         tokio::spawn(async move { service.reconcile_all().await });
         self.get(id).await
@@ -1044,10 +1213,8 @@ impl IngressConnectorService {
         let plan = self.plan().await?;
         let publications = self.publications_by_host().await?;
         let mut hosts: BTreeSet<String> = self
-            .peer_table
-            .public_hostnames()
+            .control_plane_hostnames()
             .into_iter()
-            .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
             .filter(|host| !plan.candidates(host).is_empty())
             .collect();
         hosts.extend(plan.choices.keys().cloned());
@@ -1089,9 +1256,12 @@ impl IngressConnectorService {
                 domain: c.model.domain.clone(),
                 zone: c.zone.clone(),
                 ready: c.model.status == "ready",
-                has_nodes: c.has_nodes,
+                has_nodes: c.placement.has_nodes(),
+                on_control_plane: c.placement.control_plane,
+                on_workers: c.placement.workers,
                 auto_publish: c.model.auto_publish,
                 environment_hosts: c.model.environment_hosts,
+                host_suffix: c.model.host_suffix.clone(),
             })
             .collect();
         let mut choices: Vec<(String, Option<i32>)> = plan
@@ -1111,6 +1281,7 @@ impl IngressConnectorService {
         Ok(TunnelFacts {
             tunnels,
             served: plan.served,
+            served_by_control_plane: plan.served_by_control_plane,
             choices,
             intents,
         })
@@ -1135,6 +1306,92 @@ impl IngressConnectorService {
         let plan = self.plan().await?;
         let publications = self.publications_by_host().await?;
         Ok(plan.view(&host, publications.get(&host)))
+    }
+
+    /// Whether `host` may be published through tunnel `id`: the tunnel
+    /// exists, its zone holds the hostname, and moving it there is allowed.
+    async fn check_tunnel_choice(&self, host: &str, id: i32) -> Result<(), IngressError> {
+        let connector = self.find(id).await?;
+        let zone = self.zone_of(&connector).await?;
+        record_label(host, &connector.domain, &zone)?;
+        if let Some(guard) = self.move_guard.get() {
+            guard
+                .check_move(host, &connector.name)
+                .await
+                .map_err(IngressError::Validation)?;
+        }
+        Ok(())
+    }
+
+    /// Choose tunnel `connector_id` for `hostname`, only while its choice is
+    /// still `expected` (what the caller read, as `hostname_choice` returns
+    /// it): a choice someone made in between is never replaced unseen. A
+    /// reachability run decides from what it read, so it writes this way.
+    /// Already choosing this tunnel counts as done, so a resumed run whose
+    /// write landed before it stopped does not fail.
+    pub async fn choose_tunnel_if_unchanged(
+        &self,
+        hostname: &str,
+        connector_id: i32,
+        expected: Option<Option<i32>>,
+    ) -> Result<(), IngressError> {
+        let host = normalize_host(hostname)?;
+        self.check_tunnel_choice(&host, connector_id).await?;
+        let now = Utc::now();
+        let written = match expected {
+            None => {
+                let inserted = ingress_hostname_choices::ActiveModel {
+                    hostname: Set(host.clone()),
+                    connector_id: Set(Some(connector_id)),
+                    created_at: Set(now),
+                    updated_at: Set(now),
+                    ..Default::default()
+                }
+                .insert(self.db.as_ref())
+                .await;
+                match inserted {
+                    Ok(_) => true,
+                    // `hostname` is unique: a row someone inserted meanwhile
+                    // refuses this. Any other failure is reported as it is.
+                    Err(error) => {
+                        if self.hostname_choice(&host).await?.is_none() {
+                            return Err(error.into());
+                        }
+                        false
+                    }
+                }
+            }
+            Some(previous) => {
+                let column = ingress_hostname_choices::Column::ConnectorId;
+                ingress_hostname_choices::Entity::update_many()
+                    .col_expr(column, Expr::value(Some(connector_id)))
+                    .col_expr(
+                        ingress_hostname_choices::Column::UpdatedAt,
+                        Expr::value(now),
+                    )
+                    .filter(ingress_hostname_choices::Column::Hostname.eq(&host))
+                    .filter(match previous {
+                        Some(id) => column.eq(id),
+                        None => column.is_null(),
+                    })
+                    .exec(self.db.as_ref())
+                    .await?
+                    .rows_affected
+                    == 1
+            }
+        };
+        if !written {
+            let current = self.hostname_choice(&host).await?;
+            if current != Some(Some(connector_id)) {
+                return Err(IngressError::Validation(format!(
+                    "{host}'s tunnel choice changed while this setup ran, so it was left as \
+                     the other change set it. Plan again to see it, or change it under \
+                     Expose your apps."
+                )));
+            }
+        }
+        self.reconcile_all().await;
+        Ok(())
     }
 
     /// Record the operator's choice for one hostname and apply it now.
@@ -1171,15 +1428,7 @@ impl IngressConnectorService {
                 let id = request.connector_id.ok_or_else(|| {
                     IngressError::Validation("Pick the tunnel to publish it through.".into())
                 })?;
-                let connector = self.find(id).await?;
-                let zone = self.zone_of(&connector).await?;
-                record_label(&host, &connector.domain, &zone)?;
-                if let Some(guard) = self.move_guard.get() {
-                    guard
-                        .check_move(&host, &connector.name)
-                        .await
-                        .map_err(IngressError::Validation)?;
-                }
+                self.check_tunnel_choice(&host, id).await?;
                 Some(id)
             }
         };
@@ -1228,7 +1477,7 @@ impl IngressConnectorService {
                 connector.name
             )));
         }
-        self.ensure(connector).await?;
+        self.ensure(connector.id, None).await?;
         self.reconcile_all().await;
         self.get(id).await
     }
@@ -1248,7 +1497,8 @@ impl IngressConnectorService {
         // Under the lock `ensure` and the secret rotation write the row
         // with, so neither can put back a status read before this.
         let _guard = self.settings_lock.lock().await;
-        let connector = self.find(id).await?;
+        let txn = self.db.begin().await?;
+        let connector = Self::find_for_update(&txn, id).await?;
         if connector.name != name {
             return Err(IngressError::Validation(format!(
                 "Connector {id} is `{}` now, not `{name}`; nothing was removed.",
@@ -1266,9 +1516,13 @@ impl IngressConnectorService {
                     Expr::value(Utc::now()),
                 )
                 .filter(ingress_connectors::Column::Id.eq(id))
-                .exec(self.db.as_ref())
+                .exec(&txn)
                 .await?;
+            txn.commit().await?;
             info!(connector_id = id, "ingress connector marked deleting");
+            // A connector being removed is no longer in node 0's specs:
+            // stop it there now rather than at the next poll.
+            self.wake_control_plane();
         }
         Ok(connector.external_id)
     }
@@ -1282,6 +1536,7 @@ impl IngressConnectorService {
         id: i32,
         tunnel_id: Option<&str>,
     ) -> Result<(), IngressError> {
+        let _connector = self.connector_locks().lock(id).await;
         let connector = match self.find(id).await {
             Ok(connector) => connector,
             Err(IngressError::NotFound(_)) => return Ok(()),
@@ -1360,8 +1615,7 @@ impl IngressConnectorService {
             .collect();
         let plan = self.plan().await?;
         hosts.extend(
-            plan.served
-                .iter()
+            plan.servable_hosts()
                 .filter(|host| matches!(plan.decide(host), Decision::Publish(c) if c == id))
                 .cloned(),
         );
@@ -1391,31 +1645,31 @@ impl IngressConnectorService {
         }
     }
 
+    /// Check a placement: every id is the control plane (ADR-107 D1) or an
+    /// active worker.
     async fn validate_nodes(&self, node_ids: &[i32]) -> Result<(), IngressError> {
-        let found = nodes::Entity::find()
-            .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
-            .all(self.db.as_ref())
-            .await?;
-        for id in node_ids {
-            match found.iter().find(|n| n.id == *id) {
-                None => {
-                    return Err(IngressError::Validation(format!("Node {id} does not exist.")))
-                }
-                Some(node) if node.role != "worker" => {
-                    return Err(IngressError::Validation(format!(
-                        "Node '{}' is a {}, not a worker; only workers run connectors.",
-                        node.name, node.role
-                    )))
-                }
-                Some(node) if node.status != "active" => {
-                    return Err(IngressError::Validation(format!(
-                        "Worker '{}' is {}, so it cannot run a connector. Bring it back (its agent must be running and connected) or pick another worker.",
-                        node.name, node.status
-                    )))
-                }
-                Some(_) => {}
-            }
+        let workers: Vec<i32> = node_ids
+            .iter()
+            .copied()
+            .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+            .collect();
+        let found = if workers.is_empty() {
+            Vec::new()
+        } else {
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(workers.iter().copied()))
+                .all(self.db.as_ref())
+                .await?
+        };
+        let facts: Vec<NodeFacts<'_>> = found.iter().map(NodeFacts::of).collect();
+        check_placement(node_ids, &facts)?;
+        if node_ids.contains(&CONTROL_PLANE_NODE_ID) {
+            self.control_plane_tunnels()?;
         }
+        if workers.is_empty() {
+            return Ok(());
+        }
+        let node_ids = workers.as_slice();
         // A tunnel exposes a worker as much as an open port does, so only a
         // worker that delegated public ingress takes one (ADR 058 D7). Agents
         // that report no mode predate the rule. The agent enforces this too.
@@ -1443,14 +1697,20 @@ impl IngressConnectorService {
         // Recorded before a new node can fetch the secret, so it is rotated
         // once that node leaves even if it leaves right away.
         self.add_token_holders(connector_id, &wanted).await?;
+        // One placement edit of a tunnel at a time: two requests reading the
+        // same rows would otherwise both insert their workers (and leave the
+        // union, or trip the unique constraint). The tunnel's row lock is held
+        // for this read-diff-write only, never across a provider call.
+        let txn = self.db.begin().await?;
+        Self::find_for_update(&txn, connector_id).await?;
         let existing = ingress_connector_nodes::Entity::find()
             .filter(ingress_connector_nodes::Column::ConnectorId.eq(connector_id))
-            .all(self.db.as_ref())
+            .all(&txn)
             .await?;
         for row in &existing {
             if !wanted.contains(&row.node_id) {
                 ingress_connector_nodes::Entity::delete_by_id(row.id)
-                    .exec(self.db.as_ref())
+                    .exec(&txn)
                     .await?;
             }
         }
@@ -1465,99 +1725,11 @@ impl IngressConnectorService {
                 created_at: Set(Utc::now()),
                 ..Default::default()
             }
-            .insert(self.db.as_ref())
+            .insert(&txn)
             .await?;
         }
+        txn.commit().await?;
         Ok(())
-    }
-
-    /// Create or adopt the provider-side tunnel and store the outcome on the
-    /// row, so a failure is visible on the connector rather than lost.
-    async fn ensure(&self, connector: ingress_connectors::Model) -> Result<(), IngressError> {
-        if is_deleting(&connector) {
-            return Ok(());
-        }
-        let outcome = async {
-            let provider = self.provider_for(&connector).await?;
-            let existing = self.handle_of(&connector)?;
-            let instance_id = self.records.instance_id().await?;
-            provider
-                .ensure(&TunnelContext {
-                    connector_id: connector.id,
-                    name: &connector.name,
-                    domain: &connector.domain,
-                    edge_port: connector.edge_port as u16,
-                    instance_id: &instance_id,
-                    existing,
-                })
-                .await
-        }
-        .await;
-        // Settings the service owns may have changed while the provider was
-        // called (token holders); keep the stored ones.
-        let _guard = self.settings_lock.lock().await;
-        let current = self
-            .find(connector.id)
-            .await
-            .unwrap_or_else(|_| connector.clone());
-        if is_deleting(&current) {
-            // Removed meanwhile: nothing it made is kept.
-            if let Ok(handle) = &outcome {
-                if let Ok(provider) = self.provider_for(&connector).await {
-                    let _ = provider.delete(handle).await;
-                }
-            }
-            return Ok(());
-        }
-        let mut row: ingress_connectors::ActiveModel = connector.clone().into();
-        row.updated_at = Set(Utc::now());
-        match outcome {
-            Ok(handle) => {
-                let secret = self
-                    .encryption
-                    .encrypt_string(&handle.secret)
-                    .map_err(|e| IngressError::Encryption(e.to_string()))?;
-                let replaced = tunnel_replaced(current.external_id.as_deref(), &handle.external_id);
-                row.external_id = Set(Some(handle.external_id));
-                row.settings = Set(keep_setup(&current.settings, handle.settings));
-                row.secret_encrypted = Set(Some(secret));
-                row.status = Set("ready".into());
-                row.last_error = Set(None);
-                let txn = self.db.begin().await?;
-                row.update(&txn).await?;
-                if replaced {
-                    // Every record points at the tunnel that is gone. Marked
-                    // stale, they are published again through the new one (or
-                    // removed) by the reconcile that follows.
-                    let stale = ingress_publications::Entity::update_many()
-                        .col_expr(ingress_publications::Column::State, Expr::value(STALE))
-                        .col_expr(
-                            ingress_publications::Column::PublishedAt,
-                            Expr::value(Option::<DBDateTime>::None),
-                        )
-                        .col_expr(
-                            ingress_publications::Column::UpdatedAt,
-                            Expr::value(Utc::now()),
-                        )
-                        .filter(ingress_publications::Column::ConnectorId.eq(connector.id))
-                        .exec(&txn)
-                        .await?;
-                    info!(
-                        connector_id = connector.id,
-                        publications = stale.rows_affected,
-                        "tunnel was replaced; republishing its hostnames"
-                    );
-                }
-                txn.commit().await?;
-                Ok(())
-            }
-            Err(error) => {
-                row.status = Set("error".into());
-                row.last_error = Set(Some(error.to_string()));
-                row.update(self.db.as_ref()).await?;
-                Err(error)
-            }
-        }
     }
 
     // ----- secret rotation ---------------------------------------------
@@ -1593,7 +1765,8 @@ impl IngressConnectorService {
         secret: Option<String>,
     ) -> Result<(), IngressError> {
         let _guard = self.settings_lock.lock().await;
-        let connector = self.find(connector_id).await?;
+        let txn = self.db.begin().await?;
+        let connector = Self::find_for_update(&txn, connector_id).await?;
         let stored = token_holders(&connector.settings);
         let holders = change(stored.clone());
         if secret.is_none() && stored.as_ref() == Some(&holders) {
@@ -1620,7 +1793,8 @@ impl IngressConnectorService {
             row.status = Set("ready".into());
             row.last_error = Set(None);
         }
-        row.update(self.db.as_ref()).await?;
+        row.update(&txn).await?;
+        txn.commit().await?;
         Ok(())
     }
 
@@ -1789,17 +1963,21 @@ impl IngressConnectorService {
                 .all(self.db.as_ref())
                 .await?,
         );
-        let with_nodes: HashSet<i32> = ingress_connector_nodes::Entity::find()
+        let mut placements: HashMap<i32, Placement> = HashMap::new();
+        for row in ingress_connector_nodes::Entity::find()
             .all(self.db.as_ref())
             .await?
-            .into_iter()
-            .map(|row| row.connector_id)
-            .collect();
+        {
+            placements
+                .entry(row.connector_id)
+                .or_default()
+                .add(row.node_id);
+        }
         let mut zones = self.zones_of(&models).await?;
         let connectors: Vec<PlannedConnector> = models
             .into_iter()
             .map(|model| PlannedConnector {
-                has_nodes: with_nodes.contains(&model.id),
+                placement: placements.remove(&model.id).unwrap_or_default(),
                 zone: zones.remove(&model.id).flatten(),
                 model,
             })
@@ -1835,14 +2013,26 @@ impl IngressConnectorService {
                     .map(|id| (row.domain.trim_end_matches('.').to_ascii_lowercase(), id))
             })
             .collect();
-        if !generated.is_empty() {
-            for route in &routes.routes {
-                let host = route.host.trim_end_matches('.').to_ascii_lowercase();
-                if let Some(id) = generated_connector(&generated, &host) {
-                    choices.entry(host).or_insert(Some(id));
-                }
-            }
-        }
+        let served: HashSet<String> = routes
+            .routes
+            .iter()
+            .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
+            .collect();
+        // ADR-107 D4: the control-plane proxy serves every public hostname
+        // in its route table, applying every policy that keeps one off
+        // workers. Only read when a tunnel runs there.
+        let served_by_control_plane = if connectors.iter().any(|c| c.placement.control_plane) {
+            self.control_plane_hostnames()
+        } else {
+            HashSet::new()
+        };
+        // A generated host only the control plane serves belongs to its
+        // tunnel as much as one workers serve.
+        assign_generated(
+            &mut choices,
+            &generated,
+            served.iter().chain(&served_by_control_plane),
+        );
         let mut blocking = routes.blocking_policies;
         if gate.is_none() {
             blocking = vec!["the control plane is still starting".into()];
@@ -1850,13 +2040,22 @@ impl IngressConnectorService {
         Ok(Plan {
             connectors,
             choices,
-            served: routes
-                .routes
-                .into_iter()
-                .map(|route| route.host.trim_end_matches('.').to_ascii_lowercase())
-                .collect(),
+            served,
+            served_by_control_plane,
             blocking,
         })
+    }
+
+    /// Every public hostname the control-plane proxy answers (ADR-107 D4):
+    /// its routes, published status pages, and sleeping on-demand
+    /// environments, which have no route until a visit through the proxy
+    /// wakes them. One snapshot, so an app waking up is never in neither.
+    fn control_plane_hostnames(&self) -> HashSet<String> {
+        self.peer_table
+            .control_plane_public_hostnames()
+            .into_iter()
+            .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+            .collect()
     }
 
     /// Bring every tunnel's DNS records in line with the plan.
@@ -1881,8 +2080,7 @@ impl IngressConnectorService {
             return Ok(());
         }
         let desired: HashMap<&str, i32> = plan
-            .served
-            .iter()
+            .servable_hosts()
             .filter_map(|host| match plan.decide(host) {
                 Decision::Publish(id) => Some((host.as_str(), id)),
                 Decision::Skip { .. } => None,
@@ -2053,7 +2251,7 @@ impl IngressConnectorService {
         host: &str,
         existing: Option<&ingress_publications::Model>,
         outcome: Result<(), IngressError>,
-    ) -> Result<(), IngressError> {
+    ) -> Result<ingress_publications::Model, IngressError> {
         let now = Utc::now();
         let (state, error, published_at) = match outcome {
             Ok(()) => ("published", None, Some(now)),
@@ -2062,14 +2260,14 @@ impl IngressConnectorService {
                 ("error", Some(error.to_string()), None)
             }
         };
-        match existing {
+        let saved = match existing {
             Some(row) => {
                 let mut row: ingress_publications::ActiveModel = row.clone().into();
                 row.state = Set(state.into());
                 row.last_error = Set(error);
                 row.published_at = Set(published_at);
                 row.updated_at = Set(now);
-                row.update(self.db.as_ref()).await?;
+                row.update(self.db.as_ref()).await?
             }
             None => {
                 ingress_publications::ActiveModel {
@@ -2083,10 +2281,10 @@ impl IngressConnectorService {
                     ..Default::default()
                 }
                 .insert(self.db.as_ref())
-                .await?;
+                .await?
             }
-        }
-        Ok(())
+        };
+        Ok(saved)
     }
 
     // ----- node side ---------------------------------------------------
@@ -2183,6 +2381,85 @@ impl IngressConnectorService {
     }
 }
 
+/// What a placement check reads of a `nodes` row.
+#[derive(Debug, Clone, Copy)]
+struct NodeFacts<'a> {
+    id: i32,
+    name: &'a str,
+    role: &'a str,
+    status: &'a str,
+}
+
+impl<'a> NodeFacts<'a> {
+    fn of(node: &'a nodes::Model) -> Self {
+        Self {
+            id: node.id,
+            name: &node.name,
+            role: &node.role,
+            status: &node.status,
+        }
+    }
+}
+
+/// What `validate_nodes` decides from the rows alone: the control plane is
+/// always accepted, every other id must be an active worker.
+fn check_placement(node_ids: &[i32], found: &[NodeFacts<'_>]) -> Result<(), IngressError> {
+    for id in node_ids {
+        if *id == CONTROL_PLANE_NODE_ID {
+            continue;
+        }
+        match found.iter().find(|n| n.id == *id) {
+            None => return Err(IngressError::UnknownNode { node_id: *id }),
+            Some(node) if node.role != "worker" => {
+                return Err(IngressError::NotAWorker {
+                    node_id: node.id,
+                    name: node.name.to_string(),
+                    role: node.role.to_string(),
+                })
+            }
+            Some(node) if node.status != "active" => {
+                return Err(IngressError::InactiveWorker {
+                    node_id: node.id,
+                    name: node.name.to_string(),
+                    status: node.status.to_string(),
+                })
+            }
+            Some(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// The name the console shows for a node running a connector.
+pub const CONTROL_PLANE_NODE_NAME: &str = "Control plane";
+
+/// Names of the nodes in `ids`, the control plane included, in one query.
+async fn node_names(
+    db: &sea_orm::DatabaseConnection,
+    ids: impl IntoIterator<Item = i32>,
+) -> Result<HashMap<i32, String>, sea_orm::DbErr> {
+    let ids: BTreeSet<i32> = ids.into_iter().collect();
+    let mut names: HashMap<i32, String> = HashMap::new();
+    if ids.contains(&CONTROL_PLANE_NODE_ID) {
+        names.insert(CONTROL_PLANE_NODE_ID, CONTROL_PLANE_NODE_NAME.to_string());
+    }
+    let workers: Vec<i32> = ids
+        .into_iter()
+        .filter(|id| *id != CONTROL_PLANE_NODE_ID)
+        .collect();
+    if !workers.is_empty() {
+        names.extend(
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(workers))
+                .all(db)
+                .await?
+                .into_iter()
+                .map(|n| (n.id, n.name)),
+        );
+    }
+    Ok(names)
+}
+
 fn connector_view(
     connector: ingress_connectors::Model,
     node_rows: Vec<ingress_connector_nodes::Model>,
@@ -2206,6 +2483,7 @@ fn connector_view(
         edge_port: connector.edge_port,
         auto_publish: connector.auto_publish,
         environment_hosts: connector.environment_hosts,
+        host_suffix: connector.host_suffix,
         nodes: node_rows
             .into_iter()
             .map(|n| ConnectorNodeView {
@@ -2244,6 +2522,25 @@ fn page_bounds(page: Option<u64>, page_size: Option<u64>) -> (u64, u64) {
 /// Whether a publication in `state` has a DNS record out there.
 fn has_record(state: &str) -> bool {
     state == "published" || state == STALE
+}
+
+/// The checked `host_suffix` for a new tunnel: only a provider set up with a
+/// domain names hosts under one.
+fn host_suffix_for(
+    info: &ProviderInfo,
+    setup: &ProviderSetup,
+    requested: Option<&str>,
+) -> Result<Option<String>, IngressError> {
+    let suffix = crate::reachability::environment_hosts::normalize_host_suffix(requested)
+        .map_err(IngressError::Validation)?;
+    match (&suffix, &setup.domain) {
+        (Some(suffix), None) => Err(IngressError::Validation(format!(
+            "{} is not set up with a domain, so it has no hostnames to add the suffix \
+             '{suffix}' to. Leave the hostname suffix empty.",
+            info.name
+        ))),
+        _ => Ok(suffix),
+    }
 }
 
 /// The record name of `host` inside `domain`. Cloudflare's free certificate
@@ -2288,19 +2585,61 @@ pub(crate) fn covers(domain: &str, zone: &str, host: &str) -> bool {
     host.ends_with(&format!(".{domain}")) || (host == domain && domain != zone)
 }
 
+/// Where a connector runs (ADR-107 D4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Placement {
+    control_plane: bool,
+    workers: bool,
+}
+
+impl Placement {
+    fn add(&mut self, node_id: i32) {
+        if node_id == CONTROL_PLANE_NODE_ID {
+            self.control_plane = true;
+        } else {
+            self.workers = true;
+        }
+    }
+
+    fn has_nodes(self) -> bool {
+        self.control_plane || self.workers
+    }
+}
+
+/// ADR 068 D3: each served `hosts` entry a tunnel generated goes through that
+/// tunnel, unless the operator chose otherwise for it.
+fn assign_generated<'a>(
+    choices: &mut HashMap<String, Option<i32>>,
+    generated: &HashMap<String, i32>,
+    hosts: impl Iterator<Item = &'a String>,
+) {
+    if generated.is_empty() {
+        return;
+    }
+    for host in hosts {
+        if let Some(id) = generated_connector(generated, host) {
+            choices.entry(host.clone()).or_insert(Some(id));
+        }
+    }
+}
+
 struct PlannedConnector {
     model: ingress_connectors::Model,
     /// `None` when its domain is no longer managed; it then covers nothing.
     zone: Option<String>,
-    has_nodes: bool,
+    placement: Placement,
 }
 
 struct Plan {
     connectors: Vec<PlannedConnector>,
     choices: HashMap<String, Option<i32>>,
-    /// Hostnames workers serve, which are the only ones a tunnel can carry.
+    /// Hostnames workers serve: all a tunnel with a worker replica can carry,
+    /// since the provider spreads requests over every replica.
     served: HashSet<String>,
-    /// Cluster-wide policies that keep every hostname on the control plane.
+    /// Hostnames the control plane serves: all a tunnel that runs only on
+    /// the control plane can carry. Empty when no tunnel runs there.
+    served_by_control_plane: HashSet<String>,
+    /// Cluster-wide policies that keep every hostname off workers.
     blocking: Vec<String>,
 }
 
@@ -2310,6 +2649,15 @@ enum Decision {
 }
 
 impl Plan {
+    /// Every hostname some tunnel could carry, each once.
+    fn servable_hosts(&self) -> impl Iterator<Item = &String> {
+        self.served.iter().chain(
+            self.served_by_control_plane
+                .iter()
+                .filter(|host| !self.served.contains(*host)),
+        )
+    }
+
     /// The served hostnames tunnel `id` would publish by itself, with no
     /// choice made for them, once its `auto_publish` is on.
     fn published_automatically_once_on(&mut self, id: i32) -> Vec<String> {
@@ -2318,9 +2666,13 @@ impl Plan {
                 connector.model.auto_publish = true;
             }
         }
+        let placement = self.connector(id).map(|c| c.placement).unwrap_or_default();
         let mut hosts: Vec<String> = self
-            .served
-            .iter()
+            .servable_hosts()
+            // Only what its own replicas would serve: another tunnel on the
+            // control plane widens the servable set beyond what a
+            // worker-only tunnel can publish.
+            .filter(|host| self.carries(placement, host))
             .filter(|host| {
                 self.intent(host)
                     == PublicationIntent::Tunnel {
@@ -2332,6 +2684,16 @@ impl Plan {
             .collect();
         hosts.sort();
         hosts
+    }
+
+    /// Whether every replica of a tunnel placed so serves `host` (ADR-107
+    /// D4): workers decide when there are any, as they serve less.
+    fn carries(&self, placement: Placement, host: &str) -> bool {
+        if placement.workers {
+            self.served.contains(host)
+        } else {
+            placement.control_plane && self.served_by_control_plane.contains(host)
+        }
     }
 
     fn connector(&self, id: i32) -> Option<&PlannedConnector> {
@@ -2441,20 +2803,33 @@ impl Plan {
                 None => format!("Tunnel '{name}' is not ready yet."),
             });
         }
-        if !chosen.has_nodes {
+        if !chosen.placement.has_nodes() {
             return skip(format!(
-                "Tunnel '{name}' runs on no worker. Run it on one from the worker's page."
+                "Tunnel '{name}' runs nowhere. Run it on the control plane or on a worker from the tunnel's page."
             ));
         }
-        if !self.served.contains(host) {
-            return skip(if self.blocking.is_empty() {
-                "Workers do not serve it, so a tunnel cannot carry it: it runs on the control plane, or needs a redirect, wake-up, attack mode, a security policy or path routing, which only the control plane applies.".into()
-            } else {
-                format!(
-                    "Workers serve no hostnames while {}, so a tunnel cannot carry it.",
-                    self.blocking.join(", ")
-                )
-            });
+        if chosen.placement.workers {
+            // Every replica must answer it: workers serve less than the
+            // control plane, so they decide (ADR-107 D4).
+            if !self.carries(chosen.placement, host) {
+                return skip(if !self.blocking.is_empty() {
+                    format!(
+                        "Workers serve no hostnames while {}, so a tunnel on a worker cannot carry it.",
+                        self.blocking.join(", ")
+                    )
+                } else if chosen.placement.control_plane {
+                    format!(
+                        "Workers do not serve it, and tunnel '{name}' also runs on a worker, which would answer it with a 404. Run tunnel '{name}' on the control plane only to publish it."
+                    )
+                } else {
+                    "Workers do not serve it, so a tunnel on a worker cannot carry it: it runs on the control plane, or needs a redirect, wake-up, attack mode, a security policy or path routing, which only the control plane applies. Run the tunnel on the control plane to publish it.".into()
+                });
+            }
+        } else if !self.carries(chosen.placement, host) {
+            return skip(
+                "Nothing serves it yet: deploy the environment it belongs to, then it is published."
+                    .into(),
+            );
         }
         Decision::Publish(id)
     }
@@ -2466,7 +2841,11 @@ impl Plan {
             Some(Some(id)) => (HostnameMode::Tunnel, Some(*id)),
         };
         let name_of = |id: i32| self.connector(id).map(|c| c.model.name.clone());
-        let (connector_id, state, detail) = match self.decide(host) {
+        let decision = self.decide(host);
+        let retry_dns_connector_id = self
+            .retry_dns_connector(&decision, publication)
+            .map(|c| c.model.id);
+        let (connector_id, state, detail) = match decision {
             Decision::Publish(id) => {
                 let name = name_of(id).unwrap_or_default();
                 match publication.filter(|p| p.connector_id == id) {
@@ -2513,6 +2892,7 @@ impl Plan {
             hostname: host.to_string(),
             mode,
             chosen_connector_id,
+            retry_dns_connector_id,
             connector_name: connector_id.and_then(name_of),
             connector_id,
             state: state.into(),
@@ -2693,6 +3073,42 @@ mod tests {
         );
     }
 
+    fn setup_with_domain(domain: Option<&str>) -> ProviderSetup {
+        ProviderSetup {
+            dns_provider: None,
+            domain: domain.map(str::to_string),
+            settings: BTreeMap::new(),
+            secrets: BTreeMap::new(),
+        }
+    }
+
+    /// A tunnel's host suffix is checked when it is created: normalised,
+    /// refused when malformed, and refused for a provider with no domain to
+    /// put hostnames under.
+    #[test]
+    fn a_new_tunnels_host_suffix_is_checked() {
+        use crate::registry::ProviderFactory;
+        let info = crate::cloudflare::CloudflareTunnelFactory.info();
+        let zone = setup_with_domain(Some("example.com"));
+        assert_eq!(host_suffix_for(&info, &zone, None).unwrap(), None);
+        assert_eq!(host_suffix_for(&info, &zone, Some("  ")).unwrap(), None);
+        assert_eq!(
+            host_suffix_for(&info, &zone, Some("Lab")).unwrap(),
+            Some("lab".to_string())
+        );
+        let malformed = host_suffix_for(&info, &zone, Some("lab.home")).unwrap_err();
+        assert!(
+            matches!(&malformed, IngressError::Validation(m) if m.contains("'lab.home'")),
+            "{malformed}"
+        );
+        let no_domain = host_suffix_for(&info, &setup_with_domain(None), Some("lab")).unwrap_err();
+        assert!(
+            matches!(&no_domain, IngressError::Validation(m)
+                if m.contains("not set up with a domain") && m.contains("'lab'")),
+            "{no_domain}"
+        );
+    }
+
     fn connector_model(id: i32, domain: &str, auto_publish: bool) -> ingress_connectors::Model {
         ingress_connectors::Model {
             id,
@@ -2706,6 +3122,7 @@ mod tests {
             edge_port: 443,
             auto_publish,
             environment_hosts: false,
+            host_suffix: None,
             status: "ready".into(),
             last_error: None,
             created_at: Utc::now(),
@@ -2759,12 +3176,18 @@ mod tests {
                 PlannedConnector {
                     model: connector_model(1, "example.com", false),
                     zone: Some("example.com".into()),
-                    has_nodes: true,
+                    placement: Placement {
+                        control_plane: false,
+                        workers: true,
+                    },
                 },
                 PlannedConnector {
                     model: connector_model(2, "apps.example.com", true),
                     zone: Some("example.com".into()),
-                    has_nodes: true,
+                    placement: Placement {
+                        control_plane: false,
+                        workers: true,
+                    },
                 },
             ],
             choices: HashMap::from([("chosen.example.com".to_string(), None)]),
@@ -2777,6 +3200,7 @@ mod tests {
             .into_iter()
             .map(String::from)
             .collect(),
+            served_by_control_plane: HashSet::new(),
             blocking: Vec::new(),
         };
         // A choice wins, a more specific automatic tunnel wins, and other
@@ -2785,6 +3209,260 @@ mod tests {
             plan.published_automatically_once_on(1),
             vec!["internal.example.com".to_string()]
         );
+    }
+
+    /// A worker-only tunnel's guard looks only at hostnames its workers
+    /// serve, even when another tunnel on the control plane serves more.
+    #[test]
+    fn auto_publish_on_a_worker_tunnel_ignores_what_only_the_control_plane_serves() {
+        let mut plan = Plan {
+            connectors: vec![
+                PlannedConnector {
+                    model: connector_model(1, "example.com", false),
+                    zone: Some("example.com".into()),
+                    placement: Placement {
+                        control_plane: false,
+                        workers: true,
+                    },
+                },
+                PlannedConnector {
+                    model: connector_model(2, "other.example.org", true),
+                    zone: Some("example.org".into()),
+                    placement: Placement {
+                        control_plane: true,
+                        workers: false,
+                    },
+                },
+            ],
+            choices: HashMap::new(),
+            served: HashSet::from(["on-worker.example.com".to_string()]),
+            served_by_control_plane: HashSet::from([
+                "on-worker.example.com".to_string(),
+                "on-control-plane.example.com".to_string(),
+            ]),
+            blocking: Vec::new(),
+        };
+        assert_eq!(
+            plan.published_automatically_once_on(1),
+            vec!["on-worker.example.com".to_string()]
+        );
+    }
+
+    /// ADR 068 D3 with ADR-107 D4: a generated host the control plane alone
+    /// serves still belongs to the tunnel that generated it, and an
+    /// operator's choice still wins.
+    #[test]
+    fn a_generated_host_only_the_control_plane_serves_keeps_its_tunnel() {
+        let generated = HashMap::from([("shop.tunnel.example.com".to_string(), 7)]);
+        let mut choices = HashMap::from([("chosen.tunnel.example.com".to_string(), None)]);
+        let served: HashSet<String> = HashSet::new();
+        let control_plane: HashSet<String> = HashSet::from([
+            "shop.tunnel.example.com".to_string(),
+            "unrelated.example.com".to_string(),
+        ]);
+        assign_generated(
+            &mut choices,
+            &generated,
+            served.iter().chain(&control_plane),
+        );
+        assert_eq!(choices.get("shop.tunnel.example.com"), Some(&Some(7)));
+        assert_eq!(choices.get("unrelated.example.com"), None);
+        assert_eq!(choices.get("chosen.tunnel.example.com"), Some(&None));
+    }
+
+    fn node<'a>(id: i32, name: &'a str, role: &'a str, status: &'a str) -> NodeFacts<'a> {
+        NodeFacts {
+            id,
+            name,
+            role,
+            status,
+        }
+    }
+
+    /// ADR-107 D1: node 0 is the control plane, which has no `nodes` row.
+    #[test]
+    fn the_control_plane_is_a_valid_placement_without_a_node_row() {
+        check_placement(&[CONTROL_PLANE_NODE_ID], &[]).expect("control plane");
+        check_placement(&[], &[]).expect("no placement");
+    }
+
+    #[test]
+    fn an_unknown_node_is_refused_with_its_id_and_the_control_plane_hint() {
+        let workers = [node(4, "worker-a", "worker", "active")];
+        let error = check_placement(&[CONTROL_PLANE_NODE_ID, 4, 17], &workers)
+            .expect_err("node 17 has no row");
+        assert!(matches!(error, IngressError::UnknownNode { node_id: 17 }));
+        assert_eq!(
+            error.to_string(),
+            "Node 17 does not exist (use 0 for the control plane)."
+        );
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn non_workers_and_inactive_workers_keep_their_messages() {
+        let rows = [
+            node(5, "builder-a", "builder", "active"),
+            node(6, "worker-b", "worker", "offline"),
+        ];
+        let error = check_placement(&[CONTROL_PLANE_NODE_ID, 5], &rows).expect_err("builder");
+        assert!(matches!(error, IngressError::NotAWorker { node_id: 5, .. }));
+        assert_eq!(
+            error.to_string(),
+            "Node 'builder-a' is a builder, not a worker; only workers run connectors."
+        );
+        let error = check_placement(&[6], &rows).expect_err("offline");
+        assert!(matches!(
+            error,
+            IngressError::InactiveWorker { node_id: 6, .. }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Worker 'worker-b' is offline, so it cannot run a connector. Bring it back (its agent must be running and connected) or pick another worker."
+        );
+    }
+
+    #[test]
+    fn the_control_plane_and_an_active_worker_together_are_accepted() {
+        let rows = [node(4, "worker-a", "worker", "active")];
+        check_placement(&[CONTROL_PLANE_NODE_ID, 4], &rows).expect("mixed placement");
+    }
+
+    fn placement_plan(placement: Placement) -> Plan {
+        Plan {
+            connectors: vec![PlannedConnector {
+                model: connector_model(1, "example.com", true),
+                zone: Some("example.com".into()),
+                placement,
+            }],
+            choices: HashMap::new(),
+            served: HashSet::from(["on-worker.example.com".to_string()]),
+            served_by_control_plane: HashSet::from([
+                "on-worker.example.com".to_string(),
+                "on-control-plane.example.com".to_string(),
+            ]),
+            blocking: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn retry_dns_requires_a_failed_publication_on_the_planned_cloudflare_tunnel() {
+        let mut plan = placement_plan(Placement {
+            workers: true,
+            control_plane: false,
+        });
+        let host = "on-worker.example.com";
+        let now = Utc::now();
+        let mut row = ingress_publications::Model {
+            id: 8,
+            connector_id: 1,
+            hostname: host.into(),
+            state: "error".into(),
+            last_error: Some("Conflicting DNS record".into()),
+            published_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let retry = |plan: &Plan, row: &ingress_publications::Model| {
+            plan.view(host, Some(row)).retry_dns_connector_id
+        };
+        assert_eq!(retry(&plan, &row), None);
+        plan.connectors[0].model.external_id = Some("existing-tunnel".into());
+        plan.connectors[0].model.secret_encrypted = Some("sealed".into());
+        assert_eq!(retry(&plan, &row), Some(1));
+        row.connector_id = 2;
+        assert_eq!(retry(&plan, &row), None);
+        row.connector_id = 1;
+        for state in ["published", "pending", STALE] {
+            row.state = state.into();
+            assert_eq!(retry(&plan, &row), None);
+        }
+        row.state = "error".into();
+        plan.choices.insert(host.into(), None);
+        assert_eq!(retry(&plan, &row), None);
+        plan.choices.clear();
+        plan.connectors[0].model.provider = "another_provider".into();
+        assert_eq!(retry(&plan, &row), None);
+    }
+
+    fn publishes(plan: &Plan, host: &str) -> bool {
+        matches!(plan.decide(host), Decision::Publish(1))
+    }
+
+    fn why_not(plan: &Plan, host: &str) -> String {
+        match plan.decide(host) {
+            Decision::Skip { why, .. } => why,
+            Decision::Publish(id) => panic!("{host} is published through {id}"),
+        }
+    }
+
+    /// ADR-107 D4: a tunnel only on the control plane carries what the
+    /// control-plane proxy serves, which includes what workers serve.
+    #[test]
+    fn a_control_plane_tunnel_publishes_what_the_control_plane_serves() {
+        let plan = placement_plan(Placement {
+            control_plane: true,
+            workers: false,
+        });
+        assert!(publishes(&plan, "on-control-plane.example.com"));
+        assert!(publishes(&plan, "on-worker.example.com"));
+        assert!(why_not(&plan, "nowhere.example.com").contains("Nothing serves it"));
+        let mut hosts: Vec<&String> = plan.servable_hosts().collect();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            vec!["on-control-plane.example.com", "on-worker.example.com"],
+            "each servable host once"
+        );
+    }
+
+    /// Every replica must answer: with a worker in the placement, only what
+    /// workers serve is published, and the reason says how to get the rest.
+    #[test]
+    fn a_mixed_tunnel_publishes_only_what_workers_serve() {
+        let plan = placement_plan(Placement {
+            control_plane: true,
+            workers: true,
+        });
+        assert!(publishes(&plan, "on-worker.example.com"));
+        let why = why_not(&plan, "on-control-plane.example.com");
+        assert!(why.contains("also runs on a worker"), "{why}");
+        assert!(why.contains("control plane only"), "{why}");
+    }
+
+    #[test]
+    fn a_worker_tunnel_still_publishes_only_what_workers_serve() {
+        let plan = placement_plan(Placement {
+            control_plane: false,
+            workers: true,
+        });
+        assert!(publishes(&plan, "on-worker.example.com"));
+        let why = why_not(&plan, "on-control-plane.example.com");
+        assert!(why.contains("Run the tunnel on the control plane"), "{why}");
+    }
+
+    /// Worker-wide blocking policies do not hold back a tunnel that runs
+    /// only on the control plane, which applies those policies itself.
+    #[test]
+    fn worker_blocking_policies_do_not_stop_a_control_plane_tunnel() {
+        let mut plan = placement_plan(Placement {
+            control_plane: true,
+            workers: false,
+        });
+        // While a policy blocks workers they serve nothing.
+        plan.blocking = vec!["the control plane is still starting".into()];
+        plan.served.clear();
+        assert!(publishes(&plan, "on-control-plane.example.com"));
+        assert!(publishes(&plan, "on-worker.example.com"));
+        plan.connectors[0].placement.workers = true;
+        assert!(why_not(&plan, "on-worker.example.com").contains("still starting"));
+    }
+
+    #[test]
+    fn a_tunnel_placed_nowhere_says_where_to_run_it() {
+        let plan = placement_plan(Placement::default());
+        assert!(why_not(&plan, "on-worker.example.com").contains("control plane or on a worker"));
     }
 
     #[test]
@@ -2805,6 +3483,7 @@ mod tests {
         //! ADR 064 D4: a connector marked `deleting` is never recreated by
         //! sync and its removal is finished by the reconciler.
         use super::super::*;
+        use crate::provider::TunnelContext;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
         #[derive(Default)]
@@ -2812,6 +3491,16 @@ mod tests {
             ensure: AtomicUsize,
             delete: AtomicUsize,
             fail_delete_once: AtomicBool,
+            publications: std::sync::Mutex<Vec<String>>,
+            fail_publish: AtomicBool,
+            /// The `edge_port` the last `ensure` configured the tunnel for.
+            ensured_port: std::sync::atomic::AtomicU16,
+            fail_ensure: AtomicBool,
+            /// Pause the next `ensure` after it configured the tunnel (as a
+            /// real provider then fetches the token), until `release`.
+            hold_next: AtomicBool,
+            held: tokio::sync::Notify,
+            release: tokio::sync::Notify,
         }
 
         struct FakeTunnels(Arc<Calls>);
@@ -2819,11 +3508,19 @@ mod tests {
         #[async_trait::async_trait]
         impl TunnelProvider for FakeTunnels {
             fn kind(&self) -> &'static str {
-                "fake_tunnel"
+                crate::cloudflare::KIND
             }
             async fn ensure(&self, ctx: &TunnelContext<'_>) -> Result<TunnelHandle, IngressError> {
                 // A real provider recreates a tunnel deleted at the provider.
                 self.0.ensure.fetch_add(1, Ordering::SeqCst);
+                if self.0.fail_ensure.load(Ordering::SeqCst) {
+                    return Err(IngressError::Provider("provider unavailable".into()));
+                }
+                self.0.ensured_port.store(ctx.edge_port, Ordering::SeqCst);
+                if self.0.hold_next.swap(false, Ordering::SeqCst) {
+                    self.0.held.notify_one();
+                    self.0.release.notified().await;
+                }
                 Ok(TunnelHandle {
                     external_id: format!("recreated-{}", ctx.connector_id),
                     settings: serde_json::json!({}),
@@ -2833,7 +3530,7 @@ mod tests {
             fn connector_spec(&self, id: i32, _h: &TunnelHandle, port: u16) -> NodeConnectorSpec {
                 NodeConnectorSpec {
                     id,
-                    provider: "fake_tunnel".into(),
+                    provider: crate::cloudflare::KIND.into(),
                     revision: String::new(),
                     edge_port: port,
                     client_address_header: None,
@@ -2845,8 +3542,12 @@ mod tests {
             async fn publish(
                 &self,
                 _h: &TunnelHandle,
-                _host: &str,
+                host: &str,
             ) -> Result<DnsIntent, IngressError> {
+                self.0.publications.lock().unwrap().push(host.into());
+                if self.0.fail_publish.load(Ordering::SeqCst) {
+                    return Err(IngressError::Provider("DNS record conflicts".into()));
+                }
                 Ok(DnsIntent::None)
             }
             async fn unpublish(&self, _h: &TunnelHandle, _host: &str) -> Result<(), IngressError> {
@@ -2876,7 +3577,7 @@ mod tests {
         impl crate::registry::ProviderFactory for FakeFactory {
             fn info(&self) -> ProviderInfo {
                 ProviderInfo {
-                    kind: "fake_tunnel".into(),
+                    kind: crate::cloudflare::KIND.into(),
                     name: "Fake".into(),
                     summary: String::new(),
                     requirements: Vec::new(),
@@ -2908,12 +3609,25 @@ mod tests {
         }
 
         async fn setup() -> Option<(
-            temps_database::test_utils::TestDatabase,
+            temps_test_utils::TestDatabase,
             Arc<IngressConnectorService>,
             Arc<Calls>,
             i32,
         )> {
-            let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            setup_with(Some(temps_core::tunnel_origin::TUNNEL_ORIGIN_PORT)).await
+        }
+
+        /// `origin`: the port the proxy's tunnel origin is bound on, when
+        /// this process runs control-plane connectors at all.
+        async fn setup_with(
+            origin: Option<u16>,
+        ) -> Option<(
+            temps_test_utils::TestDatabase,
+            Arc<IngressConnectorService>,
+            Arc<Calls>,
+            i32,
+        )> {
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
                 Ok(db) => db,
                 Err(error) => {
                     eprintln!(
@@ -2940,10 +3654,18 @@ mod tests {
                 Arc::new(CachedPeerTable::new(db.clone())),
             );
             service.registry = ProviderRegistry::of(vec![Arc::new(FakeFactory(calls.clone()))]);
+            if let Some(port) = origin {
+                let tunnel_origin = temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new();
+                tunnel_origin.mark_bound(port);
+                service.attach_control_plane(crate::control_plane::ControlPlaneHandle::new(
+                    tunnel_origin,
+                    Arc::new(tokio::sync::Notify::new()),
+                ));
+            }
             let now = Utc::now();
             let connector = ingress_connectors::ActiveModel {
                 name: Set("homelab".into()),
-                provider: Set("fake_tunnel".into()),
+                provider: Set(crate::cloudflare::KIND.into()),
                 dns_provider_id: Set(None),
                 domain: Set("example.com".into()),
                 external_id: Set(Some("tunnel-1".into())),
@@ -2998,6 +3720,152 @@ mod tests {
             drop(test_db);
         }
 
+        async fn managed_zone(db: &DatabaseConnection) {
+            let now = Utc::now();
+            let provider = temps_entities::dns_providers::ActiveModel {
+                name: Set("test-zone".into()),
+                provider_type: Set("cloudflare".into()),
+                credentials: Set("{}".into()),
+                is_active: Set(true),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("provider");
+            temps_entities::dns_managed_domains::ActiveModel {
+                provider_id: Set(provider.id),
+                domain: Set("example.com".into()),
+                auto_manage: Set(true),
+                proxied_by_default: Set(false),
+                verified: Set(true),
+                generated_hostname_mode: Set("standard".into()),
+                sync_generated_records: Set(false),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("managed zone");
+        }
+
+        #[tokio::test]
+        async fn retry_dns_only_publishes_the_selected_host_and_keeps_its_choice() {
+            let Some((test_db, service, calls, id)) = setup().await else {
+                return;
+            };
+            managed_zone(test_db.connection_arc().as_ref()).await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .unwrap();
+            let selected = "shop.example.com";
+            let other = "blog.example.com";
+            for host in [selected, other] {
+                service.peer_table.insert_sleeping_host_for_test(host);
+                service
+                    .save_publication(
+                        id,
+                        host,
+                        None,
+                        Err(IngressError::Provider("DNS create failed".into())),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let attempts = || calls.publications.lock().unwrap().clone();
+            assert!(service.retry_hostname_dns(id + 1, selected).await.is_err());
+            assert!(attempts().is_empty());
+            calls.fail_publish.store(true, Ordering::SeqCst);
+            let failed = service.retry_hostname_dns(id, selected).await.unwrap();
+            assert_eq!(failed.state, "error");
+            assert!(failed.detail.contains("DNS record conflicts"));
+            calls.fail_publish.store(false, Ordering::SeqCst);
+            let retried = service.retry_hostname_dns(id, selected).await.unwrap();
+            assert_eq!(retried.state, "published");
+            assert_eq!(retried.connector_id, Some(id));
+            assert!(matches!(retried.mode, HostnameMode::Automatic));
+            assert!(service.retry_hostname_dns(id, selected).await.is_err());
+            assert_eq!(attempts(), [selected, selected]);
+            assert_eq!(service.hostname(other).await.unwrap().state, "error");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 0);
+        }
+
+        /// A reachability run writes the tunnel choice it decided from only
+        /// while the hostname still has the choice it read: one someone made
+        /// meanwhile is kept and reported, never replaced unseen.
+        #[tokio::test]
+        async fn a_run_never_replaces_a_choice_made_while_it_routed() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let now = Utc::now();
+            managed_zone(db.as_ref()).await;
+            let choose = |host: &'static str, expected| {
+                let service = service.clone();
+                async move { service.choose_tunnel_if_unchanged(host, id, expected).await }
+            };
+            let choice = |host: &'static str| {
+                let service = service.clone();
+                async move { service.hostname_choice(host).await.expect("read") }
+            };
+
+            // Nothing chosen, nothing changed: the choice is recorded.
+            choose("shop.example.com", None)
+                .await
+                .expect("first choice");
+            assert_eq!(choice("shop.example.com").await, Some(Some(id)));
+            // Resumed after the write landed: already done, not a failure.
+            choose("shop.example.com", None).await.expect("resumed");
+
+            // Someone set "no tunnel" after the run read "nothing chosen".
+            ingress_hostname_choices::ActiveModel {
+                hostname: Set("blog.example.com".into()),
+                connector_id: Set(None),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .expect("other choice");
+            let error = choose("blog.example.com", None)
+                .await
+                .expect_err("kept the other choice");
+            assert!(
+                error
+                    .to_string()
+                    .contains("blog.example.com's tunnel choice changed"),
+                "{error}"
+            );
+            assert_eq!(choice("blog.example.com").await, Some(None));
+
+            // The run read "no tunnel" and confirmed replacing it: written.
+            choose("blog.example.com", Some(None))
+                .await
+                .expect("confirmed change");
+            assert_eq!(choice("blog.example.com").await, Some(Some(id)));
+
+            // The run read "no tunnel", but it was changed back meanwhile.
+            ingress_hostname_choices::Entity::update_many()
+                .col_expr(
+                    ingress_hostname_choices::Column::ConnectorId,
+                    Expr::value(Option::<i32>::None),
+                )
+                .filter(ingress_hostname_choices::Column::Hostname.eq("shop.example.com"))
+                .exec(db.as_ref())
+                .await
+                .expect("set off");
+            assert!(choose("shop.example.com", Some(Some(id + 1000)))
+                .await
+                .is_err());
+            assert_eq!(choice("shop.example.com").await, Some(None));
+            drop(test_db);
+        }
+
         /// A connector marked `deleting` is not served to nodes and its name
         /// is checked, so a stale undo cannot remove a different tunnel.
         #[tokio::test]
@@ -3013,6 +3881,910 @@ mod tests {
             assert_eq!(calls.delete.load(Ordering::SeqCst), 0);
             drop(test_db);
         }
+
+        async fn insert_node(db: &DatabaseConnection, name: &str, role: &str, status: &str) -> i32 {
+            db.execute_unprepared(&format!(
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, labels, capacity) \
+                 VALUES ('{name}', 'hash-{name}', '192.0.2.10', '10.0.0.10', '{role}', '{status}', '{{}}', '{{}}')"
+            ))
+            .await
+            .expect("node");
+            nodes::Entity::find()
+                .filter(nodes::Column::Name.eq(name))
+                .one(db)
+                .await
+                .expect("query")
+                .expect("inserted")
+                .id
+        }
+
+        fn placed(view: &ConnectorView) -> Vec<(i32, String)> {
+            view.nodes
+                .iter()
+                .map(|n| (n.node_id, n.node_name.clone()))
+                .collect()
+        }
+
+        /// ADR-107 D1 end to end on the schema: node 0 is stored, shown as
+        /// the control plane, and a mixed placement keeps the worker.
+        #[tokio::test]
+        async fn the_control_plane_can_be_placed_alone_or_with_a_worker() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+
+            service
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("node 0");
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            assert_eq!(
+                placed(&service.get(id).await.expect("view")),
+                vec![(CONTROL_PLANE_NODE_ID, CONTROL_PLANE_NODE_NAME.to_string())]
+            );
+
+            service
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed");
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed placement");
+            assert_eq!(
+                placed(&service.get(id).await.expect("view")),
+                vec![
+                    (CONTROL_PLANE_NODE_ID, CONTROL_PLANE_NODE_NAME.to_string()),
+                    (worker, "worker-a".to_string())
+                ]
+            );
+            let plan = service.plan().await.expect("plan");
+            assert_eq!(
+                plan.connector(id).expect("planned").placement,
+                Placement {
+                    control_plane: true,
+                    workers: true
+                }
+            );
+
+            // Removing the worker keeps the control-plane replica.
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("back to the control plane");
+            assert_eq!(service.get(id).await.expect("view").nodes.len(), 1);
+            drop(test_db);
+        }
+
+        /// ADR-107 D4: a sleeping on-demand app has no route, but the
+        /// control-plane proxy wakes it on a visit, so a tunnel there keeps
+        /// publishing it rather than deleting its record until it wakes.
+        #[tokio::test]
+        async fn a_control_plane_tunnel_keeps_publishing_a_sleeping_app() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            service
+                .peer_table
+                .insert_sleeping_host_for_test("sleeping-app.example.com");
+
+            let plan = service.plan().await.expect("plan");
+            assert!(plan
+                .served_by_control_plane
+                .contains("sleeping-app.example.com"));
+            let placement = plan.connector(id).expect("planned").placement;
+            assert!(plan.carries(placement, "sleeping-app.example.com"));
+            // A worker replica would answer it with a 404: still not carried
+            // by a mixed placement.
+            assert!(!plan.carries(
+                Placement {
+                    control_plane: true,
+                    workers: true
+                },
+                "sleeping-app.example.com"
+            ));
+            drop(test_db);
+        }
+
+        /// ADR-107 D4: a published status page's custom hostname is served
+        /// by the control-plane proxy only, so a tunnel there can carry it.
+        #[tokio::test]
+        async fn a_control_plane_tunnel_can_carry_a_status_page_hostname() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            service
+                .peer_table
+                .insert_status_page_host_for_test("status.example.com", Some("my-page"));
+
+            let plan = service.plan().await.expect("plan");
+            let placement = plan.connector(id).expect("planned").placement;
+            assert!(plan.carries(placement, "status.example.com"));
+            drop(test_db);
+        }
+
+        /// ADR-107 D3: a worker agent on the same machine holds the default
+        /// tunnel origin port, so the control plane's proxy listens on a
+        /// later one. A tunnel placed only on the control plane moves there:
+        /// the provider is told first, then the row and node 0's spec follow.
+        #[tokio::test]
+        async fn a_control_plane_tunnel_moves_to_the_port_the_proxy_listens_on() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned");
+            assert_eq!(calls.ensured_port.load(Ordering::SeqCst), 7481);
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 7481);
+            assert_eq!(row.status, "ready");
+            let specs = service
+                .node_specs(CONTROL_PLANE_NODE_ID)
+                .await
+                .expect("specs");
+            assert_eq!(specs.connectors[0].edge_port, 7481);
+
+            // Already there: no further provider call.
+            let ensured = calls.ensure.load(Ordering::SeqCst);
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned again");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), ensured);
+            drop(test_db);
+        }
+
+        /// A sync that read the old port while a move to the control plane's
+        /// port is at the provider must not leave the provider on one port
+        /// and the row on another: it waits for the move, then configures
+        /// and saves the moved port.
+        #[tokio::test]
+        async fn a_sync_overlapping_a_port_move_never_splits_provider_and_row() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            // The move configures 7481, then stalls before saving.
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the move reached the provider");
+
+            // An operator's sync starts from the row, still on 8443.
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            calls.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), mover)
+                .await
+                .expect("move finished")
+                .expect("join")
+                .expect("moved");
+            tokio::time::timeout(Duration::from_secs(10), syncer)
+                .await
+                .expect("sync finished")
+                .expect("join")
+                .expect("synced");
+
+            let row = service.find(id).await.expect("row");
+            assert_eq!(
+                i32::from(calls.ensured_port.load(Ordering::SeqCst)),
+                row.edge_port,
+                "the provider was last configured for one port and the row saved another"
+            );
+            assert_eq!(row.edge_port, 7481);
+            drop(test_db);
+        }
+
+        /// The other order: a sync is at the provider when the move starts.
+        /// The move waits for it, then configures and saves the new port, so
+        /// the sync's call can never land after the move's.
+        #[tokio::test]
+        async fn a_port_move_waits_for_a_sync_at_the_provider() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            // The sync configures 8443, then stalls before saving.
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the sync reached the provider");
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            assert!(!mover.is_finished(), "the move must wait for the sync");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 1);
+
+            calls.release.notify_one();
+            for task in [syncer, mover] {
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("finished")
+                    .expect("join")
+                    .expect("ok");
+            }
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 7481);
+            assert_eq!(
+                i32::from(calls.ensured_port.load(Ordering::SeqCst)),
+                row.edge_port
+            );
+            drop(test_db);
+        }
+
+        /// A worker added while the move waited for the tunnel wins: the
+        /// move re-checks the placement right before calling the provider
+        /// and leaves the port alone.
+        #[tokio::test]
+        async fn a_port_move_is_dropped_when_the_tunnel_gains_a_worker_meanwhile() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            // A sync holds the tunnel. The move picks the tunnel while it
+            // still runs only on the control plane, and waits; a worker is
+            // added meanwhile, which the move sees once it runs.
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the sync reached the provider");
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(!mover.is_finished(), "the move waits for the sync");
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("placed on a worker too");
+
+            calls.release.notify_one();
+            for task in [syncer, mover] {
+                tokio::time::timeout(Duration::from_secs(10), task)
+                    .await
+                    .expect("finished")
+                    .expect("join")
+                    .expect("ok");
+            }
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 1, "only the sync");
+            drop(test_db);
+        }
+
+        /// A placement change never waits for the provider: a worker added
+        /// while a move is at the provider is placed at once, and the moved
+        /// port saved is the one the provider has, which the worker binds.
+        #[tokio::test]
+        async fn a_placement_change_never_waits_for_a_port_move_at_the_provider() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let mover = {
+                let service = service.clone();
+                tokio::spawn(async move { service.align_control_plane_edge_ports(7481).await })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the move reached the provider");
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                service.replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker]),
+            )
+            .await
+            .expect("the placement change does not wait for the provider")
+            .expect("placed on a worker too");
+
+            calls.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), mover)
+                .await
+                .expect("finished")
+                .expect("join")
+                .expect("moved");
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 7481);
+            assert_eq!(
+                i32::from(calls.ensured_port.load(Ordering::SeqCst)),
+                row.edge_port
+            );
+            let specs = service.node_specs(worker).await.expect("worker specs");
+            assert_eq!(specs.connectors[0].edge_port, 7481);
+            drop(test_db);
+        }
+
+        /// Two placement edits of one tunnel never mix: the tunnel ends on
+        /// exactly one of the requested lists, and neither request fails on
+        /// the one-row-per-node constraint.
+        #[tokio::test]
+        async fn concurrent_placement_edits_leave_one_requested_list() {
+            let Some((test_db, service, _calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let a = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            let b = insert_node(db.as_ref(), "worker-b", "worker", "active").await;
+            async fn placed(service: &IngressConnectorService, id: i32) -> Vec<i32> {
+                let mut nodes: Vec<i32> = ingress_connector_nodes::Entity::find()
+                    .filter(ingress_connector_nodes::Column::ConnectorId.eq(id))
+                    .all(service.db.as_ref())
+                    .await
+                    .expect("rows")
+                    .into_iter()
+                    .map(|row| row.node_id)
+                    .collect();
+                nodes.sort_unstable();
+                nodes
+            }
+            let with_a = vec![CONTROL_PLANE_NODE_ID, a];
+            let with_b = vec![CONTROL_PLANE_NODE_ID, b];
+            for round in 0..10 {
+                service
+                    .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                    .await
+                    .expect("reset");
+                // Both add a worker; on odd rounds they add the same one.
+                let second = if round % 2 == 0 {
+                    with_b.clone()
+                } else {
+                    with_a.clone()
+                };
+                let (first_done, second_done) = tokio::join!(
+                    service.replace_nodes(id, &with_a),
+                    service.replace_nodes(id, &second),
+                );
+                first_done.expect("first edit");
+                second_done.expect("second edit, never a unique-constraint error");
+                let nodes = placed(&service, id).await;
+                assert!(
+                    nodes == with_a || nodes == second,
+                    "round {round}: placement mixed two requests: {nodes:?}"
+                );
+            }
+            drop(test_db);
+        }
+
+        /// No pooled connection is held while the provider is called: with a
+        /// one-connection pool, the row stays readable during the call, and
+        /// the provider's own lookups are not starved.
+        #[tokio::test]
+        async fn no_pooled_connection_is_held_while_the_provider_is_called() {
+            let Some((test_db, _service, calls, id)) = setup_with(None).await else {
+                return;
+            };
+            let mut options = sea_orm::ConnectOptions::new(test_db.database_url.clone());
+            options
+                .max_connections(1)
+                .min_connections(1)
+                .acquire_timeout(Duration::from_secs(3));
+            let small = Arc::new(sea_orm::Database::connect(options).await.expect("pool"));
+            let encryption =
+                Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"));
+            let providers = Arc::new(DnsProviderService::new(small.clone(), encryption.clone()));
+            let mut service = IngressConnectorService::new(
+                small.clone(),
+                encryption.clone(),
+                providers.clone(),
+                Arc::new(ManagedDnsRecordService::new(
+                    small.clone(),
+                    providers,
+                    encryption,
+                )),
+                Arc::new(CachedPeerTable::new(small.clone())),
+            );
+            service.registry = ProviderRegistry::of(vec![Arc::new(FakeFactory(calls.clone()))]);
+            let service = Arc::new(service);
+
+            calls.hold_next.store(true, Ordering::SeqCst);
+            let syncer = {
+                let service = service.clone();
+                tokio::spawn(async move { service.sync(id).await.map(|_| ()) })
+            };
+            tokio::time::timeout(Duration::from_secs(10), calls.held.notified())
+                .await
+                .expect("the sync reached the provider");
+            tokio::time::timeout(Duration::from_secs(5), service.find(id))
+                .await
+                .expect("the only connection is free during the provider call")
+                .expect("row");
+
+            calls.release.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), syncer)
+                .await
+                .expect("sync finished")
+                .expect("join")
+                .expect("synced");
+            drop(test_db);
+        }
+
+        /// A tunnel also placed on workers keeps its port: every worker
+        /// binds that port itself, and the control plane's replica says why
+        /// it cannot run instead.
+        #[tokio::test]
+        async fn a_tunnel_also_on_workers_keeps_its_port() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let worker = insert_node(db.as_ref(), "worker-a", "worker", "active").await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed placement");
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), 0);
+            assert_eq!(service.find(id).await.expect("row").edge_port, 8443);
+            drop(test_db);
+        }
+
+        /// The port changes only once the provider has it: a failed call
+        /// leaves the tunnel on its old port with the error shown, and the
+        /// next passes do not call the provider again for it.
+        #[tokio::test]
+        async fn a_failed_move_keeps_the_old_port_and_is_not_retried_every_pass() {
+            let Some((test_db, service, calls, id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed on the control plane");
+            calls.fail_ensure.store(true, Ordering::SeqCst);
+
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("a provider failure is the connector's, not the pass's");
+            let row = service.find(id).await.expect("row");
+            assert_eq!(row.edge_port, 8443);
+            assert_eq!(row.status, "error");
+            assert_eq!(row.last_error.as_deref(), Some("provider unavailable"));
+
+            let ensured = calls.ensure.load(Ordering::SeqCst);
+            service
+                .align_control_plane_edge_ports(7481)
+                .await
+                .expect("aligned again");
+            assert_eq!(calls.ensure.load(Ordering::SeqCst), ensured);
+            drop(test_db);
+        }
+
+        /// A new tunnel placed only on the control plane starts on the
+        /// control plane's port; any placement with a worker on the default.
+        #[tokio::test]
+        async fn a_new_tunnel_takes_the_control_planes_port_only_when_it_runs_only_there() {
+            let Some((test_db, service, _calls, _id)) = setup_with(Some(7481)).await else {
+                return;
+            };
+            assert_eq!(service.edge_port_for(&[CONTROL_PLANE_NODE_ID]), 7481);
+            assert_eq!(
+                service.edge_port_for(&[CONTROL_PLANE_NODE_ID, 4]),
+                DEFAULT_EDGE_PORT
+            );
+            assert_eq!(service.edge_port_for(&[4]), DEFAULT_EDGE_PORT);
+            assert_eq!(service.edge_port_for(&[]), DEFAULT_EDGE_PORT);
+            drop(test_db);
+        }
+
+        #[tokio::test]
+        async fn placements_name_the_node_that_cannot_run_a_connector() {
+            let Some((test_db, service, _calls, _id)) = setup().await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let builder = insert_node(db.as_ref(), "builder-a", "builder", "active").await;
+            let offline = insert_node(db.as_ref(), "worker-b", "worker", "offline").await;
+            let missing = builder + offline + 1000;
+
+            let error = service
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID, missing])
+                .await
+                .expect_err("unknown");
+            assert_eq!(
+                error.to_string(),
+                format!("Node {missing} does not exist (use 0 for the control plane).")
+            );
+            assert!(matches!(
+                service.validate_nodes(&[builder]).await,
+                Err(IngressError::NotAWorker { node_id, .. }) if node_id == builder
+            ));
+            assert!(matches!(
+                service.validate_nodes(&[CONTROL_PLANE_NODE_ID, offline]).await,
+                Err(IngressError::InactiveWorker { node_id, .. }) if node_id == offline
+            ));
+            drop(test_db);
+        }
+
+        /// The control plane's connector loop reads node 0's specs and writes
+        /// its status to the same row the console reads (ADR-107 D2).
+        #[tokio::test]
+        async fn node_zero_gets_specs_and_reports_status_like_a_worker() {
+            let Some((test_db, service, _calls, id)) = setup().await else {
+                return;
+            };
+            assert!(service
+                .node_specs(CONTROL_PLANE_NODE_ID)
+                .await
+                .expect("specs")
+                .connectors
+                .is_empty());
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed");
+            assert!(service
+                .node_has_connectors(CONTROL_PLANE_NODE_ID)
+                .await
+                .expect("has"));
+            let specs = service
+                .node_specs(CONTROL_PLANE_NODE_ID)
+                .await
+                .expect("specs");
+            assert_eq!(specs.connectors.len(), 1);
+            assert_eq!(specs.connectors[0].id, id);
+            assert_eq!(specs.connectors[0].edge_port, 8443);
+            // The secret holder list includes the control plane, so moving
+            // the tunnel off it later rotates the secret.
+            assert!(
+                token_holders(&service.find(id).await.expect("row").settings)
+                    .is_some_and(|h| h.contains(&CONTROL_PLANE_NODE_ID))
+            );
+
+            service
+                .record_status(
+                    CONTROL_PLANE_NODE_ID,
+                    NodeConnectorStatusReport {
+                        reports: vec![crate::wire::ConnectorStatus {
+                            connector_id: id,
+                            driver: Some("process".into()),
+                            state: "ready".into(),
+                            ready_connections: Some(4),
+                            connector_ref: Some("connector-ref-1".into()),
+                            last_error: None,
+                            restarts: 0,
+                        }],
+                    },
+                )
+                .await
+                .expect("status");
+            let view = service.get(id).await.expect("view");
+            assert_eq!(view.nodes.len(), 1);
+            assert_eq!(view.nodes[0].node_id, CONTROL_PLANE_NODE_ID);
+            assert_eq!(view.nodes[0].state, "ready");
+            assert_eq!(view.nodes[0].driver.as_deref(), Some("process"));
+            drop(test_db);
+        }
+
+        /// A console without its proxy in the same process (`--role
+        /// console`) has nothing to carry a control-plane tunnel: node 0 is
+        /// refused with why, and workers are still accepted.
+        #[tokio::test]
+        async fn node_zero_is_refused_where_the_control_plane_cannot_run_it() {
+            let Some((test_db, service, _calls, _id)) = setup_with(None).await else {
+                return;
+            };
+            let error = service
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect_err("no control-plane runtime");
+            assert!(matches!(
+                error,
+                IngressError::ControlPlaneUnavailable(
+                    ControlPlaneTunnelsUnavailable::SeparateProxy
+                )
+            ));
+            assert!(error.to_string().contains("--role console"), "{error}");
+            assert_eq!(
+                temps_core::problemdetails::Problem::from(error).status_code,
+                axum::http::StatusCode::CONFLICT
+            );
+            let worker = insert_node(
+                test_db.connection_arc().as_ref(),
+                "worker-a",
+                "worker",
+                "active",
+            )
+            .await;
+            service.validate_nodes(&[worker]).await.expect("a worker");
+            drop(test_db);
+        }
+
+        #[derive(Default)]
+        struct FakeRuntime {
+            applied: std::sync::Mutex<Vec<Vec<i32>>>,
+        }
+
+        #[async_trait::async_trait]
+        impl crate::control_plane::LocalConnectorRuntime for FakeRuntime {
+            async fn apply(
+                &self,
+                specs: Vec<NodeConnectorSpec>,
+            ) -> Vec<crate::wire::ConnectorStatus> {
+                self.applied
+                    .lock()
+                    .expect("lock")
+                    .push(specs.iter().map(|s| s.id).collect());
+                Vec::new()
+            }
+            async fn statuses(&self) -> Vec<crate::wire::ConnectorStatus> {
+                self.applied
+                    .lock()
+                    .expect("lock")
+                    .last()
+                    .cloned()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|connector_id| crate::wire::ConnectorStatus {
+                        connector_id,
+                        driver: Some("process".into()),
+                        state: "ready".into(),
+                        ready_connections: Some(2),
+                        connector_ref: None,
+                        last_error: None,
+                        restarts: 0,
+                    })
+                    .collect()
+            }
+        }
+
+        /// ADR-107 D2: the control plane's loop hands node 0's specs to the
+        /// local runtime only once the proxy's origin is bound on the spec's
+        /// port, and reports the result in the row the console reads.
+        #[tokio::test]
+        async fn the_control_plane_loop_runs_node_zero_specs_and_reports_them() {
+            let Some((test_db, service, _calls, id)) = setup_with(None).await else {
+                return;
+            };
+            let origin = temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new();
+            let runtime = Arc::new(FakeRuntime::default());
+            let connectors = crate::control_plane::ControlPlaneConnectors::attach(
+                service.clone(),
+                runtime.clone(),
+                crate::control_plane::ControlPlaneHandle::for_origin(origin.clone()),
+            );
+            // The fixture's connector listens on 8443; bind the origin there.
+            origin.mark_bound(8443);
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed");
+
+            connectors.sync().await.expect("sync");
+            assert_eq!(*runtime.applied.lock().expect("lock"), vec![vec![id]]);
+            let view = service.get(id).await.expect("view");
+            assert_eq!(view.nodes[0].state, "ready");
+            assert_eq!(view.nodes[0].ready_connections, Some(2));
+
+            // The proxy took tunnel traffic on another port (a worker agent
+            // on this machine held the first): a tunnel only on the control
+            // plane moves there and keeps running.
+            origin.mark_bound(7480);
+            connectors.sync().await.expect("sync");
+            assert_eq!(
+                runtime.applied.lock().expect("lock").last(),
+                Some(&vec![id])
+            );
+            assert_eq!(service.find(id).await.expect("row").edge_port, 7480);
+
+            // One also placed on a worker keeps its port: the control plane's
+            // replica runs nothing, and its row says why.
+            let worker = insert_node(
+                test_db.connection_arc().as_ref(),
+                "worker-a",
+                "worker",
+                "active",
+            )
+            .await;
+            service
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID, worker])
+                .await
+                .expect("mixed placement");
+            origin.mark_bound(7481);
+            connectors.sync().await.expect("sync");
+            assert_eq!(
+                runtime.applied.lock().expect("lock").last(),
+                Some(&Vec::new())
+            );
+            let view = service.get(id).await.expect("view");
+            let control_plane = view
+                .nodes
+                .iter()
+                .find(|node| node.node_id == CONTROL_PLANE_NODE_ID)
+                .expect("node 0");
+            assert_eq!(control_plane.state, "down");
+            assert!(
+                control_plane
+                    .last_error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("port 7480") && e.contains("port 7481")),
+                "{:?}",
+                control_plane.last_error
+            );
+            drop(test_db);
+        }
+
+        /// The console's service and the one `temps serve` runs node 0's
+        /// connectors with record token holders on the same row: neither
+        /// may overwrite the other's (a lost holder is never revoked).
+        #[tokio::test]
+        async fn two_service_instances_never_lose_each_others_token_holders() {
+            let Some((test_db, first, _calls, id)) = setup_with(None).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let encryption =
+                Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"));
+            let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+            let second = Arc::new(IngressConnectorService::new(
+                db.clone(),
+                encryption.clone(),
+                providers.clone(),
+                Arc::new(ManagedDnsRecordService::new(
+                    db.clone(),
+                    providers,
+                    encryption,
+                )),
+                Arc::new(CachedPeerTable::new(db.clone())),
+            ));
+            let mut writes = tokio::task::JoinSet::new();
+            for node in 1..=24 {
+                let service = if node % 2 == 0 {
+                    first.clone()
+                } else {
+                    second.clone()
+                };
+                writes.spawn(async move {
+                    service
+                        .add_token_holders(id, &BTreeSet::from([node]))
+                        .await
+                        .expect("holder recorded");
+                });
+            }
+            while let Some(done) = writes.join_next().await {
+                done.expect("writer");
+            }
+            let row = first.find(id).await.expect("connector");
+            assert_eq!(
+                token_holders(&row.settings),
+                Some((1..=24).collect::<BTreeSet<i32>>())
+            );
+            drop(test_db);
+        }
+
+        /// `temps serve` runs node 0's connectors on its own service
+        /// instance, so a console that fails to start does not stop them;
+        /// the console's instance shares the handle, accepts node 0 and
+        /// wakes the loop when a placement changes, long before its poll.
+        #[tokio::test]
+        async fn the_consoles_service_wakes_the_loop_serve_runs() {
+            let Some((test_db, serve_side, _calls, id)) = setup_with(None).await else {
+                return;
+            };
+            let db = test_db.connection_arc();
+            let encryption =
+                Arc::new(EncryptionService::new("0123456789abcdef0123456789abcdef").expect("key"));
+            let providers = Arc::new(DnsProviderService::new(db.clone(), encryption.clone()));
+            let console = IngressConnectorService::new(
+                db.clone(),
+                encryption.clone(),
+                providers.clone(),
+                Arc::new(ManagedDnsRecordService::new(
+                    db.clone(),
+                    providers,
+                    encryption,
+                )),
+                Arc::new(CachedPeerTable::new(db.clone())),
+            );
+            assert!(console
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID])
+                .await
+                .is_err());
+
+            let origin = temps_core::tunnel_origin::ControlPlaneTunnelOrigin::new();
+            origin.mark_bound(8443);
+            let handle = crate::control_plane::ControlPlaneHandle::for_origin(origin);
+            let runtime = Arc::new(FakeRuntime::default());
+            let connectors = crate::control_plane::ControlPlaneConnectors::attach(
+                serve_side.clone(),
+                runtime.clone(),
+                handle.clone(),
+            );
+            let shutdown = Arc::new(tokio::sync::Notify::new());
+            let task = connectors.start(shutdown.clone());
+            console.attach_control_plane(handle);
+            console
+                .validate_nodes(&[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("node 0 once attached");
+
+            console
+                .replace_nodes(id, &[CONTROL_PLANE_NODE_ID])
+                .await
+                .expect("placed");
+            console.wake_control_plane();
+            let started = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if runtime
+                        .applied
+                        .lock()
+                        .expect("lock")
+                        .iter()
+                        .any(|ids| ids == &vec![id])
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await;
+            assert!(started.is_ok(), "the wake did not reach the loop");
+            shutdown.notify_one();
+            task.await.expect("loop ends");
+            drop(test_db);
+        }
     }
 
     #[test]
@@ -3020,5 +4792,95 @@ mod tests {
         assert_eq!(page_bounds(None, None), (1, 20));
         assert_eq!(page_bounds(Some(0), Some(0)), (1, 1));
         assert_eq!(page_bounds(Some(3), Some(500)), (3, 100));
+    }
+}
+
+#[cfg(test)]
+mod secret_answer_tests {
+    use super::*;
+    use crate::registry::{DnsHandling, SetupField};
+
+    fn info() -> ProviderInfo {
+        let field = |key: &str, kind: FieldKind| SetupField {
+            key: key.into(),
+            label: format!("Label of {key}"),
+            help: None,
+            kind,
+            required: true,
+            placeholder: None,
+        };
+        ProviderInfo {
+            kind: "fixture_tunnel".into(),
+            name: "Fixture tunnel".into(),
+            summary: String::new(),
+            requirements: Vec::new(),
+            needs_public_ip: false,
+            works_behind_cgnat: true,
+            dns: DnsHandling::ProviderHostname,
+            fields: vec![
+                field("client_id", FieldKind::Text),
+                field("client_secret", FieldKind::Secret),
+            ],
+            docs_url: None,
+        }
+    }
+
+    fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, serde_json::Value> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), serde_json::json!(v)))
+            .collect()
+    }
+
+    #[test]
+    fn a_sealed_answer_reaches_the_setup_as_the_real_value() {
+        let secrets: BTreeMap<String, SecretString> = [(
+            "client_secret".to_string(),
+            SecretString::new("fixture-value"),
+        )]
+        .into();
+        let merged = merge_secret_answers(&info(), &values(&[("client_id", "id")]), &secrets)
+            .expect("a credential field may be sealed");
+        assert_eq!(merged["client_secret"], "fixture-value");
+        assert_eq!(merged["client_id"], "id");
+    }
+
+    #[test]
+    fn sealed_answers_must_name_a_credential_field_once() {
+        let sealed = |key: &str| -> BTreeMap<String, SecretString> {
+            [(key.to_string(), SecretString::new("fixture-value"))].into()
+        };
+        let not_a_credential = merge_secret_answers(&info(), &values(&[]), &sealed("client_id"))
+            .expect_err("a text field is not a credential");
+        assert!(not_a_credential.to_string().contains("client_id"));
+        let unknown =
+            merge_secret_answers(&info(), &values(&[]), &sealed("nope")).expect_err("unknown key");
+        assert!(unknown.to_string().contains("nope"));
+        let twice = merge_secret_answers(
+            &info(),
+            &values(&[("client_secret", "plain")]),
+            &sealed("client_secret"),
+        )
+        .expect_err("given twice");
+        assert!(twice.to_string().contains("both"));
+        for error in [not_a_credential, unknown, twice] {
+            assert!(!error.to_string().contains("fixture-value"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_plain_credential_answer_is_refused_without_echoing_it() {
+        let error = reject_plain_secret_answers(
+            &info(),
+            &values(&[("client_id", "id"), ("client_secret", "typed-in-chat")]),
+        )
+        .expect_err("a credential in values is refused for the assistant");
+        let text = error.to_string();
+        assert!(
+            text.contains("client_secret") && text.contains("secrets"),
+            "{text}"
+        );
+        assert!(!text.contains("typed-in-chat"), "{text}");
+        assert!(reject_plain_secret_answers(&info(), &values(&[("client_id", "id")])).is_ok());
     }
 }

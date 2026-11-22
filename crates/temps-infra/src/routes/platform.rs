@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use axum::http::StatusCode;
 use axum::{extract::State, http::HeaderMap, response::IntoResponse, routing::get, Json, Router};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use tracing::{debug, info};
 use utoipa::OpenApi;
@@ -221,8 +221,9 @@ where
 
 /// Get information about how the service is being accessed
 ///
-/// Returns details about the server's access mode, public IP address, private IP address,
-/// and domain creation capabilities. Both IP addresses are always included when available.
+/// Returns how this request reached the server, and its public and private IP
+/// addresses when available. Which ways a domain can get HTTPS is per domain:
+/// `GET /ingress/certificate-methods?domain=`.
 #[utoipa::path(
     get,
     path = "/platform/access-info",
@@ -267,10 +268,10 @@ where
         access_mode: server_mode.to_string(),
         public_ip,
         private_ip,
-        can_create_domains: server_mode.can_create_domains(),
-        domain_creation_error: server_mode
-            .domain_creation_error_message()
-            .map(|s| s.to_string()),
+        // A tunnel or proxy in front of this request's hostname blocks no
+        // other domain (ADR 058 D10): the methods are judged per domain.
+        can_create_domains: true,
+        domain_creation_error: None,
     }))
 }
 
@@ -325,6 +326,137 @@ mod tests {
         ));
         let problem = Problem::from(err);
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // ------------------------------------------------------------------
+    // GET /platform/access-info
+    // ------------------------------------------------------------------
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use temps_authz::{AuthContext, Permission, Role};
+    use tower::ServiceExt;
+
+    struct TestState(PlatformInfoService);
+
+    impl InfraAppState for TestState {
+        fn platform_info_service(&self) -> &PlatformInfoService {
+            &self.0
+        }
+    }
+
+    fn user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 5,
+            name: "Operator".into(),
+            email: "operator@example.test".into(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// `GET /platform/access-info` on `host`, with `headers`, as `auth`.
+    async fn access_info(
+        host: &str,
+        headers: &[(&str, &str)],
+        auth: Option<AuthContext>,
+    ) -> (StatusCode, serde_json::Value) {
+        let service = PlatformInfoService::without_docker();
+        // Documentation addresses: no lookup leaves the test.
+        service.seed_network_cache("203.0.113.7", "10.0.0.7");
+        let app = configure_platform_routes::<TestState>().with_state(Arc::new(TestState(service)));
+        let mut request = Request::builder()
+            .uri("/platform/access-info")
+            .header("host", host);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let mut request = request.body(Body::empty()).expect("request");
+        if let Some(auth) = auth {
+            request.extensions_mut().insert(auth);
+        }
+        let response = app.oneshot(request).await.expect("response");
+        let status = response.status();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        (
+            status,
+            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+        )
+    }
+
+    fn admin() -> Option<AuthContext> {
+        Some(AuthContext::new_session(user(), Role::Admin))
+    }
+
+    #[tokio::test]
+    async fn access_info_refuses_anonymous_callers() {
+        let (status, _) = access_info("console.example.com", &[], None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn access_info_refuses_a_key_without_platform_read() {
+        let key = AuthContext::new_api_key(
+            user(),
+            None,
+            Some(vec![Permission::ProjectsRead]),
+            "projects-only".into(),
+            8,
+        );
+        let (status, _) = access_info("console.example.com", &[], Some(key)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// The reported bug: a console opened through a Cloudflare Tunnel said
+    /// no domain could be added. The tunnel covers its own hostnames only.
+    #[tokio::test]
+    async fn a_request_through_cloudflare_still_allows_adding_domains() {
+        let (status, body) = access_info(
+            "console.example.com",
+            &[("cf-ray", "0000000000000000-AAA")],
+            admin(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["access_mode"], "cloudflare_tunnel");
+        assert_eq!(body["can_create_domains"], true);
+        assert!(body["domain_creation_error"].is_null());
+        // The server's own address is still reported, for direct domains.
+        assert_eq!(body["public_ip"], "203.0.113.7");
+    }
+
+    #[tokio::test]
+    async fn a_local_request_still_allows_adding_domains() {
+        let (status, body) = access_info("127.0.0.1:8081", &[], admin()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["access_mode"], "local");
+        assert_eq!(body["can_create_domains"], true);
+        assert!(body["domain_creation_error"].is_null());
+    }
+
+    #[tokio::test]
+    async fn a_direct_request_reports_nat_from_the_cached_addresses() {
+        let (status, body) = access_info("console.example.com", &[], admin()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["access_mode"], "nat");
+        assert_eq!(body["private_ip"], "10.0.0.7");
+        assert_eq!(body["can_create_domains"], true);
     }
 
     #[test]

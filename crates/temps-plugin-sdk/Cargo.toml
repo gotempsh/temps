@@ -3,8 +3,9 @@
 
 [package]
 name = "temps-plugin-sdk"
-version.workspace = true
+version = "0.1.0-beta.62"
 edition.workspace = true
+repository.workspace = true
 license.workspace = true
 description = "SDK for building external Temps plugins as standalone binaries"
 
@@ -30,10 +31,9 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Unix socket support
-hyper = { version = "1", features = ["full"] }
-hyper-util = { version = "0.1", features = ["tokio", "http1", "http2"] }
-tower = { version = "0.5", features = ["util"] }
-tokio-stream = { version = "0.1", features = ["net"] }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["default", "http1", "http2"] }
+tower = { workspace = true }
 
 # WebSocket support for the platform channel
 tokio-tungstenite = "0.30"
@@ -42,16 +42,14 @@ futures = { workspace = true }
 # OpenAPI
 utoipa = { workspace = true }
 
-# Shared types from temps
-temps-core = { path = "../temps-core" }
+# Constant-time comparison of the platform's proxy secret.
+subtle = { workspace = true }
 
-# Tar extraction for UI bundles
-flate2 = "1"
-tar = "0.4.45"
-
-# UUID for request IDs
-uuid = { workspace = true }
-subtle = "2.6"
+# Wire protocol shared with the platform
+temps-plugin-protocol = { path = "../temps-plugin-protocol", version = "=0.1.0-beta.62" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

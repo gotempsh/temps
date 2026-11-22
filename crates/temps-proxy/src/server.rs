@@ -30,7 +30,7 @@ use temps_config::ServerConfig;
 use temps_core::plugin::{ServiceRegistrationContext, TempsPlugin};
 use temps_database::DbConnection;
 use temps_routes::CachedPeerTable;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use async_trait::async_trait;
 use std::future::Future;
@@ -73,13 +73,14 @@ fn apply_forwarded_ip_trust_refresh(
 /// ignored and loopback is used as the client IP for IP-based controls.
 async fn load_initial_forwarded_ip_trust(
     config_service: &temps_config::ConfigService,
-) -> Result<(bool, Option<Arc<HeaderName>>)> {
+) -> Result<(bool, Option<Arc<HeaderName>>, bool)> {
     let settings = config_service.get_settings().await.map_err(|error| {
         anyhow::anyhow!("Cannot start proxy: failed to load forwarded-IP trust setting: {error}")
     })?;
     Ok((
         settings.trust_loopback_forwarded_ip(),
         loopback_ja4_header(&settings),
+        settings.expose_platform_identity(),
     ))
 }
 
@@ -88,6 +89,7 @@ async fn load_initial_forwarded_ip_trust(
 #[derive(Debug)]
 struct LoopbackTrust {
     forwarded_ip: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header such a peer sends the visitor's JA4 in (ADR 066, D4).
     ja4_header: Arc<ArcSwapOption<HeaderName>>,
 }
@@ -96,9 +98,9 @@ struct LoopbackTrust {
 /// can be written by other means; a name the rule refuses is ignored rather
 /// than trusted, so the proxy never strips a header such as `Authorization`
 /// from every request.
-fn loopback_ja4_header(settings: &temps_core::AppSettings) -> Option<Arc<HeaderName>> {
+fn loopback_ja4_header(settings: &temps_config::AppSettings) -> Option<Arc<HeaderName>> {
     let stored = settings.loopback_ja4_header.as_deref()?;
-    let name = match temps_core::normalize_loopback_ja4_header(Some(stored)) {
+    let name = match temps_config::normalize_loopback_ja4_header(Some(stored)) {
         Ok(name) => name?,
         Err(error) => {
             tracing::warn!(%error, "Ignoring the stored loopback JA4 header");
@@ -130,7 +132,7 @@ fn start_forwarded_ip_trust_refresh(
     // (the outer runtime is only driving synchronous setup at this point), but this
     // adds to the same "runtime nesting" issue `integration_test.rs` is `#[ignore]`d
     // for — worth knowing before attempting to un-ignore those tests.
-    let (initial, initial_ja4_header) =
+    let (initial, initial_ja4_header, initial_identity) =
         runtime.block_on(load_initial_forwarded_ip_trust(&config_service))?;
     info!(
         enabled = initial,
@@ -138,9 +140,11 @@ fn start_forwarded_ip_trust_refresh(
         "Loaded loopback forwarded-IP trust before proxy startup"
     );
     let trust = LoopbackTrust {
+        expose_platform_identity: Arc::new(AtomicBool::new(initial_identity)),
         forwarded_ip: Arc::new(AtomicBool::new(initial)),
         ja4_header: Arc::new(ArcSwapOption::new(initial_ja4_header)),
     };
+    let identity = Arc::downgrade(&trust.expose_platform_identity);
     let snapshot = Arc::downgrade(&trust.forwarded_ip);
     let ja4_header = Arc::downgrade(&trust.ja4_header);
     runtime.spawn(async move {
@@ -159,6 +163,9 @@ fn start_forwarded_ip_trust_refresh(
                 info!(enabled, "Updated loopback forwarded-IP trust from platform settings");
             }
             if let Some(settings) = &settings {
+                if let Some(identity) = identity.upgrade() {
+                    identity.store(settings.expose_platform_identity(), Ordering::Relaxed);
+                }
                 let header = loopback_ja4_header(settings);
                 let name = header.as_deref().map(HeaderName::as_str).map(str::to_owned);
                 if apply_loopback_ja4_header_refresh(&ja4_header, header) {
@@ -371,7 +378,7 @@ async fn setup_proxy_plugins(
     context.register_service(db.clone());
 
     // Register ConfigPlugin for configuration services
-    let config_plugin = Box::new(temps_config::ConfigPlugin::new(config.clone()));
+    let config_plugin = Box::new(temps_config_handlers::ConfigPlugin::new(config.clone()));
     config_plugin
         .register_services(&context)
         .await
@@ -488,6 +495,50 @@ fn shared_runtime(
     }
 }
 
+/// Run startup work that may use the shared pool on a runtime that lasts as
+/// long as the process.
+///
+/// A connection stays registered with the runtime that opened it, and goes back
+/// into the pool when released. Had this work run on a temporary runtime, a
+/// connection it opened would outlive that runtime, and the next acquire to pick
+/// it would hang on its health check until the acquire timeout. Whether that
+/// happens depends on whether the console has left an idle connection at that
+/// moment, so it shows up as an occasional failed startup.
+///
+/// Anything the work spawns also keeps running, such as the `settings_change`
+/// listener `ConfigPlugin` starts, which stops when its `ConfigService` is dropped.
+fn block_on_refresh_runtime<F: Future>(future: F) -> Result<F::Output> {
+    Ok(refresh_runtime()?.block_on(future))
+}
+
+/// Loads every project's edge rules (ADR-089) and starts the loops that keep
+/// them current and record their match counts. The initial load must
+/// succeed: serving a project without the rules its operator saved would
+/// silently drop its protections.
+fn start_edge_rules(
+    db: Arc<DbConnection>,
+) -> Result<(
+    Arc<crate::edge_rules::EdgeRuleGate>,
+    Option<Arc<temps_geo::GeoIpService>>,
+)> {
+    let gate = crate::edge_rules::EdgeRuleGate::start_blocking(db, &security_refresh_runtime()?)
+        .map_err(|e| anyhow::anyhow!("Failed to load project edge rules at startup: {e}"))?;
+    // The same process-wide database the request log's enrichment uses; a
+    // missing one only means geography conditions never match.
+    let geo = match temps_geo::GeoIpService::new() {
+        Ok(geo) => Some(Arc::new(geo)),
+        Err(e) => {
+            warn!(
+                error = %e,
+                "No GeoIP database for edge rules; country, continent, ASN and hosting \
+                 network conditions will not match"
+            );
+            None
+        }
+    };
+    Ok((gate, geo))
+}
+
 /// Setup and configure the proxy server with all services
 #[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
@@ -533,21 +584,7 @@ pub fn setup_proxy_server(
     preflight_check_listen_addresses(&proxy_config)?;
 
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and otherwise does sync work, so a worker
-    // thread per core would be stood up and torn down purely to drive that.
-    //
-    // Registration is not entirely free of spawns: `ConfigPlugin` starts the
-    // `settings_change` LISTEN/NOTIFY task with `tokio::spawn`. That task does
-    // not survive this runtime being dropped at the end of the statement, and
-    // did not survive the previous multi-threaded one either -- the settings
-    // cache falls back to its 5s TTL, which is the documented non-fatal
-    // behaviour. This is pre-existing and unchanged here; it is called out so
-    // the lifetime is not mistaken for something this runtime guarantees.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -560,6 +597,7 @@ pub fn setup_proxy_server(
     // LbService and never reach this object directly. Route changes become
     // visible to real traffic within at most 60 seconds via that loop.
     refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
+    refresh_runtime()?.spawn(route_table.clone().run_active_probes());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
@@ -599,12 +637,18 @@ pub fn setup_proxy_server(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -630,6 +674,7 @@ pub fn setup_proxy_server(
     // and the event store, written in batches off the request path.
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -703,14 +748,17 @@ pub fn setup_proxy_server(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics.clone())
     .with_request_policy_gate(request_policy_gate)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?)
+    .with_tunnel_origin(proxy_config.tunnel_origin.clone())
     // Signed-in addresses (ADR 065 D8). The proxy redeems sign-in codes in
     // process, so it needs the database and the gate key's sealing key; in
     // split topology both are available here as they are to the console.
@@ -778,11 +826,16 @@ pub fn setup_proxy_server(
         } else {
             temps_metrics::NodeMetricsScope::Process
         };
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to create tokio runtime for proxy metrics sampler: {}",
+                    e
+                )
+            })?;
         std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for proxy metrics sampler");
             rt.block_on(async move {
                 let store = crate::service::metrics_sampler::build_metrics_store(
                     &sampler_config_service,
@@ -847,6 +900,19 @@ pub fn setup_proxy_server(
         .build();
 
     proxy_service.add_tcp(&proxy_config.address);
+    // ADR-107 D3: the control plane's tunnel origin. Pingora cannot add a
+    // listener once it runs, so it is bound now whether or not a tunnel runs
+    // here yet.
+    if let Some(origin) = proxy_config.tunnel_origin.as_deref() {
+        if let Some(address) = first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+            &proxy_config,
+            temps_core::tunnel_origin::tunnel_origin_candidates(),
+        )) {
+            proxy_service.add_tcp(&address.to_string());
+            origin.mark_bound(address.port());
+            info!(%address, "Tunnel origin listener configured for the control plane's tunnels");
+        }
+    }
     // Add TLS if configured
     if let Some(ref tls_address) = proxy_config.tls_address {
         debug!("Adding TLS service on {}", tls_address);
@@ -931,6 +997,70 @@ fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
         let _tls_listener = bind_or_report(tls_address, "TEMPS_TLS_ADDRESS")?;
     }
     Ok(())
+}
+
+/// `candidates` without the ports this process's own listeners use (HTTP,
+/// TLS, the console's): they are not bound yet when the tunnel origin is
+/// chosen, so probing would find them free. Compared by port alone, so a
+/// wildcard listener (`0.0.0.0:7481`) excludes its loopback form too.
+fn tunnel_origin_candidates_for(
+    proxy_config: &ProxyConfig,
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Vec<std::net::SocketAddr> {
+    let own: Vec<u16> = [
+        Some(proxy_config.address.as_str()),
+        proxy_config.tls_address.as_deref(),
+        Some(proxy_config.console_address.as_str()),
+        proxy_config.console_ingress_address.as_deref(),
+        proxy_config.internal_dns_sync_address.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|address| address.rsplit_once(':')?.1.parse().ok())
+    .collect();
+    candidates
+        .into_iter()
+        .filter(|candidate| !own.contains(&candidate.port()))
+        .collect()
+}
+
+/// The first of `candidates` the control plane's tunnel origin can listen
+/// on (ADR-107 D3). The first is the default `edge_port`, which a worker
+/// agent on the same machine holds for its own connectors; the control
+/// plane then takes the next free one. Unlike the main listeners, none being
+/// free is not fatal: the proxy serves without it, and a tunnel placed on
+/// the control plane reports why it cannot start.
+fn first_bindable_tunnel_origin(
+    candidates: impl IntoIterator<Item = std::net::SocketAddr>,
+) -> Option<std::net::SocketAddr> {
+    let mut tried = Vec::new();
+    for address in candidates {
+        match std::net::TcpListener::bind(address) {
+            Ok(_) => {
+                if !tried.is_empty() {
+                    tracing::warn!(
+                        %address,
+                        taken = ?tried,
+                        "the control plane's tunnel origin listens on a later port because the \
+                         first is taken (often by a worker agent on this machine); tunnels placed \
+                         only on the control plane follow it"
+                    );
+                }
+                return Some(address);
+            }
+            Err(error) => {
+                debug!(%address, %error, "tunnel origin port taken; trying the next one");
+                tried.push(address);
+            }
+        }
+    }
+    tracing::warn!(
+        taken = ?tried,
+        "the control plane's tunnel origin could not listen on any of its ports, so tunnels \
+         cannot run on the control plane until one is free and Temps restarts \
+         (`ss -ltnp` shows what holds them)"
+    );
+    None
 }
 
 /// Test-only convenience wrapper around `bind_or_report` for exercising a
@@ -1023,14 +1153,7 @@ pub fn create_proxy_service(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and does sync work, and it spawns nothing
-    // that outlives this call. `Runtime::new()` would stand up (and tear down)
-    // one worker thread per core purely to drive that.
-    let context = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
+    let context = block_on_refresh_runtime(setup_proxy_plugins(db.clone(), config.clone()))??;
 
     // Create service implementations
     let lb_service = Arc::new(LbService::new(db.clone()));
@@ -1038,6 +1161,7 @@ pub fn create_proxy_service(
     // Keep the custom-route snapshot in memory so `has_custom_route` and
     // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
     refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
+    refresh_runtime()?.spawn(route_table.clone().run_active_probes());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
@@ -1077,12 +1201,18 @@ pub fn create_proxy_service(
     let proxy_log_writer = proxy_log_writer.with_metrics(proxy_metrics.clone());
     let proxy_log_handle = proxy_log_handle.with_metrics(proxy_metrics.clone());
 
-    // Spawn the batch writer background task
+    // Spawn the batch writer background task. The runtime is built here so a
+    // failure stops startup with an error instead of panicking the thread.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create tokio runtime for proxy log batch writer: {}",
+                e
+            )
+        })?;
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("Failed to create tokio runtime for proxy log batch writer");
         rt.block_on(proxy_log_writer.run());
     });
 
@@ -1106,6 +1236,7 @@ pub fn create_proxy_service(
     ));
     let shield_lists = Arc::new(crate::shield::ShieldLists::default());
     shield_lists.spawn_loader(db.clone(), &security_refresh_runtime()?);
+    let (edge_rules, edge_geo) = start_edge_rules(db.clone())?;
     let shield_bypass = Arc::new(crate::shield::BypassTokens::default());
     shield_bypass.spawn(db.clone(), &security_refresh_runtime()?);
     let shield_events = spawn_shield_event_store(&config, db.clone(), &config_service)?;
@@ -1132,10 +1263,12 @@ pub fn create_proxy_service(
         cert_host_cache,
         disable_https_redirect,
     )
+    .with_expose_platform_identity(loopback_trust.expose_platform_identity)
     .with_trust_loopback_forwarded_ip(loopback_trust.forwarded_ip)
     .with_loopback_ja4_header(loopback_trust.ja4_header)
     .with_proxy_metrics(proxy_metrics)
     .with_shield_lists(shield_lists)
+    .with_edge_rules(edge_rules, edge_geo)
     .with_shield_bypass_tokens(shield_bypass)
     .with_shield_events(shield_events)
     .with_netwatch(spawn_netwatch()?);
@@ -1144,11 +1277,53 @@ pub fn create_proxy_service(
 }
 
 #[cfg(test)]
+mod plugin_setup_runtime_tests {
+    use super::*;
+
+    #[test]
+    fn a_connection_opened_during_setup_stays_usable_afterwards() {
+        let other_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let _context = other_runtime.enter();
+        let database = match other_runtime.block_on(temps_test_utils::TestDatabase::new()) {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping plugin setup runtime test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("plugin setup runtime test database failed: {error}"),
+        };
+        // One connection, so the acquire below must get the one setup opened.
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect_lazy(&database.database_url)
+            .unwrap();
+
+        let setup_pool = pool.clone();
+        block_on_refresh_runtime(async move {
+            drop(setup_pool.acquire().await.unwrap());
+            // Gives the connection time to go back into the pool.
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        })
+        .unwrap();
+
+        other_runtime
+            .block_on(pool.acquire())
+            .expect("a connection opened during setup must stay usable");
+    }
+}
+
+#[cfg(test)]
 mod preflight_bind_tests {
     use super::*;
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase};
-    use temps_core::AppSettings;
+    use temps_config::AppSettings;
     use temps_entities::settings;
 
     fn test_config() -> Arc<ServerConfig> {
@@ -1211,6 +1386,7 @@ mod preflight_bind_tests {
     fn initial_forwarded_ip_trust_loads_saved_admin_choice() {
         let settings = AppSettings {
             trust_loopback_forwarded_ip: Some(true),
+            expose_platform_identity: Some(true),
             ..AppSettings::default()
         };
         let row = settings::Model {
@@ -1230,6 +1406,7 @@ mod preflight_bind_tests {
         let trust = start_forwarded_ip_trust_refresh(service)
             .expect("saved admin opt-in must apply at startup");
         assert!(trust.forwarded_ip.load(Ordering::Relaxed));
+        assert!(trust.expose_platform_identity.load(Ordering::Relaxed));
         assert!(
             trust.ja4_header.load().is_none(),
             "no JA4 header configured"
@@ -1439,6 +1616,67 @@ mod preflight_bind_tests {
             "error should name the env var to reconfigure: {message}"
         );
 
+        drop(held);
+    }
+
+    /// ADR-107 D3: a taken tunnel origin port (a worker agent on the same
+    /// machine holds the default) moves the origin to the next free one;
+    /// none free does not stop the proxy, the origin stays unbound.
+    #[test]
+    fn a_taken_tunnel_origin_port_moves_to_the_next_free_one() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let free = {
+            let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            probe.local_addr().unwrap()
+        };
+        assert_eq!(first_bindable_tunnel_origin([taken, free]), Some(free));
+        assert_eq!(first_bindable_tunnel_origin([taken]), None);
+        drop(held);
+        assert_eq!(first_bindable_tunnel_origin([taken, free]), Some(taken));
+    }
+
+    /// ADR-107 D3: the fallback never takes a port the proxy's own HTTP or
+    /// TLS listener (or the console's) is configured on, wildcard included:
+    /// they are bound after the choice, so the probe would find them free.
+    #[test]
+    fn the_tunnel_origin_never_takes_the_proxys_own_listener_ports() {
+        let candidates: Vec<std::net::SocketAddr> = (7480..=7485)
+            .map(|port| std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+            .collect();
+        let proxy_config = ProxyConfig {
+            address: "0.0.0.0:7481".to_string(),
+            tls_address: Some("127.0.0.1:7482".to_string()),
+            console_address: "[::]:7483".to_string(),
+            ..Default::default()
+        };
+        let ports: Vec<u16> = tunnel_origin_candidates_for(&proxy_config, candidates)
+            .iter()
+            .map(|address| address.port())
+            .collect();
+        assert_eq!(ports, vec![7480, 7484, 7485]);
+
+        // The case reported: a worker agent holds the first port and the TLS
+        // listener is configured on the next, still unbound. The origin skips
+        // both.
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let taken = held.local_addr().unwrap();
+        let (tls, next) = {
+            let first = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let second = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            (first.local_addr().unwrap(), second.local_addr().unwrap())
+        };
+        let proxy_config = ProxyConfig {
+            tls_address: Some(tls.to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            first_bindable_tunnel_origin(tunnel_origin_candidates_for(
+                &proxy_config,
+                [taken, tls, next]
+            )),
+            Some(next)
+        );
         drop(held);
     }
 

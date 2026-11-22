@@ -6,11 +6,14 @@
 
 pub mod agent_run_bridge;
 pub mod create_policy;
+pub mod creation_progress;
 pub mod exec;
 pub mod expiration_sweeper;
 pub mod fs;
+pub mod image_preparation;
 pub mod job_tracker;
 pub mod placement;
+pub mod preview_access;
 pub mod preview_password;
 pub mod preview_urls;
 pub mod public_id;
@@ -19,6 +22,7 @@ pub mod row_status;
 pub mod sandbox_service;
 pub mod service_manager;
 pub mod snapshot_service;
+pub mod worker_preview_relay;
 
 pub use exec::{ExecOptions, ExecResult};
 pub use expiration_sweeper::SandboxExpirationSweeper;

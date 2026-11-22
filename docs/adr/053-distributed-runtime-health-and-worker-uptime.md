@@ -2,14 +2,14 @@
 
 **Status:** Implemented for process/HTTP/TCP; runtime exec remains gated
 **Date:** 2026-10-17
-**Builds on:** [ADR-052](./052-pluggable-health-probes-for-workers.md),
+**Builds on:** [ADR-085](./085-pluggable-health-probes-for-workers.md),
 [multi-node hardening](./020-multi-node-deployment-hardening.md),
-[host Docker socket grants](./045-host-docker-socket-grant.md), and
-[control-plane enrollment and ingress](./048-control-plane-enrollment-hubs-and-ingress.md)
+[host Docker socket grants](./079-host-docker-socket-grant.md), and
+[control-plane enrollment and ingress](./080-control-plane-enrollment-hubs-and-ingress.md)
 
 ## Context
 
-ADR-052 Phase 1 gates deployments with HTTP, TCP, process or exec probes and
+ADR-085 Phase 1 gates deployments with HTTP, TCP, process or exec probes and
 records the result at deployment time. A successful gate is not evidence of
 continued health. A Redis subscriber can remain running while its connection
 to Redis is broken.
@@ -50,8 +50,8 @@ The initial implementation has two seams to preserve and improve:
   appropriate for a deployment gate and unsafe for periodic checks of a
   serving application.
 
-This ADR specifies ADR-052 Phase 2. Its runtime rules take precedence over
-ADR-052's high-level runtime outline; deployment gate behavior remains
+This ADR specifies ADR-085 Phase 2. Its runtime rules take precedence over
+ADR-085's high-level runtime outline; deployment gate behavior remains
 unchanged. Remediation and application heartbeat ingestion remain separate
 work.
 
@@ -135,7 +135,7 @@ from that comparison.
 ### 2. Persist the authorized effective probe
 
 At deployment time, resolve the repository, environment, project and automatic
-defaults using ADR-052's existing precedence. Persist an immutable effective
+defaults using ADR-085's existing precedence. Persist an immutable effective
 probe revision associated with the deployment and its replica assignments.
 Include its source, image digest, probe kind, relevant parameters and a safe
 display description. Rollback and promotion resolve and persist their own

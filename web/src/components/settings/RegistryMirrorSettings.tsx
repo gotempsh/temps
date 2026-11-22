@@ -90,7 +90,7 @@ export function RegistryMirrorSettings({
               rel="noopener noreferrer"
               className="underline"
             >
-              Configure a Docker Registry Mirror
+              Configure a Docker registry mirror
             </a>{' '}
             for both options.
           </AlertDescription>

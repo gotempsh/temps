@@ -6,7 +6,7 @@
 //! HTTP handlers for template-related endpoints.
 
 use serde::{Deserialize, Serialize};
-use temps_core::templates::{
+use temps_presets::templates::{
     EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources, TemplateRoute,
     TemplateServiceSpec,
 };
@@ -109,8 +109,8 @@ pub struct TemplateServiceResponse {
         std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
-impl From<temps_core::templates::GitRef> for GitRefResponse {
-    fn from(git: temps_core::templates::GitRef) -> Self {
+impl From<temps_presets::templates::GitRef> for GitRefResponse {
+    fn from(git: temps_presets::templates::GitRef) -> Self {
         Self {
             url: git.url,
             path: git.path,
@@ -365,7 +365,7 @@ pub struct CreateProjectFromTemplateResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_core::templates::{GitRef, TemplateService, TemplatesConfig};
+    use temps_presets::templates::{GitRef, TemplateService, TemplatesConfig};
 
     fn create_test_template() -> ProjectTemplate {
         ProjectTemplate {
@@ -385,7 +385,7 @@ mod tests {
             features: vec!["Feature 1".to_string(), "Feature 2".to_string()],
             databases: vec!["postgres".to_string()],
             shared_env_vars: vec![],
-            services: vec![temps_core::templates::TemplateServiceSpec {
+            services: vec![temps_presets::templates::TemplateServiceSpec {
                 name: "test-template".to_string(),
                 preset: "nextjs".to_string(),
                 databases: vec!["postgres".to_string()],

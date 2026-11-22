@@ -458,6 +458,20 @@ pub(crate) fn describe_delivery_bindings(hostnames: &[String], binding_ids: &[i3
 
 #[derive(Error, Debug)]
 pub enum ProjectError {
+    #[error("Active environment {environment_id} in project {project_id} was not found")]
+    PipelineEnvironmentNotFound {
+        project_id: i32,
+        environment_id: i32,
+    },
+    #[error(
+        "Failed to load pipeline environment {environment_id} in project {project_id}: {source}"
+    )]
+    PipelineEnvironmentLookup {
+        project_id: i32,
+        environment_id: i32,
+        source: sea_orm::DbErr,
+    },
+
     #[error("Database connection error: {0}")]
     DatabaseConnectionError(String),
 
@@ -549,6 +563,27 @@ pub enum ProjectError {
         /// Hostnames still delivered, in the same order as `binding_ids`.
         hostnames: Vec<String>,
         binding_ids: Vec<i32>,
+    },
+
+    /// Post-migration maintenance has not yet dropped the foreign keys from
+    /// the telemetry tables into the project delete cascade. Deleting now
+    /// would cascade through every chunk of those tables in one transaction,
+    /// which is slow and can run PostgreSQL out of lock slots, so the delete
+    /// is refused before anything is torn down.
+    #[error(
+        "Project {project_id} cannot be deleted yet: post-migration maintenance has not finished \
+         detaching the telemetry tables from projects ({} foreign key(s) left: {}). Deleting now \
+         would cascade through every chunk of those tables in one transaction, which can run \
+         PostgreSQL out of lock slots. Maintenance runs in the background after the server \
+         starts; run `temps migrate` to finish it now, or `temps doctor` to see why it has not \
+         finished, then retry the delete",
+        foreign_keys.len(),
+        foreign_keys.join(", ")
+    )]
+    TelemetryDetachPending {
+        project_id: i32,
+        /// `table.constraint` of each foreign key still in place.
+        foreign_keys: Vec<String>,
     },
 
     #[error("Other error: {0}")]

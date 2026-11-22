@@ -377,12 +377,10 @@ mod tests {
 
     #[tokio::test]
     async fn events_reach_postgres_in_batches() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Shield event store test: Docker runtime unavailable");
                 return;

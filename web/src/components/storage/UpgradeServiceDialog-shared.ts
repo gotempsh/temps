@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { DEFAULT_REDIS_IMAGE } from '@/lib/service-images'
 import { z } from 'zod'
 
 export const upgradeFormSchema = z.object({
@@ -44,9 +45,7 @@ export function getSupportedImages(serviceType: string): SupportedImage[] {
     ]
   }
   if (serviceType === 'redis') {
-    return [
-      { image: 'gotempsh/redis-walg:8-bookworm', label: 'Redis 8 + WAL-G' },
-    ]
+    return [{ image: DEFAULT_REDIS_IMAGE, label: 'Redis 8 + WAL-G' }]
   }
   if (serviceType === 'mongodb') {
     return [

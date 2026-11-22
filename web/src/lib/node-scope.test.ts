@@ -143,3 +143,32 @@ describe('reportingNotice', () => {
     expect(notice?.detail).toContain('w2: not reporting')
   })
 })
+
+test('Server defaults to the first option and preserves explicit URL scopes', () => {
+  const options = metricNodeOptions([node(7, 'worker')])
+  for (const param of [null, '', 'missing', '99']) {
+    expect(resolveNodeScope(param, options, 'first')).toEqual({
+      kind: 'node',
+      id: 0,
+    })
+  }
+  expect(scopeValue(resolveNodeScope(null, options, 'first'))).toBe('0')
+  expect(resolveNodeScope('7', options, 'first')).toEqual({
+    kind: 'node',
+    id: 7,
+  })
+  expect(resolveNodeScope('all', options, 'first')).toEqual({
+    kind: 'all',
+    ids: [0, 7],
+  })
+  expect(
+    resolveNodeScope(
+      null,
+      [
+        { id: 7, name: 'first' },
+        { id: 2, name: 'second' },
+      ],
+      'first'
+    )
+  ).toEqual({ kind: 'node', id: 7 })
+})

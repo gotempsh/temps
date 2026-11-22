@@ -12,9 +12,32 @@ use temps_core::{Job, JobQueue, JobReceiver};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
+use crate::routes::maintenance::{
+    create_maintenance_router, MaintenanceApiDoc, MaintenanceRoutesState,
+};
+use crate::routes::page_password::{
+    create_page_password_router, PagePasswordApiDoc, PagePasswordRoutesState,
+};
 use crate::routes::public::{create_public_router, PublicStatusState};
+use crate::routes::public_subscriptions::{
+    create_public_subscription_router, PublicSubscriptionState,
+};
 use crate::routes::status_page::{create_router, StatusPageApiDoc, StatusPageAppState};
+use crate::routes::subscribers::{
+    create_subscriber_router, SubscriberApiDoc, SubscriberRoutesState,
+};
+use crate::routes::target_monitors::{
+    create_target_monitor_router, TargetMonitorApiDoc, TargetMonitorRoutesState,
+};
+use crate::routes::webhooks::{create_webhook_router, WebhookApiDoc, WebhookRoutesState};
+use crate::services::checks::{
+    NetworkProber, NodeProbeLocations, TargetChecks, TargetMonitorService,
+};
+use crate::services::maintenance::StatusPageMaintenanceService;
+use crate::services::page_access::PageAccessService;
 use crate::services::public_pages::{DomainServiceCertificates, StatusPageDomainService};
+use crate::services::subscribers::{StatusPageSubscriberService, TempsEmailMailer};
+use crate::services::webhooks::{PinnedWebhookTransport, StatusPageWebhookService};
 use crate::services::{
     HealthCheckService, MonitorService, PublicStatusPageService, StatusPageService,
     StatusSnapshotCache,
@@ -246,12 +269,32 @@ impl TempsPlugin for StatusPagePlugin {
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
-            let mut health_check_service =
-                HealthCheckService::new(db.clone(), config_service, queue_service.clone())
-                    .map_err(|error| PluginError::PluginRegistrationFailed {
-                        plugin_name: "status-page".to_string(),
-                        error: error.to_string(),
-                    })?;
+            // Monitors for targets outside Temps (ADR 108 D3, D4).
+            // Worker nodes are probe locations for monitors that ask (D5).
+            let encryption = context.require_service::<temps_core::EncryptionService>();
+            let target_checks = Arc::new(TargetChecks::new(
+                encryption.clone(),
+                Arc::new(NetworkProber),
+                Arc::new(NodeProbeLocations::new(
+                    db.clone(),
+                    config_service.clone(),
+                    encryption,
+                )),
+            ));
+            context.register_service(Arc::new(TargetMonitorService::new(
+                db.clone(),
+                target_checks.clone(),
+            )));
+            let mut health_check_service = HealthCheckService::new(
+                db.clone(),
+                config_service,
+                queue_service.clone(),
+                target_checks,
+            )
+            .map_err(|error| PluginError::PluginRegistrationFailed {
+                plugin_name: "status-page".to_string(),
+                error: error.to_string(),
+            })?;
             // ADR 068 D4: probe each environment's primary address.
             if let Some(slot) =
                 context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
@@ -272,10 +315,54 @@ impl TempsPlugin for StatusPagePlugin {
                 snapshot_cache.clone(),
             ));
             context.register_service(public_status_page_service.clone());
-            let deletion_hook: Arc<dyn temps_core::ProjectDeletionHook> =
-                public_status_page_service.clone();
-            context.register_service(deletion_hook);
-            tokio::spawn(snapshot_cache.run_refresh_loop());
+            temps_core::ProjectDeletionHooks::get_or_register(context)
+                .add(public_status_page_service.clone());
+            tokio::spawn(snapshot_cache.clone().run_refresh_loop());
+
+            // Email subscribers (ADR 108 D2): mail goes through the
+            // transactional email stack, which the email plugin registers
+            // before this one.
+            let mailer = Arc::new(TempsEmailMailer::new(
+                context.require_service::<temps_email::services::EmailService>(),
+                context.require_service::<temps_email::services::ProviderService>(),
+                context.require_service::<temps_email::services::DomainService>(),
+            ));
+            let subscriber_service = Arc::new(StatusPageSubscriberService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+                mailer,
+                context.require_service::<temps_config::ConfigService>(),
+            ));
+            context.register_service(subscriber_service.clone());
+            tokio::spawn(subscriber_service.run_dispatcher());
+
+            // Page passwords (ADR 108 D2): access cookies are signed with a
+            // key derived from the install's master key.
+            context.register_service(Arc::new(PageAccessService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context
+                    .require_service::<temps_core::EncryptionService>()
+                    .as_ref(),
+            )));
+
+            // Webhooks (ADR 108 D2): owner-registered endpoints, delivered by
+            // a bounded background dispatcher.
+            let webhook_service = Arc::new(StatusPageWebhookService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+                context.require_service::<temps_core::EncryptionService>(),
+                Arc::new(PinnedWebhookTransport),
+            ));
+            context.register_service(webhook_service.clone());
+            tokio::spawn(webhook_service.run_dispatcher());
+
+            // Maintenance windows (ADR 108 D2).
+            context.register_service(Arc::new(StatusPageMaintenanceService::new(
+                db.clone(),
+                snapshot_cache.clone(),
+            )));
 
             // Start the health check scheduler with job receiver for realtime monitor creation
             let scheduler_service = health_check_service.clone();
@@ -380,7 +467,42 @@ impl TempsPlugin for StatusPagePlugin {
             project_access_checker,
         });
 
-        let routes = create_router().with_state(app_state);
+        let subscriber_state = Arc::new(SubscriberRoutesState {
+            subscribers: context.require_service::<StatusPageSubscriberService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let maintenance_state = Arc::new(MaintenanceRoutesState {
+            maintenance: context.require_service::<StatusPageMaintenanceService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let password_state = Arc::new(PagePasswordRoutesState {
+            access: context.require_service::<PageAccessService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let webhook_state = Arc::new(WebhookRoutesState {
+            webhooks: context.require_service::<StatusPageWebhookService>(),
+            pages: app_state.public_status_page_service.clone(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let target_monitor_state = Arc::new(TargetMonitorRoutesState {
+            monitors: context.require_service::<TargetMonitorService>(),
+            audit: app_state.audit_service.clone(),
+            project_access_checker: app_state.project_access_checker.clone(),
+        });
+        let routes = create_router()
+            .with_state(app_state)
+            .merge(create_subscriber_router(subscriber_state))
+            .merge(create_maintenance_router(maintenance_state))
+            .merge(create_page_password_router(password_state))
+            .merge(create_webhook_router(webhook_state))
+            .merge(create_target_monitor_router(target_monitor_state));
         Some(PluginRoutes::new(routes))
     }
 
@@ -388,12 +510,26 @@ impl TempsPlugin for StatusPagePlugin {
     /// surface). Reads only the snapshot cache; see `routes::public`.
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let cache = context.require_service::<StatusSnapshotCache>();
-        let state = Arc::new(PublicStatusState::new(cache));
-        Some(PluginRoutes::new(create_public_router(state)))
+        let access = context.require_service::<PageAccessService>();
+        let subscriptions = Arc::new(PublicSubscriptionState::new(
+            cache.clone(),
+            context.require_service::<StatusPageSubscriberService>(),
+            access.clone(),
+        ));
+        let state = Arc::new(PublicStatusState::new(cache, access));
+        Some(PluginRoutes::new(
+            create_public_router(state).merge(create_public_subscription_router(subscriptions)),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<StatusPageApiDoc as OpenApiTrait>::openapi())
+        let mut doc = <StatusPageApiDoc as OpenApiTrait>::openapi();
+        doc.merge(<SubscriberApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<MaintenanceApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<PagePasswordApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<WebhookApiDoc as OpenApiTrait>::openapi());
+        doc.merge(<TargetMonitorApiDoc as OpenApiTrait>::openapi());
+        Some(doc)
     }
 }
 

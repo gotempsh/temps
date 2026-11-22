@@ -8,6 +8,7 @@ export const metadata = {
 };
 
 export const sections = [
+  { title: "Restrict who reaches the console", id: "admin-gate" },
   { title: "When to use this", id: "when" },
   { title: "How it works", id: "how" },
   { title: "Route classification", id: "routes" },
@@ -20,6 +21,87 @@ export const sections = [
 # Admin Listener
 
 The Temps control plane serves two very different kinds of traffic on the same port: **public ingest** (browser SDKs posting analytics events, deployed apps calling the AI gateway, worker nodes registering themselves) and **admin/management** (login, dashboard, project CRUD, settings). The admin listener lets you split those onto separate bind addresses so the admin surface can live on a private interface — loopback, a VPN, or a Tailscale interface — while the public surface stays reachable from the open internet. {{ className: 'lead' }}
+
+---
+
+## Restrict who reaches the console {{ anchor: true, id: 'admin-gate' }}
+
+**By default the console answers on any address and any `Host` header.** Anyone
+who can reach the server, including by its bare IP address, gets the login
+page. The **admin access gate** closes that: an allowlist of `Host` header
+values and of client IPs/CIDRs. A request that fails it gets a `404`, so a
+scanner hitting the IP cannot tell a console is there. Deployed applications,
+SDK ingest and third-party callbacks are not affected ([below](#public-ingress)).
+It works in the default single-listener mode; you do not need the admin
+listener for it.
+
+There are two ways to configure it, and exactly one is in effect:
+
+| Source | How | When it applies |
+| --- | --- | --- |
+| Console setting (recommended) | **Settings → Security → Admin access gate**, or `PATCH /api/admin/gate-settings` (needs the `SettingsWrite` permission). Stored in the database, no restart needed: the process that saves the rules applies them at once, and every other Temps process (a separate `temps proxy` in split topology) picks them up on the database change notification, or within 60 seconds at the latest. Each successful save also writes an `ADMIN_GATE_UPDATED` audit entry with the old and new rules; if that audit write fails, the rules still apply and the failure is logged by the server. | When the environment variables below do not take over. |
+| Environment variables | `TEMPS_ADMIN_ALLOWED_HOSTS`, `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_TRUST_FORWARDED_FOR` on the `temps serve` (and, in split topology, `temps proxy`) process. Read once at startup. | When `TEMPS_ADMIN_ALLOWED_HOSTS` or `TEMPS_ADMIN_ALLOWED_IPS` has at least one entry, or `TEMPS_ADMIN_TRUST_FORWARDED_FOR` is true. They then replace the console setting entirely, and the console page shows the gate read-only. An empty list or `TEMPS_ADMIN_TRUST_FORWARDED_FOR=false` on its own changes nothing: the console setting stays in effect and editable. |
+
+There are no `temps serve` flags for the gate. Older `--help` text mentioned
+`--admin-allowed-ips` / `--admin-allowed-hosts`; those flags never existed.
+
+`GET /api/admin/gate-settings` returns the active rules and where they came
+from (`source`: `db`, `env` or `default`).
+
+### Answer only on the console's hostname
+
+The common case: the console has a domain, and requests by IP or any other name
+should not reach it. In **Settings → Security → Admin access gate**, put the
+console's hostname under **Allowed hosts** (one per line, no scheme or port;
+matching is exact and case-insensitive) and save:
+
+```
+console.example.com
+```
+
+The console refuses to save rules that would lock out the admin saving them,
+so open the console through that hostname first. Then check from another
+machine. `--resolve` sends the request to the server while TLS and the `Host`
+header both use the console's name (setting only `-H 'Host: ...'` would fail
+the certificate check); `-k` accepts the certificate's name mismatch for the
+bare-IP request:
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --resolve console.example.com:443:<server-ip> https://console.example.com/   # 200
+curl -sk -o /dev/null -w '%{http_code}\n' https://<server-ip>/                 # 404
+```
+
+A `Host` allowlist hides the console from anything that does not know its name;
+it is not authentication, because a client chooses its own `Host` header. To
+keep the console off the public internet altogether, add an IP allowlist
+(**Allowed IPs**: your office, VPN or Tailscale range) or bind the admin surface
+to a private address with the [admin listener](#when). When a CDN or load
+balancer sits in front of Temps, see **Proxy client IP** in
+[production hardening](/docs/production-hardening#tls) before
+relying on an IP allowlist.
+
+### If you lock yourself out
+
+The console refuses a save that would deny the admin saving it, but your
+address can still change later. The rules live in the database, so replace them
+there with empty ones; every Temps process picks the change up within a minute,
+without a restart:
+
+```bash
+psql "$TEMPS_DATABASE_URL" -c \
+  "UPDATE settings SET data = jsonb_set(data::jsonb, '{admin_gate}',
+     '{\"allowed_ips\": [], \"allowed_hosts\": [], \"trust_forwarded_for\": false}')::json
+   WHERE id = 1;"
+```
+
+Write the empty rules rather than deleting the `admin_gate` key: a running
+server deliberately keeps its current rules when the key disappears, so that a
+lost or restored settings row can never open the console by itself.
+
+The console is then open again on any host and address until you save new
+rules. If the gate comes from the `TEMPS_ADMIN_*` variables instead, change
+them and restart.
 
 ---
 
@@ -44,7 +126,7 @@ Each plugin in the Temps control plane declares two route sets:
 
 When `TEMPS_CONSOLE_ADMIN_ADDRESS` is set, the server binds both routers on separate `axum::serve` listeners. When it's unset, both routers are merged onto `TEMPS_CONSOLE_ADDRESS` for backwards compatibility.
 
-The admin gate (CIDR + Host allowlists) is layered on top of the admin listener as defense in depth. Denials return `404 Not Found`, not `403 Forbidden`, so a probing client cannot fingerprint the admin surface.
+The [admin access gate](#admin-gate) (CIDR + Host allowlists) applies with or without the admin listener; combined with it, it is defense in depth. Denials return `404 Not Found`, not `403 Forbidden`, so a probing client cannot fingerprint the admin surface.
 
 ---
 
@@ -62,7 +144,7 @@ The admin gate (CIDR + Host allowlists) is layered on top of the admin listener 
 | `temps-email-tracking`          | `GET /api/t/pixel/...`, `GET /api/t/click/...`, `POST /api/t/webhook/ses`              | Recipient browsers + AWS SES |
 | `temps-revenue`, `temps-email`  | Stripe + email provider webhooks, `GET /api/emails/{id}/track/open`, `GET /api/emails/{id}/track/click/{n}` | External services + recipient mail clients |
 | `temps-git`                     | `POST /api/webhook/git/{github,gitlab,gitea}/events`, `POST /api/webhook/git/{bitbucket,generic}/events/{token}` | Git providers                |
-| `temps-agents`                  | `POST /api/agents/webhook/{webhook_id}`                                                | Whatever triggers the agent  |
+| `temps-ai-agents`                  | `POST /api/agents/webhook/{webhook_id}`                                                | Whatever triggers the agent  |
 | `temps-proxy`                   | `POST /api/_temps/captcha/verify`                                                      | Visitors of a protected app  |
 | Multi-node                      | `POST /api/internal/nodes/register`, `POST /api/internal/nodes/{id}/heartbeat`, route sync | Worker nodes                 |
 
@@ -139,8 +221,8 @@ that case.
 | `TEMPS_CONSOLE_ADDRESS`            | `host:port`      | random     | Public listener (and admin listener when admin is not split out)                              |
 | `TEMPS_CONSOLE_ADMIN_ADDRESS`      | `host:port`      | unset      | Bind admin/management routes to this address. Enables two-listener mode.                      |
 | `TEMPS_CONSOLE_INGRESS_ADDRESS`    | `host:port`      | automatic  | Listener that serves only the public callback routes and health probes, used for callbacks while the console is restricted. `temps serve` picks a loopback port itself; set it only in split topology, to the same value on `temps serve --role=console` and `temps proxy`. It is always an address of its own, also in two-listener mode: `TEMPS_CONSOLE_ADDRESS` has no admin routes then but still serves the authenticated MCP endpoint, so it must not be reused. Startup fails if it equals another console listener. |
-| `TEMPS_ADMIN_ALLOWED_IPS`          | CSV of IP/CIDR   | empty      | Allowlist source addresses for the admin listener. Empty = no IP gate.                        |
-| `TEMPS_ADMIN_ALLOWED_HOSTS`        | CSV of hostnames | empty      | Allowlist `Host` header values on the admin listener. Empty = no Host gate. Port is stripped. |
+| `TEMPS_ADMIN_ALLOWED_IPS`          | CSV of IP/CIDR   | empty      | Allowlist source addresses for the admin surface. Empty = no IP gate. A non-empty `TEMPS_ADMIN_ALLOWED_IPS` or `TEMPS_ADMIN_ALLOWED_HOSTS`, or `TEMPS_ADMIN_TRUST_FORWARDED_FOR=true`, overrides the console's [admin access gate](#admin-gate) setting; empty values leave it in effect. |
+| `TEMPS_ADMIN_ALLOWED_HOSTS`        | CSV of hostnames | empty      | Allowlist `Host` header values on the admin surface. Empty = no Host gate. Port is stripped. |
 | `TEMPS_ADMIN_TRUST_FORWARDED_FOR`  | bool             | `false`    | Honor `X-Forwarded-For` for the IP gate, but only from loopback peers (anti-spoof).            |
 
 CIDR entries are standard (`10.0.0.0/8`, `2001:db8::/32`). Bare IPs become host routes (`/32` for v4, `/128` for v6). Invalid entries fail the server at startup with a typed error rather than silently allowing traffic.

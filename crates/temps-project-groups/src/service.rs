@@ -400,7 +400,7 @@ impl ProjectGroupService {
             .await
             .map_err(ProjectGroupError::db("counting project groups"))?;
         let groups = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await
             .map_err(ProjectGroupError::db(format!(
                 "listing project groups page {page}"
@@ -1631,7 +1631,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     async fn try_test_db() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

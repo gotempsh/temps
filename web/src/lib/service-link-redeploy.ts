@@ -45,10 +45,37 @@ export function environmentsToRedeploy(
   )
 }
 
-/** The prompt shown after a link change, e.g. "Postgres was linked. …". */
+/**
+ * Whether the project takes an uploaded source archive, decided the way the
+ * server decides it (`accepts_source_archive`): a project whose own source is
+ * an upload always does, any other one only while its Other sources setting
+ * is on. A deployment made from an archive outlives that setting, so turning
+ * it off leaves a live archive that cannot be uploaded again until it is
+ * turned back on.
+ */
+export function acceptsSourceArchive(project: {
+  source_type: SourceType
+  allow_alternate_sources?: boolean | null
+}): boolean {
+  return (
+    project.source_type !== 'external' &&
+    (project.source_type === 'uploaded_source' ||
+      project.allow_alternate_sources === true)
+  )
+}
+
+/**
+ * The prompt shown after a link change, e.g. "Postgres was linked. …". When
+ * the project cannot be redeployed in place, it says to upload the source
+ * again instead of offering a redeploy that would be declined, and when the
+ * project would refuse that upload too, that Other sources must be turned on
+ * first.
+ */
 export function serviceLinkRedeployMessage(
   change: ServiceLinkChange,
-  environments: Pick<EnvironmentResponse, 'name'>[]
+  environments: Pick<EnvironmentResponse, 'name'>[],
+  redeployable = true,
+  uploadAccepted = true
 ): { title: string; description: string } {
   const verb = change.kind === 'linked' ? 'linked' : 'unlinked'
   const effect =
@@ -59,9 +86,13 @@ export function serviceLinkRedeployMessage(
   const where =
     names.length === 0
       ? ''
-      : names.length === 1
-        ? ` Redeploy ${names[0]} to apply the change now.`
-        : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
+      : !redeployable
+        ? uploadAccepted
+          ? ' Upload the source again to apply the change now.'
+          : ' It runs an uploaded archive, which this service accepts only while Other sources is on in its settings. Turn it on (or ask an administrator to), then upload the source again to apply the change now.'
+        : names.length === 1
+          ? ` Redeploy ${names[0]} to apply the change now.`
+          : ` Redeploy ${names.length} environments (${names.join(', ')}) to apply the change now.`
   return {
     title: `${change.serviceName} was ${verb}`,
     description: `${effect}${where}`,
@@ -144,6 +175,105 @@ export async function redeployDeployment(
         ? 'it was deployed from an uploaded archive; upload it again'
         : 'it has no reusable source to rebuild from'
   }
+}
+
+/** How long to wait for the live deployments before offering the action anyway. */
+const REDEPLOYABILITY_DEADLINE_MS = 4000
+
+/**
+ * What the console can do for the live deployments of `environments`:
+ *
+ * - `redeploy`: at least one can be redeployed in place (or this cannot be
+ *   told, see below).
+ * - `upload`: every one was made from an uploaded archive, which the console
+ *   cannot rebuild, so the source has to be uploaded again.
+ * - `no-source`: none can be rebuilt in place and at least one is a manual or
+ *   external deployment, which has nothing to rebuild from and nothing to
+ *   upload. The redeploy itself says so, for each environment on its own
+ *   (an uploaded archive among them is told to upload again); sending the user
+ *   to an upload, or to a new-deployment dialog for the project's default
+ *   source, would hide that.
+ *
+ * Decided from each environment's current deployment, the way the redeploy
+ * itself decides ({@link deploymentRedeployPlan}), not from the project's
+ * source type: a project's type is its primary source, not a restriction, so a
+ * manual project can run an image or a Git ref, and a Git project can hold an
+ * uploaded archive.
+ *
+ * It answers as soon as one environment is known to be redeployable, and gives
+ * up waiting after a few seconds. When a deployment cannot be read, there is
+ * nothing to decide, or the lookup is too slow, this says `redeploy`: the
+ * redeploy itself reports why an environment was skipped, and withholding the
+ * action on a failed read would regress working projects.
+ */
+export type RedeployAvailability = 'redeploy' | 'upload' | 'no-source'
+
+export async function redeployAvailability(
+  projectId: number,
+  projectSourceType: SourceType,
+  environments: EnvironmentResponse[],
+  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi,
+  deadlineMs = REDEPLOYABILITY_DEADLINE_MS
+): Promise<RedeployAvailability> {
+  if (environments.length === 0) return 'redeploy'
+  const controller = new AbortController()
+  return new Promise<RedeployAvailability>((resolve) => {
+    let uploads = 0
+    let withoutSource = 0
+    const finish = (availability: RedeployAvailability) => {
+      clearTimeout(timer)
+      // Stop reads that are still waiting: the answer is known.
+      controller.abort()
+      resolve(availability)
+    }
+    // A lookup that never answers must not hold back the confirmation that
+    // depends on it; without an answer the action is offered, as for a failed
+    // read.
+    const timer = setTimeout(() => finish('redeploy'), deadlineMs)
+    for (const environment of environments) {
+      void api
+        .getDeployment({
+          path: {
+            project_id: projectId,
+            deployment_id: environment.current_deployment_id as number,
+          },
+          signal: controller.signal,
+          throwOnError: true,
+        })
+        .then(({ data: deployment }) => {
+          const plan = deploymentRedeployPlan(deployment, projectSourceType)
+          if (plan.kind !== 'unsupported') return finish('redeploy')
+          if (plan.sourceType === 'uploaded_source') uploads += 1
+          else withoutSource += 1
+          if (uploads + withoutSource < environments.length) return
+          finish(withoutSource === 0 ? 'upload' : 'no-source')
+        })
+        .catch(() => finish('redeploy'))
+    }
+  })
+}
+
+/**
+ * Whether the console should offer to redeploy rather than send the user to
+ * upload the source again: false only when every live deployment was made
+ * from an uploaded archive. See {@link redeployAvailability}.
+ */
+export async function canRedeployAnyInPlace(
+  projectId: number,
+  projectSourceType: SourceType,
+  environments: EnvironmentResponse[],
+  api: Pick<RedeployApi, 'getDeployment'> = sdkRedeployApi,
+  deadlineMs = REDEPLOYABILITY_DEADLINE_MS
+): Promise<boolean> {
+  return (
+    (await redeployAvailability(
+      projectId,
+      projectSourceType,
+      environments,
+      api,
+      deadlineMs
+    )) !== 'upload'
+  )
 }
 
 /**
@@ -239,7 +369,12 @@ export function redeploySummary(outcomes: RedeployOutcome[]): {
  * extra when the project has nothing deployed yet.
  */
 export async function toastRedeployAfterLinkChange(
-  project: { id: number; name: string; source_type: SourceType },
+  project: {
+    id: number
+    name: string
+    source_type: SourceType
+    allow_alternate_sources?: boolean | null
+  },
   change: ServiceLinkChange,
   notify: {
     info: (
@@ -247,7 +382,7 @@ export async function toastRedeployAfterLinkChange(
       options: {
         description: string
         duration: number
-        action: { label: string; onClick: () => void }
+        action?: { label: string; onClick: () => void }
       }
     ) => void
     success: (message: string) => void
@@ -266,7 +401,30 @@ export async function toastRedeployAfterLinkChange(
   }
   const targets = environmentsToRedeploy(environments)
   if (targets.length === 0) return
-  const { description } = serviceLinkRedeployMessage(change, targets)
+  const redeployable = await canRedeployAnyInPlace(
+    project.id,
+    project.source_type,
+    targets
+  )
+  const uploadAccepted = acceptsSourceArchive(project)
+  const { description } = serviceLinkRedeployMessage(
+    change,
+    targets,
+    redeployable,
+    uploadAccepted
+  )
+  if (!redeployable) {
+    // Nothing the toast could start: the source has to be uploaded again from
+    // the project (once Other sources is on, if it is off), so it only says so.
+    const next = uploadAccepted
+      ? 'upload the source to apply'
+      : 'turn on Other sources to apply'
+    notify.info(`${project.name}: ${next}`, {
+      description,
+      duration: 20_000,
+    })
+    return
+  }
   const completed = new Set<number>()
   notify.info(`${project.name}: redeploy to apply`, {
     description,

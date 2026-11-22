@@ -14,6 +14,10 @@ export * as ErrorTracking from './errors';
 export * as Flags from './flags';
 export { FlagsClient, flags } from './flags';
 
+// Server-side analytics helpers (ADR 109 D4): `analytics.identify(request, …)`.
+export * as VisitorAnalytics from './analytics';
+export { analytics } from './analytics';
+
 export interface TempsClientConfig {
   baseUrl: string;
   apiKey?: string;

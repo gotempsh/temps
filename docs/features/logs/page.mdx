@@ -274,6 +274,94 @@ To stream a deployment's build log while it runs, connect to `/api/projects/{pro
 
 ---
 
+## Saved Searches
+
+A saved search is a named set of log filters in one project: source, levels, environments, services, containers, nodes, a deployment, a text needle and attribute predicates, plus the time range it opens with. Any member who can read the project's logs sees its saved searches; creating, editing or deleting one needs `logs:write`. A project holds at most 100.
+
+On the **Logs** page, filter by a service, then open **Saved searches** to save the current filters, pin a search to the top, reopen one, or start an alert from it. A search can hold filters the page has no control for (two levels, a container id). The page then says it is showing a wider view; alerts and dashboard tiles still apply every filter.
+
+```bash
+# Save the error lines of one service that mention a failed payment
+temps logs saved create --project my-app --name "Payment failures" \
+  --level ERROR --text "payment failed" --time-range 1h
+
+temps logs saved list --project my-app
+```
+
+A saved search that an alert rule counts cannot be deleted; remove or change the rule first.
+
+## Alerts on Logs
+
+A log alert fires when the number of lines a saved search matches crosses a threshold, for example "payment failed" more than 20 times in five minutes. Create one from **Metrics → Alerts → New alert** by choosing **Log lines matching a saved search**, or from **Alert on this search** in the saved-search list.
+
+A log alert is a metric alert rule whose series is a line count. It uses the same evaluator, alarm log, silencing and notification routes as every other metric alert. The evaluator counts matching lines once per evaluation over the trailing window; ingest never inspects lines against rules, so adding alerts adds no cost per log line.
+
+- The window is at most one hour.
+- The detector is a fixed threshold. Anomaly detection and per-series splits do not apply to line counts.
+- A text needle is matched by scanning lines, and the scan stops at 1,000 matches or when its time budget runs out. The count is then a lower bound: it can show that more lines than the threshold matched, but not that fewer did, so a "fewer than" rule, or a "more than" rule still under its threshold, keeps its current state while the count is incomplete. An incomplete count never raises a false alarm and never resolves a real one.
+- A log alert's filters are its saved search's; it takes no label filters of its own. Pointing an alert at another saved search starts it fresh and resolves the alarm the old search left open.
+
+## Charting Logs on a Dashboard
+
+A dashboard tile can chart a saved search instead of a metric. In the dashboard builder, set the tile's **Chart** to **A saved log search** and pick a value:
+
+- **Matching lines** per bucket.
+- **Average**, **sum**, **maximum**, **p50**, **p95**, **p99** or **distinct values** of a numeric attribute, such as `duration_ms`.
+
+Counts come from the line index. A search with a text needle, or an install without a line index, is counted by scanning at most 5,000 lines, newest first; older buckets are left empty and the tile says from when it counted, so the chart never shows zero for a period nobody counted. A numeric attribute needs the line index and a search without a text needle. While some lines in the window are not indexed yet (the index fell behind and is catching up), counts are taken by scanning instead, and a numeric tile shows that it is unavailable rather than an average over part of the lines.
+
+```bash
+# Matching lines per 5 minutes over the last day
+temps logs saved series 4 --project my-app --since 1d --bucket-secs 300
+
+# p95 of a numeric attribute
+temps logs saved series 4 --project my-app --metric p95:duration_ms
+```
+
+## Sending Logs from Outside Temps
+
+A host, database, CDN or application that Temps did not deploy can send logs over HTTP as newline-delimited JSON, one object per line, to `POST /api/logs/ingest`. Vector and Fluent Bit both write this format, so syslog and log files reach Temps through a collector; Temps does not open a syslog port.
+
+1. On the **Logs** page, filter by the service that should own the lines and choose **Send logs**, or run `temps logs keys create --project my-app --name web-01`.
+2. Copy the key. It is shown once; Temps keeps only its hash.
+3. Send lines with the key as a bearer token (`Authorization: Bearer tlk_…`) or in the `X-Temps-Log-Key` header.
+
+The endpoint is a public receiver, like the webhook and OTLP receivers: it answers on the public ingress URL (**Settings → Public ingress**, which falls back to the console URL), and on a separate ingress listener when the console sits behind an IP allowlist. The **Send logs** dialog builds its snippets from that URL. Only the receiver is public; creating and revoking keys stays on the console.
+
+```bash
+curl -X POST https://temps.example.com/api/logs/ingest \
+  -H "Authorization: Bearer $TEMPS_LOG_KEY" \
+  -H "Content-Type: application/x-ndjson" \
+  --data-binary $'{"level":"error","message":"payment failed","service":"checkout","order_id":42}\n'
+```
+
+A Vector sink:
+
+```toml
+[sinks.temps]
+type = "http"
+inputs = ["my_source"]
+uri = "https://temps.example.com/api/logs/ingest"
+method = "post"
+encoding.codec = "json"
+framing.method = "newline_delimited"
+auth.strategy = "bearer"
+auth.token = "${TEMPS_LOG_KEY}"
+# Vector's default batch is larger than the endpoint accepts.
+batch.max_bytes = 4000000
+batch.max_events = 5000
+```
+
+Each line is read like a container's JSON line: `level` and `message` (or `msg`) as usual, other keys as attributes. The timestamp is read from `timestamp`, `@timestamp`, `time`, `ts` or `date` (RFC 3339 or an epoch number); a missing timestamp, or one more than 7 days old or 5 minutes ahead, becomes the arrival time. `service` (or `service.name`, `app`) names the service; without one, the key's default service applies. A key accepts at most 16 service names; further names fold into its default service.
+
+| Limit | Value |
+|---|---|
+| Request body | 5 MiB |
+| Lines per request | 10,000 |
+| Bytes per line | 256 KiB |
+
+A batch is parsed and charged to the budget whole before anything is stored: one malformed line refuses the batch with its line number, and a batch over the key's log ingestion budget is refused with `429` and `Retry-After` (each key is budgeted like one container: the per-container budget, or the project's override of it), so neither stores part of a batch. Refused lines are counted per key on the log pipeline status. A storage failure part-way through a batch (a full disk) stores the lines before it and fails the request; collectors deliver at least once and resend the batch, so those lines can appear twice. Revoking a key waits for its batches in flight, refuses its collectors from the next batch and closes its streams; lines already stored are kept.
+
 ## Structured Logging Best Practices
 
 To get the most out of Temps logging, use structured logging in your application:

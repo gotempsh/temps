@@ -20,4 +20,7 @@ pub struct AppState {
     pub ingest_key_service: Arc<AnalyticsIngestKeyService>,
     /// Per-key sliding-window limiter for the keyed ingest path.
     pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
+    /// ADR 109 D3: the identity mode of keyed projects. A cookieless project
+    /// records no replays, whatever an outdated tracker sends.
+    pub cookieless_identity: Arc<temps_analytics::cookieless::CookielessIdentity>,
 }

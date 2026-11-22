@@ -120,8 +120,8 @@ test('clicking a Journey column header reorders the rows, and clicking again rev
   ])
 
   fireEvent.click(
-    within(table).getByRole('button', { name: /Sort by Bounce Rate/ })
+    within(table).getByRole('button', { name: /Sort by Bounce rate/ })
   )
-  expect(columnValues(table, 'Bounce Rate')[0]).toBe('90.0%')
+  expect(columnValues(table, 'Bounce rate')[0]).toBe('90.0%')
   api.restore()
 })

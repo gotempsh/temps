@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   CustomDomainResponse,
   ProjectResponse,
@@ -9,6 +10,10 @@ import {
 import {
   deleteCustomDomainMutation,
   listCustomDomainsForProjectOptions,
+  listCustomDomainsForProjectQueryKey,
+  getEnvironmentReachabilityQueryKey,
+  listIngressHostnamesQueryKey,
+  listReachabilityRunsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
@@ -18,6 +23,8 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindings'
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
@@ -123,20 +130,30 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
   }
   return (
     <div className="space-y-6">
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-        <h2 className="text-lg font-semibold">Domains</h2>
-        <div className="flex flex-wrap gap-2">
-          <Button onClick={() => setIsAddDialogOpen(true)}>
-            Add domain
-            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-          </Button>
-        </div>
-      </div>
-
-      <p className="text-sm text-muted-foreground mb-6">
-        Configure domains for your service. Each domain can be assigned to a
-        specific environment and optionally set up with redirects.
-      </p>
+      <PageHeader
+        title="Domains"
+        description="Custom domains for this service. Each one points at an environment and can redirect."
+        actions={
+          <>
+            <RefreshButton
+              queryKeys={[
+                listCustomDomainsForProjectQueryKey({
+                  path: { project_id: project.id },
+                }),
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+                queryKeyPrefix(getEnvironmentReachabilityQueryKey),
+                queryKeyPrefix(listReachabilityRunsQueryKey),
+                // The managed-delivery rows under DNS and CDN, not its form.
+                ['delivery-bindings', project.id],
+              ]}
+            />
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              Add domain
+              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+            </Button>
+          </>
+        }
+      />
 
       {isPending ? (
         <Skeleton className="h-24 w-full" />
@@ -158,6 +175,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             >
               <div className="min-w-0">
                 <p className="break-all font-medium">{domain.domain}</p>
+                {domain.status === 'hostname_conflict' && (
+                  <p className="text-sm text-destructive">{domain.message}</p>
+                )}
                 {domain.environment && (
                   <p className="text-sm text-muted-foreground">
                     Environment: {domain.environment.slug}
@@ -220,7 +240,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           description="Add a domain to get started."
           action={
             <Button onClick={() => setIsAddDialogOpen(true)}>
-              Add Domain
+              Add domain
               <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
             </Button>
           }
@@ -231,7 +251,10 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           follows them. An app hosted elsewhere is never served by Temps'
           ingress. */}
       {project.hosting !== 'external' && project.source_type !== 'external' && (
-        <EnvironmentReachabilityList projectId={project.id} />
+        <EnvironmentReachabilityList
+          projectId={project.id}
+          projectSlug={project.slug}
+        />
       )}
 
       <Collapsible className="border-t pt-6">

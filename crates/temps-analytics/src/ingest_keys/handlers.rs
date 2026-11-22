@@ -43,7 +43,7 @@ use axum::{
     routing::{get, patch, post},
     Extension, Json, Router,
 };
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
@@ -199,7 +199,7 @@ impl From<AnalyticsIngestKeyError> for Problem {
 }
 
 fn audit_context(
-    auth: &temps_auth::context::AuthContext,
+    auth: &temps_authz::context::AuthContext,
     metadata: &RequestMetadata,
 ) -> AuditContext {
     AuditContext {
@@ -582,8 +582,8 @@ mod tests {
     use chrono::Utc;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use std::sync::Mutex;
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
     use temps_entities::analytics_ingest_keys;
     use temps_entities::deployment_tokens::DeploymentTokenPermission;
 
@@ -597,7 +597,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             let mut operations = match self.operations.lock() {
                 Ok(operations) => operations,
                 Err(poisoned) => poisoned.into_inner(),
@@ -777,9 +777,9 @@ mod tests {
     fn settings_row_with_external_url(
         external_url: Option<&str>,
     ) -> temps_entities::settings::Model {
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: external_url.map(str::to_string),
-            ..temps_core::AppSettings::default()
+            ..temps_config::AppSettings::default()
         };
         temps_entities::settings::Model {
             id: 1,

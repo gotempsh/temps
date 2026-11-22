@@ -122,12 +122,10 @@ pub async fn backfill_events_window(
         temps_analytics_backend::retention::lock_event_delivery(&delivery, false).await?;
         let batch = fetch_next_batch(&delivery, from, to, project_id, cursor, batch_size).await?;
 
-        if batch.is_empty() {
+        let (Some(first), Some(last)) = (batch.first(), batch.last()) else {
             break;
-        }
-
-        let first_id = batch.first().map(|r| r.id).unwrap_or(0);
-        let last = batch.last().expect("non-empty checked above");
+        };
+        let first_id = first.id;
         let next_cursor = BackfillCursor {
             last_timestamp: Some(last.timestamp),
             last_id: Some(last.id),

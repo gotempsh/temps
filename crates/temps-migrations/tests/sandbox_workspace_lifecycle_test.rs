@@ -16,9 +16,19 @@
 //! 3. **`down` is real.** A migration that can't be rolled back strands
 //!    an operator who upgrades and needs to go back.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection, Statement, TransactionTrait};
 use sea_orm_migration::{MigrationTrait, MigratorTrait, SchemaManager};
 use temps_migrations::{Migrator, SandboxWorkspaceLifecycleMigration};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
 const LIFECYCLE_INDEX: &str = "idx_sandboxes_lifecycle";
@@ -98,6 +108,7 @@ async fn test_sandbox_workspace_lifecycle_migration_defaults_indexes_and_reverse
             "timescaledb.max_background_workers=0",
         ])
         .with_startup_timeout(std::time::Duration::from_secs(120))
+        .with_test_labels()
         .start()
         .await
     {
