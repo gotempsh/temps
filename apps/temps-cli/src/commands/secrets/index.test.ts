@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { test, expect, describe, afterEach } from 'bun:test'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { chmod, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { buildCreateSecretBody, buildUpdateSecretBody, resolveValue } from './index.js'
+import { buildCreateSecretBody, buildUpdateSecretBody, registerSecretsCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
+
+const SECRET = 's3cr3t-test-value'
 
 const temporaryDirectories: string[] = []
 
@@ -15,30 +18,14 @@ afterEach(async () => {
   )
 })
 
-async function fixtureFile(contents: string): Promise<string> {
+async function fixtureFile(contents: string | Uint8Array): Promise<string> {
   const directory = await mkdtemp(join(tmpdir(), 'temps-secrets-test-'))
   temporaryDirectories.push(directory)
   const path = join(directory, 'creds.json')
   await writeFile(path, contents)
+  await chmod(path, 0o600)
   return path
 }
-
-describe('resolveValue', () => {
-  test('passes a plain value through untouched', () => {
-    expect(resolveValue('sk-live-123')).toBe('sk-live-123')
-  })
-
-  test('reads file contents when prefixed with @', async () => {
-    const path = await fixtureFile('{"key":"value"}')
-    expect(resolveValue(`@${path}`)).toBe('{"key":"value"}')
-  })
-
-  test('raises a clear error naming the file that could not be read', () => {
-    expect(() => resolveValue('@/nonexistent/path/creds.json')).toThrow(
-      /Failed to read file '\/nonexistent\/path\/creds.json'/,
-    )
-  })
-})
 
 describe('buildCreateSecretBody', () => {
   test('defaults to env type and resolves a plain value', () => {
@@ -75,10 +62,9 @@ describe('buildCreateSecretBody', () => {
     })
   })
 
-  test('resolves an @-prefixed value from a file', async () => {
-    const path = await fixtureFile('file-contents')
-    const body = buildCreateSecretBody({ name: 'my_key', value: `@${path}` })
-    expect(body.value).toBe('file-contents')
+  test('sends an already-resolved value as is, even one starting with @', () => {
+    const body = buildCreateSecretBody({ name: 'my_key', value: '@not-a-path' })
+    expect(body.value).toBe('@not-a-path')
   })
 })
 
@@ -96,7 +82,7 @@ describe('buildUpdateSecretBody', () => {
 
   test('requires --value since the server never echoes the existing one', () => {
     expect(() => buildUpdateSecretBody({ name: 'my_key' }, current)).toThrow(
-      /--value is required when updating/,
+      /A value is required when updating/,
     )
   })
 
@@ -135,5 +121,108 @@ describe('buildUpdateSecretBody', () => {
       fileSecret,
     )
     expect(body.mount_path).toBe('/run/secrets/new.json')
+  })
+})
+
+describe('secrets create/update value sources', () => {
+  const saved = (body: unknown) => ({
+    id: 1,
+    value: '***',
+    mount_path: null,
+    description: null,
+    created_at: '2026-01-01T00:00:00Z',
+    updated_at: '2026-01-01T00:00:00Z',
+    ...(body as object),
+  })
+  const routes = {
+    'POST /settings/secrets': (_url: URL, body: unknown) => saved(body),
+    'GET /settings/secrets': {
+      items: [saved({ name: 'gsc_creds', secret_type: 'file', mount_path: '/home/temps/gsc.json' })],
+      total: 1,
+    },
+  }
+
+  function postedValue(run: Awaited<ReturnType<typeof runWithApi>>): unknown {
+    const sent = run.bodies.find((b) => b.request === 'POST /settings/secrets')
+    expect(sent).toBeDefined()
+    return (sent!.body as Record<string, unknown>).value
+  }
+
+  test('create --value-file sends a PEM file byte-for-byte, without a newline hint', async () => {
+    const pem = '-----BEGIN PRIVATE KEY-----\nMIIB\n-----END PRIVATE KEY-----\n'
+    const path = await fixtureFile(pem)
+    const run = await runWithApi(registerSecretsCommands, [
+      'secrets', 'create', '-n', 'tls_key', '-t', 'file', '-m', '/home/temps/key.pem', '--value-file', path,
+    ], routes)
+    expect(run.error).toBeUndefined()
+    expect(postedValue(run)).toBe(pem)
+    expect(run.stderr).not.toContain('hint')
+  })
+
+  test('create --value-stdin sends the piped value, which never reaches stdout or stderr', async () => {
+    const run = await runWithApi(registerSecretsCommands, [
+      'secrets', 'create', '-n', 'my_api_key', '--value-stdin',
+    ], routes, { stdin: SECRET })
+    expect(run.error).toBeUndefined()
+    expect(postedValue(run)).toBe(SECRET)
+    expect(`${run.stdout}\n${run.stderr}`).not.toContain(SECRET)
+  })
+
+  test('create -v @path still reads the file, with a deprecation note', async () => {
+    const path = await fixtureFile(SECRET)
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'create', '-n', 'k', '-v', `@${path}`], routes)
+    expect(run.error).toBeUndefined()
+    expect(postedValue(run)).toBe(SECRET)
+    expect(run.stderr).toContain('deprecated')
+    expect(run.stderr).toContain('--value-file')
+  })
+
+  test('create -v @value --literal sends the @ value itself', async () => {
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'create', '-n', 'k', '-v', `@${SECRET}`, '--literal'], routes)
+    expect(run.error).toBeUndefined()
+    expect(postedValue(run)).toBe(`@${SECRET}`)
+  })
+
+  test('create with no value source fails before any request', async () => {
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'create', '-n', 'k'], routes)
+    expect(run.error?.message).toBe(
+      'Missing the value for secret k: pass --value-file <path>, --value-stdin, or -v/--value',
+    )
+    expect(run.requests).toEqual([])
+  })
+
+  test('create -v and --value-file together is a conflict that does not echo the value', async () => {
+    const path = await fixtureFile(SECRET)
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'create', '-n', 'k', '-v', SECRET, '--value-file', path], routes)
+    expect(run.error?.message).toBe('Pass the value for secret k from only one source, got -v/--value and --value-file')
+    expect(run.requests).toEqual([])
+  })
+
+  test('create refuses a binary file instead of mangling it', async () => {
+    const path = await fixtureFile(new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0xff]))
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'create', '-n', 'k', '-t', 'file', '-m', '/x', '--value-file', path], routes)
+    expect(run.error?.message).toContain('is not valid UTF-8 text')
+    expect(run.requests).toEqual([])
+  })
+
+  test('update --value-file re-sends the full body with the file content exactly', async () => {
+    const json = '{\n  "type": "service_account"\n}\n'
+    const path = await fixtureFile(json)
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'update', '-n', 'gsc_creds', '--value-file', path], routes)
+    expect(run.error).toBeUndefined()
+    const sent = run.bodies.find((b) => b.request === 'POST /settings/secrets')!.body
+    expect(sent).toEqual({ name: 'gsc_creds', secret_type: 'file', value: json, mount_path: '/home/temps/gsc.json' })
+  })
+
+  test('update --value-stdin reads the new value from a pipe', async () => {
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'update', '-n', 'gsc_creds', '--value-stdin'], routes, { stdin: SECRET })
+    expect(run.error).toBeUndefined()
+    expect(postedValue(run)).toBe(SECRET)
+  })
+
+  test('update without a value source fails before any request', async () => {
+    const run = await runWithApi(registerSecretsCommands, ['secrets', 'update', '-n', 'gsc_creds', '-d', 'new'], routes)
+    expect(run.error?.message).toContain('A value is required when updating')
+    expect(run.requests).toEqual([])
   })
 })

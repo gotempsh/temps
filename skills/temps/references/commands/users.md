@@ -42,6 +42,9 @@ Create a new user
 | `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | No |
 | `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--password-file <path>` | Read the password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `users me`
 

@@ -258,7 +258,7 @@ Switch between persistent and cookieless tracking, or accept/refuse browser iden
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--mode <mode>` | One of persistent, cookieless | - | No |
-| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `--browser-identify <accept\|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
 

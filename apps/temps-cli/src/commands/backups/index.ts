@@ -28,6 +28,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm, promptText, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, formatRelativeTime } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 interface CreateScheduleOptions {
   name?: string
@@ -239,7 +240,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listSources)
 
-  sources
+  const createSourceCommand = sources
     .command('create')
     .description('Create an S3 source')
     .option('-n, --name <name>', 'Source name')
@@ -251,6 +252,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--prefix <prefix>', 'Bucket path/prefix')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createSource)
+  addCredentialSources(createSourceCommand, [{ flag: 'secret-key', what: 'the S3 secret access key' }])
 
   sources
     .command('show')
@@ -259,7 +261,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(showSource)
 
-  sources
+  const updateSourceCommand = sources
     .command('update')
     .description('Update an S3 source')
     .requiredOption('--id <id>', 'S3 source ID')
@@ -271,6 +273,7 @@ export function registerBackupsCommands(program: Command): void {
     .option('--secret-key <key>', 'New secret access key')
     .option('--prefix <prefix>', 'New bucket path/prefix')
     .action(updateSource)
+  addCredentialSources(updateSourceCommand, [{ flag: 'secret-key', what: 'the S3 secret access key' }])
 
   sources
     .command('remove')

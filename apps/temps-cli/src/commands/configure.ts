@@ -9,6 +9,7 @@ import { promptUrl, promptSelect, promptConfirm, promptPassword } from '../ui/pr
 import { success, info, colors, newline, header, keyValue, icons, box } from '../ui/output.js'
 import { shouldBeInteractive } from '../utils/tty.js'
 import { setupClient, client } from '../lib/api-client.js'
+import { addCredentialSources } from '../lib/value-source.js'
 import { getCurrentUser } from '../api/sdk.gen.js'
 
 interface ConfigureOptions {
@@ -31,6 +32,7 @@ export function registerConfigureCommand(program: Command): void {
     .option('-i, --interactive', 'Force interactive mode even in non-TTY')
     .option('-y, --no-interactive', 'Non-interactive mode (uses defaults for unspecified options)')
     .action(runConfigureWizard)
+  addCredentialSources(configure, [{ flag: 'api-token', what: 'the API token' }])
 
   configure
     .command('get <key>')

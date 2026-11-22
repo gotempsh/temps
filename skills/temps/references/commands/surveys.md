@@ -59,8 +59,8 @@ Create a survey (a draft unless --status active)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `-q, --questions <json|@file|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
-| `-t, --targeting <json|@file|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
+| `-q, --questions <json\|@file\|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
+| `-t, --targeting <json\|@file\|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
 | `--description <text>` | Internal description | - | No |
 | `--status <status>` | draft (default) or active | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -78,8 +78,8 @@ Change a survey; only the options given are changed
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--name <name>` | New name | - | No |
 | `--description <text>` | New description ("" clears it) | - | No |
-| `-q, --questions <json|@file|->` | Replace the questions | - | No |
-| `-t, --targeting <json|@file|->` | Replace when it is shown | - | No |
+| `-q, --questions <json\|@file\|->` | Replace the questions | - | No |
+| `-t, --targeting <json\|@file\|->` | Replace when it is shown | - | No |
 | `--status <status>` | draft, active, paused or completed | - | No |
 | `--json` | Output in JSON format | - | No |
 

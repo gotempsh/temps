@@ -35,8 +35,8 @@ Search log lines across projects (newest first)
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -63,8 +63,8 @@ Distinct values and counts per field for the same filter scope
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -89,8 +89,8 @@ Attribute keys observed in the window, most common first (requires the ClickHous
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -117,8 +117,8 @@ Line counts bucketed over time, optionally split by a label or attribute (requir
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -145,8 +145,8 @@ Group-by aggregation over lines (requires the ClickHouse line index)
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -187,7 +187,7 @@ List the saved searches of a project, pinned first
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `logs saved create`
@@ -199,7 +199,7 @@ Save a log search
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--name <name>` | Name, unique within the project | - | Yes |
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--description <text>` | What the search is for | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
 | `--level <level>` | Log level, repeatable | `` | No |
@@ -224,7 +224,7 @@ Delete a saved search (refused while an alert rule counts it)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 
 #### `logs saved series`
 
@@ -236,7 +236,7 @@ Chart a saved search over time: matching lines per bucket, or a numeric field
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--since <duration>` | Window ending now, e.g. 30m, 6h, 1d (default 1h) | - | No |
 | `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
 | `--metric <spec>` | count (default), or avg\|sum\|max\|p50\|p95\|p99\|count_distinct:<attribute> | - | No |
@@ -260,7 +260,7 @@ List the ingest keys of a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `logs keys create`
@@ -272,7 +272,7 @@ Create an ingest key; the key is printed once
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--name <name>` | Name, e.g. the host or collector | - | Yes |
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--service <name>` | Service label for lines that name none | - | No |
 | `--environment <id>` | Pin lines to an environment id | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -287,4 +287,4 @@ Revoke an ingest key; collectors using it are refused
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |

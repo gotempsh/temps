@@ -40,7 +40,8 @@ report the version gap instead of creating services one by one.
    ones override linked-database defaults. Previews only receive shared
    variables opted in with `--preview`. Names are case-sensitive.
 4. Never put secret values on the command line: omit the value to get a hidden
-   prompt, or pipe it with `--value-stdin`, and mark it `--secret`.
+   prompt, read it with `--value-file <path>`, or pipe it with
+   `--value-stdin`, and mark it `--secret`.
 5. Imports and template creations run on the server. If waiting stops or
    fails, continue with `instantiations show <id> --wait` or
    `instantiations retry <id>`; never re-run the import, which would create

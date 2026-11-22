@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
-import { readFileSync } from 'node:fs'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -17,6 +16,12 @@ import {
   info,
   warning,
 } from '../../ui/output.js'
+import {
+  addValueSourceOptions,
+  resolveValueSource,
+  valueSourceInput,
+  type ValueSourceIO,
+} from '../../lib/value-source.js'
 
 // --- Types ---
 
@@ -38,17 +43,44 @@ interface ListResponse {
 
 // --- Helpers ---
 
-/** Resolve value: if prefixed with @, read from file path */
-export function resolveValue(value: string): string {
-  if (value.startsWith('@')) {
-    const filePath = value.slice(1)
-    try {
-      return readFileSync(filePath, 'utf-8')
-    } catch (e) {
-      throw new Error(`Failed to read file '${filePath}': ${e}`)
-    }
-  }
-  return value
+/** Where the value may come from: `-v`, `--value-file`, `--value-stdin`. */
+interface ValueSourceOptions {
+  value?: string
+  valueFile?: string
+  valueStdin?: boolean
+  literal?: boolean
+  trimTrailingNewline?: boolean
+}
+
+function hasValueSource(options: ValueSourceOptions): boolean {
+  return options.value !== undefined || options.valueFile !== undefined || options.valueStdin === true
+}
+
+/**
+ * Read the secret value from its one source. `-v @path` still reads a file
+ * (with a deprecation note) unless `--literal` is passed. A newline hint is
+ * shown only for env-type secrets: a file-type secret (a PEM key, a JSON
+ * credentials file) normally ends in one.
+ */
+export async function resolveSecretValue(
+  name: string,
+  secretType: string,
+  options: ValueSourceOptions,
+  io?: ValueSourceIO,
+): Promise<string> {
+  const resolved = await resolveValueSource(
+    valueSourceInput(options.value, options as Record<string, unknown>),
+    {
+      subject: `the value for secret ${name}`,
+      flags: { inline: '-v/--value', file: '--value-file', stdin: '--value-stdin' },
+      required: true,
+      legacyAtPath: true,
+      newlineHint: secretType !== 'file',
+    },
+    io,
+  )
+  // required: true guarantees a value.
+  return resolved!.value
 }
 
 // --- Options ---
@@ -57,16 +89,14 @@ interface ListOptions {
   json?: boolean
 }
 
-interface CreateOptions {
+interface CreateOptions extends ValueSourceOptions {
   name: string
-  value: string
   type?: string
   mountPath?: string
   description?: string
 }
 
-interface UpdateOptions {
-  value?: string
+type UpdateOptions = ValueSourceOptions & {
   type?: string
   mountPath?: string
   description?: string
@@ -78,6 +108,15 @@ interface DeleteOptions {
 }
 
 // --- Registration ---
+
+const CREATE_EXAMPLES = `
+Examples:
+  # An env-type secret piped from a password manager
+  $ op read --no-newline op://vault/api/key | temps secrets create -n my_api_key --value-stdin
+
+  # A file-type secret, sent byte-for-byte
+  $ temps secrets create -n gsc_creds -t file -m /home/temps/gsc.json --value-file ./gsc.json
+`
 
 export function registerSecretsCommands(program: Command): void {
   const secrets = program
@@ -94,14 +133,14 @@ export function registerSecretsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listAction)
 
-  secrets
+  const create = secrets
     .command('create')
     .alias('add')
-    .description('Create or update a secret (upsert by name)')
+    .description('Create or update a secret (upsert by name). Prefer --value-file or --value-stdin, which keep the value out of shell history')
     .requiredOption('-n, --name <name>', 'Secret name')
-    .requiredOption(
+    .option(
       '-v, --value <value>',
-      'Secret value. Prefix with @ to read from file (e.g. @./creds.json)',
+      'Secret value on the command line (visible in shell history and `ps`). `-v @path` reading a file is deprecated: use --value-file',
     )
     .option(
       '-t, --type <type>',
@@ -113,20 +152,22 @@ export function registerSecretsCommands(program: Command): void {
       'Absolute path inside sandbox where file-type secret is written (required for --type file)',
     )
     .option('-d, --description <description>', 'Human-readable description')
-    .action(createAction)
+  addValueSourceOptions(create, { what: 'the secret value', legacyAtPath: true })
+  create.addHelpText('after', CREATE_EXAMPLES).action(createAction)
 
-  secrets
+  const update = secrets
     .command('update')
-    .description('Update an existing secret (alias for create — upserts)')
+    .description('Update an existing secret (alias for create — upserts). The value must be re-supplied: the server never returns it')
     .requiredOption('-n, --name <name>', 'Secret name')
     .option(
       '-v, --value <value>',
-      'New value. Prefix with @ to read from file',
+      'New value on the command line (visible in shell history). `-v @path` is deprecated: use --value-file',
     )
     .option('-t, --type <type>', 'Secret type: "env" or "file"')
     .option('-m, --mount-path <path>', 'New mount path (file type only)')
     .option('-d, --description <description>', 'New description')
-    .action(updateAction)
+  addValueSourceOptions(update, { what: 'the new secret value', legacyAtPath: true })
+  update.action(updateAction)
 
   secrets
     .command('delete')
@@ -140,7 +181,8 @@ export function registerSecretsCommands(program: Command): void {
 
 // --- Body builders ---
 
-export function buildCreateSecretBody(options: CreateOptions): Record<string, unknown> {
+/** The type to create, validated before any value is read. */
+export function createSecretType(options: Pick<CreateOptions, 'type' | 'mountPath'>): 'env' | 'file' {
   const secretType = (options.type ?? 'env').toLowerCase()
   if (secretType !== 'env' && secretType !== 'file') {
     throw new Error(`Invalid --type: must be "env" or "file"`)
@@ -148,8 +190,15 @@ export function buildCreateSecretBody(options: CreateOptions): Record<string, un
   if (secretType === 'file' && !options.mountPath) {
     throw new Error('--mount-path is required when --type is "file"')
   }
+  return secretType
+}
 
-  const value = resolveValue(options.value)
+/** `value` is the already-resolved secret value, never a `@path`. */
+export function buildCreateSecretBody(
+  options: Pick<CreateOptions, 'name' | 'type' | 'mountPath' | 'description'> & { value: string },
+): Record<string, unknown> {
+  const secretType = createSecretType(options)
+  const value = options.value
 
   const body: Record<string, unknown> = {
     name: options.name,
@@ -161,26 +210,35 @@ export function buildCreateSecretBody(options: CreateOptions): Record<string, un
   return body
 }
 
-export function buildUpdateSecretBody(
-  options: UpdateOptions & { name: string },
-  current: SecretResponse,
-): Record<string, unknown> {
-  // Value must always be supplied on upsert since the server doesn't return it.
-  if (options.value === undefined) {
-    throw new Error(
-      '--value is required when updating (the server does not echo the existing value). Re-provide it.',
-    )
-  }
+const UPDATE_NEEDS_VALUE =
+  'A value is required when updating (the server does not echo the existing value). ' +
+  'Re-provide it with --value-file <path>, --value-stdin, or -v/--value.'
 
+/** The type after the update, validated before any value is read. */
+export function updateSecretType(options: Pick<UpdateOptions, 'type'>, current: SecretResponse): 'env' | 'file' {
   const secretType = (options.type ?? current.secret_type).toLowerCase()
   if (secretType !== 'env' && secretType !== 'file') {
     throw new Error(`Invalid --type: must be "env" or "file"`)
   }
+  return secretType
+}
+
+/** `options.value` is the already-resolved secret value, never a `@path`. */
+export function buildUpdateSecretBody(
+  options: Pick<UpdateOptions, 'type' | 'mountPath' | 'description'> & { name: string; value?: string },
+  current: SecretResponse,
+): Record<string, unknown> {
+  // Value must always be supplied on upsert since the server doesn't return it.
+  if (options.value === undefined) {
+    throw new Error(UPDATE_NEEDS_VALUE)
+  }
+
+  const secretType = updateSecretType(options, current)
 
   const body: Record<string, unknown> = {
     name: options.name,
     secret_type: secretType,
-    value: resolveValue(options.value),
+    value: options.value,
   }
   const mountPath = options.mountPath ?? current.mount_path ?? undefined
   if (mountPath) body.mount_path = mountPath
@@ -218,10 +276,10 @@ async function listAction(options: ListOptions): Promise<void> {
     info('No secrets defined yet.')
     info('Examples:')
     info(
-      '  env:  temps secrets create -n my_api_key -v "sk-..."',
+      '  env:  op read --no-newline op://vault/api/key | temps secrets create -n my_api_key --value-stdin',
     )
     info(
-      '  file: temps secrets create -n gsc_creds -t file -m gsc.json -v @./gsc.json',
+      '  file: temps secrets create -n gsc_creds -t file -m gsc.json --value-file ./gsc.json',
     )
     newline()
     return
@@ -255,10 +313,14 @@ async function listAction(options: ListOptions): Promise<void> {
 }
 
 async function createAction(options: CreateOptions): Promise<void> {
+  // Validate and read the value before authenticating, so a bad file or an
+  // empty pipe fails fast and without a network round trip.
+  const secretType = createSecretType(options)
+  const value = await resolveSecretValue(options.name, secretType, options)
+  const body = buildCreateSecretBody({ ...options, value })
+
   await requireAuth()
   await setupClient()
-
-  const body = buildCreateSecretBody(options)
 
   const secret = await withSpinner('Saving secret...', async () => {
     const { data, error } = await client.post({
@@ -289,22 +351,25 @@ async function createAction(options: CreateOptions): Promise<void> {
 }
 
 async function updateAction(options: UpdateOptions & { name: string }): Promise<void> {
-  await requireAuth()
-  await setupClient()
-
   // The API is upsert-based, so update simply requires the full body.
   // Fetch current state first so partial updates don't clobber other fields.
   if (
-    options.value === undefined &&
+    !hasValueSource(options) &&
     options.type === undefined &&
     options.mountPath === undefined &&
     options.description === undefined
   ) {
     warning(
-      'No fields to update. Provide at least one of --value, --type, --mount-path, or --description',
+      'No fields to update. Provide at least one of --value-file, --value-stdin, --value, --type, --mount-path, or --description',
     )
     return
   }
+  if (!hasValueSource(options)) {
+    throw new Error(UPDATE_NEEDS_VALUE)
+  }
+
+  await requireAuth()
+  await setupClient()
 
   const current = await withSpinner('Fetching current secret...', async () => {
     const { data, error } = await client.get({ url: '/settings/secrets' })
@@ -315,7 +380,8 @@ async function updateAction(options: UpdateOptions & { name: string }): Promise<
     return found
   })
 
-  const body = buildUpdateSecretBody(options, current)
+  const value = await resolveSecretValue(options.name, updateSecretType(options, current), options)
+  const body = buildUpdateSecretBody({ ...options, value }, current)
 
   const secret = await withSpinner('Updating secret...', async () => {
     const { data, error } = await client.post({

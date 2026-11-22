@@ -115,16 +115,26 @@ export async function promptSelect<T = string>(options: SelectPromptOptions<T>):
   return result
 }
 
-export async function promptCheckbox<T = string>(options: CheckboxPromptOptions<T>): Promise<T[]> {
-  const result = await checkbox({
-    message: options.message,
-    choices: options.choices,
-    required: options.required,
-    // Note: validate is not passed as inquirer expects different signature
-    theme: {
-      prefix: colors.primary('?'),
+/**
+ * `context` lets a caller prompt on another stream than stdin, e.g. the
+ * controlling terminal when stdin carries piped data.
+ */
+export async function promptCheckbox<T = string>(
+  options: CheckboxPromptOptions<T>,
+  context?: { input: NodeJS.ReadableStream; output: NodeJS.WritableStream }
+): Promise<T[]> {
+  const result = await checkbox(
+    {
+      message: options.message,
+      choices: options.choices,
+      required: options.required,
+      // Note: validate is not passed as inquirer expects different signature
+      theme: {
+        prefix: colors.primary('?'),
+      },
     },
-  })
+    context
+  )
   return result
 }
 

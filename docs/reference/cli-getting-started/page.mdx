@@ -238,6 +238,8 @@ temps projects delete --project my-app
 
 ### Managing Environment Variables
 
+Pass secret values with `--value-file <path>` or `--value-stdin` rather than on the command line, where they end up in shell history, `ps` output and CI logs. The value is sent byte-for-byte; add `--trim-trailing-newline` when a file ends with a newline the value should not have (`project-groups vars set` is the exception: it always drops one final newline). The CLI never prints the value, but shell tracing (`set -x`) can echo an expanded secret into CI logs, so turn it off around secrets. Credential flags on other commands (`--token`, `--password`, `--api-key`, `--secret-key`, ...) take `--<flag>-file` and `--<flag>-stdin` the same way; `templates create` takes secret variables as `--secret-file KEY=PATH` (`KEY=-` reads stdin).
+
 <CodeGroup title="Environment variable commands">
 
 ```bash {{ title: 'bunx' }}
@@ -246,6 +248,10 @@ bunx @temps-sdk/cli environments vars list --project my-app
 
 # Set an environment variable (prompts for the value)
 bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
+
+# Store a secret from a file, or pipe it from a password manager
+bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read --no-newline op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # Import from .env file
 bunx @temps-sdk/cli environments vars import --project my-app .env --environments production
@@ -258,6 +264,10 @@ npx @temps-sdk/cli environments vars list --project my-app
 # Set an environment variable (prompts for the value)
 npx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
 
+# Store a secret from a file, or pipe it from a password manager
+npx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read --no-newline op://vault/db/password | npx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
+
 # Import from .env file
 npx @temps-sdk/cli environments vars import --project my-app .env --environments production
 ```
@@ -268,6 +278,10 @@ temps environments vars list --project my-app
 
 # Set an environment variable (prompts for the value)
 temps environments vars set --project my-app DATABASE_URL --environments production
+
+# Store a secret from a file, or pipe it from a password manager
+temps environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read --no-newline op://vault/db/password | temps environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # Import from .env file
 temps environments vars import --project my-app .env --environments production
