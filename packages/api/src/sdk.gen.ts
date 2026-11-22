@@ -11,12 +11,16 @@ import {
   type RequestResult,
   type ServerSentEventsResult,
   type TDataShape,
+  urlSearchParamsBodySerializer,
 } from "./client";
 import { client } from "./client.gen";
 import type {
   AcceptBlueprintVersionData,
   AcceptBlueprintVersionErrors,
   AcceptBlueprintVersionResponses,
+  AccessCapabilityData,
+  AccessCapabilityErrors,
+  AccessCapabilityResponses,
   AckNodeStateData,
   AckNodeStateErrors,
   AckNodeStateResponses,
@@ -155,6 +159,9 @@ import type {
   AppendCiBuildLogsData,
   AppendCiBuildLogsErrors,
   AppendCiBuildLogsResponses,
+  AppGetWorkflowRunData,
+  AppGetWorkflowRunErrors,
+  AppGetWorkflowRunResponses,
   ApplyDomainDeliveryBindingData,
   ApplyDomainDeliveryBindingErrors,
   ApplyDomainDeliveryBindingResponses,
@@ -164,9 +171,30 @@ import type {
   ApplyHostnameModeData,
   ApplyHostnameModeErrors,
   ApplyHostnameModeResponses,
+  ApplyServiceHealthcheckData,
+  ApplyServiceHealthcheckErrors,
+  ApplyServiceHealthcheckResponses,
+  ApproveSandboxServiceData,
+  ApproveSandboxServiceErrors,
+  ApproveSandboxServiceResponses,
+  ApproveServiceGrantData,
+  ApproveServiceGrantErrors,
+  ApproveServiceGrantResponses,
   ApproveShieldProposalData,
   ApproveShieldProposalErrors,
   ApproveShieldProposalResponses,
+  AppSendGrantedEventData,
+  AppSendGrantedEventErrors,
+  AppSendGrantedEventResponses,
+  AppSendWorkflowEventData,
+  AppSendWorkflowEventErrors,
+  AppSendWorkflowEventResponses,
+  AppStartGrantedWorkflowData,
+  AppStartGrantedWorkflowErrors,
+  AppStartGrantedWorkflowResponses,
+  AppStartWorkflowRunData,
+  AppStartWorkflowRunErrors,
+  AppStartWorkflowRunResponses,
   ArchiveApplicationData,
   ArchiveApplicationErrors,
   ArchiveApplicationResponses,
@@ -240,6 +268,9 @@ import type {
   BlobUpdateSettingsData,
   BlobUpdateSettingsErrors,
   BlobUpdateSettingsResponses,
+  BulkUpdateErrorGroupsData,
+  BulkUpdateErrorGroupsErrors,
+  BulkUpdateErrorGroupsResponses,
   BulkUpdateProjectAlarmsData,
   BulkUpdateProjectAlarmsErrors,
   BulkUpdateProjectAlarmsResponses,
@@ -288,6 +319,15 @@ import type {
   CancelScheduleRunData,
   CancelScheduleRunErrors,
   CancelScheduleRunResponses,
+  CancelStatusPageMaintenanceData,
+  CancelStatusPageMaintenanceErrors,
+  CancelStatusPageMaintenanceResponses,
+  CancelWorkflowRunData,
+  CancelWorkflowRunErrors,
+  CancelWorkflowRunResponses,
+  ChangeChatPluginWatchData,
+  ChangeChatPluginWatchErrors,
+  ChangeChatPluginWatchResponses,
   ChangePasswordSelfData,
   ChangePasswordSelfErrors,
   ChangePasswordSelfResponses,
@@ -365,12 +405,18 @@ import type {
   CloseAutofixIncidentData,
   CloseAutofixIncidentErrors,
   CloseAutofixIncidentResponses,
+  CloseWorkflowDevData,
+  CloseWorkflowDevErrors,
+  CloseWorkflowDevResponses,
   ClusterDnsStatusData,
   ClusterDnsStatusErrors,
   ClusterDnsStatusResponses,
   ClusterNetworkGetData,
   ClusterNetworkGetErrors,
   ClusterNetworkGetResponses,
+  ClusterNetworkIdChangeData,
+  ClusterNetworkIdChangeErrors,
+  ClusterNetworkIdChangeResponses,
   ClusterNetworkUpdateData,
   ClusterNetworkUpdateErrors,
   ClusterNetworkUpdateResponses,
@@ -395,6 +441,12 @@ import type {
   CompleteCiBuildData,
   CompleteCiBuildErrors,
   CompleteCiBuildResponses,
+  CompleteConnectionReauthorizationData,
+  CompleteConnectionReauthorizationErrors,
+  CompleteConnectionReauthorizationResponses,
+  ConfigureWorkflowDevData,
+  ConfigureWorkflowDevErrors,
+  ConfigureWorkflowDevResponses,
   ConfirmPendingActionData,
   ConfirmPendingActionErrors,
   ConfirmPendingActionResponses,
@@ -413,9 +465,33 @@ import type {
   ControlApplicationWorkspaceData,
   ControlApplicationWorkspaceErrors,
   ControlApplicationWorkspaceResponses,
+  CreateAccessBundleData,
+  CreateAccessBundleErrors,
+  CreateAccessBundleGeneralData,
+  CreateAccessBundleGeneralErrors,
+  CreateAccessBundleGeneralResponses,
+  CreateAccessBundleResponses,
   CreateAccessProviderData,
   CreateAccessProviderErrors,
   CreateAccessProviderResponses,
+  CreateAccessServiceData,
+  CreateAccessServiceErrors,
+  CreateAccessServiceGeneralData,
+  CreateAccessServiceGeneralErrors,
+  CreateAccessServiceGeneralResponses,
+  CreateAccessServiceResponses,
+  CreateAccessSessionData,
+  CreateAccessSessionErrors,
+  CreateAccessSessionGeneralData,
+  CreateAccessSessionGeneralErrors,
+  CreateAccessSessionGeneralResponses,
+  CreateAccessSessionResponses,
+  CreateAccessVaultData,
+  CreateAccessVaultErrors,
+  CreateAccessVaultGeneralData,
+  CreateAccessVaultGeneralErrors,
+  CreateAccessVaultGeneralResponses,
+  CreateAccessVaultResponses,
   CreateAgentData,
   CreateAgentErrors,
   CreateAgentResponses,
@@ -425,6 +501,9 @@ import type {
   CreateAlertRuleData,
   CreateAlertRuleErrors,
   CreateAlertRuleResponses,
+  CreateAnalyticsGoalData,
+  CreateAnalyticsGoalErrors,
+  CreateAnalyticsGoalResponses,
   CreateAnalyticsIngestKeyData,
   CreateAnalyticsIngestKeyErrors,
   CreateAnalyticsIngestKeyResponses,
@@ -503,6 +582,18 @@ import type {
   CreateEnvironmentVariableData,
   CreateEnvironmentVariableErrors,
   CreateEnvironmentVariableResponses,
+  CreateErrorGroupCommentData,
+  CreateErrorGroupCommentErrors,
+  CreateErrorGroupCommentResponses,
+  CreateErrorGroupIssueData,
+  CreateErrorGroupIssueErrors,
+  CreateErrorGroupIssueResponses,
+  CreateErrorInboundFilterData,
+  CreateErrorInboundFilterErrors,
+  CreateErrorInboundFilterResponses,
+  CreateErrorSavedSearchData,
+  CreateErrorSavedSearchErrors,
+  CreateErrorSavedSearchResponses,
   CreateFacetData,
   CreateFacetErrors,
   CreateFacetResponses,
@@ -560,9 +651,18 @@ import type {
   CreateIngressLoginGrantData,
   CreateIngressLoginGrantErrors,
   CreateIngressLoginGrantResponses,
+  CreateInternalAccessGrantData,
+  CreateInternalAccessGrantErrors,
+  CreateInternalAccessGrantResponses,
+  CreateInternalAccessSandboxGrantData,
+  CreateInternalAccessSandboxGrantErrors,
+  CreateInternalAccessSandboxGrantResponses,
   CreateIpAccessControlData,
   CreateIpAccessControlErrors,
   CreateIpAccessControlResponses,
+  CreateLogIngestKeyData,
+  CreateLogIngestKeyErrors,
+  CreateLogIngestKeyResponses,
   CreateMcpData,
   CreateMcpErrors,
   CreateMcpResponses,
@@ -647,6 +747,9 @@ import type {
   CreateSandboxPreviewSessionErrors,
   CreateSandboxPreviewSessionResponses,
   CreateSandboxResponses,
+  CreateSavedSearchData,
+  CreateSavedSearchErrors,
+  CreateSavedSearchResponses,
   CreateServiceData,
   CreateServiceErrors,
   CreateServiceResponses,
@@ -664,10 +767,25 @@ import type {
   CreateSnapshotResponses,
   CreateStatusPageData,
   CreateStatusPageErrors,
+  CreateStatusPageMaintenanceData,
+  CreateStatusPageMaintenanceErrors,
+  CreateStatusPageMaintenanceResponses,
   CreateStatusPageResponses,
+  CreateStatusPageWebhookData,
+  CreateStatusPageWebhookErrors,
+  CreateStatusPageWebhookResponses,
+  CreateSurveyData,
+  CreateSurveyErrors,
+  CreateSurveyResponses,
+  CreateTargetMonitorData,
+  CreateTargetMonitorErrors,
+  CreateTargetMonitorResponses,
   CreateTeamData,
   CreateTeamErrors,
   CreateTeamResponses,
+  CreateTelegramProviderData,
+  CreateTelegramProviderErrors,
+  CreateTelegramProviderResponses,
   CreateThreadArtifactData,
   CreateThreadArtifactErrors,
   CreateThreadArtifactResponses,
@@ -677,12 +795,18 @@ import type {
   CreateUserData,
   CreateUserErrors,
   CreateUserResponses,
+  CreateVaultLinkData,
+  CreateVaultLinkErrors,
+  CreateVaultLinkResponses,
   CreateWebhookData,
   CreateWebhookErrors,
   CreateWebhookProviderData,
   CreateWebhookProviderErrors,
   CreateWebhookProviderResponses,
   CreateWebhookResponses,
+  CreateWorkflowGrantData,
+  CreateWorkflowGrantErrors,
+  CreateWorkflowGrantResponses,
   DeactivateApiKeyData,
   DeactivateApiKeyErrors,
   DeactivateApiKeyResponses,
@@ -698,9 +822,18 @@ import type {
   DecideReachabilityConflictData,
   DecideReachabilityConflictErrors,
   DecideReachabilityConflictResponses,
+  DeleteAccessBundleGeneralData,
+  DeleteAccessBundleGeneralErrors,
+  DeleteAccessBundleGeneralResponses,
   DeleteAccessProviderData,
   DeleteAccessProviderErrors,
   DeleteAccessProviderResponses,
+  DeleteAccessServiceGeneralData,
+  DeleteAccessServiceGeneralErrors,
+  DeleteAccessServiceGeneralResponses,
+  DeleteAccessVaultGeneralData,
+  DeleteAccessVaultGeneralErrors,
+  DeleteAccessVaultGeneralResponses,
   DeleteAgentData,
   DeleteAgentErrors,
   DeleteAgentResponses,
@@ -710,6 +843,9 @@ import type {
   DeleteAlertRuleData,
   DeleteAlertRuleErrors,
   DeleteAlertRuleResponses,
+  DeleteAnalyticsGoalData,
+  DeleteAnalyticsGoalErrors,
+  DeleteAnalyticsGoalResponses,
   DeleteApiKeyData,
   DeleteApiKeyErrors,
   DeleteApiKeyResponses,
@@ -767,6 +903,18 @@ import type {
   DeleteEnvironmentVariableData,
   DeleteEnvironmentVariableErrors,
   DeleteEnvironmentVariableResponses,
+  DeleteErrorAttachmentData,
+  DeleteErrorAttachmentErrors,
+  DeleteErrorAttachmentResponses,
+  DeleteErrorGroupCommentData,
+  DeleteErrorGroupCommentErrors,
+  DeleteErrorGroupCommentResponses,
+  DeleteErrorInboundFilterData,
+  DeleteErrorInboundFilterErrors,
+  DeleteErrorInboundFilterResponses,
+  DeleteErrorSavedSearchData,
+  DeleteErrorSavedSearchErrors,
+  DeleteErrorSavedSearchResponses,
   DeleteExternalImageData,
   DeleteExternalImageErrors,
   DeleteExternalImageResponses,
@@ -800,6 +948,12 @@ import type {
   DeleteIngressConnectorData,
   DeleteIngressConnectorErrors,
   DeleteIngressConnectorResponses,
+  DeleteInternalAccessGrantData,
+  DeleteInternalAccessGrantErrors,
+  DeleteInternalAccessGrantResponses,
+  DeleteInternalAccessSandboxGrantData,
+  DeleteInternalAccessSandboxGrantErrors,
+  DeleteInternalAccessSandboxGrantResponses,
   DeleteIpAccessControlData,
   DeleteIpAccessControlErrors,
   DeleteIpAccessControlResponses,
@@ -867,6 +1021,9 @@ import type {
   DeleteS3SourceData,
   DeleteS3SourceErrors,
   DeleteS3SourceResponses,
+  DeleteSavedSearchData,
+  DeleteSavedSearchErrors,
+  DeleteSavedSearchResponses,
   DeleteScanData,
   DeleteScanErrors,
   DeleteScanResponses,
@@ -894,6 +1051,15 @@ import type {
   DeleteStatusPageData,
   DeleteStatusPageErrors,
   DeleteStatusPageResponses,
+  DeleteStatusPageSubscriberData,
+  DeleteStatusPageSubscriberErrors,
+  DeleteStatusPageSubscriberResponses,
+  DeleteStatusPageWebhookData,
+  DeleteStatusPageWebhookErrors,
+  DeleteStatusPageWebhookResponses,
+  DeleteSurveyData,
+  DeleteSurveyErrors,
+  DeleteSurveyResponses,
   DeleteTeamData,
   DeleteTeamErrors,
   DeleteTeamResponses,
@@ -903,9 +1069,15 @@ import type {
   DeleteUserData,
   DeleteUserErrors,
   DeleteUserResponses,
+  DeleteVaultLinkData,
+  DeleteVaultLinkErrors,
+  DeleteVaultLinkResponses,
   DeleteWebhookData,
   DeleteWebhookErrors,
   DeleteWebhookResponses,
+  DeleteWorkflowRunData,
+  DeleteWorkflowRunErrors,
+  DeleteWorkflowRunResponses,
   DeployApplicationWorkspaceProjectData,
   DeployApplicationWorkspaceProjectErrors,
   DeployApplicationWorkspaceProjectResponses,
@@ -948,6 +1120,9 @@ import type {
   DetectSecretCredentialData,
   DetectSecretCredentialErrors,
   DetectSecretCredentialResponses,
+  DiagnoseWorkflowRunData,
+  DiagnoseWorkflowRunErrors,
+  DiagnoseWorkflowRunResponses,
   DisableBackupScheduleData,
   DisableBackupScheduleErrors,
   DisableBackupScheduleResponses,
@@ -977,6 +1152,9 @@ import type {
   DismissEnvironmentVariableSecretSuggestionData,
   DismissEnvironmentVariableSecretSuggestionErrors,
   DismissEnvironmentVariableSecretSuggestionResponses,
+  DnsTrafficData,
+  DnsTrafficErrors,
+  DnsTrafficResponses,
   DomainData,
   DomainErrors,
   DomainResponses,
@@ -1021,6 +1199,12 @@ import type {
   EvaluateEdgeRulesData,
   EvaluateEdgeRulesErrors,
   EvaluateEdgeRulesResponses,
+  EvaluateFlagData,
+  EvaluateFlagErrors,
+  EvaluateFlagResponses,
+  EvaluatePublicFlagsData,
+  EvaluatePublicFlagsErrors,
+  EvaluatePublicFlagsResponses,
   EvictNodeSandboxesData,
   EvictNodeSandboxesErrors,
   EvictNodeSandboxesResponses,
@@ -1036,6 +1220,9 @@ import type {
   ExecuteImportData,
   ExecuteImportErrors,
   ExecuteImportResponses,
+  ExportStatusPageSubscribersData,
+  ExportStatusPageSubscribersErrors,
+  ExportStatusPageSubscribersResponses,
   ExtendTimeoutData,
   ExtendTimeoutErrors,
   ExtendTimeoutResponses,
@@ -1093,6 +1280,9 @@ import type {
   FindConversationData,
   FindConversationErrors,
   FindConversationResponses,
+  GeneralAccessCapabilityData,
+  GeneralAccessCapabilityErrors,
+  GeneralAccessCapabilityResponses,
   GenerateJoinTokenData,
   GenerateJoinTokenErrors,
   GenerateJoinTokenResponses,
@@ -1102,6 +1292,24 @@ import type {
   GetAccessInfoData,
   GetAccessInfoErrors,
   GetAccessInfoResponses,
+  GetAccessServiceData,
+  GetAccessServiceErrors,
+  GetAccessServiceGeneralData,
+  GetAccessServiceGeneralErrors,
+  GetAccessServiceGeneralResponses,
+  GetAccessServiceResponses,
+  GetAccessSessionData,
+  GetAccessSessionErrors,
+  GetAccessSessionGeneralData,
+  GetAccessSessionGeneralErrors,
+  GetAccessSessionGeneralResponses,
+  GetAccessSessionResponses,
+  GetAccessVaultData,
+  GetAccessVaultErrors,
+  GetAccessVaultGeneralData,
+  GetAccessVaultGeneralErrors,
+  GetAccessVaultGeneralResponses,
+  GetAccessVaultResponses,
   GetActiveVisitorsData,
   GetActiveVisitorsErrors,
   GetActiveVisitorsResponses,
@@ -1128,6 +1336,9 @@ import type {
   GetAiAgentTimelineData,
   GetAiAgentTimelineErrors,
   GetAiAgentTimelineResponses,
+  GetAiHarnessStatusData,
+  GetAiHarnessStatusErrors,
+  GetAiHarnessStatusResponses,
   GetAiPageBreakdownData,
   GetAiPageBreakdownErrors,
   GetAiPageBreakdownResponses,
@@ -1158,6 +1369,18 @@ import type {
   GetAnalyticsEventsCountData,
   GetAnalyticsEventsCountErrors,
   GetAnalyticsEventsCountResponses,
+  GetAnalyticsGoalBreakdownData,
+  GetAnalyticsGoalBreakdownErrors,
+  GetAnalyticsGoalBreakdownResponses,
+  GetAnalyticsGoalData,
+  GetAnalyticsGoalErrors,
+  GetAnalyticsGoalResponses,
+  GetAnalyticsGoalStatsData,
+  GetAnalyticsGoalStatsErrors,
+  GetAnalyticsGoalStatsResponses,
+  GetAnalyticsIdentitySettingsData,
+  GetAnalyticsIdentitySettingsErrors,
+  GetAnalyticsIdentitySettingsResponses,
   GetAnalyticsIngestKeyEndpointData,
   GetAnalyticsIngestKeyEndpointErrors,
   GetAnalyticsIngestKeyEndpointResponses,
@@ -1240,6 +1463,7 @@ import type {
   GetBulkActivationJobErrors,
   GetBulkActivationJobResponses,
   GetCertificateMethodsData,
+  GetCertificateMethodsErrors,
   GetCertificateMethodsResponses,
   GetCertificateSettingsData,
   GetCertificateSettingsErrors,
@@ -1399,6 +1623,9 @@ import type {
   GetDeploymentOperationStatusData,
   GetDeploymentOperationStatusErrors,
   GetDeploymentOperationStatusResponses,
+  GetDeploymentRegressionsData,
+  GetDeploymentRegressionsErrors,
+  GetDeploymentRegressionsResponses,
   GetDeploymentResponses,
   GetDeploymentTokenData,
   GetDeploymentTokenErrors,
@@ -1484,6 +1711,12 @@ import type {
   GetEnvironmentVariableValueData,
   GetEnvironmentVariableValueErrors,
   GetEnvironmentVariableValueResponses,
+  GetErrorAttachmentContentData,
+  GetErrorAttachmentContentErrors,
+  GetErrorAttachmentContentResponses,
+  GetErrorAttachmentUsageData,
+  GetErrorAttachmentUsageErrors,
+  GetErrorAttachmentUsageResponses,
   GetErrorDashboardStatsData,
   GetErrorDashboardStatsErrors,
   GetErrorDashboardStatsResponses,
@@ -1493,6 +1726,15 @@ import type {
   GetErrorGroupData,
   GetErrorGroupErrors,
   GetErrorGroupResponses,
+  GetErrorGroupSuspectCommitsData,
+  GetErrorGroupSuspectCommitsErrors,
+  GetErrorGroupSuspectCommitsResponses,
+  GetErrorSavedSearchData,
+  GetErrorSavedSearchErrors,
+  GetErrorSavedSearchResponses,
+  GetErrorSourceControlData,
+  GetErrorSourceControlErrors,
+  GetErrorSourceControlResponses,
   GetErrorStatsData,
   GetErrorStatsErrors,
   GetErrorStatsResponses,
@@ -1505,6 +1747,9 @@ import type {
   GetEventEntriesData,
   GetEventEntriesErrors,
   GetEventEntriesResponses,
+  GetEventPropertiesData,
+  GetEventPropertiesErrors,
+  GetEventPropertiesResponses,
   GetEventsCountData,
   GetEventsCountErrors,
   GetEventsCountResponses,
@@ -1595,6 +1840,9 @@ import type {
   GetGroupRepositoryData,
   GetGroupRepositoryErrors,
   GetGroupRepositoryResponses,
+  GetHealthcheckDefaultsData,
+  GetHealthcheckDefaultsErrors,
+  GetHealthcheckDefaultsResponses,
   GetHealthData,
   GetHealthErrors,
   GetHealthResponses,
@@ -1637,6 +1885,9 @@ import type {
   GetInstantiationData,
   GetInstantiationErrors,
   GetInstantiationResponses,
+  GetInvocationKeyData,
+  GetInvocationKeyErrors,
+  GetInvocationKeyResponses,
   GetIpAccessControlData,
   GetIpAccessControlErrors,
   GetIpAccessControlResponses,
@@ -1667,6 +1918,9 @@ import type {
   GetLogContextData,
   GetLogContextErrors,
   GetLogContextResponses,
+  GetManagedCaCertificateData,
+  GetManagedCaCertificateErrors,
+  GetManagedCaCertificateResponses,
   GetMcpData,
   GetMcpErrors,
   GetMcpResponses,
@@ -1675,6 +1929,9 @@ import type {
   GetMetricsOverTimeResponses,
   GetMonitorData,
   GetMonitorErrors,
+  GetMonitorProbeLocationsData,
+  GetMonitorProbeLocationsErrors,
+  GetMonitorProbeLocationsResponses,
   GetMonitorResponses,
   GetNotificationDeliveryCoverageData,
   GetNotificationDeliveryCoverageErrors,
@@ -1688,9 +1945,18 @@ import type {
   GetOnDemandCertStatusData,
   GetOnDemandCertStatusErrors,
   GetOnDemandCertStatusResponses,
+  GetOperationBreakdownData,
+  GetOperationBreakdownErrors,
+  GetOperationBreakdownResponses,
+  GetOperationTrendData,
+  GetOperationTrendErrors,
+  GetOperationTrendResponses,
   GetOrCreateDsnData,
   GetOrCreateDsnErrors,
   GetOrCreateDsnResponses,
+  GetPageBackendData,
+  GetPageBackendErrors,
+  GetPageBackendResponses,
   GetPageFlowData,
   GetPageFlowErrors,
   GetPageFlowResponses,
@@ -1712,6 +1978,9 @@ import type {
   GetPendingActionData,
   GetPendingActionErrors,
   GetPendingActionResponses,
+  GetPerformanceIssueStatusData,
+  GetPerformanceIssueStatusErrors,
+  GetPerformanceIssueStatusResponses,
   GetPerformanceMetricsData,
   GetPerformanceMetricsErrors,
   GetPerformanceMetricsResponses,
@@ -1733,6 +2002,9 @@ import type {
   GetPlatformInfoData,
   GetPlatformInfoErrors,
   GetPlatformInfoResponses,
+  GetPluginAiToolsData,
+  GetPluginAiToolsErrors,
+  GetPluginAiToolsResponses,
   GetPostgresWalHealthData,
   GetPostgresWalHealthErrors,
   GetPostgresWalHealthResponses,
@@ -1791,6 +2063,9 @@ import type {
   GetProjectGroupMembershipErrors,
   GetProjectGroupMembershipResponses,
   GetProjectGroupResponses,
+  GetProjectIngestSetupData,
+  GetProjectIngestSetupErrors,
+  GetProjectIngestSetupResponses,
   GetProjectIpAccessData,
   GetProjectIpAccessErrors,
   GetProjectIpAccessResponses,
@@ -1872,6 +2147,9 @@ import type {
   GetPublicRepositoryResponses,
   GetPublicStatusPageData,
   GetPublicStatusPageErrors,
+  GetPublicStatusPageFeedData,
+  GetPublicStatusPageFeedErrors,
+  GetPublicStatusPageFeedResponses,
   GetPublicStatusPageJsonData,
   GetPublicStatusPageJsonErrors,
   GetPublicStatusPageJsonResponses,
@@ -1894,6 +2172,9 @@ import type {
   GetRecordOwnershipData,
   GetRecordOwnershipErrors,
   GetRecordOwnershipResponses,
+  GetReleaseHealthSeriesData,
+  GetReleaseHealthSeriesErrors,
+  GetReleaseHealthSeriesResponses,
   GetRemoteExternalImageData,
   GetRemoteExternalImageErrors,
   GetRemoteExternalImageResponses,
@@ -1944,6 +2225,9 @@ import type {
   GetRuleResponses,
   GetRunData,
   GetRunErrors,
+  GetRunJournalData,
+  GetRunJournalErrors,
+  GetRunJournalResponses,
   GetRunResponses,
   GetRuntimeHealthData,
   GetRuntimeHealthErrors,
@@ -1951,21 +2235,33 @@ import type {
   GetRunWithLogsData,
   GetRunWithLogsErrors,
   GetRunWithLogsResponses,
-  GetS3CredentialsData,
-  GetS3CredentialsErrors,
-  GetS3CredentialsResponses,
   GetS3SourceData,
   GetS3SourceErrors,
   GetS3SourceResponses,
+  GetSandboxCreationBySandboxData,
+  GetSandboxCreationBySandboxErrors,
+  GetSandboxCreationBySandboxResponses,
+  GetSandboxCreationData,
+  GetSandboxCreationErrors,
+  GetSandboxCreationResponses,
   GetSandboxData,
   GetSandboxErrors,
+  GetSandboxImagePreparationData,
+  GetSandboxImagePreparationErrors,
+  GetSandboxImagePreparationResponses,
   GetSandboxPlacementData,
   GetSandboxPlacementErrors,
   GetSandboxPlacementResponses,
+  GetSandboxResourceDefaultsData,
+  GetSandboxResourceDefaultsErrors,
+  GetSandboxResourceDefaultsResponses,
   GetSandboxResponses,
   GetSandboxStatusData,
   GetSandboxStatusErrors,
   GetSandboxStatusResponses,
+  GetSavedSearchData,
+  GetSavedSearchErrors,
+  GetSavedSearchResponses,
   GetScanByDeploymentData,
   GetScanByDeploymentErrors,
   GetScanByDeploymentResponses,
@@ -1986,6 +2282,9 @@ import type {
   GetServiceEnvironmentVariablesErrors,
   GetServiceEnvironmentVariablesResponses,
   GetServiceErrors,
+  GetServiceHealthcheckData,
+  GetServiceHealthcheckErrors,
+  GetServiceHealthcheckResponses,
   GetServiceHealthStatusData,
   GetServiceHealthStatusErrors,
   GetServiceHealthStatusResponses,
@@ -2005,6 +2304,9 @@ import type {
   GetServiceStatsData,
   GetServiceStatsErrors,
   GetServiceStatsResponses,
+  GetServiceTlsData,
+  GetServiceTlsErrors,
+  GetServiceTlsResponses,
   GetServiceTypeParametersData,
   GetServiceTypeParametersErrors,
   GetServiceTypeParametersResponses,
@@ -2052,10 +2354,25 @@ import type {
   GetStatusOverviewResponses,
   GetStatusPageData,
   GetStatusPageErrors,
+  GetStatusPageMaintenanceData,
+  GetStatusPageMaintenanceErrors,
+  GetStatusPageMaintenanceResponses,
+  GetStatusPagePasswordData,
+  GetStatusPagePasswordErrors,
+  GetStatusPagePasswordResponses,
   GetStatusPageResponses,
+  GetStatusPageSubscriptionsData,
+  GetStatusPageSubscriptionsErrors,
+  GetStatusPageSubscriptionsResponses,
   GetSuggestionDefaultData,
   GetSuggestionDefaultErrors,
   GetSuggestionDefaultResponses,
+  GetSurveyData,
+  GetSurveyErrors,
+  GetSurveyResponses,
+  GetSurveyResultsData,
+  GetSurveyResultsErrors,
+  GetSurveyResultsResponses,
   GetSystemAlarmsSummaryData,
   GetSystemAlarmsSummaryErrors,
   GetSystemAlarmsSummaryResponses,
@@ -2131,6 +2448,9 @@ import type {
   GetUserPendingActionData,
   GetUserPendingActionErrors,
   GetUserPendingActionResponses,
+  GetVaultEligibilityData,
+  GetVaultEligibilityErrors,
+  GetVaultEligibilityResponses,
   GetVisibleCustomDomainByHostnameData,
   GetVisibleCustomDomainByHostnameErrors,
   GetVisibleCustomDomainByHostnameResponses,
@@ -2164,6 +2484,18 @@ import type {
   GetWebhookData,
   GetWebhookErrors,
   GetWebhookResponses,
+  GetWorkflowCredentialData,
+  GetWorkflowCredentialErrors,
+  GetWorkflowCredentialResponses,
+  GetWorkflowRunData,
+  GetWorkflowRunErrors,
+  GetWorkflowRunResponses,
+  GetWorkflowSettingsData,
+  GetWorkflowSettingsErrors,
+  GetWorkflowSettingsResponses,
+  GetWorkflowsOverviewData,
+  GetWorkflowsOverviewErrors,
+  GetWorkflowsOverviewResponses,
   GetWorkloadModeData,
   GetWorkloadModeErrors,
   GetWorkloadModeResponses,
@@ -2208,6 +2540,15 @@ import type {
   HasTracesData,
   HasTracesErrors,
   HasTracesResponses,
+  HeartbeatRunData,
+  HeartbeatRunErrors,
+  HeartbeatRunResponses,
+  IdentifyVisitorData,
+  IdentifyVisitorErrors,
+  IdentifyVisitorForTokenData,
+  IdentifyVisitorForTokenErrors,
+  IdentifyVisitorForTokenResponses,
+  IdentifyVisitorResponses,
   ImportApplicationWorkspaceGitData,
   ImportApplicationWorkspaceGitErrors,
   ImportApplicationWorkspaceGitResponses,
@@ -2229,6 +2570,9 @@ import type {
   ImportTraefikAcmeJsonData,
   ImportTraefikAcmeJsonErrors,
   ImportTraefikAcmeJsonResponses,
+  IngestLogs2Data,
+  IngestLogs2Errors,
+  IngestLogs2Responses,
   IngestLogsByPathData,
   IngestLogsByPathErrors,
   IngestLogsByPathResponses,
@@ -2268,12 +2612,18 @@ import type {
   InspectDropArchiveData,
   InspectDropArchiveErrors,
   InspectDropArchiveResponses,
+  InstallLocalFileData,
+  InstallLocalFileErrors,
+  InstallLocalFileResponses,
   InstantiateTemplateData,
   InstantiateTemplateErrors,
   InstantiateTemplateResponses,
   IssueRuntimeCredentialsData,
   IssueRuntimeCredentialsErrors,
   IssueRuntimeCredentialsResponses,
+  IssueWorkflowCredentialData,
+  IssueWorkflowCredentialErrors,
+  IssueWorkflowCredentialResponses,
   JobLogsData,
   JobLogsErrors,
   JobLogsResponses,
@@ -2337,12 +2687,39 @@ import type {
   LinkCustomDomainToCertificateData,
   LinkCustomDomainToCertificateErrors,
   LinkCustomDomainToCertificateResponses,
+  LinkErrorGroupIssueData,
+  LinkErrorGroupIssueErrors,
+  LinkErrorGroupIssueResponses,
   LinkServiceToProjectData,
   LinkServiceToProjectErrors,
   LinkServiceToProjectResponses,
+  ListAccessBundlesData,
+  ListAccessBundlesErrors,
+  ListAccessBundlesGeneralData,
+  ListAccessBundlesGeneralErrors,
+  ListAccessBundlesGeneralResponses,
+  ListAccessBundlesResponses,
   ListAccessProvidersData,
   ListAccessProvidersErrors,
   ListAccessProvidersResponses,
+  ListAccessServicesData,
+  ListAccessServicesErrors,
+  ListAccessServicesGeneralData,
+  ListAccessServicesGeneralErrors,
+  ListAccessServicesGeneralResponses,
+  ListAccessServicesResponses,
+  ListAccessSessionsData,
+  ListAccessSessionsErrors,
+  ListAccessSessionsGeneralData,
+  ListAccessSessionsGeneralErrors,
+  ListAccessSessionsGeneralResponses,
+  ListAccessSessionsResponses,
+  ListAccessVaultsData,
+  ListAccessVaultsErrors,
+  ListAccessVaultsGeneralData,
+  ListAccessVaultsGeneralErrors,
+  ListAccessVaultsGeneralResponses,
+  ListAccessVaultsResponses,
   ListAgentRunsData,
   ListAgentRunsErrors,
   ListAgentRunsResponses,
@@ -2364,6 +2741,12 @@ import type {
   ListAllRunsData,
   ListAllRunsErrors,
   ListAllRunsResponses,
+  ListAllWorkflowRunsData,
+  ListAllWorkflowRunsErrors,
+  ListAllWorkflowRunsResponses,
+  ListAnalyticsGoalsData,
+  ListAnalyticsGoalsErrors,
+  ListAnalyticsGoalsResponses,
   ListAnalyticsIngestKeysData,
   ListAnalyticsIngestKeysErrors,
   ListAnalyticsIngestKeysResponses,
@@ -2409,6 +2792,9 @@ import type {
   ListChatOperationsData,
   ListChatOperationsErrors,
   ListChatOperationsResponses,
+  ListChatPluginWatchesData,
+  ListChatPluginWatchesErrors,
+  ListChatPluginWatchesResponses,
   ListChatResourcesData,
   ListChatResourcesErrors,
   ListChatResourcesResponses,
@@ -2472,6 +2858,15 @@ import type {
   ListDnsProvidersData,
   ListDnsProvidersErrors,
   ListDnsProvidersResponses,
+  ListDnsQueriesData,
+  ListDnsQueriesErrors,
+  ListDnsQueriesResponses,
+  ListDnsRecordsData,
+  ListDnsRecordsErrors,
+  ListDnsRecordsResponses,
+  ListDnsResolversData,
+  ListDnsResolversErrors,
+  ListDnsResolversResponses,
   ListDomainDeliveryBindingsData,
   ListDomainDeliveryBindingsErrors,
   ListDomainDeliveryBindingsResponses,
@@ -2502,12 +2897,33 @@ import type {
   ListEntitiesData,
   ListEntitiesErrors,
   ListEntitiesResponses,
+  ListErrorEventAttachmentsData,
+  ListErrorEventAttachmentsErrors,
+  ListErrorEventAttachmentsResponses,
   ListErrorEventsData,
   ListErrorEventsErrors,
   ListErrorEventsResponses,
+  ListErrorGroupActivityData,
+  ListErrorGroupActivityErrors,
+  ListErrorGroupActivityResponses,
+  ListErrorGroupFingerprintsData,
+  ListErrorGroupFingerprintsErrors,
+  ListErrorGroupFingerprintsResponses,
+  ListErrorGroupIssuesData,
+  ListErrorGroupIssuesErrors,
+  ListErrorGroupIssuesResponses,
   ListErrorGroupsData,
   ListErrorGroupsErrors,
   ListErrorGroupsResponses,
+  ListErrorInboundFiltersData,
+  ListErrorInboundFiltersErrors,
+  ListErrorInboundFiltersResponses,
+  ListErrorOwnershipRulesData,
+  ListErrorOwnershipRulesErrors,
+  ListErrorOwnershipRulesResponses,
+  ListErrorSavedSearchesData,
+  ListErrorSavedSearchesErrors,
+  ListErrorSavedSearchesResponses,
   ListEventsData,
   ListEventsResponses,
   ListEventTypesData,
@@ -2521,6 +2937,9 @@ import type {
   ListFacetsData,
   ListFacetsErrors,
   ListFacetsResponses,
+  ListFeedbackAttachmentsData,
+  ListFeedbackAttachmentsErrors,
+  ListFeedbackAttachmentsResponses,
   ListFlagsData,
   ListFlagsErrors,
   ListFlagsResponses,
@@ -2569,6 +2988,12 @@ import type {
   ListInstantiationsData,
   ListInstantiationsErrors,
   ListInstantiationsResponses,
+  ListInternalAccessGrantsData,
+  ListInternalAccessGrantsErrors,
+  ListInternalAccessGrantsResponses,
+  ListInternalAccessSandboxGrantsData,
+  ListInternalAccessSandboxGrantsErrors,
+  ListInternalAccessSandboxGrantsResponses,
   ListIpAccessControlData,
   ListIpAccessControlErrors,
   ListIpAccessControlResponses,
@@ -2578,6 +3003,9 @@ import type {
   ListKnownAiAgentsData,
   ListKnownAiAgentsErrors,
   ListKnownAiAgentsResponses,
+  ListLogIngestKeysData,
+  ListLogIngestKeysErrors,
+  ListLogIngestKeysResponses,
   ListManagedDomainsData,
   ListManagedDomainsErrors,
   ListManagedDomainsResponses,
@@ -2688,6 +3116,9 @@ import type {
   ListReleaseFilesData,
   ListReleaseFilesErrors,
   ListReleaseFilesResponses,
+  ListReleaseHealthData,
+  ListReleaseHealthErrors,
+  ListReleaseHealthResponses,
   ListReleasesData,
   ListReleasesErrors,
   ListReleasesResponses,
@@ -2721,6 +3152,15 @@ import type {
   ListSandboxesData,
   ListSandboxesErrors,
   ListSandboxesResponses,
+  ListSandboxInternalAddressesData,
+  ListSandboxInternalAddressesErrors,
+  ListSandboxInternalAddressesResponses,
+  ListSandboxServicesData,
+  ListSandboxServicesErrors,
+  ListSandboxServicesResponses,
+  ListSavedSearchesData,
+  ListSavedSearchesErrors,
+  ListSavedSearchesResponses,
   ListScheduleRunJobsData,
   ListScheduleRunJobsErrors,
   ListScheduleRunJobsResponses,
@@ -2739,6 +3179,9 @@ import type {
   ListSecretsData,
   ListSecretsErrors,
   ListSecretsResponses,
+  ListServiceGrantsData,
+  ListServiceGrantsErrors,
+  ListServiceGrantsResponses,
   ListServiceHealthStatusesData,
   ListServiceHealthStatusesErrors,
   ListServiceHealthStatusesResponses,
@@ -2784,9 +3227,24 @@ import type {
   ListStatusPageDomainsData,
   ListStatusPageDomainsErrors,
   ListStatusPageDomainsResponses,
+  ListStatusPageMaintenancesData,
+  ListStatusPageMaintenancesErrors,
+  ListStatusPageMaintenancesResponses,
   ListStatusPagesData,
   ListStatusPagesErrors,
   ListStatusPagesResponses,
+  ListStatusPageSubscribersData,
+  ListStatusPageSubscribersErrors,
+  ListStatusPageSubscribersResponses,
+  ListStatusPageWebhooksData,
+  ListStatusPageWebhooksErrors,
+  ListStatusPageWebhooksResponses,
+  ListSurveyResponsesData,
+  ListSurveyResponsesErrors,
+  ListSurveyResponsesResponses,
+  ListSurveysData,
+  ListSurveysErrors,
+  ListSurveysResponses,
   ListSyncedRepositoriesData,
   ListSyncedRepositoriesErrors,
   ListSyncedRepositoriesResponses,
@@ -2823,9 +3281,27 @@ import type {
   ListVariableHistoryData,
   ListVariableHistoryErrors,
   ListVariableHistoryResponses,
+  ListVaultLinksData,
+  ListVaultLinksErrors,
+  ListVaultLinksResponses,
   ListWebhooksData,
   ListWebhooksErrors,
   ListWebhooksResponses,
+  ListWorkflowDefinitionsData,
+  ListWorkflowDefinitionsErrors,
+  ListWorkflowDefinitionsResponses,
+  ListWorkflowGrantsData,
+  ListWorkflowGrantsErrors,
+  ListWorkflowGrantsResponses,
+  ListWorkflowProjectKeysData,
+  ListWorkflowProjectKeysErrors,
+  ListWorkflowProjectKeysResponses,
+  ListWorkflowRunsData,
+  ListWorkflowRunsErrors,
+  ListWorkflowRunsResponses,
+  ListWorkflowStepsData,
+  ListWorkflowStepsErrors,
+  ListWorkflowStepsResponses,
   LoginData,
   LoginErrors,
   LogIngestBudgetData,
@@ -2841,6 +3317,9 @@ import type {
   LookupShieldClientData,
   LookupShieldClientErrors,
   LookupShieldClientResponses,
+  MergeErrorGroupsData,
+  MergeErrorGroupsErrors,
+  MergeErrorGroupsResponses,
   MeshEnrollData,
   MeshEnrollErrors,
   MeshEnrollResponses,
@@ -2928,6 +3407,18 @@ import type {
   ObservabilityListEventsData,
   ObservabilityListEventsErrors,
   ObservabilityListEventsResponses,
+  OfrepPublicBulkData,
+  OfrepPublicBulkErrors,
+  OfrepPublicBulkResponses,
+  OfrepPublicSingleData,
+  OfrepPublicSingleErrors,
+  OfrepPublicSingleResponses,
+  OfrepServerBulkData,
+  OfrepServerBulkErrors,
+  OfrepServerBulkResponses,
+  OfrepServerSingleData,
+  OfrepServerSingleErrors,
+  OfrepServerSingleResponses,
   OidcCallbackData,
   OpenAutofixIncidentData,
   OpenAutofixIncidentErrors,
@@ -2935,6 +3426,9 @@ import type {
   OpenRepositoryPullRequestData,
   OpenRepositoryPullRequestErrors,
   OpenRepositoryPullRequestResponses,
+  OpenWorkflowDevData,
+  OpenWorkflowDevErrors,
+  OpenWorkflowDevResponses,
   PatchAdminGateData,
   PatchAdminGateErrors,
   PatchAdminGateResponses,
@@ -2956,9 +3450,15 @@ import type {
   PlanRestoreData,
   PlanRestoreErrors,
   PlanRestoreResponses,
+  PollWorkflowDevData,
+  PollWorkflowDevErrors,
+  PollWorkflowDevResponses,
   PostDnsAckData,
   PostDnsAckErrors,
   PostDnsAckResponses,
+  PrepareSandboxImagesData,
+  PrepareSandboxImagesErrors,
+  PrepareSandboxImagesResponses,
   PreviewActivityReportData,
   PreviewActivityReportErrors,
   PreviewActivityReportResponses,
@@ -2977,6 +3477,9 @@ import type {
   PreviewStatusPageData,
   PreviewStatusPageErrors,
   PreviewStatusPageResponses,
+  ProjectAccessVaultsData,
+  ProjectAccessVaultsErrors,
+  ProjectAccessVaultsResponses,
   PromoteClusterMemberData,
   PromoteClusterMemberErrors,
   PromoteClusterMemberResponses,
@@ -2992,9 +3495,18 @@ import type {
   ProvisionDomainData,
   ProvisionDomainErrors,
   ProvisionDomainResponses,
+  PublicSurveysData,
+  PublicSurveysErrors,
+  PublicSurveysResponses,
   PublishStatusPageData,
   PublishStatusPageErrors,
   PublishStatusPageResponses,
+  PurgeAssetCacheData,
+  PurgeAssetCacheErrors,
+  PurgeAssetCacheResponses,
+  PurgeEnvironmentAssetCacheData,
+  PurgeEnvironmentAssetCacheErrors,
+  PurgeEnvironmentAssetCacheResponses,
   PurgeProjectLogsData,
   PurgeProjectLogsErrors,
   PurgeProjectLogsResponses,
@@ -3004,6 +3516,9 @@ import type {
   PutEnvironmentIpAccessData,
   PutEnvironmentIpAccessErrors,
   PutEnvironmentIpAccessResponses,
+  PutPluginAiToolsData,
+  PutPluginAiToolsErrors,
+  PutPluginAiToolsResponses,
   PutProjectIpAccessData,
   PutProjectIpAccessErrors,
   PutProjectIpAccessResponses,
@@ -3052,11 +3567,17 @@ import type {
   ReassignProjectCustomDomainData,
   ReassignProjectCustomDomainErrors,
   ReassignProjectCustomDomainResponses,
+  ReauthorizeConnectionData,
+  ReauthorizeConnectionErrors,
+  ReauthorizeConnectionResponses,
   RebuildSandboxImageData,
   RebuildSandboxImageErrors,
   RebuildSandboxImageResponses,
   ReconcileCloudBackupSourceData,
   ReconcileCloudBackupSourceResponses,
+  RecordBrowserIdentifyData,
+  RecordBrowserIdentifyErrors,
+  RecordBrowserIdentifyResponses,
   RecordConsoleEventData,
   RecordConsoleEventErrors,
   RecordConsoleEventResponses,
@@ -3066,6 +3587,9 @@ import type {
   RecordFlagExposureData,
   RecordFlagExposureErrors,
   RecordFlagExposureResponses,
+  RecordRunStepData,
+  RecordRunStepErrors,
+  RecordRunStepResponses,
   RecordSpeedMetricsData,
   RecordSpeedMetricsErrors,
   RecordSpeedMetricsResponses,
@@ -3078,6 +3602,9 @@ import type {
   RefreshAiProviderStatusData,
   RefreshAiProviderStatusErrors,
   RefreshAiProviderStatusResponses,
+  RefreshErrorGroupIssuesData,
+  RefreshErrorGroupIssuesErrors,
+  RefreshErrorGroupIssuesResponses,
   RefreshProviderModelsData,
   RefreshProviderModelsErrors,
   RefreshProviderModelsResponses,
@@ -3150,18 +3677,32 @@ import type {
   ReorderEdgeRulesData,
   ReorderEdgeRulesErrors,
   ReorderEdgeRulesResponses,
+  ReplaceErrorOwnershipRulesData,
+  ReplaceErrorOwnershipRulesErrors,
+  ReplaceErrorOwnershipRulesResponses,
   RepointContinuousArchiveSourceData,
   RepointContinuousArchiveSourceErrors,
   RepointContinuousArchiveSourceResponses,
+  ReportRunOutcomeData,
+  ReportRunOutcomeErrors,
+  ReportRunOutcomeResponses,
   RequestDiscoveredRouteCertData,
   RequestDiscoveredRouteCertErrors,
   RequestDiscoveredRouteCertResponses,
   RequestPasswordResetData,
   RequestPasswordResetErrors,
   RequestPasswordResetResponses,
+  RequestSandboxServiceData,
+  RequestSandboxServiceErrors,
+  RequestSandboxServiceResponses,
+  RequestServiceGrantData,
+  RequestServiceGrantErrors,
+  RequestServiceGrantResponses,
   ResendEmailData,
   ResendEmailErrors,
   ResendEmailResponses,
+  ResetBrowserIdentityData,
+  ResetBrowserIdentityResponses,
   ResetPasswordData,
   ResetPasswordErrors,
   ResetPasswordResponses,
@@ -3174,12 +3715,18 @@ import type {
   ResetUserPasswordData,
   ResetUserPasswordErrors,
   ResetUserPasswordResponses,
+  ReshuffleFlagData,
+  ReshuffleFlagErrors,
+  ReshuffleFlagResponses,
   ResizeSandboxData,
   ResizeSandboxErrors,
   ResizeSandboxResponses,
   ResolveAlarmData,
   ResolveAlarmErrors,
   ResolveAlarmResponses,
+  ResolveDnsNameData,
+  ResolveDnsNameErrors,
+  ResolveDnsNameResponses,
   ResolvePermissionData,
   ResolvePermissionErrors,
   ResolvePermissionResponses,
@@ -3189,6 +3736,9 @@ import type {
   ResolveUserPermissionData,
   ResolveUserPermissionErrors,
   ResolveUserPermissionResponses,
+  RespondWorkflowDevData,
+  RespondWorkflowDevErrors,
+  RespondWorkflowDevResponses,
   RestartContainerData,
   RestartContainerErrors,
   RestartContainerResponses,
@@ -3219,6 +3769,9 @@ import type {
   ResumeSandboxData,
   ResumeSandboxErrors,
   ResumeSandboxResponses,
+  ResumeWorkflowRunData,
+  ResumeWorkflowRunErrors,
+  ResumeWorkflowRunResponses,
   RetrieveBatchData,
   RetrieveBatchErrors,
   RetrieveBatchResponses,
@@ -3237,6 +3790,9 @@ import type {
   RetryGoalData,
   RetryGoalErrors,
   RetryGoalResponses,
+  RetryIngressHostnameDnsData,
+  RetryIngressHostnameDnsErrors,
+  RetryIngressHostnameDnsResponses,
   RetryInstantiationData,
   RetryInstantiationErrors,
   RetryInstantiationResponses,
@@ -3246,6 +3802,9 @@ import type {
   RetryRunData,
   RetryRunErrors,
   RetryRunResponses,
+  RetryWorkflowRunData,
+  RetryWorkflowRunErrors,
+  RetryWorkflowRunResponses,
   RevealGlobalMcpConfigData,
   RevealGlobalMcpConfigErrors,
   RevealGlobalMcpConfigResponses,
@@ -3261,6 +3820,9 @@ import type {
   RevealServiceParameterData,
   RevealServiceParameterErrors,
   RevealServiceParameterResponses,
+  RevealWorkflowPayloadData,
+  RevealWorkflowPayloadErrors,
+  RevealWorkflowPayloadResponses,
   RevenueCreateIntegrationData,
   RevenueCreateIntegrationErrors,
   RevenueCreateIntegrationResponses,
@@ -3301,6 +3863,12 @@ import type {
   RevenueUpdateSecretData,
   RevenueUpdateSecretErrors,
   RevenueUpdateSecretResponses,
+  RevokeAccessSessionData,
+  RevokeAccessSessionErrors,
+  RevokeAccessSessionGeneralData,
+  RevokeAccessSessionGeneralErrors,
+  RevokeAccessSessionGeneralResponses,
+  RevokeAccessSessionResponses,
   RevokeAnalyticsIngestKeyData,
   RevokeAnalyticsIngestKeyErrors,
   RevokeAnalyticsIngestKeyResponses,
@@ -3316,12 +3884,27 @@ import type {
   RevokeJoinTokenData,
   RevokeJoinTokenErrors,
   RevokeJoinTokenResponses,
+  RevokeLogIngestKeyData,
+  RevokeLogIngestKeyErrors,
+  RevokeLogIngestKeyResponses,
   RevokeProjectAccessData,
   RevokeProjectAccessErrors,
   RevokeProjectAccessResponses,
+  RevokeSandboxServiceData,
+  RevokeSandboxServiceErrors,
+  RevokeSandboxServiceResponses,
+  RevokeServiceGrantData,
+  RevokeServiceGrantErrors,
+  RevokeServiceGrantResponses,
   RevokeShieldTokenData,
   RevokeShieldTokenErrors,
   RevokeShieldTokenResponses,
+  RevokeWorkflowCredentialData,
+  RevokeWorkflowCredentialErrors,
+  RevokeWorkflowCredentialResponses,
+  RevokeWorkflowGrantData,
+  RevokeWorkflowGrantErrors,
+  RevokeWorkflowGrantResponses,
   RollbackPgUpgradeData,
   RollbackPgUpgradeErrors,
   RollbackPgUpgradeResponses,
@@ -3373,6 +3956,9 @@ import type {
   RunScheduleNowData,
   RunScheduleNowErrors,
   RunScheduleNowResponses,
+  SandboxAccessVaultsData,
+  SandboxAccessVaultsErrors,
+  SandboxAccessVaultsResponses,
   SandboxCreatePreviewLinkData,
   SandboxCreatePreviewLinkErrors,
   SandboxCreatePreviewLinkResponses,
@@ -3390,6 +3976,12 @@ import type {
   SaveBlueprintVersionData,
   SaveBlueprintVersionErrors,
   SaveBlueprintVersionResponses,
+  SavedSearchSeriesData,
+  SavedSearchSeriesErrors,
+  SavedSearchSeriesResponses,
+  SearchErrorGroupAssigneesData,
+  SearchErrorGroupAssigneesErrors,
+  SearchErrorGroupAssigneesResponses,
   SearchGlobalLogsData,
   SearchGlobalLogsErrors,
   SearchGlobalLogsResponses,
@@ -3408,6 +4000,12 @@ import type {
   SendUserMessageData,
   SendUserMessageErrors,
   SendUserMessageResponses,
+  SendWorkflowEventData,
+  SendWorkflowEventErrors,
+  SendWorkflowEventResponses,
+  ServiceCatalogData,
+  ServiceCatalogErrors,
+  ServiceCatalogResponses,
   SetAlternateSourcesData,
   SetAlternateSourcesErrors,
   SetAlternateSourcesResponses,
@@ -3432,9 +4030,18 @@ import type {
   SetEgressPolicyData,
   SetEgressPolicyErrors,
   SetEgressPolicyResponses,
+  SetErrorAttachmentQuotaData,
+  SetErrorAttachmentQuotaErrors,
+  SetErrorAttachmentQuotaResponses,
+  SetErrorGroupAssigneeData,
+  SetErrorGroupAssigneeErrors,
+  SetErrorGroupAssigneeResponses,
   SetFlagEnvironmentData,
   SetFlagEnvironmentErrors,
   SetFlagEnvironmentResponses,
+  SetFlagRulesData,
+  SetFlagRulesErrors,
+  SetFlagRulesResponses,
   SetGroupRepositoryData,
   SetGroupRepositoryErrors,
   SetGroupRepositoryResponses,
@@ -3468,6 +4075,9 @@ import type {
   SetRepositoryInheritanceData,
   SetRepositoryInheritanceErrors,
   SetRepositoryInheritanceResponses,
+  SetStatusPagePasswordData,
+  SetStatusPagePasswordErrors,
+  SetStatusPagePasswordResponses,
   SetTraefikDiscoveredRouteEnabledData,
   SetTraefikDiscoveredRouteEnabledErrors,
   SetTraefikDiscoveredRouteEnabledResponses,
@@ -3483,6 +4093,9 @@ import type {
   SetupMfaData,
   SetupMfaErrors,
   SetupMfaResponses,
+  ShredWorkflowProjectKeyData,
+  ShredWorkflowProjectKeyErrors,
+  ShredWorkflowProjectKeyResponses,
   SignEveryoneOutOfAddressData,
   SignEveryoneOutOfAddressErrors,
   SignEveryoneOutOfAddressResponses,
@@ -3504,6 +4117,9 @@ import type {
   SourceSandboxData,
   SourceSandboxErrors,
   SourceSandboxResponses,
+  SplitErrorGroupData,
+  SplitErrorGroupErrors,
+  SplitErrorGroupResponses,
   StartAiProviderLoginData,
   StartAiProviderLoginErrors,
   StartAiProviderLoginResponses,
@@ -3522,6 +4138,9 @@ import type {
   StartFixData,
   StartFixErrors,
   StartFixResponses,
+  StartGithubManifestFlowData,
+  StartGithubManifestFlowErrors,
+  StartGithubManifestFlowResponses,
   StartGitProviderOauthData,
   StartGitProviderOauthErrors,
   StartManagedCloudLoginData,
@@ -3540,9 +4159,27 @@ import type {
   StartUpdateData,
   StartUpdateErrors,
   StartUpdateResponses,
+  StartWorkflowRunData,
+  StartWorkflowRunErrors,
+  StartWorkflowRunResponses,
   StatPathData,
   StatPathErrors,
   StatPathResponses,
+  StatusPageConfirmData,
+  StatusPageConfirmErrors,
+  StatusPageConfirmFormData,
+  StatusPageConfirmFormErrors,
+  StatusPageConfirmFormResponses,
+  StatusPageConfirmResponses,
+  StatusPageSubscribeData,
+  StatusPageSubscribeErrors,
+  StatusPageSubscribeResponses,
+  StatusPageUnsubscribeData,
+  StatusPageUnsubscribeErrors,
+  StatusPageUnsubscribeFormData,
+  StatusPageUnsubscribeFormErrors,
+  StatusPageUnsubscribeFormResponses,
+  StatusPageUnsubscribeResponses,
   StopAutofixIncidentData,
   StopAutofixIncidentErrors,
   StopAutofixIncidentResponses,
@@ -3636,6 +4273,9 @@ import type {
   TestS3SourceConnectionData,
   TestS3SourceConnectionErrors,
   TestS3SourceConnectionResponses,
+  TestWalArchiveTargetData,
+  TestWalArchiveTargetErrors,
+  TestWalArchiveTargetResponses,
   TrackChatSandboxChangesData,
   TrackChatSandboxChangesErrors,
   TrackChatSandboxChangesResponses,
@@ -3671,9 +4311,17 @@ import type {
   UnlinkChatSandboxData,
   UnlinkChatSandboxErrors,
   UnlinkChatSandboxResponses,
+  UnlinkErrorGroupIssueData,
+  UnlinkErrorGroupIssueErrors,
+  UnlinkErrorGroupIssueResponses,
   UnlinkServiceFromProjectData,
   UnlinkServiceFromProjectErrors,
   UnlinkServiceFromProjectResponses,
+  UnlockPublicStatusPageData,
+  UnlockPublicStatusPageErrors,
+  UnmergeErrorGroupData,
+  UnmergeErrorGroupErrors,
+  UnmergeErrorGroupResponses,
   UnpublishStatusPageData,
   UnpublishStatusPageErrors,
   UnpublishStatusPageResponses,
@@ -3683,6 +4331,24 @@ import type {
   UnsilenceSystemAlarmData,
   UnsilenceSystemAlarmErrors,
   UnsilenceSystemAlarmResponses,
+  UpdateAccessBundleData,
+  UpdateAccessBundleErrors,
+  UpdateAccessBundleGeneralData,
+  UpdateAccessBundleGeneralErrors,
+  UpdateAccessBundleGeneralResponses,
+  UpdateAccessBundleResponses,
+  UpdateAccessServiceData,
+  UpdateAccessServiceErrors,
+  UpdateAccessServiceGeneralData,
+  UpdateAccessServiceGeneralErrors,
+  UpdateAccessServiceGeneralResponses,
+  UpdateAccessServiceResponses,
+  UpdateAccessVaultData,
+  UpdateAccessVaultErrors,
+  UpdateAccessVaultGeneralData,
+  UpdateAccessVaultGeneralErrors,
+  UpdateAccessVaultGeneralResponses,
+  UpdateAccessVaultResponses,
   UpdateAgentData,
   UpdateAgentErrors,
   UpdateAgentResponses,
@@ -3701,6 +4367,12 @@ import type {
   UpdateAlertRuleData,
   UpdateAlertRuleErrors,
   UpdateAlertRuleResponses,
+  UpdateAnalyticsGoalData,
+  UpdateAnalyticsGoalErrors,
+  UpdateAnalyticsGoalResponses,
+  UpdateAnalyticsIdentitySettingsData,
+  UpdateAnalyticsIdentitySettingsErrors,
+  UpdateAnalyticsIdentitySettingsResponses,
   UpdateAnalyticsIngestKeyData,
   UpdateAnalyticsIngestKeyErrors,
   UpdateAnalyticsIngestKeyResponses,
@@ -3763,9 +4435,18 @@ import type {
   UpdateEnvironmentVariableData,
   UpdateEnvironmentVariableErrors,
   UpdateEnvironmentVariableResponses,
+  UpdateErrorGroupCommentData,
+  UpdateErrorGroupCommentErrors,
+  UpdateErrorGroupCommentResponses,
   UpdateErrorGroupData,
   UpdateErrorGroupErrors,
   UpdateErrorGroupResponses,
+  UpdateErrorInboundFilterData,
+  UpdateErrorInboundFilterErrors,
+  UpdateErrorInboundFilterResponses,
+  UpdateErrorSavedSearchData,
+  UpdateErrorSavedSearchErrors,
+  UpdateErrorSavedSearchResponses,
   UpdateFlagData,
   UpdateFlagErrors,
   UpdateFlagResponses,
@@ -3787,6 +4468,12 @@ import type {
   UpdateGroupEnvVarData,
   UpdateGroupEnvVarErrors,
   UpdateGroupEnvVarResponses,
+  UpdateHealthcheckDefaultsData,
+  UpdateHealthcheckDefaultsErrors,
+  UpdateHealthcheckDefaultsResponses,
+  UpdateHostImagePreparationData,
+  UpdateHostImagePreparationErrors,
+  UpdateHostImagePreparationResponses,
   UpdateHttpCheckData,
   UpdateHttpCheckErrors,
   UpdateHttpCheckResponses,
@@ -3894,11 +4581,17 @@ import type {
   UpdateSandboxPlacementData,
   UpdateSandboxPlacementErrors,
   UpdateSandboxPlacementResponses,
+  UpdateSavedSearchData,
+  UpdateSavedSearchErrors,
+  UpdateSavedSearchResponses,
   UpdateSelfData,
   UpdateSelfErrors,
   UpdateSelfResponses,
   UpdateServiceData,
   UpdateServiceErrors,
+  UpdateServiceHealthcheckData,
+  UpdateServiceHealthcheckErrors,
+  UpdateServiceHealthcheckResponses,
   UpdateServiceLogIngestionData,
   UpdateServiceLogIngestionErrors,
   UpdateServiceLogIngestionResponses,
@@ -3909,6 +4602,9 @@ import type {
   UpdateServiceTemplateRuntimeData,
   UpdateServiceTemplateRuntimeErrors,
   UpdateServiceTemplateRuntimeResponses,
+  UpdateServiceTlsData,
+  UpdateServiceTlsErrors,
+  UpdateServiceTlsResponses,
   UpdateSessionDurationData,
   UpdateSessionDurationErrors,
   UpdateSessionDurationResponses,
@@ -3929,16 +4625,34 @@ import type {
   UpdateSpeedMetricsResponses,
   UpdateStatusPageData,
   UpdateStatusPageErrors,
+  UpdateStatusPageMaintenanceData,
+  UpdateStatusPageMaintenanceErrors,
+  UpdateStatusPageMaintenanceResponses,
   UpdateStatusPageResponses,
+  UpdateStatusPageSubscriptionsData,
+  UpdateStatusPageSubscriptionsErrors,
+  UpdateStatusPageSubscriptionsResponses,
+  UpdateStatusPageWebhookData,
+  UpdateStatusPageWebhookErrors,
+  UpdateStatusPageWebhookResponses,
   UpdateSuggestionDefaultData,
   UpdateSuggestionDefaultErrors,
   UpdateSuggestionDefaultResponses,
+  UpdateSurveyData,
+  UpdateSurveyErrors,
+  UpdateSurveyResponses,
+  UpdateTargetMonitorData,
+  UpdateTargetMonitorErrors,
+  UpdateTargetMonitorResponses,
   UpdateTeamData,
   UpdateTeamErrors,
   UpdateTeamMemberRoleData,
   UpdateTeamMemberRoleErrors,
   UpdateTeamMemberRoleResponses,
   UpdateTeamResponses,
+  UpdateTelegramProviderData,
+  UpdateTelegramProviderErrors,
+  UpdateTelegramProviderResponses,
   UpdateTelemetrySettingsData,
   UpdateTelemetrySettingsErrors,
   UpdateTelemetrySettingsResponses,
@@ -3954,6 +4668,9 @@ import type {
   UpdateWebhookProviderErrors,
   UpdateWebhookProviderResponses,
   UpdateWebhookResponses,
+  UpdateWorkflowSettingsData,
+  UpdateWorkflowSettingsErrors,
+  UpdateWorkflowSettingsResponses,
   UpdateWorkloadModeData,
   UpdateWorkloadModeErrors,
   UpdateWorkloadModeResponses,
@@ -4301,6 +5018,115 @@ export const recordEventMetrics = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Evaluate every client-visible flag for the visitor making the request.
+ *
+ * Unauthenticated: the project and environment come from the `Host` the
+ * browser called, never from the body. Only flags marked `client_visible`
+ * are evaluated or mentioned; a server-only flag is indistinguishable from
+ * one that does not exist.
+ */
+export const evaluatePublicFlags = <ThrowOnError extends boolean = false>(
+  options: Options<EvaluatePublicFlagsData, ThrowOnError>,
+): RequestResult<
+  EvaluatePublicFlagsResponses,
+  EvaluatePublicFlagsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    EvaluatePublicFlagsResponses,
+    EvaluatePublicFlagsErrors,
+    ThrowOnError
+  >({
+    url: "/_temps/flags",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Identify the visitor of this browser (ADR 109 D4)
+ */
+export const recordBrowserIdentify = <ThrowOnError extends boolean = false>(
+  options: Options<RecordBrowserIdentifyData, ThrowOnError>,
+): RequestResult<
+  RecordBrowserIdentifyResponses,
+  RecordBrowserIdentifyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RecordBrowserIdentifyResponses,
+    RecordBrowserIdentifyErrors,
+    ThrowOnError
+  >({
+    url: "/_temps/identify",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * OFREP bulk evaluation for OpenFeature web SDKs, same origin.
+ */
+export const ofrepPublicBulk = <ThrowOnError extends boolean = false>(
+  options: Options<OfrepPublicBulkData, ThrowOnError>,
+): RequestResult<
+  OfrepPublicBulkResponses,
+  OfrepPublicBulkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    OfrepPublicBulkResponses,
+    OfrepPublicBulkErrors,
+    ThrowOnError
+  >({
+    url: "/_temps/ofrep/v1/evaluate/flags",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * OFREP single-flag evaluation, same origin.
+ */
+export const ofrepPublicSingle = <ThrowOnError extends boolean = false>(
+  options: Options<OfrepPublicSingleData, ThrowOnError>,
+): RequestResult<
+  OfrepPublicSingleResponses,
+  OfrepPublicSingleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    OfrepPublicSingleResponses,
+    OfrepPublicSingleErrors,
+    ThrowOnError
+  >({
+    url: "/_temps/ofrep/v1/evaluate/flags/{key}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Forget this browser's visitor (ADR 109 D4)
+ */
+export const resetBrowserIdentity = <ThrowOnError extends boolean = false>(
+  options?: Options<ResetBrowserIdentityData, ThrowOnError>,
+): RequestResult<ResetBrowserIdentityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).post<
+    ResetBrowserIdentityResponses,
+    unknown,
+    ThrowOnError
+  >({ url: "/_temps/reset", ...options });
+
+/**
  * Ingest a browser-tunneled Sentry envelope.
  *
  * Two resolution paths, tried in this order:
@@ -4458,6 +5284,441 @@ export const updateSpeedMetrics = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/_temps/speed/update",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * The active surveys the visitor making this request may see.
+ *
+ * Unauthenticated: the project comes from the `Host` the browser called.
+ * Answers are recorded through the analytics event endpoint as
+ * `survey_shown`, `survey_dismissed` and `survey_sent`.
+ */
+export const publicSurveys = <ThrowOnError extends boolean = false>(
+  options: Options<PublicSurveysData, ThrowOnError>,
+): RequestResult<PublicSurveysResponses, PublicSurveysErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    PublicSurveysResponses,
+    PublicSurveysErrors,
+    ThrowOnError
+  >({
+    url: "/_temps/surveys",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listAccessServicesGeneral = <ThrowOnError extends boolean = false>(
+  options?: Options<ListAccessServicesGeneralData, ThrowOnError>,
+): RequestResult<
+  ListAccessServicesGeneralResponses,
+  ListAccessServicesGeneralErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListAccessServicesGeneralResponses,
+    ListAccessServicesGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-services",
+    ...options,
+  });
+
+export const createAccessServiceGeneral = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateAccessServiceGeneralData, ThrowOnError>,
+): RequestResult<
+  CreateAccessServiceGeneralResponses,
+  CreateAccessServiceGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessServiceGeneralResponses,
+    CreateAccessServiceGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-services",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteAccessServiceGeneral = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DeleteAccessServiceGeneralData, ThrowOnError>,
+): RequestResult<
+  DeleteAccessServiceGeneralResponses,
+  DeleteAccessServiceGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteAccessServiceGeneralResponses,
+    DeleteAccessServiceGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-services/{service_id}",
+    ...options,
+  });
+
+export const getAccessServiceGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessServiceGeneralData, ThrowOnError>,
+): RequestResult<
+  GetAccessServiceGeneralResponses,
+  GetAccessServiceGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAccessServiceGeneralResponses,
+    GetAccessServiceGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-services/{service_id}",
+    ...options,
+  });
+
+export const updateAccessServiceGeneral = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateAccessServiceGeneralData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessServiceGeneralResponses,
+  UpdateAccessServiceGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessServiceGeneralResponses,
+    UpdateAccessServiceGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-services/{service_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listAccessSessionsGeneral = <ThrowOnError extends boolean = false>(
+  options?: Options<ListAccessSessionsGeneralData, ThrowOnError>,
+): RequestResult<
+  ListAccessSessionsGeneralResponses,
+  ListAccessSessionsGeneralErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListAccessSessionsGeneralResponses,
+    ListAccessSessionsGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-sessions",
+    ...options,
+  });
+
+export const getAccessSessionGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessSessionGeneralData, ThrowOnError>,
+): RequestResult<
+  GetAccessSessionGeneralResponses,
+  GetAccessSessionGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAccessSessionGeneralResponses,
+    GetAccessSessionGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-sessions/{session_id}",
+    ...options,
+  });
+
+export const revokeAccessSessionGeneral = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RevokeAccessSessionGeneralData, ThrowOnError>,
+): RequestResult<
+  RevokeAccessSessionGeneralResponses,
+  RevokeAccessSessionGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeAccessSessionGeneralResponses,
+    RevokeAccessSessionGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-sessions/{session_id}/revoke",
+    ...options,
+  });
+
+export const listAccessVaultsGeneral = <ThrowOnError extends boolean = false>(
+  options?: Options<ListAccessVaultsGeneralData, ThrowOnError>,
+): RequestResult<
+  ListAccessVaultsGeneralResponses,
+  ListAccessVaultsGeneralErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListAccessVaultsGeneralResponses,
+    ListAccessVaultsGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults",
+    ...options,
+  });
+
+export const createAccessVaultGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessVaultGeneralData, ThrowOnError>,
+): RequestResult<
+  CreateAccessVaultGeneralResponses,
+  CreateAccessVaultGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessVaultGeneralResponses,
+    CreateAccessVaultGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteAccessVaultGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteAccessVaultGeneralData, ThrowOnError>,
+): RequestResult<
+  DeleteAccessVaultGeneralResponses,
+  DeleteAccessVaultGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteAccessVaultGeneralResponses,
+    DeleteAccessVaultGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}",
+    ...options,
+  });
+
+export const getAccessVaultGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessVaultGeneralData, ThrowOnError>,
+): RequestResult<
+  GetAccessVaultGeneralResponses,
+  GetAccessVaultGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAccessVaultGeneralResponses,
+    GetAccessVaultGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}",
+    ...options,
+  });
+
+export const updateAccessVaultGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAccessVaultGeneralData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessVaultGeneralResponses,
+  UpdateAccessVaultGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessVaultGeneralResponses,
+    UpdateAccessVaultGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listAccessBundlesGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<ListAccessBundlesGeneralData, ThrowOnError>,
+): RequestResult<
+  ListAccessBundlesGeneralResponses,
+  ListAccessBundlesGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAccessBundlesGeneralResponses,
+    ListAccessBundlesGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/bundles",
+    ...options,
+  });
+
+export const createAccessBundleGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessBundleGeneralData, ThrowOnError>,
+): RequestResult<
+  CreateAccessBundleGeneralResponses,
+  CreateAccessBundleGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessBundleGeneralResponses,
+    CreateAccessBundleGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/bundles",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteAccessBundleGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteAccessBundleGeneralData, ThrowOnError>,
+): RequestResult<
+  DeleteAccessBundleGeneralResponses,
+  DeleteAccessBundleGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteAccessBundleGeneralResponses,
+    DeleteAccessBundleGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/bundles/{bundle_id}",
+    ...options,
+  });
+
+export const updateAccessBundleGeneral = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAccessBundleGeneralData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessBundleGeneralResponses,
+  UpdateAccessBundleGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessBundleGeneralResponses,
+    UpdateAccessBundleGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/bundles/{bundle_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getVaultEligibility = <ThrowOnError extends boolean = false>(
+  options: Options<GetVaultEligibilityData, ThrowOnError>,
+): RequestResult<
+  GetVaultEligibilityResponses,
+  GetVaultEligibilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetVaultEligibilityResponses,
+    GetVaultEligibilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/consumers/{sandbox_id}",
+    ...options,
+  });
+
+export const listVaultLinks = <ThrowOnError extends boolean = false>(
+  options: Options<ListVaultLinksData, ThrowOnError>,
+): RequestResult<ListVaultLinksResponses, ListVaultLinksErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    ListVaultLinksResponses,
+    ListVaultLinksErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/links",
+    ...options,
+  });
+
+export const createVaultLink = <ThrowOnError extends boolean = false>(
+  options: Options<CreateVaultLinkData, ThrowOnError>,
+): RequestResult<
+  CreateVaultLinkResponses,
+  CreateVaultLinkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateVaultLinkResponses,
+    CreateVaultLinkErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/links",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteVaultLink = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteVaultLinkData, ThrowOnError>,
+): RequestResult<
+  DeleteVaultLinkResponses,
+  DeleteVaultLinkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteVaultLinkResponses,
+    DeleteVaultLinkErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/links/{link_id}",
+    ...options,
+  });
+
+export const createAccessSessionGeneral = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateAccessSessionGeneralData, ThrowOnError>,
+): RequestResult<
+  CreateAccessSessionGeneralResponses,
+  CreateAccessSessionGeneralErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessSessionGeneralResponses,
+    CreateAccessSessionGeneralErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/access-vaults/{vault_id}/sessions",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -4632,17 +5893,6 @@ export const deleteOidcRoleMapping = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
-/**
- * Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
- *
- * `POST /api/agents/webhook/{webhook_id}`
- * Header: `X-Webhook-Token: <secret>`
- *
- * The `webhook_id` in the URL is a short non-secret identifier (safe to log).
- * The actual credential is the secret token in the header.
- *
- * Accepts any JSON body, which is passed as `user_context` to the agent run.
- */
 export const webhookTrigger = <ThrowOnError extends boolean = false>(
   options: Options<WebhookTriggerData, ThrowOnError>,
 ): RequestResult<WebhookTriggerResponses, WebhookTriggerErrors, ThrowOnError> =>
@@ -5570,6 +6820,44 @@ export const createGlobalConversation = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/ai/conversations",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listChatPluginWatches = <ThrowOnError extends boolean = false>(
+  options: Options<ListChatPluginWatchesData, ThrowOnError>,
+): RequestResult<
+  ListChatPluginWatchesResponses,
+  ListChatPluginWatchesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListChatPluginWatchesResponses,
+    ListChatPluginWatchesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{chat}/plugin-watches",
+    ...options,
+  });
+
+export const changeChatPluginWatch = <ThrowOnError extends boolean = false>(
+  options: Options<ChangeChatPluginWatchData, ThrowOnError>,
+): RequestResult<
+  ChangeChatPluginWatchResponses,
+  ChangeChatPluginWatchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ChangeChatPluginWatchResponses,
+    ChangeChatPluginWatchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/conversations/{chat}/plugin-watches",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -7674,6 +8962,31 @@ export const getEventEntries = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Break one event down by one of its custom properties
+ *
+ * Ranks the values of one top-level key of an event's custom properties,
+ * e.g. the `url` of `outbound_click` or the `extension` of `file_download`
+ * (ADR 109 D1). Crawler traffic is excluded. A value is null when the event
+ * was sent without that property.
+ */
+export const getEventProperties = <ThrowOnError extends boolean = false>(
+  options: Options<GetEventPropertiesData, ThrowOnError>,
+): RequestResult<
+  GetEventPropertiesResponses,
+  GetEventPropertiesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetEventPropertiesResponses,
+    GetEventPropertiesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/analytics/event-properties",
+    ...options,
+  });
+
+/**
  * Get paginated list of visitors who triggered a specific event
  */
 export const getEventVisitors = <ThrowOnError extends boolean = false>(
@@ -8099,6 +9412,35 @@ export const enrichVisitor = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Identify a visitor of the token's own project (ADR 109 D4)
+ *
+ * The form a deployed app uses: the project comes from its injected
+ * deployment token, so the app needs no project id. Behaves exactly like
+ * `PUT /projects/{project_id}/analytics/visitors/{visitor_id}/identify`,
+ * which callers without a project-scoped token use instead.
+ */
+export const identifyVisitorForToken = <ThrowOnError extends boolean = false>(
+  options: Options<IdentifyVisitorForTokenData, ThrowOnError>,
+): RequestResult<
+  IdentifyVisitorForTokenResponses,
+  IdentifyVisitorForTokenErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    IdentifyVisitorForTokenResponses,
+    IdentifyVisitorForTokenErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/analytics/visitors/{visitor_id}/identify",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Get visitor record from database
  */
 export const getVisitorInfo = <ThrowOnError extends boolean = false>(
@@ -8206,6 +9548,33 @@ export const createApiKey = <ThrowOnError extends boolean = false>(
     },
   });
 
+/**
+ * Whether the caller's external AI harness has connected.
+ *
+ * Backs the console's "Let your AI operate Temps" onboarding and its
+ * app-wide "finish connecting" banner. `connected` when the dedicated
+ * `Temps AI harness` key has authenticated a request, or when a key minted
+ * by a browser-approved `temps login` after it has: the CLI falls back to
+ * that flow when it is not handed a usable key, so the harness works
+ * without ever sending the dedicated key.
+ */
+export const getAiHarnessStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetAiHarnessStatusData, ThrowOnError>,
+): RequestResult<
+  GetAiHarnessStatusResponses,
+  GetAiHarnessStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetAiHarnessStatusResponses,
+    GetAiHarnessStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/api-keys/ai-harness/status",
+    ...options,
+  });
+
 export const getApiKeyPermissions = <ThrowOnError extends boolean = false>(
   options?: Options<GetApiKeyPermissionsData, ThrowOnError>,
 ): RequestResult<
@@ -8252,7 +9621,7 @@ export const getApiKey = <ThrowOnError extends boolean = false>(
 export const updateApiKey = <ThrowOnError extends boolean = false>(
   options: Options<UpdateApiKeyData, ThrowOnError>,
 ): RequestResult<UpdateApiKeyResponses, UpdateApiKeyErrors, ThrowOnError> =>
-  (options.client ?? client).put<
+  (options.client ?? client).patch<
     UpdateApiKeyResponses,
     UpdateApiKeyErrors,
     ThrowOnError
@@ -8308,6 +9677,30 @@ export const rotateApiKey = <ThrowOnError extends boolean = false>(
     url: "/api-keys/{id}/rotate",
     ...options,
   });
+
+/**
+ * List audit logs with optional filtering
+ */
+export const listAuditLogs = <ThrowOnError extends boolean = false>(
+  options?: Options<ListAuditLogsData, ThrowOnError>,
+): RequestResult<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListAuditLogsResponses,
+    ListAuditLogsErrors,
+    ThrowOnError
+  >({ url: "/audit/logs", ...options });
+
+/**
+ * Get a specific audit log entry by ID
+ */
+export const getAuditLog = <ThrowOnError extends boolean = false>(
+  options: Options<GetAuditLogData, ThrowOnError>,
+): RequestResult<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetAuditLogResponses,
+    GetAuditLogErrors,
+    ThrowOnError
+  >({ url: "/audit/logs/{id}", ...options });
 
 export const cliDeviceApprove = <ThrowOnError extends boolean = false>(
   options: Options<CliDeviceApproveData, ThrowOnError>,
@@ -9282,8 +10675,8 @@ export const attachScheduleServices = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Detach a single external service from a backup schedule. Idempotent —
- * returns `204` whether or not a row was actually removed.
+ * Detach a single external service from a backup schedule. Returns `204` when
+ * the service was detached, and `404` when it wasn't attached to the schedule.
  */
 export const detachScheduleService = <ThrowOnError extends boolean = false>(
   options: Options<DetachScheduleServiceData, ThrowOnError>,
@@ -9831,6 +11224,80 @@ export const deleteAccessProvider = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Recent queries answered by the internal resolvers, newest first. Kept
+ * for 24 hours; forwarded names are never stored.
+ */
+export const listDnsQueries = <ThrowOnError extends boolean = false>(
+  options?: Options<ListDnsQueriesData, ThrowOnError>,
+): RequestResult<ListDnsQueriesResponses, ListDnsQueriesErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListDnsQueriesResponses,
+    ListDnsQueriesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/queries",
+    ...options,
+  });
+
+/**
+ * The internal zone's records with their owners, newest first.
+ */
+export const listDnsRecords = <ThrowOnError extends boolean = false>(
+  options?: Options<ListDnsRecordsData, ThrowOnError>,
+): RequestResult<ListDnsRecordsResponses, ListDnsRecordsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListDnsRecordsResponses,
+    ListDnsRecordsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/records",
+    ...options,
+  });
+
+/**
+ * Resolve a name from one node's resolver and show the answer.
+ */
+export const resolveDnsName = <ThrowOnError extends boolean = false>(
+  options: Options<ResolveDnsNameData, ThrowOnError>,
+): RequestResult<ResolveDnsNameResponses, ResolveDnsNameErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    ResolveDnsNameResponses,
+    ResolveDnsNameErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/resolve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Each node's resolver: health, version, records served, last sync, and
+ * the open DNS alarms.
+ */
+export const listDnsResolvers = <ThrowOnError extends boolean = false>(
+  options?: Options<ListDnsResolversData, ThrowOnError>,
+): RequestResult<
+  ListDnsResolversResponses,
+  ListDnsResolversErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListDnsResolversResponses,
+    ListDnsResolversErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/resolvers",
+    ...options,
+  });
+
+/**
  * Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
  * enabled, the total record count, and per-node resolver status as last
  * reported by each node's heartbeat. Lets an operator answer "is cluster
@@ -9854,6 +11321,22 @@ export const clusterDnsStatus = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/cluster/dns/status",
+    ...options,
+  });
+
+/**
+ * Queries per outcome over time for one node's resolver.
+ */
+export const dnsTraffic = <ThrowOnError extends boolean = false>(
+  options?: Options<DnsTrafficData, ThrowOnError>,
+): RequestResult<DnsTrafficResponses, DnsTrafficErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    DnsTrafficResponses,
+    DnsTrafficErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cluster/dns/traffic",
     ...options,
   });
 
@@ -10098,7 +11581,7 @@ export const deploymentMetricsGetRange = <ThrowOnError extends boolean = false>(
  * Enable or disable OTLP metric ingestion for a deployment.
  *
  * When `enabled=true`, seeds the default container alert rules for the
- * deployment via [`temps_monitoring::seed_default_container_rules`] (idempotent).
+ * deployment via [`temps_alarms::seed_default_container_rules`] (idempotent).
  */
 export const deploymentMetricsToggle = <ThrowOnError extends boolean = false>(
   options: Options<DeploymentMetricsToggleData, ThrowOnError>,
@@ -11804,6 +13287,56 @@ export const listServiceHealthStatuses = <ThrowOnError extends boolean = false>(
   >({ url: "/external-services/health-status-batch", ...options });
 
 /**
+ * Get the instance-wide default healthcheck of managed service containers
+ *
+ * Null values use each engine's built-in timing. `engines` lists what a
+ * service of each engine inherits.
+ */
+export const getHealthcheckDefaults = <ThrowOnError extends boolean = false>(
+  options?: Options<GetHealthcheckDefaultsData, ThrowOnError>,
+): RequestResult<
+  GetHealthcheckDefaultsResponses,
+  GetHealthcheckDefaultsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetHealthcheckDefaultsResponses,
+    GetHealthcheckDefaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/healthcheck-defaults",
+    ...options,
+  });
+
+/**
+ * Replace the instance-wide default healthcheck of managed service containers
+ *
+ * Applies to containers created or recreated afterwards; nothing running
+ * changes. Send null for a value to use each engine's built-in timing.
+ */
+export const updateHealthcheckDefaults = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateHealthcheckDefaultsData, ThrowOnError>,
+): RequestResult<
+  UpdateHealthcheckDefaultsResponses,
+  UpdateHealthcheckDefaultsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateHealthcheckDefaultsResponses,
+    UpdateHealthcheckDefaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/healthcheck-defaults",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Import an existing Docker container as a managed external service
  */
 export const importExternalService = <ThrowOnError extends boolean = false>(
@@ -12191,6 +13724,83 @@ export const getServiceHealthStatus = <ThrowOnError extends boolean = false>(
   >({ url: "/external-services/{id}/health-status", ...options });
 
 /**
+ * Get a managed service's healthcheck
+ *
+ * Its own overrides, what a new or recreated container gets (with where
+ * each value comes from), and what the running container has.
+ */
+export const getServiceHealthcheck = <ThrowOnError extends boolean = false>(
+  options: Options<GetServiceHealthcheckData, ThrowOnError>,
+): RequestResult<
+  GetServiceHealthcheckResponses,
+  GetServiceHealthcheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetServiceHealthcheckResponses,
+    GetServiceHealthcheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/healthcheck",
+    ...options,
+  });
+
+/**
+ * Replace a managed service's healthcheck overrides
+ *
+ * Send null for a value to inherit the instance default. Applies when the
+ * container is next recreated; nothing running changes.
+ */
+export const updateServiceHealthcheck = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateServiceHealthcheckData, ThrowOnError>,
+): RequestResult<
+  UpdateServiceHealthcheckResponses,
+  UpdateServiceHealthcheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateServiceHealthcheckResponses,
+    UpdateServiceHealthcheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/healthcheck",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Recreate a managed service's container to apply its healthcheck now
+ *
+ * The service restarts briefly. Its volumes and configuration are kept: the
+ * original container is kept until the replacement holds the same data,
+ * and put back otherwise. Only for a running standalone service on a
+ * process that runs local containers: recreating starts the container, so
+ * a stopped service is left alone. Not available for clusters, worker
+ * databases or imported containers.
+ */
+export const applyServiceHealthcheck = <ThrowOnError extends boolean = false>(
+  options: Options<ApplyServiceHealthcheckData, ThrowOnError>,
+): RequestResult<
+  ApplyServiceHealthcheckResponses,
+  ApplyServiceHealthcheckErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ApplyServiceHealthcheckResponses,
+    ApplyServiceHealthcheckErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/healthcheck/apply",
+    ...options,
+  });
+
+/**
  * Get this service's own container log ingestion budget.
  *
  * Both fields null means the service uses the platform budget from
@@ -12503,7 +14113,7 @@ export const externalServiceMetricsByDatabase = <
  * Enable or disable metric collection for an external service.
  *
  * When `enabled=true`, seeds the default alert rules for the service's engine
- * via [`temps_monitoring::seed_default_rules`] (idempotent).
+ * via [`temps_alarms::seed_default_rules`] (idempotent).
  */
 export const externalServiceMetricsToggle = <
   ThrowOnError extends boolean = false,
@@ -12977,6 +14587,57 @@ export const stopService = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({ url: "/external-services/{id}/stop", ...options });
 
+export const getServiceTls = <ThrowOnError extends boolean = false>(
+  options: Options<GetServiceTlsData, ThrowOnError>,
+): RequestResult<GetServiceTlsResponses, GetServiceTlsErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetServiceTlsResponses,
+    GetServiceTlsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/tls",
+    ...options,
+  });
+
+export const updateServiceTls = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateServiceTlsData, ThrowOnError>,
+): RequestResult<
+  UpdateServiceTlsResponses,
+  UpdateServiceTlsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateServiceTlsResponses,
+    UpdateServiceTlsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/tls",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getManagedCaCertificate = <ThrowOnError extends boolean = false>(
+  options: Options<GetManagedCaCertificateData, ThrowOnError>,
+): RequestResult<
+  GetManagedCaCertificateResponses,
+  GetManagedCaCertificateErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetManagedCaCertificateResponses,
+    GetManagedCaCertificateErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/tls/ca-certificate",
+    ...options,
+  });
+
 /**
  * Upgrade external service to new Docker image with data migration
  * This endpoint uses service-specific upgrade procedures (e.g., pg_upgrade for PostgreSQL)
@@ -12997,6 +14658,23 @@ export const upgradeService = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const testWalArchiveTarget = <ThrowOnError extends boolean = false>(
+  options: Options<TestWalArchiveTargetData, ThrowOnError>,
+): RequestResult<
+  TestWalArchiveTargetResponses,
+  TestWalArchiveTargetErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    TestWalArchiveTargetResponses,
+    TestWalArchiveTargetErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/wal-archive/test",
+    ...options,
+  });
+
 /**
  * Postgres WAL & archive health snapshot
  *
@@ -13006,7 +14684,10 @@ export const upgradeService = <ThrowOnError extends boolean = false>(
  * replication slots, archive backlog, or misconfigured `archive_command`.
  *
  * Returns 404 when no snapshot exists yet (probe hasn't run, or the service
- * isn't Postgres).
+ * isn't Postgres). When the last check could not run (a database on a
+ * worker whose agent predates the WAL probe, or cannot be reached), the 404
+ * has type `https://temps.sh/probs/wal-health-not-checked` and carries
+ * `reason` and `checked_at`, so the page can say the check is not happening.
  */
 export const getPostgresWalHealth = <ThrowOnError extends boolean = false>(
   options: Options<GetPostgresWalHealthData, ThrowOnError>,
@@ -13021,6 +14702,12 @@ export const getPostgresWalHealth = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({ url: "/external-services/{id}/wal-health", ...options });
 
+/**
+ * Get a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadMode = <ThrowOnError extends boolean = false>(
   options: Options<GetWorkloadModeData, ThrowOnError>,
 ): RequestResult<
@@ -13038,6 +14725,12 @@ export const getWorkloadMode = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Change a database's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const updateWorkloadMode = <ThrowOnError extends boolean = false>(
   options: Options<UpdateWorkloadModeData, ThrowOnError>,
 ): RequestResult<
@@ -13059,6 +14752,12 @@ export const updateWorkloadMode = <ThrowOnError extends boolean = false>(
     },
   });
 
+/**
+ * List what a recreate from the workload spec would change (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const getWorkloadPendingChanges = <ThrowOnError extends boolean = false>(
   options: Options<GetWorkloadPendingChangesData, ThrowOnError>,
 ): RequestResult<
@@ -13076,6 +14775,12 @@ export const getWorkloadPendingChanges = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Recreate a database's container from its workload spec (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Databases default to `legacy` and need no change here.
+ */
 export const recreateFromWorkloadSpec = <ThrowOnError extends boolean = false>(
   options: Options<RecreateFromWorkloadSpecData, ThrowOnError>,
 ): RequestResult<
@@ -13628,6 +15333,29 @@ export const listConnections = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const completeConnectionReauthorization = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CompleteConnectionReauthorizationData, ThrowOnError>,
+): RequestResult<
+  CompleteConnectionReauthorizationResponses,
+  CompleteConnectionReauthorizationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CompleteConnectionReauthorizationResponses,
+    CompleteConnectionReauthorizationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/git-connections/reauthorize/complete",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * Permanently delete a git provider connection
  */
@@ -13729,6 +15457,23 @@ export const runConnectionHealthCheck = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/git-connections/{connection_id}/health-check",
+    ...options,
+  });
+
+export const reauthorizeConnection = <ThrowOnError extends boolean = false>(
+  options: Options<ReauthorizeConnectionData, ThrowOnError>,
+): RequestResult<
+  ReauthorizeConnectionResponses,
+  ReauthorizeConnectionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ReauthorizeConnectionResponses,
+    ReauthorizeConnectionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/git-connections/{connection_id}/reauthorize",
     ...options,
   });
 
@@ -14027,6 +15772,31 @@ export const createGiteaPatProvider = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * Start creating a GitHub App from a manifest.
+ *
+ * Issues the `state` the console sends to GitHub along with the manifest. The
+ * callback GitHub redirects back to carries no session cookie (it is
+ * `SameSite=Strict`), so this state is what proves an operator started the
+ * flow. It works once and expires after 15 minutes.
+ */
+export const startGithubManifestFlow = <ThrowOnError extends boolean = false>(
+  options?: Options<StartGithubManifestFlowData, ThrowOnError>,
+): RequestResult<
+  StartGithubManifestFlowResponses,
+  StartGithubManifestFlowErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    StartGithubManifestFlowResponses,
+    StartGithubManifestFlowErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/git-providers/github/manifest/start",
+    ...options,
   });
 
 /**
@@ -14636,17 +16406,23 @@ export const setIncidentUpdateVisibility = <
   });
 
 /**
- * Which certificate methods fit this cluster.
+ * Which ways to give a domain HTTPS work here.
  *
- * HTTP-01 needs an ingress that answers on port 80; without one, issue
- * certificates through DNS-01.
+ * Through a tunnel that covers it, or with a Temps certificate by HTTP-01
+ * (needs public port 80) or DNS-01 (through a connected DNS provider, or a
+ * TXT record added by hand). Each says why it does not fit and where to set
+ * it up.
  */
 export const getCertificateMethods = <ThrowOnError extends boolean = false>(
   options?: Options<GetCertificateMethodsData, ThrowOnError>,
-): RequestResult<GetCertificateMethodsResponses, unknown, ThrowOnError> =>
+): RequestResult<
+  GetCertificateMethodsResponses,
+  GetCertificateMethodsErrors,
+  ThrowOnError
+> =>
   (options?.client ?? client).get<
     GetCertificateMethodsResponses,
-    unknown,
+    GetCertificateMethodsErrors,
     ThrowOnError
   >({
     security: [{ scheme: "bearer", type: "http" }],
@@ -14856,6 +16632,26 @@ export const setConnectorEnvironmentHosts = <
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * Retry DNS setup for a failed hostname publication on its current tunnel.
+ */
+export const retryIngressHostnameDns = <ThrowOnError extends boolean = false>(
+  options: Options<RetryIngressHostnameDnsData, ThrowOnError>,
+): RequestResult<
+  RetryIngressHostnameDnsResponses,
+  RetryIngressHostnameDnsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RetryIngressHostnameDnsResponses,
+    RetryIngressHostnameDnsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ingress/connectors/{id}/hostnames/{hostname}/retry-dns",
+    ...options,
   });
 
 /**
@@ -15241,6 +17037,12 @@ export const completeCiBuild = <ThrowOnError extends boolean = false>(
     },
   });
 
+/**
+ * Explain where the workload plane would place an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminExplainEnvironmentPlacement = <
   ThrowOnError extends boolean = false,
 >(
@@ -15260,6 +17062,12 @@ export const adminExplainEnvironmentPlacement = <
     ...options,
   });
 
+/**
+ * Recommend node pinning for an environment (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminEnvironmentPinningRecommendation = <
   ThrowOnError extends boolean = false,
 >(
@@ -15401,6 +17209,12 @@ export const adminAttachEnvironmentVolume = <
     },
   });
 
+/**
+ * Get an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadIsolation = <
   ThrowOnError extends boolean = false,
 >(
@@ -15420,6 +17234,12 @@ export const adminGetEnvironmentWorkloadIsolation = <
     ...options,
   });
 
+/**
+ * Change an environment's workload isolation (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadIsolation = <
   ThrowOnError extends boolean = false,
 >(
@@ -15443,6 +17263,12 @@ export const adminSetEnvironmentWorkloadIsolation = <
     },
   });
 
+/**
+ * Get an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminGetEnvironmentWorkloadMode = <
   ThrowOnError extends boolean = false,
 >(
@@ -15462,6 +17288,12 @@ export const adminGetEnvironmentWorkloadMode = <
     ...options,
   });
 
+/**
+ * Change an environment's workload mode (internal, operator-only)
+ *
+ * An ADR-055 migration control for operators and the CLI; the console does
+ * not show it. Environments default to `legacy` and need no change here.
+ */
 export const adminSetEnvironmentWorkloadMode = <
   ThrowOnError extends boolean = false,
 >(
@@ -15966,29 +17798,6 @@ export const adminSetNodeResources = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
-  });
-
-/**
- * Get decrypted S3 credentials for a backup/restore operation.
- *
- * Agents call this endpoint to receive the S3 credentials they need to upload
- * or download backups. The credentials are decrypted from the stored S3 source
- * and returned over the authenticated TLS/WireGuard channel.
- */
-export const getS3Credentials = <ThrowOnError extends boolean = false>(
-  options: Options<GetS3CredentialsData, ThrowOnError>,
-): RequestResult<
-  GetS3CredentialsResponses,
-  GetS3CredentialsErrors,
-  ThrowOnError
-> =>
-  (options.client ?? client).get<
-    GetS3CredentialsResponses,
-    GetS3CredentialsErrors,
-    ThrowOnError
-  >({
-    url: "/internal/nodes/{node_id}/s3-credentials/{s3_source_id}",
-    ...options,
   });
 
 /**
@@ -16589,6 +18398,33 @@ export const searchGlobalLogs = <ThrowOnError extends boolean = false>(
     ...options,
     headers: {
       "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Ingest newline-delimited JSON log lines with a log ingest key.
+ *
+ * One JSON object per line; see the logs documentation for the keys read.
+ * A batch is parsed and charged to the budget whole before anything is
+ * stored, so a malformed or over-budget batch stores nothing. Storage is
+ * at least once: if storing fails part-way (a full disk), the lines before
+ * the failure are kept and counted against the key, the request fails, and
+ * a collector that resends the batch stores those lines again.
+ */
+export const ingestLogs = <ThrowOnError extends boolean = false>(
+  options: Options<IngestLogsData, ThrowOnError>,
+): RequestResult<IngestLogsResponses, IngestLogsErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    IngestLogsResponses,
+    IngestLogsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/logs/ingest",
+    ...options,
+    headers: {
+      "Content-Type": "application/x-ndjson",
       ...options.headers,
     },
   });
@@ -17707,6 +19543,54 @@ export const updateSlackProvider = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Create a new Telegram notification provider
+ */
+export const createTelegramProvider = <ThrowOnError extends boolean = false>(
+  options: Options<CreateTelegramProviderData, ThrowOnError>,
+): RequestResult<
+  CreateTelegramProviderResponses,
+  CreateTelegramProviderErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateTelegramProviderResponses,
+    CreateTelegramProviderErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-providers/telegram",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Update a Telegram notification provider
+ */
+export const updateTelegramProvider = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateTelegramProviderData, ThrowOnError>,
+): RequestResult<
+  UpdateTelegramProviderResponses,
+  UpdateTelegramProviderErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateTelegramProviderResponses,
+    UpdateTelegramProviderErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/notification-providers/telegram/{id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Create a new Webhook notification provider
  *
  * Webhook providers send notifications as JSON payloads to any HTTP endpoint.
@@ -17999,6 +19883,58 @@ export const testNotificationRoute = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/notification-routes/{id}/test",
     ...options,
+  });
+
+/**
+ * OFREP bulk evaluation for server-side OpenFeature SDKs.
+ *
+ * Every flag of the token's environment, including server-only ones. Point
+ * an OFREP provider at `TEMPS_API_URL` with `TEMPS_API_TOKEN` as its bearer
+ * token.
+ */
+export const ofrepServerBulk = <ThrowOnError extends boolean = false>(
+  options: Options<OfrepServerBulkData, ThrowOnError>,
+): RequestResult<
+  OfrepServerBulkResponses,
+  OfrepServerBulkErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    OfrepServerBulkResponses,
+    OfrepServerBulkErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ofrep/v1/evaluate/flags",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * OFREP single-flag evaluation for server-side OpenFeature SDKs.
+ */
+export const ofrepServerSingle = <ThrowOnError extends boolean = false>(
+  options: Options<OfrepServerSingleData, ThrowOnError>,
+): RequestResult<
+  OfrepServerSingleResponses,
+  OfrepServerSingleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    OfrepServerSingleResponses,
+    OfrepServerSingleErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ofrep/v1/evaluate/flags/{key}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -18825,6 +20761,82 @@ export const queryMetrics = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Where the time inside one operation goes
+ */
+export const getOperationBreakdown = <ThrowOnError extends boolean = false>(
+  options: Options<GetOperationBreakdownData, ThrowOnError>,
+): RequestResult<
+  GetOperationBreakdownResponses,
+  GetOperationBreakdownErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetOperationBreakdownResponses,
+    GetOperationBreakdownErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/operations/breakdown",
+    ...options,
+  });
+
+/**
+ * Which operations got slower or faster after a deployment
+ */
+export const getDeploymentRegressions = <ThrowOnError extends boolean = false>(
+  options: Options<GetDeploymentRegressionsData, ThrowOnError>,
+): RequestResult<
+  GetDeploymentRegressionsResponses,
+  GetDeploymentRegressionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetDeploymentRegressionsResponses,
+    GetDeploymentRegressionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/operations/regressions",
+    ...options,
+  });
+
+/**
+ * Hourly latency of one operation over time
+ */
+export const getOperationTrend = <ThrowOnError extends boolean = false>(
+  options: Options<GetOperationTrendData, ThrowOnError>,
+): RequestResult<
+  GetOperationTrendResponses,
+  GetOperationTrendErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetOperationTrendResponses,
+    GetOperationTrendErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/operations/trend",
+    ...options,
+  });
+
+/**
+ * A page's web vitals next to the backend requests that served it
+ */
+export const getPageBackend = <ThrowOnError extends boolean = false>(
+  options: Options<GetPageBackendData, ThrowOnError>,
+): RequestResult<GetPageBackendResponses, GetPageBackendErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetPageBackendResponses,
+    GetPageBackendErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/pages/backend",
+    ...options,
+  });
+
+/**
  * Chart the OTel pipeline counters over time.
  *
  * `/otel/pipeline-stats` gives lifetime totals and `/otel/ingest-errors`
@@ -19034,12 +21046,12 @@ export const getTrace = <ThrowOnError extends boolean = false>(
  * checks rate limit and storage quota, routes high-severity logs
  * to DB and all logs to S3.
  */
-export const ingestLogs = <ThrowOnError extends boolean = false>(
-  options: Options<IngestLogsData, ThrowOnError>,
-): RequestResult<IngestLogsResponses, IngestLogsErrors, ThrowOnError> =>
+export const ingestLogs2 = <ThrowOnError extends boolean = false>(
+  options: Options<IngestLogs2Data, ThrowOnError>,
+): RequestResult<IngestLogs2Responses, IngestLogs2Errors, ThrowOnError> =>
   (options.client ?? client).post<
-    IngestLogsResponses,
-    IngestLogsErrors,
+    IngestLogs2Responses,
+    IngestLogs2Errors,
     ThrowOnError
   >({
     url: "/otel/v1/logs",
@@ -19246,8 +21258,9 @@ export const getGroupedPageMetrics = <ThrowOnError extends boolean = false>(
 /**
  * Get information about how the service is being accessed
  *
- * Returns details about the server's access mode, public IP address, private IP address,
- * and domain creation capabilities. Both IP addresses are always included when available.
+ * Returns how this request reached the server, and its public and private IP
+ * addresses when available. Which ways a domain can get HTTPS is per domain:
+ * `GET /ingress/certificate-methods?domain=`.
  */
 export const getAccessInfo = <ThrowOnError extends boolean = false>(
   options?: Options<GetAccessInfoData, ThrowOnError>,
@@ -20281,6 +22294,285 @@ export const grantProjectAccess = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const listAccessServices = <ThrowOnError extends boolean = false>(
+  options: Options<ListAccessServicesData, ThrowOnError>,
+): RequestResult<
+  ListAccessServicesResponses,
+  ListAccessServicesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAccessServicesResponses,
+    ListAccessServicesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-services",
+    ...options,
+  });
+
+export const createAccessService = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessServiceData, ThrowOnError>,
+): RequestResult<
+  CreateAccessServiceResponses,
+  CreateAccessServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessServiceResponses,
+    CreateAccessServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-services",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getAccessService = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessServiceData, ThrowOnError>,
+): RequestResult<
+  GetAccessServiceResponses,
+  GetAccessServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAccessServiceResponses,
+    GetAccessServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-services/{service_id}",
+    ...options,
+  });
+
+export const updateAccessService = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAccessServiceData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessServiceResponses,
+  UpdateAccessServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessServiceResponses,
+    UpdateAccessServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-services/{service_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listAccessSessions = <ThrowOnError extends boolean = false>(
+  options: Options<ListAccessSessionsData, ThrowOnError>,
+): RequestResult<
+  ListAccessSessionsResponses,
+  ListAccessSessionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAccessSessionsResponses,
+    ListAccessSessionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-sessions",
+    ...options,
+  });
+
+export const getAccessSession = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessSessionData, ThrowOnError>,
+): RequestResult<
+  GetAccessSessionResponses,
+  GetAccessSessionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAccessSessionResponses,
+    GetAccessSessionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-sessions/{session_id}",
+    ...options,
+  });
+
+export const revokeAccessSession = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeAccessSessionData, ThrowOnError>,
+): RequestResult<
+  RevokeAccessSessionResponses,
+  RevokeAccessSessionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeAccessSessionResponses,
+    RevokeAccessSessionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-sessions/{session_id}/revoke",
+    ...options,
+  });
+
+export const listAccessVaults = <ThrowOnError extends boolean = false>(
+  options: Options<ListAccessVaultsData, ThrowOnError>,
+): RequestResult<
+  ListAccessVaultsResponses,
+  ListAccessVaultsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAccessVaultsResponses,
+    ListAccessVaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults",
+    ...options,
+  });
+
+export const createAccessVault = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessVaultData, ThrowOnError>,
+): RequestResult<
+  CreateAccessVaultResponses,
+  CreateAccessVaultErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessVaultResponses,
+    CreateAccessVaultErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getAccessVault = <ThrowOnError extends boolean = false>(
+  options: Options<GetAccessVaultData, ThrowOnError>,
+): RequestResult<GetAccessVaultResponses, GetAccessVaultErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetAccessVaultResponses,
+    GetAccessVaultErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}",
+    ...options,
+  });
+
+export const updateAccessVault = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAccessVaultData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessVaultResponses,
+  UpdateAccessVaultErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessVaultResponses,
+    UpdateAccessVaultErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listAccessBundles = <ThrowOnError extends boolean = false>(
+  options: Options<ListAccessBundlesData, ThrowOnError>,
+): RequestResult<
+  ListAccessBundlesResponses,
+  ListAccessBundlesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAccessBundlesResponses,
+    ListAccessBundlesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}/bundles",
+    ...options,
+  });
+
+export const createAccessBundle = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessBundleData, ThrowOnError>,
+): RequestResult<
+  CreateAccessBundleResponses,
+  CreateAccessBundleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessBundleResponses,
+    CreateAccessBundleErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}/bundles",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateAccessBundle = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAccessBundleData, ThrowOnError>,
+): RequestResult<
+  UpdateAccessBundleResponses,
+  UpdateAccessBundleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAccessBundleResponses,
+    UpdateAccessBundleErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}/bundles/{bundle_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const createAccessSession = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAccessSessionData, ThrowOnError>,
+): RequestResult<
+  CreateAccessSessionResponses,
+  CreateAccessSessionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAccessSessionResponses,
+    CreateAccessSessionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/access-vaults/{vault_id}/sessions",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 export const revokeProjectAccess = <ThrowOnError extends boolean = false>(
   options: Options<RevokeProjectAccessData, ThrowOnError>,
 ): RequestResult<
@@ -21164,6 +23456,210 @@ export const getFilteredTraffic = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * List a project's conversion goals, newest first
+ */
+export const listAnalyticsGoals = <ThrowOnError extends boolean = false>(
+  options: Options<ListAnalyticsGoalsData, ThrowOnError>,
+): RequestResult<
+  ListAnalyticsGoalsResponses,
+  ListAnalyticsGoalsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListAnalyticsGoalsResponses,
+    ListAnalyticsGoalsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals",
+    ...options,
+  });
+
+/**
+ * Define a conversion goal
+ */
+export const createAnalyticsGoal = <ThrowOnError extends boolean = false>(
+  options: Options<CreateAnalyticsGoalData, ThrowOnError>,
+): RequestResult<
+  CreateAnalyticsGoalResponses,
+  CreateAnalyticsGoalErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateAnalyticsGoalResponses,
+    CreateAnalyticsGoalErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Conversions, conversion rate and revenue of every goal in a period
+ */
+export const getAnalyticsGoalStats = <ThrowOnError extends boolean = false>(
+  options: Options<GetAnalyticsGoalStatsData, ThrowOnError>,
+): RequestResult<
+  GetAnalyticsGoalStatsResponses,
+  GetAnalyticsGoalStatsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAnalyticsGoalStatsResponses,
+    GetAnalyticsGoalStatsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals/stats",
+    ...options,
+  });
+
+/**
+ * Delete a conversion goal (stored events are not touched)
+ */
+export const deleteAnalyticsGoal = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteAnalyticsGoalData, ThrowOnError>,
+): RequestResult<
+  DeleteAnalyticsGoalResponses,
+  DeleteAnalyticsGoalErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteAnalyticsGoalResponses,
+    DeleteAnalyticsGoalErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals/{goal_id}",
+    ...options,
+  });
+
+/**
+ * Get one conversion goal
+ */
+export const getAnalyticsGoal = <ThrowOnError extends boolean = false>(
+  options: Options<GetAnalyticsGoalData, ThrowOnError>,
+): RequestResult<
+  GetAnalyticsGoalResponses,
+  GetAnalyticsGoalErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAnalyticsGoalResponses,
+    GetAnalyticsGoalErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals/{goal_id}",
+    ...options,
+  });
+
+/**
+ * Replace a conversion goal's definition
+ */
+export const updateAnalyticsGoal = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateAnalyticsGoalData, ThrowOnError>,
+): RequestResult<
+  UpdateAnalyticsGoalResponses,
+  UpdateAnalyticsGoalErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAnalyticsGoalResponses,
+    UpdateAnalyticsGoalErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals/{goal_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * One goal's conversions by source, page, country or technology
+ */
+export const getAnalyticsGoalBreakdown = <ThrowOnError extends boolean = false>(
+  options: Options<GetAnalyticsGoalBreakdownData, ThrowOnError>,
+): RequestResult<
+  GetAnalyticsGoalBreakdownResponses,
+  GetAnalyticsGoalBreakdownErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAnalyticsGoalBreakdownResponses,
+    GetAnalyticsGoalBreakdownErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/goals/{goal_id}/breakdown",
+    ...options,
+  });
+
+/**
+ * How the project identifies visitors: stored ids or cookieless
+ */
+export const getAnalyticsIdentitySettings = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetAnalyticsIdentitySettingsData, ThrowOnError>,
+): RequestResult<
+  GetAnalyticsIdentitySettingsResponses,
+  GetAnalyticsIdentitySettingsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetAnalyticsIdentitySettingsResponses,
+    GetAnalyticsIdentitySettingsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/identity",
+    ...options,
+  });
+
+/**
+ * Change how the project identifies visitors
+ *
+ * `mode`: `cookieless` stores nothing on the visitor's device: the proxy
+ * stops setting analytics cookies and visitors are counted by a hash that
+ * changes every day. Visitors already counted keep their history.
+ *
+ * `accept_browser_identify`: `false` ignores `identify()` from the browser,
+ * so only the app's backend (a deployment token) can attach a user id.
+ * Omitted fields keep their value.
+ */
+export const updateAnalyticsIdentitySettings = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateAnalyticsIdentitySettingsData, ThrowOnError>,
+): RequestResult<
+  UpdateAnalyticsIdentitySettingsResponses,
+  UpdateAnalyticsIdentitySettingsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAnalyticsIdentitySettingsResponses,
+    UpdateAnalyticsIdentitySettingsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/identity",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * The public address an app Temps does not deploy should send analytics to.
  *
  * This is the `basePath` of the install snippet. It is its own endpoint
@@ -21440,6 +23936,37 @@ export const deleteTrafficFilter = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Identify a visitor from the app's backend (ADR 109 D4).
+ *
+ * Sets the visitor's `user_id` and merges `traits` into its `custom_data`,
+ * both marked as vouched for by the backend: a later `identify()` from the
+ * browser cannot replace them. Deployed apps call it with the injected
+ * deployment token (`visitors:enrich`) and the sealed `_temps_visitor_id`
+ * cookie of the request, which the Node SDK's `analytics.identify(request,
+ * ...)` reads for them. In a cookieless project nothing is stored.
+ */
+export const identifyVisitor = <ThrowOnError extends boolean = false>(
+  options: Options<IdentifyVisitorData, ThrowOnError>,
+): RequestResult<
+  IdentifyVisitorResponses,
+  IdentifyVisitorErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    IdentifyVisitorResponses,
+    IdentifyVisitorErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/analytics/visitors/{visitor_id}/identify",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Return the top callers (by client IP, ranked by request count) in a
  * project's API traffic window.
  *
@@ -21572,6 +24099,27 @@ export const getApiTimeseries = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/api-analytics/timeseries",
+    ...options,
+  });
+
+/**
+ * Purge all cached static assets for a project.
+ * Orphaned CAS blobs are cleaned up by the nightly garbage collector.
+ */
+export const purgeAssetCache = <ThrowOnError extends boolean = false>(
+  options: Options<PurgeAssetCacheData, ThrowOnError>,
+): RequestResult<
+  PurgeAssetCacheResponses,
+  PurgeAssetCacheErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    PurgeAssetCacheResponses,
+    PurgeAssetCacheErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/asset-cache",
     ...options,
   });
 
@@ -23686,6 +26234,28 @@ export const wakeEnvironment = <ThrowOnError extends boolean = false>(
   >({ url: "/projects/{project_id}/environments/{env_id}/wake", ...options });
 
 /**
+ * Purge cached static assets for a specific environment.
+ */
+export const purgeEnvironmentAssetCache = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<PurgeEnvironmentAssetCacheData, ThrowOnError>,
+): RequestResult<
+  PurgeEnvironmentAssetCacheResponses,
+  PurgeEnvironmentAssetCacheErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    PurgeEnvironmentAssetCacheResponses,
+    PurgeEnvironmentAssetCacheErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/asset-cache",
+    ...options,
+  });
+
+/**
  * Where this environment's Compose stack lives: its home node, a pending
  * move, and whether the environment's Target Nodes / Label Selectors still
  * describe that home.
@@ -24611,6 +27181,459 @@ export const revokeShieldToken = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const getWorkflowsOverview = <ThrowOnError extends boolean = false>(
+  options: Options<GetWorkflowsOverviewData, ThrowOnError>,
+): RequestResult<
+  GetWorkflowsOverviewResponses,
+  GetWorkflowsOverviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetWorkflowsOverviewResponses,
+    GetWorkflowsOverviewErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows",
+    ...options,
+  });
+
+export const revokeWorkflowCredential = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeWorkflowCredentialData, ThrowOnError>,
+): RequestResult<
+  RevokeWorkflowCredentialResponses,
+  RevokeWorkflowCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    RevokeWorkflowCredentialResponses,
+    RevokeWorkflowCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/credential",
+    ...options,
+  });
+
+export const getWorkflowCredential = <ThrowOnError extends boolean = false>(
+  options: Options<GetWorkflowCredentialData, ThrowOnError>,
+): RequestResult<
+  GetWorkflowCredentialResponses,
+  GetWorkflowCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetWorkflowCredentialResponses,
+    GetWorkflowCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/credential",
+    ...options,
+  });
+
+export const issueWorkflowCredential = <ThrowOnError extends boolean = false>(
+  options: Options<IssueWorkflowCredentialData, ThrowOnError>,
+): RequestResult<
+  IssueWorkflowCredentialResponses,
+  IssueWorkflowCredentialErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IssueWorkflowCredentialResponses,
+    IssueWorkflowCredentialErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/credential",
+    ...options,
+  });
+
+export const openWorkflowDev = <ThrowOnError extends boolean = false>(
+  options: Options<OpenWorkflowDevData, ThrowOnError>,
+): RequestResult<
+  OpenWorkflowDevResponses,
+  OpenWorkflowDevErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    OpenWorkflowDevResponses,
+    OpenWorkflowDevErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/dev",
+    ...options,
+  });
+
+export const closeWorkflowDev = <ThrowOnError extends boolean = false>(
+  options: Options<CloseWorkflowDevData, ThrowOnError>,
+): RequestResult<
+  CloseWorkflowDevResponses,
+  CloseWorkflowDevErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    CloseWorkflowDevResponses,
+    CloseWorkflowDevErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}",
+    ...options,
+  });
+
+export const configureWorkflowDev = <ThrowOnError extends boolean = false>(
+  options: Options<ConfigureWorkflowDevData, ThrowOnError>,
+): RequestResult<
+  ConfigureWorkflowDevResponses,
+  ConfigureWorkflowDevErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    ConfigureWorkflowDevResponses,
+    ConfigureWorkflowDevErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const pollWorkflowDev = <ThrowOnError extends boolean = false>(
+  options: Options<PollWorkflowDevData, ThrowOnError>,
+): RequestResult<
+  PollWorkflowDevResponses,
+  PollWorkflowDevErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    PollWorkflowDevResponses,
+    PollWorkflowDevErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/poll",
+    ...options,
+  });
+
+export const respondWorkflowDev = <ThrowOnError extends boolean = false>(
+  options: Options<RespondWorkflowDevData, ThrowOnError>,
+): RequestResult<
+  RespondWorkflowDevResponses,
+  RespondWorkflowDevErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RespondWorkflowDevResponses,
+    RespondWorkflowDevErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/dev/{session_id}/requests/{request_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const sendWorkflowEvent = <ThrowOnError extends boolean = false>(
+  options: Options<SendWorkflowEventData, ThrowOnError>,
+): RequestResult<
+  SendWorkflowEventResponses,
+  SendWorkflowEventErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SendWorkflowEventResponses,
+    SendWorkflowEventErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/events",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listWorkflowGrants = <ThrowOnError extends boolean = false>(
+  options: Options<ListWorkflowGrantsData, ThrowOnError>,
+): RequestResult<
+  ListWorkflowGrantsResponses,
+  ListWorkflowGrantsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListWorkflowGrantsResponses,
+    ListWorkflowGrantsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/grants",
+    ...options,
+  });
+
+export const createWorkflowGrant = <ThrowOnError extends boolean = false>(
+  options: Options<CreateWorkflowGrantData, ThrowOnError>,
+): RequestResult<
+  CreateWorkflowGrantResponses,
+  CreateWorkflowGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateWorkflowGrantResponses,
+    CreateWorkflowGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/grants",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const revokeWorkflowGrant = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeWorkflowGrantData, ThrowOnError>,
+): RequestResult<
+  RevokeWorkflowGrantResponses,
+  RevokeWorkflowGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    RevokeWorkflowGrantResponses,
+    RevokeWorkflowGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/grants/{grant_id}",
+    ...options,
+  });
+
+export const listWorkflowRuns = <ThrowOnError extends boolean = false>(
+  options: Options<ListWorkflowRunsData, ThrowOnError>,
+): RequestResult<
+  ListWorkflowRunsResponses,
+  ListWorkflowRunsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListWorkflowRunsResponses,
+    ListWorkflowRunsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs",
+    ...options,
+  });
+
+export const startWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<StartWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  StartWorkflowRunResponses,
+  StartWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    StartWorkflowRunResponses,
+    StartWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  DeleteWorkflowRunResponses,
+  DeleteWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteWorkflowRunResponses,
+    DeleteWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}",
+    ...options,
+  });
+
+export const getWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<GetWorkflowRunData, ThrowOnError>,
+): RequestResult<GetWorkflowRunResponses, GetWorkflowRunErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetWorkflowRunResponses,
+    GetWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}",
+    ...options,
+  });
+
+export const cancelWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<CancelWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  CancelWorkflowRunResponses,
+  CancelWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CancelWorkflowRunResponses,
+    CancelWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/cancel",
+    ...options,
+  });
+
+export const diagnoseWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<DiagnoseWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  DiagnoseWorkflowRunResponses,
+  DiagnoseWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DiagnoseWorkflowRunResponses,
+    DiagnoseWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/diagnose",
+    ...options,
+  });
+
+export const resumeWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<ResumeWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  ResumeWorkflowRunResponses,
+  ResumeWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ResumeWorkflowRunResponses,
+    ResumeWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/resume",
+    ...options,
+  });
+
+export const retryWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<RetryWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  RetryWorkflowRunResponses,
+  RetryWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RetryWorkflowRunResponses,
+    RetryWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/retry",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const revealWorkflowPayload = <ThrowOnError extends boolean = false>(
+  options: Options<RevealWorkflowPayloadData, ThrowOnError>,
+): RequestResult<
+  RevealWorkflowPayloadResponses,
+  RevealWorkflowPayloadErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevealWorkflowPayloadResponses,
+    RevealWorkflowPayloadErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/reveal",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listWorkflowSteps = <ThrowOnError extends boolean = false>(
+  options: Options<ListWorkflowStepsData, ThrowOnError>,
+): RequestResult<
+  ListWorkflowStepsResponses,
+  ListWorkflowStepsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListWorkflowStepsResponses,
+    ListWorkflowStepsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/runs/{run_id}/steps",
+    ...options,
+  });
+
+export const getWorkflowSettings = <ThrowOnError extends boolean = false>(
+  options: Options<GetWorkflowSettingsData, ThrowOnError>,
+): RequestResult<
+  GetWorkflowSettingsResponses,
+  GetWorkflowSettingsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetWorkflowSettingsResponses,
+    GetWorkflowSettingsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/settings",
+    ...options,
+  });
+
+export const updateWorkflowSettings = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateWorkflowSettingsData, ThrowOnError>,
+): RequestResult<
+  UpdateWorkflowSettingsResponses,
+  UpdateWorkflowSettingsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateWorkflowSettingsResponses,
+    UpdateWorkflowSettingsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/environments/{environment_id}/workflows/settings",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * List all alert rules for a project
  */
@@ -24698,6 +27721,90 @@ export const updateAlertRule = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Set how many bytes of attachments the project may store
+ */
+export const setErrorAttachmentQuota = <ThrowOnError extends boolean = false>(
+  options: Options<SetErrorAttachmentQuotaData, ThrowOnError>,
+): RequestResult<
+  SetErrorAttachmentQuotaResponses,
+  SetErrorAttachmentQuotaErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    SetErrorAttachmentQuotaResponses,
+    SetErrorAttachmentQuotaErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-attachments/quota",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Whether attachments are stored, and how much of the quota they use
+ */
+export const getErrorAttachmentUsage = <ThrowOnError extends boolean = false>(
+  options: Options<GetErrorAttachmentUsageData, ThrowOnError>,
+): RequestResult<
+  GetErrorAttachmentUsageResponses,
+  GetErrorAttachmentUsageErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetErrorAttachmentUsageResponses,
+    GetErrorAttachmentUsageErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-attachments/usage",
+    ...options,
+  });
+
+/**
+ * Delete an attachment
+ */
+export const deleteErrorAttachment = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteErrorAttachmentData, ThrowOnError>,
+): RequestResult<
+  DeleteErrorAttachmentResponses,
+  DeleteErrorAttachmentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteErrorAttachmentResponses,
+    DeleteErrorAttachmentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-attachments/{attachment_id}",
+    ...options,
+  });
+
+/**
+ * Download an attachment
+ */
+export const getErrorAttachmentContent = <ThrowOnError extends boolean = false>(
+  options: Options<GetErrorAttachmentContentData, ThrowOnError>,
+): RequestResult<
+  GetErrorAttachmentContentResponses,
+  GetErrorAttachmentContentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetErrorAttachmentContentResponses,
+    GetErrorAttachmentContentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-attachments/{attachment_id}/content",
+    ...options,
+  });
+
+/**
  * Get error dashboard statistics
  */
 export const getErrorDashboardStats = <ThrowOnError extends boolean = false>(
@@ -24714,6 +27821,29 @@ export const getErrorDashboardStats = <ThrowOnError extends boolean = false>(
   >({ url: "/projects/{project_id}/error-dashboard-stats", ...options });
 
 /**
+ * Search users and teams to assign an error group to
+ *
+ * Returns at most 20 users who can access the project and 20 teams whose
+ * name (or a user's email) contains `q`.
+ */
+export const searchErrorGroupAssignees = <ThrowOnError extends boolean = false>(
+  options: Options<SearchErrorGroupAssigneesData, ThrowOnError>,
+): RequestResult<
+  SearchErrorGroupAssigneesResponses,
+  SearchErrorGroupAssigneesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    SearchErrorGroupAssigneesResponses,
+    SearchErrorGroupAssigneesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-group-assignees",
+    ...options,
+  });
+
+/**
  * List error groups for a project
  */
 export const listErrorGroups = <ThrowOnError extends boolean = false>(
@@ -24728,6 +27858,31 @@ export const listErrorGroups = <ThrowOnError extends boolean = false>(
     ListErrorGroupsErrors,
     ThrowOnError
   >({ url: "/projects/{project_id}/error-groups", ...options });
+
+/**
+ * Resolve, reopen or ignore many error groups of a project at once — either
+ * the explicit `group_ids` or every group matching `filter`.
+ */
+export const bulkUpdateErrorGroups = <ThrowOnError extends boolean = false>(
+  options: Options<BulkUpdateErrorGroupsData, ThrowOnError>,
+): RequestResult<
+  BulkUpdateErrorGroupsResponses,
+  BulkUpdateErrorGroupsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    BulkUpdateErrorGroupsResponses,
+    BulkUpdateErrorGroupsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/bulk",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
 
 /**
  * Get a specific error group
@@ -24757,6 +27912,125 @@ export const updateErrorGroup = <ThrowOnError extends boolean = false>(
     ThrowOnError
   >({
     url: "/projects/{project_id}/error-groups/{group_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List a group's comments and activity, newest first
+ */
+export const listErrorGroupActivity = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorGroupActivityData, ThrowOnError>,
+): RequestResult<
+  ListErrorGroupActivityResponses,
+  ListErrorGroupActivityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorGroupActivityResponses,
+    ListErrorGroupActivityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/activity",
+    ...options,
+  });
+
+/**
+ * Assign an error group to a user or a team, or unassign it
+ *
+ * The assignee is independent of the status: an assigned group can be
+ * resolved or ignored and keeps its assignee. A new assignee is emailed
+ * when an email provider is configured, and `status_change` alert rules
+ * that list `assigned` fire.
+ */
+export const setErrorGroupAssignee = <ThrowOnError extends boolean = false>(
+  options: Options<SetErrorGroupAssigneeData, ThrowOnError>,
+): RequestResult<
+  SetErrorGroupAssigneeResponses,
+  SetErrorGroupAssigneeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    SetErrorGroupAssigneeResponses,
+    SetErrorGroupAssigneeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/assignee",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Comment on an error group
+ */
+export const createErrorGroupComment = <ThrowOnError extends boolean = false>(
+  options: Options<CreateErrorGroupCommentData, ThrowOnError>,
+): RequestResult<
+  CreateErrorGroupCommentResponses,
+  CreateErrorGroupCommentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateErrorGroupCommentResponses,
+    CreateErrorGroupCommentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/comments",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete a comment on an error group
+ *
+ * Its author may delete it, and so may an administrator.
+ */
+export const deleteErrorGroupComment = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteErrorGroupCommentData, ThrowOnError>,
+): RequestResult<
+  DeleteErrorGroupCommentResponses,
+  DeleteErrorGroupCommentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteErrorGroupCommentResponses,
+    DeleteErrorGroupCommentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}",
+    ...options,
+  });
+
+/**
+ * Edit your comment on an error group
+ */
+export const updateErrorGroupComment = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateErrorGroupCommentData, ThrowOnError>,
+): RequestResult<
+  UpdateErrorGroupCommentResponses,
+  UpdateErrorGroupCommentErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateErrorGroupCommentResponses,
+    UpdateErrorGroupCommentErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/comments/{comment_id}",
     ...options,
     headers: {
       "Content-Type": "application/json",
@@ -24799,6 +28073,505 @@ export const getErrorEvent = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * List the attachments of an error event
+ */
+export const listErrorEventAttachments = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorEventAttachmentsData, ThrowOnError>,
+): RequestResult<
+  ListErrorEventAttachmentsResponses,
+  ListErrorEventAttachmentsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorEventAttachmentsResponses,
+    ListErrorEventAttachmentsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/events/{event_id}/attachments",
+    ...options,
+  });
+
+/**
+ * The fingerprints routing to this group, and the groups merged into it.
+ */
+export const listErrorGroupFingerprints = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListErrorGroupFingerprintsData, ThrowOnError>,
+): RequestResult<
+  ListErrorGroupFingerprintsResponses,
+  ListErrorGroupFingerprintsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorGroupFingerprintsResponses,
+    ListErrorGroupFingerprintsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/fingerprints",
+    ...options,
+  });
+
+/**
+ * List the issues linked to an error group
+ */
+export const listErrorGroupIssues = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorGroupIssuesData, ThrowOnError>,
+): RequestResult<
+  ListErrorGroupIssuesResponses,
+  ListErrorGroupIssuesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorGroupIssuesResponses,
+    ListErrorGroupIssuesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/issues",
+    ...options,
+  });
+
+/**
+ * Open an issue for an error group in the project's repository
+ */
+export const createErrorGroupIssue = <ThrowOnError extends boolean = false>(
+  options: Options<CreateErrorGroupIssueData, ThrowOnError>,
+): RequestResult<
+  CreateErrorGroupIssueResponses,
+  CreateErrorGroupIssueErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateErrorGroupIssueResponses,
+    CreateErrorGroupIssueErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/issues",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Link an existing issue to an error group by its URL
+ */
+export const linkErrorGroupIssue = <ThrowOnError extends boolean = false>(
+  options: Options<LinkErrorGroupIssueData, ThrowOnError>,
+): RequestResult<
+  LinkErrorGroupIssueResponses,
+  LinkErrorGroupIssueErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    LinkErrorGroupIssueResponses,
+    LinkErrorGroupIssueErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/issues/link",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Read again whether the group's issues are open or closed
+ *
+ * Reads each linked GitHub or GitLab issue once (at most 10) and stores
+ * what it says. It changes nothing in the repository or in the group, so
+ * it is not audited.
+ */
+export const refreshErrorGroupIssues = <ThrowOnError extends boolean = false>(
+  options: Options<RefreshErrorGroupIssuesData, ThrowOnError>,
+): RequestResult<
+  RefreshErrorGroupIssuesResponses,
+  RefreshErrorGroupIssuesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RefreshErrorGroupIssuesResponses,
+    RefreshErrorGroupIssuesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/issues/refresh",
+    ...options,
+  });
+
+/**
+ * Unlink an issue from an error group; the issue itself is left as it is
+ */
+export const unlinkErrorGroupIssue = <ThrowOnError extends boolean = false>(
+  options: Options<UnlinkErrorGroupIssueData, ThrowOnError>,
+): RequestResult<
+  UnlinkErrorGroupIssueResponses,
+  UnlinkErrorGroupIssueErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    UnlinkErrorGroupIssueResponses,
+    UnlinkErrorGroupIssueErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/issues/{link_id}",
+    ...options,
+  });
+
+/**
+ * Merge other groups into this one: their fingerprints route here, so their
+ * future events land here, and their counts are added to this group's.
+ *
+ * Stored events keep the group they were ingested into, so nothing is
+ * rewritten and unmerging restores both groups exactly.
+ */
+export const mergeErrorGroups = <ThrowOnError extends boolean = false>(
+  options: Options<MergeErrorGroupsData, ThrowOnError>,
+): RequestResult<
+  MergeErrorGroupsResponses,
+  MergeErrorGroupsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    MergeErrorGroupsResponses,
+    MergeErrorGroupsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/merge",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Split named fingerprints out of this group into a new one, so their future
+ * events are tracked separately. Stored events stay with this group.
+ */
+export const splitErrorGroup = <ThrowOnError extends boolean = false>(
+  options: Options<SplitErrorGroupData, ThrowOnError>,
+): RequestResult<
+  SplitErrorGroupResponses,
+  SplitErrorGroupErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    SplitErrorGroupResponses,
+    SplitErrorGroupErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/split",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * The commits that last touched the code an error group fails in
+ */
+export const getErrorGroupSuspectCommits = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetErrorGroupSuspectCommitsData, ThrowOnError>,
+): RequestResult<
+  GetErrorGroupSuspectCommitsResponses,
+  GetErrorGroupSuspectCommitsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetErrorGroupSuspectCommitsResponses,
+    GetErrorGroupSuspectCommitsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/suspect-commits",
+    ...options,
+  });
+
+/**
+ * Take this group back out of the merge it is part of: its fingerprints
+ * route to it again and the count it contributed is subtracted from the
+ * group it was merged into.
+ */
+export const unmergeErrorGroup = <ThrowOnError extends boolean = false>(
+  options: Options<UnmergeErrorGroupData, ThrowOnError>,
+): RequestResult<
+  UnmergeErrorGroupResponses,
+  UnmergeErrorGroupErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    UnmergeErrorGroupResponses,
+    UnmergeErrorGroupErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-groups/{group_id}/unmerge",
+    ...options,
+  });
+
+/**
+ * List a project's inbound filters and how many events each dropped.
+ */
+export const listErrorInboundFilters = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorInboundFiltersData, ThrowOnError>,
+): RequestResult<
+  ListErrorInboundFiltersResponses,
+  ListErrorInboundFiltersErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorInboundFiltersResponses,
+    ListErrorInboundFiltersErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-inbound-filters",
+    ...options,
+  });
+
+/**
+ * Add an inbound filter. It applies to the next event.
+ */
+export const createErrorInboundFilter = <ThrowOnError extends boolean = false>(
+  options: Options<CreateErrorInboundFilterData, ThrowOnError>,
+): RequestResult<
+  CreateErrorInboundFilterResponses,
+  CreateErrorInboundFilterErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateErrorInboundFilterResponses,
+    CreateErrorInboundFilterErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-inbound-filters",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete an inbound filter. Matching events are stored again from the next
+ * one.
+ */
+export const deleteErrorInboundFilter = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteErrorInboundFilterData, ThrowOnError>,
+): RequestResult<
+  DeleteErrorInboundFilterResponses,
+  DeleteErrorInboundFilterErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteErrorInboundFilterResponses,
+    DeleteErrorInboundFilterErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-inbound-filters/{filter_id}",
+    ...options,
+  });
+
+/**
+ * Change an inbound filter's pattern or switch it on or off.
+ */
+export const updateErrorInboundFilter = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateErrorInboundFilterData, ThrowOnError>,
+): RequestResult<
+  UpdateErrorInboundFilterResponses,
+  UpdateErrorInboundFilterErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateErrorInboundFilterResponses,
+    UpdateErrorInboundFilterErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-inbound-filters/{filter_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List the project's ownership rules
+ */
+export const listErrorOwnershipRules = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorOwnershipRulesData, ThrowOnError>,
+): RequestResult<
+  ListErrorOwnershipRulesResponses,
+  ListErrorOwnershipRulesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorOwnershipRulesResponses,
+    ListErrorOwnershipRulesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-ownership-rules",
+    ...options,
+  });
+
+/**
+ * Replace the project's ownership rules
+ *
+ * A new group is assigned to the owner of the first rule matching one of
+ * its frames, innermost first. Existing groups are not reassigned.
+ */
+export const replaceErrorOwnershipRules = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ReplaceErrorOwnershipRulesData, ThrowOnError>,
+): RequestResult<
+  ReplaceErrorOwnershipRulesResponses,
+  ReplaceErrorOwnershipRulesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    ReplaceErrorOwnershipRulesResponses,
+    ReplaceErrorOwnershipRulesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-ownership-rules",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List your saved searches and the shared ones, newest first
+ */
+export const listErrorSavedSearches = <ThrowOnError extends boolean = false>(
+  options: Options<ListErrorSavedSearchesData, ThrowOnError>,
+): RequestResult<
+  ListErrorSavedSearchesResponses,
+  ListErrorSavedSearchesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListErrorSavedSearchesResponses,
+    ListErrorSavedSearchesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-saved-searches",
+    ...options,
+  });
+
+/**
+ * Save a search over the project's error groups
+ */
+export const createErrorSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<CreateErrorSavedSearchData, ThrowOnError>,
+): RequestResult<
+  CreateErrorSavedSearchResponses,
+  CreateErrorSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateErrorSavedSearchResponses,
+    CreateErrorSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-saved-searches",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete a saved search
+ *
+ * Its owner may, and an administrator may delete a shared one.
+ */
+export const deleteErrorSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteErrorSavedSearchData, ThrowOnError>,
+): RequestResult<
+  DeleteErrorSavedSearchResponses,
+  DeleteErrorSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteErrorSavedSearchResponses,
+    DeleteErrorSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-saved-searches/{saved_search_id}",
+    ...options,
+  });
+
+/**
+ * Get one saved search: yours, or a shared one
+ */
+export const getErrorSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<GetErrorSavedSearchData, ThrowOnError>,
+): RequestResult<
+  GetErrorSavedSearchResponses,
+  GetErrorSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetErrorSavedSearchResponses,
+    GetErrorSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-saved-searches/{saved_search_id}",
+    ...options,
+  });
+
+/**
+ * Rename, share or change the filters of your saved search
+ */
+export const updateErrorSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateErrorSavedSearchData, ThrowOnError>,
+): RequestResult<
+  UpdateErrorSavedSearchResponses,
+  UpdateErrorSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateErrorSavedSearchResponses,
+    UpdateErrorSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-saved-searches/{saved_search_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Get error statistics for a project
  */
 export const getErrorStats = <ThrowOnError extends boolean = false>(
@@ -24825,6 +28598,26 @@ export const getErrorTimeSeries = <ThrowOnError extends boolean = false>(
     GetErrorTimeSeriesErrors,
     ThrowOnError
   >({ url: "/projects/{project_id}/error-time-series", ...options });
+
+/**
+ * Whether issues can be opened in the project's repository
+ */
+export const getErrorSourceControl = <ThrowOnError extends boolean = false>(
+  options: Options<GetErrorSourceControlData, ThrowOnError>,
+): RequestResult<
+  GetErrorSourceControlResponses,
+  GetErrorSourceControlErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetErrorSourceControlResponses,
+    GetErrorSourceControlErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/error-tracking/source-control",
+    ...options,
+  });
 
 /**
  * Get event counts with filtering
@@ -25116,6 +28909,26 @@ export const updateProjectFeedback = <ThrowOnError extends boolean = false>(
     },
   });
 
+/**
+ * List the attachments of a feedback, such as its screenshot
+ */
+export const listFeedbackAttachments = <ThrowOnError extends boolean = false>(
+  options: Options<ListFeedbackAttachmentsData, ThrowOnError>,
+): RequestResult<
+  ListFeedbackAttachmentsResponses,
+  ListFeedbackAttachmentsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListFeedbackAttachmentsResponses,
+    ListFeedbackAttachmentsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/feedback/{feedback_id}/attachments",
+    ...options,
+  });
+
 export const listFlags = <ThrowOnError extends boolean = false>(
   options: Options<ListFlagsData, ThrowOnError>,
 ): RequestResult<ListFlagsResponses, ListFlagsErrors, ThrowOnError> =>
@@ -25209,6 +29022,73 @@ export const setFlagEnvironment = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * Replace the ordered targeting rules of a flag in one environment.
+ *
+ * Rules apply after the kill switch and before the environment value; the
+ * first rule whose conditions hold (and whose rollout includes the subject)
+ * decides the value. Send the environment row's `updated_at` as
+ * `expected_updated_at` so a concurrent edit is refused with 409 instead of
+ * being overwritten.
+ */
+export const setFlagRules = <ThrowOnError extends boolean = false>(
+  options: Options<SetFlagRulesData, ThrowOnError>,
+): RequestResult<SetFlagRulesResponses, SetFlagRulesErrors, ThrowOnError> =>
+  (options.client ?? client).put<
+    SetFlagRulesResponses,
+    SetFlagRulesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/flags/{key}/environments/{environment_id}/rules",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Evaluate one flag as an app in the given environment would, for a context
+ * you supply. Read-only; the console's "test this flag" panel.
+ */
+export const evaluateFlag = <ThrowOnError extends boolean = false>(
+  options: Options<EvaluateFlagData, ThrowOnError>,
+): RequestResult<EvaluateFlagResponses, EvaluateFlagErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    EvaluateFlagResponses,
+    EvaluateFlagErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/flags/{key}/evaluate",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Regenerate the flag's bucketing salt.
+ *
+ * Reassigns every subject of every percentage rollout and split of this flag,
+ * in every environment. Use it to draw a fresh sample, never on a running
+ * experiment.
+ */
+export const reshuffleFlag = <ThrowOnError extends boolean = false>(
+  options: Options<ReshuffleFlagData, ThrowOnError>,
+): RequestResult<ReshuffleFlagResponses, ReshuffleFlagErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    ReshuffleFlagResponses,
+    ReshuffleFlagErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/flags/{key}/reshuffle",
+    ...options,
   });
 
 /**
@@ -25780,6 +29660,32 @@ export const getBucketedIncidents = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Get where this project's apps send telemetry
+ *
+ * The public URL, method and content type of every ingest route (analytics,
+ * session replay, errors, OTLP logs and traces), the credential each expects
+ * and where to create it, and whether the project already has it. Header
+ * values are templates over an environment variable; no credential is
+ * returned.
+ */
+export const getProjectIngestSetup = <ThrowOnError extends boolean = false>(
+  options: Options<GetProjectIngestSetupData, ThrowOnError>,
+): RequestResult<
+  GetProjectIngestSetupResponses,
+  GetProjectIngestSetupErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetProjectIngestSetupResponses,
+    GetProjectIngestSetupErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ingest-setup",
+    ...options,
+  });
+
 export const getInheritedEnvVars = <ThrowOnError extends boolean = false>(
   options: Options<GetInheritedEnvVarsData, ThrowOnError>,
 ): RequestResult<
@@ -25794,6 +29700,162 @@ export const getInheritedEnvVars = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/inherited-env-vars",
+    ...options,
+  });
+
+/**
+ * List the projects allowed to call this project's internal addresses
+ *
+ * Newest first. With `environment_id`, only the grants that cover that
+ * environment (its own and the project-wide ones).
+ */
+export const listInternalAccessGrants = <ThrowOnError extends boolean = false>(
+  options: Options<ListInternalAccessGrantsData, ThrowOnError>,
+): RequestResult<
+  ListInternalAccessGrantsResponses,
+  ListInternalAccessGrantsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListInternalAccessGrantsResponses,
+    ListInternalAccessGrantsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access",
+    ...options,
+  });
+
+/**
+ * Allow another project to call this project's internal addresses
+ *
+ * Workloads of the calling project (or of one environment of it) may then
+ * call this project's `*.temps.local` addresses (or one environment's)
+ * through the internal proxy. Workers apply it with their next route sync,
+ * within seconds.
+ */
+export const createInternalAccessGrant = <ThrowOnError extends boolean = false>(
+  options: Options<CreateInternalAccessGrantData, ThrowOnError>,
+): RequestResult<
+  CreateInternalAccessGrantResponses,
+  CreateInternalAccessGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateInternalAccessGrantResponses,
+    CreateInternalAccessGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * List the sandboxes allowed to call this project's internal addresses
+ *
+ * Newest first. With `environment_id`, only the grants that cover that
+ * environment (its own and the project-wide ones).
+ */
+export const listInternalAccessSandboxGrants = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListInternalAccessSandboxGrantsData, ThrowOnError>,
+): RequestResult<
+  ListInternalAccessSandboxGrantsResponses,
+  ListInternalAccessSandboxGrantsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListInternalAccessSandboxGrantsResponses,
+    ListInternalAccessSandboxGrantsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access/sandboxes",
+    ...options,
+  });
+
+/**
+ * Allow one of your sandboxes to call this project's internal addresses
+ *
+ * The sandbox may then call this project's `<environment>.<project>.temps.local`
+ * addresses (or one environment's) with plain `http://`, through its egress
+ * proxy, in every egress mode. The internal proxy applies it with its next
+ * route snapshot, within seconds. Destroying the sandbox removes the grant.
+ */
+export const createInternalAccessSandboxGrant = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateInternalAccessSandboxGrantData, ThrowOnError>,
+): RequestResult<
+  CreateInternalAccessSandboxGrantResponses,
+  CreateInternalAccessSandboxGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateInternalAccessSandboxGrantResponses,
+    CreateInternalAccessSandboxGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access/sandboxes",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Stop a sandbox from calling this project's internal addresses
+ *
+ * The internal proxy refuses the sandbox again with its next route
+ * snapshot, within seconds.
+ */
+export const deleteInternalAccessSandboxGrant = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DeleteInternalAccessSandboxGrantData, ThrowOnError>,
+): RequestResult<
+  DeleteInternalAccessSandboxGrantResponses,
+  DeleteInternalAccessSandboxGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteInternalAccessSandboxGrantResponses,
+    DeleteInternalAccessSandboxGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access/sandboxes/{grant_id}",
+    ...options,
+  });
+
+/**
+ * Stop another project from calling this project's internal addresses
+ *
+ * Workers refuse the caller again with their next route sync, within
+ * seconds (ADR 101 D5).
+ */
+export const deleteInternalAccessGrant = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteInternalAccessGrantData, ThrowOnError>,
+): RequestResult<
+  DeleteInternalAccessGrantResponses,
+  DeleteInternalAccessGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteInternalAccessGrantResponses,
+    DeleteInternalAccessGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/internal-access/{grant_id}",
     ...options,
   });
 
@@ -25897,6 +29959,23 @@ export const testProjectIpAccess = <ThrowOnError extends boolean = false>(
     },
   });
 
+export const projectAccessVaults = <ThrowOnError extends boolean = false>(
+  options: Options<ProjectAccessVaultsData, ThrowOnError>,
+): RequestResult<
+  ProjectAccessVaultsResponses,
+  ProjectAccessVaultsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ProjectAccessVaultsResponses,
+    ProjectAccessVaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/linked-vaults",
+    ...options,
+  });
+
 /**
  * Purge all logs for a project before a given timestamp
  */
@@ -25919,6 +29998,195 @@ export const purgeProjectLogs = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * List a project's log ingest keys. Never returns a key's plaintext.
+ */
+export const listLogIngestKeys = <ThrowOnError extends boolean = false>(
+  options: Options<ListLogIngestKeysData, ThrowOnError>,
+): RequestResult<
+  ListLogIngestKeysResponses,
+  ListLogIngestKeysErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListLogIngestKeysResponses,
+    ListLogIngestKeysErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/ingest-keys",
+    ...options,
+  });
+
+/**
+ * Create a log ingest key. The response is the only time the key is shown.
+ */
+export const createLogIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<CreateLogIngestKeyData, ThrowOnError>,
+): RequestResult<
+  CreateLogIngestKeyResponses,
+  CreateLogIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateLogIngestKeyResponses,
+    CreateLogIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/ingest-keys",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Revoke a log ingest key. Lines it already sent stay.
+ */
+export const revokeLogIngestKey = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeLogIngestKeyData, ThrowOnError>,
+): RequestResult<
+  RevokeLogIngestKeyResponses,
+  RevokeLogIngestKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeLogIngestKeyResponses,
+    RevokeLogIngestKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/ingest-keys/{key_id}/revoke",
+    ...options,
+  });
+
+/**
+ * List a project's saved log searches, pinned first.
+ */
+export const listSavedSearches = <ThrowOnError extends boolean = false>(
+  options: Options<ListSavedSearchesData, ThrowOnError>,
+): RequestResult<
+  ListSavedSearchesResponses,
+  ListSavedSearchesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListSavedSearchesResponses,
+    ListSavedSearchesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches",
+    ...options,
+  });
+
+/**
+ * Save a log search for a project.
+ */
+export const createSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<CreateSavedSearchData, ThrowOnError>,
+): RequestResult<
+  CreateSavedSearchResponses,
+  CreateSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateSavedSearchResponses,
+    CreateSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete a saved log search. Refused while a log alert counts it.
+ */
+export const deleteSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteSavedSearchData, ThrowOnError>,
+): RequestResult<
+  DeleteSavedSearchResponses,
+  DeleteSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteSavedSearchResponses,
+    DeleteSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches/{saved_search_id}",
+    ...options,
+  });
+
+/**
+ * Read one saved log search.
+ */
+export const getSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<GetSavedSearchData, ThrowOnError>,
+): RequestResult<GetSavedSearchResponses, GetSavedSearchErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetSavedSearchResponses,
+    GetSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches/{saved_search_id}",
+    ...options,
+  });
+
+/**
+ * Change a saved log search.
+ */
+export const updateSavedSearch = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateSavedSearchData, ThrowOnError>,
+): RequestResult<
+  UpdateSavedSearchResponses,
+  UpdateSavedSearchErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateSavedSearchResponses,
+    UpdateSavedSearchErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches/{saved_search_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Chart a saved log search over time: matching lines per bucket, or a
+ * numeric attribute aggregated per bucket.
+ */
+export const savedSearchSeries = <ThrowOnError extends boolean = false>(
+  options: Options<SavedSearchSeriesData, ThrowOnError>,
+): RequestResult<
+  SavedSearchSeriesResponses,
+  SavedSearchSeriesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    SavedSearchSeriesResponses,
+    SavedSearchSeriesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/logs/saved-searches/{saved_search_id}/series",
+    ...options,
   });
 
 export const listMcps = <ThrowOnError extends boolean = false>(
@@ -26044,6 +30312,86 @@ export const createMonitor = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Where monitors can be checked from
+ *
+ * The control plane, plus the online worker nodes a monitor with
+ * `probe_from_nodes` would also be checked from (at most four, one per
+ * `region` label first). `configured` is false when there is no worker
+ * node, with what to do about it.
+ */
+export const getMonitorProbeLocations = <ThrowOnError extends boolean = false>(
+  options: Options<GetMonitorProbeLocationsData, ThrowOnError>,
+): RequestResult<
+  GetMonitorProbeLocationsResponses,
+  GetMonitorProbeLocationsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetMonitorProbeLocationsResponses,
+    GetMonitorProbeLocationsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/monitors/probe-locations",
+    ...options,
+  });
+
+/**
+ * Monitor a target outside Temps
+ *
+ * Checks a URL (`http`), a port (`tcp`), a TLS certificate (`tls`) or a
+ * DNS record (`dns`) that is not a Temps environment. The target must have
+ * a public address. The first check runs within about 15 seconds.
+ */
+export const createTargetMonitor = <ThrowOnError extends boolean = false>(
+  options: Options<CreateTargetMonitorData, ThrowOnError>,
+): RequestResult<
+  CreateTargetMonitorResponses,
+  CreateTargetMonitorErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateTargetMonitorResponses,
+    CreateTargetMonitorErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/monitors/targets",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Change a monitor of a target outside Temps
+ *
+ * Fields left out keep their value. `request` replaces every header and the
+ * body. Changing the check may change its kind; the target must fit it.
+ */
+export const updateTargetMonitor = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateTargetMonitorData, ThrowOnError>,
+): RequestResult<
+  UpdateTargetMonitorResponses,
+  UpdateTargetMonitorErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateTargetMonitorResponses,
+    UpdateTargetMonitorErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/monitors/{monitor_id}/target",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * List a merged page of observability events for a project.
  *
  * Each row carries everything the side panel needs to render — no
@@ -26088,6 +30436,66 @@ export const observabilityFullEvent = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/observe/events/{kind}/{event_id}/full",
+    ...options,
+  });
+
+/**
+ * Whether performance issues are detected for a project
+ */
+export const getPerformanceIssueStatus = <ThrowOnError extends boolean = false>(
+  options: Options<GetPerformanceIssueStatusData, ThrowOnError>,
+): RequestResult<
+  GetPerformanceIssueStatusResponses,
+  GetPerformanceIssueStatusErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPerformanceIssueStatusResponses,
+    GetPerformanceIssueStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/performance-issues/status",
+    ...options,
+  });
+
+/**
+ * Releases with sessions in the window, the most recently active first.
+ */
+export const listReleaseHealth = <ThrowOnError extends boolean = false>(
+  options: Options<ListReleaseHealthData, ThrowOnError>,
+): RequestResult<
+  ListReleaseHealthResponses,
+  ListReleaseHealthErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListReleaseHealthResponses,
+    ListReleaseHealthErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/release-health",
+    ...options,
+  });
+
+/**
+ * One release's sessions and crash-free rate per hour.
+ */
+export const getReleaseHealthSeries = <ThrowOnError extends boolean = false>(
+  options: Options<GetReleaseHealthSeriesData, ThrowOnError>,
+): RequestResult<
+  GetReleaseHealthSeriesResponses,
+  GetReleaseHealthSeriesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetReleaseHealthSeriesResponses,
+    GetReleaseHealthSeriesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/release-health/series",
     ...options,
   });
 
@@ -26485,6 +30893,166 @@ export const getProjectRuntimeHealth = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const listServiceGrants = <ThrowOnError extends boolean = false>(
+  options: Options<ListServiceGrantsData, ThrowOnError>,
+): RequestResult<
+  ListServiceGrantsResponses,
+  ListServiceGrantsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListServiceGrantsResponses,
+    ListServiceGrantsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
+    ...options,
+  });
+
+export const requestServiceGrant = <ThrowOnError extends boolean = false>(
+  options: Options<RequestServiceGrantData, ThrowOnError>,
+): RequestResult<
+  RequestServiceGrantResponses,
+  RequestServiceGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RequestServiceGrantResponses,
+    RequestServiceGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const approveServiceGrant = <ThrowOnError extends boolean = false>(
+  options: Options<ApproveServiceGrantData, ThrowOnError>,
+): RequestResult<
+  ApproveServiceGrantResponses,
+  ApproveServiceGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ApproveServiceGrantResponses,
+    ApproveServiceGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/approve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const revokeServiceGrant = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeServiceGrantData, ThrowOnError>,
+): RequestResult<
+  RevokeServiceGrantResponses,
+  RevokeServiceGrantErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeServiceGrantResponses,
+    RevokeServiceGrantErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/service-grants/{grant_id}/revoke",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listSandboxServices = <ThrowOnError extends boolean = false>(
+  options: Options<ListSandboxServicesData, ThrowOnError>,
+): RequestResult<
+  ListSandboxServicesResponses,
+  ListSandboxServicesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListSandboxServicesResponses,
+    ListSandboxServicesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/services",
+    ...options,
+  });
+
+export const requestSandboxService = <ThrowOnError extends boolean = false>(
+  options: Options<RequestSandboxServiceData, ThrowOnError>,
+): RequestResult<
+  RequestSandboxServiceResponses,
+  RequestSandboxServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RequestSandboxServiceResponses,
+    RequestSandboxServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/services",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const approveSandboxService = <ThrowOnError extends boolean = false>(
+  options: Options<ApproveSandboxServiceData, ThrowOnError>,
+): RequestResult<
+  ApproveSandboxServiceResponses,
+  ApproveSandboxServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ApproveSandboxServiceResponses,
+    ApproveSandboxServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/approve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const revokeSandboxService = <ThrowOnError extends boolean = false>(
+  options: Options<RevokeSandboxServiceData, ThrowOnError>,
+): RequestResult<
+  RevokeSandboxServiceResponses,
+  RevokeSandboxServiceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    RevokeSandboxServiceResponses,
+    RevokeSandboxServiceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/sandboxes/{sandbox_id}/services/{access_id}/revoke",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * List project secrets (metadata only — values never returned).
  */
@@ -26599,6 +31167,23 @@ export const listSecretHistory = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/secrets/{secret_id}/history",
+    ...options,
+  });
+
+export const accessCapability = <ThrowOnError extends boolean = false>(
+  options: Options<AccessCapabilityData, ThrowOnError>,
+): RequestResult<
+  AccessCapabilityResponses,
+  AccessCapabilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    AccessCapabilityResponses,
+    AccessCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/service-access/capability",
     ...options,
   });
 
@@ -27017,6 +31602,113 @@ export const getStatusOverview = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const listSurveys = <ThrowOnError extends boolean = false>(
+  options: Options<ListSurveysData, ThrowOnError>,
+): RequestResult<ListSurveysResponses, ListSurveysErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    ListSurveysResponses,
+    ListSurveysErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys",
+    ...options,
+  });
+
+export const createSurvey = <ThrowOnError extends boolean = false>(
+  options: Options<CreateSurveyData, ThrowOnError>,
+): RequestResult<CreateSurveyResponses, CreateSurveyErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    CreateSurveyResponses,
+    CreateSurveyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const deleteSurvey = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteSurveyData, ThrowOnError>,
+): RequestResult<DeleteSurveyResponses, DeleteSurveyErrors, ThrowOnError> =>
+  (options.client ?? client).delete<
+    DeleteSurveyResponses,
+    DeleteSurveyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys/{survey_id}",
+    ...options,
+  });
+
+export const getSurvey = <ThrowOnError extends boolean = false>(
+  options: Options<GetSurveyData, ThrowOnError>,
+): RequestResult<GetSurveyResponses, GetSurveyErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetSurveyResponses,
+    GetSurveyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys/{survey_id}",
+    ...options,
+  });
+
+export const updateSurvey = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateSurveyData, ThrowOnError>,
+): RequestResult<UpdateSurveyResponses, UpdateSurveyErrors, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateSurveyResponses,
+    UpdateSurveyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys/{survey_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listSurveyResponses = <ThrowOnError extends boolean = false>(
+  options: Options<ListSurveyResponsesData, ThrowOnError>,
+): RequestResult<
+  ListSurveyResponsesResponses,
+  ListSurveyResponsesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListSurveyResponsesResponses,
+    ListSurveyResponsesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys/{survey_id}/responses",
+    ...options,
+  });
+
+export const getSurveyResults = <ThrowOnError extends boolean = false>(
+  options: Options<GetSurveyResultsData, ThrowOnError>,
+): RequestResult<
+  GetSurveyResultsResponses,
+  GetSurveyResultsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetSurveyResultsResponses,
+    GetSurveyResultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/surveys/{survey_id}/results",
+    ...options,
+  });
+
 export const listTelemetryReleases = <ThrowOnError extends boolean = false>(
   options: Options<ListTelemetryReleasesData, ThrowOnError>,
 ): RequestResult<
@@ -27283,6 +31975,44 @@ export const retryDelivery = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/webhooks/{webhook_id}/deliveries/{delivery_id}/retry",
     ...options,
+  });
+
+export const listWorkflowProjectKeys = <ThrowOnError extends boolean = false>(
+  options: Options<ListWorkflowProjectKeysData, ThrowOnError>,
+): RequestResult<
+  ListWorkflowProjectKeysResponses,
+  ListWorkflowProjectKeysErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListWorkflowProjectKeysResponses,
+    ListWorkflowProjectKeysErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/workflow-keys",
+    ...options,
+  });
+
+export const shredWorkflowProjectKey = <ThrowOnError extends boolean = false>(
+  options: Options<ShredWorkflowProjectKeyData, ThrowOnError>,
+): RequestResult<
+  ShredWorkflowProjectKeyResponses,
+  ShredWorkflowProjectKeyErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ShredWorkflowProjectKeyResponses,
+    ShredWorkflowProjectKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/workflow-keys/{key_id}/shred",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 export const workflowDryRun = <ThrowOnError extends boolean = false>(
@@ -28003,6 +32733,78 @@ export const revenueListProviders = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const sandboxAccessVaults = <ThrowOnError extends boolean = false>(
+  options: Options<SandboxAccessVaultsData, ThrowOnError>,
+): RequestResult<
+  SandboxAccessVaultsResponses,
+  SandboxAccessVaultsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    SandboxAccessVaultsResponses,
+    SandboxAccessVaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/sandboxes/{sandbox_id}/access-vaults",
+    ...options,
+  });
+
+/**
+ * List the internal addresses one of your sandboxes may call
+ *
+ * One entry per environment its grants cover, with the `curl` command to
+ * run inside the sandbox.
+ */
+export const listSandboxInternalAddresses = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListSandboxInternalAddressesData, ThrowOnError>,
+): RequestResult<
+  ListSandboxInternalAddressesResponses,
+  ListSandboxInternalAddressesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListSandboxInternalAddressesResponses,
+    ListSandboxInternalAddressesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/sandboxes/{sandbox_id}/internal-addresses",
+    ...options,
+  });
+
+export const generalAccessCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GeneralAccessCapabilityData, ThrowOnError>,
+): RequestResult<
+  GeneralAccessCapabilityResponses,
+  GeneralAccessCapabilityErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GeneralAccessCapabilityResponses,
+    GeneralAccessCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/service-access/capability",
+    ...options,
+  });
+
+export const serviceCatalog = <ThrowOnError extends boolean = false>(
+  options?: Options<ServiceCatalogData, ThrowOnError>,
+): RequestResult<ServiceCatalogResponses, ServiceCatalogErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ServiceCatalogResponses,
+    ServiceCatalogErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/service-access/catalog",
+    ...options,
+  });
+
 /**
  * Get session replays for a project
  */
@@ -28561,6 +33363,31 @@ export const clusterNetworkUpdate = <ThrowOnError extends boolean = false>(
       "Content-Type": "application/json",
       ...options.headers,
     },
+  });
+
+/**
+ * Give this cluster its own VXLAN network ID (ADR 062)
+ *
+ * Assigns a fresh random network ID. Every node's overlay, and the control
+ * plane's, is rebuilt on it at its next reconcile; cross-node traffic pauses
+ * until each one has. Refused while a node's agent has not reported that it
+ * can follow a new network ID.
+ */
+export const clusterNetworkIdChange = <ThrowOnError extends boolean = false>(
+  options?: Options<ClusterNetworkIdChangeData, ThrowOnError>,
+): RequestResult<
+  ClusterNetworkIdChangeResponses,
+  ClusterNetworkIdChangeErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    ClusterNetworkIdChangeResponses,
+    ClusterNetworkIdChangeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/settings/cluster-network/network-id",
+    ...options,
   });
 
 /**
@@ -29662,6 +34489,184 @@ export const verifyStatusPageDomain = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Maintenance windows of a status page
+ *
+ * Newest first, cancelled and completed ones included.
+ */
+export const listStatusPageMaintenances = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ListStatusPageMaintenancesData, ThrowOnError>,
+): RequestResult<
+  ListStatusPageMaintenancesResponses,
+  ListStatusPageMaintenancesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListStatusPageMaintenancesResponses,
+    ListStatusPageMaintenancesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/maintenances",
+    ...options,
+  });
+
+/**
+ * Schedule a maintenance window
+ *
+ * While it runs, the covered monitors show "Under maintenance", their
+ * checks are left out of uptime and no outage incident or alert is raised
+ * for them. It is announced once, now, through the page's feed and
+ * subscriptions. It cannot start in the past.
+ */
+export const createStatusPageMaintenance = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CreateStatusPageMaintenanceData, ThrowOnError>,
+): RequestResult<
+  CreateStatusPageMaintenanceResponses,
+  CreateStatusPageMaintenanceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateStatusPageMaintenanceResponses,
+    CreateStatusPageMaintenanceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/maintenances",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Cancel a maintenance window
+ *
+ * A scheduled window never runs; one in progress ends now. Checks taken
+ * while it ran stay out of uptime. The window is kept, marked cancelled.
+ */
+export const cancelStatusPageMaintenance = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<CancelStatusPageMaintenanceData, ThrowOnError>,
+): RequestResult<
+  CancelStatusPageMaintenanceResponses,
+  CancelStatusPageMaintenanceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    CancelStatusPageMaintenanceResponses,
+    CancelStatusPageMaintenanceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/maintenances/{maintenance_id}",
+    ...options,
+  });
+
+/**
+ * A maintenance window
+ */
+export const getStatusPageMaintenance = <ThrowOnError extends boolean = false>(
+  options: Options<GetStatusPageMaintenanceData, ThrowOnError>,
+): RequestResult<
+  GetStatusPageMaintenanceResponses,
+  GetStatusPageMaintenanceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetStatusPageMaintenanceResponses,
+    GetStatusPageMaintenanceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/maintenances/{maintenance_id}",
+    ...options,
+  });
+
+/**
+ * Change a maintenance window
+ *
+ * Before it starts every field can change; once it has started, only the
+ * title, description and end. A cancelled or completed window cannot
+ * change. Changes are shown on the page but not announced again.
+ */
+export const updateStatusPageMaintenance = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateStatusPageMaintenanceData, ThrowOnError>,
+): RequestResult<
+  UpdateStatusPageMaintenanceResponses,
+  UpdateStatusPageMaintenanceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateStatusPageMaintenanceResponses,
+    UpdateStatusPageMaintenanceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/maintenances/{maintenance_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Whether a status page needs a password
+ */
+export const getStatusPagePassword = <ThrowOnError extends boolean = false>(
+  options: Options<GetStatusPagePasswordData, ThrowOnError>,
+): RequestResult<
+  GetStatusPagePasswordResponses,
+  GetStatusPagePasswordErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetStatusPagePasswordResponses,
+    GetStatusPagePasswordErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/password",
+    ...options,
+  });
+
+/**
+ * Set, change or remove a status page's password
+ *
+ * With a password (8 to 256 characters), visitors must type it to read the
+ * page, its JSON or subscribe, and the page's Atom feed is not served.
+ * `null` makes the page open again. Any change signs every visitor out.
+ */
+export const setStatusPagePassword = <ThrowOnError extends boolean = false>(
+  options: Options<SetStatusPagePasswordData, ThrowOnError>,
+): RequestResult<
+  SetStatusPagePasswordResponses,
+  SetStatusPagePasswordErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    SetStatusPagePasswordResponses,
+    SetStatusPagePasswordErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/password",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Preview what a status page shows visitors, published or not
  */
 export const previewStatusPage = <ThrowOnError extends boolean = false>(
@@ -29722,6 +34727,132 @@ export const rotateStatusPageUrl = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Subscribers of a status page
+ *
+ * Newest first. Addresses are personal data: only callers who may change the
+ * page see them.
+ */
+export const listStatusPageSubscribers = <ThrowOnError extends boolean = false>(
+  options: Options<ListStatusPageSubscribersData, ThrowOnError>,
+): RequestResult<
+  ListStatusPageSubscribersResponses,
+  ListStatusPageSubscribersErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListStatusPageSubscribersResponses,
+    ListStatusPageSubscribersErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/subscribers",
+    ...options,
+  });
+
+/**
+ * Export the subscribers of a status page as CSV
+ *
+ * `email,state,subscribed_at,confirmed_at`, oldest first. Audit-logged.
+ */
+export const exportStatusPageSubscribers = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<ExportStatusPageSubscribersData, ThrowOnError>,
+): RequestResult<
+  ExportStatusPageSubscribersResponses,
+  ExportStatusPageSubscribersErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ExportStatusPageSubscribersResponses,
+    ExportStatusPageSubscribersErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/subscribers/export",
+    ...options,
+  });
+
+/**
+ * Delete a subscriber
+ *
+ * Removes the address from the page. The subscriber gets no more mail.
+ */
+export const deleteStatusPageSubscriber = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<DeleteStatusPageSubscriberData, ThrowOnError>,
+): RequestResult<
+  DeleteStatusPageSubscriberResponses,
+  DeleteStatusPageSubscriberErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteStatusPageSubscriberResponses,
+    DeleteStatusPageSubscriberErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/subscribers/{subscriber_id}",
+    ...options,
+  });
+
+/**
+ * Email subscription settings of a status page
+ *
+ * Whether visitors can subscribe, the sender, whether mail and links can go
+ * out (with what is missing and where to fix it) and subscriber counts.
+ */
+export const getStatusPageSubscriptions = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetStatusPageSubscriptionsData, ThrowOnError>,
+): RequestResult<
+  GetStatusPageSubscriptionsResponses,
+  GetStatusPageSubscriptionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetStatusPageSubscriptionsResponses,
+    GetStatusPageSubscriptionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/subscriptions",
+    ...options,
+  });
+
+/**
+ * Change the email subscription settings of a status page
+ *
+ * Switching subscriptions on needs a sender at a verified email domain with
+ * an active provider, and an address for the links (a public URL or a
+ * verified custom domain); otherwise 409 says what is missing.
+ */
+export const updateStatusPageSubscriptions = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateStatusPageSubscriptionsData, ThrowOnError>,
+): RequestResult<
+  UpdateStatusPageSubscriptionsResponses,
+  UpdateStatusPageSubscriptionsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateStatusPageSubscriptionsResponses,
+    UpdateStatusPageSubscriptionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/subscriptions",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Unpublish a status page; its public URL returns 404 immediately
  */
 export const unpublishStatusPage = <ThrowOnError extends boolean = false>(
@@ -29742,6 +34873,103 @@ export const unpublishStatusPage = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Webhooks of a status page
+ *
+ * Newest first, each with the outcome of its last delivery.
+ */
+export const listStatusPageWebhooks = <ThrowOnError extends boolean = false>(
+  options: Options<ListStatusPageWebhooksData, ThrowOnError>,
+): RequestResult<
+  ListStatusPageWebhooksResponses,
+  ListStatusPageWebhooksErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListStatusPageWebhooksResponses,
+    ListStatusPageWebhooksErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/webhooks",
+    ...options,
+  });
+
+/**
+ * Register a webhook on a status page
+ *
+ * Each new public event of the page (an incident update or resolution, a
+ * scheduled maintenance window) is posted to the URL as JSON, signed in
+ * `X-Temps-Signature` with the secret returned here, once. The URL must be
+ * `https://` and resolve to a public address.
+ */
+export const createStatusPageWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<CreateStatusPageWebhookData, ThrowOnError>,
+): RequestResult<
+  CreateStatusPageWebhookResponses,
+  CreateStatusPageWebhookErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    CreateStatusPageWebhookResponses,
+    CreateStatusPageWebhookErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/webhooks",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Delete a webhook
+ *
+ * Events still waiting for it are dropped.
+ */
+export const deleteStatusPageWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteStatusPageWebhookData, ThrowOnError>,
+): RequestResult<
+  DeleteStatusPageWebhookResponses,
+  DeleteStatusPageWebhookErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).delete<
+    DeleteStatusPageWebhookResponses,
+    DeleteStatusPageWebhookErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/webhooks/{webhook_id}",
+    ...options,
+  });
+
+/**
+ * Change a webhook's URL or switch it on or off
+ */
+export const updateStatusPageWebhook = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateStatusPageWebhookData, ThrowOnError>,
+): RequestResult<
+  UpdateStatusPageWebhookResponses,
+  UpdateStatusPageWebhookErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).patch<
+    UpdateStatusPageWebhookResponses,
+    UpdateStatusPageWebhookErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/status-pages/{status_page_id}/webhooks/{webhook_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * Public status page (HTML)
  */
 export const getPublicStatusPage = <ThrowOnError extends boolean = false>(
@@ -29758,6 +34986,82 @@ export const getPublicStatusPage = <ThrowOnError extends boolean = false>(
   >({ url: "/status/{slug}", ...options });
 
 /**
+ * Confirmation link: asks for a click
+ */
+export const statusPageConfirmForm = <ThrowOnError extends boolean = false>(
+  options: Options<StatusPageConfirmFormData, ThrowOnError>,
+): RequestResult<
+  StatusPageConfirmFormResponses,
+  StatusPageConfirmFormErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    StatusPageConfirmFormResponses,
+    StatusPageConfirmFormErrors,
+    ThrowOnError
+  >({ url: "/status/{slug}/confirm/{token}", ...options });
+
+/**
+ * Confirm a subscription
+ */
+export const statusPageConfirm = <ThrowOnError extends boolean = false>(
+  options: Options<StatusPageConfirmData, ThrowOnError>,
+): RequestResult<
+  StatusPageConfirmResponses,
+  StatusPageConfirmErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    StatusPageConfirmResponses,
+    StatusPageConfirmErrors,
+    ThrowOnError
+  >({ url: "/status/{slug}/confirm/{token}", ...options });
+
+/**
+ * Public status page (Atom feed)
+ *
+ * The page's public incident updates and maintenance announcements as an
+ * Atom feed, newest first, built with the page snapshot: it carries nothing
+ * the page does not show. A password-protected page has no feed.
+ */
+export const getPublicStatusPageFeed = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicStatusPageFeedData, ThrowOnError>,
+): RequestResult<
+  GetPublicStatusPageFeedResponses,
+  GetPublicStatusPageFeedErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPublicStatusPageFeedResponses,
+    GetPublicStatusPageFeedErrors,
+    ThrowOnError
+  >({ url: "/status/{slug}/feed.atom", ...options });
+
+/**
+ * Subscribe to a status page by email
+ */
+export const statusPageSubscribe = <ThrowOnError extends boolean = false>(
+  options: Options<StatusPageSubscribeData, ThrowOnError>,
+): RequestResult<
+  StatusPageSubscribeResponses,
+  StatusPageSubscribeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    StatusPageSubscribeResponses,
+    StatusPageSubscribeErrors,
+    ThrowOnError
+  >({
+    ...urlSearchParamsBodySerializer,
+    url: "/status/{slug}/subscribe",
+    ...options,
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...options.headers,
+    },
+  });
+
+/**
  * Public status page (JSON)
  */
 export const getPublicStatusPageJson = <ThrowOnError extends boolean = false>(
@@ -29772,6 +35076,62 @@ export const getPublicStatusPageJson = <ThrowOnError extends boolean = false>(
     GetPublicStatusPageJsonErrors,
     ThrowOnError
   >({ url: "/status/{slug}/summary.json", ...options });
+
+/**
+ * Unlock a password-protected status page
+ *
+ * The password form's post. The right password sets a cookie that opens
+ * the page for 7 days and redirects to it; a wrong one shows the form
+ * again. Repeated wrong passwords from one client are refused for a while.
+ */
+export const unlockPublicStatusPage = <ThrowOnError extends boolean = false>(
+  options: Options<UnlockPublicStatusPageData, ThrowOnError>,
+): RequestResult<unknown, UnlockPublicStatusPageErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    unknown,
+    UnlockPublicStatusPageErrors,
+    ThrowOnError
+  >({
+    ...urlSearchParamsBodySerializer,
+    url: "/status/{slug}/unlock",
+    ...options,
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Unsubscribe link: asks for a click
+ */
+export const statusPageUnsubscribeForm = <ThrowOnError extends boolean = false>(
+  options: Options<StatusPageUnsubscribeFormData, ThrowOnError>,
+): RequestResult<
+  StatusPageUnsubscribeFormResponses,
+  StatusPageUnsubscribeFormErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    StatusPageUnsubscribeFormResponses,
+    StatusPageUnsubscribeFormErrors,
+    ThrowOnError
+  >({ url: "/status/{slug}/unsubscribe/{token}", ...options });
+
+/**
+ * Unsubscribe
+ */
+export const statusPageUnsubscribe = <ThrowOnError extends boolean = false>(
+  options: Options<StatusPageUnsubscribeData, ThrowOnError>,
+): RequestResult<
+  StatusPageUnsubscribeResponses,
+  StatusPageUnsubscribeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    StatusPageUnsubscribeResponses,
+    StatusPageUnsubscribeErrors,
+    ThrowOnError
+  >({ url: "/status/{slug}/unsubscribe/{token}", ...options });
 
 /**
  * List host/control-plane-wide alarms with optional filters.
@@ -30741,6 +36101,105 @@ export const createSandbox = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Read a create's steps by the `creation_id` its `POST /v1/sandboxes` sent.
+ * Only the user who started the create can read it.
+ */
+export const getSandboxCreation = <ThrowOnError extends boolean = false>(
+  options: Options<GetSandboxCreationData, ThrowOnError>,
+): RequestResult<
+  GetSandboxCreationResponses,
+  GetSandboxCreationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetSandboxCreationResponses,
+    GetSandboxCreationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/creations/{creation_id}",
+    ...options,
+  });
+
+/**
+ * Every host that can run sandboxes, with whether its default sandbox
+ * image is pulled (with download progress while it pulls), and whether
+ * Temps keeps it prepared.
+ */
+export const getSandboxImagePreparation = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<GetSandboxImagePreparationData, ThrowOnError>,
+): RequestResult<
+  GetSandboxImagePreparationResponses,
+  GetSandboxImagePreparationErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetSandboxImagePreparationResponses,
+    GetSandboxImagePreparationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/image-preparation",
+    ...options,
+  });
+
+/**
+ * Pull the default sandbox image on every eligible host (or one), so the
+ * first sandbox there starts without a multi-gigabyte download, and keep
+ * those hosts prepared across upgrades. Saves the policy of every host at
+ * once and returns; the hosts are asked to pull in the background and
+ * their progress is read from the GET. Admin only.
+ */
+export const prepareSandboxImages = <ThrowOnError extends boolean = false>(
+  options?: Options<PrepareSandboxImagesData, ThrowOnError>,
+): RequestResult<
+  PrepareSandboxImagesResponses,
+  PrepareSandboxImagesErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    PrepareSandboxImagesResponses,
+    PrepareSandboxImagesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/image-preparation",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options?.headers,
+    },
+  });
+
+/**
+ * Turn keeping one host's sandbox image prepared on or off. Admin only.
+ */
+export const updateHostImagePreparation = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateHostImagePreparationData, ThrowOnError>,
+): RequestResult<
+  UpdateHostImagePreparationResponses,
+  UpdateHostImagePreparationErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateHostImagePreparationResponses,
+    UpdateHostImagePreparationErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/image-preparation/nodes/{node_id}",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
  * List the nodes sandboxes can be placed on and the operator allow-list.
  */
 export const getSandboxPlacement = <ThrowOnError extends boolean = false>(
@@ -30824,6 +36283,28 @@ export const evictNodeSandboxes = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/v1/sandboxes/placement/nodes/{node}/evict",
+    ...options,
+  });
+
+/**
+ * Effective resource defaults and input ceilings for the requested placement.
+ */
+export const getSandboxResourceDefaults = <
+  ThrowOnError extends boolean = false,
+>(
+  options?: Options<GetSandboxResourceDefaultsData, ThrowOnError>,
+): RequestResult<
+  GetSandboxResourceDefaultsResponses,
+  GetSandboxResourceDefaultsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetSandboxResourceDefaultsResponses,
+    GetSandboxResourceDefaultsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/resource-defaults",
     ...options,
   });
 
@@ -30916,6 +36397,29 @@ export const cmdLogs = <ThrowOnError extends boolean = false>(
       ...options,
     },
   );
+
+/**
+ * Read the steps of the create that made a sandbox, while this server still
+ * tracks it (it is running, or finished less than 15 minutes ago).
+ */
+export const getSandboxCreationBySandbox = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetSandboxCreationBySandboxData, ThrowOnError>,
+): RequestResult<
+  GetSandboxCreationBySandboxResponses,
+  GetSandboxCreationBySandboxErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetSandboxCreationBySandboxResponses,
+    GetSandboxCreationBySandboxErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/{id}/creation",
+    ...options,
+  });
 
 export const destroySandbox = <ThrowOnError extends boolean = false>(
   options: Options<DestroySandboxData, ThrowOnError>,
@@ -31689,6 +37193,282 @@ export const triggerWeeklyDigest = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const heartbeatRun = <ThrowOnError extends boolean = false>(
+  options: Options<HeartbeatRunData, ThrowOnError>,
+): RequestResult<HeartbeatRunResponses, HeartbeatRunErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    HeartbeatRunResponses,
+    HeartbeatRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflow-runs/{run_id}/heartbeat",
+    ...options,
+  });
+
+export const getRunJournal = <ThrowOnError extends boolean = false>(
+  options: Options<GetRunJournalData, ThrowOnError>,
+): RequestResult<GetRunJournalResponses, GetRunJournalErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetRunJournalResponses,
+    GetRunJournalErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflow-runs/{run_id}/journal",
+    ...options,
+  });
+
+export const reportRunOutcome = <ThrowOnError extends boolean = false>(
+  options: Options<ReportRunOutcomeData, ThrowOnError>,
+): RequestResult<
+  ReportRunOutcomeResponses,
+  ReportRunOutcomeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ReportRunOutcomeResponses,
+    ReportRunOutcomeErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflow-runs/{run_id}/outcome",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const recordRunStep = <ThrowOnError extends boolean = false>(
+  options: Options<RecordRunStepData, ThrowOnError>,
+): RequestResult<RecordRunStepResponses, RecordRunStepErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    RecordRunStepResponses,
+    RecordRunStepErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflow-runs/{run_id}/steps",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const listWorkflowDefinitions = <ThrowOnError extends boolean = false>(
+  options?: Options<ListWorkflowDefinitionsData, ThrowOnError>,
+): RequestResult<
+  ListWorkflowDefinitionsResponses,
+  ListWorkflowDefinitionsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListWorkflowDefinitionsResponses,
+    ListWorkflowDefinitionsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/definitions",
+    ...options,
+  });
+
+export const listAllWorkflowRuns = <ThrowOnError extends boolean = false>(
+  options?: Options<ListAllWorkflowRunsData, ThrowOnError>,
+): RequestResult<
+  ListAllWorkflowRunsResponses,
+  ListAllWorkflowRunsErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    ListAllWorkflowRunsResponses,
+    ListAllWorkflowRunsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/runs",
+    ...options,
+  });
+
+export const appSendWorkflowEvent = <ThrowOnError extends boolean = false>(
+  options: Options<AppSendWorkflowEventData, ThrowOnError>,
+): RequestResult<
+  AppSendWorkflowEventResponses,
+  AppSendWorkflowEventErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AppSendWorkflowEventResponses,
+    AppSendWorkflowEventErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/events",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getInvocationKey = <ThrowOnError extends boolean = false>(
+  options?: Options<GetInvocationKeyData, ThrowOnError>,
+): RequestResult<
+  GetInvocationKeyResponses,
+  GetInvocationKeyErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetInvocationKeyResponses,
+    GetInvocationKeyErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/invocation-key",
+    ...options,
+  });
+
+export const appSendGrantedEvent = <ThrowOnError extends boolean = false>(
+  options: Options<AppSendGrantedEventData, ThrowOnError>,
+): RequestResult<
+  AppSendGrantedEventResponses,
+  AppSendGrantedEventErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AppSendGrantedEventResponses,
+    AppSendGrantedEventErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/projects/{project_id}/environments/{environment_id}/events",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const appStartGrantedWorkflow = <ThrowOnError extends boolean = false>(
+  options: Options<AppStartGrantedWorkflowData, ThrowOnError>,
+): RequestResult<
+  AppStartGrantedWorkflowResponses,
+  AppStartGrantedWorkflowErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AppStartGrantedWorkflowResponses,
+    AppStartGrantedWorkflowErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/projects/{project_id}/environments/{environment_id}/runs",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const appStartWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<AppStartWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  AppStartWorkflowRunResponses,
+  AppStartWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    AppStartWorkflowRunResponses,
+    AppStartWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/runs",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const appGetWorkflowRun = <ThrowOnError extends boolean = false>(
+  options: Options<AppGetWorkflowRunData, ThrowOnError>,
+): RequestResult<
+  AppGetWorkflowRunResponses,
+  AppGetWorkflowRunErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    AppGetWorkflowRunResponses,
+    AppGetWorkflowRunErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/workflows/v1/runs/{run_id}",
+    ...options,
+  });
+
+export const installLocalFile = <ThrowOnError extends boolean = false>(
+  options: Options<InstallLocalFileData, ThrowOnError>,
+): RequestResult<
+  InstallLocalFileResponses,
+  InstallLocalFileErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    InstallLocalFileResponses,
+    InstallLocalFileErrors,
+    ThrowOnError
+  >({
+    ...formDataBodySerializer,
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/x/plugins/install/file",
+    ...options,
+    headers: {
+      "Content-Type": null,
+      ...options.headers,
+    },
+  });
+
+export const getPluginAiTools = <ThrowOnError extends boolean = false>(
+  options: Options<GetPluginAiToolsData, ThrowOnError>,
+): RequestResult<
+  GetPluginAiToolsResponses,
+  GetPluginAiToolsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPluginAiToolsResponses,
+    GetPluginAiToolsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/x/plugins/{name}/ai-tools",
+    ...options,
+  });
+
+export const putPluginAiTools = <ThrowOnError extends boolean = false>(
+  options: Options<PutPluginAiToolsData, ThrowOnError>,
+): RequestResult<
+  PutPluginAiToolsResponses,
+  PutPluginAiToolsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    PutPluginAiToolsResponses,
+    PutPluginAiToolsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/x/plugins/{name}/ai-tools",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
 /**
  * Ingest a Sentry envelope (binary payload)
  */
@@ -31775,27 +37555,3 @@ export const ingestSentryEvent = <ThrowOnError extends boolean = false>(
       ...options.headers,
     },
   });
-
-/**
- * List audit logs with optional filtering
- */
-export const listAuditLogs = <ThrowOnError extends boolean = false>(
-  options?: Options<ListAuditLogsData, ThrowOnError>,
-): RequestResult<ListAuditLogsResponses, ListAuditLogsErrors, ThrowOnError> =>
-  (options?.client ?? client).get<
-    ListAuditLogsResponses,
-    ListAuditLogsErrors,
-    ThrowOnError
-  >({ url: "audit/logs", ...options });
-
-/**
- * Get a specific audit log entry by ID
- */
-export const getAuditLog = <ThrowOnError extends boolean = false>(
-  options: Options<GetAuditLogData, ThrowOnError>,
-): RequestResult<GetAuditLogResponses, GetAuditLogErrors, ThrowOnError> =>
-  (options.client ?? client).get<
-    GetAuditLogResponses,
-    GetAuditLogErrors,
-    ThrowOnError
-  >({ url: "audit/logs/{id}", ...options });
