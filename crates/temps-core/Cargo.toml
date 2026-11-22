@@ -19,8 +19,6 @@ readme = "README.md"
 serde = { workspace = true }
 serde_json = { workspace = true }
 yaml_serde = { workspace = true }
-include_dir = { workspace = true }
-semver = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
@@ -28,10 +26,12 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
+bytes = { workspace = true }
 axum = { workspace = true }
 utoipa = { workspace = true }
 tower-http = { workspace = true }
 aes-gcm = { workspace = true }
+zeroize = { workspace = true }
 # Argon2id KDF for password-derived encryption keys (EncryptionService::encrypt_with_password).
 argon2 = { workspace = true }
 base64 = { workspace = true }
@@ -40,12 +40,13 @@ rand = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 hmac = { workspace = true }
+# Constant-time comparison for secrets and token hashes (`crypto::constant_time_eq`).
+subtle = { workspace = true }
 # Gate tokens for signed-in addresses (ADR 065 D8): one verifier for every listener.
 ed25519-dalek = { workspace = true }
 # Cloudflare Access JWTs (ADR 065 D9): RS256 only, checked at every listener.
 jsonwebtoken = { workspace = true }
 x25519-dalek = { workspace = true }
-futures = { workspace = true }
 once_cell = { workspace = true }
 url = { workspace = true }  # For URL validation and SSRF prevention
 cookie = { workspace = true }
@@ -56,6 +57,8 @@ arc-swap = { workspace = true }
 # workspace 0.14.8; node_pki.rs was migrated to the 0.14 `Issuer` API in #250
 # (merged from main), so the earlier 0.13.2 pin is no longer needed.
 rcgen = { workspace = true }
+# Validity windows for managed-service certificates (rcgen takes `time` types).
+time = { workspace = true }
 # TLS client config that verifies the control plane's node API by its
 # reserved server name rather than by the address it is reached at
 # (`node_pki::control_plane_client_config`).
@@ -65,10 +68,9 @@ rustls = { workspace = true }
 # resolvable in a process that has no daemon at all.
 bollard = { workspace = true }
 
-# Internal dependencies - only core dependencies to avoid cycles
-temps-memory = { path = "../temps-memory" }
-
 [dev-dependencies]
+# Asserts SANs, key usages and signatures of issued certificates.
+x509-parser = { workspace = true }
 # Signs test Access JWTs.
 rsa = { workspace = true }
 tempfile = { workspace = true }

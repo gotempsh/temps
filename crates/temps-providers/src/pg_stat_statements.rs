@@ -67,16 +67,16 @@ impl PgStatConnectionPolicy {
         username: &str,
         password: &str,
         database: &str,
-    ) -> temps_query::Result<tokio_postgres::Client> {
+    ) -> temps_providers_core::query::Result<tokio_postgres::Client> {
         match self {
             Self::Standard => {
-                temps_query_postgres::connect_with_tls_ladder(
+                temps_providers_postgres::query::connect_with_tls_ladder(
                     host, port, username, password, database,
                 )
                 .await
             }
             Self::ManagedPrivate => {
-                temps_query_postgres::connect_with_private_tls_ladder(
+                temps_providers_postgres::query::connect_with_private_tls_ladder(
                     host, port, username, password, database,
                 )
                 .await

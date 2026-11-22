@@ -733,7 +733,7 @@ pub fn validate(application_id: i64, document: &BlueprintDocument) -> Result<(),
     // Field names that hold credentials are refused anywhere in the document,
     // the same rule as every other artifact the model writes.
     if let Ok(value) = serde_json::to_value(document) {
-        if let Err(crate::applications::ApplicationError::SecretValue(path)) =
+        if let Err(crate::applications::ApplicationError::SecretValue { path }) =
             crate::applications::validate_secret_free_payload(&value, "$")
         {
             problems.push(format!(

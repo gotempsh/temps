@@ -1,6 +1,9 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::stored_preset::NixpacksProviderExt;
+use crate::stored_preset::StoredPresetConfigExt;
+use crate::stored_preset::StoredPresetExt;
 use async_trait::async_trait;
 use std::{fmt, path::Path};
 
@@ -8,6 +11,7 @@ mod autopack_preset;
 mod build_system;
 mod compiled_workspace;
 pub mod compose_check;
+pub mod compose_security;
 mod docker;
 pub mod docker_compose;
 mod docker_custom;
@@ -26,13 +30,17 @@ mod react_app;
 pub mod registry_prefix;
 mod rsbuild;
 mod rust_preset;
+#[cfg(test)]
+mod runtime_user_test_support;
 mod vite;
+mod workflow_worker;
 mod workspace_manifests;
 
 // Preset configuration schemas
 // Source abstraction for file access
 pub mod preset_config_schema;
 pub mod source;
+pub mod stored_preset;
 
 // New preset provider system
 pub mod preset_provider;
@@ -472,6 +480,7 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         Box::new(PythonPreset::new()),
         Box::new(JavaPreset::new()),
         // Generic presets
+        Box::new(workflow_worker::WorkflowWorker),
         Box::new(docker_compose::DockerComposePreset),
         Box::new(DockerfilePreset),
         Box::new(DockerCustomPreset),
@@ -641,6 +650,10 @@ pub fn get_preset_for_storage(
     }
 
     if preset == PresetType::Dockerfile {
+        if matches!(config, Some(StoredPresetConfig::Dockerfile(config)) if config.variant == DockerfileVariant::WorkflowWorker)
+        {
+            return Ok(Some(Box::new(workflow_worker::WorkflowWorker)));
+        }
         let is_custom = matches!(
             config,
             Some(StoredPresetConfig::Dockerfile(config))
@@ -1957,7 +1970,8 @@ impl<'a> JsTree<'a> {
             }
             let mut current = Some(dir);
             while let Some(directory) = current {
-                if !has_own_source_below.insert(directory) || tree.package_dirs.contains(directory) {
+                if !has_own_source_below.insert(directory) || tree.package_dirs.contains(directory)
+                {
                     break;
                 }
                 current = parent_dir(directory);
@@ -2033,7 +2047,9 @@ impl<'a> JsTree<'a> {
     fn has_app_source(&self, dir: &str) -> bool {
         let server_dir = child_dir(dir, "server");
         self.has_file(dir, is_js_source_file)
-            || self.has_own_source_below.contains(child_dir(dir, "src").as_str())
+            || self
+                .has_own_source_below
+                .contains(child_dir(dir, "src").as_str())
             || (!self.package_dirs.contains(server_dir.as_str())
                 && self.has_own_source_below.contains(server_dir.as_str()))
     }
@@ -2188,7 +2204,12 @@ mod file_tree_detection_tests {
     #[test]
     fn framework_presets_are_not_doubled_with_generic_node() {
         assert_eq!(
-            detect(&["package.json", "vite.config.ts", "index.html", "src/main.ts"]),
+            detect(&[
+                "package.json",
+                "vite.config.ts",
+                "index.html",
+                "src/main.ts"
+            ]),
             vec![pair("./", "vite")]
         );
         // Another language owns a directory whose package.json is tooling.
@@ -2202,7 +2223,12 @@ mod file_tree_detection_tests {
     #[test]
     fn index_html_beside_a_bundler_config_is_a_template_not_a_site() {
         assert_eq!(
-            detect(&["package.json", "webpack.config.js", "index.html", "src/app.js"]),
+            detect(&[
+                "package.json",
+                "webpack.config.js",
+                "index.html",
+                "src/app.js"
+            ]),
             vec![pair("./", "nixpacks-node")]
         );
         assert_eq!(
@@ -2360,10 +2386,25 @@ mod file_tree_detection_tests {
     #[test]
     fn another_ecosystem_using_npm_for_assets_gets_no_node_card() {
         for files in [
-            &["index.php", "package.json", "tailwind.config.js", "assets/app.js"][..],
-            &["manage.py", "requirements/base.txt", "package.json", "assets/app.js"][..],
+            &[
+                "index.php",
+                "package.json",
+                "tailwind.config.js",
+                "assets/app.js",
+            ][..],
+            &[
+                "manage.py",
+                "requirements/base.txt",
+                "package.json",
+                "assets/app.js",
+            ][..],
             &["requirements/base.txt", "package.json", "assets/app.js"][..],
-            &["hugo.toml", "package.json", "content/_index.md", "assets/app.js"][..],
+            &[
+                "hugo.toml",
+                "package.json",
+                "content/_index.md",
+                "assets/app.js",
+            ][..],
         ] {
             assert!(
                 !detect(files)
@@ -2413,11 +2454,25 @@ mod file_tree_detection_tests {
     #[test]
     fn public_of_a_javascript_app_without_a_bundler_config_is_not_a_site() {
         for files in [
-            &["package.json", "public/index.html", "src/index.js", "src/App.js"][..],
+            &[
+                "package.json",
+                "public/index.html",
+                "src/index.js",
+                "src/App.js",
+            ][..],
             &["package.json", "server.js", "public/index.html"][..],
-            &["package.json", "vue.config.js", "public/index.html", "src/main.js"][..],
+            &[
+                "package.json",
+                "vue.config.js",
+                "public/index.html",
+                "src/main.js",
+            ][..],
         ] {
-            assert_eq!(detect(files), vec![pair("./", "nixpacks-node")], "{files:?}");
+            assert_eq!(
+                detect(files),
+                vec![pair("./", "nixpacks-node")],
+                "{files:?}"
+            );
         }
     }
 
@@ -2473,7 +2528,10 @@ mod file_tree_detection_tests {
     /// no start command appears. Source in src/ or server/ is an app.
     #[test]
     fn code_outside_the_app_layout_keeps_public_a_static_site() {
-        for code in [&["api/hello.js"][..], &["lib/analytics.js", "lib/util/format.mjs"][..]] {
+        for code in [
+            &["api/hello.js"][..],
+            &["lib/analytics.js", "lib/util/format.mjs"][..],
+        ] {
             let mut files = vec!["package.json", "public/index.html", "public/style.css"];
             files.extend_from_slice(code);
             assert_eq!(
@@ -2485,7 +2543,11 @@ mod file_tree_detection_tests {
         for app in [&["server/index.js"][..], &["src/app/main.js"][..]] {
             let mut files = vec!["package.json", "public/index.html", "api/hello.js"];
             files.extend_from_slice(app);
-            assert_eq!(detect(&files), vec![pair("./", "nixpacks-node")], "{files:?}");
+            assert_eq!(
+                detect(&files),
+                vec![pair("./", "nixpacks-node")],
+                "{files:?}"
+            );
         }
     }
 
@@ -2501,7 +2563,10 @@ mod file_tree_detection_tests {
                 "public/package.json",
                 "public/index.html",
             ]),
-            vec![pair("./", "nixpacks-node"), pair("public", "nixpacks-static")]
+            vec![
+                pair("./", "nixpacks-node"),
+                pair("public", "nixpacks-static")
+            ]
         );
     }
 
@@ -2518,7 +2583,10 @@ mod file_tree_detection_tests {
                 "web/public/package.json",
                 "web/public/index.html",
             ]),
-            vec![pair("web", "nixpacks-node"), pair("web/public", "nixpacks-static")]
+            vec![
+                pair("web", "nixpacks-node"),
+                pair("web/public", "nixpacks-static")
+            ]
         );
         assert_eq!(
             detect(&[
@@ -2610,7 +2678,10 @@ mod file_tree_detection_tests {
                 "client/package.json",
                 "client/src/index.js",
             ]),
-            vec![pair("client", "nixpacks-node"), pair("server", "nixpacks-node")]
+            vec![
+                pair("client", "nixpacks-node"),
+                pair("server", "nixpacks-node")
+            ]
         );
     }
 

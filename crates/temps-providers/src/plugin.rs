@@ -80,8 +80,22 @@ impl TempsPlugin for ProvidersPlugin {
             {
                 external_service_manager = external_service_manager.with_cluster_dns_slot(slot);
             }
-            let external_service_manager = Arc::new(external_service_manager);
+            // ADR-102: the one place a worker's S3 credential is derived,
+            // shared by the manager and the backup engines. The Cloud
+            // plugin's minter is handed over at initialisation.
+            let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
+                encryption_service.clone(),
+            ));
+            context.register_service(worker_credentials.clone());
+            let external_service_manager =
+                Arc::new(external_service_manager.with_worker_credentials(worker_credentials));
             context.register_service(external_service_manager.clone());
+            let workflow_journal: Arc<dyn temps_core::workflow_journal::ManagedWorkflowJournal> =
+                Arc::new(crate::workflow_journal::PostgresWorkflowJournal::new(
+                    db.clone(),
+                    external_service_manager.clone(),
+                ));
+            context.register_service(workflow_journal);
 
             // Imports of external databases into managed services. Registered
             // on every process so the console can always explain whether an
@@ -106,12 +120,42 @@ impl TempsPlugin for ProvidersPlugin {
             );
             context.register_service(env_vars_provider);
 
+            // ADR-102: a worker PostgreSQL archives with a short-lived
+            // credential scoped to its own repository; keep it fresh. Runs on
+            // every profile: a control plane without local workloads is
+            // exactly the one whose databases are on workers.
+            external_service_manager.spawn_worker_archive_credential_refresh();
+
             // Managed-service containers live on THIS host's Docker daemon.
             // A process that runs no local workloads has none to reconcile, so
             // both background sweeps below are skipped entirely rather than
             // left to retry against an absent daemon. The HTTP surface stays
             // registered so the console can still list what exists and explain
             // why provisioning is unavailable here.
+            // The healthcheck overrides every managed container is created
+            // with, loaded before routes serve so no create races them. Also
+            // on a process without local workloads: the workload specs of
+            // worker databases are computed here. Reads only rows with an
+            // override, so a default install reads none. Kept current after
+            // that, so what another process sharing the database saves
+            // reaches the containers this one creates.
+            let healthcheck_defaults = Arc::new(crate::services::HealthcheckDefaultsService::new(
+                context.require_service::<temps_config::ConfigService>(),
+                external_service_manager.clone(),
+            ));
+            match healthcheck_defaults.reload_registry().await {
+                Ok(services) => {
+                    tracing::info!(services, "Loaded managed service healthcheck overrides")
+                }
+                Err(error) => tracing::error!(
+                    error = %error,
+                    "Could not load the managed service healthcheck overrides; new containers \
+                     use the instance default until the healthcheck listener reads them"
+                ),
+            }
+            healthcheck_defaults.spawn_registry_sync();
+            context.register_service(healthcheck_defaults);
+
             if !local_workloads.local_workloads_enabled() {
                 tracing::info!(
                     profile = local_workloads.profile(),
@@ -245,6 +289,27 @@ impl TempsPlugin for ProvidersPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // ADR-102: a managed source's worker credentials are minted by
+            // Temps Cloud. `get_service`: a build without the Cloud plugin
+            // has no managed source, and refuses one with the reason.
+            let worker_credentials =
+                context.require_service::<crate::worker_s3_scope::WorkerCredentialScoper>();
+            match context.get_service::<dyn temps_core::ManagedBackupScopedCredentials>() {
+                Some(minter) => worker_credentials.set_managed_minter(minter),
+                None => tracing::info!(
+                    "Cloud plugin not registered; worker jobs on a Temps Cloud managed source \
+                     are refused (no scoped credential can be minted)"
+                ),
+            }
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the services from the plugin context
         let external_service_manager = context.require_service::<ExternalServiceManager>();
@@ -313,12 +378,28 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import_routes =
             crate::handlers::data_import_handlers::configure_routes().with_state(app_state.clone());
         let workload_routes =
-            crate::handlers::workload_handlers::configure_routes().with_state(app_state);
+            crate::handlers::workload_handlers::configure_routes().with_state(app_state.clone());
+        let server_tls_routes =
+            crate::handlers::server_tls_handlers::configure_routes().with_state(app_state.clone());
+        let archive_target_routes = crate::handlers::archive_target_handlers::configure_routes()
+            .with_state(app_state.clone());
+        let healthcheck_defaults =
+            context.require_service::<crate::services::HealthcheckDefaultsService>();
+        let healthcheck_routes = crate::handlers::healthcheck_handlers::configure_routes()
+            .with_state(Arc::new(
+                crate::handlers::healthcheck_handlers::HealthcheckState {
+                    app: app_state,
+                    defaults: healthcheck_defaults,
+                },
+            ));
 
         let router = providers_routes
             .merge(pg_stat_routes)
             .merge(data_import_routes)
-            .merge(workload_routes);
+            .merge(workload_routes)
+            .merge(server_tls_routes)
+            .merge(archive_target_routes)
+            .merge(healthcheck_routes);
         Some(PluginRoutes::new(router))
     }
 
@@ -331,9 +412,22 @@ impl TempsPlugin for ProvidersPlugin {
         let data_import = <DataImportApiDoc as OpenApiTrait>::openapi();
         use crate::handlers::workload_handlers::WorkloadModeApiDoc;
         let workload = <WorkloadModeApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::server_tls_handlers::ServerTlsApiDoc;
+        let server_tls = <ServerTlsApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::archive_target_handlers::ArchiveTargetApiDoc;
+        let archive_target = <ArchiveTargetApiDoc as OpenApiTrait>::openapi();
+        use crate::handlers::healthcheck_handlers::HealthcheckApiDoc;
+        let healthcheck = <HealthcheckApiDoc as OpenApiTrait>::openapi();
         Some(merge_openapi_schemas(
             base,
-            vec![pg_stat, data_import, workload],
+            vec![
+                pg_stat,
+                data_import,
+                workload,
+                server_tls,
+                archive_target,
+                healthcheck,
+            ],
         ))
     }
 }

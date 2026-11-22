@@ -974,6 +974,27 @@ impl ManifestRepo {
         rows.iter().map(row_to_manifest).collect()
     }
 
+    /// Whether a live chunk overlapping `query`'s window and scope is not
+    /// in the line index yet (its index write failed, or it was compacted
+    /// or sealed while the index was down). The reindexer will add it; until
+    /// then a count read from the index alone would miss its lines. Reads
+    /// the partial index on unindexed chunks, which the reindexer keeps
+    /// small.
+    pub async fn has_unindexed(&self, query: &LogQuery) -> Result<bool, LogAggregatorError> {
+        let mut binder = Binder::new();
+        let mut conditions = build_conditions(query, &mut binder, false);
+        conditions.push("indexed_at IS NULL".to_string());
+        let sql = format!(
+            "SELECT EXISTS (SELECT 1 FROM log_chunks WHERE {}) AS pending",
+            conditions.join(" AND ")
+        );
+        let rows = self.query_all(sql, binder.into_values()).await?;
+        match rows.first() {
+            Some(row) => Ok(row.try_get::<bool>("", "pending")?),
+            None => Ok(false),
+        }
+    }
+
     /// Live chunk count and how many of them are indexed — the index
     /// coverage figure for the capabilities endpoint.
     pub async fn index_coverage(&self) -> Result<(u64, u64), LogAggregatorError> {
@@ -1406,7 +1427,7 @@ mod tests {
         }
     }
 
-    async fn legacy_regression_database() -> Option<temps_database::test_utils::TestDatabase> {
+    async fn legacy_regression_database() -> Option<temps_test_utils::TestDatabase> {
         if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none() {
             let available = match bollard::Docker::connect_with_local_defaults() {
                 Ok(docker) => docker.ping().await.is_ok(),
@@ -1418,7 +1439,7 @@ mod tests {
             }
         }
         Some(
-            temps_database::test_utils::TestDatabase::with_migrations()
+            temps_test_utils::TestDatabase::with_migrations()
                 .await
                 .expect("apply migrations for legacy manifest regression"),
         )
@@ -1549,7 +1570,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn resume_position_outlives_hard_deleted_chunk_rows() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1601,7 +1622,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn insert_candidates_delete_round_trip() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1660,13 +1681,60 @@ mod tests {
         assert!(!tombstoned_after.iter().any(|(id, _)| *id == meta.id));
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn has_unindexed_sees_a_chunk_until_it_is_indexed() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Docker/DB not available, skipping test");
+                return;
+            }
+        };
+        let repo = ManifestRepo::new(db.connection_arc());
+        let project_id = 990_011;
+        let meta = test_chunk_meta(project_id, "container-unindexed");
+        let seq = repo.insert(&meta).await.unwrap();
+
+        let mut q = query(LogAccessScope::Allowed {
+            project_ids: vec![project_id],
+            external_service_ids: vec![],
+        });
+        q.start_time = meta.started_at - chrono::Duration::hours(1);
+        q.end_time = meta.ended_at + chrono::Duration::hours(1);
+        assert!(
+            repo.has_unindexed(&q).await.unwrap(),
+            "a new chunk is not indexed"
+        );
+
+        let mut other = q.clone();
+        other.scope = LogAccessScope::Allowed {
+            project_ids: vec![project_id + 1],
+            external_service_ids: vec![],
+        };
+        assert!(
+            !repo.has_unindexed(&other).await.unwrap(),
+            "another project's chunk does not count"
+        );
+        let mut later = q.clone();
+        later.start_time = meta.ended_at + chrono::Duration::hours(2);
+        later.end_time = meta.ended_at + chrono::Duration::hours(3);
+        assert!(
+            !repo.has_unindexed(&later).await.unwrap(),
+            "outside the window"
+        );
+
+        repo.mark_indexed(seq).await.unwrap();
+        assert!(!repo.has_unindexed(&q).await.unwrap(), "indexed now");
+    }
+
     /// The forget backlog round trip a `ForgetSweeper` relies on: enqueue is
     /// idempotent, `pending_forgets` returns oldest-first, a failure keeps
     /// the row and records why, and only `resolve_forgets` ever removes one.
     #[tokio::test]
     #[serial_test::serial]
     async fn forget_backlog_enqueue_fail_resolve_round_trip() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");
@@ -1723,7 +1791,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn record_forget_failure_creates_the_row_when_enqueue_never_ran() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 println!("Docker/DB not available, skipping test");

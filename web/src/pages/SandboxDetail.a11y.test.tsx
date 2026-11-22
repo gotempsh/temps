@@ -80,6 +80,20 @@ test('the command runner fields are named, not just titled', async () => {
   })
   expect(cwd.getAttribute('placeholder')).toBe('/workspace')
   view.getByRole('textbox', { name: 'Command to run in the sandbox' })
+  expect(view.getAllByRole('tab').map((tab) => tab.textContent)).toEqual([
+    'Terminal',
+    'Files',
+    'Services',
+    'Network',
+    'Access',
+    'Activity',
+  ])
+  expect(view.getAllByRole('tabpanel')).toHaveLength(1)
+  view.getByRole('button', { name: 'Sandbox actions' })
+  expect(view.queryByRole('button', { name: /^Stop/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /^Restart/ })).toBeNull()
+  expect(view.queryByRole('button', { name: /^Delete/ })).toBeNull()
+  expect(view.container.querySelector('aside')).toBeNull()
 
   const result = await axe.run(view.container, {
     runOnly: { type: 'rule', values: ['label', 'label-title-only'] },

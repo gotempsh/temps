@@ -6,6 +6,12 @@
 //! Provides an in-memory storage backend for unit and integration tests,
 //! plus helpers to construct protobuf trace trees and OtelService instances.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "test support: an in-memory store whose lock is never poisoned"
+)]
+
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -306,6 +312,14 @@ impl MockOtelStorage {
                         p99_ms: percentile(&durations, 0.99),
                     },
                     last_seen,
+                    query.apdex_threshold_ms.map(|threshold_ms| ApdexCounts {
+                        threshold_ms,
+                        satisfied: durations.iter().filter(|d| **d <= threshold_ms).count() as i64,
+                        tolerating: durations
+                            .iter()
+                            .filter(|d| **d > threshold_ms && **d <= threshold_ms * 4.0)
+                            .count() as i64,
+                    }),
                 )
             })
             .collect();
@@ -649,6 +663,13 @@ impl OtelStorage for MockOtelStorage {
                     .map(|min| s.duration_ms >= min)
                     .unwrap_or(true)
             })
+            .filter(|s| {
+                query.attribute_path.as_ref().is_none_or(|wanted| {
+                    s.attributes
+                        .get(&wanted.key)
+                        .is_some_and(|value| wanted.matches(value))
+                })
+            })
             .take(query.limit.unwrap_or(100) as usize)
             .cloned()
             .collect();
@@ -866,6 +887,14 @@ impl OtelStorage for MockOtelStorage {
                 if span.duration_ms < min_dur {
                     continue;
                 }
+            }
+            // The time window, as the real backends apply it to span starts.
+            if query
+                .start_time
+                .is_some_and(|start| span.start_time < start)
+                || query.end_time.is_some_and(|end| span.start_time > end)
+            {
+                continue;
             }
             trace_map
                 .entry(span.trace_id.clone())

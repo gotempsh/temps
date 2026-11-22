@@ -256,8 +256,15 @@ fn describe(ingress: &LocalIngress) -> String {
 }
 
 /// `--data-dir`, else `TEMPS_DATA_DIR`/`~/.temps`, else the data directory
-/// the installed service runs with (`sudo` changes `~`).
-fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
+/// the installed service runs with (`sudo` changes `~`). The directory is
+/// resolved once, here: every later read, check and write uses the same
+/// canonical path, so a symlinked directory cannot be repointed between a
+/// root run's ownership check and its writes.
+pub(super) fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
+    canonical_config(found_config_path(target)?)
+}
+
+fn found_config_path(target: &Target) -> anyhow::Result<PathBuf> {
     if let Some(dir) = &target.data_dir {
         return Ok(dir.join("agent.json"));
     }
@@ -277,6 +284,20 @@ fn config_path(target: &Target) -> anyhow::Result<PathBuf> {
     )
 }
 
+/// `path` with its directory canonicalized (`agent.json` itself is kept as
+/// named: a symlink there is refused when it is read).
+fn canonical_config(path: PathBuf) -> anyhow::Result<PathBuf> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = std::fs::canonicalize(dir).map_err(|e| {
+        anyhow::anyhow!(
+            "No agent.json at {} ({e}). Run `temps join` first, or pass --data-dir with the \
+             directory the agent runs from.",
+            path.display()
+        )
+    })?;
+    Ok(dir.join("agent.json"))
+}
+
 fn unit_text() -> Option<String> {
     std::fs::read_to_string(UNIT_PATH).ok()
 }
@@ -292,15 +313,10 @@ fn unit_pins_listen() -> bool {
     unit_text().is_some_and(|text| text.contains("--public-ingress-address"))
 }
 
+/// `agent.json` as an object, read safely (see
+/// [`super::agent_labels::read_agent_config`]).
 fn read_config(path: &Path) -> anyhow::Result<serde_json::Value> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| anyhow::anyhow!("Could not read {}: {e}", path.display()))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| anyhow::anyhow!("{} is not valid JSON: {e}", path.display()))?;
-    if !value.is_object() {
-        anyhow::bail!("{} is not an agent config object", path.display());
-    }
-    Ok(value)
+    Ok(super::agent_labels::read_agent_config(path)?.value)
 }
 
 fn status(path: &Path) -> anyhow::Result<()> {
@@ -319,7 +335,9 @@ fn status(path: &Path) -> anyhow::Result<()> {
 /// Replace `ingress` in agent.json, keeping every other field, and retire the
 /// legacy listen fields so the two cannot disagree.
 fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
-    let mut value = read_config(path)?;
+    let _lock = super::agent_labels::lock_agent_config(path)?;
+    let file = super::agent_labels::read_agent_config(path)?;
+    let mut value = file.value;
     let object = value
         .as_object_mut()
         .ok_or_else(|| anyhow::anyhow!("{} is not an agent config object", path.display()))?;
@@ -328,29 +346,7 @@ fn write_ingress(path: &Path, ingress: &LocalIngress) -> anyhow::Result<()> {
         "public_ingress_address".to_string(),
         serde_json::Value::Null,
     );
-    let text = serde_json::to_string_pretty(&value)?;
-    let tmp = path.with_extension("json.tmp");
-    {
-        use std::io::Write;
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options.open(&tmp).map_err(|e| {
-            anyhow::anyhow!(
-                "Could not write {}: {e}. Run this as the user the agent runs as (often root).",
-                tmp.display()
-            )
-        })?;
-        file.write_all(text.as_bytes())?;
-        file.sync_all()?;
-    }
-    std::fs::rename(&tmp, path)
-        .map_err(|e| anyhow::anyhow!("Could not replace {}: {e}", path.display()))?;
-    Ok(())
+    super::agent_labels::write_config_atomically(path, &value, file.identity)
 }
 
 #[cfg(test)]

@@ -8,6 +8,7 @@ import {
   getEmailOptions,
   getEmailQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { resendEmail } from '@/api/client'
 import { problemMessage } from '@/components/email/sharedUtils'
 import { client } from '@/api/client/client.gen'
@@ -594,6 +595,13 @@ export function EmailDetail() {
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
+          <RefreshButton
+            queryKeys={[
+              getEmailQueryKey({ path: { id: email.id } }),
+              ['email-events', email.id],
+              ['email-tracking-links', email.id],
+            ]}
+          />
           {canResend(email) && (
             <Button
               variant="outline"

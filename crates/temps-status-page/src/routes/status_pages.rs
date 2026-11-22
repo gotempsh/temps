@@ -25,30 +25,8 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use temps_auth::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_permission_guard, project_scope_guard, RequireAuth};
 
-/// Authorize `$permission` on every project in `$project_ids` (the projects a
-/// status page draws from), with ADR-028 semantics on each. A page without
-/// components has no project to check against, so only instance
-/// administrators may act on it.
-macro_rules! page_projects_guard {
-    ($auth:expr, $permission:ident, $project_ids:expr, $checker:expr) => {{
-        let __project_ids: &[i32] = &$project_ids;
-        if __project_ids.is_empty() && ($auth.is_deployment_token() || !$auth.is_instance_admin()) {
-            return Err(temps_core::error_builder::forbidden()
-                .title("Insufficient Permissions")
-                .detail(
-                    "This status page has no components left, so it belongs to no project; \
-                     only an instance administrator can manage it",
-                )
-                .build());
-        }
-        for &__project_id in __project_ids {
-            project_permission_guard!($auth, $permission, __project_id, $checker);
-            project_scope_guard!($auth, __project_id);
-        }
-    }};
-}
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 
@@ -71,7 +49,7 @@ pub struct StatusPageListQuery {
 }
 
 fn audit_for(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     action: PublicStatusPageAction,
     page: &StatusPageResponse,
@@ -179,7 +157,7 @@ where
                 .filter(|id| !hidden.contains(id))
                 .collect();
             if !candidates.is_empty() {
-                let required = temps_auth::permissions::Permission::StatusPageRead.to_string();
+                let required = temps_authz::permissions::Permission::StatusPageRead.to_string();
                 let permissions = checker
                     .effective_project_permissions_batch(user_id, &candidates)
                     .await
@@ -648,7 +626,7 @@ where
 }
 
 fn domain_audit(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     action: PublicStatusPageAction,
     project_ids: &[i32],
@@ -672,7 +650,7 @@ fn domain_audit(
 
 /// The acting user's email, used as the ACME account contact exactly like
 /// the Domains API does.
-fn acme_email(auth: &temps_auth::AuthContext) -> String {
+fn acme_email(auth: &temps_authz::AuthContext) -> String {
     auth.user
         .as_ref()
         .map(|user| user.email.clone())
@@ -1020,14 +998,14 @@ mod tests {
     use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set};
     use std::collections::BTreeSet;
     use std::sync::Mutex;
-    use temps_auth::permissions::{Permission, Role};
-    use temps_auth::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
+    use temps_authz::AuthContext;
     use temps_config::ConfigService;
     use temps_core::{
         AuditLogger, AuditOperation, NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter,
     };
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{environments, projects, upstream_config::UpstreamList, users};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
     use tower::ServiceExt;
 
     #[derive(Default)]
@@ -1037,11 +1015,20 @@ mod tests {
 
     #[async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
-            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)?;
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            let payload: serde_json::Value = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.entries
                 .lock()
-                .map_err(|_| anyhow::anyhow!("audit log mutex poisoned"))?
+                .map_err(|_| {
+                    temps_core::AuditError::write(
+                        operation.operation_type(),
+                        "audit log mutex poisoned",
+                    )
+                })?
                 .push((operation.operation_type(), payload));
             Ok(())
         }
@@ -1419,7 +1406,12 @@ mod tests {
             audit_service: audit.clone(),
             checker: checker(project_a),
         });
-        let public = create_public_router(Arc::new(PublicStatusState::new(cache)));
+        let access = Arc::new(crate::services::page_access::PageAccessService::new(
+            db.clone(),
+            cache.clone(),
+            &temps_core::EncryptionService::new_from_password("status-page-route-tests"),
+        ));
+        let public = create_public_router(Arc::new(PublicStatusState::new(cache, access)));
         Some(Fx {
             certs,
             _db: test_db,
@@ -1539,6 +1531,7 @@ mod tests {
         // `public_ingress_url`: no address is invented, the page says why.
         assert_eq!(page.public_url, None);
         assert_eq!(page.public_json_url, None);
+        assert_eq!(page.public_feed_url, None);
         assert!(!page.public_url_status.configured);
         assert_eq!(
             page.public_url_status.setup_path.as_deref(),
@@ -1599,6 +1592,12 @@ mod tests {
             "total_checks",
             "failed_checks",
             "degraded_checks",
+            // Scheduled maintenance windows: admin-written public title and
+            // description, times, and the components' display names.
+            "maintenances",
+            "description",
+            "starts_at",
+            "ends_at",
         ]
         .iter()
         .map(|k| k.to_string())

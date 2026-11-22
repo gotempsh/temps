@@ -10,14 +10,15 @@
 //! [`escape_html`]; everything else is a fixed vocabulary.
 
 use std::fmt::Write as _;
+pub use temps_core::escape::escape_html;
 
 use chrono::NaiveDate;
 use temps_core::UtcDateTime;
 
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay,
-    StatusPageTheme,
+    PublicIncidentStatus, PublicMaintenance, PublicMaintenanceStatus, PublicStatusComponent,
+    PublicStatusPageResponse, PublicUptimeDay, StatusPageTheme,
 };
 
 /// Seconds between browser auto-refreshes (`<meta http-equiv="refresh">`),
@@ -31,22 +32,6 @@ const TOOLTIP_EDGE_BARS: usize = 12;
 const NARROW_SCREEN_DAYS: usize = 30;
 /// Accent used when the page sets none.
 const DEFAULT_ACCENT: &str = "#4f46e5";
-
-/// Escape text for an HTML text node or a double/single-quoted attribute.
-pub fn escape_html(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for c in input.chars() {
-        match c {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            _ => out.push(c),
-        }
-    }
-    out
-}
 
 fn format_time(time: &UtcDateTime) -> String {
     time.format("%Y-%m-%d %H:%M UTC").to_string()
@@ -80,6 +65,7 @@ fn overall_label(status: PublicComponentStatus) -> &'static str {
         PublicComponentStatus::Degraded => "Some systems are degraded",
         PublicComponentStatus::Outage => "Some systems are down",
         PublicComponentStatus::Unknown => "Status not available yet",
+        PublicComponentStatus::Maintenance => "Scheduled maintenance in progress",
     }
 }
 
@@ -89,6 +75,7 @@ fn overall_icon(status: PublicComponentStatus) -> &'static str {
         PublicComponentStatus::Degraded => "!",
         PublicComponentStatus::Outage => "&#10005;",
         PublicComponentStatus::Unknown => "?",
+        PublicComponentStatus::Maintenance => "&#9881;",
     }
 }
 
@@ -110,7 +97,7 @@ fn severity_class(severity: PublicIncidentSeverity) -> &'static str {
 }
 
 const STYLE: &str = r#"
-:root{--bg:#f7f7f8;--fg:#18181b;--muted:#6b6b76;--card:#fff;--border:#e4e4e7;--ok:#16a34a;--warn:#e08a00;--down:#dc2626;--none:#d4d4d8;--tip:#fff;--shadow:0 8px 24px rgba(0,0,0,.12)}
+:root{--bg:#f7f7f8;--fg:#18181b;--muted:#6b6b76;--card:#fff;--border:#e4e4e7;--ok:#16a34a;--warn:#e08a00;--down:#dc2626;--none:#d4d4d8;--maint:#2563eb;--tip:#fff;--shadow:0 8px 24px rgba(0,0,0,.12)}
 html[data-theme=dark]{--bg:#09090b;--fg:#fafafa;--muted:#a1a1aa;--card:#151518;--border:#27272a;--none:#3f3f46;--tip:#1f1f23;--shadow:0 8px 24px rgba(0,0,0,.6)}
 @media (prefers-color-scheme:dark){html[data-theme=auto]{--bg:#09090b;--fg:#fafafa;--muted:#a1a1aa;--card:#151518;--border:#27272a;--none:#3f3f46;--tip:#1f1f23;--shadow:0 8px 24px rgba(0,0,0,.6)}}
 *{box-sizing:border-box}
@@ -128,7 +115,7 @@ h2{font-size:17px;margin:36px 0 12px}
 p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .banner{border-radius:12px;padding:18px 22px;font-weight:650;font-size:18px;color:#fff;margin:20px 0 8px;display:flex;align-items:center;gap:14px}
 .banner .ic{width:30px;height:30px;border-radius:50%;background:rgba(255,255,255,.25);display:inline-flex;align-items:center;justify-content:center;font-size:16px;flex:none}
-.s-operational{background:var(--ok)}.s-degraded{background:var(--warn)}.s-outage{background:var(--down)}.s-unknown{background:var(--muted)}
+.s-operational{background:var(--ok)}.s-degraded{background:var(--warn)}.s-outage{background:var(--down)}.s-unknown{background:var(--muted)}.s-maintenance{background:var(--maint)}
 .card{background:var(--card);border:1px solid var(--border);border-radius:12px}
 .comp{padding:18px 22px}
 .card>*+*,.members>*+*{border-top:1px solid var(--border)}
@@ -143,7 +130,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .row{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap}
 .name{font-weight:600}
 .pill{font-size:13px;font-weight:600}
-.t-operational{color:var(--ok)}.t-degraded{color:var(--warn)}.t-outage{color:var(--down)}.t-unknown{color:var(--muted)}
+.t-operational{color:var(--ok)}.t-degraded{color:var(--warn)}.t-outage{color:var(--down)}.t-unknown{color:var(--muted)}.t-maintenance{color:var(--maint)}
 .bars{display:flex;gap:2px;margin:12px 0 8px;height:34px}
 .bar{flex:1;min-width:2px;border-radius:2px;position:relative;cursor:default}
 .bar:hover{box-shadow:inset 0 0 0 40px rgba(255,255,255,.3)}
@@ -166,7 +153,7 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .rt polyline{fill:none;stroke:var(--accent);stroke-width:1.5;stroke-linejoin:round;stroke-linecap:round}
 .inc{padding:16px 20px;border-left:4px solid var(--warn);margin-bottom:12px}
 .inc.sev-critical{border-left-color:var(--down)}.inc.sev-minor{border-left-color:var(--warn)}.inc.sev-major{border-left-color:#ea580c}
-.inc.resolved{border-left-color:var(--ok)}
+.inc.resolved{border-left-color:var(--ok)}.inc.maint{border-left-color:var(--maint)}
 .inc h3{font-size:16px;margin:0}
 .upd{padding:8px 0 0}
 .upd+.upd{border-top:1px dashed var(--border);margin-top:8px}
@@ -177,12 +164,39 @@ p.desc{color:var(--muted);margin:0 0 4px;white-space:pre-wrap}
 .day .none{color:var(--muted);font-size:14px;margin:0}
 .day .item{margin-top:6px}
 .day .item a,.day .item strong{font-weight:600}
+.sub{padding:18px 22px}
+.sub p{margin:0}
+.sub label{display:block;margin-bottom:10px}
+.sub .row{justify-content:flex-start;align-items:center}
+.sub input{flex:1 1 16em;min-width:0;font:inherit;padding:8px 12px;border:1px solid var(--border);border-radius:8px;background:var(--bg);color:var(--fg)}
+.sub button{font:inherit;font-weight:600;padding:8px 16px;border:0;border-radius:8px;background:var(--accent);color:#fff;cursor:pointer}
+.sub form+p,.sub p+form{margin-top:12px}
 footer{color:var(--muted);font-size:13px;margin-top:40px;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
 @media (max-width:640px){.bar.o{display:none}.bar.nl .tip{left:-4px;transform:none}.n90{display:none}.n30{display:inline}.tip{width:220px}.banner{font-size:16px}.brand{font-size:19px}.brand img{max-height:32px;max-width:min(140px,100%)}}
 "#;
 
 /// Render the full HTML document for a public status page.
 pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
+    render_public_page_html_with(page, PageActions::default())
+}
+
+/// Where a page's own links point, which depends on whether it is served at
+/// its slug URL or on a custom hostname (ADR 108 D2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PageActions<'a> {
+    /// The subscribe form posts here; `None` hides the form (subscriptions
+    /// are off). The form is a plain HTML post: the page runs no script.
+    pub subscribe: Option<&'a str>,
+    /// The page's Atom feed.
+    pub feed: Option<&'a str>,
+}
+
+/// [`render_public_page_html`] with the page's own links (see
+/// [`PageActions`]).
+pub fn render_public_page_html_with(
+    page: &PublicStatusPageResponse,
+    actions: PageActions<'_>,
+) -> String {
     let mut html = String::with_capacity(32 * 1024);
     let title = escape_html(&page.title);
     let appearance = &page.appearance;
@@ -199,7 +213,18 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
          <meta name=\"robots\" content=\"noindex,nofollow\">\
          <meta name=\"referrer\" content=\"no-referrer\">\
          <meta http-equiv=\"refresh\" content=\"{AUTO_REFRESH_SECS}\">\
-         <title>{title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>",
+         <title>{title}</title>",
+    );
+    if let Some(feed) = actions.feed {
+        let _ = write!(
+            html,
+            "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"{title}\" href=\"{}\">",
+            escape_html(feed)
+        );
+    }
+    let _ = write!(
+        html,
+        "<style>:root{{--accent:{}}}{STYLE}</style></head><body>",
         accent(appearance.accent_color.as_deref())
     );
 
@@ -254,6 +279,8 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
         }
     }
 
+    render_maintenances(&mut html, &page.maintenances);
+
     let _ = write!(
         html,
         "<h2>Uptime <span class=\"n90\">over the last {} days</span><span class=\"n30\">over the last {} days</span></h2>",
@@ -276,11 +303,19 @@ pub fn render_public_page_html(page: &PublicStatusPageResponse) -> String {
 
     render_past_incidents(&mut html, page);
 
+    if let Some(action) = actions.subscribe {
+        render_subscribe_form(&mut html, action);
+    }
+
     let _ = write!(
         html,
-        "<footer><span>Last updated {}. This page refreshes every minute.</span><span>Times are in UTC.</span></footer></main></body></html>",
+        "<footer><span>Last updated {}. This page refreshes every minute.</span><span>Times are in UTC.",
         format_time(&page.generated_at)
     );
+    if let Some(feed) = actions.feed {
+        let _ = write!(html, " <a href=\"{}\">Atom feed</a>", escape_html(feed));
+    }
+    html.push_str("</span></footer></main></body></html>");
     html
 }
 
@@ -572,8 +607,170 @@ fn render_incident(html: &mut String, incident: &PublicIncident) {
     html.push_str("</section>");
 }
 
+/// Maintenance in progress first, then what is scheduled (the snapshot
+/// already orders them soonest first).
+fn render_maintenances(html: &mut String, maintenances: &[PublicMaintenance]) {
+    if maintenances.is_empty() {
+        return;
+    }
+    html.push_str("<h2>Scheduled maintenance</h2>");
+    let ordered = maintenances
+        .iter()
+        .filter(|m| m.status == PublicMaintenanceStatus::InProgress)
+        .chain(
+            maintenances
+                .iter()
+                .filter(|m| m.status == PublicMaintenanceStatus::Scheduled),
+        );
+    for maintenance in ordered {
+        let affected = if maintenance.affected_components.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " · Affects {}",
+                maintenance
+                    .affected_components
+                    .iter()
+                    .map(|name| escape_html(name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        let _ = write!(
+            html,
+            "<section class=\"card inc maint\"><h3>{}</h3><div class=\"meta\">{} · {} to {}{affected}</div>",
+            escape_html(&maintenance.title),
+            maintenance.status.label(),
+            format_time(&maintenance.starts_at),
+            format_time(&maintenance.ends_at),
+        );
+        if let Some(description) = maintenance
+            .description
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+        {
+            let _ = write!(
+                html,
+                "<div class=\"upd\"><p>{}</p></div>",
+                escape_html(description)
+            );
+        }
+        html.push_str("</section>");
+    }
+}
+
 /// The last [`PAST_INCIDENT_DAYS`] days, newest first, each with the incidents
 /// that started on it, or "No incidents reported."
+fn render_subscribe_form(html: &mut String, action: &str) {
+    let _ = write!(
+        html,
+        "<h2 id=\"subscribe\">Get updates by email</h2><div class=\"card sub\">\
+         <form method=\"post\" action=\"{}\">\
+         <label for=\"sub-email\">We email you when an incident is posted or updated here, or maintenance is scheduled.</label>\
+         <div class=\"row\"><input id=\"sub-email\" type=\"email\" name=\"email\" required \
+         maxlength=\"254\" autocomplete=\"email\" placeholder=\"you@example.com\">\
+         <button type=\"submit\">Subscribe</button></div></form>\
+         <p class=\"meta\">We send a confirmation link first. Every email has a link to \
+         unsubscribe.</p></div>",
+        escape_html(action)
+    );
+}
+
+/// A small standalone page in the status page's look: the answer to a
+/// subscribe post and the pages behind the confirm and unsubscribe links.
+/// `form` is `(action, button label)` for a page that asks for a click
+/// (a link opened by a mail scanner must not confirm or unsubscribe anything).
+pub fn render_notice_page(
+    page_title: &str,
+    appearance: &super::types::StatusPageAppearance,
+    heading: &str,
+    body: &str,
+    form: Option<(&str, &str)>,
+    back_href: &str,
+) -> String {
+    let mut html = String::with_capacity(4 * 1024);
+    let theme = match appearance.theme {
+        StatusPageTheme::Auto => "auto",
+        StatusPageTheme::Light => "light",
+        StatusPageTheme::Dark => "dark",
+    };
+    let title = escape_html(page_title);
+    let _ = write!(
+        html,
+        "<!doctype html><html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <title>{} · {title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>\
+         <header class=\"top\"><div class=\"in\"><h1 class=\"brand\"><span>{title}</span></h1>\
+         </div></header><main><h2>{}</h2><div class=\"card sub\"><p>{}</p>",
+        escape_html(heading),
+        accent(appearance.accent_color.as_deref()),
+        escape_html(heading),
+        escape_html(body),
+    );
+    if let Some((action, label)) = form {
+        let _ = write!(
+            html,
+            "<form method=\"post\" action=\"{}\"><button type=\"submit\">{}</button></form>",
+            escape_html(action),
+            escape_html(label)
+        );
+    }
+    let _ = write!(
+        html,
+        "</div><p><a href=\"{}\">Back to the status page</a></p></main></body></html>",
+        escape_html(back_href)
+    );
+    html
+}
+
+/// The password form of a protected page (ADR 108 D2): a plain HTML post to
+/// `action`, no script. `error` is shown above the field after a wrong try.
+pub fn render_unlock_page(
+    page_title: &str,
+    appearance: &super::types::StatusPageAppearance,
+    action: &str,
+    error: Option<&str>,
+) -> String {
+    let mut html = String::with_capacity(4 * 1024);
+    let theme = match appearance.theme {
+        StatusPageTheme::Auto => "auto",
+        StatusPageTheme::Light => "light",
+        StatusPageTheme::Dark => "dark",
+    };
+    let title = escape_html(page_title);
+    let _ = write!(
+        html,
+        "<!doctype html><html lang=\"en\" data-theme=\"{theme}\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <meta name=\"robots\" content=\"noindex,nofollow\">\
+         <meta name=\"referrer\" content=\"no-referrer\">\
+         <title>{title}</title><style>:root{{--accent:{}}}{STYLE}</style></head><body>\
+         <header class=\"top\"><div class=\"in\"><h1 class=\"brand\"><span>{title}</span></h1>\
+         </div></header><main><h2>This status page is protected</h2><div class=\"card sub\">",
+        accent(appearance.accent_color.as_deref()),
+    );
+    if let Some(error) = error {
+        let _ = write!(
+            html,
+            "<p class=\"t-outage\" role=\"alert\">{}</p>",
+            escape_html(error)
+        );
+    }
+    let _ = write!(
+        html,
+        "<form method=\"post\" action=\"{}\"><label for=\"page-password\">Enter the password \
+         you were given to see this page.</label><div class=\"row\"><input id=\"page-password\" \
+         type=\"password\" name=\"password\" required maxlength=\"256\" \
+         autocomplete=\"current-password\"><button type=\"submit\">Open the page</button></div>\
+         </form><p class=\"meta\">Your browser keeps you signed in to this page for 7 days.</p>\
+         </div></main></body></html>",
+        escape_html(action)
+    );
+    html
+}
+
 fn render_past_incidents(html: &mut String, page: &PublicStatusPageResponse) {
     html.push_str("<h2>Past incidents</h2><div>");
     let today = page.generated_at.date_naive();
@@ -662,9 +859,103 @@ mod tests {
                     created_at: now,
                 }],
             }],
+            maintenances: vec![],
             history_days: 1,
             generated_at: now,
         }
+    }
+
+    #[test]
+    fn the_unlock_page_posts_a_password_without_script_and_escapes() {
+        let html = render_unlock_page(
+            "Acme <b>",
+            &StatusPageAppearance::default(),
+            "/api/status/ab\"cd/unlock",
+            Some("Wrong <password>"),
+        );
+        assert!(html.contains("<form method=\"post\" action=\"/api/status/ab&quot;cd/unlock\">"));
+        assert!(html.contains("type=\"password\" name=\"password\""));
+        assert!(html.contains("Wrong &lt;password&gt;"));
+        assert!(html.contains("Acme &lt;b&gt;"));
+        assert!(!html.contains("<script"));
+    }
+
+    #[test]
+    fn maintenance_windows_are_listed_in_progress_first_and_escaped() {
+        let mut page = page_with("API", "Investigating", "Status");
+        let now = Utc::now();
+        let window = |title: &str, status| PublicMaintenance {
+            title: title.to_string(),
+            description: Some("<script>x</script>".to_string()),
+            status,
+            starts_at: now,
+            ends_at: now + chrono::Duration::hours(1),
+            affected_components: vec!["API <b>".to_string()],
+        };
+        page.maintenances = vec![
+            window("Later work", PublicMaintenanceStatus::Scheduled),
+            window("Ongoing work", PublicMaintenanceStatus::InProgress),
+        ];
+        let html = render_public_page_html(&page);
+        assert!(html.contains("<h2>Scheduled maintenance</h2>"));
+        let ongoing = html.find("Ongoing work").expect("ongoing listed");
+        let later = html.find("Later work").expect("scheduled listed");
+        assert!(ongoing < later, "in-progress maintenance comes first");
+        assert!(html.contains("Affects API &lt;b&gt;"));
+        assert!(!html.contains("<script>"));
+
+        page.maintenances.clear();
+        assert!(!render_public_page_html(&page).contains("Scheduled maintenance"));
+    }
+
+    #[test]
+    fn the_subscribe_form_appears_only_when_asked_for_and_posts_without_script() {
+        let page = page_with("API", "Investigating", "Status");
+        let without = render_public_page_html(&page);
+        assert!(!without.contains("<form"));
+        let with = render_public_page_html_with(
+            &page,
+            PageActions {
+                subscribe: Some("/api/status/ab\"cd/subscribe"),
+                feed: None,
+            },
+        );
+        assert!(with.contains("<form method=\"post\" action=\"/api/status/ab&quot;cd/subscribe\">"));
+        assert!(with.contains("type=\"email\" name=\"email\" required"));
+        assert!(!with.contains("<script"));
+    }
+
+    #[test]
+    fn the_feed_is_linked_from_the_head_and_the_footer() {
+        let page = page_with("API", "Investigating", "Status");
+        assert!(!render_public_page_html(&page).contains("application/atom+xml"));
+        let html = render_public_page_html_with(
+            &page,
+            PageActions {
+                subscribe: None,
+                feed: Some("/feed.atom"),
+            },
+        );
+        assert!(html.contains(
+            "<link rel=\"alternate\" type=\"application/atom+xml\" title=\"Status\" href=\"/feed.atom\">"
+        ));
+        assert!(html.contains("<a href=\"/feed.atom\">Atom feed</a>"));
+    }
+
+    #[test]
+    fn notice_pages_escape_text_and_post_to_their_own_path() {
+        let html = render_notice_page(
+            "Acme <Status>",
+            &StatusPageAppearance::default(),
+            "Confirm your subscription",
+            "Body & more",
+            Some(("/confirm/abc", "Confirm subscription")),
+            "/",
+        );
+        assert!(html.contains("Acme &lt;Status&gt;"));
+        assert!(html.contains("Body &amp; more"));
+        assert!(html.contains("<form method=\"post\" action=\"/confirm/abc\">"));
+        assert!(!html.contains("<script"));
     }
 
     #[test]
@@ -784,11 +1075,6 @@ mod tests {
         assert!(html.contains("Some systems are degraded"));
         assert!(html.contains("Active incidents"));
         assert!(html.contains("99.50% uptime"));
-    }
-
-    #[test]
-    fn escape_html_covers_quotes() {
-        assert_eq!(escape_html("a&b<c>\"d'"), "a&amp;b&lt;c&gt;&quot;d&#39;");
     }
 
     #[test]

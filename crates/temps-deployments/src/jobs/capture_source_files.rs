@@ -19,11 +19,14 @@
 //! scheduled when the project has opted into source context, so it is a no-op
 //! for everyone else.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_error_tracking::services::SourceMapService;
 use tracing::{debug, info, warn};

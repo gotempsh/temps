@@ -16,7 +16,6 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 
-anyhow.workspace = true
 async-trait.workspace = true
 aws-sdk-s3.workspace = true
 axum.workspace = true
@@ -33,8 +32,8 @@ utoipa.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tempfile.workspace = true
-temps-database = { path = "../temps-database" }
 
 [lints]
 workspace = true

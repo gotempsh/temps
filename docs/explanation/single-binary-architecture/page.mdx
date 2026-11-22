@@ -68,7 +68,8 @@ Temps is organized as a Rust workspace with 51 crates, each responsible for a sp
 temps (binary)
 ├── temps-core          # Shared types, error handling, retry logic
 ├── temps-config        # Configuration management
-├── temps-database      # PostgreSQL/Sea-ORM connection and migrations
+├── temps-database      # PostgreSQL/Sea-ORM connection
+├── temps-schema        # Schema guard and migration runner
 ├── temps-entities      # Database models
 ├── temps-routes        # HTTP router (Axum)
 ├── temps-auth          # Authentication, permissions, API keys

@@ -87,7 +87,7 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 | `notify`                            | `notify.ok(message, description?)`, `notify.fail(message, description?)`                                | Background events the user isn't watching (RULES.md § Notifications)                                                                                                                    | Honour-system                  |
 | `Article`                           | `children`                                                                                              | Long-form content read top to bottom (release notes, postmortems, docs) — not for record/scan pages, that's `Detail`                                                                    | Honour-system                  |
 | `GitProviderMark`                   | `provider`, `variant?`, `className?`, `label?`                                                          | Existing GitHub/GitLab/Bitbucket/Gitea brand marks; optional monochrome variant; branch fallback for unknown providers                                                                  | Label and fallback unit tests  |
-| `ProjectAvatar`                     | `name`                                                                                                  | Deterministic project identity where there's no deployment media (pickers, ledger rows, headers) — never a guaranteed-404 favicon fetch                                                 | Honour-system                  |
+| `ProjectAvatar`                     | `name`                                                                                                  | Letter-only identity for a host app with no deployment media. The console itself uses `ServiceIcon` (`web/src/components/project/ServiceIcon.tsx`) for every project icon                                                 | Honour-system                  |
 | `DataTable`                         | `columns`, `rows`, `rowKey`, `renderRow?`, `isLoading?`, `aria-label?`, `pagination?`                   | Any table — embedded (settings sub-panel, `Detail`'s `main`) or as `Ledger`'s body                                                                                                      | Honour-system                  |
 | `CompactRow`                        | `timestamp`, `icon`, `primary`, `secondary?`, `meta?`                                                   | One row of a dense event/log/activity list (promoted from Observe's `ObserveRowShell`)                                                                                                  | Honour-system                  |
 | `Wizard`                            | `title`, `description`, `currentStep`, `steps`, `footer?`, `celebrate?`                                 | Any multi-step flow (setup wizard, onboarding, "connect a resource")                                                                                                                    | Honour-system                  |
@@ -127,8 +127,8 @@ generated from `tokens.json`, scoped to `.tds` (never `:root`).
 ## Responsive & keyboard
 
 `PageHeader` actions wrap under the title below `sm`. `Detail`'s aside stacks
-below `main` below `lg`. `Ledger`'s table is the one thing allowed to scroll
-horizontally. `Picker` is fully keyboard-filterable from focus; shortcuts get
+below `main` below `lg`. Nothing scrolls horizontally, `Ledger`'s
+table included: columns show by priority (see `RULES.md`, Responsive). `Picker` is fully keyboard-filterable from focus; shortcuts get
 a visible `Kbd` badge next to their control — never a keyboard-only entry
 point (repo-wide discoverability rule, `CLAUDE.md`).
 
@@ -145,10 +145,11 @@ the sample request without clearing filters; a selection with no matches
 has a reset action. Fixture dates are relative to when the page opens, so
 presets remain useful; custom ranges preserve absolute timestamps. All records are invented and no API is called.
 
-`DataTable` owns the header, rows, skeleton, border and horizontal scrolling.
+`DataTable` owns the header, rows, skeleton and border; columns carry priority
+classes so the table never scrolls sideways.
 The caller owns request errors, empty/no-match copy, filters, and retries.
-Give the table an accessible name with `aria-label`. Prefer a real link in
-the identity column over row-click-only navigation. Loading cells retain
+Give the table an accessible name with `aria-label`. Rows are `RecordRow`s:
+put a `RecordLink` in the identity column and the whole row opens it. Loading cells retain
 column visibility/alignment classes. Pagination boundary controls guard
 keyboard activation as well as pointer interaction.
 
@@ -515,13 +516,15 @@ The UI retains that existing request; this pass changes its discoverability and
 copy. The live action was intentionally not invoked. Console TypeScript, DS lint,
 and sandbox build passed; browser confirmed the named section and exposed action.
 
-## Resource navigation convention (2026-09-21)
+## Resource navigation convention (2026-09-21, revised 2026-11-06)
 
-`RecordLink` is the single primary-detail affordance for tables: underlined name
-and persistent right arrow, implemented as a router link. `DataTable` and
-`Ledger` no longer accept `onRowClick`; render `RecordLink` in the identity
-column instead. The `/ledger` reference screen demonstrates this. Do not turn
-rows into buttons or add a redundant View action. Full-width details reserve
+`RecordLink` is the single primary-detail affordance for tables, implemented as
+a router link. Since 2026-11-06 it renders as the plain record name (no
+underline, no arrow) and `RecordRow` makes the whole row follow it, with
+modifier-click and middle-click opening a new tab. `DataTable` and `Ledger`
+render `RecordRow`s and accept no `onRowClick`; render `RecordLink` in the
+identity column instead. The `/ledger` reference screen demonstrates this. Do
+not turn rows into buttons or add a redundant View action. Full-width details reserve
 aside space only when there is an aside. See `RULES.md` and root `DESIGN.md`.
 
 ### Canonical tabs: underline navigation
@@ -541,8 +544,9 @@ touching it.
 Use `TabsTrigger count={number}` for optional counts, including zero. Omit a
 count until it is known; never invent totals or show the current page's item
 count as the total. Counts stay visible on inactive tabs. Keep Radix keyboard
-navigation, focus indicators, disabled states, and panel semantics; let long
-strips scroll horizontally. Meaningful detail views keep their selection in
+navigation, focus indicators, disabled states, and panel semantics; long
+strips wrap to a second line rather than scroll (the shared scrolling strip is
+a legacy gap). Meaningful detail views keep their selection in
 the URL. Use a segmented toggle only for a local value choice (such as chart
 interval or list/grid display), not for navigating content sections.
 

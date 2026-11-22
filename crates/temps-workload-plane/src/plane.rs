@@ -922,6 +922,14 @@ impl WorkloadPlane {
         Ok(row.map(|row| (row.workload_id, row.driver)))
     }
 
+    /// See [`isolation_of_instances`].
+    pub async fn isolation_of_instances(
+        &self,
+        instance_ids: &[String],
+    ) -> Result<HashMap<String, (i64, Isolation)>, PlaneError> {
+        isolation_of_instances(self.db.as_ref(), instance_ids).await
+    }
+
     pub fn with_finalizer(mut self, finalizer: Arc<dyn Finalizer>) -> Self {
         self.finalizers
             .insert(finalizer.name().to_string(), finalizer);
@@ -1353,6 +1361,47 @@ impl WorkloadPlane {
         rows.into_iter().map(|row| view_from(row, None)).collect()
     }
 
+    /// Every workload of `owner` the plane still has, finished or being
+    /// deleted included, oldest first: a finished job is kept until its
+    /// time-to-live. Each view is complete, as [`Self::get`] would return
+    /// it: its status (phase, conditions, exit code) from its row, its
+    /// attempt and finish time from its latest instance. Two queries
+    /// whatever the number of workloads: the owner's rows, then the latest
+    /// instances of all of them at once.
+    pub async fn list_owned(&self, owner: &Owner) -> Result<Vec<WorkloadView>, PlaneError> {
+        let rows = workloads::Entity::find()
+            .filter(workloads::Column::OwnerKind.eq(owner.kind.as_str()))
+            .filter(workloads::Column::OwnerId.eq(owner.id))
+            .order_by_asc(workloads::Column::Id)
+            .all(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db("listing the owner's workloads", owner))?;
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let instances = workload_instances::Entity::find()
+            .filter(workload_instances::Column::WorkloadId.is_in(rows.iter().map(|row| row.id)))
+            .order_by_asc(workload_instances::Column::WorkloadId)
+            .order_by_desc(workload_instances::Column::Attempt)
+            .all(self.db.as_ref())
+            .await
+            .map_err(PlaneError::db(
+                "listing the latest instances of the owner's workloads",
+                owner,
+            ))?;
+        // Ordered by attempt, newest first: the first seen is the latest.
+        let mut latest: HashMap<i64, workload_instances::Model> = HashMap::new();
+        for instance in instances {
+            latest.entry(instance.workload_id).or_insert(instance);
+        }
+        rows.into_iter()
+            .map(|row| {
+                let instance = latest.get(&row.id);
+                view_from(row, instance)
+            })
+            .collect()
+    }
+
     /// The workload's events, newest first.
     pub async fn events(&self, id: i64) -> Result<Vec<temps_workload::WorkloadEvent>, PlaneError> {
         events::list(self.db.as_ref(), id).await
@@ -1499,6 +1548,52 @@ pub(crate) fn encode_status(
         field: "status",
         reason: e.to_string(),
     })
+}
+
+/// The workload and isolation behind each of several runtime ids, in one
+/// query. An id no instance ever had is absent from the map; an id reused by
+/// several instances answers for the latest one, as
+/// [`WorkloadPlane::workload_for_instance`] does.
+///
+/// Takes the database rather than a plane because what a replica is does not
+/// depend on a plane running in this process: one that failed to start must
+/// not make a microVM look like a container.
+pub async fn isolation_of_instances(
+    db: &DatabaseConnection,
+    instance_ids: &[String],
+) -> Result<HashMap<String, (i64, Isolation)>, PlaneError> {
+    if instance_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(String, i64, serde_json::Value)> = workload_instances::Entity::find()
+        .inner_join(workloads::Entity)
+        .filter(
+            Expr::expr(Expr::cust("\"workload_instances\".\"handle\"->>'id'"))
+                .is_in(instance_ids.iter().map(String::as_str)),
+        )
+        .order_by_asc(workload_instances::Column::Id)
+        .select_only()
+        .expr(Expr::cust("\"workload_instances\".\"handle\"->>'id'"))
+        .column(workloads::Column::Id)
+        .column(workloads::Column::Spec)
+        .into_tuple()
+        .all(db)
+        .await
+        .map_err(PlaneError::db(
+            "finding the workloads of runtime ids",
+            format!("{} instance(s)", instance_ids.len()),
+        ))?;
+    rows.into_iter()
+        .map(|(instance_id, workload_id, spec)| {
+            let spec: WorkloadSpec =
+                serde_json::from_value(spec).map_err(|e| PlaneError::Corrupt {
+                    workload_id,
+                    field: "spec",
+                    reason: e.to_string(),
+                })?;
+            Ok((instance_id, (workload_id, spec.isolation)))
+        })
+        .collect()
 }
 
 pub(crate) fn view_from(
@@ -1675,6 +1770,60 @@ mod tests {
         let view = plane.get(kept).await.expect("the disarmed workload stays");
         assert!(view.deleted_at.is_none());
         assert_eq!(driver.running().len(), 1);
+    }
+
+    /// A finished job stays listed for its owner until its time-to-live,
+    /// with the phase it ended in; `list_active` drops it at once. Another
+    /// owner's workloads are never listed.
+    #[tokio::test]
+    async fn an_owners_finished_job_is_listed_until_it_is_removed() {
+        let Some(db) = test_db().await else { return };
+        let (plane, driver, _audit) = plane_with(&db);
+        let finished = plane
+            .apply(apply_request(41, "restore-a", job_spec("app:1")))
+            .await
+            .expect("applied");
+        let live = plane
+            .apply(apply_request(41, "restore-b", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane
+            .apply(apply_request(42, "restore-c", job_spec("app:1")))
+            .await
+            .expect("applied");
+        plane.reconcile_at(Utc::now(), false).await;
+        let instance = driver
+            .running()
+            .into_iter()
+            .find(|name| name.ends_with(&format!("-{finished}-a1")))
+            .expect("the finished job's instance");
+        driver.exit(&instance, 0);
+        plane.reconcile_at(Utc::now(), false).await;
+
+        let owner = apply_request(41, "unused", job_spec("app:1")).owner;
+        let owned = plane.list_owned(&owner).await.expect("listed");
+        let ids: Vec<i64> = owned.iter().map(|view| view.id).collect();
+        assert_eq!(ids, vec![finished, live]);
+        assert_eq!(owned[0].status.phase, WorkloadPhase::Succeeded);
+        // Each view is the one `get` returns, latest instance included,
+        // read in two queries rather than one per workload.
+        for view in &owned {
+            let one = plane.get(view.id).await.expect("read");
+            assert_eq!(view.status, one.status, "workload {}", view.id);
+            assert_eq!(view.attempt, one.attempt, "workload {}", view.id);
+            assert_eq!(view.finished_at, one.finished_at, "workload {}", view.id);
+        }
+        assert_eq!(owned[0].status.exit_code, Some(0));
+        assert_eq!(owned[0].attempt, 1);
+        assert!(owned[0].finished_at.is_some());
+        let active: Vec<i64> = plane
+            .list_active(&owner)
+            .await
+            .expect("listed")
+            .iter()
+            .map(|view| view.id)
+            .collect();
+        assert_eq!(active, vec![live]);
     }
 
     #[tokio::test]

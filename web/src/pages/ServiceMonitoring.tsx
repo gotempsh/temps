@@ -84,6 +84,29 @@ import {
 } from '@/lib/service-alert-comparator'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
+  containerCpuAxisWidth,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import {
+  PG_CACHE_HIT_RATIO_METRIC,
+  formatPgCacheHitRatio,
+  metricTileValue,
+  pgCacheHitRatioDescription,
+  pgCacheHitRatioLabel,
+  pgCacheHitRatioScopedLabel,
+  type PgCacheHitScope,
+} from '@/lib/pg-cache-hit'
+import {
   serviceMetricsEngine,
   type ServiceMetricsEngine,
 } from '@/lib/service-metrics-engine'
@@ -362,7 +385,8 @@ const ENGINE_GROUPS: Record<EngineKind, MetricGroup[]> = {
 const RESOURCES_GROUP: MetricGroup = {
   title: 'Resources',
   metrics: [
-    'container.cpu_percent',
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
     'container.memory_used_bytes',
     'container.memory_percent',
   ],
@@ -462,7 +486,8 @@ const HERO_METRICS: Record<EngineKind, string[]> = {
     'rustfs_s3_operations_total',
   ],
   unsupported: [
-    'container.cpu_percent',
+    CONTAINER_CPU_METRIC,
+    CONTAINER_CPU_UTILIZATION_METRIC,
     'container.memory_used_bytes',
     'container.memory_percent',
   ],
@@ -488,6 +513,9 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
   if (MARIADB_FLAG_METRICS.has(name)) {
     const flag = formatFlagValue(value)
     if (flag !== null) return flag
@@ -513,9 +541,9 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Container resources (all engines) — sampled from docker stats. CPU uses
-  // the docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  // Container resources (all engines) — sampled from docker stats. CPU reads
+  // in cores (stored as Docker's 100% == one core) and as % of the limit.
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
   // Postgres connections — "Total" is the headline (client backends only;
@@ -525,6 +553,7 @@ const METRIC_LABELS: Record<string, string> = {
   'pg.connections_idle': 'Idle',
   'pg.connections_idle_in_transaction': 'Idle in Transaction',
   'pg.connections_other': 'Other',
+  [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
   rustfs_cluster_buckets_total: 'Buckets',
   rustfs_cluster_objects_total: 'Objects',
   rustfs_cluster_capacity_usable_total_bytes: 'Usable Capacity',
@@ -623,17 +652,55 @@ type MetricTileProps = {
   onClick?: () => void
   alert?: 'warning' | 'critical'
   size?: 'hero' | 'group'
+  /** Databases the value covers, named in the label of a per-database
+   *  metric such as the cache hit ratio. */
+  scope?: PgCacheHitScope
+  /** Text to show instead of the formatted `value`, for a tile that reads
+   *  more than one metric (CPU used against the CPU limit). */
+  display?: string
 }
 
-function MetricTile({
+/** The label and tooltip of a tile, naming its scope where it matters. */
+function metricTileText(
+  name: string,
+  scope?: PgCacheHitScope
+): { label: string; hint?: string } {
+  if (name === PG_CACHE_HIT_RATIO_METRIC && scope) {
+    return {
+      label: pgCacheHitRatioScopedLabel(scope),
+      hint: pgCacheHitRatioDescription(scope),
+    }
+  }
+  if (name === CONTAINER_CPU_METRIC) {
+    return { label: CONTAINER_CPU_TILE_LABEL, hint: CONTAINER_CPU_TILE_HINT }
+  }
+  return { label: labelForMetric(name) }
+}
+
+/** A tile's text when it reads more than its own metric. */
+function metricTileDisplay(
+  name: string,
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
+): string | undefined {
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
+  return undefined
+}
+
+/** One metric's latest value, clickable to chart it. */
+export function MetricTile({
   name,
   value,
   selected,
   onClick,
   alert,
   size = 'group',
+  scope,
+  display,
 }: MetricTileProps) {
   const isHero = size === 'hero'
+  const { label, hint } = metricTileText(name, scope)
   const className = [
     'flex flex-col text-left transition-colors',
     isHero ? 'gap-1 px-4 py-4' : 'gap-0.5 px-4 py-3',
@@ -658,7 +725,9 @@ function MetricTile({
         {alert === 'warning' && (
           <span className="inline-block size-1.5 shrink-0 rounded-full bg-amber-400" />
         )}
-        <span className="truncate">{labelForMetric(name)}</span>
+        <span className="truncate" title={hint ?? label}>
+          {label}
+        </span>
       </dt>
       <dd
         className={[
@@ -666,7 +735,7 @@ function MetricTile({
           isHero ? 'text-2xl' : 'text-lg',
         ].join(' ')}
       >
-        {value != null ? formatMetricValue(name, value) : '—'}
+        {display ?? (value != null ? formatMetricValue(name, value) : '—')}
       </dd>
     </>
   )
@@ -685,10 +754,17 @@ function MetricTile({
 type MetricChartProps = {
   serviceId: number
   metricName: string
+  /** Charted before `metricName` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   range: string
 }
 
-function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
+function MetricChart({
+  serviceId,
+  metricName,
+  historyMetric,
+  range,
+}: MetricChartProps) {
   const refetchInterval = useRefreshInterval()
   const { data, isLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
@@ -698,13 +774,25 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
     staleTime: 15_000,
     refetchInterval,
   })
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metricName, range },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval,
+  })
 
-  const chartData = (data ?? []).map((p) => ({
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
+  const chartData = points.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
-  if (isLoading) {
+  if (isLoading || (historyMetric != null && historyLoading)) {
     return (
       <div className="flex h-full items-center justify-center gap-2 text-sm text-muted-foreground">
         <Loader2 className="size-4 animate-spin text-muted-foreground" />
@@ -751,12 +839,13 @@ function MetricChart({ serviceId, metricName, range }: MetricChartProps) {
           tickLine={false}
           axisLine={false}
           width={
-            metricName.endsWith('_ratio') || metricName.endsWith('_percent')
+            containerCpuAxisWidth(metricName) ??
+            (metricName.endsWith('_ratio') || metricName.endsWith('_percent')
               ? 52
               : metricName.endsWith('_bytes') ||
                   metricName.endsWith('_bytes_total')
                 ? 70
-                : 44
+                : 44)
           }
           {...yAxisTickProps(
             chartData.map((p) => p.value),
@@ -809,7 +898,9 @@ function AddAlertRuleDialog({
   onSuccess,
 }: AddAlertRuleDialogProps) {
   const [name, setName] = useState('')
-  const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
+  // CPU alerts threshold the share of the limit, never cores × 100.
+  const alertMetrics = alertableMetrics(ALL_METRICS[engine])
+  const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
   const [comparator, setComparator] = useState<ServiceAlertComparator>('>')
   const [severity, setSeverity] = useState<Severity>('warning')
@@ -865,7 +956,7 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {ALL_METRICS[engine].map((m) => (
+                {alertMetrics.map((m) => (
                   <SelectItem key={m} value={m}>
                     {labelForMetric(m)}
                   </SelectItem>
@@ -1095,8 +1186,11 @@ function DatabasesSection({
               <MetricTile
                 key={name}
                 name={name}
-                value={values.get(name)}
+                value={metricTileValue(name, (m) => values.get(m))}
                 selected={false}
+                scope={
+                  selected === ALL_DATABASES ? 'all' : { database: selected }
+                }
               />
             ))}
           </dl>
@@ -1317,6 +1411,8 @@ type MonitoringDashboardProps = {
   /** Raw service type, named in the notice for engines without a collector. */
   serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 function MonitoringDashboard({
@@ -1324,6 +1420,7 @@ function MonitoringDashboard({
   engine,
   serviceType,
   latestMetrics,
+  cluster,
 }: MonitoringDashboardProps) {
   const refetchInterval = useRefreshInterval()
   // Container CPU/memory first — resource saturation is the first thing an
@@ -1336,6 +1433,9 @@ function MonitoringDashboard({
     heroMetrics[0] ?? groups[0]?.metrics[0] ?? ''
   )
   const [range, setRange] = useState('1h')
+  // The series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
 
   const latestByName = new Map<string, number>()
   for (const m of latestMetrics) {
@@ -1396,11 +1496,17 @@ function MonitoringDashboard({
             <MetricTile
               key={name}
               name={name}
-              value={latestByName.get(name)}
+              value={metricTileValue(name, (m) => latestByName.get(m))}
+              display={metricTileDisplay(
+                name,
+                (m) => latestByName.get(m),
+                cluster
+              )}
               selected={selectedMetric === name}
               onClick={() => setSelectedMetric(name)}
               alert={firingBySeverity.get(name)}
               size="hero"
+              scope="all"
             />
           ))}
         </dl>
@@ -1411,10 +1517,10 @@ function MonitoringDashboard({
         <div className="flex flex-wrap items-center justify-between gap-2 border-b border-border px-4 py-3">
           <div className="min-w-0">
             <p className="truncate text-sm font-medium text-foreground">
-              {labelForMetric(selectedMetric)}
+              {labelForMetric(chartMetric)}
             </p>
             <p className="mt-0.5 truncate font-mono text-xs text-muted-foreground">
-              {selectedMetric}
+              {chartMetric}
             </p>
           </div>
           <div className="flex shrink-0 gap-1">
@@ -1434,7 +1540,8 @@ function MonitoringDashboard({
         <div className="h-56 px-2 py-4 overflow-visible">
           <MetricChart
             serviceId={serviceId}
-            metricName={selectedMetric}
+            metricName={chartMetric}
+            historyMetric={historyMetric}
             range={range}
           />
         </div>
@@ -1453,7 +1560,12 @@ function MonitoringDashboard({
               <MetricTile
                 key={name}
                 name={name}
-                value={latestByName.get(name)}
+                value={metricTileValue(name, (m) => latestByName.get(m))}
+                display={metricTileDisplay(
+                  name,
+                  (m) => latestByName.get(m),
+                  cluster
+                )}
                 selected={selectedMetric === name}
                 onClick={() => setSelectedMetric(name)}
                 alert={firingBySeverity.get(name)}
@@ -1678,6 +1790,7 @@ export function ServiceMonitoring() {
               engine={engine}
               serviceType={serviceData?.service?.service_type ?? ''}
               latestMetrics={latestMetrics}
+              cluster={serviceData?.service?.topology === 'cluster'}
             />
           )}
         </div>

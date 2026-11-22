@@ -242,12 +242,11 @@ async fn gitea_webhook_events(
     // event type. This prevents a non-push event from returning a different
     // response ("event type not handled") that an unsigned sender could use
     // as an oracle to distinguish event types from signature failures.
-    let mut any_valid = false;
+    let mut authorized_projects = Vec::new();
 
     for project in &matching_projects {
         if verify_gitea_webhook_signature(project, &body, signature, &state).await {
-            any_valid = true;
-            break;
+            authorized_projects.push(project.clone());
         } else {
             warn!(
                 delivery_id = delivery_id,
@@ -257,7 +256,7 @@ async fn gitea_webhook_events(
         }
     }
 
-    if !any_valid {
+    if authorized_projects.is_empty() {
         // SECURITY: Return HTTP 200 (not 401/403) so the caller cannot
         // determine whether a signature check was performed or whether the
         // project exists (ADR Decision 4, matching gitlab.rs:285).
@@ -273,7 +272,56 @@ async fn gitea_webhook_events(
     }
 
     // Signature is valid. NOW branch on event type.
-    // Non-push events are accepted (200) and logged but not dispatched.
+    // A closed pull request retires its branch's preview on the projects that
+    // signed the delivery.
+    if event_type == "pull_request" {
+        if let Some((branch, reason)) = super::pull_request::closed_pull_request(&body) {
+            if let Err(e) = state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(branch, reason, authorized_projects)
+                .await
+            {
+                error!(
+                    delivery_id = delivery_id,
+                    repo_owner = repo_owner,
+                    repo_name = repo_name,
+                    "Failed to queue preview teardown for Gitea pull request: {:?}",
+                    e
+                );
+            }
+        }
+        return axum::Json(GiteaWebhookResponse {
+            message: "processed".to_string(),
+        });
+    }
+
+    // Gitea reports a deleted branch as a `delete` event, never as a push.
+    if event_type == "delete" {
+        if let Some(branch) = deleted_branch(&payload) {
+            if let Err(e) = state
+                .git_provider_manager
+                .handle_branch_closed_for_projects(
+                    branch,
+                    temps_core::PreviewBranchCloseReason::BranchDeleted,
+                    authorized_projects,
+                )
+                .await
+            {
+                error!(
+                    delivery_id = delivery_id,
+                    repo_owner = repo_owner,
+                    repo_name = repo_name,
+                    "Failed to queue preview teardown for deleted Gitea branch: {:?}",
+                    e
+                );
+            }
+        }
+        return axum::Json(GiteaWebhookResponse {
+            message: "processed".to_string(),
+        });
+    }
+
+    // Other non-push events are accepted (200) and logged but not dispatched.
     if event_type != "push" {
         info!(
             delivery_id = delivery_id,
@@ -287,17 +335,9 @@ async fn gitea_webhook_events(
 
     let git_ref = payload.get("ref").and_then(|v| v.as_str()).unwrap_or("");
 
-    let branch = if git_ref.starts_with("refs/heads/") {
-        Some(git_ref.replace("refs/heads/", ""))
-    } else {
-        None
-    };
+    let branch = super::branch_from_ref(git_ref, false);
 
-    let tag = if git_ref.starts_with("refs/tags/") {
-        Some(git_ref.replace("refs/tags/", ""))
-    } else {
-        None
-    };
+    let tag = git_ref.strip_prefix("refs/tags/").map(str::to_owned);
 
     let commit = payload
         .get("after")
@@ -313,28 +353,29 @@ async fn gitea_webhook_events(
         .unwrap_or("")
         .to_string();
 
-    // Dispatch through the existing push-event machinery.
-    let triggered = if let Err(e) = state
+    // Dispatch only to the projects whose secret signed this delivery: a
+    // same-named repository on another Gitea host is not the one pushed to.
+    let triggered = match state
         .git_provider_manager
-        .handle_push_event(
-            repo_owner.to_string(),
-            repo_name.to_string(),
+        .handle_push_event_for_projects(
             branch.clone(),
             tag.clone(),
             commit.clone(),
+            authorized_projects,
         )
         .await
     {
-        error!(
-            delivery_id = delivery_id,
-            repo_owner = repo_owner,
-            repo_name = repo_name,
-            "Failed to handle Gitea push event: {:?}",
-            e
-        );
-        0
-    } else {
-        matching_projects.len()
+        Ok(triggered) => triggered,
+        Err(e) => {
+            error!(
+                delivery_id = delivery_id,
+                repo_owner = repo_owner,
+                repo_name = repo_name,
+                "Failed to handle Gitea push event: {:?}",
+                e
+            );
+            0
+        }
     };
 
     info!(
@@ -350,8 +391,57 @@ async fn gitea_webhook_events(
     })
 }
 
+/// The branch a Gitea `delete` event removed; `None` for a deleted tag.
+/// Gitea sends the short name, so a `refs/heads/` prefix is part of it.
+fn deleted_branch(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("ref_type").and_then(|v| v.as_str()) != Some("branch") {
+        return None;
+    }
+
+    let branch = payload.get("ref").and_then(|v| v.as_str())?;
+    (!branch.is_empty()).then(|| branch.to_string())
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn delete_events_name_the_deleted_branch_but_never_a_tag() {
+        let event =
+            |ref_type: &str, name: &str| serde_json::json!({ "ref": name, "ref_type": ref_type });
+        assert_eq!(
+            super::deleted_branch(&event("branch", "feat/topic")).as_deref(),
+            Some("feat/topic")
+        );
+        assert_eq!(
+            super::deleted_branch(&event("branch", "refs/heads/topic")).as_deref(),
+            Some("refs/heads/topic")
+        );
+        assert_eq!(super::deleted_branch(&event("tag", "v1.0.0")), None);
+        assert_eq!(super::deleted_branch(&event("branch", "")), None);
+    }
+
+    #[test]
+    fn branch_refs_preserve_embedded_prefixes() {
+        for (input, expected) in [
+            (
+                "refs/heads/feat/refs/heads/victim",
+                Some("feat/refs/heads/victim"),
+            ),
+            ("refs/heads/x", Some("x")),
+            ("refs/heads/feat/topic", Some("feat/topic")),
+            ("refs/tags/release", None),
+        ] {
+            assert_eq!(
+                super::super::branch_from_ref(input, false).as_deref(),
+                expected
+            );
+        }
+        assert_eq!(
+            super::super::branch_from_ref("feat/topic", false).as_deref(),
+            None
+        );
+    }
+
     use super::*;
 
     // ── project_has_signing_token ─────────────────────────────────────────────

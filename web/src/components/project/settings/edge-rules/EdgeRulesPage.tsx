@@ -26,7 +26,12 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
-import { Button as BusyButton, RecordLink, Status } from '@temps-sdk/ds'
+import {
+  Button as BusyButton,
+  RecordLink,
+  RecordRow,
+  Status,
+} from '@temps-sdk/ds'
 import { useQuery, type UseQueryResult } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
@@ -451,7 +456,7 @@ function RulesTable({
         {rules.map((rule, index) => {
           const busy = busyRuleId === rule.id
           return (
-            <TableRow
+            <RecordRow
               key={rule.id}
               className={rule.enabled ? undefined : 'text-muted-foreground'}
             >
@@ -572,7 +577,7 @@ function RulesTable({
                   </DropdownMenu>
                 </div>
               </TableCell>
-            </TableRow>
+            </RecordRow>
           )
         })}
       </TableBody>

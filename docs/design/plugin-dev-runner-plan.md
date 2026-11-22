@@ -59,7 +59,7 @@ shutdown is Ctrl-C; explicit session selection avoids sending to another runner.
 - `sdks/node/packages/plugin-sdk/src/{runtime,launch,protocol,client,types}.ts`:
   protocol-2 hello, private stdin launch configuration, ready, Unix socket,
   authenticated channel, and nested `call` / `outcome` frames.
-- `crates/temps-core/src/external_plugin/{channel,manifest,actor}.rs` and
+- `crates/temps-plugin-protocol/src/{channel,manifest}.rs`, `crates/temps-external-plugins/src/actor.rs` and
   `crates/temps-plugin-sdk/src/{protocol,runtime,auth}.rs`: authoritative Rust
   protocol and permissions. Use both SDKs as conformance clients.
 - `crates/temps-external-plugins/src/{event_listener,proxy,host_api}.rs`:

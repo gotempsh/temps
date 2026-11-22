@@ -513,8 +513,9 @@ Rejected: leaves self-hosted users without MCP support.
   for the `mcp add/remove/status` commands.
 - **Migration needed:** yes — delete `mcp/` workspace, delete
   `skills/temps-mcp-setup/`, verify npm deprecation.
-- **Breaking changes:** no — the new endpoint is additive.  Existing skills and
-  CLI commands are unaffected.
+- **Breaking changes:** yes — the endpoint-specific tools, including edge-rule
+  tools, are removed. Refresh client tool discovery and start with `temps --help`.
+  Edge rules remain available through the console and REST API.
 - **Security auditor sign-off required** before Cloud enablement.
 - **Feature flag:** use ADR-034 flag system; default off until security review
   is complete.
@@ -528,3 +529,40 @@ Rejected: leaves self-hosted users without MCP support.
 - **Open operational item:** a maintainer with npm publish access must confirm
   and if necessary execute:
   `npm deprecate @temps-sdk/mcp "@temps-sdk/mcp is no longer maintained; use bunx @temps-sdk/cli mcp add instead"`
+
+## Primary tool surface: virtual CLI
+
+The external endpoint exposes `temps` for reads and `temps_write` for write
+proposals as its primary surface. Both share the chat API-tool handles and
+curated allowlists, keeping the prompt footprint constant as described in
+ADR-024 and preserving parity with chat. Plugin operations published into the
+same index become available without registering another MCP tool.
+
+`temps` is available regardless of the legacy group selection. `temps_write`
+and `confirm_action` require `?write=1`. Write proposals expire after five
+minutes, are single-use, and are bound to the proposing API key and user;
+confirmation replays with the current caller's authorization and records an
+MCP audit outcome. Endpoint-specific tools are removed as described below.
+
+
+### Virtual CLI migration: endpoint tools removed
+
+The external MCP surface now lists only `temps` for read-only connections,
+plus `temps_write` and `confirm_action` with `?write=1`. Endpoint-specific tools have been
+removed rather than maintained as a second dispatch and authorization path.
+Existing `?groups=` URLs remain accepted but do not filter the virtual CLI;
+API-key permissions and the shared chat allowlists determine access.
+
+Clients must refresh their MCP tool list and start with `temps --help`.
+Replace `list_projects` with `projects get_projects`, `get_project` with
+`projects get_project`, and discover `get_project_deployments` and
+`trigger_project_pipeline` through section help for deployment operations.
+Writes use `temps_write` to propose and `confirm_action` to execute after
+human approval. Proposal tokens appear in standard text content so clients
+such as Claude Code can pass them to confirmation.
+
+Edge-rule tools are removed without adding their operations to the shared
+allowlists: rule match values can contain secrets, and the chat policy
+explicitly excludes them. Operators retain the console and REST API for
+edge rules. A safe redacted representation is required before exposing them
+through the shared CLI. This is an intentional breaking change.

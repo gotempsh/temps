@@ -23,7 +23,6 @@ import {
   ArrowLeft,
   BadgeCheck,
   BarChart3,
-  Bot,
   ChevronsUpDown,
   Check,
   Folder,
@@ -32,14 +31,12 @@ import {
   Monitor,
   Moon,
   Search,
-  MessageSquare,
-  Server,
   Settings,
   Sun,
   Sparkles,
-  Terminal,
-  Wand2,
+  X,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
 import {
   adminGetNodeOptions,
@@ -62,6 +59,7 @@ import {
   resolveNodeSection,
 } from '@/lib/node-detail'
 import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { SIDEBAR_HELP_LINKS } from '@/lib/support'
 import {
   isSettingsSidebarRoute,
   primaryPlatformGroups,
@@ -93,25 +91,12 @@ import {
   type SettingsNavigationIcon,
 } from '@/components/settings/settings-navigation'
 
-// AI drill-down — swapped in for /ai-gateway, /chat, /agent-sandbox,
-// /skills, /mcp-servers, /ai-workflows, mirroring the Settings sidebar
-// swap so AI's several pages read as one coherent area instead of a
-// scattered set of sidebar entries.
-const AI_MODE_PREFIXES = [
-  '/ai-gateway',
-  '/chat',
-  '/agent-sandbox',
-  '/skills',
-  '/mcp-servers',
-  '/ai-workflows',
-]
+// AI drill-down — swapped in for /ai-gateway and /chat, mirroring the
+// Settings sidebar swap so AI's pages read as one coherent area instead of a
+// scattered set of sidebar entries. The assistant itself is reached from the
+// header's AI button, so the area holds only the gateway's pages.
+const AI_MODE_PREFIXES = ['/ai-gateway', '/chat']
 const aiNavItems: PlatformNavItem[] = [
-  {
-    title: 'Harnesses',
-    url: '/agent-sandbox/providers',
-    icon: Terminal,
-    featureKey: 'ai-chat',
-  },
   {
     title: 'Providers',
     url: '/ai-gateway',
@@ -136,31 +121,6 @@ const aiNavItems: PlatformNavItem[] = [
     icon: Activity,
     featureKey: 'ai-gateway',
   },
-  {
-    title: 'Setup',
-    url: '/ai-gateway/setup',
-    icon: Terminal,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Chats',
-    url: '/chat',
-    icon: MessageSquare,
-    featureKey: 'ai-chat',
-  },
-  {
-    title: 'Workflows',
-    url: '/ai-workflows',
-    icon: Bot,
-    featureKey: 'ai-agents-workflows',
-  },
-  {
-    title: 'Skills',
-    url: '/skills',
-    icon: Wand2,
-    featureKey: 'ai-foundation-api-tools',
-  },
-  { title: 'MCP servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({
@@ -386,6 +346,27 @@ export default function AppSidebar() {
         ) : null}
       </SidebarContent>
       <SidebarFooter>
+        <SidebarMenu>
+          {SIDEBAR_HELP_LINKS.map((link) => (
+            <SidebarMenuItem key={link.id}>
+              <SidebarMenuButton
+                asChild
+                tooltip={link.label}
+                className={compact ? 'justify-center' : 'justify-start'}
+              >
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`${link.label} (opens in a new tab)`}
+                >
+                  <link.icon aria-hidden="true" />
+                  {!compact && <span>{link.label}</span>}
+                </a>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
         <NavUser />
       </SidebarFooter>
     </Sidebar>
@@ -485,11 +466,13 @@ function NavSection({
 // as a bordered callout card (not a plain nav row) with a mini progress bar
 // so it reads as a distinct "you have setup left" prompt. Full checklist
 // detail lives on its own /setup page. Renders nothing once dismissed or
-// fully complete (same visibility rule as the /setup page).
+// fully complete (same visibility rule as the /setup page). Once a step is done
+// it can be dismissed; /setup stays reachable from the command palette.
 function GettingStartedNavItem() {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const { completedCount, totalCount, visible } = useGettingStarted()
+  const { completedCount, totalCount, visible, canDismiss, dismiss } =
+    useGettingStarted()
 
   if (!visible) return null
 
@@ -519,10 +502,13 @@ function GettingStartedNavItem() {
   }
 
   return (
-    <SidebarGroup className="pb-0">
+    <SidebarGroup className="relative pb-0">
       <Link
         to="/setup"
-        className="group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70"
+        className={cn(
+          'group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70',
+          canDismiss && 'pr-9'
+        )}
       >
         <div className="flex items-center gap-2">
           <BadgeCheck className="size-4 shrink-0 text-primary" />
@@ -538,6 +524,23 @@ function GettingStartedNavItem() {
           />
         </div>
       </Link>
+      {canDismiss && (
+        <button
+          type="button"
+          aria-label="Hide platform setup"
+          title="Hide platform setup"
+          className="absolute right-3.5 top-4 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+          onClick={() => {
+            dismiss()
+            toast('Platform setup hidden', {
+              description:
+                'Open it again from ⌘K: search for "Finish setting up".',
+            })
+          }}
+        >
+          <X className="size-3.5" />
+        </button>
+      )}
     </SidebarGroup>
   )
 }
@@ -886,7 +889,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
-// Chats, Workflows, Skills, MCP Servers). Back button returns to root.
+// Limits, Activity). Back button returns to root.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function AiNav({ onBack }: { onBack: () => void }) {

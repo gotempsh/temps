@@ -29,11 +29,11 @@ use sqlx::postgres::{PgListener, PgPool};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use temps_config::AppSettings;
 use temps_core::gate::{AccessGate, GateKind, GatePolicy, TempsGate};
 use temps_core::public_hostname_resolver::match_strategy;
 use temps_core::{
-    AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
-    ServiceEndpointScheme,
+    ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext, ServiceEndpointScheme,
 };
 use temps_entities::custom_routes::RouteType;
 use temps_entities::preset::ComposePublicPort;
@@ -41,6 +41,8 @@ use temps_entities::{deployments, environments, nodes, projects};
 use tracing::{debug, error, info, warn};
 
 mod load;
+mod pinned_upstream;
+pub use pinned_upstream::{PinnedUpstream, UpstreamAddresses, REFRESH_INTERVAL};
 
 /// Look up the address a container's node publishes its ports on (see
 /// `nodes::Model::data_address`: the mesh address for a node that joined with
@@ -95,9 +97,16 @@ fn build_backend_entry(
         runtime_context,
     );
     Some(BackendEntry {
+        compose_service: container.service_name.clone().zip(container.container_port),
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -198,9 +207,16 @@ fn build_public_compose_backend_entry(
         runtime_context,
     )?;
     Some(BackendEntry {
+        compose_service: Some((public_port.service.clone(), target)),
+        node_id: container.node_id,
+        state: Default::default(),
+        tier: 0,
+        capacity: None,
+        check_health: false,
         address,
         container_id: Some(container.container_id.clone()),
         container_name: Some(container.container_name.clone()),
+        pinned: None,
     })
 }
 
@@ -246,6 +262,23 @@ fn tunnel_service_hostnames(hosts: Option<&Vec<String>>, route_label: &str) -> V
         .map(|(label, domain)| {
             PublicHostnameStrategy::Flat.service_hostname(domain, label, route_label)
         })
+        .collect()
+}
+
+/// Every public Compose service beside each tunnel host of an environment
+/// (ADR 068 D3): the same names the awake path routes, so a sleeping
+/// environment still wakes on them and a control-plane tunnel keeps
+/// publishing them (ADR-107 D4).
+fn compose_tunnel_service_hostnames(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+    tunnel_hosts: Option<&Vec<String>>,
+) -> Vec<String> {
+    let Some(temps_entities::preset::PresetConfig::DockerCompose(config)) = preset_config else {
+        return Vec::new();
+    };
+    temps_entities::preset::compose_public_route_labels(&config.public_ports)
+        .iter()
+        .flat_map(|label| tunnel_service_hostnames(tunnel_hosts, label))
         .collect()
 }
 
@@ -444,10 +477,21 @@ pub struct BackendEntry {
     pub container_id: Option<String>,
     /// Human-readable container name (e.g., "my-app-abc123")
     pub container_name: Option<String>,
+    /// Set for a custom route upstream named by hostname: requests go to the
+    /// checked addresses held here, never to `address`, which is kept for
+    /// display. `None` for every platform backend.
+    pub pinned: Option<Arc<PinnedUpstream>>,
+    /// Compose service and container port, independent of the published dial port.
+    pub compose_service: Option<(String, i32)>,
+    pub node_id: Option<i32>,
+    pub state: Arc<crate::replica_policy::ReplicaState>,
+    pub tier: usize,
+    pub capacity: Option<u32>,
+    pub check_health: bool,
 }
 
 /// Result of selecting a backend via round-robin.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct BackendSelection {
     /// Network address to connect to
     pub address: String,
@@ -455,6 +499,11 @@ pub struct BackendSelection {
     pub container_id: Option<String>,
     /// Human-readable container name
     pub container_name: Option<String>,
+    /// Why this backend must not be dialled right now (a pinned upstream with
+    /// no allowed address). The caller fails the request instead of
+    /// connecting to `address`.
+    pub refused: Option<String>,
+    pub in_flight: Option<crate::replica_policy::InFlightGuard>,
 }
 
 /// Backend type for a route
@@ -492,27 +541,32 @@ impl BackendType {
             } => {
                 if backends.is_empty() {
                     return Some(BackendSelection {
+                        in_flight: None,
+                        refused: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     });
                 }
 
-                let entry = if backends.len() == 1 {
-                    &backends[0]
-                } else {
-                    let index =
-                        round_robin_counter.fetch_add(1, Ordering::Relaxed) % backends.len();
-                    (0..backends.len())
-                        .map(|offset| &backends[(index + offset) % backends.len()])
-                        .find(|entry| !avoid.contains(&entry.address))
-                        .unwrap_or(&backends[index])
-                };
+                let cursor = round_robin_counter.fetch_add(1, Ordering::Relaxed);
+                let (index, guard) =
+                    crate::replica_policy::reserve_avoiding(backends, cursor, avoid)?;
+                let entry = &backends[index];
 
+                let (address, refused) = match &entry.pinned {
+                    None => (entry.address.clone(), None),
+                    Some(pin) => match pin.pick_avoiding(avoid) {
+                        Ok(address) => (address.to_string(), None),
+                        Err(reason) => (entry.address.clone(), Some(reason)),
+                    },
+                };
                 Some(BackendSelection {
-                    address: entry.address.clone(),
+                    in_flight: Some(guard),
+                    address,
                     container_id: entry.container_id.clone(),
                     container_name: entry.container_name.clone(),
+                    refused,
                 })
             }
             BackendType::StaticDir { .. } => None,
@@ -590,6 +644,8 @@ impl RouteInfo {
         self.backend
             .get_backend_avoiding(avoid)
             .unwrap_or_else(|| BackendSelection {
+                in_flight: None,
+                refused: None,
                 address: "127.0.0.1:8080".to_string(),
                 container_id: None,
                 container_name: None,
@@ -698,6 +754,29 @@ pub type OnCertEligibleCallback = Arc<
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StatusPageHostRoute {
     pub slug: Option<Arc<str>>,
+}
+
+/// Whether `host` (normalized) is a hostname a tunnel can publish: a real
+/// name with a dot, not a wildcard and not an internal `.temps.local` one.
+fn is_public_hostname(host: &str) -> bool {
+    host.contains('.') && !host.starts_with("*.") && !host.ends_with(".temps.local")
+}
+
+/// The public hostnames of `sleeping` environments (see
+/// `RouteTableSnapshot::sleeping_public_hosts`): normalized, deduplicated,
+/// and without bare subdomains, wildcards, internal or private addresses.
+fn sleeping_public_hosts(
+    sleeping: &[SleepingEnvironmentEntry],
+    private_hosts: &HashSet<String>,
+) -> Arc<[String]> {
+    let mut hosts: Vec<String> = sleeping
+        .iter()
+        .map(|entry| normalize_route_hostname(&entry.domain).into_owned())
+        .filter(|host| is_public_hostname(host) && !private_hosts.contains(host))
+        .collect();
+    hosts.sort_unstable();
+    hosts.dedup();
+    hosts.into()
 }
 
 /// Lowercase `host`, dropping a `:port` suffix and a trailing dot, the same
@@ -999,6 +1078,12 @@ struct LegacyRouteTable {
 
 #[derive(Clone, Debug, Default)]
 struct RouteTableSnapshot {
+    /// Probe membership is committed atomically with the routes it checks.
+    active_probes: Arc<Vec<crate::replica_policy::Probe>>,
+    /// Platform hostnames that may have no route at all right now (an
+    /// undeployed environment's stored address, a sleeping environment's
+    /// hostname), lower-cased. Only consulted to keep a TLS wildcard off them.
+    owned_hosts: HashSet<String>,
     http_routes: HashMap<String, RouteInfo>,
     tls_routes: HashMap<String, RouteInfo>,
     http_wildcards: WildcardMatcher,
@@ -1018,14 +1103,30 @@ struct RouteTableSnapshot {
     /// The gate of each signed-in address (ADR 065 D7), by lower-cased host.
     /// Empty on an install with no signed-in address.
     gated: HashMap<String, Arc<GatePolicy>>,
+    /// Public hostnames of sleeping on-demand environments (ADR-107 D4).
+    /// They have no route (the proxy wakes them on a visit), so a tunnel on
+    /// the control plane keeps publishing them. Part of the snapshot so a
+    /// reader sees an app either routed or sleeping, never neither, while it
+    /// wakes or falls asleep.
+    sleeping_public_hosts: Arc<[String]>,
 }
 
 impl RouteTableSnapshot {
     /// Whether any routable map resolves `host`, in the same order as
     /// `resolve_route_for_sni`, without cloning a `RouteInfo`.
+    /// Whether some exact (non-wildcard) route serves `host`, live or not.
+    fn has_exact_route(&self, host: &str) -> bool {
+        self.http_routes.contains_key(host)
+            || self.legacy.exact.contains_key(host)
+            || self.unavailable.exact.contains_key(host)
+            || self.owned_hosts.contains(host)
+    }
+
     fn has_live_route(&self, host: &str) -> bool {
         self.tls_routes.contains_key(host)
-            || self.tls_wildcards.match_domain(host).is_some()
+            // A TLS wildcard only serves a name no exact route claims; see
+            // `get_route_by_sni`.
+            || (self.tls_wildcards.match_domain(host).is_some() && !self.has_exact_route(host))
             || self.http_routes.contains_key(host)
             || self.legacy.exact.contains_key(host)
             || self.http_wildcards.match_domain(host).is_some()
@@ -1157,7 +1258,8 @@ fn worker_servable(
     shield: ShieldPinning,
 ) -> bool {
     route.redirect_to.is_none()
-        && matches!(route.backend, BackendType::Upstream { .. })
+        && matches!(&route.backend, BackendType::Upstream { backends, .. }
+            if backends.iter().all(|b| b.tier == 0 && b.capacity.is_none() && !b.check_health))
         && !route.environment.as_ref().is_some_and(|environment| {
             snapshot
                 .path_routes
@@ -1201,6 +1303,11 @@ impl RouteOwnershipSnapshot {
             return false;
         };
         !label.is_empty() && !base.is_empty() && self.wildcard_bases.contains(base)
+    }
+
+    /// Whether an exact route or a reserved name owns `host`, not a wildcard.
+    fn owns_exactly(&self, host: &str) -> bool {
+        self.reserved_hosts.contains(host) || self.exact.contains(host)
     }
 
     fn include(&mut self, other: &Self) {
@@ -1420,10 +1527,16 @@ pub struct CachedPeerTable {
     /// All route indexes and wake-gate ownership published as one immutable,
     /// lock-free snapshot. A reload can never expose mismatched generations.
     route_snapshot: ArcSwap<RouteTableSnapshot>,
+    probe_started: std::sync::atomic::AtomicBool,
 
     /// Serializes reloads so their three-phase snapshot publication cannot
     /// interleave, even when manual refresh and database notification race.
     route_reload_lock: tokio::sync::Mutex<()>,
+    /// The pins the last reload published for custom route upstream names,
+    /// by host and port. A reload that cannot resolve a name keeps the
+    /// addresses its previous pin was checked with. Weak: the route snapshot
+    /// owns the pins.
+    custom_route_pins: parking_lot::Mutex<HashMap<(String, u16), std::sync::Weak<PinnedUpstream>>>,
 
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
@@ -1494,6 +1607,105 @@ pub struct CachedPeerTable {
 }
 
 impl CachedPeerTable {
+    pub async fn run_active_probes(self: Arc<Self>) {
+        use futures::{stream::FuturesUnordered, StreamExt};
+        if self.probe_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        struct StartedGuard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for StartedGuard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, Ordering::Release);
+            }
+        }
+        let _started = StartedGuard(&self.probe_started);
+        let client = crate::replica_policy::probe_client_with_retry(
+            || {
+                reqwest::Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+            },
+            temps_core::retry::RetryConfig::default(),
+        )
+        .await;
+        use std::{cmp::Reverse, collections::BinaryHeap, time::Instant};
+        let mut snapshot = Arc::new(Vec::new());
+        let mut entries: HashMap<usize, (crate::replica_policy::Probe, Instant)> = HashMap::new();
+        let mut due = BinaryHeap::new();
+        let mut running = HashSet::new();
+        let mut tasks = FuturesUnordered::new();
+        loop {
+            let now = Instant::now();
+            let current = self.route_snapshot.load().active_probes.clone();
+            // Reconcile membership only when routes publish a new snapshot.
+            // Completions only update one deadline, never scan every replica.
+            if !Arc::ptr_eq(&snapshot, &current) {
+                snapshot = current;
+                let mut previous = std::mem::take(&mut entries);
+                due.clear();
+                for probe in snapshot.iter() {
+                    let key = Arc::as_ptr(&probe.state) as usize;
+                    let when = previous
+                        .remove(&key)
+                        .filter(|(old, _)| {
+                            old.url == probe.url
+                                && old.config.health_check.interval_seconds
+                                    == probe.config.health_check.interval_seconds
+                        })
+                        .map(|(_, when)| when)
+                        .unwrap_or(now);
+                    entries.insert(key, (probe.clone(), when));
+                    if !running.contains(&key) {
+                        due.push(Reverse((when, key)));
+                    }
+                }
+            }
+            // Earliest deadlines get the next free slot. At most one request
+            // per replica and 16 overall; overdue work stays in the bounded heap.
+            while running.len() < 16 {
+                let Some(&Reverse((when, key))) = due.peek() else {
+                    break;
+                };
+                if when > now {
+                    break;
+                }
+                due.pop();
+                let Some((probe, next)) = entries.get_mut(&key) else {
+                    continue;
+                };
+                *next = now
+                    + std::time::Duration::from_secs(u64::from(
+                        probe.config.health_check.interval_seconds,
+                    ));
+                running.insert(key);
+                let probe = probe.clone();
+                let client = client.clone();
+                tasks.push(async move {
+                    probe.check(&client).await;
+                    key
+                });
+            }
+            // Poll only the snapshot pointer when idle. With available slots,
+            // also wake at the earliest deadline; a full pool waits for a result.
+            let mut wake_at = now + std::time::Duration::from_millis(250);
+            if running.len() < 16 {
+                if let Some(Reverse((when, _))) = due.peek() {
+                    wake_at = wake_at.min(*when);
+                }
+            }
+            tokio::select! {
+                Some(key) = tasks.next(), if !tasks.is_empty() => {
+                    running.remove(&key);
+                    if let Some((_, when)) = entries.get(&key) {
+                        due.push(Reverse((*when, key)));
+                    }
+                }
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => {}
+            }
+        }
+    }
+
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self::new_with_runtime_context(db, Arc::new(RuntimeContext::host()))
     }
@@ -1504,7 +1716,9 @@ impl CachedPeerTable {
     ) -> Self {
         Self {
             route_snapshot: ArcSwap::from_pointee(RouteTableSnapshot::default()),
+            probe_started: std::sync::atomic::AtomicBool::new(false),
             route_reload_lock: tokio::sync::Mutex::new(()),
+            custom_route_pins: parking_lot::Mutex::new(HashMap::new()),
             db,
             runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
@@ -1804,7 +2018,15 @@ impl CachedPeerTable {
             return Some(route.clone());
         }
 
-        // 2. Try wildcard match in TLS wildcards
+        // 2. A TLS wildcard never takes a name an exact route serves -- a
+        //    project or environment hostname, or an exact HTTP route --
+        //    including one with no live deployment right now. Passing that
+        //    name through would hand its traffic to the wildcard's upstream.
+        if snapshot.has_exact_route(sni) {
+            return None;
+        }
+
+        // 3. Try wildcard match in TLS wildcards
         if let Some(route) = snapshot.tls_wildcards.match_domain(sni) {
             return Some(route.clone());
         }
@@ -1823,12 +2045,14 @@ impl CachedPeerTable {
         if snapshot.legacy.is_reserved(sni) {
             return None;
         }
+        // Exact names first, whatever their kind, then wildcards: the order
+        // `get_route_by_sni` and the HTTP lookup resolve a name in.
         snapshot
             .tls_routes
             .get(sni)
-            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_routes.get(sni))
             .or_else(|| snapshot.legacy.exact.get(sni))
+            .or_else(|| snapshot.tls_wildcards.match_domain(sni))
             .or_else(|| snapshot.http_wildcards.match_domain(sni))
             .or_else(|| snapshot.legacy.wildcards.match_domain(sni))
             .cloned()
@@ -1867,6 +2091,23 @@ impl CachedPeerTable {
     pub fn insert_gate_policy_for_test(&self, host: &str, policy: GatePolicy) {
         let mut snapshot = (*self.route_snapshot.load_full()).clone();
         snapshot.gated.insert(gate_host_key(host), Arc::new(policy));
+        self.route_snapshot.store(Arc::new(snapshot));
+    }
+
+    /// Treat the table as loaded for cross-crate tests without database
+    /// setup, so an unknown host does not wait for a first load.
+    #[doc(hidden)]
+    pub fn mark_loaded_for_test(&self) {
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Publish compiled ingress endpoints for cross-crate tests without
+    /// database setup.
+    #[doc(hidden)]
+    pub fn set_ingress_snapshot_for_test(&self, ingress: crate::ingress::IngressSnapshot) {
+        let mut snapshot = (*self.route_snapshot.load_full()).clone();
+        snapshot.ingress = Arc::new(ingress);
         self.route_snapshot.store(Arc::new(snapshot));
     }
 
@@ -2128,7 +2369,19 @@ impl CachedPeerTable {
     /// `host`. This is a single lock-free snapshot load and does not clone a
     /// `RouteInfo`; it is intended for the per-request wake gate.
     pub fn owns_hostname(&self, host: &str) -> bool {
-        self.route_snapshot.load().ownership.owns(host)
+        let snapshot = self.route_snapshot.load();
+        if !snapshot.ownership.owns(host) {
+            return false;
+        }
+        if !snapshot.owned_hosts.contains(host) || snapshot.ownership.owns_exactly(host) {
+            return true;
+        }
+        // A platform hostname with no exact route (a sleeping or undeployed
+        // environment's) is claimed here only by a wildcard. A TLS wildcard
+        // never serves it (see `get_route_by_sni`), so it must not keep the
+        // environment from waking; an HTTP-side wildcard still does.
+        snapshot.http_wildcards.match_domain(host).is_some()
+            || snapshot.legacy.wildcards.match_domain(host).is_some()
     }
 
     /// Get current number of routes in the table
@@ -2275,6 +2528,48 @@ impl CachedPeerTable {
             .keys()
             .filter(|host| !host.ends_with(".temps.local"))
             .count()
+    }
+
+    /// Public hostnames of sleeping on-demand environments: routed nowhere
+    /// until a visit wakes them, but the control-plane proxy answers them.
+    pub fn public_sleeping_hostnames(&self) -> Vec<String> {
+        self.route_snapshot.load().sleeping_public_hosts.to_vec()
+    }
+
+    /// Every public hostname the control-plane proxy answers (ADR-107 D4),
+    /// read from one snapshot: its routes, the custom hostnames of published
+    /// status pages, and sleeping on-demand environments. The console's and
+    /// the public ingress's own hostnames are never among them.
+    pub fn control_plane_public_hostnames(&self) -> Vec<String> {
+        let snapshot = self.route_snapshot.load();
+        let routed = snapshot
+            .legacy
+            .exact
+            .keys()
+            .filter(|host| !host.ends_with(".temps.local"));
+        let status_pages = snapshot
+            .legacy
+            .status_page_hosts
+            .iter()
+            .filter(|(host, route)| route.slug.is_some() && is_public_hostname(host))
+            .map(|(host, _)| host);
+        routed
+            .chain(status_pages)
+            .chain(snapshot.sleeping_public_hosts.iter())
+            .cloned()
+            .collect()
+    }
+
+    /// Marks `host` as a sleeping environment's, for callers in other
+    /// crates that need one without a database. `load_routes` owns this on
+    /// the production path.
+    #[doc(hidden)]
+    pub fn insert_sleeping_host_for_test(&self, host: &str) {
+        let mut snapshot = self.route_snapshot.load().as_ref().clone();
+        let mut hosts = snapshot.sleeping_public_hosts.to_vec();
+        hosts.push(normalize_route_hostname(host).into_owned());
+        snapshot.sleeping_public_hosts = hosts.into();
+        self.route_snapshot.store(Arc::new(snapshot));
     }
 
     /// Every public hostname in the route table, whoever serves it.
@@ -2712,11 +3007,86 @@ async fn load_tailnet_principals(
         .collect())
 }
 #[cfg(test)]
+mod pinned_backend_tests {
+    use super::*;
+
+    fn backend(pinned: UpstreamAddresses) -> BackendType {
+        BackendType::Upstream {
+            backends: vec![BackendEntry {
+                compose_service: None,
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
+                address: "upstream.example.net:443".to_string(),
+                container_id: None,
+                container_name: None,
+                pinned: Some(Arc::new(PinnedUpstream::new(
+                    "upstream.example.net",
+                    443,
+                    pinned,
+                ))),
+            }],
+            round_robin_counter: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    #[test]
+    fn a_pinned_backend_is_selected_at_its_checked_address_not_its_name() {
+        let selection = backend(UpstreamAddresses::Allowed(vec!["8.8.8.8:443"
+            .parse()
+            .expect("address")]))
+        .get_backend()
+        .expect("upstream");
+        assert_eq!(selection.address, "8.8.8.8:443");
+        assert!(selection.refused.is_none());
+    }
+
+    /// A retry after a failed connect goes to another checked address when
+    /// there is one, whatever the shared round-robin counter says.
+    #[test]
+    fn a_retry_skips_the_checked_address_that_just_failed() {
+        let backend = backend(UpstreamAddresses::Allowed(vec![
+            "8.8.8.8:443".parse().expect("address"),
+            "8.8.4.4:443".parse().expect("address"),
+        ]));
+        let failed = vec!["8.8.8.8:443".to_string()];
+        for _ in 0..4 {
+            let selection = backend.get_backend_avoiding(&failed).expect("upstream");
+            assert_eq!(selection.address, "8.8.4.4:443");
+        }
+        // With every address failed, the normal choice is still made.
+        let all = vec!["8.8.8.8:443".to_string(), "8.8.4.4:443".to_string()];
+        let selection = backend.get_backend_avoiding(&all).expect("upstream");
+        assert!(all.contains(&selection.address));
+    }
+
+    #[test]
+    fn a_pinned_backend_without_an_allowed_address_is_refused() {
+        for state in [
+            UpstreamAddresses::Pending,
+            UpstreamAddresses::Refused("resolves to 127.0.0.1".to_string()),
+        ] {
+            let selection = backend(state).get_backend().expect("upstream");
+            assert!(selection.refused.is_some(), "{selection:?}");
+        }
+    }
+}
+
+#[cfg(test)]
 mod backend_avoiding_tests {
     use super::*;
 
     fn two_replicas() -> BackendType {
         let entry = |address: &str| BackendEntry {
+            compose_service: None,
+            node_id: None,
+            state: Default::default(),
+            tier: 0,
+            capacity: None,
+            check_health: false,
+            pinned: None,
             address: address.to_string(),
             container_id: None,
             container_name: None,
@@ -2772,6 +3142,137 @@ mod backend_avoiding_tests {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn active_probe_reload_applies_new_path_and_shorter_interval() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::channel(3);
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 1024];
+                let n = socket.read(&mut request).await.unwrap();
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(String::from_utf8_lossy(&request[..n]).into_owned())
+                    .await
+                    .unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        let state = Arc::new(ReplicaState::default());
+        let make_probe = |path: &str, interval| Probe {
+            state: state.clone(),
+            url: format!("http://{address}{path}"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: interval,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/first", 3600)]),
+            ..Default::default()
+        }));
+        let checker = tokio::spawn(table.clone().run_active_probes());
+        let first = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(first.starts_with("GET /first "));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 3600)]),
+            ..Default::default()
+        }));
+        let second = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(second.starts_with("GET /second "));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(vec![make_probe("/second", 1)]),
+            ..Default::default()
+        }));
+        let third = tokio::time::timeout(std::time::Duration::from_secs(3), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(third.starts_with("GET /second "));
+        checker.abort();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_probes_do_not_wait_for_an_unrelated_slow_replica() {
+        use crate::replica_policy::{Probe, ReplicaState};
+        use temps_entities::deployment_config::{ActiveHealthCheck, LoadBalancingConfig};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let slow = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let fast = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let make_probe = |address| Probe {
+            state: Arc::new(ReplicaState::default()),
+            url: format!("http://{address}/health"),
+            config: LoadBalancingConfig {
+                health_check: ActiveHealthCheck {
+                    enabled: true,
+                    interval_seconds: 1,
+                    timeout_seconds: 60,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let probes = vec![
+            make_probe(slow.local_addr().unwrap()),
+            make_probe(fast.local_addr().unwrap()),
+        ];
+        let slow_server = tokio::spawn(async move {
+            let (_socket, _) = slow.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(2);
+        let fast_server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = fast.accept().await.unwrap();
+                let mut request = [0; 1024];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tx.send(()).await.unwrap();
+            }
+        });
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = Arc::new(CachedPeerTable::new(Arc::new(db)));
+        table.route_snapshot.store(Arc::new(RouteTableSnapshot {
+            active_probes: Arc::new(probes),
+            ..Default::default()
+        }));
+        let checker = tokio::spawn(table.run_active_probes());
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(4), async {
+            assert!(rx.recv().await.is_some());
+            assert!(rx.recv().await.is_some());
+        })
+        .await;
+        checker.abort();
+        slow_server.abort();
+        fast_server.abort();
+        assert!(
+            completed.is_ok(),
+            "a slow replica blocked another replica's next probe"
+        );
+    }
+
     use super::*;
 
     fn snapshot_test_route() -> RouteInfo {
@@ -2873,6 +3374,8 @@ mod tests {
                 promoted_from_deployment_id: None,
                 upload_request_id: None,
                 docker_socket_mounted: false,
+                runs_as_root: false,
+                image_user: None,
             }
         }
 
@@ -2880,6 +3383,13 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3062,6 +3572,13 @@ mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: address.to_string(),
                         container_id: None,
                         container_name: None,
@@ -3330,6 +3847,7 @@ mod tests {
                 cloud_telemetry_attribute_allowlist: Vec::new(),
                 cloud_telemetry_write_mode: Default::default(),
                 cloud_analytics_write_mode: Default::default(),
+                analytics_identity_mode: Default::default(),
                 instantiation_token: None,
                 log_ingest_lines_per_sec: None,
                 log_ingest_kib_per_sec: None,
@@ -3637,6 +4155,13 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3664,6 +4189,13 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3687,6 +4219,13 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "192.168.1.100:3000".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3714,16 +4253,37 @@ mod tests {
             backend: BackendType::Upstream {
                 backends: vec![
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "127.0.0.1:8080".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "127.0.0.1:8081".to_string(),
                         container_id: None,
                         container_name: None,
                     },
                     BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "127.0.0.1:8082".to_string(),
                         container_id: None,
                         container_name: None,
@@ -3770,11 +4330,25 @@ mod tests {
         let backend = BackendType::Upstream {
             backends: vec![
                 BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,
                 },
                 BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "127.0.0.1:8081".to_string(),
                     container_id: None,
                     container_name: None,
@@ -3829,6 +4403,13 @@ mod tests {
     fn test_backend_type_upstream_single_address() {
         let backend = BackendType::Upstream {
             backends: vec![BackendEntry {
+                compose_service: None,
+                node_id: None,
+                state: Default::default(),
+                tier: 0,
+                capacity: None,
+                check_health: false,
+                pinned: None,
                 address: "192.168.1.100:3000".to_string(),
                 container_id: None,
                 container_name: None,
@@ -3876,6 +4457,13 @@ mod tests {
         let route = RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "10.0.0.1:9000".to_string(),
                     container_id: None,
                     container_name: None,
@@ -4091,6 +4679,10 @@ mod tests {
                             updated_at: now,
                         }]])
                         .append_query_results([Vec::<dns_managed_domains::Model>::new()])
+                        // One-label names other owners hold (ADR-105 D7): none.
+                        .append_query_results([Vec::<
+                            std::collections::BTreeMap<String, sea_orm::Value>,
+                        >::new()])
                         .append_query_results([vec![environment_domains::Model {
                             id: 1,
                             environment_id: 1,
@@ -4115,11 +4707,14 @@ mod tests {
                         .append_query_results([containers.clone()])
                         .append_query_results([vec![project.clone()]])
                         .append_query_results([Vec::<custom_routes::Model>::new()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers.clone()])
+                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([containers.clone()])
                         .append_query_results([vec![custom_domain]])
-                        .append_query_results([containers.clone()])
-                        .append_query_results([vec![environment.clone()]])
-                        .append_query_results([containers.clone()])
-                        .append_query_results([vec![environment.clone()]])
+                        .append_query_results([Vec::<
+                            std::collections::BTreeMap<String, sea_orm::Value>,
+                        >::new()])
                         .append_query_results([containers])
                         .append_query_results([Vec::<
                             std::collections::BTreeMap<String, sea_orm::Value>,
@@ -4288,6 +4883,86 @@ mod tests {
             ]
         );
         assert!(tunnel_service_hostnames(None, "api").is_empty());
+    }
+
+    /// ADR-107 D4: a control-plane tunnel publishes what this proxy answers,
+    /// including a published status page's custom hostname, never a
+    /// status-page tombstone, which only answers 404.
+    #[test]
+    fn control_plane_hostnames_include_published_status_pages() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection();
+        let table = CachedPeerTable::new(Arc::new(db));
+        table.insert_status_page_host_for_test("Status.Example.com", Some("my-page"));
+        table.insert_status_page_host_for_test("old-status.example.com", None);
+        table.insert_sleeping_host_for_test("sleeping-app.example.com");
+
+        let hosts = table.control_plane_public_hostnames();
+        assert!(
+            hosts.contains(&"status.example.com".to_string()),
+            "{hosts:?}"
+        );
+        assert!(
+            hosts.contains(&"sleeping-app.example.com".to_string()),
+            "{hosts:?}"
+        );
+        assert!(
+            !hosts.contains(&"old-status.example.com".to_string()),
+            "{hosts:?}"
+        );
+    }
+
+    /// Sleeping hostnames ride in the route snapshot, so a reader sees an
+    /// app that wakes or falls asleep either routed or sleeping, never
+    /// neither; and only real public names are kept.
+    #[test]
+    fn sleeping_public_hosts_keep_only_public_names() {
+        let entry = |domain: &str| SleepingEnvironmentEntry {
+            domain: domain.to_string(),
+            environment_id: 1,
+            project_id: 1,
+            deployment_id: 1,
+            wake_timeout_seconds: 30,
+        };
+        let private: HashSet<String> = ["app.internal.example.com".to_string()].into();
+        let hosts = sleeping_public_hosts(
+            &[
+                entry("App.Example.com."),
+                entry("app.example.com"),
+                entry("bare-subdomain"),
+                entry("*.example.com"),
+                entry("shop.temps.local"),
+                entry("app.internal.example.com"),
+            ],
+            &private,
+        );
+        assert_eq!(hosts.as_ref(), ["app.example.com".to_string()]);
+    }
+
+    /// A sleeping Compose environment wakes on (and a control-plane tunnel
+    /// keeps publishing) every tunnel-form service host, as when awake.
+    #[test]
+    fn a_sleeping_compose_environment_keeps_its_tunnel_service_hostnames() {
+        use temps_entities::preset::{DockerComposeConfig, PresetConfig};
+        let route = |service: &str, port: u16| ComposePublicPort {
+            service: service.to_string(),
+            port,
+            ..Default::default()
+        };
+        let config = PresetConfig::DockerCompose(DockerComposeConfig {
+            public_ports: vec![route("web", 3000), route("web", 9222), route("api", 8080)],
+            ..Default::default()
+        });
+        let tunnel_hosts = vec!["shop-staging.tunnel.example.com".to_string()];
+        assert_eq!(
+            compose_tunnel_service_hostnames(Some(&config), Some(&tunnel_hosts)),
+            vec![
+                "shop-staging--web.tunnel.example.com".to_string(),
+                "shop-staging--web-9222.tunnel.example.com".to_string(),
+                "shop-staging--api.tunnel.example.com".to_string(),
+            ]
+        );
+        assert!(compose_tunnel_service_hostnames(Some(&config), None).is_empty());
+        assert!(compose_tunnel_service_hostnames(None, Some(&tunnel_hosts)).is_empty());
     }
 
     #[test]
@@ -4649,8 +5324,8 @@ mod unavailable_route_tests {
     use super::CachedPeerTable;
     use crate::test_utils::TestDBMockOperations;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{custom_routes, environment_domains};
+    use temps_test_utils::TestDatabase;
 
     // ── Hosts without a live backend (issue #1334) ────────────────────
     //
@@ -4664,9 +5339,7 @@ mod unavailable_route_tests {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-route test: Docker runtime unavailable: {error}");
                 None
@@ -4899,12 +5572,133 @@ mod unavailable_route_tests {
                 .any(|entry| entry.domain == host && entry.environment_id == environment.id),
             "the sleeping environment must still be handed to the wake path: {sleeping:?}"
         );
+        // ADR-107 D4: a control-plane tunnel keeps publishing it, so a
+        // visit can reach the proxy that wakes it.
+        let published = route_table.public_sleeping_hostnames();
+        assert!(published.contains(&host.to_string()), "{published:?}");
+        assert!(
+            published.iter().all(|h| h.contains('.')),
+            "a bare subdomain is no hostname: {published:?}"
+        );
 
         Ok(())
     }
 
+    /// A sleeping environment whose hostname sits under a TLS wildcard custom
+    /// route still wakes: the wildcard never serves that hostname, so it must
+    /// not count as owning it either, or the request gets neither a route nor
+    /// a wake. Under an HTTP wildcard the hostname is still served by that
+    /// wildcard, as before.
     #[tokio::test]
-    async fn live_route_always_wins_over_an_unavailable_entry(
+    async fn a_sleeping_environment_under_a_tls_wildcard_still_wakes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::environments;
+
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("sleepy-tls.example.com")
+            .await?;
+        environments::ActiveModel {
+            id: Set(environment.id),
+            sleeping: Set(true),
+            ..Default::default()
+        }
+        .update(test_db.db.as_ref())
+        .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9705)).await?;
+        insert_environment_domain(&test_db, environment.id, "shop.tlssleep.example.com").await?;
+        insert_environment_domain(&test_db, environment.id, "shop.httpsleep.example.com").await?;
+        for (domain, route_type) in [
+            (
+                "*.tlssleep.example.com",
+                temps_entities::custom_routes::RouteType::Tls,
+            ),
+            (
+                "*.httpsleep.example.com",
+                temps_entities::custom_routes::RouteType::Http,
+            ),
+        ] {
+            custom_routes::ActiveModel {
+                domain: Set(domain.to_string()),
+                host: Set("8.8.4.4".to_string()),
+                port: Set(8443),
+                enabled: Set(true),
+                route_type: Set(route_type),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await?;
+        }
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let host = "shop.tlssleep.example.com";
+        assert!(route_table.get_route_by_sni(host).is_none());
+        assert!(
+            !route_table.owns_hostname(host),
+            "the TLS wildcard must not keep the sleeping environment from waking"
+        );
+        // Another name under the same wildcard is still the wildcard's.
+        assert!(route_table.owns_hostname("other.tlssleep.example.com"));
+        // An HTTP wildcard still serves (and so owns) the name, as before.
+        assert!(route_table.owns_hostname("shop.httpsleep.example.com"));
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A TLS wildcard custom route does not take an app hostname that is down
+    /// right now: SNI lookup refuses it, and the host still reports the
+    /// unavailable page rather than looking routable.
+    #[tokio::test]
+    async fn a_tls_wildcard_does_not_hide_an_unavailable_app_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(database) = database_or_skip().await else {
+            return Ok(());
+        };
+        let test_db = TestDBMockOperations::new(database.db.clone()).await?;
+        let (_project, environment, deployment) = test_db
+            .create_test_project_with_domain("down-tls.example.com")
+            .await?;
+        insert_container(&test_db, deployment.id, "exited", Some(9704)).await?;
+        insert_environment_domain(&test_db, environment.id, "store.tlswild.example.com").await?;
+        custom_routes::ActiveModel {
+            domain: Set("*.tlswild.example.com".to_string()),
+            host: Set("8.8.4.4".to_string()),
+            port: Set(8443),
+            enabled: Set(true),
+            route_type: Set(temps_entities::custom_routes::RouteType::Tls),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        let route_table = CachedPeerTable::new(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(route_table
+            .get_route_by_sni("store.tlswild.example.com")
+            .is_none());
+        assert!(
+            route_table
+                .get_unavailable_route("store.tlswild.example.com")
+                .is_some(),
+            "the down app hostname must still answer with its unavailable page"
+        );
+        assert!(route_table
+            .get_route_by_sni("other.tlswild.example.com")
+            .is_some());
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_live_wildcard_route_wins_over_an_unavailable_entry_but_an_exact_custom_route_does_not(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use crate::route_table::UnavailableReason;
 
@@ -4923,12 +5717,12 @@ mod unavailable_route_tests {
         ] {
             insert_environment_domain(&test_db, environment.id, domain).await?;
         }
-        // Operator routes that resolve two of those hosts to a live upstream:
-        // one exact, one through a wildcard.
+        // Operator routes aimed at two of those hosts: one exact, one through
+        // a wildcard.
         for domain in ["shared.example.com", "*.wild.example.com"] {
             custom_routes::ActiveModel {
                 domain: Set(domain.to_string()),
-                host: Set("localhost".to_string()),
+                host: Set("8.8.8.8".to_string()),
                 port: Set(8080),
                 enabled: Set(true),
                 ..Default::default()
@@ -4940,16 +5734,35 @@ mod unavailable_route_tests {
         let route_table = CachedPeerTable::new(test_db.db.clone());
         route_table.load_routes().await?;
 
-        for host in ["shared.example.com", "app.wild.example.com"] {
-            assert!(
-                route_table.get_route_by_host(host).is_some(),
-                "{host} has a live route"
-            );
-            assert!(
-                route_table.get_unavailable_route(host).is_none(),
-                "{host} has a live route and must not be reported unavailable"
-            );
-        }
+        // A wildcard route is the operator's catch-all and is what serves a host
+        // the platform has no live route for.
+        assert!(
+            route_table
+                .get_route_by_host("app.wild.example.com")
+                .is_some(),
+            "a live wildcard route serves the host"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("app.wild.example.com")
+                .is_none(),
+            "a live route must not be reported unavailable"
+        );
+        // An exact custom route never takes an environment's own hostname, even
+        // while that environment has nothing running: the platform keeps the
+        // name and answers it as unavailable.
+        assert!(
+            route_table
+                .get_route_by_host("shared.example.com")
+                .is_none(),
+            "an exact custom route must not displace an environment address"
+        );
+        assert!(
+            route_table
+                .get_unavailable_route("shared.example.com")
+                .is_some(),
+            "the environment address stays reported as unavailable"
+        );
         assert_unavailable(
             &route_table,
             "only-down.example.com",
@@ -4974,7 +5787,7 @@ mod unavailable_route_tests {
         use sea_orm::{ActiveModelBehavior, EntityTrait};
         use temps_entities::settings;
 
-        let app_settings = temps_core::AppSettings {
+        let app_settings = temps_config::AppSettings {
             external_url: Some("https://console.example.com".to_string()),
             preview_domain: preview_domain.to_string(),
             ..Default::default()
@@ -5214,16 +6027,14 @@ mod route_generation_tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicU64;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Isolated database, or `None` when Docker is unavailable.
     async fn database_or_skip() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping route generation test: Docker runtime unavailable: {error}");
                 None

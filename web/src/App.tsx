@@ -119,6 +119,9 @@ const Revenue = lazy(() =>
 const StatusPages = lazy(() =>
   import('./pages/StatusPages').then((m) => ({ default: m.StatusPages }))
 )
+const NewStatusPagePage = lazy(() =>
+  import('./pages/StatusPages').then((m) => ({ default: m.NewStatusPagePage }))
+)
 const StatusPageDetailPage = lazy(() =>
   import('./pages/StatusPages').then((m) => ({
     default: m.StatusPageDetailPage,
@@ -127,6 +130,19 @@ const StatusPageDetailPage = lazy(() =>
 const Sandboxes = lazy(() => import('./pages/Sandboxes'))
 const WorkspaceDetail = lazy(() => import('./pages/WorkspaceDetail'))
 const SandboxDetail = lazy(() => import('./pages/SandboxDetail'))
+const AccessSessionCreatePage = lazy(
+  () => import('./pages/AccessSessionCreatePage')
+)
+const AccessSessionDetailPage = lazy(
+  () => import('./pages/AccessSessionDetailPage')
+)
+const AccessBundleDetailPage = lazy(
+  () => import('./pages/AccessBundleDetailPage')
+)
+const AccessBundlePage = lazy(() => import('./pages/AccessBundlePage'))
+const VaultDetailPage = lazy(() => import('./pages/VaultDetailPage'))
+const VaultPage = lazy(() => import('./pages/VaultPage'))
+const AccessServicePage = lazy(() => import('./pages/AccessServicePage'))
 const Storage = lazy(() =>
   import('./pages/Storage').then((m) => ({ default: m.Storage }))
 )
@@ -240,6 +256,36 @@ const TunnelDomainDetail = lazy(() =>
 )
 const Certificates = lazy(() =>
   import('./pages/Certificates').then((m) => ({ default: m.Certificates }))
+)
+const ProjectWorkflowKeys = lazy(() =>
+  import('./pages/workflows/ProjectWorkflowKeys').then((m) => ({
+    default: m.ProjectWorkflowKeys,
+  }))
+)
+const WorkflowSettings = lazy(() =>
+  import('./pages/workflows/WorkflowSettings').then((m) => ({
+    default: m.WorkflowSettings,
+  }))
+)
+const WorkflowGrants = lazy(() =>
+  import('./pages/workflows/WorkflowGrants').then((m) => ({
+    default: m.WorkflowGrants,
+  }))
+)
+const AllWorkflows = lazy(() =>
+  import('./pages/workflows/AllWorkflows').then((m) => ({
+    default: m.AllWorkflows,
+  }))
+)
+const WorkflowDetail = lazy(() =>
+  import('./pages/workflows/WorkflowDetail').then((m) => ({
+    default: m.WorkflowDetail,
+  }))
+)
+const WorkflowRunDetail = lazy(() =>
+  import('./pages/workflows/WorkflowRunDetail').then((m) => ({
+    default: m.WorkflowRunDetail,
+  }))
 )
 const Backups = lazy(() =>
   import('./pages/Backups').then((m) => ({ default: m.Backups }))
@@ -393,6 +439,11 @@ const RequestTimeoutsPage = lazy(() =>
     default: m.RequestTimeoutsPage,
   }))
 )
+const ServiceHealthchecksPage = lazy(() =>
+  import('./pages/settings/ServiceHealthchecksPage').then((m) => ({
+    default: m.ServiceHealthchecksPage,
+  }))
+)
 const OnDemandTlsPage = lazy(() =>
   import('./pages/settings/OnDemandTlsPage').then((m) => ({
     default: m.OnDemandTlsPage,
@@ -453,6 +504,11 @@ const TelemetrySettingsPage = lazy(() =>
     default: m.TelemetrySettingsPage,
   }))
 )
+const DnsPage = lazy(() =>
+  import('./pages/settings/DnsPage').then((m) => ({
+    default: m.DnsPage,
+  }))
+)
 const NetworkPolicyPage = lazy(() =>
   import('./pages/settings/NetworkPolicyPage').then((m) => ({
     default: m.NetworkPolicyPage,
@@ -488,70 +544,25 @@ const AiGatewayActivityPage = lazy(() =>
     default: m.AiGatewayActivityPage,
   }))
 )
-const AiGatewaySetupPage = lazy(() =>
-  import('./pages/AiGatewaySetupPage').then((m) => ({
-    default: m.AiGatewaySetupPage,
-  }))
-)
 
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
     default: m.AiChat,
   }))
 )
-const AiWorkflowsOverview = lazy(() =>
-  import('./pages/AiWorkflowsOverview').then((m) => ({
-    default: m.AiWorkflowsOverview,
+const SandboxSettingsPage = lazy(() =>
+  import('./pages/sandbox-settings/SandboxSettingsPage').then((m) => ({
+    default: m.SandboxSettingsPage,
   }))
 )
-const AgentSandboxLayout = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxLayout').then((m) => ({
-    default: m.AgentSandboxLayout,
-  }))
-)
-const AgentSandboxDashboard = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxDashboard').then((m) => ({
-    default: m.AgentSandboxDashboard,
-  }))
-)
-const AgentSandboxProvidersList = lazy(() =>
+const AutofixCredentialsList = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProvidersList').then((m) => ({
     default: m.AgentSandboxProvidersList,
   }))
 )
-const AgentSandboxProviderDetail = lazy(() =>
+const AutofixCredentialDetail = lazy(() =>
   import('./pages/agent-sandbox/AgentSandboxProviderDetail').then((m) => ({
     default: m.AgentSandboxProviderDetail,
-  }))
-)
-const AgentSandboxSandboxPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSandboxPage').then((m) => ({
-    default: m.AgentSandboxSandboxPage,
-  }))
-)
-const AgentSandboxPreviewPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxPreviewPage').then((m) => ({
-    default: m.AgentSandboxPreviewPage,
-  }))
-)
-const AgentSandboxSecretsPage = lazy(() =>
-  import('./pages/agent-sandbox/AgentSandboxSecretsPage').then((m) => ({
-    default: m.AgentSandboxSecretsPage,
-  }))
-)
-const GlobalSkillsSettingsPage = lazy(() =>
-  import('./components/settings/GlobalSkillsSettings').then((m) => ({
-    default: m.GlobalSkillsSettings,
-  }))
-)
-const GlobalMcpServersSettingsPage = lazy(() =>
-  import('./components/settings/GlobalMcpServersSettings').then((m) => ({
-    default: m.GlobalMcpServersSettings,
-  }))
-)
-const GlobalSkillDetailPage = lazy(() =>
-  import('./pages/settings/GlobalSkillDetail').then((m) => ({
-    default: m.GlobalSkillDetail,
   }))
 )
 const OtelPipelineStatusPage = lazy(() =>
@@ -562,11 +573,6 @@ const OtelPipelineStatusPage = lazy(() =>
 const TraefikDiscoveryPage = lazy(() =>
   import('./pages/settings/TraefikDiscoveryPage').then((m) => ({
     default: m.TraefikDiscoveryPage,
-  }))
-)
-const GlobalMcpServerDetailPage = lazy(() =>
-  import('./pages/settings/GlobalMcpServerDetail').then((m) => ({
-    default: m.GlobalMcpServerDetail,
   }))
 )
 
@@ -704,6 +710,7 @@ const FullAppRoutes = () => {
                     the screen. Anything sized to 100% of it — a plugin
                     iframe, say — lost its last rows off-screen. */}
                 <div
+                  data-console-scroll
                   className={
                     focusMode
                       ? 'flex-1 min-h-0 overflow-hidden flex flex-col'
@@ -761,19 +768,96 @@ const FullAppRoutes = () => {
                         <Route path="/revenue" element={<Revenue />} />
                         <Route path="/status-pages" element={<StatusPages />} />
                         <Route
+                          path="/status-pages/new"
+                          element={<NewStatusPagePage />}
+                        />
+                        <Route
                           path="/status-pages/:statusPageId"
                           element={<StatusPageDetailPage />}
+                        />
+                        <Route
+                          path="/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/new"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/projects/:projectId/access-services/:serviceId/edit"
+                          element={<AccessServicePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/new"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/edit"
+                          element={<AccessBundlePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId/sessions/new"
+                          element={<AccessSessionCreatePage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/sessions/:sessionId"
+                          element={<AccessSessionDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId/bundles/:bundleId"
+                          element={<AccessBundleDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route path="/vault" element={<VaultPage />} />
+                        <Route
+                          path="/vault/vaults/:vaultId"
+                          element={<VaultDetailPage />}
+                        />
+                        <Route
+                          path="/vault/projects/:projectId"
+                          element={<VaultPage />}
                         />
                         <Route path="/sandboxes" element={<Sandboxes />} />
                         <Route
                           path="/workspaces"
-                          element={
-                            <Sandboxes key="workspaces" workspacesOnly />
-                          }
+                          element={<RedirectWithQuery to="/sandboxes" />}
                         />
                         <Route
                           path="/workspaces/:workspaceId"
                           element={<WorkspaceDetail />}
+                        />
+                        {/* One route for every tab, so switching tabs keeps
+                            the page (and each tab's unsaved edits) mounted. */}
+                        <Route
+                          path="/sandboxes/settings/*"
+                          element={<SandboxSettingsPage />}
                         />
                         <Route
                           path="/sandboxes/:sandboxId"
@@ -939,6 +1023,10 @@ const FullAppRoutes = () => {
                             element={<RequestTimeoutsPage />}
                           />
                           <Route
+                            path="service-healthchecks"
+                            element={<ServiceHealthchecksPage />}
+                          />
+                          <Route
                             path="on-demand-tls"
                             element={<OnDemandTlsPage />}
                           />
@@ -977,6 +1065,7 @@ const FullAppRoutes = () => {
                             path="traefik-discovery"
                             element={<TraefikDiscoveryPage />}
                           />
+                          <Route path="dns" element={<DnsPage />} />
                           <Route
                             path="network-policy"
                             element={<NetworkPolicyPage />}
@@ -1078,9 +1167,13 @@ const FullAppRoutes = () => {
                           path="/ai-gateway/activity"
                           element={<AiGatewayActivityPage />}
                         />
+                        {/* Retired AI surfaces: harnesses, the harness
+                            workspace, workflows, skills, MCP servers and the
+                            gateway setup page. Old links land on the page that
+                            replaced them instead of a 404. */}
                         <Route
                           path="/ai-gateway/setup"
-                          element={<AiGatewaySetupPage />}
+                          element={<RedirectWithQuery to="/ai-gateway" />}
                         />
                         <Route path="/chat" element={<AiChat />} />
                         {/* The AI workspace page was retired; old links
@@ -1091,49 +1184,41 @@ const FullAppRoutes = () => {
                         />
                         <Route
                           path="/ai-workflows"
-                          element={<AiWorkflowsOverview />}
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        {/* Autofix's agent credentials. Not in navigation;
+                            autofix's setup steps link here. */}
+                        <Route
+                          path="/agent-sandbox/providers"
+                          element={<AutofixCredentialsList />}
                         />
                         <Route
-                          path="/agent-sandbox"
-                          element={<AgentSandboxLayout />}
-                        >
-                          <Route index element={<AgentSandboxDashboard />} />
-                          <Route
-                            path="providers"
-                            element={<AgentSandboxProvidersList />}
-                          />
-                          <Route
-                            path="providers/:id"
-                            element={<AgentSandboxProviderDetail />}
-                          />
-                          <Route
-                            path="sandbox"
-                            element={<AgentSandboxSandboxPage />}
-                          />
-                          <Route
-                            path="preview"
-                            element={<AgentSandboxPreviewPage />}
-                          />
-                          <Route
-                            path="secrets"
-                            element={<AgentSandboxSecretsPage />}
-                          />
-                        </Route>
-                        <Route
-                          path="/skills"
-                          element={<GlobalSkillsSettingsPage />}
+                          path="/agent-sandbox/providers/:id"
+                          element={<AutofixCredentialDetail />}
                         />
                         <Route
-                          path="/skills/:slug"
-                          element={<GlobalSkillDetailPage />}
+                          path="/agent-sandbox/sandbox"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings" />
+                          }
                         />
                         <Route
-                          path="/mcp-servers"
-                          element={<GlobalMcpServersSettingsPage />}
+                          path="/agent-sandbox/preview"
+                          element={
+                            <RedirectWithQuery to="/sandboxes/settings/preview" />
+                          }
                         />
                         <Route
-                          path="/mcp-servers/:slug"
-                          element={<GlobalMcpServerDetailPage />}
+                          path="/agent-sandbox/*"
+                          element={<RedirectWithQuery to="/ai-gateway" />}
+                        />
+                        <Route
+                          path="/skills/*"
+                          element={<RedirectWithQuery to="/chat" />}
+                        />
+                        <Route
+                          path="/mcp-servers/*"
+                          element={<RedirectWithQuery to="/chat" />}
                         />
                         <Route path="/git-providers" element={<GitSources />} />
                         <Route
@@ -1167,6 +1252,27 @@ const FullAppRoutes = () => {
                         <Route
                           path="/dns-providers/:id"
                           element={<DnsProviderDetail />}
+                        />
+                        <Route path="/workflows" element={<AllWorkflows />} />
+                        <Route
+                          path="/workflows/:projectId/:environmentId"
+                          element={<WorkflowDetail />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/keys"
+                          element={<ProjectWorkflowKeys />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/settings"
+                          element={<WorkflowSettings />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/grants"
+                          element={<WorkflowGrants />}
+                        />
+                        <Route
+                          path="/workflows/:projectId/:environmentId/runs/:runId"
+                          element={<WorkflowRunDetail />}
                         />
                         <Route path="/backups" element={<Backups />} />
                         <Route
@@ -1216,7 +1322,7 @@ const FullAppRoutes = () => {
                         />
                         <Route
                           path="/settings/agent-sandbox/*"
-                          element={<RedirectWithQuery to="/agent-sandbox" />}
+                          element={<RedirectWithQuery to="/ai-gateway" />}
                         />
                         <Route
                           path="/settings/skills/*"
@@ -1409,7 +1515,9 @@ const queryClient = new QueryClient({
       // `meta` and `mutationKey` arrive in the fourth argument; the third is
       // the `onMutate` result, which is `undefined` for these mutations.
       onError: (error: unknown, _variables, _onMutateResult, context) => {
-        const problemDetails = error as ProblemDetails
+        const problemDetails = error as ProblemDetails & {
+          extensions?: Record<string, unknown>
+        }
 
         // Sensitive mutations own this response: they open a step-up dialog
         // and retry after verification. A global error toast would be both

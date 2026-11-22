@@ -143,6 +143,7 @@ pub(crate) mod test_support {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            analytics_identity_mode: Default::default(),
             cloud_telemetry_attribute_allowlist: Vec::new(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,

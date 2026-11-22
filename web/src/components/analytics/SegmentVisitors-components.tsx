@@ -21,7 +21,6 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { useQuery } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
 import {
   ArrowLeft,
@@ -38,6 +37,7 @@ import {
   segmentParamFor,
   type SegmentVisitorsProps,
 } from './SegmentVisitors-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 const PAGE_SIZE = 25
 
@@ -84,6 +84,7 @@ export function SegmentVisitors({
   value,
   startDate,
   endDate,
+  rangeScope,
   environment,
   onBack,
 }: SegmentVisitorsProps) {
@@ -92,7 +93,7 @@ export function SegmentVisitors({
 
   const filterParam = segmentParamFor(dimension)
 
-  const pageScope = `${dimension}\u0000${value}\u0000${startDate}\u0000${endDate}\u0000${environment ?? ''}`
+  const pageScope = `${dimension}\u0000${value}\u0000${rangeScope}\u0000${environment ?? ''}`
   const [previousPageScope, setPreviousPageScope] = React.useState(pageScope)
   if (pageScope !== previousPageScope) {
     setPreviousPageScope(pageScope)
@@ -105,7 +106,7 @@ export function SegmentVisitors({
     segmentQuery[filterParam] = value
   }
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error, isPlaceholderData } = useWindowQuery({
     ...getVisitorsOptions({
       query: {
         project_id: project.id,
@@ -125,6 +126,9 @@ export function SegmentVisitors({
   const visitors = data?.visitors ?? []
   const totalCount = data?.filtered_count ?? data?.total_count ?? 0
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
+  // Refresh keeps the page; if the moved window has fewer visitors, go to its
+  // last page rather than an empty one with no way back.
+  if (data && !isPlaceholderData && page > totalPages) setPage(totalPages)
 
   if (!filterParam) {
     return (

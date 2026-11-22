@@ -32,9 +32,9 @@ type WorkspaceFileWrite = (std::path::PathBuf, Vec<u8>, Option<u32>);
 
 pub(super) async fn workspace_file_limits(
     state: &AppState,
-) -> Result<temps_core::AiWorkspaceFileLimitsSettings, Problem> {
+) -> Result<temps_config::AiWorkspaceFileLimitsSettings, Problem> {
     let Some(config) = &state.config_service else {
-        return Ok(temps_core::AiWorkspaceFileLimitsSettings::default());
+        return Ok(temps_config::AiWorkspaceFileLimitsSettings::default());
     };
     config
         .get_settings()
@@ -48,8 +48,8 @@ pub(super) async fn workspace_file_limits(
 }
 
 pub(super) fn effective_workspace_file_limits(
-    mut limits: temps_core::AiWorkspaceFileLimitsSettings,
-) -> temps_core::AiWorkspaceFileLimitsSettings {
+    mut limits: temps_config::AiWorkspaceFileLimitsSettings,
+) -> temps_config::AiWorkspaceFileLimitsSettings {
     limits.max_files_per_upload = limits
         .max_files_per_upload
         .min(WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST as u32);
@@ -76,13 +76,13 @@ pub(super) fn require_workspace_file_policy_access(auth: &AuthContext) -> Result
     operation_id = "get_workspace_file_limits",
     summary = "Get effective AI workspace file limits",
     description = "Returns the non-sensitive effective transfer and preview policy for the current workspace user.",
-    responses((status = 200, body = temps_core::AiWorkspaceFileLimitsSettings), (status = 401), (status = 403), (status = 500)),
+    responses((status = 200, body = temps_config::AiWorkspaceFileLimitsSettings), (status = 401), (status = 403), (status = 500)),
     security(("bearer_auth" = []))
 )]
 pub async fn get_workspace_file_limits(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AppState>>,
-) -> Result<Json<temps_core::AiWorkspaceFileLimitsSettings>, Problem> {
+) -> Result<Json<temps_config::AiWorkspaceFileLimitsSettings>, Problem> {
     require_workspace_file_policy_access(&auth)?;
     Ok(Json(workspace_file_limits(&state).await?))
 }
@@ -115,7 +115,7 @@ pub(super) fn validate_workspace_import_path(path: &str) -> Result<(), Problem> 
 
 pub(super) fn decode_workspace_file_writes(
     request: WriteApplicationWorkspaceFilesRequest,
-    limits: &temps_core::AiWorkspaceFileLimitsSettings,
+    limits: &temps_config::AiWorkspaceFileLimitsSettings,
 ) -> Result<Vec<WorkspaceFileWrite>, Problem> {
     let max_files = usize::try_from(limits.max_files_per_upload)
         .unwrap_or(WORKSPACE_IMPORT_ABSOLUTE_MAX_FILES_PER_REQUEST)

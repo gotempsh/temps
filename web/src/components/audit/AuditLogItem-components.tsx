@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { vaultAuditLabel } from '@/lib/vault-audit'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { AuditLogUserInfo } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
@@ -186,6 +187,22 @@ function describeGroupEvent(
   }
 }
 
+const PREVIEW_RETIRED_BECAUSE: Record<string, string> = {
+  branch_deleted: 'its branch was deleted',
+  pull_request_closed: 'its pull request was closed',
+  pull_request_merged: 'its pull request was merged',
+}
+
+function describePreviewRetired(data?: Record<string, unknown>): string {
+  const branch = get<string>(data, 'branch')
+  const kind = get<{ kind?: string }>(data, 'reason')?.kind
+  const subject = branch ? `the preview of branch "${branch}"` : 'a preview'
+  const because = kind ? PREVIEW_RETIRED_BECAUSE[kind] : undefined
+  return because
+    ? `Retired ${subject} because ${because}`
+    : `Retired ${subject}`
+}
+
 function describe(
   op: string,
   data?: Record<string, unknown>,
@@ -225,6 +242,8 @@ function describe(
     : undefined
   const failureReason = get<string>(data, 'reason')
 
+  const vaultLabel = vaultAuditLabel(op)
+  if (vaultLabel) return vaultLabel
   switch (op) {
     case 'EXTERNAL_PLUGIN_HOST_OPERATION_ALLOWED':
     case 'EXTERNAL_PLUGIN_HOST_OPERATION_DENIED':
@@ -408,6 +427,8 @@ function describe(
       )
     case 'ENVIRONMENT_DELETED':
       return 'Deleted an environment'
+    case 'PREVIEW_ENVIRONMENT_RETIRED':
+      return describePreviewRetired(data)
     case 'ENVIRONMENT_SLEEP_STATE_CHANGED':
       return `Changed environment sleep state${status ? ` to ${status}` : ''}`
 
@@ -736,7 +757,10 @@ export function AuditLogItemRow({
           <TableCell colSpan={6} className="py-3">
             <div className="space-y-1.5 text-sm">
               {Object.entries(data).map(([key, value]) => (
-                <div key={key} className="flex flex-col gap-1 sm:flex-row sm:gap-3">
+                <div
+                  key={key}
+                  className="flex flex-col gap-1 sm:flex-row sm:gap-3"
+                >
                   <span className="font-medium text-muted-foreground sm:w-[160px] sm:shrink-0">
                     {key}
                   </span>

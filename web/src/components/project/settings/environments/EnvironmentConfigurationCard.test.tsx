@@ -3,7 +3,13 @@
 
 import { afterEach, expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+} from '@testing-library/react'
 import { MemoryRouter } from 'react-router'
 import type { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { installBrowserWindow } from '@/test/dom'
@@ -65,4 +71,494 @@ test('nothing is shown when placement has no problem', async () => {
   const { view, nodesCalled } = renderCard(null, [])
   await waitFor(() => expect(nodesCalled.count).toBeGreaterThan(0))
   expect(view.queryByText(/Replicas can.t spread/)).toBeNull()
+})
+
+test('submitting without blur saves the edited preferred node order', async () => {
+  let submitted:
+    { load_balancing?: { preferredNodeIds?: number[] } } | undefined
+  const environment = {
+    id: 1,
+    name: 'production',
+    slug: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: { strategy: 'preferred_nodes', preferredNodeIds: [0] },
+    },
+  } as EnvironmentResponse
+  const api = mockApi({
+    'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+    'PUT /projects/1/environments/1/settings': async (request) => {
+      submitted = await request.json()
+      return jsonResponse(environment)
+    },
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false }, mutations: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={
+            { id: 1, slug: 'example', source_type: 'manual' } as ProjectResponse
+          }
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const input = view.getByLabelText('Preferred node IDs, in priority order')
+  fireEvent.change(input, { target: { value: '3, 5, 0' } })
+  // Enter submits the form without blurring the focused input.
+  fireEvent.submit(input.closest('form')!)
+  await waitFor(() =>
+    expect(submitted?.load_balancing?.preferredNodeIds).toEqual([3, 5, 0])
+  )
+  api.restore()
+})
+
+test('clearing a health number then disabling probes keeps the error reachable', async () => {
+  const submissions: Array<{
+    load_balancing: {
+      healthCheck: { enabled: boolean; intervalSeconds: number }
+    }
+  }> = []
+  const environment = {
+    id: 1,
+    name: 'production',
+    slug: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: {
+        strategy: 'round_robin',
+        healthCheck: {
+          enabled: true,
+          intervalSeconds: 2,
+          timeoutSeconds: 2,
+          unhealthyThreshold: 3,
+          healthyThreshold: 2,
+        },
+      },
+    },
+  } as EnvironmentResponse
+  mockApi({
+    'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+    'PUT /projects/1/environments/1/settings': async (request) => {
+      submissions.push(await request.json())
+      return jsonResponse(environment)
+    },
+  })
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: {
+            queries: { retry: false },
+            mutations: { retry: false },
+          },
+        })
+      }
+    >
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={
+            { id: 1, slug: 'app', source_type: 'manual' } as ProjectResponse
+          }
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  fireEvent.change(view.getByLabelText('Interval (seconds)'), {
+    target: { value: '' },
+  })
+  fireEvent.click(view.getByLabelText('Active health checks'))
+  fireEvent.submit(
+    view.getByRole('button', { name: 'Save changes' }).closest('form')!
+  )
+  await waitFor(() =>
+    expect(view.getByText('Enter a whole number from 1 to 3600')).toBeTruthy()
+  )
+  expect(submissions).toHaveLength(0)
+  const interval = view.getByLabelText('Interval (seconds)')
+  expect(interval.getAttribute('aria-invalid')).toBe('true')
+  fireEvent.change(interval, { target: { value: '5' } })
+  fireEvent.submit(interval.closest('form')!)
+  await waitFor(() => expect(submissions).toHaveLength(1))
+  expect(submissions[0].load_balancing.healthCheck).toMatchObject({
+    enabled: false,
+    intervalSeconds: 5,
+  })
+})
+
+test('routing drafts survive refetch and reset for another environment', async () => {
+  mockApi({ 'GET /internal/nodes': () => jsonResponse({ nodes: [] }) })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const initial = {
+    id: 1,
+    name: 'production',
+    slug: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: {
+        strategy: 'preferred_nodes',
+        preferredNodeIds: [0],
+        healthCheck: { enabled: true, intervalSeconds: 2 },
+      },
+    },
+  } as EnvironmentResponse
+  const card = (environment: EnvironmentResponse) => (
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const view = render(card(initial))
+  fireEvent.change(
+    view.getByLabelText('Preferred node IDs, in priority order'),
+    { target: { value: '7, 0' } }
+  )
+  fireEvent.change(view.getByLabelText('Interval (seconds)'), {
+    target: { value: '9' },
+  })
+  fireEvent.click(view.getByLabelText('Active health checks'))
+  await act(async () => {
+    view.rerender(
+      card({
+        ...initial,
+        deployment_config: {
+          loadBalancing: {
+            ...initial.deployment_config!.loadBalancing!,
+            preferredNodeIds: [3],
+            healthCheck: { enabled: true, intervalSeconds: 4 },
+          },
+        },
+      })
+    )
+  })
+  expect(
+    (
+      view.getByLabelText(
+        'Preferred node IDs, in priority order'
+      ) as HTMLInputElement
+    ).value
+  ).toBe('7, 0')
+  expect(
+    view.getByLabelText('Active health checks').getAttribute('aria-checked')
+  ).toBe('false')
+  fireEvent.click(view.getByLabelText('Active health checks'))
+  expect(
+    (view.getByLabelText('Interval (seconds)') as HTMLInputElement).value
+  ).toBe('9')
+  await act(async () => {
+    view.rerender(card({ ...initial, id: 2 }))
+  })
+  await waitFor(() =>
+    expect(
+      (
+        view.getByLabelText(
+          'Preferred node IDs, in priority order'
+        ) as HTMLInputElement
+      ).value
+    ).toBe('0')
+  )
+  expect(
+    (view.getByLabelText('Interval (seconds)') as HTMLInputElement).value
+  ).toBe('2')
+})
+
+for (const strategy of ['round_robin', 'preferred_nodes'] as const) {
+  for (const limit of [null, 12]) {
+    test(`${strategy} shows an overflow limit only when applicable (${limit})`, () => {
+      mockApi({ 'GET /internal/nodes': () => jsonResponse({ nodes: [] }) })
+      const view = render(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <EnvironmentConfigurationCard
+              project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+              environment={
+                {
+                  id: 1,
+                  name: 'production',
+                  deployment_config: {
+                    loadBalancing: { strategy, maxInFlightPerReplica: limit },
+                  },
+                } as EnvironmentResponse
+              }
+              onUpdate={() => {}}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+      const input = view.queryByLabelText(
+        'In-flight requests per replica before overflow'
+      )
+      expect(input !== null).toBe(strategy === 'preferred_nodes')
+    })
+  }
+}
+
+test('round robin rejects an invalid limit and keeps it editable', async () => {
+  let submissions = 0
+  const environment = {
+    id: 1,
+    name: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: { strategy: 'round_robin', maxInFlightPerReplica: 0 },
+    },
+  } as EnvironmentResponse
+  mockApi({
+    'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+    'PUT /projects/1/environments/1/settings': () => {
+      submissions++
+      return jsonResponse(environment)
+    },
+  })
+  const view = render(
+    <QueryClientProvider client={new QueryClient()}>
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  const limit = view.getByLabelText(
+    'In-flight requests per replica before overflow'
+  )
+  const form = limit.closest('form')!
+  fireEvent.submit(form)
+  await waitFor(() => expect(limit.getAttribute('aria-invalid')).toBe('true'))
+  expect(submissions).toBe(0)
+  fireEvent.change(limit, { target: { value: '' } })
+  fireEvent.submit(form)
+  await waitFor(() => expect(submissions).toBe(1))
+})
+
+for (const editDuringSave of [false, true]) {
+  test(`saved routing refetch preserves only later edits (${editDuringSave})`, async () => {
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let started = false
+    let saved = false
+    const initial = {
+      id: 1,
+      name: 'production',
+      branch: 'main',
+      deployment_config: {
+        loadBalancing: { strategy: 'preferred_nodes', preferredNodeIds: [0] },
+      },
+    } as EnvironmentResponse
+    mockApi({
+      'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+      'PUT /projects/1/environments/1/settings': async () => {
+        started = true
+        await pending
+        return jsonResponse(initial)
+      },
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const card = (environment: EnvironmentResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <EnvironmentConfigurationCard
+            project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+            environment={environment}
+            onUpdate={() => {
+              saved = true
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const view = render(card(initial))
+    const input = view.getByLabelText(
+      'Preferred node IDs, in priority order'
+    ) as HTMLInputElement
+    fireEvent.change(input, { target: { value: '7, 0' } })
+    fireEvent.submit(input.closest('form')!)
+    await waitFor(() => expect(started).toBe(true))
+    if (editDuringSave) fireEvent.change(input, { target: { value: '8, 0' } })
+    finish()
+    await waitFor(() => expect(saved).toBe(true))
+    await act(async () => {
+      view.rerender(
+        card({
+          ...initial,
+          deployment_config: {
+            loadBalancing: {
+              strategy: 'preferred_nodes',
+              preferredNodeIds: [9, 0],
+            },
+          },
+        })
+      )
+    })
+    await waitFor(() =>
+      expect(input.value).toBe(editDuringSave ? '8, 0' : '9, 0')
+    )
+  })
+}
+
+for (const editDuringSave of [false, true]) {
+  test(`numeric drafts use the saved baseline without losing pending edits (${editDuringSave})`, async () => {
+    let finish!: () => void
+    const pending = new Promise<void>((resolve) => {
+      finish = resolve
+    })
+    let started = false
+    let saved = false
+    const initial = {
+      id: 1,
+      name: 'production',
+      branch: 'main',
+      deployment_config: {
+        loadBalancing: {
+          strategy: 'round_robin',
+          healthCheck: { enabled: true, intervalSeconds: 2 },
+        },
+      },
+    } as EnvironmentResponse
+    mockApi({
+      'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+      'PUT /projects/1/environments/1/settings': async () => {
+        started = true
+        await pending
+        return jsonResponse(initial)
+      },
+    })
+    const client = new QueryClient()
+    const card = (environment: EnvironmentResponse) => (
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <EnvironmentConfigurationCard
+            project={{ id: 1, source_type: 'manual' } as ProjectResponse}
+            environment={environment}
+            onUpdate={() => {
+              saved = true
+            }}
+          />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    const view = render(card(initial))
+    const input = view.getByLabelText('Interval (seconds)') as HTMLInputElement
+    fireEvent.change(input, { target: { value: '5' } })
+    fireEvent.submit(input.closest('form')!)
+    await waitFor(() => expect(started).toBe(true))
+    if (editDuringSave) fireEvent.change(input, { target: { value: '2' } })
+    finish()
+    await waitFor(() => expect(saved).toBe(true))
+    for (const intervalSeconds of [5, 6]) {
+      await act(async () => {
+        view.rerender(
+          card({
+            ...initial,
+            deployment_config: {
+              loadBalancing: {
+                strategy: 'round_robin',
+                healthCheck: { enabled: true, intervalSeconds },
+              },
+            },
+          })
+        )
+      })
+      expect(input.value).toBe(editDuringSave ? '2' : String(intervalSeconds))
+    }
+  })
+}
+
+test('invalid probe path stays reachable after disabling health checks', async () => {
+  const submissions: Array<{
+    load_balancing: {
+      healthCheck: { enabled: boolean; path: string | null }
+    }
+  }> = []
+  const environment = {
+    id: 1,
+    name: 'production',
+    slug: 'production',
+    branch: 'main',
+    deployment_config: {
+      loadBalancing: {
+        strategy: 'round_robin',
+        healthCheck: {
+          enabled: true,
+          intervalSeconds: 2,
+          timeoutSeconds: 2,
+          unhealthyThreshold: 3,
+          healthyThreshold: 2,
+        },
+      },
+    },
+  } as EnvironmentResponse
+  mockApi({
+    'GET /internal/nodes': () => jsonResponse({ nodes: [] }),
+    'PUT /projects/1/environments/1/settings': async (request) => {
+      submissions.push(await request.json())
+      return jsonResponse(environment)
+    },
+  })
+  const view = render(
+    <QueryClientProvider
+      client={
+        new QueryClient({
+          defaultOptions: {
+            queries: { retry: false },
+            mutations: { retry: false },
+          },
+        })
+      }
+    >
+      <MemoryRouter>
+        <EnvironmentConfigurationCard
+          project={
+            { id: 1, slug: 'app', source_type: 'manual' } as ProjectResponse
+          }
+          environment={environment}
+          onUpdate={() => {}}
+        />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  fireEvent.change(view.getByLabelText('Probe path'), {
+    target: { value: 'ready' },
+  })
+  fireEvent.click(view.getByLabelText('Active health checks'))
+  fireEvent.submit(
+    view.getByRole('button', { name: 'Save changes' }).closest('form')!
+  )
+  await waitFor(() =>
+    expect(
+      view.getByText(
+        'Use a path starting with /, without fragments or backslashes (maximum 2048 bytes)'
+      )
+    ).toBeTruthy()
+  )
+  expect(submissions).toHaveLength(0)
+  const interval = view.getByLabelText('Probe path')
+  expect(interval.getAttribute('aria-invalid')).toBe('true')
+  fireEvent.change(interval, { target: { value: '/ready?full=true' } })
+  fireEvent.submit(interval.closest('form')!)
+  await waitFor(() => expect(submissions).toHaveLength(1))
+  expect(submissions[0].load_balancing.healthCheck).toMatchObject({
+    enabled: false,
+    path: '/ready?full=true',
+  })
 })

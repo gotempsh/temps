@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use async_trait::async_trait;
 use bollard::models::{ContainerConfig, ContainerCreateBody, HostConfig};
 use bollard::query_parameters::{
-    CommitContainerOptionsBuilder, CreateContainerOptionsBuilder, CreateImageOptionsBuilder,
-    LogsOptions, RemoveContainerOptions, UploadToContainerOptionsBuilder, WaitContainerOptions,
+    CommitContainerOptionsBuilder, CreateContainerOptionsBuilder, LogsOptions,
+    RemoveContainerOptions, UploadToContainerOptionsBuilder, WaitContainerOptions,
 };
 use bollard::Docker;
 use futures::StreamExt;
@@ -285,13 +285,12 @@ impl DockerVmNft {
             reason,
         };
         if self.docker.inspect_image(&self.base_image).await.is_err() {
-            let options = CreateImageOptionsBuilder::new()
-                .from_image(&self.base_image)
-                .build();
-            let mut pull = self.docker.create_image(Some(options), None, None);
-            while let Some(progress) = pull.next().await {
-                progress.map_err(|e| image_error(format!("pulling {}: {e}", self.base_image)))?;
-            }
+            temps_docker_util::pull_image(
+                &self.docker,
+                temps_docker_util::PullSpec::new(&self.base_image),
+            )
+            .await
+            .map_err(|e| image_error(format!("pulling {}: {}", self.base_image, e.cause_text())))?;
         }
         info!(image = %self.image, "building the nft helper image in the Docker VM");
         let name = helper_name("build");

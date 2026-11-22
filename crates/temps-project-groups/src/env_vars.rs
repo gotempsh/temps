@@ -460,7 +460,7 @@ mod tests {
     // Database-backed: skips when no container runtime is available.
     use crate::service::{CreateProjectGroupRequest, ProjectGroupService};
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     async fn insert_project_with_env(
         conn: &impl ConnectionTrait,

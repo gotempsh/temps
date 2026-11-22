@@ -10,6 +10,7 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -25,8 +26,9 @@ import {
   OBSERVABILITY_PAGE_SIZE,
   observationError,
 } from '@/lib/global-observability'
-import { Inbox, RefreshCw, Search, X } from 'lucide-react'
+import { Inbox, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
+import type { QueryKey } from '@tanstack/react-query'
 import { useUrlBoundText } from '@temps-sdk/ds'
 
 export function FilterSelect({
@@ -85,8 +87,7 @@ export function GlobalPage({
   title,
   description,
   view,
-  fetching,
-  refresh,
+  refreshQueryKeys,
   searchLabel,
   filters,
   filterNotice,
@@ -96,8 +97,8 @@ export function GlobalPage({
   title: string
   description: string
   view: GlobalView
-  fetching: boolean
-  refresh: () => void
+  /** The queries this page shows, refetched by its Refresh. */
+  refreshQueryKeys: readonly QueryKey[]
   searchLabel: string
   filters?: ReactNode
   /** Explains a filter's effect (cost, completeness) under the filter row. */
@@ -120,19 +121,10 @@ export function GlobalPage({
         title={title}
         description={description}
         actions={
-          <Button
-            variant="outline"
-            disabled={fetching}
-            onClick={() => {
-              if (view.range !== 'custom') view.setRange(view.range)
-              else refresh()
-            }}
-          >
-            <RefreshCw
-              className={fetching ? 'size-4 animate-spin' : 'size-4'}
-            />
-            Refresh
-          </Button>
+          <RefreshButton
+            queryKeys={refreshQueryKeys}
+            onRefresh={view.advance}
+          />
         }
       />
       <div
@@ -189,6 +181,7 @@ export function QueryContent({
   empty,
   title,
   retry,
+  setup,
   children,
 }: {
   loading: boolean
@@ -196,6 +189,12 @@ export function QueryContent({
   empty: boolean
   title: string
   retry: () => void
+  /**
+   * How to start sending this data, shown instead of the generic empty state
+   * when the view is unfiltered. A filtered view keeps the "change the
+   * filters" message: there, data may exist outside the filter.
+   */
+  setup?: ReactNode
   children: ReactNode
 }) {
   if (loading)
@@ -222,6 +221,7 @@ export function QueryContent({
         </AlertDescription>
       </Alert>
     )
+  if (empty && setup) return <>{setup}</>
   if (empty)
     return (
       <div className="rounded-lg border bg-card text-card-foreground">
@@ -254,7 +254,7 @@ export function GlobalPagination({
       pageSize={OBSERVABILITY_PAGE_SIZE}
       total={total}
       totalPages={Math.max(1, Math.ceil(total / OBSERVABILITY_PAGE_SIZE))}
-      onPageChange={view.setPage}
+      onPageChange={(page) => view.setPage(page)}
     />
   )
 }

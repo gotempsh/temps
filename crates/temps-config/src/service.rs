@@ -44,12 +44,16 @@ pub async fn anonymous_telemetry_preference(
 /// from `AppSettings`' serde field name.
 const GEO_SETTINGS_KEY: &str = "geo";
 
+use crate::AgentSandboxSettings;
+use crate::AnalyticsRetentionSettings;
+use crate::AppSettings;
+use crate::BlobSettings;
+use crate::BuildLimitsSettings;
+use crate::GeoLicenseKeyIntent;
+use crate::KvSettings;
+use crate::PreviewGatewaySettings;
 use serde_derive::{Deserialize, Serialize};
-use temps_core::{
-    AgentSandboxSettings, AnalyticsRetentionSettings, AppSettings, BlobSettings,
-    BuildLimitsSettings, ClickHouseCompression, GeoLicenseKeyIntent, KvSettings,
-    ObservabilityRetentionSettings, PreviewGatewaySettings, PublicHostnameStrategy,
-};
+use temps_core::{ClickHouseCompression, ObservabilityRetentionSettings, PublicHostnameStrategy};
 
 /// Whether a settings write explicitly changes outbound private-network trust.
 pub enum TrustedPrivateNetworksIntent {
@@ -57,8 +61,16 @@ pub enum TrustedPrivateNetworksIntent {
     Replace(Vec<String>),
 }
 
+/// Whether a settings write explicitly changes inbound proxy trust.
+pub enum TrustedProxyRangesIntent {
+    Unchanged,
+    Replace(Vec<String>),
+}
+
 /// Values from the locked row and the committed update, for accurate auditing.
 pub struct SettingsUpdateResult {
+    pub previous_trusted_proxy_cidrs: Vec<String>,
+    pub trusted_proxy_cidrs: Vec<String>,
     pub previous_trusted_private_networks: Vec<String>,
     pub trusted_private_networks: Vec<String>,
 }
@@ -66,10 +78,7 @@ pub struct SettingsUpdateResult {
 /// Rebase credential-owned fields onto the row locked by the settings writer.
 /// A bulk settings payload (including one built from an older GET) is never
 /// allowed to create, restore, or verify a provider credential.
-pub(crate) fn preserve_provider_credential_proof(
-    incoming: &mut AppSettings,
-    current: &AppSettings,
-) {
+pub fn preserve_provider_credential_proof(incoming: &mut AppSettings, current: &AppSettings) {
     for (id, current_cfg) in &current.agent_sandbox.providers {
         match incoming.agent_sandbox.providers.get_mut(id) {
             Some(candidate) => {
@@ -518,10 +527,10 @@ impl ServerConfig {
         let auth_secret = installation_secrets.auth_secret;
         let encryption_key = installation_secrets.encryption_key;
 
-        // Get console address - use a random available port
+        // Get console address - hold a random available port until it is served
         let console_address = match console_address {
             Some(address) => address,
-            None => Self::get_random_console_address()?,
+            None => crate::loopback_reservation::reserve_loopback_address()?,
         };
 
         // Admin listener (opt-in). When unset, the existing single-listener
@@ -660,7 +669,8 @@ impl ServerConfig {
     /// only bound when `--console-ingress-address` names one.
     pub fn with_default_ingress_listener(mut self) -> std::io::Result<Self> {
         if self.public_surface_address().is_none() {
-            self.console_ingress_address = Some(Self::get_random_console_address()?);
+            self.console_ingress_address =
+                Some(crate::loopback_reservation::reserve_loopback_address()?);
         }
         Ok(self)
     }
@@ -679,18 +689,6 @@ impl ServerConfig {
         self.console_ingress_address
             .as_deref()
             .filter(|address| !address.is_empty())
-    }
-
-    /// Get a random available port for console address
-    fn get_random_console_address() -> std::io::Result<String> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").map_err(|e| {
-            std::io::Error::new(
-                e.kind(),
-                format!("Failed to reserve a random loopback port on 127.0.0.1: {e}"),
-            )
-        })?;
-        let port = listener.local_addr()?.port();
-        Ok(format!("127.0.0.1:{}", port))
     }
 
     // Helper methods
@@ -942,6 +940,7 @@ pub struct ConfigService {
     /// write-through by `update_settings`; otherwise refreshed after
     /// `SETTINGS_CACHE_TTL`.
     settings_cache: tokio::sync::RwLock<SettingsCacheState>,
+    expose_platform_identity: std::sync::atomic::AtomicBool,
     /// Background task that LISTENs on the Postgres `settings_change` channel and
     /// invalidates `settings_cache` the instant another process writes settings.
     /// The 5s `SETTINGS_CACHE_TTL` remains as a safety net for any missed NOTIFY.
@@ -956,6 +955,11 @@ pub struct ConfigService {
     /// reach subscribers. Subscribers are woken only when the value actually
     /// changes. See [`ConfigService::subscribe_build_limits`].
     build_limits: tokio::sync::watch::Sender<Option<BuildLimitsSettings>>,
+    /// The managed service healthcheck defaults of the newest settings
+    /// snapshot that reached the cache, fed like `build_limits`. See
+    /// [`ConfigService::subscribe_managed_service_healthchecks`].
+    managed_service_healthchecks:
+        tokio::sync::watch::Sender<Option<crate::ManagedServiceHealthcheckSettings>>,
     /// The ClickHouse wire-compression mode this process builds its clients
     /// with. Resolved once at startup from the stored
     /// `clickhouse.compression` setting (see
@@ -973,6 +977,16 @@ pub struct ConfigService {
 /// (TLS verification and the outbound SSRF trust list), so they never await
 /// a DB lookup. Always called under the settings-cache generation guard.
 fn publish_process_wide_settings(settings: &AppSettings) {
+    let proxy_ranges = match temps_core::trusted_proxies::TrustedProxyRanges::parse(
+        &settings.trusted_proxy_cidrs,
+    ) {
+        Ok(ranges) => ranges,
+        Err(error) => {
+            warn!(%error, "Invalid stored trusted proxy ranges; forwarded headers from those peers are ignored");
+            temps_core::trusted_proxies::TrustedProxyRanges::default()
+        }
+    };
+    temps_core::trusted_proxies::set_trusted_proxy_ranges(proxy_ranges);
     temps_core::tls::set_insecure_tls(settings.insecure_tls);
     // Auth cookies take `Secure` from this trusted value rather than from
     // client-supplied headers (see `temps_core::secure_cookie_for_request`).
@@ -1007,8 +1021,10 @@ impl ConfigService {
             config,
             db,
             settings_cache: tokio::sync::RwLock::new(SettingsCacheState::default()),
+            expose_platform_identity: std::sync::atomic::AtomicBool::new(false),
             listener_handle: std::sync::Mutex::new(None),
             build_limits: tokio::sync::watch::channel(None).0,
+            managed_service_healthchecks: tokio::sync::watch::channel(None).0,
             clickhouse_compression: ClickHouseCompression::default(),
         }
     }
@@ -1025,9 +1041,37 @@ impl ConfigService {
         self.build_limits.subscribe()
     }
 
-    /// Hand the build limits of a snapshot that is becoming the cached one to
-    /// subscribers. Called under the settings-cache generation guard, like
-    /// [`publish_process_wide_settings`], so a stale read cannot publish.
+    /// Follow the managed service healthcheck defaults
+    /// (`AppSettings.managed_service_healthchecks`).
+    ///
+    /// Like [`Self::subscribe_build_limits`]: the receiver holds the latest
+    /// value (`None` until settings have been read once) and is notified
+    /// only when the defaults change, whichever process saved them. The
+    /// providers plugin uses this to give containers this process creates
+    /// a default another process saved.
+    pub fn subscribe_managed_service_healthchecks(
+        &self,
+    ) -> tokio::sync::watch::Receiver<Option<crate::ManagedServiceHealthcheckSettings>> {
+        self.managed_service_healthchecks.subscribe()
+    }
+
+    /// Hand the settings that have subscribers, from a snapshot that is
+    /// becoming the cached one, to them. Called under the settings-cache
+    /// generation guard, like [`publish_process_wide_settings`], so a stale
+    /// read cannot publish.
+    fn publish_subscribed_settings(&self, settings: &AppSettings) {
+        self.publish_build_limits(settings);
+        let healthchecks = settings.managed_service_healthchecks;
+        self.managed_service_healthchecks
+            .send_if_modified(|current| {
+                if *current == Some(healthchecks) {
+                    return false;
+                }
+                *current = Some(healthchecks);
+                true
+            });
+    }
+
     fn publish_build_limits(&self, settings: &AppSettings) {
         let published = self.build_limits.send_if_modified(|current| {
             if current.as_ref() == Some(&settings.build_limits) {
@@ -1500,7 +1544,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         }
     }
 
-    /// Get the application settings
+    /// Lock-free view for console ingress error pages, updated with the settings cache.
+    pub fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Get the application settings.
     pub async fn get_settings(&self) -> Result<AppSettings, ConfigServiceError> {
         // Serve from the in-memory cache while it is fresh — this is what keeps
         // the proxy's per-request callers off the database (see field docs).
@@ -1652,9 +1702,13 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // guard as the settings snapshot. A DB read started before an
         // invalidation must not be able to restore stale TLS behavior after
         // the newer settings have become authoritative.
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
         if publish_limits {
-            self.publish_build_limits(&settings);
+            self.publish_subscribed_settings(&settings);
         }
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
@@ -1670,8 +1724,12 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return false;
         }
         cache.generation = cache.generation.wrapping_add(1);
+        self.expose_platform_identity.store(
+            settings.expose_platform_identity(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         publish_process_wide_settings(&settings);
-        self.publish_build_limits(&settings);
+        self.publish_subscribed_settings(&settings);
         cache.snapshot = Some((settings, std::time::Instant::now()));
         true
     }
@@ -1717,10 +1775,38 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// must never restore trust that an administrator has since revoked.
     pub async fn update_settings_with_intents(
         &self,
-        mut settings: AppSettings,
+        settings: AppSettings,
         geo_license_key_intent: GeoLicenseKeyIntent,
         trusted_private_networks_intent: TrustedPrivateNetworksIntent,
     ) -> Result<SettingsUpdateResult, ConfigServiceError> {
+        self.update_settings_with_proxy_intent(
+            settings,
+            geo_license_key_intent,
+            trusted_private_networks_intent,
+            TrustedProxyRangesIntent::Unchanged,
+        )
+        .await
+    }
+
+    /// Rebase omitted proxy trust on the locked settings row, so an unrelated
+    /// write cannot restore a range revoked by a concurrent administrator.
+    pub async fn update_settings_with_proxy_intent(
+        &self,
+        mut settings: AppSettings,
+        geo_license_key_intent: GeoLicenseKeyIntent,
+        trusted_private_networks_intent: TrustedPrivateNetworksIntent,
+        proxy_intent: TrustedProxyRangesIntent,
+    ) -> Result<SettingsUpdateResult, ConfigServiceError> {
+        let proxy_ranges = match proxy_intent {
+            TrustedProxyRangesIntent::Unchanged => None,
+            TrustedProxyRangesIntent::Replace(entries) => Some(
+                temps_core::trusted_proxies::TrustedProxyRanges::parse(&entries)
+                    .map_err(|error| ConfigServiceError::InvalidConfiguration {
+                        details: error.to_string(),
+                    })?
+                    .canonical_ranges(),
+            ),
+        };
         let now = Utc::now();
         let cache_generation = self.settings_cache.read().await.generation;
 
@@ -1781,7 +1867,11 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             }
             TrustedPrivateNetworksIntent::Replace(networks) => networks,
         };
+        settings.trusted_proxy_cidrs =
+            proxy_ranges.unwrap_or_else(|| locked_settings.trusted_proxy_cidrs.clone());
         let result = SettingsUpdateResult {
+            previous_trusted_proxy_cidrs: locked_settings.trusted_proxy_cidrs.clone(),
+            trusted_proxy_cidrs: settings.trusted_proxy_cidrs.clone(),
             previous_trusted_private_networks: locked_settings.trusted_private_networks.clone(),
             trusted_private_networks: settings.trusted_private_networks.clone(),
         };
@@ -1817,6 +1907,10 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         // from an older snapshot must not rename a running service's container.
         settings.kv = locked_settings.kv.clone();
         settings.blob = locked_settings.blob.clone();
+        // The managed-service healthcheck defaults are owned by
+        // `update_managed_service_healthcheck_settings`, whose handler
+        // validates and audits them.
+        settings.managed_service_healthchecks = locked_settings.managed_service_healthchecks;
         // Shield's platform settings are owned by `update_shield_settings`
         // (`PUT /settings/shield`), which audits each change.
         settings.shield = locked_settings.shield.clone();
@@ -2039,6 +2133,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             // Fail closed until the authoritative row has been reloaded. This
             // is important when the invalidated value had insecure TLS enabled
             // or trusted private networks the operator has since removed.
+            temps_core::trusted_proxies::set_trusted_proxy_ranges(Default::default());
             temps_core::tls::set_insecure_tls(false);
             temps_core::url_validation::set_trusted_private_networks(Vec::new());
         }
@@ -2052,6 +2147,16 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         debug!("Invalidated AppSettings cache (settings_change NOTIFY)");
     }
 
+    async fn refresh_settings_snapshot(&self) {
+        match tokio::time::timeout(SETTINGS_CACHE_TTL, self.get_settings()).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                warn!(%error, "Settings snapshot refresh failed; retaining the last known value")
+            }
+            Err(_) => warn!("Settings snapshot refresh timed out; retaining the last known value"),
+        }
+    }
+
     /// Spawn the background task that LISTENs on the Postgres `settings_change`
     /// channel and invalidates the in-memory settings cache the instant any
     /// process writes the settings row. This makes cross-process settings
@@ -2063,86 +2168,112 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// Startup failure to connect is non-fatal — the TTL still refreshes the
     /// cache, just with up to 5s of latency. Mirrors the listener structure in
     /// `temps-routes::project_change_listener`.
+    ///
+    /// The task holds the service weakly. [`Drop`] is what stops it, and a strong
+    /// reference would keep that from ever running, leaving the task and its
+    /// database connection alive after everything else let go of the service.
     pub fn start_settings_listener(self: &std::sync::Arc<Self>) {
-        let service = self.clone();
+        let service = std::sync::Arc::downgrade(self);
         let database_url = self.get_database_url();
 
         let handle = tokio::spawn(async move {
-            use sqlx::postgres::{PgListener, PgPool};
-
-            // Establish the initial connection + subscription. A failure here is
-            // non-fatal: the cache TTL still expires settings within 5s.
-            let pool = match PgPool::connect(&database_url).await {
-                Ok(pool) => pool,
-                Err(e) => {
-                    warn!(
-                        "settings_change listener: failed to connect to Postgres ({}); \
-                         falling back to {}s cache TTL only",
-                        e,
-                        SETTINGS_CACHE_TTL.as_secs()
-                    );
-                    return;
+            let refresh_service = service.clone();
+            let refresh = async move {
+                loop {
+                    let Some(service) = refresh_service.upgrade() else {
+                        return;
+                    };
+                    service.refresh_settings_snapshot().await;
+                    drop(service);
+                    tokio::time::sleep(SETTINGS_CACHE_TTL).await;
                 }
             };
+            let listen = async move {
+                use sqlx::postgres::{PgListener, PgPool};
 
-            let mut pg_listener = match PgListener::connect_with(&pool).await {
-                Ok(listener) => listener,
-                Err(e) => {
-                    warn!(
-                        "settings_change listener: failed to create PgListener ({}); \
-                         falling back to {}s cache TTL only",
-                        e,
-                        SETTINGS_CACHE_TTL.as_secs()
-                    );
-                    return;
-                }
-            };
-
-            if let Err(e) = pg_listener.listen("settings_change").await {
-                warn!(
-                    "settings_change listener: failed to subscribe ({}); \
-                     falling back to {}s cache TTL only",
-                    e,
-                    SETTINGS_CACHE_TTL.as_secs()
-                );
-                return;
-            }
-            info!("Started listening for settings_change events");
-
-            // Pure event-driven loop: invalidate on each NOTIFY. After a
-            // listener error we reconnect, re-subscribe, and invalidate once to
-            // catch any change missed during the gap.
-            loop {
-                match pg_listener.recv().await {
-                    Ok(_notification) => {
-                        service.invalidate_settings_cache().await;
-                    }
+                // Establish the initial connection + subscription. A failure here is
+                // non-fatal: the cache TTL still expires settings within 5s.
+                let pool = match PgPool::connect(&database_url).await {
+                    Ok(pool) => pool,
                     Err(e) => {
-                        warn!("Error receiving settings_change notification: {}", e);
+                        warn!(
+                            "settings_change listener: failed to connect to Postgres ({}); \
+                         falling back to {}s cache TTL only",
+                            e,
+                            SETTINGS_CACHE_TTL.as_secs()
+                        );
+                        return;
+                    }
+                };
 
-                        // Back off, then attempt to reconnect.
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                let mut pg_listener = match PgListener::connect_with(&pool).await {
+                    Ok(listener) => listener,
+                    Err(e) => {
+                        warn!(
+                            "settings_change listener: failed to create PgListener ({}); \
+                         falling back to {}s cache TTL only",
+                            e,
+                            SETTINGS_CACHE_TTL.as_secs()
+                        );
+                        return;
+                    }
+                };
 
-                        match PgListener::connect_with(&pool).await {
-                            Ok(mut new_listener) => {
-                                if let Err(e) = new_listener.listen("settings_change").await {
-                                    warn!("Failed to re-subscribe to settings_change: {}", e);
-                                } else {
-                                    pg_listener = new_listener;
-                                    info!("Reconnected to settings_change listener");
+                if let Err(e) = pg_listener.listen("settings_change").await {
+                    warn!(
+                        "settings_change listener: failed to subscribe ({}); \
+                     falling back to {}s cache TTL only",
+                        e,
+                        SETTINGS_CACHE_TTL.as_secs()
+                    );
+                    return;
+                }
+                info!("Started listening for settings_change events");
+
+                // Pure event-driven loop: invalidate on each NOTIFY. After a
+                // listener error we reconnect, re-subscribe, and invalidate once to
+                // catch any change missed during the gap.
+                loop {
+                    match pg_listener.recv().await {
+                        Ok(_notification) => {
+                            let Some(service) = service.upgrade() else {
+                                return;
+                            };
+                            service.invalidate_settings_cache().await;
+                        }
+                        Err(e) => {
+                            warn!("Error receiving settings_change notification: {}", e);
+
+                            // Back off, then attempt to reconnect.
+                            tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+                            match PgListener::connect_with(&pool).await {
+                                Ok(mut new_listener) => {
+                                    if let Err(e) = new_listener.listen("settings_change").await {
+                                        warn!("Failed to re-subscribe to settings_change: {}", e);
+                                    } else {
+                                        pg_listener = new_listener;
+                                        info!("Reconnected to settings_change listener");
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("Failed to reconnect settings_change listener: {}", e);
                                 }
                             }
-                            Err(e) => {
-                                warn!("Failed to reconnect settings_change listener: {}", e);
-                            }
-                        }
 
-                        // Recovery: invalidate so a NOTIFY missed during the gap
-                        // can't leave the cache holding stale settings.
-                        service.invalidate_settings_cache().await;
+                            // Recovery: invalidate so a NOTIFY missed during the gap
+                            // can't leave the cache holding stale settings.
+                            let Some(service) = service.upgrade() else {
+                                return;
+                            };
+                            service.invalidate_settings_cache().await;
+                        }
                     }
                 }
-            }
+            };
+            // Keep the atomic ingress snapshot fresh even when no requests read
+            // settings, LISTEN startup fails, or a notification reload fails.
+            tokio::join!(listen, refresh);
         });
 
         if let Ok(mut guard) = self.listener_handle.lock() {
@@ -2204,6 +2335,20 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         self.update_settings_section("blob", update_fn).await
     }
 
+    /// Change the managed-service healthcheck defaults under the settings-row
+    /// lock and return them as saved. Generic settings saves restore this
+    /// section from the locked row, so this is its only write path.
+    pub async fn update_managed_service_healthcheck_settings<F>(
+        &self,
+        update_fn: F,
+    ) -> Result<crate::ManagedServiceHealthcheckSettings, ConfigServiceError>
+    where
+        F: FnOnce(&mut crate::ManagedServiceHealthcheckSettings),
+    {
+        self.update_settings_section("managed_service_healthchecks", update_fn)
+            .await
+    }
+
     /// Change the OTLP ingest settings under the settings-row lock and return
     /// them as saved, leaving every other section byte-for-byte untouched.
     /// Used by the OTel plugin's one-release `TEMPS_OTEL_*` migration; admins
@@ -2211,9 +2356,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_otel_ingest_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::OtelIngestSettings, ConfigServiceError>
+    ) -> Result<crate::OtelIngestSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::OtelIngestSettings),
+        F: FnOnce(&mut crate::OtelIngestSettings),
     {
         self.update_settings_section("otel_ingest", update_fn).await
     }
@@ -2223,9 +2368,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_backup_executor_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::BackupExecutorSettings, ConfigServiceError>
+    ) -> Result<crate::BackupExecutorSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::BackupExecutorSettings),
+        F: FnOnce(&mut crate::BackupExecutorSettings),
     {
         self.update_settings_section("backup_executor", update_fn)
             .await
@@ -2236,9 +2381,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_letsencrypt_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::LetsEncryptSettings, ConfigServiceError>
+    ) -> Result<crate::LetsEncryptSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::LetsEncryptSettings),
+        F: FnOnce(&mut crate::LetsEncryptSettings),
     {
         self.update_settings_section("letsencrypt", update_fn).await
     }
@@ -2249,24 +2394,24 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// shows nor resets it.
     pub async fn env_migration_ledger(
         &self,
-    ) -> Result<temps_core::EnvMigrationLedger, ConfigServiceError> {
+    ) -> Result<crate::EnvMigrationLedger, ConfigServiceError> {
         let malformed = || ConfigServiceError::MalformedSettingsSection {
-            section: temps_core::ENV_MIGRATION_LEDGER_KEY,
+            section: crate::ENV_MIGRATION_LEDGER_KEY,
         };
         let row = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?;
         match row
             .as_ref()
-            .and_then(|row| row.data.get(temps_core::ENV_MIGRATION_LEDGER_KEY))
+            .and_then(|row| row.data.get(crate::ENV_MIGRATION_LEDGER_KEY))
         {
-            None | Some(serde_json::Value::Null) => Ok(temps_core::EnvMigrationLedger::default()),
+            None | Some(serde_json::Value::Null) => Ok(crate::EnvMigrationLedger::default()),
             Some(ledger) => serde_json::from_value(ledger.clone()).map_err(|_| malformed()),
         }
     }
 
     /// Record deprecated environment variables as handled, so later starts
-    /// ignore them (see [`temps_core::EnvMigrationLedger`]). Runs under the
+    /// ignore them (see [`crate::EnvMigrationLedger`]). Runs under the
     /// settings-row lock; a no-op for an empty list.
     pub async fn record_env_migrations_handled(
         &self,
@@ -2276,8 +2421,8 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             return Ok(());
         }
         self.update_settings_section(
-            temps_core::ENV_MIGRATION_LEDGER_KEY,
-            |ledger: &mut temps_core::EnvMigrationLedger| {
+            crate::ENV_MIGRATION_LEDGER_KEY,
+            |ledger: &mut crate::EnvMigrationLedger| {
                 ledger
                     .handled
                     .extend(env_vars.iter().map(|env_var| (*env_var).to_string()));
@@ -2290,14 +2435,14 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// [`Self::env_migration_ledger`] for the boot-time shim, which must never
     /// block startup: a failed read is logged and treated as an empty ledger,
     /// the behaviour before the ledger existed.
-    pub async fn env_migration_ledger_or_empty(&self) -> temps_core::EnvMigrationLedger {
+    pub async fn env_migration_ledger_or_empty(&self) -> crate::EnvMigrationLedger {
         self.env_migration_ledger().await.unwrap_or_else(|error| {
             warn!(
                 %error,
                 "Failed to read the environment-migration ledger; deprecated variables are \
                  treated as not yet migrated this start"
             );
-            temps_core::EnvMigrationLedger::default()
+            crate::EnvMigrationLedger::default()
         })
     }
 
@@ -2320,9 +2465,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_screenshot_settings<F>(
         &self,
         update_fn: F,
-    ) -> Result<temps_core::ScreenshotSettings, ConfigServiceError>
+    ) -> Result<crate::ScreenshotSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::ScreenshotSettings),
+        F: FnOnce(&mut crate::ScreenshotSettings),
     {
         self.update_settings_section("screenshots", update_fn).await
     }
@@ -2335,7 +2480,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// settings-row lock; returns whether it changed anything.
     pub async fn enable_cluster_dns_for_worker(&self) -> Result<bool, ConfigServiceError> {
         let mut changed = false;
-        self.update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
+        self.update_settings_section("cluster_dns", |dns: &mut crate::ClusterDnsSettings| {
             if dns.should_enable_for_worker() {
                 dns.enabled = true;
                 changed = true;
@@ -2351,9 +2496,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     /// path and its audit entry is the record of every change.
     pub async fn update_shield_settings(
         &self,
-        shield: temps_core::ShieldSettings,
-    ) -> Result<temps_core::ShieldSettings, ConfigServiceError> {
-        self.update_settings_section("shield", move |current: &mut temps_core::ShieldSettings| {
+        shield: crate::ShieldSettings,
+    ) -> Result<crate::ShieldSettings, ConfigServiceError> {
+        self.update_settings_section("shield", move |current: &mut crate::ShieldSettings| {
             *current = shield
         })
         .await
@@ -2873,9 +3018,9 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
     pub async fn update_geo_settings<F>(
         &self,
         mutate: F,
-    ) -> Result<temps_core::GeoSettings, ConfigServiceError>
+    ) -> Result<crate::GeoSettings, ConfigServiceError>
     where
-        F: FnOnce(&mut temps_core::GeoSettings),
+        F: FnOnce(&mut crate::GeoSettings),
     {
         let transaction = self.db.begin().await?;
         let query = settings::Entity::find_by_id(1);
@@ -2890,7 +3035,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
         if let Some(model) = existing {
             let mut document = model.data.clone();
             let mut geo = match document.get(GEO_SETTINGS_KEY) {
-                None | Some(serde_json::Value::Null) => temps_core::GeoSettings::default(),
+                None | Some(serde_json::Value::Null) => crate::GeoSettings::default(),
                 Some(stored) => serde_json::from_value(stored.clone()).map_err(|error| {
                     warn!(
                         %error,
@@ -2936,7 +3081,7 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
 
         // No row yet (a fresh install whose first geo check runs before any
         // settings save): insert the defaults with this section applied.
-        let mut geo = temps_core::GeoSettings::default();
+        let mut geo = crate::GeoSettings::default();
         mutate(&mut geo);
         let updated = geo.clone();
         let settings = AppSettings {
@@ -3600,12 +3745,10 @@ mod tests {
 
     #[tokio::test]
     async fn persisted_installation_mode_is_authoritative() {
-        let database = match temps_database::test_utils::TestDatabase::new().await {
+        let database = match temps_test_utils::TestDatabase::new().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping installation mode test: Docker unavailable: {error}");
                 return;
@@ -3686,6 +3829,48 @@ mod tests {
                 if operation == "testing config entropy"
                     && reason.contains("config entropy unavailable")
         ));
+    }
+
+    /// A server that accepts a connection and never answers holds the listener
+    /// where a real one would sit between events: running, with a socket open.
+    #[tokio::test]
+    async fn dropping_the_service_stops_its_settings_listener() {
+        use tokio::io::AsyncReadExt;
+
+        let server = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            format!(
+                "postgresql://user:pass@{}/temps",
+                server.local_addr().unwrap()
+            ),
+            None,
+            Some("127.0.0.1:8000".to_string()),
+        )
+        .expect("ServerConfig::new");
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = Arc::new(ConfigService::new(Arc::new(config), Arc::new(db)));
+
+        service.start_settings_listener();
+        let (mut connection, _) =
+            tokio::time::timeout(std::time::Duration::from_secs(10), server.accept())
+                .await
+                .expect("the listener should connect")
+                .unwrap();
+
+        let weak = Arc::downgrade(&service);
+        drop(service);
+        assert!(
+            weak.upgrade().is_none(),
+            "the listener must not keep the service alive"
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            let mut buffer = [0u8; 1024];
+            while matches!(connection.read(&mut buffer).await, Ok(read) if read > 0) {}
+        })
+        .await;
+        assert!(closed.is_ok(), "the listener's connection was never closed");
     }
 
     fn test_config() -> Arc<ServerConfig> {
@@ -3889,7 +4074,7 @@ mod tests {
         let mut sandbox = AgentSandboxSettings::default();
         sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("encrypted-test-token".into()),
                 ..Default::default()
@@ -4057,7 +4242,7 @@ mod tests {
         let mut locked = AppSettings::default();
         locked.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("new-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4066,7 +4251,7 @@ mod tests {
         );
         locked.agent_sandbox.providers.insert(
             "omitted".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("omitted-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4076,7 +4261,7 @@ mod tests {
         let mut incoming = AppSettings::default();
         incoming.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("old-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": false, "custom": 1}),
@@ -4085,7 +4270,7 @@ mod tests {
         );
         incoming.agent_sandbox.providers.insert(
             "new".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 credentials_encrypted: Some("forged-ciphertext".into()),
                 extra: serde_json::json!({"credential_verified": true}),
                 ..Default::default()
@@ -4115,7 +4300,7 @@ mod tests {
         let mut deleted = locked.clone();
         deleted.agent_sandbox.providers.insert(
             "replaced".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: None,
                 extra: serde_json::json!({}),
@@ -4143,7 +4328,7 @@ mod tests {
         locked_settings.anonymous_telemetry_enabled = Some(false);
         locked_settings.agent_sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "subscription".into(),
                 credentials_encrypted: Some("replacement".into()),
                 extra: serde_json::json!({"credential_verified": true}),
@@ -4171,7 +4356,7 @@ mod tests {
         };
         incoming.agent_sandbox.providers.insert(
             "codex_cli".into(),
-            temps_core::ProviderConfig {
+            crate::ProviderConfig {
                 auth_type: "api_key".into(),
                 credentials_encrypted: Some("stale".into()),
                 extra: serde_json::json!({"credential_verified": false}),
@@ -4220,18 +4405,18 @@ mod tests {
     async fn settings_save_cannot_clobber_the_refresh_jobs_recorded_geo_state() {
         // What both writers started from: no metadata, no key.
         let stale_snapshot = AppSettings::from_json(settings_row("example.test").data);
-        assert_eq!(stale_snapshot.geo, temps_core::GeoSettings::default());
+        assert_eq!(stale_snapshot.geo, crate::GeoSettings::default());
 
         // The job (and a concurrent key save) committed first, so this is what
         // the row holds by the time the PUT takes the lock.
         let checked_at = Utc::now();
         let mut locked = settings_row("example.test");
         let mut locked_settings = AppSettings::from_json(locked.data.clone());
-        locked_settings.geo.source = Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
+        locked_settings.geo.source = Some(crate::GEO_SOURCE_MAXMIND_OFFICIAL.to_string());
         locked_settings.geo.build_epoch = Some(1_767_225_600);
         locked_settings.geo.last_refreshed_at = Some(checked_at);
         locked_settings.geo.last_check_at = Some(checked_at);
-        locked_settings.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+        locked_settings.geo.last_check_status = Some(crate::GEO_CHECK_STATUS_OK.to_string());
         locked_settings.geo.maxmind_license_key_encrypted =
             Some("just-saved-ciphertext".to_string());
         locked.data = locked_settings.to_json();
@@ -4256,7 +4441,7 @@ mod tests {
         // forward verbatim out of the stale snapshot.
         let mut incoming = stale_snapshot.clone();
         incoming.preview_domain = "new.example.test".into();
-        incoming.geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_ERROR.to_string());
+        incoming.geo.last_check_status = Some(crate::GEO_CHECK_STATUS_ERROR.to_string());
         incoming.geo.last_error = Some("a failure the client invented".to_string());
 
         svc.update_settings(incoming).await.expect("settings save");
@@ -4265,12 +4450,12 @@ mod tests {
         assert_eq!(cached.preview_domain, "new.example.test");
         assert_eq!(
             cached.geo.source.as_deref(),
-            Some(temps_core::GEO_SOURCE_MAXMIND_OFFICIAL)
+            Some(crate::GEO_SOURCE_MAXMIND_OFFICIAL)
         );
         assert_eq!(cached.geo.build_epoch, Some(1_767_225_600));
         assert_eq!(
             cached.geo.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_OK)
+            Some(crate::GEO_CHECK_STATUS_OK)
         );
         assert_eq!(cached.geo.last_error, None);
         assert!(cached.geo.last_check_at.is_some());
@@ -4397,14 +4582,14 @@ mod tests {
 
         let updated = svc
             .update_geo_settings(|geo| {
-                geo.last_check_status = Some(temps_core::GEO_CHECK_STATUS_OK.to_string());
+                geo.last_check_status = Some(crate::GEO_CHECK_STATUS_OK.to_string());
                 geo.build_epoch = Some(1_767_225_600);
             })
             .await
             .expect("record the geo check");
         assert_eq!(
             updated.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_OK)
+            Some(crate::GEO_CHECK_STATUS_OK)
         );
 
         drop(svc);
@@ -4594,12 +4779,10 @@ mod tests {
 
     #[tokio::test]
     async fn env_migration_ledger_survives_settings_saves_and_stays_out_of_the_api() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping env migration ledger test: Docker unavailable: {error}");
                 return;
@@ -4638,7 +4821,7 @@ mod tests {
         assert!(
             settings
                 .to_json()
-                .get(temps_core::ENV_MIGRATION_LEDGER_KEY)
+                .get(crate::ENV_MIGRATION_LEDGER_KEY)
                 .is_none(),
             "the ledger must not be part of the settings API document"
         );
@@ -4656,7 +4839,7 @@ mod tests {
     #[tokio::test]
     async fn a_malformed_env_migration_ledger_is_reported_and_treated_as_empty_at_boot() {
         let mut row = settings_row("preserved.example.test");
-        row.data[temps_core::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
+        row.data[crate::ENV_MIGRATION_LEDGER_KEY] = serde_json::json!({ "handled": 7 });
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Sqlite)
                 .append_query_results([[row.clone()], [row]])
@@ -4672,7 +4855,7 @@ mod tests {
             matches!(
                 error,
                 ConfigServiceError::MalformedSettingsSection {
-                    section: temps_core::ENV_MIGRATION_LEDGER_KEY
+                    section: crate::ENV_MIGRATION_LEDGER_KEY
                 }
             ),
             "unexpected ledger error: {error:?}"
@@ -4686,12 +4869,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_turns_cluster_dns_on_once_unless_an_operator_decided() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping cluster DNS integration test: Docker unavailable: {error}");
                 return;
@@ -4719,10 +4900,10 @@ mod tests {
 
         // An operator turns it off; the next worker leaves it off.
         service
-            .update_settings_section("cluster_dns", |dns: &mut temps_core::ClusterDnsSettings| {
-                *dns = temps_core::ClusterDnsSettings::after_operator_save(
+            .update_settings_section("cluster_dns", |dns: &mut crate::ClusterDnsSettings| {
+                *dns = crate::ClusterDnsSettings::after_operator_save(
                     &dns.clone(),
-                    &temps_core::ClusterDnsSettings {
+                    &crate::ClusterDnsSettings {
                         enabled: false,
                         operator_chosen: false,
                     },
@@ -4745,12 +4926,10 @@ mod tests {
 
     #[tokio::test]
     async fn join_token_writes_survive_stale_bulk_settings_saves() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping join-token integration test: Docker unavailable: {error}");
                 return;
@@ -4815,12 +4994,10 @@ mod tests {
 
     #[tokio::test]
     async fn preview_gateway_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping preview gateway settings test: Docker unavailable: {error}");
                 return;
@@ -4906,13 +5083,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn healthcheck_defaults_change_only_through_their_own_write_path() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping healthcheck settings test: Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("healthcheck settings test database failed: {error}"),
+        };
+        let service = ConfigService::new(test_config(), database.db.clone());
+        let stale_bulk_document = service.get_settings().await.expect("initial settings");
+        assert_eq!(
+            stale_bulk_document.managed_service_healthchecks,
+            crate::ManagedServiceHealthcheckSettings::default(),
+            "nothing is overridden by default"
+        );
+
+        let saved = service
+            .update_managed_service_healthcheck_settings(|h| {
+                h.interval_secs = Some(60);
+                h.retries = Some(4);
+            })
+            .await
+            .expect("save the healthcheck defaults");
+        assert_eq!(saved.interval_secs, Some(60));
+
+        // A settings-page save from before the change neither reverts the
+        // section nor, when it sets the section itself, changes it.
+        let mut rewrite = stale_bulk_document;
+        rewrite.managed_service_healthchecks.interval_secs = Some(5);
+        service
+            .update_settings(rewrite)
+            .await
+            .expect("bulk save that sets the healthcheck section");
+        let stored = service
+            .get_settings()
+            .await
+            .expect("settings after the saves");
+        assert_eq!(stored.managed_service_healthchecks, saved);
+    }
+
+    #[tokio::test]
+    async fn kv_and_blob_container_names_change_only_through_their_own_write_path() {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping KV/Blob settings test: Docker unavailable: {error}");
                 return;
@@ -4970,12 +5189,10 @@ mod tests {
     /// Shield settings change, so its audit entry records every change.
     #[tokio::test]
     async fn shield_settings_change_only_through_their_own_write_path() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping Shield settings test: Docker unavailable: {error}");
                 return;
@@ -4987,7 +5204,7 @@ mod tests {
         assert!(stale_bulk_document.shield.share_observations);
 
         let saved = service
-            .update_shield_settings(temps_core::ShieldSettings {
+            .update_shield_settings(crate::ShieldSettings {
                 share_observations: false,
             })
             .await
@@ -6128,6 +6345,23 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn settings_snapshot_refresh_recovers_without_an_http_request() {
+        let mut row = settings_row("privacy");
+        row.data["expose_platform_identity"] = serde_json::json!(true);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom(
+                "temporary database outage".into(),
+            )])
+            .append_query_results(vec![vec![row]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        svc.refresh_settings_snapshot().await;
+        assert!(!svc.expose_platform_identity());
+        svc.refresh_settings_snapshot().await;
+        assert!(svc.expose_platform_identity());
+    }
+
     #[test]
     fn published_trusted_networks_skip_invalid_entries() {
         let settings = AppSettings {
@@ -6204,6 +6438,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn proxy_trust_rebases_omissions_and_audits_locked_values() {
+        for submitted in [None, Some(vec![]), Some(vec!["10.30.1.9/16".to_string()])] {
+            let mut locked = settings_row("example.test");
+            locked.data["trusted_proxy_cidrs"] = serde_json::json!(["10.20.0.0/16"]);
+            let db = Arc::new(
+                MockDatabase::new(DatabaseBackend::Sqlite)
+                    .append_query_results(vec![vec![locked]; 4])
+                    .append_exec_results([sea_orm::MockExecResult {
+                        last_insert_id: 1,
+                        rows_affected: 1,
+                    }])
+                    .into_connection(),
+            );
+            let service = ConfigService::new(test_config(), db);
+            let stale = AppSettings {
+                trusted_proxy_cidrs: vec!["192.168.0.0/16".into()],
+                ..AppSettings::default()
+            };
+            let intent = match submitted.clone() {
+                None => TrustedProxyRangesIntent::Unchanged,
+                Some(entries) => TrustedProxyRangesIntent::Replace(entries),
+            };
+            let saved = service
+                .update_settings_with_proxy_intent(
+                    stale,
+                    GeoLicenseKeyIntent::Unchanged,
+                    TrustedPrivateNetworksIntent::Unchanged,
+                    intent,
+                )
+                .await
+                .unwrap();
+            let expected = match submitted {
+                None => vec!["10.20.0.0/16".to_string()],
+                Some(entries) if entries.is_empty() => vec![],
+                Some(_) => vec!["10.30.0.0/16".to_string()],
+            };
+            assert_eq!(saved.previous_trusted_proxy_cidrs, ["10.20.0.0/16"]);
+            assert_eq!(saved.trusted_proxy_cidrs, expected);
+            assert_eq!(
+                service.get_settings().await.unwrap().trusted_proxy_cidrs,
+                expected
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_proxy_trust_is_rejected_before_database_access() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Sqlite).into_connection());
+        let service = ConfigService::new(test_config(), db);
+        for cidr in ["invalid", "0.0.0.0/0"] {
+            let error = service
+                .update_settings_with_proxy_intent(
+                    AppSettings::default(),
+                    GeoLicenseKeyIntent::Unchanged,
+                    TrustedPrivateNetworksIntent::Unchanged,
+                    TrustedProxyRangesIntent::Replace(vec![cidr.into()]),
+                )
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error,
+                ConfigServiceError::InvalidConfiguration { .. }
+            ));
+            assert!(error.to_string().contains(cidr));
+        }
+    }
+
+    #[tokio::test]
     async fn explicit_private_network_update_reports_the_locked_audit_values() {
         for submitted in [vec![], vec!["192.168.4.0/24".to_string()]] {
             let mut locked = settings_row("example.test");
@@ -6249,12 +6552,10 @@ mod tests {
 
     #[tokio::test]
     async fn postgres_stale_settings_save_cannot_restore_revoked_private_networks() {
-        let mut database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let mut database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping private-network race test: Docker unavailable: {error}");
                 return;
@@ -6315,6 +6616,54 @@ mod tests {
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
+    }
+
+    #[tokio::test]
+    async fn healthcheck_default_subscribers_see_loaded_and_changed_defaults_only() {
+        let row = |interval_secs: Option<u32>, preview_domain: &str| {
+            let mut s = AppSettings::default();
+            s.managed_service_healthchecks.interval_secs = interval_secs;
+            let mut data = s.to_json();
+            data["preview_domain"] = serde_json::json!(preview_domain);
+            settings::Model {
+                id: 1,
+                data,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+            }
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                vec![row(Some(60), "one.example.com")],
+                vec![row(Some(90), "one.example.com")],
+                vec![row(Some(90), "two.example.com")],
+            ])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+        let mut defaults = svc.subscribe_managed_service_healthchecks();
+        assert_eq!(*defaults.borrow_and_update(), None, "nothing loaded yet");
+
+        // Another process saved: its NOTIFY invalidates the cache, which
+        // reloads the row.
+        svc.invalidate_settings_cache().await;
+        assert!(defaults.has_changed().expect("sender alive"));
+        assert_eq!(
+            defaults.borrow_and_update().and_then(|d| d.interval_secs),
+            Some(60)
+        );
+
+        svc.invalidate_settings_cache().await;
+        assert!(defaults.has_changed().expect("sender alive"));
+        assert_eq!(
+            defaults.borrow_and_update().and_then(|d| d.interval_secs),
+            Some(90)
+        );
+
+        svc.invalidate_settings_cache().await;
+        assert!(
+            !defaults.has_changed().expect("sender alive"),
+            "a save that leaves the healthcheck defaults alone must not wake subscribers"
+        );
     }
 
     #[tokio::test]
@@ -6534,12 +6883,10 @@ mod tests {
 
     #[tokio::test]
     async fn stateless_telemetry_id_is_random_stored_and_not_derived_from_instance_id() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!(
                     "Skipping stateless telemetry id integration test: Docker unavailable: {error}"
@@ -6589,12 +6936,10 @@ mod tests {
 
     #[tokio::test]
     async fn delivery_default_requires_a_usable_provider_and_profile() {
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping delivery default test: Docker unavailable: {error}");
                 return;
@@ -6846,6 +7191,48 @@ mod tests {
             .with_default_ingress_listener()
             .unwrap();
         assert!(blank.public_surface_address().is_some());
+    }
+
+    #[test]
+    fn a_random_console_port_stays_held_until_the_console_takes_it() {
+        let config = ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgresql://test".to_string(),
+            None,
+            None,
+        )
+        .expect("ServerConfig::new");
+
+        let error = std::net::TcpListener::bind(&config.console_address)
+            .expect_err("the console's port must stay held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        crate::loopback_reservation::take_reserved_socket(&config.console_address)
+            .expect("the console takes the socket that holds its port");
+    }
+
+    #[test]
+    fn a_random_ingress_port_stays_held_until_the_console_takes_it() {
+        let config = config_with_listeners(None, None)
+            .with_default_ingress_listener()
+            .unwrap();
+        let address = config.public_surface_address().unwrap();
+
+        let error =
+            std::net::TcpListener::bind(address).expect_err("the ingress port must stay held");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        crate::loopback_reservation::take_reserved_socket(address)
+            .expect("the console takes the socket that holds its port");
+    }
+
+    #[test]
+    fn a_named_console_address_is_not_reserved() {
+        let config = test_config();
+
+        assert!(
+            crate::loopback_reservation::take_reserved_socket(&config.console_address).is_none()
+        );
     }
 
     /// Count occurrences of `needle` in every `.rs` file under `dir`, keyed by

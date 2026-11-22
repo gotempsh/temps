@@ -23,7 +23,6 @@ import type {
   AgentConfigResponse,
   AgentRunResponse,
 } from '@/api/client/types.gen'
-import { autopilotPaths } from '@/components/agents/AutopilotPage'
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
 import { AutofixSettingsCard } from '@/components/autofix/AutofixSettingsCard'
 import { Button } from '@/components/ui/button'
@@ -138,7 +137,10 @@ function AutomationRow({
 
 function AutomationList({ project }: { project: ProjectResponse }) {
   const queryClient = useQueryClient()
-  const paths = autopilotPaths(project.slug)
+  // Runs still open at the project's `agents/:runId` route; the agent editor
+  // was retired with the AI workflows pages, so automations are switched on
+  // and off here and no longer edited.
+  const runHref = (runId: number) => `/projects/${project.slug}/agents/${runId}`
   const path = { project_id: project.id }
 
   const autofix = useQuery(getAutofixCapabilityOptions({ path }))
@@ -251,16 +253,11 @@ function AutomationList({ project }: { project: ProjectResponse }) {
               })
             }
             details={
-              <>
-                <Link className="underline" to={paths.editAgent(workflow.slug)}>
-                  Edit prompt
+              run && (
+                <Link className="underline" to={runHref(run.id)}>
+                  Last run <TimeAgo date={run.created_at} />
                 </Link>
-                {run && (
-                  <Link className="underline" to={paths.run(run.id)}>
-                    Last run <TimeAgo date={run.created_at} />
-                  </Link>
-                )}
-              </>
+              )
             }
           />
         )

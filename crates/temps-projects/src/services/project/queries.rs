@@ -4,6 +4,7 @@
 //! Project reads: lookups, search, pagination, statistics and row mapping.
 
 use super::*;
+use temps_core::escape::escape_like;
 
 async fn has_ready_deployment(
     db: &temps_database::DbConnection,
@@ -68,16 +69,6 @@ impl sea_orm::FromQueryResult for ProjectWithGitProviderType {
 /// Alias for the joined-in `git_providers.provider_type` column. Named rather
 /// than bare so it can never collide with a `projects` column.
 const GIT_PROVIDER_TYPE_ALIAS: &str = "git_provider_type";
-
-fn escape_like_literal(value: &str) -> String {
-    value.chars().fold(String::new(), |mut escaped, character| {
-        if matches!(character, '\\' | '%' | '_') {
-            escaped.push('\\');
-        }
-        escaped.push(character);
-        escaped
-    })
-}
 
 impl ProjectService {
     pub async fn get_projects(&self) -> Result<Vec<Project>, ProjectError> {
@@ -278,7 +269,7 @@ impl ProjectService {
                 query = query.filter(projects::Column::Id.is_not_in(hidden.iter().copied()));
             }
             if let Some(search) = search {
-                let pattern = format!("%{}%", escape_like_literal(search));
+                let pattern = format!("%{}%", escape_like(search));
                 // Table-qualified: the page query joins `git_providers`, which
                 // has a `name` column of its own, and an unqualified `name`
                 // here is rejected by Postgres as ambiguous.
@@ -505,7 +496,7 @@ impl ProjectService {
             .and_then(|config| serde_json::to_value(config).ok());
 
         let service_template = db_project.service_template.as_ref().and_then(|snapshot| {
-            serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
+            serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(
                 snapshot.clone(),
             )
             .ok()

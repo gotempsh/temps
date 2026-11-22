@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::{AuditContext, AuditOperation};
 
@@ -33,9 +32,8 @@ impl AuditOperation for EnvironmentVariableValueRevealedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -48,26 +46,33 @@ pub struct EnvironmentSettingsUpdatedFields {
     pub branch: Option<String>,
     pub replicas: Option<i32>,
     pub security_updated: bool,
+    /// Routing policy change, including explicit reset to project inheritance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub load_balancing: Option<Option<temps_entities::deployment_config::LoadBalancingConfig>>,
     /// Record that health changed without copying command arguments into audit data.
     pub health_updated: bool,
     /// Per-environment attack-mode override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit project),
     /// `Some(Some(b))` = overridden.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub attack_mode: Option<Option<bool>>,
     /// The Shield mode stored after a write that changed it (ADR 066):
     /// `None` = unchanged, `Some(None)` = inherits the project's,
     /// `Some(Some(mode))` = set here. A legacy `attack_mode` write changes
     /// it too.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub shield_mode: Option<Option<temps_shield::ShieldMode>>,
     /// The exempt paths written, when they changed.
     pub shield_exempt_paths: Option<Vec<String>>,
     /// Per-environment HTTP→HTTPS redirect override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit the proxy default),
     /// `Some(Some(b))` = overridden.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub force_https: Option<Option<bool>>,
     /// Per-environment build location override change (tri-state):
     /// `None` = unchanged, `Some(None)` = cleared (inherit the project),
     /// `Some(Some(location))` = overridden.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub build_location: Option<Option<temps_entities::deployment_config::BuildLocation>>,
 }
 
@@ -101,9 +106,8 @@ impl AuditOperation for EnvironmentSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -135,9 +139,8 @@ impl AuditOperation for EnvironmentSleepStateChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -171,9 +174,8 @@ impl AuditOperation for EnvironmentSubdomainUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -205,9 +207,8 @@ impl AuditOperation for EnvironmentDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -242,9 +243,8 @@ impl AuditOperation for EnvironmentVariablePromotedToSecretAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -288,9 +288,8 @@ impl AuditOperation for EnvironmentVariableWrittenAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -324,9 +323,8 @@ impl AuditOperation for EnvironmentVariableDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -365,9 +363,8 @@ impl AuditOperation for ProjectSecretWrittenAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -396,9 +393,8 @@ impl AuditOperation for ProjectSecretDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -432,9 +428,8 @@ impl AuditOperation for IngressSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -467,9 +462,8 @@ impl AuditOperation for IngressLoginGrantIssuedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation: {error}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -503,11 +497,11 @@ impl AuditOperation for SandboxPreviewLoginGrantIssuedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!(
-                "Failed to serialize preview login grant audit for sandbox {}: {error}",
-                self.sandbox_id
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize(
+                format!("preview login grant for sandbox {}", self.sandbox_id),
+                source,
             )
         })
     }
@@ -541,14 +535,81 @@ impl AuditOperation for EnvironmentVariableSecretSuggestionDismissedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_audit_distinguishes_unchanged_reset_and_override() {
+        let mut audit = EnvironmentSettingsUpdatedAudit {
+            context: AuditContext {
+                user_id: 1,
+                ip_address: None,
+                user_agent: "test".into(),
+            },
+            project_id: 1,
+            project_name: "app".into(),
+            project_slug: "app".into(),
+            environment_id: 2,
+            environment_name: "production".into(),
+            environment_slug: "production".into(),
+            updated_settings: EnvironmentSettingsUpdatedFields {
+                cpu_request: None,
+                cpu_limit: None,
+                memory_request: None,
+                memory_limit: None,
+                branch: None,
+                replicas: None,
+                security_updated: false,
+                health_updated: false,
+                load_balancing: None,
+                attack_mode: None,
+                shield_mode: None,
+                shield_exempt_paths: None,
+                force_https: None,
+                build_location: None,
+            },
+        };
+        let keys = [
+            "load_balancing",
+            "attack_mode",
+            "shield_mode",
+            "force_https",
+            "build_location",
+        ];
+        let unchanged: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        for key in keys {
+            assert!(unchanged["updated_settings"].get(key).is_none(), "{key}");
+        }
+        audit.updated_settings.load_balancing = Some(None);
+        audit.updated_settings.attack_mode = Some(None);
+        audit.updated_settings.shield_mode = Some(None);
+        audit.updated_settings.force_https = Some(None);
+        audit.updated_settings.build_location = Some(None);
+        let reset: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        for key in keys {
+            assert_eq!(
+                reset["updated_settings"].get(key),
+                Some(&serde_json::Value::Null),
+                "{key}"
+            );
+        }
+        audit.updated_settings.load_balancing = Some(Some(Default::default()));
+        audit.updated_settings.attack_mode = Some(Some(false));
+        audit.updated_settings.force_https = Some(Some(true));
+        let overridden: serde_json::Value =
+            serde_json::from_str(&AuditOperation::serialize(&audit).unwrap()).unwrap();
+        assert!(overridden["updated_settings"]["load_balancing"].is_object());
+        assert_eq!(overridden["updated_settings"]["attack_mode"], false);
+        assert_eq!(overridden["updated_settings"]["force_https"], true);
+    }
 
     #[test]
     fn secret_audit_events_never_include_a_value_field() {

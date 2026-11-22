@@ -1071,7 +1071,7 @@ fn interpolation_in_volumes_names_the_security_check() {
         .expect("interpolation check is in the settings catalog")
         .label;
     assert!(
-        message.contains("rejected volumes for service 'trawl'"),
+        message.contains("rejected [check=interpolation] volumes for service 'trawl'"),
         "{message}"
     );
     assert!(
@@ -1936,6 +1936,110 @@ fn non_loopback_port_rejection_names_the_exact_fix() {
     executor
         .preflight_validate(
             "services:\n  web:\n    image: app\n    ports:\n      - \"127.0.0.1::3000\"\n",
+            None,
+        )
+        .unwrap();
+}
+
+#[test]
+fn policy_rejections_keep_the_actual_check_before_user_fields() {
+    let executor = executor_with_checks_disabled(&[]);
+    for (content, expected) in [
+        ("services:\n  app:\n    image: nginx\n    privileged: true\n", PolicyCheck::Privileged),
+        ("services:\n  app:\n    image: nginx\n    privileged: ${FLAG}\n", PolicyCheck::Interpolation),
+        ("services:\n  app:\n    image: nginx\n    network_mode: host\n", PolicyCheck::HostNetwork),
+        ("services:\n  app:\n    image: nginx\n    shm_size: 600m\n", PolicyCheck::ServiceShm),
+        ("services:\n  app:\n    image: nginx\n    volumes: [data:/data]\nvolumes:\n  data:\n    driver: remote\n", PolicyCheck::VolumeDrivers),
+        ("services:\n  app:\n    image: nginx\nvolumes:\n  data:\n    driver_opts: {type: nfs, device: server:/data}\n", PolicyCheck::VolumeNetworkFilesystems),
+        ("services:\n  app:\n    image: nginx\nvolumes:\n  data:\n    driver_opts: {type: none, o: bind, device: /data}\n", PolicyCheck::VolumeHostPaths),
+        ("services:\n  a:\n    image: nginx\n    shm_size: 512m\n  b:\n    image: nginx\n    shm_size: 512m\n  c:\n    image: nginx\n    shm_size: 1m\n", PolicyCheck::AggregateShm),
+    ] {
+        let error = executor.preflight_validate(content, None).unwrap_err();
+        assert!(matches!(&error, ComposeError::SecurityPolicyViolation { check: Some(check), .. } if *check == expected), "{error}");
+        assert!(error.to_string().starts_with(&format!("Compose security policy rejected [check={}]", expected.as_str())));
+    }
+}
+
+#[test]
+fn inline_override_rejections_keep_the_actual_check() {
+    let executor = executor_with_checks_disabled(&[]);
+    let base = "services:\n  app:\n    image: nginx\n";
+    for (content, expected) in [
+        ("networks: {}", PolicyCheck::InlineSections),
+        (
+            "services:\n  extra:\n    image: nginx\n",
+            PolicyCheck::InlineServices,
+        ),
+        (
+            "services:\n  app:\n    volumes: [data:/data]\n",
+            PolicyCheck::InlineFields,
+        ),
+    ] {
+        let error = executor
+            .preflight_validate(base, Some(content))
+            .unwrap_err();
+        assert!(
+            matches!(&error, ComposeError::InvalidOverride { check: Some(check), .. } if *check == expected),
+            "{error}"
+        );
+        assert!(error.to_string().starts_with(&format!(
+            "Invalid compose override [check={}]",
+            expected.as_str()
+        )));
+    }
+}
+
+#[test]
+fn structural_rejections_carry_no_policy_check() {
+    // Each of these is rejected even with its nearest check disabled, so
+    // telemetry must not name that check as the cause.
+    let executor =
+        executor_with_checks_disabled(&[PolicyCheck::EnvFiles, PolicyCheck::NetworkMode]);
+    for content in [
+        "services:\n  app:\n    image: nginx\n    env_file: true\n",
+        "services:\n  app:\n    image: nginx\n    env_file: [1]\n",
+        "services:\n  app:\n    image: nginx\n    env_file:\n      - required: true\n",
+        "services:\n  app:\n    image: nginx\n    network_mode: service:missing\n",
+        "services:\n  app:\n    image: nginx\n    network_mode: 'service:'\n",
+    ] {
+        let error = executor.preflight_validate(content, None).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                ComposeError::SecurityPolicyViolation { check: None, .. }
+            ),
+            "{content}: {error}"
+        );
+        assert!(
+            error.to_string().contains("[check=unclassified]"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn configurable_volume_and_env_file_rejections_name_their_check() {
+    let executor = executor_with_checks_disabled(&[]);
+    for (content, expected) in [
+        (
+            "services:\n  app:\n    image: nginx\n    volumes:\n      - type: tmpfs\n        target: /cache\n",
+            PolicyCheck::Tmpfs,
+        ),
+        (
+            "services:\n  app:\n    image: nginx\n    env_file: ../outside.env\n",
+            PolicyCheck::EnvFiles,
+        ),
+    ] {
+        let error = executor.preflight_validate(content, None).unwrap_err();
+        assert!(
+            matches!(&error, ComposeError::SecurityPolicyViolation { check: Some(check), .. } if *check == expected),
+            "{content}: {error}"
+        );
+    }
+    // The same long-form tmpfs mount is allowed once its check is disabled.
+    executor_with_checks_disabled(&[PolicyCheck::Tmpfs])
+        .preflight_validate(
+            "services:\n  app:\n    image: nginx\n    volumes:\n      - type: tmpfs\n        target: /cache\n",
             None,
         )
         .unwrap();

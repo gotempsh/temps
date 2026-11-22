@@ -50,6 +50,7 @@ import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
 import { registerOtelCommands } from './commands/otel/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
 import { registerFlagsCommands } from './commands/flags/index.js'
+import { registerSurveysCommands } from './commands/surveys/index.js'
 import { registerDataCommands } from './commands/data/index.js'
 import { registerBlobCommands } from './commands/blob/index.js'
 import { registerDsnCommands } from './commands/dsn/index.js'
@@ -83,6 +84,7 @@ import { registerMcpServersCommands } from './commands/mcp-servers/index.js'
 import { registerMcpCommands } from './commands/mcp/index.js'
 import { registerSecretsCommands } from './commands/secrets/index.js'
 import { registerSandboxCommands } from './commands/sandbox/index.js'
+import { registerDurableWorkflowCommands } from './commands/workflows/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
 import { registerRevenueCommands } from './commands/revenue/index.js'
 import { registerSessionReplayCommands } from './commands/session-replay/index.js'
@@ -215,6 +217,7 @@ export function createProgram(): Command {
   registerOtelCommands(program)
   registerKvCommands(program)
   registerFlagsCommands(program)
+  registerSurveysCommands(program)
   registerDataCommands(program)
   registerBlobCommands(program)
   registerDsnCommands(program)
@@ -249,6 +252,7 @@ export function createProgram(): Command {
   registerSecretsCommands(program)
   registerSandboxCommands(program)
   registerWorkflowCommands(program)
+  registerDurableWorkflowCommands(program)
   registerRevenueCommands(program)
   registerSessionReplayCommands(program)
   registerTraefikDiscoveryCommands(program)

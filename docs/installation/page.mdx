@@ -36,13 +36,49 @@ cosign verify-blob --bundle "$archive.sigstore.json" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com "$archive"
 gh attestation verify "$archive" --repo gotempsh/temps \
-  --signer-workflow gotempsh/temps/.github/workflows/release.yml
+  --cert-identity "$identity"
 ```
 
 The exact certificate identity binds the signature to the release workflow and
 chosen tag. A checksum detects corrupted downloads; it does not establish the
-publisher's identity. The installer and `temps upgrade` verify checksums, but do
-not perform this cosign verification automatically.
+publisher's identity, because whoever can replace a release's tarball can
+replace its checksum too.
+
+### What the installer and `temps upgrade` verify {{ anchor: true, id: 'release-signature-verification' }}
+
+Both check the SHA-256 checksum and then the signature, before anything is
+unpacked:
+
+| Path | Signature check | Unsigned release (no `.sigstore.json`) | Signature present but invalid |
+| ---- | --------------- | -------------------------------------- | ----------------------------- |
+| `temps upgrade` | Always, in-process. No cosign needed. | Refused; `--allow-unsigned` installs it on the checksum alone | Refused |
+| Console **Update now** | Always, in-process | Refused; run `temps upgrade --version <tag> --allow-unsigned` from a shell | Refused |
+| `temps firecracker setup` / `temps microsandbox setup` fetching guest agents | Always, in-process | Refused; pass the agent path explicitly | Refused |
+| `install.sh` | With `cosign` if it is on `PATH`, else with an authenticated `gh` (`gh attestation verify`), else not at all, with a warning and the commands above | Refused; `--allow-unsigned` installs it on the checksum alone | Install aborted |
+
+The in-process check pins the certificate identity to
+`https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/<tag>`
+for the exact tag being installed, and the issuer to GitHub Actions
+(`https://token.actions.githubusercontent.com`). A valid Sigstore signature
+from any other repository, workflow, branch or tag is rejected. Stable, beta
+and nightly releases all carry this identity. The check also requires the
+certificate to chain to Sigstore's Fulcio CA, and requires its certificate
+transparency timestamp and its Rekor transparency-log entry.
+
+The Sigstore trusted root (CA certificates and log keys) is refreshed from
+Sigstore's TUF repository (`tuf-repo-cdn.sigstore.dev`), with a 30-second
+limit and nothing cached on disk. If that host is unreachable, the trusted root
+built into the `temps` binary is used instead, and a warning is logged.
+Verification never needs extra tools on the server. When it fails, the upgrade
+stops and names the tag, the asset, the expected signer and what was found.
+
+`--allow-unsigned` only covers releases published before signing was
+introduced, which have no bundle. It never accepts a signature that is present
+but does not verify. Pass it to the installer as
+`curl -fsSL https://temps.sh/install.sh | bash -s -- --allow-unsigned <tag>`.
+
+Enterprise Edition binaries (`temps upgrade --tier ee`) come from the
+license-gated download proxy and are checked against its checksum only.
 
 The main container image is signed by digest and carries a GitHub build
 provenance attestation for that digest. Image tags drop the leading `v` (release
@@ -57,7 +93,7 @@ cosign verify "$image" \
   --certificate-identity "$identity" \
   --certificate-oidc-issuer https://token.actions.githubusercontent.com
 gh attestation verify "oci://$image" --repo gotempsh/temps \
-  --signer-workflow gotempsh/temps/.github/workflows/release.yml
+  --cert-identity "$identity"
 docker buildx imagetools inspect "$image" --format '{{json .SBOM}}'
 docker buildx imagetools inspect "$image" --format '{{json .Provenance}}'
 ```
@@ -95,6 +131,69 @@ and is not a claim that all packages are present in the runtime image.
   support distributions with an older glibc, such as RHEL 8/9, Amazon Linux 2, and
   Amazon Linux 2023; [build from source](#build-from-source) there.
 - **macOS** (Intel and Apple Silicon)
+
+Everything else a self-hosted install supports, from worker and builder nodes
+to backups, is listed in [What Temps supports](/docs/capabilities).
+
+### Docker, and access to its socket
+
+Temps builds and runs applications as Docker containers, so the server needs a
+running Docker Engine **and the user that runs Temps must be able to open the
+Docker socket** (`/var/run/docker.sock` on Linux). Without that access the
+console does not start: the proxy keeps serving your applications, but the
+console answers `503` and the log shows `Docker dependency check FAILED`.
+
+Check it as that user before you start Temps (here the user is `temps`):
+
+```bash
+sudo -u temps docker info >/dev/null && echo ok
+```
+
+`permission denied while trying to connect to the Docker daemon socket` means
+the user is not allowed to use the socket. Grant it one of two ways:
+
+- **Add the user to the `docker` group** (the socket's group on most
+  distributions), then restart Temps:
+
+  ```bash
+  sudo usermod -aG docker temps
+  ```
+
+- **For a systemd service, grant the group to the service only** with a
+  drop-in, without changing the user's groups everywhere:
+
+  ```bash
+  sudo systemctl edit temps
+  ```
+
+  ```ini
+  [Service]
+  SupplementaryGroups=docker
+  ```
+
+  ```bash
+  sudo systemctl restart temps
+  ```
+
+  `sudo -u temps docker info` keeps failing after this change, because sudo
+  uses the account's own groups and the drop-in only applies to the service.
+  To test with the service's groups, run the check the way systemd runs the
+  service:
+
+  ```bash
+  sudo systemd-run --uid=temps -p SupplementaryGroups=docker --pipe --wait --quiet \
+    docker info >/dev/null && echo ok
+  ```
+
+  Or restart the service and check that its log no longer shows
+  `Docker dependency check FAILED`.
+
+Membership of the `docker` group is equivalent to root on the host, which is
+why Temps runs as a dedicated user. Colima, OrbStack, Rancher Desktop and
+rootless Docker use a different socket; see
+[Docker is not reachable](/docs/troubleshooting#startup). A control plane that
+runs no workloads itself (`temps serve --profile control-plane`) does not need
+Docker at all.
 
 ### Required Ports
 
@@ -476,6 +575,15 @@ sudo systemctl start temps
 sudo systemctl status temps
 ```
 
+The `temps` user must be able to open the Docker socket, either through
+membership of the `docker` group or by adding `SupplementaryGroups=docker` to
+the `[Service]` section above (see
+[Docker, and access to its socket](#docker-and-access-to-its-socket)).
+
+By default the console answers on every hostname and on the server's bare IP
+address. To serve it only on its own hostname, set the
+[admin access gate](/docs/admin-listener#admin-gate) after the first login.
+
 Never pass `--database-url` on `ExecStart`: the flag still works, but it puts
 the password in `ps` output and in `systemctl cat temps`, and Temps logs a
 warning at startup when it is used.
@@ -515,7 +623,7 @@ server {
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection 'upgrade';
-        proxy_set_header Host $host;
+        proxy_set_header Host $http_host;
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -597,4 +705,4 @@ After installation:
 4. **Configure email notifications** for alerts
 5. **Set up backups** for your data
 
-Return to the [Quickstart](/docs/quickstart) guide to deploy your first application.
+Return to the [Quickstart](/docs/quickstart) guide to deploy your first application, or see [What Temps supports](/docs/capabilities) for everything else Temps can do.

@@ -55,6 +55,7 @@ use serde::Serialize;
 use tracing::{debug, info, warn};
 
 use crate::engines::control_plane::resolve_excluded_data;
+use crate::engines::pg_client_tools::{probe_docker, probe_host_tool, HostTool, HostToolProbe};
 
 /// Directory, relative to the data dir, holding pre-migration backups.
 pub const PRE_MIGRATION_BACKUP_DIR: &str = "backups/pre-migration";
@@ -846,21 +847,6 @@ fn server_major(version_num: i32) -> u32 {
     (version_num.max(0) / 10_000) as u32
 }
 
-/// `pg_dump (PostgreSQL) 18.6 (Ubuntu 18.6-1)` -> `18`.
-fn parse_pg_dump_major(version_output: &str) -> Option<u32> {
-    version_output
-        .split_whitespace()
-        .find_map(|token| {
-            let major = token.split('.').next()?;
-            if token.contains('.') || token.chars().all(|c| c.is_ascii_digit()) {
-                major.parse::<u32>().ok()
-            } else {
-                None
-            }
-        })
-        .filter(|major| *major >= 9)
-}
-
 /// `temps-pre-migration-20261004T101500Z-v0.1.0-beta.57`.
 fn backup_file_stem(created_at: DateTime<Utc>, binary_version: &str) -> String {
     let version: String = binary_version
@@ -909,17 +895,20 @@ fn pg_dump_args(
 /// A host `pg_dump` if one with a new-enough major is on `PATH`, otherwise
 /// Docker, otherwise an error explaining both.
 async fn choose_dump_method(server_major: u32) -> Result<DumpMethod, PreMigrationBackupError> {
-    let host = match probe_host_pg_dump().await {
-        Some((binary, major)) if major >= server_major => {
+    let host = match probe_host_tool("pg_dump").await {
+        HostToolProbe::Found(HostTool { binary, major }) if major >= server_major => {
             return Ok(DumpMethod::HostPgDump { binary, major });
         }
-        Some((binary, major)) => format!(
+        HostToolProbe::Found(HostTool { binary, major }) => format!(
             "{} is pg_dump {major}, older than the server",
             binary.display()
         ),
-        None => "no pg_dump on PATH".to_string(),
+        HostToolProbe::Unusable { binary, reason } => {
+            format!("{} is not a usable pg_dump: {reason}", binary.display())
+        }
+        HostToolProbe::Missing => "no pg_dump on PATH".to_string(),
     };
-    match probe_docker().await {
+    match probe_docker(DOCKER_PING_TIMEOUT).await {
         Ok(()) => Ok(DumpMethod::Docker {
             image: format!("postgres:{server_major}"),
         }),
@@ -928,46 +917,6 @@ async fn choose_dump_method(server_major: u32) -> Result<DumpMethod, PreMigratio
             host,
             docker,
         }),
-    }
-}
-
-async fn probe_host_pg_dump() -> Option<(PathBuf, u32)> {
-    let binary = find_on_path("pg_dump")?;
-    let output = tokio::time::timeout(
-        Duration::from_secs(10),
-        tokio::process::Command::new(&binary)
-            .arg("--version")
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .ok()?
-    .ok()?;
-    let major = parse_pg_dump_major(&String::from_utf8_lossy(&output.stdout))?;
-    Some((binary, major))
-}
-
-#[allow(
-    clippy::disallowed_methods,
-    reason = "host lookup: PATH is searched for the pg_dump binary, not configuration"
-)]
-fn find_on_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| candidate.is_file())
-}
-
-async fn probe_docker() -> Result<(), String> {
-    let docker = bollard::Docker::connect_with_local_defaults()
-        .map_err(|error| format!("cannot connect to the Docker daemon: {error}"))?;
-    match tokio::time::timeout(DOCKER_PING_TIMEOUT, docker.ping()).await {
-        Ok(Ok(_)) => Ok(()),
-        Ok(Err(error)) => Err(format!("the Docker daemon did not answer a ping: {error}")),
-        Err(_) => Err(format!(
-            "the Docker daemon did not answer a ping within {}s",
-            DOCKER_PING_TIMEOUT.as_secs()
-        )),
     }
 }
 
@@ -1374,14 +1323,7 @@ mod tests {
         assert_eq!(server_major(180_006), 18);
         assert_eq!(server_major(160_004), 16);
         assert_eq!(server_major(-1), 0);
-        assert_eq!(
-            parse_pg_dump_major("pg_dump (PostgreSQL) 18.6 (Ubuntu 18.6-1.pgdg22.04+2)\n"),
-            Some(18)
-        );
-        assert_eq!(parse_pg_dump_major("pg_dump (PostgreSQL) 16.4"), Some(16));
-        assert_eq!(parse_pg_dump_major("pg_dump (PostgreSQL) 17"), Some(17));
-        assert_eq!(parse_pg_dump_major("command not found"), None);
-        assert_eq!(parse_pg_dump_major(""), None);
+        // Client-tool version parsing is tested in `engines::pg_client_tools`.
     }
 
     #[test]

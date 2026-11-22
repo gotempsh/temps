@@ -16,6 +16,8 @@
 //!   start/stop/restart, env vars and metrics
 //! - `cleanup`: owner cleanup of a deleted project's or environment's
 //!   containers, and its ownership checks
+//! - `images`: removal of a deleted project's built images from every
+//!   runtime that holds them
 //! - `guards`: the Docker-socket grant and external-hosting checks every deploy
 //!   path runs
 //! - `trigger`: manual pipeline and image deployment triggers
@@ -56,9 +58,9 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
     LatestDeploymentMedia,
 };
+use crate::workflow::WorkflowTask;
 use crate::UpdateDeploymentSettingsRequest;
 use temps_core::PublicHostnameStrategy;
-use temps_core::WorkflowTask;
 
 // Sibling service modules, imported so the submodules below keep reaching
 // them as `super::<module>`.
@@ -71,6 +73,7 @@ mod domains;
 mod drain_plan;
 mod error;
 mod guards;
+mod images;
 mod lifecycle;
 mod numbering;
 mod promote;
@@ -300,4 +303,4 @@ impl DeploymentService {
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_entities::{agent_run_logs, agent_runs};
 
@@ -615,7 +615,7 @@ pub async fn cancel_run(
         .map_err(Problem::from)?;
 
     let run = app_state
-        .run_service
+        .executor
         .cancel_run(run_id)
         .await
         .map_err(Problem::from)?;

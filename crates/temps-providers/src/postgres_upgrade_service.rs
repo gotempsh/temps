@@ -128,12 +128,6 @@ impl PostgresUpgradeService {
         &self,
         req: StartMajorUpgradeRequest,
     ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
-        // Resolve the Docker daemon up front — a major upgrade always
-        // creates/removes containers, so there is no point validating the
-        // request or inserting a row when this process has no daemon at all
-        // (e.g. `--profile control-plane`).
-        let docker = self.docker_handle.require()?;
-
         // 1-3. Fetch the service and run the full pre-flight validation.
         let svc = external_services::Entity::find_by_id(req.service_id)
             .one(self.db.as_ref())
@@ -141,7 +135,37 @@ impl PostgresUpgradeService {
             .ok_or(PostgresUpgradeError::NotFound {
                 upgrade_id: req.service_id,
             })?;
+        // The migration creates and removes containers on this server's
+        // Docker. A database on a worker node has none here: running it
+        // would start an empty server beside the real one.
+        if let Some(node_id) = svc.node_id {
+            return Err(PostgresUpgradeError::WorkerNodeService {
+                service_id: req.service_id,
+                node_id,
+            });
+        }
+        // Resolve the Docker daemon before anything is validated or written:
+        // a major upgrade always creates/removes containers, so there is no
+        // point going further when this process has no daemon at all (e.g.
+        // `--profile control-plane`).
+        let docker = self.docker_handle.require()?;
         validate_start_request(&req, &svc.service_type)?;
+        // Before the configured image is compared: the answer for an imported
+        // service is the same whatever image the request names.
+        if let Some(container) = self
+            .lifecycle
+            .imported_container(req.service_id)
+            .await
+            .map_err(|reason| PostgresUpgradeError::ServiceConfiguration {
+                service_id: req.service_id,
+                reason,
+            })?
+        {
+            return Err(PostgresUpgradeError::ImportedService {
+                service_id: req.service_id,
+                container,
+            });
+        }
         let configured_image =
             self.lifecycle
                 .docker_image(req.service_id)
@@ -634,6 +658,8 @@ fn pg_upgrade_failure_code(error: &PostgresUpgradeError) -> OperationFailureCode
         | PostgresUpgradeError::SourceImageMismatch { .. }
         | PostgresUpgradeError::WrongServiceType { .. }
         | PostgresUpgradeError::ServiceConfiguration { .. }
+        | PostgresUpgradeError::ImportedService { .. }
+        | PostgresUpgradeError::WorkerNodeService { .. }
         | PostgresUpgradeError::NoDefaultS3Source { .. } => {
             OperationFailureCode::InvalidConfiguration
         }
@@ -1072,9 +1098,14 @@ mod tests {
     #[tokio::test]
     async fn test_start_major_upgrade_without_docker_returns_typed_error() {
         // Arrange: a `control-plane`-shaped service — no Docker daemon in
-        // this process — and a MockDatabase that expects zero queries,
-        // proving the Docker check happens before any DB round-trip.
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        // this process — and a MockDatabase that answers only the service
+        // lookup, proving the Docker check happens before anything else is
+        // read or written.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![postgres_row(None, None)]])
+                .into_connection(),
+        );
         let logs = tempfile::tempdir().expect("create log tempdir");
         let service = build_no_docker_service(db.clone(), logs.path().to_path_buf());
 
@@ -1094,9 +1125,181 @@ mod tests {
         let statements = Arc::try_unwrap(db)
             .expect("service dropped, leaving one DB reference")
             .into_transaction_log();
+        assert_eq!(
+            statements.len(),
+            1,
+            "Docker unavailability must be caught right after the service lookup: {statements:?}"
+        );
+    }
+
+    /// Service 7, a standalone PostgreSQL 16, on `node_id` (the control plane
+    /// when `None`), imported from `container_name` when one is given.
+    fn postgres_row(
+        node_id: Option<i32>,
+        container_name: Option<&str>,
+    ) -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 7,
+            name: "app-postgres".to_string(),
+            service_type: "postgres".to_string(),
+            version: Some("16".to_string()),
+            status: "running".to_string(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            slug: Some("app-postgres".to_string()),
+            config: None,
+            node_id,
+            topology: "standalone".to_string(),
+            error_message: None,
+            health_status: None,
+            last_health_check_at: None,
+            last_health_error: None,
+            consecutive_health_failures: 0,
+            health_metadata: None,
+            metrics_enabled: false,
+            default_backup_provisioned: false,
+            container_name: container_name.map(str::to_string),
+            created_by_user_id: None,
+            continuous_archive_s3_source_id: None,
+            continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
+        }
+    }
+
+    struct ImportedLifecycle;
+
+    #[async_trait]
+    impl PostgresContainerLifecycle for ImportedLifecycle {
+        async fn container_name(&self, service_id: i32) -> Result<String, String> {
+            StubLifecycle.container_name(service_id).await
+        }
+
+        async fn connection_params(&self, service_id: i32) -> Result<PostgresConnection, String> {
+            StubLifecycle.connection_params(service_id).await
+        }
+
+        async fn docker_image(&self, service_id: i32) -> Result<String, String> {
+            StubLifecycle.docker_image(service_id).await
+        }
+
+        async fn imported_container(&self, _service_id: i32) -> Result<Option<String>, String> {
+            Ok(Some("operator-postgres".to_string()))
+        }
+
+        async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {
+            panic!("imported service {service_id} must never be stopped or removed")
+        }
+
+        async fn create_and_start(&self, service_id: i32, _image: &str) -> Result<(), String> {
+            panic!("imported service {service_id} must never get a new container")
+        }
+
+        async fn set_docker_image(&self, service_id: i32, _image: &str) -> Result<(), String> {
+            panic!("imported service {service_id} must keep its stored image")
+        }
+    }
+
+    /// The major-upgrade route works on the derived container too, so it
+    /// refuses an imported service before inserting a row or starting a task.
+    #[tokio::test]
+    async fn test_start_major_upgrade_refuses_imported_service_before_insert() {
+        let service_row = postgres_row(None, Some("operator-postgres"));
+        // Only the service lookup: a further query would fail the mock.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![service_row]])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = PostgresUpgradeService::new(
+            db.clone(),
+            Arc::new(DockerHandle::available(Arc::new(
+                bollard::Docker::connect_with_http(
+                    "http://127.0.0.1:1",
+                    1,
+                    bollard::API_DEFAULT_VERSION,
+                )
+                .expect("a lazily connecting client"),
+            ))),
+            Arc::new(StubProvider),
+            Arc::new(ImportedLifecycle),
+            Arc::new(LogService::new(logs.path().to_path_buf())),
+        );
+
+        let error = service
+            .start_major_upgrade(sample_request())
+            .await
+            .expect_err("an imported service must not enter the migration");
+
         assert!(
-            statements.is_empty(),
-            "Docker unavailability must be caught before any DB query: {statements:?}"
+            matches!(
+                &error,
+                PostgresUpgradeError::ImportedService { service_id: 7, container }
+                    if container == "operator-postgres"
+            ),
+            "{error}"
+        );
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(error)
+                .status_code
+                .as_u16(),
+            409
+        );
+    }
+
+    /// A database on a worker node has no container on this server's
+    /// Docker: the migration would start an empty server here. Refused
+    /// before Docker is asked for, so a control-plane profile names the node
+    /// rather than the missing daemon, and nothing is written.
+    #[tokio::test]
+    async fn test_start_major_upgrade_refuses_a_worker_service_naming_its_node() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![postgres_row(Some(3), None)]])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_no_docker_service(db.clone(), logs.path().to_path_buf());
+
+        let error = service
+            .start_major_upgrade(sample_request())
+            .await
+            .expect_err("a worker service must not be migrated on this server");
+
+        assert!(
+            matches!(
+                error,
+                PostgresUpgradeError::WorkerNodeService {
+                    service_id: 7,
+                    node_id: 3
+                }
+            ),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("worker node 3"), "{rendered}");
+        assert!(rendered.contains("Nothing was changed"), "{rendered}");
+        assert_eq!(
+            temps_core::problemdetails::Problem::from(error)
+                .status_code
+                .as_u16(),
+            409
+        );
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one DB reference")
+            .into_transaction_log();
+        assert_eq!(
+            statements.len(),
+            1,
+            "only the service lookup: {statements:?}"
         );
     }
 
@@ -1147,6 +1350,11 @@ mod tests {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)

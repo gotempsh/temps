@@ -28,17 +28,18 @@
         "3306/tcp": {}
       },
       "Healthcheck": {
-        "Interval": 1000000000,
-        "Retries": 5,
-        "StartInterval": 1000000000,
-        "StartPeriod": 30000000000,
+        "Interval": 30000000000,
+        "Retries": 3,
+        "StartInterval": 2000000000,
+        "StartPeriod": 120000000000,
         "Test": [
           "CMD-SHELL",
           "mariadb-admin ping -h 127.0.0.1 -uroot -p\"$MARIADB_ROOT_PASSWORD\" --silent"
         ],
-        "Timeout": 3000000000
+        "Timeout": 5000000000
       },
       "HostConfig": {
+        "Init": true,
         "LogConfig": {
           "Config": {
             "max-file": "3",
@@ -69,7 +70,7 @@
           "no-new-privileges:true"
         ]
       },
-      "Image": "mariadb:lts",
+      "Image": "ghcr.io/gotempsh/mariadb-walg@sha256:fa4c9247f82c47ace7c1aa9b77010870f4905bbae57c4f0aa24ae6ba3b6cdbf3",
       "Labels": {
         "temps.service_name": "golden",
         "temps.service_type": "mariadb"

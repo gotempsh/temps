@@ -342,11 +342,7 @@ pub fn display_endpoint(endpoint: Option<&str>, region: &str) -> String {
 /// The endpoint as the SDK receives it: a bare `host:port` means plain HTTP,
 /// matching what an S3-compatible service on a private network expects.
 pub fn endpoint_url(endpoint: &str) -> String {
-    if endpoint.starts_with("http") {
-        endpoint.to_string()
-    } else {
-        format!("http://{}", endpoint)
-    }
+    temps_core::s3_endpoint::endpoint_url(endpoint)
 }
 
 /// What a reachability check does when the bucket does not exist yet.

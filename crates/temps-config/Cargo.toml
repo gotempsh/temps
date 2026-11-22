@@ -5,22 +5,19 @@
 name = "temps-config"
 version.workspace = true
 edition.workspace = true
-description = "Platform settings service and handlers, plus cluster CA, node enrollment tokens, installation secrets, disk status and retention settings"
+description = "Platform settings service, plus cluster CA, node enrollment tokens, installation secrets, disk status, retention settings and deployment config inheritance and validation"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 temps-core = { path = "../temps-core" }
-temps-clickhouse = { path = "../temps-clickhouse" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 yaml_serde = { workspace = true }
-serde_path_to_error = { workspace = true }
 tokio = { workspace = true }
 dirs = { workspace = true }
 thiserror = { workspace = true }
@@ -33,14 +30,19 @@ serde_derive = { workspace = true }
 uuid = { workspace = true }
 utoipa = { workspace = true }
 sysinfo = { workspace = true }
-axum = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 tracing = { workspace = true }
 sqlx = { workspace = true }
+# The control plane's mutual-TLS clients for node agents (`node_client`).
+reqwest = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tempfile = { workspace = true }
+x509-parser = { workspace = true }
 
 [lints]
 workspace = true

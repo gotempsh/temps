@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-workload = { path = "../temps-workload" }
 temps-netpol-ebpf-common = { path = "../temps-netpol-ebpf-common" }
 arc-swap = { workspace = true }

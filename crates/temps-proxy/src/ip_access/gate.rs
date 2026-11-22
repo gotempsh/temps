@@ -1209,14 +1209,12 @@ mod tests {
     #[tokio::test]
     async fn change_feed_triggers_drive_delta_refreshes_on_a_real_database() -> anyhow::Result<()> {
         use sea_orm::ConnectionTrait;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_database = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping IP access change feed test: Docker runtime unavailable");
                 return Ok(());

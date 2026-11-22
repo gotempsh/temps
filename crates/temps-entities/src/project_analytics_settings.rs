@@ -25,6 +25,10 @@ pub struct Model {
     /// Flag events whose referrer is on the bundled referrer-spam list as
     /// non-human. Defaults to `true`.
     pub exclude_spam_referrers: bool,
+    /// Apply `identify` calls made from the browser (ADR 109 D4). When
+    /// `false`, only the app's backend can identify a visitor. Defaults to
+    /// `true`.
+    pub accept_browser_identify: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

@@ -347,6 +347,13 @@ mod on_demand_http_tests {
         RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: "127.0.0.1:8080".to_string(),
                     container_id: None,
                     container_name: None,

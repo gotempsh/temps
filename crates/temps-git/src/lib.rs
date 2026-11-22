@@ -30,3 +30,4 @@ pub use services::pr_commenter::{
     CommentPhase, GitPrCommenter, PrCommenter, PrCommenterError, PreviewCommentContext,
 };
 pub use services::repository_directory::{MissingRepositoryDirectory, RepositoryDirectoryCheck};
+pub use services::source_control::GitSourceControl;

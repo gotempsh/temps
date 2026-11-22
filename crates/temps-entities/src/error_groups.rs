@@ -34,8 +34,48 @@ pub struct Model {
     pub total_count: i32,
 
     // Status management
-    pub status: String, // 'unresolved', 'resolved', 'ignored', 'assigned'
-    pub assigned_to: Option<String>, // User ID or email
+    pub status: String, // 'unresolved', 'resolved', 'ignored'
+    /// Legacy free-text assignee, read-only since ADR 111 D1.6: a value the
+    /// migration could not match to a user. New assignments use
+    /// `assignee_user_id` or `assignee_team_id`.
+    pub assigned_to: Option<String>,
+    /// The user the group is assigned to (ADR 111, D1.6). At most one of
+    /// this and `assignee_team_id` is set.
+    pub assignee_user_id: Option<i32>,
+    /// The team the group is assigned to.
+    pub assignee_team_id: Option<i32>,
+
+    /// Set when this group was merged into another one (ADR 111, D1.2): its
+    /// fingerprints now route to that group and new events land there. The
+    /// row keeps its own events and `total_count` so unmerging restores both
+    /// exactly, and lists and status counts skip it while this is set.
+    pub merged_into_group_id: Option<i32>,
+
+    // Ignore conditions (ADR 111, D1.3), read only while `status` is
+    // 'ignored'. With none set, the next event reopens the group; otherwise
+    // it stays ignored until any condition is met.
+    /// Stay ignored until this time.
+    pub ignore_until: Option<DBDateTime>,
+    /// Stay ignored until `total_count` reaches this value.
+    pub ignore_until_event_count: Option<i32>,
+    /// Stay ignored until this many new distinct users are affected.
+    pub ignore_until_user_count: Option<i32>,
+    /// New distinct users seen since the group was ignored.
+    pub ignore_user_count: i32,
+    /// Stay ignored whatever happens.
+    pub ignore_forever: bool,
+
+    /// Resolved "in the next release" (ADR 111, D1.5), read only while
+    /// `status` is 'resolved': events from `resolved_in_release_after_id` or
+    /// an older release, and events with no release, keep it resolved; an
+    /// event from a newer release reopens it.
+    pub resolved_in_next_release: bool,
+    /// The newest release of the project when the group was resolved.
+    pub resolved_in_release_after_id: Option<i32>,
+
+    /// `error` for a group filed from an exception, `performance` for one a
+    /// trace detector filed (ADR 111, D2).
+    pub issue_type: String,
 
     // Relations
     pub project_id: i32,
@@ -117,46 +157,3 @@ impl Related<super::error_events::Entity> for Entity {
 }
 
 impl ActiveModelBehavior for ActiveModel {}
-
-impl Model {
-    /// Tokenize the error message using the provided tokenizer
-    pub fn tokenize_message(
-        &self,
-        tokenizer: &dyn crate::tokenizer::Tokenizer,
-    ) -> Result<Vec<u32>, crate::tokenizer::TokenizerError> {
-        let text = self.message_template.as_deref().unwrap_or(&self.title);
-        tokenizer.encode(text)
-    }
-
-    /// Create a vector embedding from tokenized message
-    /// This converts token IDs to a fixed-size vector representation
-    pub fn create_embedding_from_tokens(tokens: &[u32], embedding_size: usize) -> PgVector {
-        // Simple approach: use token frequency as features
-        let mut embedding = vec![0.0; embedding_size];
-
-        for &token in tokens {
-            let idx = (token as usize) % embedding_size;
-            embedding[idx] += 1.0;
-        }
-
-        // Normalize
-        let sum: f32 = embedding.iter().sum();
-        if sum > 0.0 {
-            for val in &mut embedding {
-                *val /= sum;
-            }
-        }
-
-        PgVector(embedding)
-    }
-
-    /// Convenience method to tokenize and create embedding in one step
-    pub fn tokenize_and_embed(
-        &self,
-        tokenizer: &dyn crate::tokenizer::Tokenizer,
-        embedding_size: usize,
-    ) -> Result<PgVector, crate::tokenizer::TokenizerError> {
-        let tokens = self.tokenize_message(tokenizer)?;
-        Ok(Self::create_embedding_from_tokens(&tokens, embedding_size))
-    }
-}

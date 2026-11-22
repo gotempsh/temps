@@ -16,6 +16,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::auth::{require_agent_auth, AgentAuth};
 use crate::handlers::{self, AgentApiDoc, AgentState};
 use crate::sandbox_handlers::{self, SandboxHost, SandboxHostState, SANDBOX_UPLOAD_BODY_LIMIT};
+use crate::sealed_requests::{open_sealed_requests, open_sealed_uploads, SealedRequestState};
 use crate::service_handlers;
 use crate::AgentConfig;
 use temps_deployer::docker_socket_grant::DockerSocketGrant;
@@ -63,25 +64,26 @@ pub fn build_router(
     config: &AgentConfig,
     network: SharedNetwork,
     platform: SharedPlatform,
+    engines: AgentEngines,
 ) -> Router {
     // ADR-048: the worker hosts sandboxes with the same Docker provider the
     // control plane uses for local ones.
     let sandbox_host = docker.clone().map(|docker| {
         let docker = Arc::new(docker);
-        let provider = Arc::new(
-            temps_ai_agents::sandbox::docker::DockerSandboxProvider::new(
-                docker.clone(),
-                temps_ai_agents::sandbox::docker::DockerSandboxConfig {
-                    control_plane_url: config.control_plane_url.clone(),
-                    // Bound exec output while Docker streams it, not after: the
-                    // exec response is cut to this size anyway.
-                    exec_output_limit: Some(
-                        temps_ai_agents::sandbox::remote::WORKER_EXEC_OUTPUT_LIMIT,
-                    ),
-                    ..Default::default()
-                },
-            ),
+        let provider = temps_sandbox_providers::docker::DockerSandboxProvider::new(
+            docker.clone(),
+            temps_sandbox_providers::docker::DockerSandboxConfig {
+                control_plane_url: config.control_plane_url.clone(),
+                // Bound exec output while Docker streams it, not after: the
+                // exec response is cut to this size anyway.
+                exec_output_limit: Some(temps_sandbox_providers::remote::WORKER_EXEC_OUTPUT_LIMIT),
+                ..Default::default()
+            },
         );
+        #[cfg(target_os = "linux")]
+        let provider = provider
+            .with_service_access_root(config.compose_data_dir().join("service-access-mounts"));
+        let provider = Arc::new(provider);
         spawn_sandbox_quarantine(provider.clone(), config.node_name.clone());
         SandboxHost {
             provider,
@@ -100,6 +102,8 @@ pub fn build_router(
     ));
     let state = Arc::new(AgentState {
         container_deployer,
+        service_runtime: engines.service_runtime,
+        plugin_builder: engines.plugin_builder,
         image_builder,
         docker,
         overlay_bridge_address: network.overlay_bridge_address,
@@ -110,9 +114,11 @@ pub fn build_router(
     let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
+    let sealed_requests = SealedRequestState::from_config(config);
 
     let runtime_health_routes = crate::runtime_health::router(runtime_docker, config, auth.clone());
     let worker_metrics_routes = crate::worker_metrics::router(config, auth.clone());
+    let uptime_probe_routes = crate::uptime_probe::router(auth.clone(), sealed_requests.clone());
 
     // API routes — all protected by bearer token auth
     let api_routes = Router::new()
@@ -190,6 +196,14 @@ pub fn build_router(
         )
         .route("/agent/images/scan", post(crate::build_handler::scan_image))
         .route("/agent/images/{name}/exists", get(handlers::image_exists))
+        .route(
+            temps_deployer::remote::REMOVE_IMAGES_PATH,
+            post(handlers::remove_images),
+        )
+        .route(
+            temps_deployer::remote::LIST_OWNED_IMAGES_PATH,
+            post(handlers::list_owned_images),
+        )
         .route("/agent/health", get(handlers::health_check))
         // Service management routes
         .route("/agent/services", post(service_handlers::create_service))
@@ -220,9 +234,27 @@ pub fn build_router(
             "/agent/services/{name}/snapshot",
             get(service_handlers::service_snapshot),
         )
+        // Read-only observation for the service page: runtime state,
+        // resource samples and the Postgres WAL probe.
+        .route(
+            "/agent/services/{name}/runtime",
+            get(crate::service_observe_handlers::service_runtime),
+        )
+        .route(
+            "/agent/services/{name}/stats",
+            get(crate::service_observe_handlers::service_stats),
+        )
+        .route(
+            "/agent/services/wal-health",
+            post(crate::service_observe_handlers::wal_health),
+        )
         .route(
             "/agent/services/runtime-env",
             post(service_handlers::runtime_env),
+        )
+        .route(
+            "/agent/services/runtime-env-preview",
+            post(service_handlers::runtime_env_preview),
         )
         .route(
             "/agent/services/revoke-s3-access",
@@ -231,7 +263,8 @@ pub fn build_router(
         .route(
             "/agent/services/health-probe",
             post(service_handlers::health_probe),
-        )
+        );
+    let api_routes = service_data_routes(api_routes)
         .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
@@ -267,37 +300,132 @@ pub fn build_router(
             "/agent/compose/remove-verified",
             post(crate::compose_handlers::remove_verified),
         )
+        // Layers run outermost-last: authentication comes first, so only an
+        // authenticated caller can make the agent decrypt anything.
+        .layer(middleware::from_fn(open_sealed_requests))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth.clone()))
         .layer(Extension(resource_limits))
         .layer(Extension(compose_state))
+        .layer(Extension(sealed_requests.clone()))
         .with_state(state);
 
-    let sandbox_routes = sandbox_router(sandbox_state, auth);
+    let sandbox_routes = sandbox_router(sandbox_state, auth, sealed_requests);
 
     // Swagger UI — no auth required so it's accessible for documentation
     let mut api = AgentApiDoc::openapi();
     api.merge(crate::runtime_health::RuntimeHealthApiDoc::openapi());
     api.merge(crate::worker_metrics::WorkerMetricsApiDoc::openapi());
+    api.merge(crate::uptime_probe::UptimeProbeApiDoc::openapi());
     let swagger_ui = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", api);
 
     api_routes
         .merge(sandbox_routes)
         .merge(runtime_health_routes)
         .merge(worker_metrics_routes)
+        .merge(uptime_probe_routes)
         .merge(swagger_ui)
 }
 
+/// The agent's backup and in-place restore routes of a worker's services:
+/// the control plane's own engines run on this node (ADR-099). Every body is
+/// sealed, because it carries a credential (one scoped to the job, ADR-102).
+fn service_data_routes(router: Router<Arc<AgentState>>) -> Router<Arc<AgentState>> {
+    router
+        .route(
+            "/agent/services/data-backup",
+            post(crate::service_data_handlers::data_backup),
+        )
+        .route(
+            "/agent/services/data-restore",
+            post(crate::service_data_handlers::data_restore),
+        )
+        .route(
+            "/agent/services/postgres/walg-backup",
+            post(crate::service_data_handlers::postgres_walg_backup),
+        )
+        .route(
+            "/agent/services/postgres/walg-backup/outcome",
+            post(crate::service_data_handlers::postgres_walg_backup_outcome),
+        )
+        .route(
+            "/agent/services/postgres/cluster-walg-backup",
+            post(crate::service_data_handlers::postgres_cluster_walg_backup),
+        )
+        .route(
+            "/agent/services/postgres/walg-restore",
+            post(crate::service_data_handlers::postgres_walg_restore),
+        )
+        .route(
+            "/agent/services/restore/outcome",
+            post(crate::service_data_handlers::worker_restore_outcome),
+        )
+        .route(
+            "/agent/services/postgres/walg-archive",
+            post(crate::service_data_handlers::postgres_walg_archive),
+        )
+        // The control plane's MariaDB engines, run on this node (ADR-099).
+        .route(
+            "/agent/services/mariadb/physical-backup",
+            post(crate::service_mariadb_handlers::mariadb_physical_backup),
+        )
+        .route(
+            "/agent/services/mariadb/dump-backup",
+            post(crate::service_mariadb_handlers::mariadb_dump_backup),
+        )
+        .route(
+            "/agent/services/mariadb/restore",
+            post(crate::service_mariadb_handlers::mariadb_restore),
+        )
+        .route(
+            "/agent/services/mariadb/binlog-archive",
+            post(crate::service_mariadb_handlers::mariadb_binlog_archive),
+        )
+        .route(
+            "/agent/services/postgres/walg-credentials",
+            post(crate::service_data_handlers::postgres_walg_credentials),
+        )
+        .route(
+            "/agent/services/mongodb/backup",
+            post(crate::service_data_handlers::mongodb_backup),
+        )
+        .route(
+            "/agent/services/mongodb/restore",
+            post(crate::service_data_handlers::mongodb_restore),
+        )
+        .route(
+            "/agent/services/redis/walg-backup",
+            post(crate::service_data_handlers::redis_walg_backup),
+        )
+        .route(
+            "/agent/services/redis/rdb-backup",
+            post(crate::service_data_handlers::redis_rdb_backup),
+        )
+        .route(
+            "/agent/services/redis/restore",
+            post(crate::service_data_handlers::redis_restore),
+        )
+}
+
 /// ADR-048 sandbox host API — same auth as every other agent route. File
-/// and directory uploads travel base64-encoded in JSON, so only those two
-/// routes raise the body limit (to [`SANDBOX_UPLOAD_BODY_LIMIT`]) and only
-/// they take an upload slot ([`sandbox_handlers::limit_uploads`]); every
-/// other route keeps axum's 2 MiB default.
-pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<AgentAuth>) -> Router {
+/// and directory uploads travel base64-encoded in JSON and use upload slots.
+/// Signed service-access policies have a separate eight MiB/two-slot budget;
+/// other routes keep axum's two MiB default.
+pub(crate) fn sandbox_router(
+    sandbox_state: Arc<SandboxHostState>,
+    auth: Arc<AgentAuth>,
+    sealed_requests: Arc<SealedRequestState>,
+) -> Router {
     let upload_slot =
         || middleware::from_fn_with_state(sandbox_state.clone(), sandbox_handlers::limit_uploads);
     Router::new()
         .route("/agent/sandboxes", post(sandbox_handlers::create_sandbox))
+        .route(
+            sandbox_handlers::service_access::PATH,
+            post(sandbox_handlers::service_access::command).layer(
+                axum::extract::DefaultBodyLimit::max(sandbox_handlers::service_access::BODY_LIMIT),
+            ),
+        )
         .route(
             "/agent/sandboxes/exec",
             post(sandbox_handlers::exec_sandbox),
@@ -320,6 +448,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
                 .layer(axum::extract::DefaultBodyLimit::max(
                     SANDBOX_UPLOAD_BODY_LIMIT,
                 ))
+                .layer(middleware::from_fn(open_sealed_uploads))
                 .layer(upload_slot()),
         )
         .route(
@@ -328,6 +457,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
                 .layer(axum::extract::DefaultBodyLimit::max(
                     SANDBOX_UPLOAD_BODY_LIMIT,
                 ))
+                .layer(middleware::from_fn(open_sealed_uploads))
                 .layer(upload_slot()),
         )
         .route(
@@ -372,6 +502,18 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
             post(sandbox_handlers::sandbox_image_identity),
         )
         .route(
+            "/agent/sandboxes/image-prepare",
+            post(sandbox_handlers::prepare_sandbox_image),
+        )
+        .route(
+            "/agent/sandboxes/image-prepare-status",
+            post(sandbox_handlers::sandbox_image_prepare_status),
+        )
+        .route(
+            "/agent/sandboxes/image-remove",
+            post(sandbox_handlers::remove_sandbox_image),
+        )
+        .route(
             "/agent/sandboxes/agent-runtime-check",
             post(sandbox_handlers::check_sandbox_agent_runtime),
         )
@@ -387,8 +529,14 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
             sandbox_state.clone(),
             sandbox_handlers::redact_host_paths,
         ))
+        .layer(middleware::from_fn(open_sealed_requests))
+        .layer(middleware::from_fn_with_state(
+            sandbox_state.clone(),
+            sandbox_handlers::service_access::limit,
+        ))
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(sealed_requests))
         .with_state(sandbox_state)
 }
 
@@ -399,7 +547,7 @@ pub(crate) fn sandbox_router(sandbox_state: Arc<SandboxHostState>, auth: Arc<Age
 /// is logged, not fatal — the node still refuses to recover a stale sandbox
 /// when it is next accessed.
 fn spawn_sandbox_quarantine(
-    provider: Arc<temps_ai_agents::sandbox::docker::DockerSandboxProvider>,
+    provider: Arc<temps_sandbox_providers::docker::DockerSandboxProvider>,
     node_name: String,
 ) {
     let Ok(runtime) = tokio::runtime::Handle::try_current() else {
@@ -482,6 +630,7 @@ fn spawn_heartbeat_loop(
     docker_socket_grant: DockerSocketGrant,
     wakers: HeartbeatWakers,
     resolver_address: Arc<std::sync::RwLock<Option<std::net::IpAddr>>>,
+    labels_settings: crate::labels::LabelsSettings,
 ) {
     let HeartbeatWakers {
         mesh_listener,
@@ -491,7 +640,16 @@ fn spawn_heartbeat_loop(
     let heartbeat_client = crate::control_plane_client_builder(config);
     let node_id = config.node_id;
     let token = config.token.clone();
-    let labels = config.labels.clone();
+    // ADR-091: labels saved in agent.json are reloaded while the agent runs
+    // (`temps agent labels set`); a change wakes the heartbeat. `kept_sender`
+    // holds the channel open when nothing reloads.
+    let enrollment = crate::labels::Enrollment {
+        node_id: config.node_id,
+        control_plane_url: config.control_plane_url.clone(),
+    };
+    let (mut labels_rx, kept_sender) =
+        crate::labels::watch_labels(&labels_settings, config.labels.clone(), enrollment.clone());
+    let mut accepted_labels = crate::labels::AcceptedLabels::new(labels_settings, enrollment);
     // ADR 045: advertise this host's own grant so the control plane can gate
     // placement up front instead of discovering mid-deploy that the node would
     // have deployed the project without the socket. Snapshotted once at
@@ -500,6 +658,7 @@ fn spawn_heartbeat_loop(
     let docker_socket_projects = docker_socket_grant.to_vec();
 
     tokio::spawn(async move {
+        let _kept_sender = kept_sender;
         // Strict TLS — the worker→control-plane heartbeat carries the
         // node's auth token. A MitM with a self-signed cert here would
         // capture the token and impersonate this worker. There is no
@@ -537,7 +696,8 @@ fn spawn_heartbeat_loop(
         let mut addresses_sent: Option<Vec<crate::overlay_addresses::OverlayAddress>> = None;
         let mut beats_since_addresses_sent: u32 = 0;
         let mut capacity_sampler = CapacitySampler::new();
-        let mut resolver_coverage = temps_deployer::resolver_coverage::ResolverCoverage::new();
+        let mut resolver_coverage =
+            temps_deployer::resolver_coverage::ResolverCoverage::for_node(node_id);
 
         let mut last_beat: Option<tokio::time::Instant> = None;
 
@@ -553,6 +713,17 @@ fn spawn_heartbeat_loop(
                         mesh_listener = ?mesh_listener.get(),
                         "the agent API's mesh listener changed; sending a heartbeat now"
                     );
+                }
+                // ADR-091: labels changed in agent.json are reported at
+                // once, so `temps agent labels set` can confirm them.
+                Ok(()) = labels_rx.changed() => {
+                    tracing::info!(node_id, "labels changed; sending a heartbeat now");
+                    if let Some(last) = last_beat {
+                        let gap = last.elapsed();
+                        if gap < EARLY_BEAT_MIN_GAP {
+                            tokio::time::sleep(EARLY_BEAT_MIN_GAP - gap).await;
+                        }
+                    }
                 }
                 // ADR-055 §7: a changed instance report is sent early rather
                 // than up to 30 s late, but never more often than once per
@@ -581,6 +752,22 @@ fn spawn_heartbeat_loop(
                     temps_core::node_address::AGENT_MESH_LISTENER_KEY.to_string(),
                     value,
                 );
+            }
+            // A Mac worker says so (ADR 090): the console labels it and shows
+            // it asleep rather than broken while the Mac sleeps.
+            if let (Some(host), Some(fields)) = (
+                crate::mac_worker::heartbeat_host(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(temps_core::node_address::AGENT_HOST_KEY.to_string(), host);
+            }
+            // Whether `<env>.<project>.temps.local` names, which resolve to
+            // this node's bridge, are actually served here, and why not.
+            if let (Some(proxy), Some(fields)) = (
+                crate::internal_routing::heartbeat_value(),
+                capacity.as_object_mut(),
+            ) {
+                fields.insert(crate::internal_routing::HEARTBEAT_KEY.to_string(), proxy);
             }
             // The node runtime's reports: only those that changed since the
             // last accepted beat.
@@ -640,6 +827,9 @@ fn spawn_heartbeat_loop(
                 known_platform
             };
 
+            let current = labels_rx.borrow_and_update().clone();
+            accepted_labels.sending(&current);
+            let labels = current.labels;
             let mut body = serde_json::json!({
                 "capacity": capacity,
                 "labels": labels,
@@ -747,6 +937,11 @@ fn spawn_heartbeat_loop(
                 .unwrap_or_default();
             if let Some(overlay) = &overlay_snapshot.overlay {
                 body["overlay"] = serde_json::json!(overlay);
+            }
+            // ADR 062: the network ID this node follows, from the first poll
+            // on, so the control plane knows it can change the cluster's.
+            if let Some(vni) = overlay_snapshot.vxlan_vni {
+                body["overlay_vxlan_vni"] = serde_json::json!(vni);
             }
             let occupied_to_send = overlay_snapshot
                 .occupied_ranges
@@ -873,6 +1068,7 @@ fn spawn_heartbeat_loop(
                             addresses_sent = Some(addresses);
                             beats_since_addresses_sent = 0;
                         }
+                        accepted_labels.accepted(&labels).await;
                         tracing::debug!(node_id = node_id, "Heartbeat sent to control plane");
                         break;
                     }
@@ -1121,19 +1317,35 @@ fn validate_agent_transport(config: &AgentConfig) -> Result<(), crate::AgentErro
     Ok(())
 }
 
-/// Options of [`start_agent_server_with`] that older callers do not set.
-#[derive(Debug, Clone)]
+/// Options of [`start_agent_server_with`].
+#[derive(Clone)]
 pub struct AgentServerOptions {
     /// Run the node runtime and advertise the `state_stream` capability
     /// (ADR-055 §7). Off, the agent is driven through `/agent/*` only, as
     /// before; `temps agent --disable-state-stream` is the rollback.
     pub state_stream: bool,
+    pub engines: AgentEngines,
+    /// Where the reported labels come from, and whether they are reloaded
+    /// from `agent.json` (ADR-091). The default reloads nothing.
+    pub labels: crate::labels::LabelsSettings,
 }
 
-impl Default for AgentServerOptions {
-    fn default() -> Self {
-        Self { state_stream: true }
+impl AgentServerOptions {
+    pub fn new(engines: AgentEngines) -> Self {
+        Self {
+            state_stream: true,
+            engines,
+            labels: crate::labels::LabelsSettings::default(),
+        }
     }
+}
+
+/// The heavy code a worker calls but does not build: the database engines and
+/// the plugin compiler. The binary that starts the agent passes them in.
+#[derive(Clone)]
+pub struct AgentEngines {
+    pub service_runtime: Arc<dyn temps_service_protocol::NodeServiceRuntime>,
+    pub plugin_builder: Arc<dyn crate::plugin_build_handler::PluginContainerBuilder>,
 }
 
 /// Start the agent server. This blocks until the server shuts down.
@@ -1144,6 +1356,7 @@ pub async fn start_agent_server(
     config: AgentConfig,
     network: SharedNetwork,
     docker_socket_grant: DockerSocketGrant,
+    engines: AgentEngines,
 ) -> Result<(), crate::AgentError> {
     start_agent_server_with(
         container_deployer,
@@ -1152,7 +1365,7 @@ pub async fn start_agent_server(
         config,
         network,
         docker_socket_grant,
-        AgentServerOptions::default(),
+        AgentServerOptions::new(engines),
     )
     .await
 }
@@ -1200,14 +1413,25 @@ pub async fn start_agent_server_with(
         &config,
         network.clone(),
         platform.clone(),
+        options.engines.clone(),
     );
+    // ADR-095: the resolver's report and test resolution. The same slot
+    // goes to the network-sync loop, which starts the resolver.
+    let agent_dns: crate::dns_report::SharedAgentDns = Arc::default();
+    let router = router.merge(crate::dns_report::router(
+        agent_dns.clone(),
+        Arc::new(AgentAuth::new(&config.token)),
+    ));
 
     // Shared DNS resolver health (ADR-024) and overlay report (ADR 056)
     // slots. Written by the network-sync loop below on every tick, read by
     // the heartbeat loop so the control plane learns resolver and overlay
     // health without an operator SSHing in to read logs. Live for the
     // agent's process lifetime, same as `platform`.
-    let health = crate::network_sync::HealthSlots::default();
+    let health = crate::network_sync::HealthSlots {
+        dns_report: agent_dns,
+        ..Default::default()
+    };
 
     // This node's mesh address (published by the network-sync loop) and the
     // address the agent API is served on over the mesh (reported by the
@@ -1266,6 +1490,7 @@ pub async fn start_agent_server_with(
             node_runtime,
         },
         network.overlay_bridge_address.clone(),
+        options.labels.clone(),
     );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
@@ -1511,6 +1736,101 @@ pub(crate) mod tests {
         }
     }
 
+    /// ADR-091 end to end on the agent side: `temps agent labels set`
+    /// rewrites agent.json, and the running heartbeat loop reports the new
+    /// labels to the control plane without a restart, then records them.
+    #[tokio::test]
+    async fn a_label_change_in_agent_json_reaches_the_control_plane_without_a_restart() {
+        let beats: Arc<std::sync::Mutex<Vec<serde_json::Value>>> = Default::default();
+        let recorded = beats.clone();
+        let control_plane = Router::new().route(
+            "/api/internal/nodes/{id}/heartbeat",
+            post(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let recorded = recorded.clone();
+                async move {
+                    recorded.lock().unwrap().push(body);
+                    axum::Json(serde_json::json!({"status": "ok"}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, control_plane).await.unwrap() });
+
+        let dir = tempfile::tempdir().unwrap();
+        let agent_json = dir.path().join("agent.json");
+        let saved = |labels: &str| {
+            format!(r#"{{"node_id":1,"control_plane_url":"{url}","labels":{labels}}}"#)
+        };
+        std::fs::write(&agent_json, saved(r#"{"zone":"a"}"#)).unwrap();
+        let mut config = test_agent_config(false);
+        config.node_id = 1;
+        config.control_plane_url = url.clone();
+        config.labels = serde_json::json!({"zone": "a"});
+        // Nothing answers here: the inventory listing fails and is skipped.
+        let deployer = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "worker-1".into(),
+            )
+            .unwrap(),
+        );
+        spawn_heartbeat_loop(
+            &config,
+            deployer,
+            Arc::new(std::sync::Mutex::new(None)),
+            None,
+            Default::default(),
+            DockerSocketGrant::default(),
+            HeartbeatWakers {
+                mesh_listener: Default::default(),
+                node_runtime: None,
+            },
+            Default::default(),
+            crate::labels::LabelsSettings {
+                origin: crate::labels::LabelsOrigin::AgentJson,
+                data_dir: Some(dir.path().to_path_buf()),
+            },
+        );
+
+        let accepted = |labels: serde_json::Value| {
+            let dir = dir.path().to_path_buf();
+            async move {
+                tokio::time::timeout(Duration::from_secs(25), async {
+                    loop {
+                        if crate::labels::read_status(&dir)
+                            .is_some_and(|status| status.labels == labels)
+                        {
+                            return;
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                })
+                .await
+                .expect("the control plane accepted these labels and the agent recorded them")
+            }
+        };
+        accepted(serde_json::json!({"zone": "a"})).await;
+        let first_beats = beats.lock().unwrap().len();
+
+        std::fs::write(
+            &agent_json,
+            saved(r#"{"zone":"a","temps.sh/role":"dedicated"}"#),
+        )
+        .unwrap();
+        let wanted = serde_json::json!({"zone": "a", "temps.sh/role": "dedicated"});
+        accepted(wanted.clone()).await;
+        let beats = beats.lock().unwrap();
+        // Sent early, not at the next 30-second tick.
+        assert!(beats.len() > first_beats);
+        assert_eq!(beats.last().unwrap()["labels"], wanted);
+        let status = crate::labels::read_status(dir.path()).unwrap();
+        assert_eq!(status.origin, crate::labels::LabelsOrigin::AgentJson);
+        assert_eq!(status.node_id, 1);
+        assert_eq!(status.control_plane_url.as_deref(), Some(url.as_str()));
+    }
+
     #[test]
     fn required_mtls_rejects_missing_identity() {
         let error = validate_agent_transport(&test_agent_config(true)).unwrap_err();
@@ -1691,7 +2011,8 @@ pub(crate) mod tests {
     }
 
     /// Every sandbox host route, as the control plane's client calls it.
-    const SANDBOX_ROUTES: [&str; 19] = [
+    const SANDBOX_ROUTES: [&str; 23] = [
+        "/agent/sandboxes/service-access",
         "/agent/sandboxes",
         "/agent/sandboxes/exec",
         "/agent/sandboxes/exec-stream",
@@ -1709,6 +2030,9 @@ pub(crate) mod tests {
         "/agent/sandboxes/resize-disk",
         "/agent/sandboxes/egress-policy",
         "/agent/sandboxes/image-identity",
+        "/agent/sandboxes/image-prepare",
+        "/agent/sandboxes/image-prepare-status",
+        "/agent/sandboxes/image-remove",
         "/agent/sandboxes/agent-runtime-check",
         "/agent/sandboxes/recover-agent-harness",
     ];
@@ -1721,7 +2045,14 @@ pub(crate) mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
         (
-            sandbox_router(state, Arc::new(AgentAuth::new("secret"))),
+            sandbox_router(
+                state,
+                Arc::new(AgentAuth::new("secret")),
+                Arc::new(SealedRequestState {
+                    key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                    node_name: "test-node".to_string(),
+                }),
+            ),
             root,
         )
     }
@@ -1737,6 +2068,366 @@ pub(crate) mod tests {
             request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
         }
         request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    /// The deploy routes and sandbox routes as the agent really mounts them:
+    /// authentication first, then the seal, then the handler.
+    fn sealed_test_app(private_key: Option<String>) -> Router {
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let mut config = test_agent_config(false);
+        config.public_ingress_private_key = private_key;
+        build_router(
+            remote.clone(),
+            remote,
+            None,
+            &config,
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
+        )
+    }
+
+    fn sealed_request(
+        path: &str,
+        token: Option<&str>,
+        body: Vec<u8>,
+    ) -> axum::http::Request<axum::body::Body> {
+        let mut request = axum::http::Request::builder()
+            .method("POST")
+            .uri(path)
+            .header(
+                axum::http::header::CONTENT_TYPE,
+                temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+            );
+        if let Some(token) = token {
+            request = request.header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"));
+        }
+        request.body(axum::body::Body::from(body)).unwrap()
+    }
+
+    #[tokio::test]
+    async fn sealed_requests_are_authenticated_then_opened_then_handled_on_every_router() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        for path in [
+            "/agent/containers/deploy",
+            "/agent/v2/containers/deploy",
+            "/agent/services",
+            "/agent/services/exec",
+            "/agent/services/workload",
+            "/agent/services/wal-health",
+            "/agent/services/data-backup",
+            "/agent/services/data-restore",
+            "/agent/services/restore/outcome",
+            "/agent/services/mariadb/physical-backup",
+            "/agent/services/mariadb/dump-backup",
+            "/agent/services/mariadb/restore",
+            "/agent/services/mariadb/binlog-archive",
+            "/agent/sandboxes",
+            "/agent/sandboxes/exec",
+            "/agent/sandboxes/write-file",
+            "/agent/sandboxes/write-directory",
+            "/agent/images/pull",
+        ] {
+            let sealed = NodeSealing::Key(public.clone())
+                .seal("test-node", path, br#"{"not":"a valid request"}"#)
+                .unwrap();
+
+            // No token: refused before anything is decrypted.
+            let response = sealed_test_app(Some(private.clone()))
+                .oneshot(sealed_request(path, None, sealed.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // Authenticated: opened, and the handler's own validation answers.
+            // Without the seal being opened this would be 415 or 400.
+            let response = sealed_test_app(Some(private.clone()))
+                .oneshot(sealed_request(path, Some(&token), sealed))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+        }
+    }
+
+    /// A restore this node never received (or ran before its agent
+    /// restarted) is reported as unknown, not as running or failed: the
+    /// control plane must not guess its outcome.
+    #[tokio::test]
+    async fn a_restore_outcome_the_node_never_recorded_is_unknown() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let path = "/agent/services/restore/outcome";
+        let sealed = NodeSealing::Key(public)
+            .seal(
+                "test-node",
+                path,
+                br#"{"engine":"mongodb","service":"orders","operation_id":"restore-run-404"}"#,
+            )
+            .unwrap();
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(path, Some(&token), sealed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["success"], true, "{body}");
+        assert_eq!(
+            body["data"],
+            serde_json::json!({"state": "unknown"}),
+            "{body}"
+        );
+    }
+
+    /// The service page's read-only routes take the node token like every
+    /// other `/agent/services/*` route: a container's state and usage are
+    /// not public.
+    #[tokio::test]
+    async fn service_observation_routes_require_the_node_token() {
+        use axum::http::StatusCode;
+        use tower::ServiceExt;
+        let token = test_agent_config(false).token;
+        for path in [
+            "/agent/services/postgres-orders/runtime",
+            "/agent/services/postgres-orders/stats?samples=2",
+        ] {
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+
+            // With the token the handler answers: this test router has no
+            // Docker, so it says so instead of 401.
+            let response = sealed_test_app(None)
+                .oneshot(
+                    axum::http::Request::get(path)
+                        .header(axum::http::header::AUTHORIZATION, format!("Bearer {token}"))
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+    }
+
+    /// A sealed attachment is bigger than the limit on other sealed requests.
+    #[tokio::test]
+    async fn sealed_sandbox_uploads_use_the_upload_limit_and_other_routes_do_not() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::{
+            NodeSealing, MAX_SEALED_REQUEST_BYTES, MAX_SEALED_UPLOAD_BYTES,
+        };
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let path = "/agent/sandboxes/write-file";
+        let body = format!(
+            r#"{{"padding":"{}"}}"#,
+            "x".repeat(MAX_SEALED_REQUEST_BYTES)
+        );
+        let sealed = NodeSealing::Key(public.clone())
+            .seal("test-node", path, body.as_bytes())
+            .unwrap();
+        assert!(sealed.len() > MAX_SEALED_REQUEST_BYTES);
+        assert!(sealed.len() < MAX_SEALED_UPLOAD_BYTES);
+
+        // Opened: the handler's own validation is what answers.
+        let response = sealed_test_app(Some(private.clone()))
+            .oneshot(sealed_request(path, Some(&token), sealed))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+        let response = sealed_test_app(Some(private.clone()))
+            .oneshot(sealed_request(
+                "/agent/sandboxes/exec",
+                Some(&token),
+                vec![b'x'; MAX_SEALED_REQUEST_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(
+                path,
+                Some(&token),
+                vec![b'x'; MAX_SEALED_UPLOAD_BYTES + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Client to agent to container runtime: the values arrive complete. The
+    /// agent's runtime here is itself a remote deployer, so what it was handed
+    /// can be read back from the far side without Docker.
+    #[tokio::test]
+    async fn a_sealed_deploy_reaches_the_container_runtime_with_every_value() {
+        use temps_core::sealed_request::{open_request, NodeSealing};
+        use temps_deployer::{ContainerDeployer, DeployRequest};
+
+        let runtime_seen: Arc<std::sync::Mutex<Option<Vec<u8>>>> = Default::default();
+        let recorded = runtime_seen.clone();
+        let runtime = Router::new().fallback(move |body: axum::body::Bytes| {
+            let recorded = recorded.clone();
+            async move {
+                *recorded.lock().unwrap() = Some(body.to_vec());
+                axum::Json(serde_json::json!({
+                    "success": true,
+                    "data": {
+                        "container_id": "abc",
+                        "container_name": "app-1",
+                        "container_port": 80,
+                        "host_port": 0,
+                        "status": { "Running": null },
+                    },
+                    "error": null,
+                }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let runtime_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, runtime).await.unwrap() });
+
+        let (runtime_private, runtime_public) =
+            temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                runtime_url,
+                "unused".into(),
+                "runtime".into(),
+            )
+            .unwrap()
+            .with_sealing(NodeSealing::Key(runtime_public)),
+        );
+
+        let (node_private, node_public) =
+            temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let mut config = test_agent_config(false);
+        config.public_ingress_private_key = Some(node_private);
+        let agent = build_router(
+            runtime.clone(),
+            runtime,
+            None,
+            &config,
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let agent_url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, agent).await.unwrap() });
+
+        let control_plane = temps_deployer::remote::RemoteNodeDeployer::new(
+            agent_url,
+            config.token.clone(),
+            "worker-1".into(),
+        )
+        .unwrap()
+        .with_sealing(NodeSealing::Key(node_public));
+        let result = control_plane
+            .deploy_container(DeployRequest {
+                image_name: "registry.example/app:v1".to_string(),
+                container_name: "app-1".to_string(),
+                environment_vars: std::collections::HashMap::from([(
+                    "PUBLIC_NAME".to_string(),
+                    "a-variable".to_string(),
+                )]),
+                secrets: std::collections::HashMap::from([(
+                    "API_KEY".to_string(),
+                    "a-secret".to_string(),
+                )]),
+                port_mappings: vec![],
+                network_name: None,
+                extra_networks: Vec::new(),
+                resource_limits: temps_deployer::ResourceLimits::default(),
+                restart_policy: temps_deployer::RestartPolicy::Never,
+                log_path: std::path::PathBuf::from("/tmp/app-1.log"),
+                command: None,
+                entrypoint: None,
+                log_config: None,
+                labels: Default::default(),
+                project_slug: None,
+                control_plane_grants_socket: false,
+            })
+            .await
+            .expect("the sealed deploy should succeed end to end");
+        assert_eq!(result.container_id, "abc");
+
+        let received = runtime_seen.lock().unwrap().take().unwrap();
+        let opened = open_request(&runtime_private, "/agent/containers/deploy", &received).unwrap();
+        let handed_over: DeployRequest = serde_json::from_slice(&opened).unwrap();
+        assert_eq!(handed_over.secrets["API_KEY"], "a-secret");
+        assert_eq!(handed_over.environment_vars["PUBLIC_NAME"], "a-variable");
+        assert_eq!(handed_over.image_name, "registry.example/app:v1");
+    }
+
+    #[tokio::test]
+    async fn a_request_sealed_for_another_route_never_reaches_a_handler() {
+        use axum::http::StatusCode;
+        use temps_core::sealed_request::NodeSealing;
+        use tower::ServiceExt;
+        let (private, public) = temps_core::worker_ingress::generate_ingress_key().unwrap();
+        let token = test_agent_config(false).token;
+        let sealed = NodeSealing::Key(public)
+            .seal(
+                "test-node",
+                "/agent/services",
+                br#"{"not":"a valid request"}"#,
+            )
+            .unwrap();
+        let response = sealed_test_app(Some(private))
+            .oneshot(sealed_request(
+                "/agent/containers/deploy",
+                Some(&token),
+                sealed,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -1762,6 +2453,10 @@ pub(crate) mod tests {
                 dns_policy: temps_node_dns::open_dns_policy_slot(),
             },
             Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
         );
         for route in ["/agent/containers/deploy", "/agent/v2/containers/deploy"] {
             for (token, status) in [(None, 401), (Some("wrong"), 401), (Some("secret"), 422)] {
@@ -1774,6 +2469,111 @@ pub(crate) mod tests {
             }
             assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
         }
+    }
+
+    /// The image removal route exists, is documented, refuses callers
+    /// without the agent token, and bounds the batch before touching Docker.
+    #[tokio::test]
+    async fn image_removal_route_is_behind_agent_auth_and_bounded() {
+        use tower::ServiceExt;
+        let remote = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                "http://127.0.0.1:9".into(),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .unwrap(),
+        );
+        let app = build_router(
+            remote.clone(),
+            remote,
+            None,
+            &test_agent_config(false),
+            SharedNetwork {
+                overlay_bridge_address: Default::default(),
+                overlay_peers: Default::default(),
+                host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+                dns_policy: temps_node_dns::open_dns_policy_slot(),
+            },
+            Default::default(),
+            AgentEngines {
+                service_runtime: crate::test_engines::service_runtime(),
+                plugin_builder: crate::test_engines::plugin_builder(),
+            },
+        );
+        let route = temps_deployer::remote::REMOVE_IMAGES_PATH;
+        let one = br#"{"images":[{"reference":"app-1:latest"}]}"#.to_vec();
+        for token in [None, Some("wrong")] {
+            let response = app
+                .clone()
+                .oneshot(post_json(route, token, one.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{token:?}");
+        }
+
+        let too_many = serde_json::to_vec(&temps_deployer::remote::RemoveImagesRequest {
+            images: vec![
+                temps_deployer::ImageRemovalRequest::new("app:latest", None);
+                temps_deployer::MAX_IMAGE_REMOVAL_BATCH + 1
+            ],
+        })
+        .unwrap();
+        let response = app
+            .clone()
+            .oneshot(post_json(route, Some("secret"), too_many))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+
+        // The runtime behind this agent cannot be reached: the whole call
+        // fails, and says so, rather than reporting images as removed.
+        let response = app
+            .clone()
+            .oneshot(post_json(route, Some("secret"), one))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 500);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(route));
+
+        let listing = temps_deployer::remote::LIST_OWNED_IMAGES_PATH;
+        let owner = br#"{"owner":"install-a.marker-b","project_id":7}"#.to_vec();
+        for token in [None, Some("wrong")] {
+            let response = app
+                .clone()
+                .oneshot(post_json(listing, token, owner.clone()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 401, "{token:?}");
+        }
+        // A filter value is checked before it reaches Docker.
+        let response = app
+            .clone()
+            .oneshot(post_json(
+                listing,
+                Some("secret"),
+                br#"{"owner":"x\" OR label=anything","project_id":7}"#.to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 400);
+        // So is the project ID: one project's images, never every project's.
+        for project in ["0", "-3"] {
+            let body = format!(r#"{{"owner":"install-a.marker-b","project_id":{project}}}"#);
+            let response = app
+                .clone()
+                .oneshot(post_json(listing, Some("secret"), body.into_bytes()))
+                .await
+                .unwrap();
+            assert_eq!(response.status().as_u16(), 400, "project {project}");
+        }
+        let response = app
+            .clone()
+            .oneshot(post_json(listing, Some("secret"), owner))
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 500);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(listing));
     }
 
     #[tokio::test]
@@ -1847,7 +2647,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn only_upload_routes_accept_bodies_over_two_mib() {
+    async fn only_upload_and_bounded_policy_routes_accept_bodies_over_two_mib() {
         use tower::ServiceExt;
         let (app, _root) = sandbox_app();
         // Valid JSON just over axum's 2 MiB default.
@@ -1864,7 +2664,7 @@ pub(crate) mod tests {
                 .oneshot(post_json(route, Some("secret"), big.clone()))
                 .await
                 .unwrap();
-            if UPLOAD_ROUTES.contains(&route) {
+            if UPLOAD_ROUTES.contains(&route) || route == sandbox_handlers::service_access::PATH {
                 assert_ne!(
                     response.status(),
                     axum::http::StatusCode::PAYLOAD_TOO_LARGE,
@@ -1878,5 +2678,74 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+    #[tokio::test]
+    async fn service_access_bounds_decoding_and_registers_its_openapi_contract() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        let held = state
+            .access_permits
+            .clone()
+            .acquire_many_owned(2)
+            .await
+            .unwrap();
+        let app = sandbox_router(
+            state,
+            Arc::new(AgentAuth::new("secret")),
+            Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "test-node".into(),
+            }),
+        );
+        let path = sandbox_handlers::service_access::PATH;
+        let response = app
+            .clone()
+            .oneshot(post_json(path, Some("secret"), b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::TOO_MANY_REQUESTS);
+        let response = app
+            .clone()
+            .oneshot(post_json(path, None, b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+        drop(held);
+        let response = app
+            .oneshot(post_json(
+                path,
+                Some("secret"),
+                vec![b' '; sandbox_handlers::service_access::BODY_LIMIT + 1],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(AgentApiDoc::openapi().paths.paths.contains_key(path));
+    }
+    #[tokio::test(start_paused = true)]
+    async fn slow_service_access_body_times_out_and_releases_delivery_capacity() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(SandboxHostState::new(None, root.path().to_path_buf()));
+        let app = sandbox_router(
+            state.clone(),
+            Arc::new(AgentAuth::new("secret")),
+            Arc::new(SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "test-node".into(),
+            }),
+        );
+        let body = axum::body::Body::from_stream(futures::stream::pending::<
+            Result<bytes::Bytes, std::io::Error>,
+        >());
+        let request = axum::http::Request::post(sandbox_handlers::service_access::PATH)
+            .header(axum::http::header::AUTHORIZATION, "Bearer secret")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::GATEWAY_TIMEOUT);
+        assert_eq!(state.access_permits.available_permits(), 2);
     }
 }

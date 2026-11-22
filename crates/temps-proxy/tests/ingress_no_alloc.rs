@@ -144,7 +144,7 @@ fn deciding_an_environment_request_through_its_compiled_endpoint_does_not_alloca
     let project = project();
     let environment = environment();
     let rules = ip_rules();
-    let instance = temps_core::RateLimitSettings::default();
+    let instance = temps_config::RateLimitSettings::default();
     let access = EnvironmentAccess {
         environment: &environment,
         project: &project,

@@ -1136,6 +1136,9 @@ impl GitProviderService for GiteaProvider {
         if config.events.contains(&"pull_request".to_string()) {
             events.push("pull_request".to_string());
         }
+        if config.events.contains(&"delete".to_string()) {
+            events.push("delete".to_string());
+        }
         if events.is_empty() {
             events.push("push".to_string()); // default to push
         }
@@ -1713,6 +1716,38 @@ mod tests {
                 token: "test-token".to_string(),
             },
         )
+    }
+
+    #[tokio::test]
+    async fn created_webhook_subscribes_to_branch_deletions() {
+        let mut server = mockito::Server::new_async().await;
+        let hook = server
+            .mock("POST", mockito::Matcher::Regex("/hooks$".to_string()))
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "events": ["push", "pull_request", "delete"]
+            })))
+            .with_status(201)
+            .with_body(r#"{"id":7}"#)
+            .create_async()
+            .await;
+        let provider = make_provider(&server.url());
+
+        let id = provider
+            .create_webhook(
+                "test-token",
+                "temps",
+                "example",
+                WebhookConfig {
+                    url: "https://example.com/hook".to_string(),
+                    secret: Some("secret".to_string()),
+                    events: vec!["push".into(), "pull_request".into(), "delete".into()],
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(id, "7");
+        hook.assert_async().await;
     }
 
     #[tokio::test]

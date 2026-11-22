@@ -8,6 +8,8 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 
 Deploy a project from git
 
+**Usage:** `deploy [project] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

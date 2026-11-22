@@ -8,6 +8,7 @@ use sea_orm::{
 };
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 use temps_entities::{projects, source_files, source_maps};
 use thiserror::Error;
 use tracing::{debug, warn};
@@ -1170,18 +1171,6 @@ fn has_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|seg| seg == "..")
 }
 
-/// Escape `LIKE` metacharacters (`\`, `%`, `_`) so an attacker-controlled frame
-/// filename is matched literally by a trailing-suffix `LIKE`. PostgreSQL's
-/// default `LIKE` escape character is `\`, so escaping in the bound value is
-/// sufficient (no `ESCAPE` clause needed). Without this, a filename containing
-/// `_` or `%` would match unrelated stored files and could surface the wrong
-/// file's source in the error UI.
-fn escape_like(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
-}
-
 /// A resolved stack frame with original source coordinates and source context.
 struct ResolvedFrame {
     file: String,
@@ -1521,7 +1510,6 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
 
     #[test]
@@ -1575,12 +1563,6 @@ mod tests {
             "mappings": "AACA,IAAAA"
         }))
         .unwrap()
-    }
-
-    async fn setup_test_db() -> TestDatabase {
-        TestDatabase::with_migrations()
-            .await
-            .expect("Failed to create test database")
     }
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> i32 {
@@ -1643,7 +1625,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn debug_id_artifacts_native_storage_isolation_retry_and_late_symbolication() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let project = create_test_project(&db).await;
         let other = create_test_project(&db).await;
@@ -1793,7 +1775,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_source_context_enabled_reads_project_flag() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1807,7 +1789,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_native_source_context_resolves_when_enabled() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1847,7 +1829,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_native_source_context_skipped_when_disabled() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await; // opt-in defaults to false
@@ -1877,7 +1859,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_native_source_context_suffix_match() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1913,7 +1895,7 @@ mod tests {
         // A binary built without `-trimpath` reports the Docker build path
         // (e.g. "/src/...") which the uploaded module-relative path lacks.
         // The trailing-suffix match must still resolve it.
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -1954,7 +1936,7 @@ mod tests {
         // A frame filename containing `_` must be matched literally by the
         // trailing-suffix LIKE, not as a single-char wildcard that could pull an
         // unrelated file's source into the frame.
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2001,7 +1983,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_upload_and_list_source_maps() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2037,7 +2019,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_upload_replaces_existing() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2078,7 +2060,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_upload_normalizes_url_paths() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2106,7 +2088,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_list_releases() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2134,7 +2116,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_delete_release() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2162,7 +2144,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_upload_rejects_invalid_source_map() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2187,7 +2169,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_upload_rejects_empty_release() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2299,7 +2281,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_symbolicate_nextjs_server_frame_via_abs_path() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2353,7 +2335,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_symbolicate_bare_filename_suffix_match() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2401,7 +2383,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_symbolicate_stored_event_on_the_fly() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2484,7 +2466,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_symbolicate_stored_event_skips_already_symbolicated() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;
@@ -2586,7 +2568,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_symbolicate_includes_source_context() {
-        let test_db = setup_test_db().await;
+        let test_db = temps_test_utils::setup_test_db().await;
         let db = test_db.connection_arc();
         let service = SourceMapService::new(db.clone());
         let project_id = create_test_project(&db).await;

@@ -33,13 +33,13 @@ use temps_cloud::{
     ManagedBackupOutcome, CONSOLE_OIDC_BOOTSTRAP_FILENAME,
 };
 use temps_cloud_client::FirstLinkEnrollment;
-use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
+use temps_config_handlers::ConfigPlugin;
 use temps_core::plugin::{PluginManager, TempsPlugin};
 use temps_product_telemetry::TelemetryPlugin;
 // `TempsPlugin` is used both directly (extra_plugins field) and through
 // `dyn TempsPlugin` in `ConsoleApiParams`.
-use temps_core::templates::TemplateService;
+use super::static_files::StaticFilesPlugin;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
@@ -67,6 +67,7 @@ use temps_monitoring::{
 use temps_notifications::NotificationsPlugin;
 use temps_observability::ObservabilityPlugin;
 use temps_otel::plugin::OtelPlugin;
+use temps_presets::templates::TemplateService;
 use temps_project_groups::ProjectGroupsPlugin;
 use temps_projects::ProjectsPlugin;
 use temps_providers::ProvidersPlugin;
@@ -75,8 +76,8 @@ use temps_queue::QueuePlugin;
 use temps_revenue::RevenuePlugin;
 use temps_sandbox::plugin::SandboxPlugin;
 use temps_screenshots::ScreenshotsPlugin;
-use temps_static_files::StaticFilesPlugin;
 use temps_status_page::StatusPagePlugin;
+use temps_surveys::SurveysPlugin;
 use temps_teams::TeamsPlugin;
 use temps_vulnerability_scanner::VulnerabilityScannerPlugin;
 use temps_webhooks::WebhooksPlugin;
@@ -1844,7 +1845,7 @@ async fn configured_maxmind_license_key(
         .one(db.as_ref())
         .await
     {
-        Ok(Some(row)) => temps_core::AppSettings::from_json(row.data),
+        Ok(Some(row)) => temps_config::AppSettings::from_json(row.data),
         Ok(None) => return None,
         Err(e) => {
             warn!(
@@ -1870,6 +1871,37 @@ async fn configured_maxmind_license_key(
             None
         }
     }
+}
+
+/// Make sure the optional geo databases are present, without letting a slow or
+/// stalled download hold up the console.
+async fn ensure_geolite2_databases(data_dir: &Path, license_key: Option<String>) {
+    let city = data_dir.join("GeoLite2-City.mmdb");
+    let asn = data_dir.join(temps_geo::ASN_DB_FILENAME);
+    // One after the other: each download is held in memory until it is written.
+    let downloads = async move {
+        ensure_geolite2_database(&city, license_key.as_deref()).await;
+        ensure_geolite2_asn_database(&asn, license_key.as_deref()).await;
+    };
+    let wait = temps_geo::refresh::startup_download_deadline()
+        .saturating_duration_since(std::time::Instant::now());
+    if !finished_within(downloads, wait).await {
+        warn!(
+            wait_seconds = temps_geo::refresh::STARTUP_DOWNLOAD_WAIT.as_secs(),
+            "GeoLite2 downloads are still running; starting without waiting for them. \
+             Geolocation and datacenter traffic detection turn on when their databases arrive"
+        );
+    }
+}
+
+/// Run `task` in the background and wait up to `wait` for it. Returns whether
+/// it finished; when it has not, it keeps running.
+async fn finished_within<F>(task: F, wait: std::time::Duration) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    // Dropping a task's handle detaches the task rather than cancelling it.
+    tokio::time::timeout(wait, tokio::spawn(task)).await.is_ok()
 }
 
 /// Make sure the optional GeoLite2-ASN database is present, downloading the
@@ -1927,12 +1959,9 @@ async fn ensure_geolite2_asn_database(default_db_path: &Path, license_key: Optio
 
 /// Validate GeoLite2-City database exists in multiple locations.
 /// Checks current directory and data directory; if neither has the file,
-/// downloads it to `default_db_path`. Errors only after the download attempt
-/// fails.
-async fn validate_geolite2_database(
-    default_db_path: &Path,
-    license_key: Option<&str>,
-) -> anyhow::Result<()> {
+/// downloads it to `default_db_path`. A failed download is a warning: the
+/// server runs without geolocation until the file is provided.
+async fn ensure_geolite2_database(default_db_path: &Path, license_key: Option<&str>) {
     // Check multiple locations in order of preference
     let search_paths = vec![
         // 1. Current working directory (most convenient for local development)
@@ -1945,7 +1974,7 @@ async fn validate_geolite2_database(
     for path in &search_paths {
         if path.exists() {
             debug!("✓ GeoLite2 database found at: {}", path.display());
-            return Ok(());
+            return;
         }
     }
 
@@ -1957,44 +1986,16 @@ async fn validate_geolite2_database(
         search_paths[1].display()
     );
     match download_geolite2_database_on_startup(default_db_path, license_key).await {
-        Ok(()) => Ok(()),
-        Err(e) => Err(anyhow::Error::new(
-            super::startup_failure::ConsoleStartupError::GeoDatabase {
-                checked: search_paths.clone(),
-                reason: e.to_string(),
-                message: format!(
-                    "❌ GeoLite2-City.mmdb not found and automatic download failed\n\n\
-            The MaxMind GeoLite2 database is required for geolocation features.\n\n\
-            📍 Checked locations (in order):\n\
-            1. {}\n\
-            2. {}\n\n\
-            ⬇️  Download attempt error: {}\n\n\
-            📥 Manual setup (takes 2 minutes):\n\
-            1. Visit: https://www.maxmind.com/en/geolite2/geolite2-free-data-sources\n\
-            2. Create free MaxMind account (if needed)\n\
-            3. Download 'GeoLite2-City' (GZIP format: .tar.gz)\n\
-            4. Extract the archive:\n\
-               tar xzf GeoLite2-City_*.tar.gz\n\n\
-            5. Copy the database file to any location above:\n\
-               # Option A: Current directory (recommended for local development)\n\
-               cp GeoLite2-City_*/GeoLite2-City.mmdb .\n\n\
-               # Option B: Data directory\n\
-               cp GeoLite2-City_*/GeoLite2-City.mmdb {}\n\n\
-            6. Start the server again\n\n\
-            🔑 Automatic downloads and refreshes:\n\
-            Add a MaxMind license key (free MaxMind account) under\n\
-            Settings → Metrics Monitoring → Geolocation database, and Temps\n\
-            downloads GeoLite2-City itself and re-checks it on the refresh\n\
-            interval configured there (default every 24 hours).\n\n\
-            🐳 For Docker users:\n\
-            See Dockerfile in the repository for embedding the database",
-                    search_paths[0].display(),
-                    search_paths[1].display(),
-                    e,
-                    search_paths[1].display()
-                ),
-            },
-        )),
+        Ok(()) => {}
+        Err(e) => warn!(
+            first_location = %search_paths[0].display(),
+            second_location = %search_paths[1].display(),
+            error = %temps_geo::redact_license_key(e.to_string(), license_key),
+            "GeoLite2-City.mmdb not found and could not be downloaded; starting without \
+             geolocation. Add a MaxMind license key under Settings > Metrics Monitoring > \
+             Geolocation database, or copy GeoLite2-City.mmdb into the data directory. \
+             No restart is needed"
+        ),
     }
 }
 
@@ -2012,6 +2013,9 @@ pub struct ConsoleApiParams {
     pub cookie_crypto: Arc<CookieCrypto>,
     pub encryption_service: Arc<EncryptionService>,
     pub route_table: Arc<temps_proxy::CachedPeerTable>,
+    /// The process runtime context (host or container), registered for
+    /// plugins that resolve a deployment container's internal address.
+    pub runtime_context: Arc<temps_core::RuntimeContext>,
     pub queue: Arc<dyn temps_core::JobQueue>,
     /// Fires once, right after plugin two-phase init completes (see the call
     /// site in `start_console_api`) — earlier and narrower than `/readyz`,
@@ -2122,19 +2126,33 @@ pub struct ConsoleApiParams {
     /// listeners start; the caller records the failure if this function
     /// returns an error, so the proxy can explain it on the console URL.
     pub startup_state: Arc<temps_core::console_startup::ConsoleStartupState>,
+    /// The control plane's own tunnel connectors (ADR-107 D2), which
+    /// `temps serve` runs beside the in-process proxy. Attached to the
+    /// console's ingress service so it accepts node `0` and wakes them on a
+    /// placement change. `None` with `--role console`, where the proxy is
+    /// another process.
+    pub control_plane_tunnels: Option<temps_ingress::control_plane::ControlPlaneHandle>,
 }
 
+/// The backlog `TcpListener::bind` uses, so a reserved port behaves the same.
+const RESERVED_LISTENER_BACKLOG: u32 = 1024;
+
 /// Bind a console listener, naming the address in the error so the startup
-/// status page can tell the operator which address is taken.
+/// status page can tell the operator which address is taken. A port the server
+/// picked for itself is already held, and starts listening here.
 async fn bind_console_listener(
     address: &str,
 ) -> Result<TcpListener, super::startup_failure::ConsoleStartupError> {
-    TcpListener::bind(address).await.map_err(|source| {
-        super::startup_failure::ConsoleStartupError::ListenerBind {
+    let bound = match temps_config::loopback_reservation::take_reserved_socket(address) {
+        Some(socket) => socket.listen(RESERVED_LISTENER_BACKLOG),
+        None => TcpListener::bind(address).await,
+    };
+    bound.map_err(
+        |source| super::startup_failure::ConsoleStartupError::ListenerBind {
             address: address.to_string(),
             source,
-        }
-    })
+        },
+    )
 }
 
 /// Storage backend selection error for the log aggregator. Owned by
@@ -2355,6 +2373,10 @@ async fn serve_public_only(
 async fn public_only_not_found(req: Request) -> Response {
     use axum::response::IntoResponse;
 
+    let hide_identity = req
+        .extensions()
+        .get::<Arc<temps_config::ConfigService>>()
+        .is_none_or(|settings| !settings.expose_platform_identity());
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2378,9 +2400,52 @@ async fn public_only_not_found(req: Request) -> Response {
             (header::CACHE_CONTROL, "no-store"),
             (header::CONTENT_TYPE, "text/html; charset=utf-8"),
         ],
-        temps_proxy::branded_404::render(host, request_id),
+        temps_proxy::branded_404::render_with_identity(host, request_id, hide_identity),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod geo_download_wait_tests {
+    use super::finished_within;
+    use std::time::Duration;
+    use tokio::sync::oneshot;
+
+    #[tokio::test]
+    async fn a_stalled_download_does_not_hold_up_startup_and_keeps_running() {
+        let (release, released) = oneshot::channel::<()>();
+        let (finish, finished) = oneshot::channel::<()>();
+        let download = async move {
+            let _ = released.await;
+            let _ = finish.send(());
+        };
+
+        let in_time = tokio::time::timeout(
+            Duration::from_secs(5),
+            finished_within(download, Duration::from_millis(50)),
+        )
+        .await
+        .expect("startup must stop waiting for a stalled download");
+        assert!(!in_time);
+
+        release.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), finished)
+            .await
+            .expect("the download must keep running after startup moves on")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn startup_waits_for_a_download_that_finishes_in_time() {
+        let (finish, mut finished) = oneshot::channel::<()>();
+        let download = async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = finish.send(());
+        };
+
+        assert!(finished_within(download, Duration::from_secs(30)).await);
+        assert!(finished.try_recv().is_ok());
+    }
 }
 
 #[cfg(test)]
@@ -2516,7 +2581,54 @@ mod public_only_app_tests {
     }
 
     #[tokio::test]
-    async fn a_browser_gets_the_branded_404_and_an_api_client_an_empty_one() {
+    async fn public_ingress_exposes_platform_identity_only_when_enabled() {
+        for expose in [None, Some(false), Some(true)] {
+            let now = chrono::Utc::now();
+            let settings = temps_config::AppSettings {
+                expose_platform_identity: expose,
+                ..Default::default()
+            };
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                    .append_query_results(vec![vec![temps_entities::settings::Model {
+                        id: 1,
+                        data: settings.to_json(),
+                        created_at: now,
+                        updated_at: now,
+                    }]])
+                    .into_connection(),
+            );
+            let config = temps_config::ServerConfig::new(
+                "127.0.0.1:3000".into(),
+                "postgresql://test".into(),
+                None,
+                None,
+            )
+            .unwrap();
+            let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+            service.get_settings().await.unwrap();
+            let request = Request::builder()
+                .uri("/dashboard")
+                .header(header::HOST, "hooks.example.test")
+                .header(header::ACCEPT, "text/html")
+                .body(Body::empty())
+                .unwrap();
+            let response = send(app().layer(axum::Extension(service)), request).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            assert_eq!(
+                String::from_utf8_lossy(&body)
+                    .to_lowercase()
+                    .contains("temps"),
+                expose == Some(true)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_browser_gets_a_neutral_404_by_default_and_an_api_client_an_empty_one() {
         let browser = Request::builder()
             .uri("/dashboard")
             .header(header::HOST, "hooks.example.com")
@@ -2531,9 +2643,10 @@ mod public_only_app_tests {
         let html = String::from_utf8_lossy(&body);
         assert!(
             html.contains("<!doctype html>"),
-            "expected the branded page"
+            "expected the neutral page"
         );
         assert!(html.contains("hooks.example.com"));
+        assert!(!html.to_lowercase().contains("temps"));
         assert!(
             !html.contains("id=\"root\""),
             "the dashboard bundle must never be served here"
@@ -3456,7 +3569,10 @@ mod console_oidc_bootstrap_audit_tests {
 
     #[async_trait::async_trait]
     impl AuditLogger for RecordingAuditLogger {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.operations
                 .lock()
                 .unwrap()
@@ -4020,6 +4136,51 @@ mod spa_fallback_tests {
                 .get(header::CONTENT_TYPE)
                 .map(|v| v.as_bytes()),
             Some(b"application/json".as_slice())
+        );
+    }
+}
+
+#[cfg(test)]
+mod bind_console_listener_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn serves_a_reserved_port_on_the_reserved_address() {
+        let address = temps_config::loopback_reservation::reserve_loopback_address().unwrap();
+
+        let listener = bind_console_listener(&address).await.unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().to_string(), address);
+        tokio::net::TcpStream::connect(&address).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn binds_a_named_address_that_was_not_reserved() {
+        let free = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = free.local_addr().unwrap().to_string();
+        drop(free);
+
+        let listener = bind_console_listener(&address).await.unwrap();
+
+        assert_eq!(listener.local_addr().unwrap().to_string(), address);
+    }
+
+    #[tokio::test]
+    async fn names_the_address_when_a_named_one_is_taken() {
+        let taken = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = taken.local_addr().unwrap().to_string();
+
+        let error = bind_console_listener(&address).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                crate::commands::serve::startup_failure::ConsoleStartupError::ListenerBind {
+                    address: named,
+                    ..
+                } if named == &address
+            ),
+            "unexpected error: {error}"
         );
     }
 }

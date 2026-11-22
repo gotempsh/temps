@@ -220,7 +220,7 @@ async fn start_container_health_monitor(
     // Build the metrics store if monitoring is enabled, so container
     // resource metrics are written alongside the alarm logic.
     let container_metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = {
-        use temps_core::MetricsStoreKind;
+        use temps_config::MetricsStoreKind;
         use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
         // Provide a metrics store for container resource metrics. When
@@ -281,7 +281,7 @@ async fn start_metrics_pipeline(
         service_context.get_service::<temps_config::ConfigService>(),
         service_context.get_service::<temps_core::EncryptionService>(),
     ) {
-        use temps_core::MetricsStoreKind;
+        use temps_config::MetricsStoreKind;
         use temps_metrics::{MetricsScraper, MetricsStore, TimescaleMetricsStore};
 
         // The metrics store and scraper are ALWAYS wired up — the per-service
@@ -327,6 +327,32 @@ async fn start_metrics_pipeline(
                 );
                 tokio::spawn(worker_metrics.run());
 
+                // ADR-095: internal DNS observability. Registered before
+                // the routes are built, so the Settings → DNS handlers read
+                // the same store the collector writes. Node 0 reports from
+                // the proxy process (`serve/proxy.rs`).
+                let dns_observability = Arc::new(temps_dns::DnsObservabilityService::new(
+                    db.clone(),
+                    metrics_store.clone(),
+                ));
+                service_context.register_service(dns_observability.clone());
+                let cluster_dns = Arc::new(
+                    temps_deployments::services::cluster_dns::ClusterDnsService::new(
+                        db.clone(),
+                        dns_observability,
+                        cfg_svc.clone(),
+                        enc_svc.clone(),
+                    ),
+                );
+                tokio::spawn(
+                    temps_deployments::services::cluster_dns::ClusterDnsCollector::new(
+                        db.clone(),
+                        cluster_dns,
+                        alarm_service.clone(),
+                    )
+                    .run(),
+                );
+
                 let mut scraper =
                     MetricsScraper::new(db.clone(), metrics_store.clone(), cfg_svc, enc_svc);
                 // HA clusters are scraped at their elected primary, which
@@ -370,7 +396,7 @@ async fn start_metrics_pipeline(
                 // the raw hypertable rows.
                 {
                     use chrono::{Duration, Utc};
-                    use temps_core::MetricsStoreKind;
+                    use temps_config::MetricsStoreKind;
                     use temps_metrics::{MetricsStore, TimescaleMetricsStore};
 
                     let prune_db = db.clone();
@@ -465,6 +491,12 @@ fn start_external_service_health_monitor(
             ExternalServiceHealthConfig::default(),
             docker_handle.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
+        );
+
+        health_monitor = health_monitor.with_telemetry(
+            service_context
+                .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
+                .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter)),
         );
 
         // Attach the shared metrics store (registered by the MetricsScraper

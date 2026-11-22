@@ -16,6 +16,7 @@ use temps_import_types::plan::{
     BuildConfiguration, DeploymentConfiguration, EnvironmentConfiguration, PlanComplexity,
     PlanMetadata, ProjectConfiguration, ProjectType, Protocol,
 };
+use temps_import_types::sanitize_slug;
 use temps_import_types::{
     CredentialValidation, DataImplication, DataImplicationSeverity, DeploymentStrategy,
     DomainAction, DomainPlan, DomainSnapshot, EnvironmentVariable, ImportContext,
@@ -63,13 +64,6 @@ fn config_from(credentials: &ImportCredentials) -> Result<KamalConfig, KamalImpo
 // ---------------------------------------------------------------------------
 // Mapping helpers
 // ---------------------------------------------------------------------------
-
-fn sanitize_slug(name: &str) -> String {
-    name.to_lowercase()
-        .replace(|c: char| !c.is_alphanumeric() && c != '-', "-")
-        .trim_matches('-')
-        .to_string()
-}
 
 /// Detect the service type of an accessory from its image
 fn detect_service_type(image: &str) -> Option<SnapshotServiceType> {

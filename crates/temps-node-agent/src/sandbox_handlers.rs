@@ -7,7 +7,7 @@
 //! replays one `SandboxProvider` call against the worker's own
 //! `DockerSandboxProvider` — the same implementation the control plane uses
 //! for local sandboxes — so behaviour is identical wherever a sandbox lives.
-//! The control plane's side is `temps_ai_agents::sandbox::remote`.
+//! The control plane's side is `temps_sandbox_providers::remote`.
 //!
 //! Trust boundary: the caller is the authenticated control plane (bearer
 //! token + mTLS, enforced by the same middleware as every other agent
@@ -34,6 +34,7 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+pub(crate) mod service_access;
 use base64::Engine;
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
@@ -41,22 +42,23 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
-use temps_ai_agents::ai_cli::OnEventCallback;
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::docker::SANDBOX_CONTAINER_LABEL;
-use temps_ai_agents::sandbox::remote::{
+use temps_agent_core::error::AgentError;
+use temps_agent_core::OnEventCallback;
+use temps_sandbox_providers::docker::SANDBOX_CONTAINER_LABEL;
+use temps_sandbox_providers::remote::{
     is_sandbox_handle, is_valid_sandbox_label, RemoteAliveResponse, RemoteByteChannel,
     RemoteByteChannelError, RemoteByteChannelQuery, RemoteCreateRequest, RemoteDestroyRequest,
     RemoteEgressPolicyRequest, RemoteErrorBody, RemoteExecFrame, RemoteExecRequest,
     RemoteExecResponse, RemoteFileContents, RemoteHandleRequest, RemoteImageIdentityResponse,
+    RemoteImagePrepareRequest, RemoteImageRemoveRequest, RemoteImageRemoveResponse,
     RemoteKillRequest, RemoteOkResponse, RemoteReadFileRequest, RemoteRecoverHarnessRequest,
     RemoteRecoverRequest, RemoteReleaseOrphanedRequest, RemoteResizeDiskRequest,
     RemoteRuntimeCompatibility, RemoteStatusResponse, RemoteWriteDirectoryRequest,
     RemoteWriteFileRequest, EXEC_STREAM_HEARTBEAT_INTERVAL, SANDBOX_CONTAINER_PREFIX,
     WORKER_EXEC_OUTPUT_LIMIT, WORKER_READ_FILE_MAX_BYTES,
 };
-use temps_ai_agents::sandbox::user::SANDBOX_WORK_DIR;
-use temps_ai_agents::sandbox::{
+use temps_sandbox_providers::user::SANDBOX_WORK_DIR;
+use temps_sandbox_providers::{
     ExecStream, OnStreamEventCallback, SandboxBackend, SandboxCreateConfig, SandboxHandle,
     SandboxProvider,
 };
@@ -157,6 +159,7 @@ pub struct SandboxHostState {
     /// Upload slots, see [`MAX_CONCURRENT_UPLOADS`].
     upload_permits: Arc<Semaphore>,
     upload_permit_wait: Duration,
+    pub(crate) access_permits: Arc<Semaphore>,
 }
 
 impl SandboxHostState {
@@ -167,6 +170,7 @@ impl SandboxHostState {
             creating: std::sync::Mutex::new(HashSet::new()),
             upload_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_UPLOADS)),
             upload_permit_wait: UPLOAD_PERMIT_WAIT,
+            access_permits: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -271,11 +275,13 @@ fn provider_err(e: AgentError) -> ApiError {
         // sandbox is not reachable here, which the control plane already
         // reads as "gone" from a 404.
         AgentError::SandboxNotRunning { .. } => StatusCode::NOT_FOUND,
-        AgentError::Validation { .. }
+        AgentError::SandboxCpuLimit { .. } | AgentError::Validation { .. }
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. } => StatusCode::BAD_REQUEST,
         AgentError::SandboxUnsupportedOnNode { .. } => StatusCode::UNPROCESSABLE_ENTITY,
-        AgentError::SandboxConflictOnNode { .. } => StatusCode::CONFLICT,
+        AgentError::SandboxConflictOnNode { .. } | AgentError::ServiceAccessUnavailable { .. } => {
+            StatusCode::CONFLICT
+        }
         // Kept apart from 422 (not available on worker nodes): this backend
         // can never enforce the policy, wherever it runs.
         AgentError::SandboxEgressPolicyUnsupported { .. } => StatusCode::NOT_IMPLEMENTED,
@@ -293,6 +299,7 @@ fn provider_err(e: AgentError) -> ApiError {
         AgentError::ConfigNotFound { .. }
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
+        | AgentError::RunCancelled { .. }
         | AgentError::ProjectNotFound { .. }
         | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }
@@ -559,6 +566,31 @@ pub async fn create_sandbox(
             format!("sandbox '{}': {}", req.label, e),
         )
     })?;
+    let mut cpu_limit = req.cpu_limit;
+    let mut memory_limit_mb = req.memory_limit_mb;
+    if let Some(host) = host
+        .provider
+        .host_capacity(None, req.backend)
+        .await
+        .map_err(provider_err)?
+    {
+        if let Some(cpu) = cpu_limit {
+            cpu_limit = Some(
+                host.cpu_limit(req.run_id, (!req.cpu_is_default).then_some(cpu), cpu)
+                    .map_err(provider_err)?,
+            );
+        }
+        if let Some(memory) = memory_limit_mb {
+            memory_limit_mb = Some(
+                host.memory_limit(
+                    req.run_id,
+                    (!req.memory_is_default).then_some(memory),
+                    memory,
+                )
+                .map_err(provider_err)?,
+            );
+        }
+    }
     let claim = CreateClaim::acquire(&state, &req.label)?;
     let container_name = format!("{}{}", SANDBOX_CONTAINER_PREFIX, req.label);
     let replacing = match host.containers.find(&container_name).await {
@@ -639,8 +671,8 @@ pub async fn create_sandbox(
         host_work_dir: host_work_dir.clone(),
         workspace_volume: None,
         image: req.image,
-        cpu_limit: req.cpu_limit,
-        memory_limit_mb: req.memory_limit_mb,
+        cpu_limit,
+        memory_limit_mb,
         pids_limit: req.pids_limit,
         disk_size_mb: req.disk_size_mb,
         allow_docker: false,
@@ -1630,6 +1662,7 @@ pub async fn release_orphaned_sandbox_resources(
 pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusResponse> {
     let Some(SandboxHost { provider, .. }) = state.host.as_ref() else {
         return Ok(Json(RemoteStatusResponse {
+            capacity: None,
             available: false,
             image_ready: false,
             image: String::new(),
@@ -1644,6 +1677,14 @@ pub async fn sandbox_status(State(state): HostState) -> ApiResult<RemoteStatusRe
         }
     };
     Ok(Json(RemoteStatusResponse {
+        capacity: if available {
+            provider
+                .host_capacity(None, None)
+                .await
+                .map_err(provider_err)?
+        } else {
+            None
+        },
         available,
         image_ready,
         image,
@@ -1766,6 +1807,100 @@ pub async fn sandbox_image_identity(
         .await
         .map_err(provider_err)?;
     Ok(Json(RemoteImageIdentityResponse { image }))
+}
+
+/// `POST /agent/sandboxes/image-prepare` — start pulling the sandbox image
+/// (the one a create on this node would use, unless the body names one) in
+/// the background, or join the pull already running, and return its status.
+/// A create of that image while it pulls waits on the same pull.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-prepare",
+    request_body = RemoteImagePrepareRequest,
+    responses(
+        (status = 200, description = "The pull's status", body = temps_sandbox_providers::ImagePrepareStatus),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn prepare_sandbox_image(
+    State(state): HostState,
+    Json(req): Json<RemoteImagePrepareRequest>,
+) -> ApiResult<temps_sandbox_providers::ImagePrepareStatus> {
+    let host = host(&state)?;
+    let status = host
+        .provider
+        .prepare_image(req.image.as_deref(), Some(SandboxBackend::Docker))
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(status))
+}
+
+/// `POST /agent/sandboxes/image-prepare-status` — where this node stands with
+/// the sandbox image, without starting anything.
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-prepare-status",
+    request_body = RemoteImagePrepareRequest,
+    responses(
+        (status = 200, description = "The image's status on this node", body = temps_sandbox_providers::ImagePrepareStatus),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn sandbox_image_prepare_status(
+    State(state): HostState,
+    Json(req): Json<RemoteImagePrepareRequest>,
+) -> ApiResult<temps_sandbox_providers::ImagePrepareStatus> {
+    let host = host(&state)?;
+    let status = host
+        .provider
+        .image_prepare_status(req.image.as_deref(), Some(SandboxBackend::Docker))
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(status))
+}
+
+/// `POST /agent/sandboxes/image-remove` — remove a sandbox image the control
+/// plane prepared earlier and no longer uses as the default. Never forced:
+/// an image a container still uses is left alone (`in_use`).
+#[utoipa::path(
+    tag = "Sandboxes",
+    post,
+    path = "/agent/sandboxes/image-remove",
+    request_body = RemoteImageRemoveRequest,
+    responses(
+        (status = 200, description = "What the removal did", body = RemoteImageRemoveResponse),
+        (status = 400, description = "Empty image reference", body = RemoteErrorBody),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "The Docker daemon failed", body = RemoteErrorBody),
+        (status = 503, description = "No Docker daemon on this node", body = RemoteErrorBody)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_sandbox_image(
+    State(state): HostState,
+    Json(req): Json<RemoteImageRemoveRequest>,
+) -> ApiResult<RemoteImageRemoveResponse> {
+    let host = host(&state)?;
+    if req.image.trim().is_empty() {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "image-remove needs an image reference".to_string(),
+        ));
+    }
+    let outcome = host
+        .provider
+        .remove_prepared_image(&req.image)
+        .await
+        .map_err(provider_err)?;
+    Ok(Json(RemoteImageRemoveResponse { outcome }))
 }
 
 /// `POST /agent/sandboxes/agent-runtime-check`
@@ -1913,7 +2048,7 @@ const BYTE_CHANNEL_MAX_FRAME: usize = 1024 * 1024;
 /// relay; when the guest side ends the socket is closed.
 async fn pump_byte_channel(
     socket: WebSocket,
-    attachment: temps_ai_agents::sandbox::PtyAttachment,
+    attachment: temps_sandbox_providers::PtyAttachment,
     work_root: PathBuf,
     sandbox: String,
 ) {
@@ -1921,7 +2056,7 @@ async fn pump_byte_channel(
     use tokio::io::AsyncWriteExt;
 
     let (mut to_cp, mut from_cp) = socket.split();
-    let temps_ai_agents::sandbox::PtyAttachment {
+    let temps_sandbox_providers::PtyAttachment {
         mut output,
         mut input,
     } = attachment;
@@ -1978,7 +2113,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
-    use temps_ai_agents::sandbox::{
+    use temps_sandbox_providers::{
         EgressRule, KillSignal, SandboxBackend, SandboxEgressPolicy, SandboxExecResult,
     };
     use tokio::sync::Notify;
@@ -2083,6 +2218,7 @@ mod tests {
     #[derive(Default)]
     struct FakeProvider {
         seen_ids: Mutex<Vec<String>>,
+        created_limits: tokio::sync::Mutex<Vec<(Option<f64>, Option<u64>)>>,
         destroyed: Mutex<Vec<(String, bool)>>,
         /// Labels `release_orphaned_resources` was asked to release.
         released: Mutex<Vec<String>>,
@@ -2120,7 +2256,38 @@ mod tests {
 
     #[async_trait::async_trait]
     impl SandboxProvider for FakeProvider {
+        async fn host_capacity(
+            &self,
+            _: Option<i32>,
+            _: Option<temps_sandbox_providers::SandboxBackend>,
+        ) -> Result<Option<temps_sandbox_providers::SandboxHostCapacity>, AgentError> {
+            Ok(Some(temps_sandbox_providers::SandboxHostCapacity {
+                cpu_cores: 1.0,
+                memory_mb: 1024,
+            }))
+        }
+
+        async fn service_access(
+            &self,
+            handle: &SandboxHandle,
+            _: temps_sandbox_providers::service_access::ServiceAccessCommand,
+        ) -> Result<temps_sandbox_providers::service_access::ServiceAccessReply, AgentError>
+        {
+            self.saw(handle);
+            Ok(
+                temps_sandbox_providers::service_access::ServiceAccessReply::Retired {
+                    target: temps_sandbox_providers::service_access::ServiceAccessTarget {
+                        incarnation: "test-incarnation".into(),
+                        container_id: handle.sandbox_id.clone(),
+                    },
+                },
+            )
+        }
         async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+            self.created_limits
+                .lock()
+                .await
+                .push((config.cpu_limit, config.memory_limit_mb));
             self.create_entered.notify_one();
             if let Some(gate) = &self.create_gate {
                 gate.notified().await;
@@ -2413,10 +2580,34 @@ mod tests {
         })
     }
 
+    #[tokio::test]
+    async fn sandbox_host_capacity_on_worker_distinguishes_defaults_from_overrides() {
+        let node = node();
+        let mut req = create_req("capacity-test");
+        req.cpu_limit = Some(4.0);
+        req.memory_limit_mb = Some(8192);
+        let Err((status, Json(error))) =
+            create_sandbox(State(node.state.clone()), req.clone()).await
+        else {
+            panic!("Worker accepted an explicit request above capacity");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(error.error.contains("0.01 to 1"));
+        req.cpu_is_default = true;
+        req.memory_is_default = true;
+        assert!(create_sandbox(State(node.state.clone()), req).await.is_ok());
+        assert_eq!(
+            *node.provider.created_limits.lock().await,
+            vec![(Some(1.0), Some(1024))]
+        );
+    }
+
     fn create_req(label: &str) -> Json<RemoteCreateRequest> {
         Json(RemoteCreateRequest {
             run_id: 1,
             label: label.into(),
+            cpu_is_default: false,
+            memory_is_default: false,
             image: None,
             cpu_limit: None,
             memory_limit_mb: None,
@@ -2434,23 +2625,29 @@ mod tests {
     /// control-plane provider pointed at them.
     async fn control_plane_for(
         node: &Node,
-    ) -> temps_ai_agents::sandbox::remote::RemoteSandboxProvider {
+    ) -> temps_sandbox_providers::remote::RemoteSandboxProvider {
+        let (private_key, public_key) = temps_core::worker_ingress::generate_ingress_key().unwrap();
         let app = crate::server::sandbox_router(
             node.state.clone(),
             Arc::new(crate::auth::AgentAuth::new("round-trip-token")),
+            Arc::new(crate::sealed_requests::SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(Some(private_key)),
+                node_name: "round-trip-node".to_string(),
+            }),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, app).await.unwrap();
         });
-        temps_ai_agents::sandbox::remote::RemoteSandboxProvider::new(
+        temps_sandbox_providers::remote::RemoteSandboxProvider::new(
             2,
             "worker-2".into(),
             format!("http://{addr}"),
             "round-trip-token".into(),
             reqwest::Client::new(),
         )
+        .with_sealing(temps_core::sealed_request::NodeSealing::Key(public_key))
     }
 
     fn restricted() -> SandboxEgressPolicy {
@@ -3055,7 +3252,7 @@ mod tests {
 
     #[tokio::test]
     async fn long_lines_are_streamed_whole_in_continuation_frames() {
-        let long = "z".repeat(temps_ai_agents::sandbox::remote::WORKER_EXEC_LINE_LIMIT + 10);
+        let long = "z".repeat(temps_sandbox_providers::remote::WORKER_EXEC_LINE_LIMIT + 10);
         let n = node_with(
             FakeProvider {
                 exec_lines: vec![line_of(ExecStream::Stdout, &long)],
@@ -3304,6 +3501,7 @@ mod tests {
         for _ in 0..200 {
             if !n.provider.destroyed.lock().unwrap().is_empty()
                 && !n.state.work_root.join("orphan").exists()
+                && n.state.creating.lock().unwrap().is_empty()
             {
                 break;
             }
@@ -3449,7 +3647,7 @@ mod tests {
             std::os::unix::fs::symlink("/", source.path().join("root")).unwrap();
         }
 
-        let archive = temps_ai_agents::sandbox::remote::tar_directory(source.path()).unwrap();
+        let archive = temps_sandbox_providers::remote::tar_directory(source.path()).unwrap();
         let n = node();
         upload(&n, archive).await.unwrap();
 
@@ -3476,6 +3674,53 @@ mod tests {
     }
 
     // ── upload concurrency ──────────────────────────────────────────────
+
+    /// Opening a sealed upload holds far more memory than anything else the agent
+    /// does, so it has to wait for a slot like the upload itself.
+    #[tokio::test]
+    async fn a_sealed_upload_waits_for_an_upload_slot_before_it_is_opened() {
+        use tower::ServiceExt;
+        let root = tempfile::tempdir().unwrap();
+        let state = Arc::new(
+            SandboxHostState::new(None, root.path().to_path_buf())
+                .with_upload_permit_wait(Duration::from_millis(50)),
+        );
+        let _every_slot = state
+            .upload_permits
+            .clone()
+            .acquire_many_owned(MAX_CONCURRENT_UPLOADS as u32)
+            .await
+            .unwrap();
+        let app = crate::server::sandbox_router(
+            state,
+            Arc::new(crate::auth::AgentAuth::new("node-token")),
+            Arc::new(crate::sealed_requests::SealedRequestState {
+                key: crate::sealed_requests::NodeRequestKey::fixed(None),
+                node_name: "worker-a".to_string(),
+            }),
+        );
+        for path in [
+            "/agent/sandboxes/write-file",
+            "/agent/sandboxes/write-directory",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post(path)
+                        .header("authorization", "Bearer node-token")
+                        .header(
+                            "content-type",
+                            temps_core::sealed_request::SEALED_REQUEST_CONTENT_TYPE,
+                        )
+                        .body(axum::body::Body::from("not an envelope"))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            // Opened first, this would be refused for having no key.
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{path}");
+        }
+    }
 
     #[tokio::test]
     async fn uploads_beyond_the_limit_wait_then_get_503() {
@@ -3530,5 +3775,52 @@ mod tests {
         let _ = started.acquire().await.unwrap();
         release.add_permits(1);
         assert_eq!(again.await.unwrap().unwrap().status(), StatusCode::OK);
+    }
+    #[tokio::test]
+    async fn service_access_resolves_container_identity_but_retirement_keeps_exact_target() {
+        use temps_sandbox_providers::{
+            remote::RemoteServiceAccessRequest,
+            service_access::{ServiceAccessCommand, ServiceAccessTarget},
+        };
+        let node = node();
+        let request = |command| {
+            Json(RemoteServiceAccessRequest {
+                handle: sandbox_handle("temps-sandbox-abc", "stale-id"),
+                command,
+            })
+        };
+        let _receipt = service_access::command(
+            State(node.state.clone()),
+            request(ServiceAccessCommand::Inspect),
+        )
+        .await
+        .unwrap();
+        let _receipt = service_access::command(
+            State(node.state.clone()),
+            request(ServiceAccessCommand::Retire {
+                expected: ServiceAccessTarget {
+                    incarnation: "test-incarnation".into(),
+                    container_id: "stale-id".into(),
+                },
+                boot_id: uuid::Uuid::new_v4(),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            *node.provider.seen_ids.lock().unwrap(),
+            ["real-id", "stale-id"]
+        );
+        let rejected = service_access::command(
+            State(node.state),
+            Json(RemoteServiceAccessRequest {
+                handle: sandbox_handle("project-container", "real-id"),
+                command: ServiceAccessCommand::Inspect,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::BAD_REQUEST);
+        assert_eq!(node.provider.seen_ids.lock().unwrap().len(), 2);
     }
 }

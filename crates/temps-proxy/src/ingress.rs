@@ -1050,6 +1050,7 @@ pub fn grant_host<'b>(host: &str, buffer: &'b mut [u8; 256]) -> Option<&'b str> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
     use temps_workload_ingress::{
         AccessPolicy, Endpoint, EndpointProtocol, EndpointTarget, ProductRef, RateLimit,
     };
@@ -2207,7 +2208,7 @@ mod tests {
         use crate::ip_access::ProjectIpAccessGate;
         use serde::Deserialize;
         use std::collections::HashMap;
-        use temps_core::RateLimitSettings;
+        use temps_config::RateLimitSettings;
         use temps_entities::deployment_config::{
             DeploymentConfig, PasswordProtectionConfig, SecurityConfig,
         };

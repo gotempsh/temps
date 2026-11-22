@@ -28,6 +28,53 @@ use temps_workload_docker::secrets::{
 };
 use tracing::{debug, info, warn};
 
+/// Grace period between SIGTERM and SIGKILL for a stop that names none: the
+/// platform default a project's stop timeout falls back to.
+const DEFAULT_STOP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// bollard's own client timeout, which also bounds `POST /containers/{id}/stop`.
+const DEFAULT_DOCKER_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Margin past the grace period for the daemon to kill the container and answer.
+const STOP_REQUEST_MARGIN: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Docker takes the grace period as whole seconds in an `i32`.
+fn stop_grace_seconds(grace: std::time::Duration) -> i32 {
+    i32::try_from(grace.as_secs()).unwrap_or(i32::MAX)
+}
+
+/// The client for one stop request. The daemon answers a stop only once the
+/// container has exited, which with a long grace period is well past bollard's
+/// two-minute default: without a longer timeout the request would fail while
+/// the container is still draining. Only this request gets it, so a hung daemon
+/// still fails every other call in two minutes.
+fn stop_request_client(docker: &bollard::Docker, grace: std::time::Duration) -> bollard::Docker {
+    let needed = grace.saturating_add(STOP_REQUEST_MARGIN);
+    docker
+        .clone()
+        .with_timeout(needed.max(DEFAULT_DOCKER_CLIENT_TIMEOUT))
+}
+
+fn start_error(container_id: &str, source: bollard::errors::Error) -> DeployerError {
+    DeployerError::DeploymentFailed(format!(
+        "Failed to start container {container_id}: {source}"
+    ))
+}
+
+/// A failed stop as a deployer error. Only Docker's 404 means the container is
+/// gone, and so not running; any other failure may have left it running.
+fn stop_error(container_id: &str, error: bollard::errors::Error) -> DeployerError {
+    match error {
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            message,
+        } => DeployerError::ContainerNotFound(format!(
+            "Container {container_id} not found: {message}"
+        )),
+        other => DeployerError::Other(format!("Failed to stop container {container_id}: {other}")),
+    }
+}
+
 /// A failed inspect as a deployer error. Only Docker's 404 means the
 /// container is gone: callers record a container as removed on
 /// [`DeployerError::ContainerNotFound`], so a daemon error, timeout or
@@ -523,6 +570,15 @@ impl ContainerDeployer for DockerRuntime {
             let mut truncated = false;
             while let Some(frame) = output.next().await {
                 let frame = frame.map_err(|e| failure(e.to_string()))?;
+                // This exec has no TTY, so Docker multiplexes every frame. bollard
+                // reports the leftovers of a stream cut mid-frame as `Console` at
+                // EOF rather than as an error, and a probe must not read that
+                // ambiguous ending as a clean one.
+                if matches!(frame, bollard::container::LogOutput::Console { .. }) {
+                    return Err(failure(
+                        "command output stream ended in the middle of a frame".to_string(),
+                    ));
+                }
                 truncated |= crate::append_exec_output(&mut captured, frame.as_ref());
             }
             let inspect = docker
@@ -907,23 +963,31 @@ impl ContainerDeployer for DockerRuntime {
         self.require_docker()?
             .start_container(container_id, None::<StartContainerOptions>)
             .await
-            .map_err(|e| DeployerError::Other(format!("Failed to start container: {}", e)))?;
+            .map_err(|e| start_error(container_id, e))?;
         Ok(())
     }
 
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError> {
-        self.require_docker()?
+        self.stop_container_with_grace(container_id, DEFAULT_STOP_GRACE)
+            .await
+    }
+
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        let docker = self.require_docker()?;
+        stop_request_client(&docker, grace)
             .stop_container(
                 container_id,
                 Some(StopContainerOptions {
-                    t: Some(10),
+                    t: Some(stop_grace_seconds(grace)),
                     signal: None,
                 }),
             )
             .await
-            .map_err(|e| {
-                DeployerError::Other(format!("Failed to stop container {}: {}", container_id, e))
-            })?;
+            .map_err(|error| stop_error(container_id, error))?;
         Ok(())
     }
 
@@ -1289,6 +1353,46 @@ impl ContainerDeployer for DockerRuntime {
                 image_name, e
             ))),
         }
+    }
+
+    async fn remove_unused_images(
+        &self,
+        requests: &[crate::ImageRemovalRequest],
+    ) -> Result<Vec<crate::ImageRemovalOutcome>, DeployerError> {
+        let docker = self.require_docker()?;
+        temps_docker_util::remove_unused_images(&docker, requests)
+            .await
+            .map_err(|source| DeployerError::ImageInventory {
+                location: "the local Docker daemon".to_string(),
+                operation: "remove images",
+                source: Box::new(source),
+            })
+    }
+
+    async fn list_owned_images(
+        &self,
+        owner: &str,
+        project_id: i32,
+        after: Option<&crate::ListCursor>,
+    ) -> Result<crate::LabelledImages, DeployerError> {
+        let docker = self.require_docker()?;
+        let project = project_id.to_string();
+        temps_docker_util::list_labelled_images(
+            &docker,
+            &[
+                (crate::IMAGE_OWNER_LABEL, owner),
+                (crate::IMAGE_PROJECT_LABEL, project.as_str()),
+            ],
+            crate::build_protocol::IMAGE_LABEL_PREFIX,
+            true,
+            after,
+        )
+        .await
+        .map_err(|source| DeployerError::ImageInventory {
+            location: "the local Docker daemon".to_string(),
+            operation: "list a deleted project's images",
+            source: Box::new(source),
+        })
     }
 }
 

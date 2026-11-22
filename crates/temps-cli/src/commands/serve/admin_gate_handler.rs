@@ -9,13 +9,14 @@
 //!   address/host, persists, and atomic-swaps the live config.
 //!
 //! Both routes require `SettingsWrite` (PATCH) or `SettingsRead` (GET) like
-//! the rest of the admin surface.
+//! the rest of the admin surface. A successful PATCH is audit-logged as
+//! `ADMIN_GATE_UPDATED` with the previous and new rules.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use axum::{
-    extract::{ConnectInfo, State},
+    extract::{ConnectInfo, Extension, State},
     http::{header, StatusCode},
     response::IntoResponse,
     routing::get,
@@ -24,17 +25,61 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::{AuditContext, AuditLogger, AuditOperation, RequestMetadata};
+use tracing::error;
 use utoipa::ToSchema;
 
 use super::admin_gate::{trusted_forwarded_client_ip, AdminGateSource, InvalidForwardedFor};
 use super::admin_gate_service::{
     AdminGateCallerIps, AdminGateService, AdminGateServiceError, AdminGateSettings,
+    PreviousAdminGate,
 };
 
 /// State carried by these handlers. Held behind an `Arc` so axum can clone
 /// it cheaply for every request.
 pub struct AdminGateAppState {
     pub service: AdminGateService,
+    pub audit_service: Arc<dyn AuditLogger>,
+}
+
+/// Audit record for a change to who may reach the console. Carries the rules
+/// before and after, so the trail answers "who opened (or closed) the admin
+/// surface, and to what".
+#[derive(Debug, Clone, Serialize)]
+pub struct AdminGateUpdatedAudit {
+    pub context: AuditContext,
+    pub old_allowed_ips: Vec<String>,
+    pub old_allowed_hosts: Vec<String>,
+    pub old_trust_forwarded_for: bool,
+    /// The stored document this save replaced, as JSON text, when it could
+    /// not be parsed (the `old_*` fields are then empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub old_unreadable_document: Option<String>,
+    pub new_allowed_ips: Vec<String>,
+    pub new_allowed_hosts: Vec<String>,
+    pub new_trust_forwarded_for: bool,
+}
+
+impl AuditOperation for AdminGateUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "ADMIN_GATE_UPDATED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -147,6 +192,7 @@ async fn patch_admin_gate(
     RequireAuth(auth): RequireAuth,
     State(state): State<Arc<AdminGateAppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Extension(metadata): Extension<RequestMetadata>,
     headers: axum::http::HeaderMap,
     Json(request): Json<UpdateAdminGateRequest>,
 ) -> Result<impl IntoResponse, Problem> {
@@ -164,10 +210,40 @@ async fn patch_admin_gate(
         trust_forwarded_for: request.trust_forwarded_for,
     };
 
-    let cfg = state
+    let update = state
         .service
         .update(new_settings, caller_ips, caller_host.as_deref())
         .await?;
+    // The rules this write replaced, read under the row lock it took, so
+    // overlapping saves each audit the change they actually made.
+    let (previous, old_unreadable_document) = match update.previous {
+        PreviousAdminGate::Rules(rules) => (rules.normalized(), None),
+        PreviousAdminGate::Unreadable(raw) => (AdminGateSettings::default(), Some(raw)),
+    };
+    let cfg = update.current;
+
+    let audit = AdminGateUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        old_allowed_ips: previous.allowed_ips,
+        old_allowed_hosts: previous.allowed_hosts,
+        old_trust_forwarded_for: previous.trust_forwarded_for,
+        old_unreadable_document,
+        new_allowed_ips: cfg.allowed_nets.iter().map(|n| n.to_string()).collect(),
+        new_allowed_hosts: cfg.allowed_hosts.as_ref().clone(),
+        new_trust_forwarded_for: cfg.trust_forwarded_for,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        // The rules are already live; a failed audit write degrades the
+        // trail, it does not undo the change.
+        error!(
+            user_id = auth.user_id(),
+            "Failed to write ADMIN_GATE_UPDATED audit log: {}", e
+        );
+    }
 
     Ok(Json(AdminGateResponse {
         allowed_ips: cfg.allowed_nets.iter().map(|n| n.to_string()).collect(),
@@ -239,6 +315,40 @@ mod tests {
         AuthContext::new_session(user, Role::Admin)
     }
 
+    /// Records every audit operation type it is handed.
+    #[derive(Default)]
+    struct RecordingAuditLogger {
+        entries: std::sync::Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AuditLogger for RecordingAuditLogger {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.entries
+                .lock()
+                .unwrap()
+                .push((operation.operation_type(), operation.serialize()?));
+            Ok(())
+        }
+    }
+
+    fn test_request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "admin-gate-test".to_string(),
+            headers: axum::http::HeaderMap::new(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
+
     fn request_headers(forwarded_for: &str) -> axum::http::HeaderMap {
         let mut headers = axum::http::HeaderMap::new();
         headers.insert(header::HOST, "admin.example.com".parse().unwrap());
@@ -304,12 +414,17 @@ mod tests {
         let (service, _handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
             .await
             .unwrap();
-        let state = Arc::new(AdminGateAppState { service });
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AdminGateAppState {
+            service,
+            audit_service: audit.clone(),
+        });
 
         let response = patch_admin_gate(
             RequireAuth(admin_auth()),
             State(Arc::clone(&state)),
             ConnectInfo("127.0.0.1:43210".parse().unwrap()),
+            Extension(test_request_metadata()),
             request_headers("100.100.1.2"),
             Json(UpdateAdminGateRequest {
                 allowed_ips: vec!["100.64.0.0/10".to_string()],
@@ -327,6 +442,22 @@ mod tests {
             "100.100.1.2".parse::<IpAddr>().unwrap(),
             Some("admin.example.com")
         ));
+
+        // The write is audit-logged with the rules before and after.
+        let entries = audit.entries.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "ADMIN_GATE_UPDATED");
+        let body: serde_json::Value = serde_json::from_str(&entries[0].1).unwrap();
+        assert_eq!(body["old_allowed_hosts"], serde_json::json!([]));
+        assert_eq!(
+            body["new_allowed_hosts"],
+            serde_json::json!(["admin.example.com"])
+        );
+        assert_eq!(
+            body["new_allowed_ips"],
+            serde_json::json!(["100.64.0.0/10"])
+        );
+        assert_eq!(body["new_trust_forwarded_for"], serde_json::json!(true));
     }
 
     #[tokio::test]
@@ -337,12 +468,17 @@ mod tests {
         let (service, _handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
             .await
             .unwrap();
-        let state = Arc::new(AdminGateAppState { service });
+        let audit = Arc::new(RecordingAuditLogger::default());
+        let state = Arc::new(AdminGateAppState {
+            service,
+            audit_service: audit.clone(),
+        });
 
         let result = patch_admin_gate(
             RequireAuth(admin_auth()),
             State(Arc::clone(&state)),
             ConnectInfo("127.0.0.1:43210".parse().unwrap()),
+            Extension(test_request_metadata()),
             request_headers("100.100.1.2"),
             Json(UpdateAdminGateRequest {
                 allowed_ips: vec!["127.0.0.1/32".to_string()],
@@ -358,5 +494,7 @@ mod tests {
 
         assert_eq!(problem.status_code, StatusCode::CONFLICT);
         assert!(state.service.snapshot().is_noop());
+        // A rejected write changes nothing, so it records nothing.
+        assert!(audit.entries.lock().unwrap().is_empty());
     }
 }

@@ -28,21 +28,34 @@ use utoipa::openapi::{ComponentsBuilder, OpenApi};
 pub use axum;
 pub use utoipa;
 
-/// Middleware execution priority
-/// Lower numbers execute first, higher numbers execute later
+/// Middleware execution priority.
+///
+/// **Higher numbers see the request first.** Middleware is applied in
+/// ascending order with `Router::layer`, and the last layer added is the
+/// outermost, so a request passes through the highest number first and the
+/// lowest number last, right before the handler. The response comes back in
+/// the opposite order.
+///
+/// So [`Security`](Self::Security) (0) is the innermost: by the time auth runs,
+/// every other priority has already run, and those middlewares cannot rely on
+/// what auth adds to the request. `RequestMetadataMiddleware`
+/// ([`Observability`](Self::Observability), 100) relies on this order: it runs
+/// before auth so that auth can read the metadata it adds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum MiddlewarePriority {
-    /// Security middleware (authentication, authorization) - executes first
+    /// Security middleware (authentication, authorization): value 0, the last
+    /// to see the request before the handler
     Security,
-    /// Logging and metrics middleware
+    /// Logging and metrics middleware: value 100, runs before `Security`
     Observability,
     /// Request/response transformation middleware
     Transform,
     /// Caching and performance middleware
     Performance,
-    /// Business logic middleware
+    /// Business logic middleware: value 400, the first of the named priorities
+    /// to see the request
     Business,
-    /// Custom middleware with explicit priority
+    /// Custom middleware with explicit priority; see the ordering rule above
     Custom(u16),
 }
 
@@ -1310,7 +1323,9 @@ impl PluginManager {
             }
         }
 
-        // Sort middleware by priority (lower numbers execute first)
+        // Ascending, because `apply_middleware_to_router` layers in this order
+        // and the last layer added is the outermost: the highest number sees
+        // the request first (see `MiddlewarePriority`).
         all_middleware.sort_by_key(|mw| mw.priority.value());
 
         debug!("Collected {} middleware from plugins", all_middleware.len());
@@ -1547,7 +1562,9 @@ pub mod middleware_helpers {
     ///
     /// Apply the layer directly to your Axum `Router`:
     /// ```rust,no_run
-    /// router.layer(cors)
+    /// # let router = axum::Router::<()>::new();
+    /// # let cors = tower_http::cors::CorsLayer::new();
+    /// let router = router.layer(cors);
     /// ```
     pub fn cors_layer(allowed_origins: Vec<String>) -> tower_http::cors::CorsLayer {
         use axum::http::{HeaderValue, Method};
@@ -1785,6 +1802,78 @@ mod split_application_tests {
             probe_status(split.admin.clone(), "/admin-needs-metadata").await,
             axum::http::StatusCode::OK,
             "admin route extracting RequestMetadata must succeed"
+        );
+    }
+
+    /// Registers two middlewares, in the order that would hide a missing sort,
+    /// which record their priority as a request passes through them.
+    struct RecordingOrderPlugin {
+        seen: std::sync::Arc<std::sync::Mutex<Vec<u16>>>,
+    }
+
+    impl TempsPlugin for RecordingOrderPlugin {
+        fn name(&self) -> &'static str {
+            "recording-order"
+        }
+
+        fn register_services<'a>(
+            &'a self,
+            _ctx: &'a ServiceRegistrationContext,
+        ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn configure_routes(&self, _ctx: &PluginContext) -> Option<PluginRoutes> {
+            let router = Router::new().route("/order-probe", get(|| async { "ok" }));
+            Some(PluginRoutes::new(router))
+        }
+
+        fn configure_middleware(&self, _ctx: &PluginContext) -> Option<PluginMiddlewareCollection> {
+            let mut collection = PluginMiddlewareCollection::new();
+            for priority in [
+                MiddlewarePriority::Business,
+                MiddlewarePriority::Security,
+                MiddlewarePriority::Observability,
+            ] {
+                let seen = self.seen.clone();
+                collection.add_simple_middleware(
+                    format!("recorder-{}", priority.value()),
+                    "recording-order",
+                    priority,
+                    move |req: Request, next: Next| {
+                        let seen = seen.clone();
+                        async move {
+                            seen.lock().unwrap().push(priority.value());
+                            Ok(next.run(req).await)
+                        }
+                    },
+                );
+            }
+            Some(collection)
+        }
+    }
+
+    #[tokio::test]
+    async fn the_highest_middleware_priority_sees_the_request_first() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut manager = PluginManager::default();
+        manager.register_plugin(Box::new(RecordingOrderPlugin { seen: seen.clone() }));
+
+        let split = manager.build_split_application().unwrap();
+
+        assert_eq!(
+            probe_status(split.admin.clone(), "/order-probe").await,
+            axum::http::StatusCode::OK,
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec![
+                MiddlewarePriority::Business.value(),
+                MiddlewarePriority::Observability.value(),
+                MiddlewarePriority::Security.value(),
+            ],
+            "RequestMetadataMiddleware relies on running before auth; changing \
+             this order changes what every middleware can read from the request"
         );
     }
 

@@ -11,7 +11,9 @@ import {
   Clock,
   Cloud,
   Gauge,
+  Globe,
   HardDrive,
+  HeartPulse,
   Key,
   KeyRound,
   LockKeyhole,
@@ -107,6 +109,30 @@ export const settingsNavigationGroups: SettingsNavigationGroup[] = [
         title: 'Request timeouts',
         url: '/settings/request-timeouts',
         icon: Clock,
+      },
+      {
+        title: 'Service health checks',
+        url: '/settings/service-healthchecks',
+        icon: HeartPulse,
+        keywords: [
+          'healthcheck',
+          'docker healthcheck',
+          'health check interval',
+          'database health',
+        ],
+      },
+      {
+        title: 'DNS',
+        url: '/settings/dns',
+        icon: Globe,
+        keywords: [
+          'cluster dns',
+          'resolver',
+          'temps.local',
+          'nxdomain',
+          'servfail',
+          'name resolution',
+        ],
       },
       // Worker Nodes and Plugins deliberately are NOT here: they are
       // main-navigation pages (see components/dashboard/primary-navigation.ts).

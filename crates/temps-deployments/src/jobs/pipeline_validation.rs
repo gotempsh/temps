@@ -5,11 +5,14 @@
 //!
 //! This module provides synchronous validation of the complete deployment pipeline
 
+use crate::workflow::LogWriter;
+use crate::workflow::WorkflowBuilder;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowBuilder, WorkflowError, WorkflowTask};
 use temps_git::{GitProviderManagerError, GitProviderManagerTrait, PullRequest, RepositoryInfo};
 
 use crate::jobs::{

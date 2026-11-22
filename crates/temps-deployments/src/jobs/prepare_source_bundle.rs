@@ -3,13 +3,16 @@
 
 //! Prepare an uploaded source archive for the normal preset build pipeline.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use temps_core::drop_entries::{classify_drop_entry, DropEntryDisposition, DropSkipReport};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployment_logs::{LogLevel, LogService};
 
 /// Entry name for diagnostics. This is the decoded name that `enclosed_name`
@@ -402,7 +405,7 @@ mod tests {
     struct DiscardingLogWriter;
 
     #[async_trait]
-    impl temps_core::LogWriter for DiscardingLogWriter {
+    impl crate::workflow::LogWriter for DiscardingLogWriter {
         async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
             Ok(())
         }

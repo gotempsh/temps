@@ -15,6 +15,17 @@ const USER_SANDBOX_CAP_LOCK_NAMESPACE: i32 = 0x7365_6263;
 /// How long removing the container of a failed worker create may take: the
 /// same per-node deadline as an eviction's container destroy.
 const CREATE_CLEANUP_DEADLINE: std::time::Duration = EVICTION_DESTROY_DEADLINE;
+/// How often a create asks a worker how its image pull is going.
+const WORKER_PULL_POLL: std::time::Duration = std::time::Duration::from_secs(1);
+/// Longest a create waits for a worker's image pull: the pull's own ceiling
+/// plus slack.
+const WORKER_PULL_DEADLINE: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60 * 60 + 10 * 60);
+/// Detail of a create step its provider ran without reporting it separately.
+const UNREPORTED_STEP_DETAIL: &str =
+    "completed as part of the create; this backend does not report the step separately";
+
+use crate::services::creation_progress::{CreationProgress, CreationStepKind};
 
 impl SandboxService {
     /// Create a new standalone sandbox. Inserts the DB row first (to get
@@ -30,6 +41,29 @@ impl SandboxService {
                 summary.status = "starting".to_string();
             }
         }
+    }
+
+    /// The steps of a create `user_id` started with `creation_id`.
+    pub fn creation(
+        &self,
+        user_id: i32,
+        creation_id: &str,
+    ) -> Result<crate::services::creation_progress::SandboxCreation, SandboxError> {
+        self.creations
+            .get(user_id, creation_id)
+            .ok_or_else(|| SandboxError::CreationNotFound {
+                creation_id: creation_id.to_string(),
+                user_id,
+            })
+    }
+
+    /// The steps of the create that made sandbox `public_id`, while this
+    /// process still tracks it. The caller authorizes access to the sandbox.
+    pub fn creation_for_sandbox(
+        &self,
+        public_id: &str,
+    ) -> Option<crate::services::creation_progress::SandboxCreation> {
+        self.creations.for_sandbox(public_id)
     }
 
     /// [`Self::create_sandbox`] in a task of its own, so it always reaches its
@@ -58,8 +92,43 @@ impl SandboxService {
     pub async fn create_sandbox(
         &self,
         user_id: i32,
-        mut req: CreateSandboxRequest,
+        req: CreateSandboxRequest,
     ) -> Result<sandboxes::Model, SandboxError> {
+        use crate::services::creation_progress::CreationIdError;
+        let progress = self
+            .creations
+            .begin(user_id, req.creation_id.as_deref())
+            .map_err(|error| match error {
+                CreationIdError::Invalid { creation_id } => {
+                    SandboxError::CreationIdInvalid { creation_id }
+                }
+                CreationIdError::InUse {
+                    creation_id,
+                    user_id,
+                } => SandboxError::CreationIdInUse {
+                    creation_id,
+                    user_id,
+                },
+            })?;
+        // Fails the record if this future is dropped before it finishes.
+        let _abandoned = progress.abandon_guard();
+        let result = self.create_sandbox_steps(user_id, req, &progress).await;
+        match &result {
+            Ok(_) => progress.succeed(UNREPORTED_STEP_DETAIL),
+            Err(error) => progress.fail(&error.to_string()),
+        }
+        result
+    }
+
+    /// The steps of a sandbox create (see [`Self::create_sandbox`]), each
+    /// recorded in `progress` as it starts and ends.
+    async fn create_sandbox_steps(
+        &self,
+        user_id: i32,
+        mut req: CreateSandboxRequest,
+        progress: &CreationProgress,
+    ) -> Result<sandboxes::Model, SandboxError> {
+        progress.start(CreationStepKind::CheckRequest);
         let lifecycle = match req.lifecycle.as_deref() {
             None => SandboxLifecycle::default(),
             Some(value) => SandboxLifecycle::parse(value)?,
@@ -140,80 +209,76 @@ impl SandboxService {
         let backend = parse_requested_backend(req.backend.as_deref())?;
         validate_allow_docker(req.allow_docker, backend)?;
 
+        progress.done(CreationStepKind::CheckRequest, None);
+
         // ADR-048: decide which node hosts the sandbox before anything is
         // created. Explicit requests are validated against the operator
         // allow-list and never fall back to another node.
+        progress.start(CreationStepKind::SelectNode);
         let node_id = self.place_sandbox(&req).await?;
+        let node_label = self.node_label(node_id).await;
+        progress.done(CreationStepKind::SelectNode, Some(node_label.clone()));
+        progress.start(CreationStepKind::RecordSandbox);
+
+        if node_id.is_some() && req.from_snapshot_artifact.is_some() {
+            return Err(SandboxError::Validation {
+                message: "restoring a snapshot onto a worker node is not available yet; \
+                          create the sandbox on the control plane (node: \"control-plane\")"
+                    .to_string(),
+            });
+        }
+        self.check_placement_backend(node_id, backend)?;
 
         // Operator limits (HTTP create path only). The settings are read once
         // and fail closed: an unreadable section must not turn into "no
-        // limits". Host memory is only known for the control plane.
+        // limits". Docker capacity belongs to the placement host.
         let operator_limits = if req.enforce_operator_limits {
             let settings = self
                 .platform_config
                 .get_agent_sandbox_settings()
                 .await
                 .map_err(|source| SandboxError::LimitSettings { user_id, source })?;
-            let host_memory_mb = if node_id.is_none() {
-                create_policy::control_plane_memory_mb()
-            } else {
-                None
-            };
-            // On the control plane the provider says what it defaults to; a
-            // worker applies the control plane's configured sandbox
-            // defaults (Docker only, ADR-048) and Docker's PID default.
-            let defaults = if node_id.is_none() {
-                self.registry
-                    .provider_arc()
-                    .default_resource_limits(backend)
-            } else {
-                temps_ai_agents::sandbox::DefaultResourceLimits {
-                    cpu_limit: Some(settings.cpu_limit),
-                    memory_limit_mb: Some(settings.memory_limit_mb),
-                    pids_limit: Some(temps_ai_agents::sandbox::docker::DEFAULT_PIDS_LIMIT),
-                    cpu_whole_cores: false,
-                }
-            };
+            let provider = self.registry.provider_arc();
+            let host = provider
+                .host_capacity(node_id, backend)
+                .await
+                .map_err(|e| from_agent_error(&public_id_value, e))?;
+            let host_memory_mb = host.map(|h| h.memory_mb).or_else(|| {
+                node_id
+                    .is_none()
+                    .then(create_policy::control_plane_memory_mb)
+                    .flatten()
+            });
+            let defaults = self.resource_defaults(node_id, backend, &settings);
             // The host-memory check sees only what the caller sent; the
             // clamp then fills in omitted limits, and the maximums are
             // checked against the result.
+            create_policy::check_cpu_limit(
+                &public_id_value,
+                req.cpu_limit,
+                host.map(|h| h.cpu_cores),
+                settings.max_cpu_limit,
+            )?;
             create_policy::check_host_memory(&req, host_memory_mb)?;
-            create_policy::clamp_omitted_limits(&mut req, &settings, defaults);
-            create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
-            create_policy::check_requested_limits(&req, &settings, defaults)?;
+            // When the daemon is the tighter bound, leave the limit omitted.
+            // Its provider applies and logs the clamp with the new run id.
+            let mut effective_defaults = defaults;
+            if let Some(host) = host {
+                effective_defaults.cpu_limit =
+                    defaults.cpu_limit.map(|cpu| cpu.min(host.cpu_cores));
+                effective_defaults.memory_limit_mb = defaults
+                    .memory_limit_mb
+                    .map(|memory| memory.min(host.memory_mb));
+            }
+            create_policy::clamp_omitted_limits(&mut req, &settings, effective_defaults);
+            if host.is_none() {
+                create_policy::pin_omitted_memory_to_host(&mut req, defaults, host_memory_mb);
+            }
+            create_policy::check_requested_limits(&req, &settings, effective_defaults)?;
             Some(settings)
         } else {
             None
         };
-
-        if node_id.is_some() {
-            if req.from_snapshot_artifact.is_some() {
-                return Err(SandboxError::Validation {
-                    message: "restoring a snapshot onto a worker node is not available yet; \
-                              create the sandbox on the control plane (node: \"control-plane\")"
-                        .to_string(),
-                });
-            }
-            if let Some(b) =
-                backend.filter(|b| !temps_ai_agents::sandbox::WORKER_SANDBOX_BACKENDS.contains(b))
-            {
-                return Err(SandboxError::Validation {
-                    message: placement::worker_backend_unavailable(b),
-                });
-            }
-        }
-
-        // Fail closed if the caller asked for a backend this host can't
-        // provide (e.g. `firecracker` on a Docker-only host). Isolation
-        // level is a security property — silently downgrading to Docker
-        // would be worse than a clear error.
-        if let (Some(b), None) = (backend, node_id) {
-            if !self.registry.provider_arc().supports_backend(b) {
-                return Err(SandboxError::Validation {
-                    message: backend_unavailable_message(b),
-                });
-            }
-        }
 
         // Validate + hash the optional preview password *before* any
         // container/workdir work starts. A caller passing junk should fail
@@ -300,7 +365,7 @@ impl SandboxService {
             // dir from the provider handle rather than from this row. It
             // only surfaced once the terminal used the row's value as a
             // PTY cwd and every shell died with ENOENT.
-            work_dir: Set(temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            work_dir: Set(temps_sandbox_providers::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(metadata_value),
             created_at: Set(now),
@@ -367,9 +432,42 @@ impl SandboxService {
             });
         }
 
+        progress.sandbox_recorded(&public_id_value);
+        progress.done(CreationStepKind::RecordSandbox, None);
+        if req.from_snapshot_artifact.is_some() {
+            progress.skip(
+                CreationStepKind::PullImage,
+                "restored from a snapshot, which carries its own image",
+            );
+        }
+        if source.is_none() {
+            progress.skip(CreationStepKind::SeedSource, "no source was requested");
+        }
+        // A worker cannot report the steps inside its create, so its image
+        // is pulled first, as a step of its own with its progress; the
+        // create then finds it present. A create on this host reports its
+        // own pull through the provider's progress sink.
+        if let (Some(node), None) = (node_id, req.from_snapshot_artifact.as_ref()) {
+            if let Err(error) = self
+                .pull_image_on_worker(
+                    node,
+                    &node_label,
+                    req.image.as_deref(),
+                    backend,
+                    &row,
+                    progress,
+                )
+                .await
+            {
+                self.mark_destroyed(row.id).await.ok();
+                return Err(error);
+            }
+            progress.start(CreationStepKind::CreateContainer);
+        }
+
         let container_label = container_label_for(&public_id_value).to_string();
 
-        let config = SandboxCreateConfig {
+        let mut config = SandboxCreateConfig {
             node_id,
             owner_user_id: None,
             run_id: row.id,
@@ -389,21 +487,37 @@ impl SandboxService {
             backend,
         };
 
-        // Choose create path: snapshot restore vs normal create.
-        let create_result = if let Some(ref artifact) = req.from_snapshot_artifact {
-            // ADR-037: restore from snapshot. The provider ensures the image
-            // is loaded into the daemon before creating the container.
-            self.registry.create_from_snapshot(artifact, config).await
-        } else {
-            self.registry.create(config).await
-        };
+        if managed_application_id.is_some() {
+            if let Err(error) = self.apply_application_limits(&mut config).await {
+                // No provider create was attempted. Only the new row belongs to
+                // this attempt; retain the application's existing directory.
+                self.mark_destroyed(row.id).await?;
+                return Err(from_agent_error(&public_id_value, error));
+            }
+        }
+
+        // Choose create path: snapshot restore vs normal create. The
+        // provider reports its steps (image, container create and start,
+        // readiness) to `progress` as it runs them.
+        let create_result =
+            temps_sandbox_providers::with_create_progress(progress.phase_sink(), async {
+                if let Some(ref artifact) = req.from_snapshot_artifact {
+                    // ADR-037: restore from snapshot. The provider ensures the
+                    // image is loaded into the daemon before creating the
+                    // container.
+                    self.registry.create_from_snapshot(artifact, config).await
+                } else {
+                    self.registry.create(config).await
+                }
+            })
+            .await;
 
         let handle = match create_result {
             Ok(h) => h,
             // The worker refused because the label already names a live
             // sandbox there. That container is not this request's: never
             // destroy it, only retire this row.
-            Err(e @ temps_ai_agents::error::AgentError::SandboxConflictOnNode { .. }) => {
+            Err(e @ temps_agent_core::error::AgentError::SandboxConflictOnNode { .. }) => {
                 if !using_trusted_work_dir {
                     self.remove_work_dir(&public_id_value).await;
                 }
@@ -427,7 +541,13 @@ impl SandboxService {
                     self.remove_work_dir(&public_id_value).await;
                 }
                 self.mark_destroyed(row.id).await.ok();
-                if e.image_pull_failure().is_some() || e.network_pool_exhaustion().is_some() {
+                if matches!(
+                    e,
+                    temps_agent_core::error::AgentError::SandboxCpuLimit { .. }
+                        | temps_agent_core::error::AgentError::Validation { .. }
+                ) || e.image_pull_failure().is_some()
+                    || e.network_pool_exhaustion().is_some()
+                {
                     // The image could not be pulled, or the host has no
                     // address space left for the sandbox's network: report
                     // which, so the caller can tell a missing tag or a full
@@ -443,6 +563,20 @@ impl SandboxService {
 
         if node_id.is_some() {
             self.confirm_worker_create(&row, user_id).await?;
+        }
+        // The container is up. Steps its provider ran without reporting them
+        // (a worker's create, a microVM backend) end here, not after seeding.
+        for step in [
+            CreationStepKind::PullImage,
+            CreationStepKind::CreateContainer,
+            CreationStepKind::StartContainer,
+            CreationStepKind::WaitReady,
+        ] {
+            let detail = match node_id {
+                Some(_) => format!("on {node_label}, reported together with the container create"),
+                None => UNREPORTED_STEP_DETAIL.to_string(),
+            };
+            progress.done_unreported(step, &detail);
         }
 
         // Persist the *effective* backend + image the provider actually
@@ -475,6 +609,14 @@ impl SandboxService {
         // isn't left with a half-initialized container that's billing
         // their timeout budget.
         if let Some(source) = source {
+            progress.start(CreationStepKind::SeedSource);
+            progress.detail(
+                CreationStepKind::SeedSource,
+                match &source {
+                    SandboxSource::Git { .. } => "cloning the repository",
+                    SandboxSource::Tarball { .. } => "extracting the archive",
+                },
+            );
             if let Err(e) = self
                 .seed_source(row.id, &public_id_value, user_id, &source)
                 .await
@@ -501,7 +643,9 @@ impl SandboxService {
                 Some(serde_json::json!({ "type": source_kind(&source) })),
             )
             .await;
+            progress.done(CreationStepKind::SeedSource, None);
         }
+        progress.start(CreationStepKind::Ready);
 
         self.record_event(
             row.id,
@@ -524,6 +668,115 @@ impl SandboxService {
             user_id
         );
         Ok(row)
+    }
+
+    /// How a create names the node it placed a sandbox on.
+    async fn node_label(&self, node_id: Option<i32>) -> String {
+        match node_id {
+            None => format!("the {}", placement::CONTROL_PLANE_NAME),
+            Some(id) => placement::node_names(self.db.as_ref(), [id])
+                .await
+                .ok()
+                .and_then(|mut names| names.remove(&id))
+                .map(|name| format!("node '{name}'"))
+                .unwrap_or_else(|| format!("node {id}")),
+        }
+    }
+
+    /// Pull the image a create on worker `node` will use, as its own step
+    /// with its download progress, waiting on a pull already running there
+    /// (an operator's "prepare sandboxes", another create). A node that
+    /// cannot pull ahead (an older agent) pulls during the container create
+    /// instead; a pull that fails ends the create with the node's reason.
+    async fn pull_image_on_worker(
+        &self,
+        node: i32,
+        node_label: &str,
+        image: Option<&str>,
+        backend: Option<temps_sandbox_providers::SandboxBackend>,
+        row: &sandboxes::Model,
+        progress: &CreationProgress,
+    ) -> Result<(), SandboxError> {
+        use temps_sandbox_providers::ImagePrepareState;
+        progress.start(CreationStepKind::PullImage);
+        let provider = self.registry.provider_arc();
+        let mut status = match provider.prepare_image_on(Some(node), image, backend).await {
+            Ok(status) => status,
+            Err(error) => {
+                // The create itself reaches the node and reports a failure
+                // with full context; do not fail it on the preflight.
+                tracing::warn!(
+                    sandbox_id = %row.public_id,
+                    node_id = node,
+                    %error,
+                    "could not ask the node to pull the sandbox image ahead of the create"
+                );
+                progress.detail(
+                    CreationStepKind::PullImage,
+                    format!("{node_label} pulls the image during the container create"),
+                );
+                return Ok(());
+            }
+        };
+        let deadline = tokio::time::Instant::now() + WORKER_PULL_DEADLINE;
+        loop {
+            match status.state {
+                ImagePrepareState::Ready => {
+                    let detail = if status.already_present
+                        || status.bytes_total.is_none() && status.started_at.is_none()
+                    {
+                        format!("already present on {node_label}")
+                    } else {
+                        format!("pulled on {node_label}")
+                    };
+                    progress.done(CreationStepKind::PullImage, Some(detail));
+                    return Ok(());
+                }
+                ImagePrepareState::Failed => {
+                    return Err(SandboxError::ImageUnavailable {
+                        sandbox_id: row.public_id.clone(),
+                        image: status.image.clone(),
+                        reason: format!(
+                            "{node_label}: {}",
+                            status
+                                .error
+                                .unwrap_or_else(|| "the pull failed without a reason".into())
+                        ),
+                    });
+                }
+                ImagePrepareState::NotPulled | ImagePrepareState::Unsupported => {
+                    progress.detail(
+                        CreationStepKind::PullImage,
+                        format!("{node_label} pulls the image during the container create"),
+                    );
+                    return Ok(());
+                }
+                ImagePrepareState::Pulling => progress.image_progress(&status),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(SandboxError::ImageUnavailable {
+                    sandbox_id: row.public_id.clone(),
+                    image: status.image.clone(),
+                    reason: format!(
+                        "{node_label} was still pulling the image after {} minutes",
+                        WORKER_PULL_DEADLINE.as_secs() / 60
+                    ),
+                });
+            }
+            tokio::time::sleep(WORKER_PULL_POLL).await;
+            status = match provider
+                .image_prepare_status_on(Some(node), Some(&status.image), backend)
+                .await
+            {
+                Ok(next) => next,
+                // A node that cannot answer for a moment is asked again; the
+                // deadline bounds the wait.
+                Err(error) => {
+                    tracing::debug!(node_id = node, %error, "sandbox image status unavailable");
+                    status
+                }
+            };
+        }
     }
 
     /// An eviction can destroy a worker sandbox's row while its container
@@ -630,9 +883,9 @@ impl SandboxService {
 /// Guest privilege escalation is a creation-time, explicit backend opt-in.
 pub(super) fn validate_allow_docker(
     allow_docker: bool,
-    backend: Option<temps_ai_agents::sandbox::SandboxBackend>,
+    backend: Option<temps_sandbox_providers::SandboxBackend>,
 ) -> Result<(), SandboxError> {
-    if allow_docker && backend != Some(temps_ai_agents::sandbox::SandboxBackend::Microsandbox) {
+    if allow_docker && backend != Some(temps_sandbox_providers::SandboxBackend::Microsandbox) {
         return Err(SandboxError::Validation {
             message: "allow_docker requires backend=microsandbox; Docker inside Firecracker is not supported yet".into(),
         });
@@ -643,8 +896,8 @@ pub(super) fn validate_allow_docker(
 /// Parse the backend a create request asked for. `None` = host default.
 pub(super) fn parse_requested_backend(
     requested: Option<&str>,
-) -> Result<Option<temps_ai_agents::sandbox::SandboxBackend>, SandboxError> {
-    use temps_ai_agents::sandbox::SandboxBackend;
+) -> Result<Option<temps_sandbox_providers::SandboxBackend>, SandboxError> {
+    use temps_sandbox_providers::SandboxBackend;
     match requested {
         None => Ok(None),
         Some("docker") => Ok(Some(SandboxBackend::Docker)),
@@ -663,12 +916,12 @@ pub(super) fn parse_requested_backend(
 /// microsandbox the host probe says exactly what is missing (platform,
 /// hypervisor, or runtime) and where to fix it.
 pub(super) fn backend_unavailable_message(
-    backend: temps_ai_agents::sandbox::SandboxBackend,
+    backend: temps_sandbox_providers::SandboxBackend,
 ) -> String {
     match backend {
-        temps_ai_agents::sandbox::SandboxBackend::Microsandbox => {
-            let capability = temps_ai_agents::sandbox::microsandbox::microsandbox_capability(
-                &temps_ai_agents::sandbox::microsandbox::host_data_dir(),
+        temps_sandbox_providers::SandboxBackend::Microsandbox => {
+            let capability = temps_sandbox_providers::microsandbox::microsandbox_capability(
+                &temps_sandbox_providers::microsandbox::host_data_dir(),
             );
             match capability.reason {
                 Some(reason) => {
@@ -683,7 +936,7 @@ pub(super) fn backend_unavailable_message(
                         "backend 'microsandbox' is not available on this host: {}{} (see {})",
                         reason,
                         fix,
-                        temps_ai_agents::sandbox::microsandbox::SETUP_PATH
+                        temps_sandbox_providers::microsandbox::SETUP_PATH
                     )
                 }
                 // Ready now but not registered: the server started before
@@ -693,13 +946,13 @@ pub(super) fn backend_unavailable_message(
                     .to_string(),
             }
         }
-        temps_ai_agents::sandbox::SandboxBackend::Firecracker => {
+        temps_sandbox_providers::SandboxBackend::Firecracker => {
             // Registration is decided once, at startup, from the server's own
             // data directory. Name that directory and the command that
             // provisions it: a bare `temps firecracker setup` from a shell
             // without the server's TEMPS_DATA_DIR provisions a different one.
-            let data_dir = temps_ai_agents::sandbox::microsandbox::host_data_dir();
-            let command = temps_ai_agents::sandbox::microsandbox::command_with_data_dir(
+            let data_dir = temps_sandbox_providers::microsandbox::host_data_dir();
+            let command = temps_sandbox_providers::microsandbox::command_with_data_dir(
                 "temps firecracker setup",
                 &data_dir,
             );
@@ -711,8 +964,8 @@ pub(super) fn backend_unavailable_message(
                 command
             )
         }
-        temps_ai_agents::sandbox::SandboxBackend::Docker
-        | temps_ai_agents::sandbox::SandboxBackend::Local => {
+        temps_sandbox_providers::SandboxBackend::Docker
+        | temps_sandbox_providers::SandboxBackend::Local => {
             format!("backend '{}' is not available on this host", backend)
         }
     }

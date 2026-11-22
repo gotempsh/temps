@@ -81,6 +81,12 @@ pub trait ConversationContextProvider: Send + Sync {
     /// The `context_type` this provider handles, e.g. `"deployment"`.
     fn context_type(&self) -> &'static str;
 
+    /// Opaque publication identity for invalidating turn-local API tool results.
+    /// Implementations must read an in-memory snapshot, without I/O or locking.
+    fn api_tools_revision(&self) -> Option<String> {
+        None
+    }
+
     /// Finer-grained authorization for this context (the route already enforces
     /// project-level access). Default allow.
     async fn authorize(&self, _project_id: Option<i32>, _context_id: &str) -> bool {

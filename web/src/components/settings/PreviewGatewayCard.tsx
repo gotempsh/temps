@@ -194,13 +194,10 @@ export function PreviewGatewayCard() {
     action: GatewayAction,
     title: string,
     fallback: string,
-    error: unknown
+    error: unknown,
+    port = settings?.host_port ?? status?.host_port
   ) => {
-    const message = previewGatewayErrorMessage(
-      error,
-      fallback,
-      settings?.host_port ?? status?.host_port
-    )
+    const message = previewGatewayErrorMessage(error, fallback, port)
     setActionError({ action, title, message })
     toast.error(title, { description: message })
   }
@@ -298,7 +295,8 @@ export function PreviewGatewayCard() {
         'save',
         'Failed to save gateway settings',
         'The preview gateway settings could not be saved.',
-        error
+        error,
+        hostPort
       )
       await reloadAfterFailedAction()
     } finally {
@@ -498,8 +496,7 @@ export function PreviewGatewayCard() {
             id="gateway-host-port-description"
             className="text-sm text-muted-foreground"
           >
-            Bound only on 127.0.0.1. If another process uses this port, choose a
-            free port, save settings, then restart the gateway.
+            Saving applies this loopback port to the gateway and proxy.
           </p>
         </div>
 

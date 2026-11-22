@@ -202,6 +202,9 @@ pub fn convert_sentry_event_to_error_data(
     };
 
     Ok(CreateErrorEventData {
+        issue_type: None,
+        dedup_key: None,
+        grouping_key: None,
         source: Some("sentry".to_string()),
         raw_sentry_event: Some(raw_event.clone()),
         exceptions: exceptions_list,

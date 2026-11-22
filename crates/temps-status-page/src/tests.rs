@@ -7,8 +7,8 @@ use sea_orm::{ActiveModelTrait, DatabaseConnection, EntityTrait, Set};
 use std::sync::Arc;
 use temps_config::{ConfigService, ServerConfig};
 use temps_core::{Job, JobQueue, JobReceiver, QueueError};
-use temps_database::test_utils::TestDatabase;
 use temps_entities::{deployments, environments, projects, status_monitors};
+use temps_test_utils::TestDatabase;
 
 fn create_test_config_service(db: &Arc<DatabaseConnection>) -> Arc<ConfigService> {
     let config = ServerConfig::new(
@@ -1133,8 +1133,13 @@ mod integration_tests {
         }
 
         let job_queue: Arc<dyn JobQueue> = Arc::new(MockJobQueue);
-        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue)
-            .expect("test HTTP client should build");
+        let health_check_service = HealthCheckService::new(
+            db.clone(),
+            config_service,
+            job_queue,
+            crate::services::health_check_service::test_target_checks(),
+        )
+        .expect("test HTTP client should build");
 
         // Initialize monitors for all environments
         health_check_service.initialize_monitors().await.unwrap();

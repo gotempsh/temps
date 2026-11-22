@@ -14,8 +14,8 @@ pub mod proxy_tests {
     use std::sync::atomic::{AtomicU16, Ordering};
     use std::sync::Arc;
 
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpListener;
 
@@ -209,6 +209,7 @@ pub mod proxy_tests {
                 "".to_string(),
             ));
             Ok(PeerSelection {
+                in_flight: None,
                 peer,
                 container_id: None,
                 container_name: None,

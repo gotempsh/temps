@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use temps_entities::compose_security::{
     ComposeSecurityCheck as PolicyCheck, ComposeSecurityPolicy,
 };
+use temps_presets::compose_security::ComposeSecurityCheckExt;
 
 use super::{ComposeError, ComposeExecutor, MAX_RESOLVED_COMPOSE_SERVICES, TEMPS_SECRETS_OVERRIDE};
 use yaml_serde::value::{Tag, TaggedValue};
@@ -237,6 +238,7 @@ impl ComposeExecutor {
                 && root_map.contains_key(YamlValue::String("include".to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::Include),
                     service: "<top-level>".to_string(),
                     field: "include".to_string(),
                     reason: "top-level 'include' pulls in unvalidated compose files; \
@@ -261,6 +263,7 @@ impl ComposeExecutor {
         };
         if services.len() > MAX_RESOLVED_COMPOSE_SERVICES {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<top-level>".to_string(),
                 field: "services".to_string(),
                 reason: format!(
@@ -283,6 +286,7 @@ impl ComposeExecutor {
             // parser may still treat it as a service. Fail closed instead.
             let Some(service_name) = service_key.as_str() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<non-string>".to_string(),
                     field: "services".to_string(),
                     reason: "service names must be quoted strings; non-string scalar keys \
@@ -298,6 +302,7 @@ impl ComposeExecutor {
             // character set.
             if !Self::is_valid_service_name(service_name) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: service_name.to_string(),
                     field: "services".to_string(),
                     reason: "service names may only contain letters, digits, '.', '_' and '-' \
@@ -452,6 +457,7 @@ impl ComposeExecutor {
             if let Some(shm_size) = service.get(YamlValue::String("shm_size".to_string())) {
                 let bytes = Self::parse_compose_byte_size(shm_size).ok_or_else(|| {
                     ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: "shared-memory size must be a positive byte count or a value such as '128m', '256mb', or '512MiB'".to_string(),
@@ -459,6 +465,7 @@ impl ComposeExecutor {
                 })?;
                 if self.enforced(PolicyCheck::ServiceShm) && bytes > MAX_SERVICE_SHM_BYTES {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::ServiceShm),
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
@@ -469,6 +476,7 @@ impl ComposeExecutor {
                 }
                 total_shm_bytes = total_shm_bytes.checked_add(bytes).ok_or_else(|| {
                     ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: "aggregate shared-memory sizing exceeds the supported range"
@@ -479,6 +487,7 @@ impl ComposeExecutor {
                     && total_shm_bytes > MAX_COMPOSE_SHM_BYTES
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::AggregateShm),
                         service: service_name.to_string(),
                         field: "shm_size".to_string(),
                         reason: format!(
@@ -524,6 +533,7 @@ impl ComposeExecutor {
         };
         let Some(networks) = networks.as_mapping() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<top-level>".to_string(),
                 field: "networks".to_string(),
                 reason: "top-level networks must be a mapping".to_string(),
@@ -533,6 +543,7 @@ impl ComposeExecutor {
         for (network_name, network) in networks {
             let Some(name) = network_name.as_str() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<top-level>".to_string(),
                     field: "networks".to_string(),
                     reason: "network names must be strings".to_string(),
@@ -543,6 +554,7 @@ impl ComposeExecutor {
             }
             let Some(options) = network.as_mapping() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<top-level>".to_string(),
                     field: format!("networks.{name}"),
                     reason: "network configuration must be a mapping".to_string(),
@@ -553,6 +565,7 @@ impl ComposeExecutor {
                 && options.contains_key(YamlValue::String("name".to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::NetworkNames),
                     service: "<top-level>".to_string(),
                     field: format!("networks.{name}.name"),
                     reason: "custom Docker network names can attach a service to a daemon-global network outside this deployment"
@@ -565,6 +578,7 @@ impl ComposeExecutor {
                     && external.as_bool() != Some(false)
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::ExternalNetworks),
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.external"),
                         reason: "external Compose networks bypass Temps-managed network policy"
@@ -576,6 +590,7 @@ impl ComposeExecutor {
             if let Some(driver) = options.get(YamlValue::String("driver".to_string())) {
                 let Some(driver) = driver.as_str() else {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.driver"),
                         reason: "network driver must be the literal value 'bridge'".to_string(),
@@ -583,6 +598,7 @@ impl ComposeExecutor {
                 };
                 if self.enforced(PolicyCheck::NetworkDrivers) && driver != "bridge" {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::NetworkDrivers),
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.driver"),
                         reason: format!(
@@ -600,6 +616,7 @@ impl ComposeExecutor {
                 }) && options.contains_key(YamlValue::String(field.to_string()))
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(if field == "ipam" { PolicyCheck::NetworkIpam } else { PolicyCheck::NetworkOptions }),
                         service: "<top-level>".to_string(),
                         field: format!("networks.{name}.{field}"),
                         reason: format!(
@@ -627,6 +644,7 @@ impl ComposeExecutor {
         };
         let Some(volumes) = volumes_value.as_mapping() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<top-level>".to_string(),
                 field: "volumes".to_string(),
                 reason: "top-level volumes must be a mapping".to_string(),
@@ -635,6 +653,7 @@ impl ComposeExecutor {
         for (name, def) in volumes {
             let Some(name) = name.as_str() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<top-level>".to_string(),
                     field: "volumes".to_string(),
                     reason: "volume names must be strings".to_string(),
@@ -645,6 +664,7 @@ impl ComposeExecutor {
             }
             let Some(def_map) = def.as_mapping() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: format!("volumes.{name}"),
                     field: format!("volumes.{name}"),
                     reason: "volume configuration must be a mapping".to_string(),
@@ -655,6 +675,7 @@ impl ComposeExecutor {
                 && def_map.contains_key(YamlValue::String("name".to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::VolumeNames),
                     service: format!("volumes.{name}"),
                     field: format!("volumes.{name}.name"),
                     reason: "custom Docker volume names are daemon-global and can reference another deployment's data"
@@ -667,6 +688,7 @@ impl ComposeExecutor {
                     && external.as_bool() != Some(false)
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::ExternalVolumes),
                         service: format!("volumes.{name}"),
                         field: format!("volumes.{name}.external"),
                         reason:
@@ -682,6 +704,7 @@ impl ComposeExecutor {
             if let Some(driver) = def_map.get(YamlValue::String("driver".to_string())) {
                 let Some(driver) = driver.as_str() else {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: format!("volumes.{name}"),
                         field: format!("volumes.{name}.driver"),
                         reason: "volume driver must be the literal value 'local'".to_string(),
@@ -726,6 +749,7 @@ impl ComposeExecutor {
                 continue;
             }
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(check),
                 service: format!("volumes.{name}"),
                 field: format!("volumes.{name}.driver_opts"),
                 reason: "volume driver_opts can make the Docker daemon mount host or network filesystems and are not allowed"
@@ -743,6 +767,7 @@ impl ComposeExecutor {
         };
         let Some(map) = value.as_mapping() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<top-level>".to_string(),
                 field: key.to_string(),
                 reason: format!("top-level {key} must be a mapping"),
@@ -765,6 +790,7 @@ impl ComposeExecutor {
             }
             let Some(def_map) = def.as_mapping() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: format!("{key}.{name}"),
                     field: format!("{key}.{name}"),
                     reason: format!("{key} configuration must be a mapping"),
@@ -774,6 +800,7 @@ impl ComposeExecutor {
                 && def_map.contains_key(YamlValue::String("name".to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(external_check),
                     service: format!("{key}.{name}"),
                     field: format!("{key}.{name}.name"),
                     reason: format!(
@@ -787,6 +814,7 @@ impl ComposeExecutor {
                     && external.as_bool() != Some(false)
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(external_check),
                         service: format!("{key}.{name}"),
                         field: format!("{key}.{name}.external"),
                         reason: format!(
@@ -798,6 +826,7 @@ impl ComposeExecutor {
             if let Some(file) = def_map.get(YamlValue::String("file".to_string())) {
                 let Some(file) = file.as_str() else {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: format!("{key}.{name}"),
                         field: format!("{key}.file"),
                         reason: format!("{key} file must be a confined literal path"),
@@ -805,6 +834,7 @@ impl ComposeExecutor {
                 };
                 if self.enforced(paths) && Self::is_dangerous_host_path(file) {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(paths),
                         service: format!("{key}.{name}"),
                         field: format!("{key}.file"),
                         reason: format!("host file '{file}' exposed through {key} is not allowed"),
@@ -829,6 +859,7 @@ impl ComposeExecutor {
         if let Some(context) = build.as_str() {
             if self.enforced(PolicyCheck::RemoteBuild) && Self::is_remote_build_context(context) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::RemoteBuild),
                     service: service_name.to_string(),
                     field: "build.context".to_string(),
                     reason: "remote build contexts are not allowed because Docker would fetch them from the host network".to_string(),
@@ -839,6 +870,7 @@ impl ComposeExecutor {
                 && Self::is_dangerous_host_path(context)
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::BuildContext),
                     service: service_name.to_string(),
                     field: "build.context".to_string(),
                     reason: "build context must be a confined relative path; absolute, project-escaping, or interpolated values are not allowed".to_string(),
@@ -848,6 +880,7 @@ impl ComposeExecutor {
         }
         let Some(build_map) = build.as_mapping() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service_name.to_string(),
                 field: "build".to_string(),
                 reason:
@@ -862,6 +895,7 @@ impl ComposeExecutor {
                 Some(true) if !self.enforced(PolicyCheck::BuildPrivileged) => {}
                 Some(true) => {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::BuildPrivileged),
                         service: service_name.to_string(),
                         field: "build.privileged".to_string(),
                         reason: "privileged build steps can escape the build sandbox".to_string(),
@@ -869,6 +903,7 @@ impl ComposeExecutor {
                 }
                 None => {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "build.privileged".to_string(),
                         reason: "build.privileged must be the literal boolean false; strings, interpolation, and other value types are not allowed"
@@ -881,6 +916,7 @@ impl ComposeExecutor {
             && build_map.contains_key(YamlValue::String("entitlements".to_string()))
         {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::BuildEntitlements),
                 service: service_name.to_string(),
                 field: "build.entitlements".to_string(),
                 reason: "build entitlements (e.g. security.insecure) grant host access".to_string(),
@@ -891,6 +927,7 @@ impl ComposeExecutor {
                 && build_map.contains_key(YamlValue::String(field.to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Self::field_check(&format!("build.{field}")),
                     service: service_name.to_string(),
                     field: format!("build.{field}"),
                     reason: format!(
@@ -902,6 +939,7 @@ impl ComposeExecutor {
         if let Some(network) = build_map.get(YamlValue::String("network".to_string())) {
             let Some(network) = network.as_str() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: service_name.to_string(),
                     field: "build.network".to_string(),
                     reason: "build.network must be a literal network name; interpolation and other value types are not allowed"
@@ -910,6 +948,7 @@ impl ComposeExecutor {
             };
             if Self::contains_interpolation(network) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::BuildNetwork),
                     service: service_name.to_string(),
                     field: "build.network".to_string(),
                     reason: "interpolation in build.network is not allowed because it can resolve to the host network after validation"
@@ -920,6 +959,7 @@ impl ComposeExecutor {
                 && !matches!(network.trim(), "default" | "none")
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::BuildNetwork),
                     service: service_name.to_string(),
                     field: "build.network".to_string(),
                     reason: "build.network must be 'default' or 'none'; named and host networks can expose other deployments to build steps"
@@ -931,6 +971,7 @@ impl ComposeExecutor {
             && build_map.contains_key(YamlValue::String("ssh".to_string()))
         {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::BuildSsh),
                 service: service_name.to_string(),
                 field: "build.ssh".to_string(),
                 reason: "build.ssh forwards the host SSH agent into the build and can leak \
@@ -943,6 +984,7 @@ impl ComposeExecutor {
                 && build_map.contains_key(YamlValue::String(field.to_string()))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Self::field_check(&format!("build.{field}")),
                     service: service_name.to_string(),
                     field: format!("build.{field}"),
                     reason: format!(
@@ -959,6 +1001,7 @@ impl ComposeExecutor {
             if let Some(raw_value) = build_map.get(YamlValue::String(field.to_string())) {
                 let Some(value) = raw_value.as_str() else {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: format!("build.{field}"),
                         reason: format!("build.{field} must be a literal relative path"),
@@ -969,6 +1012,7 @@ impl ComposeExecutor {
                     && Self::is_remote_build_context(value)
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::RemoteBuild),
                         service: service_name.to_string(),
                         field: "build.context".to_string(),
                         reason: "remote build contexts are not allowed because Docker would fetch them from the host network".to_string(),
@@ -982,6 +1026,11 @@ impl ComposeExecutor {
                     && Self::is_dangerous_host_path(value)
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(if field == "context" {
+                            PolicyCheck::BuildContext
+                        } else {
+                            PolicyCheck::Dockerfile
+                        }),
                         service: service_name.to_string(),
                         field: format!("build.{field}"),
                         reason: format!(
@@ -1017,6 +1066,7 @@ impl ComposeExecutor {
             .is_some_and(|res| res.contains_key(YamlValue::String("devices".to_string())));
         if has_devices {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::Gpu),
                 service: service_name.to_string(),
                 field: "deploy.resources.reservations.devices".to_string(),
                 reason: "device reservations expose host accelerators/devices (equivalent to \
@@ -1038,6 +1088,7 @@ impl ComposeExecutor {
         if let Some(scale) = service.get(YamlValue::String("scale".to_string())) {
             if scale.as_u64() != Some(1) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::Replicas),
                     service: service_name.to_string(),
                     field: "scale".to_string(),
                     reason: "Compose services are limited to one replica; scale must be the literal integer 1"
@@ -1049,6 +1100,7 @@ impl ComposeExecutor {
         if let Some(deploy) = service.get(YamlValue::String("deploy".to_string())) {
             let Some(deploy) = deploy.as_mapping() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: service_name.to_string(),
                     field: "deploy".to_string(),
                     reason: "deploy must be a literal mapping".to_string(),
@@ -1057,6 +1109,7 @@ impl ComposeExecutor {
             if let Some(replicas) = deploy.get(YamlValue::String("replicas".to_string())) {
                 if replicas.as_u64() != Some(1) {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::Replicas),
                         service: service_name.to_string(),
                         field: "deploy.replicas".to_string(),
                         reason: "Compose services are limited to one replica; deploy.replicas must be the literal integer 1"
@@ -1067,6 +1120,7 @@ impl ComposeExecutor {
             if let Some(mode) = deploy.get(YamlValue::String("mode".to_string())) {
                 if mode.as_str() != Some("replicated") {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::Replicas),
                         service: service_name.to_string(),
                         field: "deploy.mode".to_string(),
                         reason: "only deploy.mode 'replicated' is allowed".to_string(),
@@ -1087,6 +1141,7 @@ impl ComposeExecutor {
         if let Some(image) = service.get(YamlValue::String("image".to_string())) {
             let Some(image) = image.as_str() else {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: service_name.to_string(),
                     field: "image".to_string(),
                     reason: "image must be a literal registry reference".to_string(),
@@ -1139,6 +1194,7 @@ impl ComposeExecutor {
             };
             if let Some(reason) = rejection {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::ImageReferences),
                     service: service_name.to_string(),
                     field: "image".to_string(),
                     reason,
@@ -1146,6 +1202,7 @@ impl ComposeExecutor {
             }
             if self.enforced(PolicyCheck::BuildImage) && has_build {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::BuildImage),
                     service: service_name.to_string(),
                     field: "image".to_string(),
                     reason: "image is set on a service that also has build:. Remove image:; \
@@ -1161,6 +1218,7 @@ impl ComposeExecutor {
                 && (has_build || pull_policy.as_str() != Some("always"))
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::PullPolicy),
                     service: service_name.to_string(),
                     field: "pull_policy".to_string(),
                     reason: "image services always pull from their registry and build services use a Temps-scoped local image; custom pull_policy values are not allowed"
@@ -1186,6 +1244,7 @@ impl ComposeExecutor {
                     || Self::validate_relative_path(path, "env_file").is_err())
             {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::EnvFiles),
                     service: service_name.to_string(),
                     field: "env_file".to_string(),
                     reason: "env_file paths must be literal relative paths confined to the project"
@@ -1206,6 +1265,7 @@ impl ComposeExecutor {
                                 .and_then(YamlValue::as_str)
                             else {
                                 return Err(ComposeError::SecurityPolicyViolation {
+                                    check: None,
                                     service: service_name.to_string(),
                                     field: "env_file".to_string(),
                                     reason:
@@ -1217,6 +1277,7 @@ impl ComposeExecutor {
                         }
                         _ => {
                             return Err(ComposeError::SecurityPolicyViolation {
+                                check: None,
                                 service: service_name.to_string(),
                                 field: "env_file".to_string(),
                                 reason: "env_file must be a path or a sequence of path entries"
@@ -1228,6 +1289,7 @@ impl ComposeExecutor {
                 Ok(())
             }
             _ => Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service_name.to_string(),
                 field: "env_file".to_string(),
                 reason: "env_file must be a literal path or sequence".to_string(),
@@ -1248,28 +1310,16 @@ impl ComposeExecutor {
         };
         let Some(ports) = ports.as_sequence() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::PublishedPorts),
                 service: service_name.to_string(),
                 field: "ports".to_string(),
                 reason: "ports must be a sequence of loopback-only bindings".to_string(),
             });
         };
         for port in ports {
-            let loopback_only = match port {
-                YamlValue::String(binding) => {
-                    !Self::contains_interpolation(binding)
-                        && binding.starts_with("127.0.0.1:")
-                        && binding.split(':').count() >= 3
-                }
-                YamlValue::Mapping(binding) => {
-                    binding
-                        .get(YamlValue::String("host_ip".to_string()))
-                        .and_then(YamlValue::as_str)
-                        == Some("127.0.0.1")
-                }
-                _ => false,
-            };
-            if !loopback_only {
+            if !Self::port_entry_is_loopback_only(port) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::PublishedPorts),
                     service: service_name.to_string(),
                     field: "ports".to_string(),
                     reason: Self::loopback_port_remediation(port),
@@ -1279,9 +1329,36 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    /// Whether one `ports` entry publishes on loopback only, in either the
+    /// short or the long form. Shared with
+    /// [`ComposeExecutor::normalize_for_policy`], which rewrites the entries
+    /// this rejects: the rewrite and the rule it satisfies must agree, or a
+    /// rewritten model would still fail validation.
+    pub(super) fn port_entry_is_loopback_only(port: &YamlValue) -> bool {
+        match port {
+            YamlValue::String(binding) => {
+                !Self::contains_interpolation(binding)
+                    && binding.starts_with("127.0.0.1:")
+                    && binding.split(':').count() >= 3
+            }
+            YamlValue::Mapping(binding) => {
+                binding
+                    .get(YamlValue::String("host_ip".to_string()))
+                    .and_then(YamlValue::as_str)
+                    == Some("127.0.0.1")
+            }
+            _ => false,
+        }
+    }
+
     /// Rejection text for a published port that is not loopback-only, naming
-    /// the exact entry and the exact replacement. Temps does not rewrite the
-    /// file itself: which ports a stack exposes is the author's decision.
+    /// the exact entry and the exact replacement.
+    ///
+    /// A file is normally rewritten before it reaches this rule
+    /// ([`ComposeExecutor::normalize_for_policy`]), so this text is what an
+    /// entry the rewrite could not parse — a variable, an unknown protocol —
+    /// or a file validated without normalization (an inline override that no
+    /// Compose CLI merged) reports.
     fn loopback_port_remediation(port: &YamlValue) -> String {
         const WHY: &str = "published ports must explicitly bind to 127.0.0.1 so traffic cannot \
                            bypass the Temps proxy";
@@ -1318,7 +1395,7 @@ impl ComposeExecutor {
     /// Restricts to the Compose spec character set (alphanumeric start, then
     /// letters/digits/`.`/`_`/`-`), rejecting names with newlines, colons, or
     /// spaces that could corrupt the generated security override.
-    fn is_valid_service_name(name: &str) -> bool {
+    pub(super) fn is_valid_service_name(name: &str) -> bool {
         let mut chars = name.chars();
         match chars.next() {
             Some(c) if c.is_ascii_alphanumeric() => {}
@@ -1400,6 +1477,7 @@ impl ComposeExecutor {
             };
             if Self::value_contains_interpolation(value) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::Interpolation),
                     service: service_name.to_string(),
                     field: (*field).to_string(),
                     reason: format!(
@@ -1439,6 +1517,7 @@ impl ComposeExecutor {
         match value.as_bool() {
             Some(value) if value == rejected && self.field_enforced(field) => {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Self::field_check(field),
                     service: service_name.to_string(),
                     field: field.to_string(),
                     reason: reason.to_string(),
@@ -1447,6 +1526,7 @@ impl ComposeExecutor {
             Some(_) => {}
             None => {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: service_name.to_string(),
                     field: field.to_string(),
                     reason: format!(
@@ -1470,6 +1550,7 @@ impl ComposeExecutor {
         }
         if service.contains_key(YamlValue::String(field.to_string())) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Self::field_check(field),
                 service: service_name.to_string(),
                 field: field.to_string(),
                 reason: reason.to_string(),
@@ -1489,6 +1570,7 @@ impl ComposeExecutor {
         };
         let Some(mode) = value.as_str() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service_name.to_string(),
                 field: "network_mode".to_string(),
                 reason: "network_mode must be omitted, 'none', or 'service:<declared-service>'"
@@ -1515,7 +1597,19 @@ impl ComposeExecutor {
             }
         }
 
+        // `service:` targets are rejected only when the service is missing or
+        // empty, which no setting allows, so they carry no policy check.
+        let check = if mode == "host" {
+            Some(PolicyCheck::HostNetwork)
+        } else if mode.starts_with("container:") {
+            Some(PolicyCheck::ContainerNamespace)
+        } else if mode.starts_with("service:") {
+            None
+        } else {
+            Some(PolicyCheck::NetworkMode)
+        };
         Err(ComposeError::SecurityPolicyViolation {
+            check,
             service: service_name.to_string(),
             field: "network_mode".to_string(),
             reason: "network_mode may not join host, default bridge, arbitrary container, or external namespaces; omit it for the project network, use 'none', or share a declared service namespace"
@@ -1534,6 +1628,7 @@ impl ComposeExecutor {
         };
         let Some(mode) = value.as_str() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service_name.to_string(),
                 field: field.to_string(),
                 reason: format!("{field} must be a literal namespace mode"),
@@ -1549,6 +1644,7 @@ impl ComposeExecutor {
         };
         if mode == "host" && self.enforced(check) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(check),
                 service: service_name.to_string(),
                 field: field.to_string(),
                 reason: "host namespace sharing is not allowed for compose deployments".to_string(),
@@ -1559,6 +1655,7 @@ impl ComposeExecutor {
         // containers. Only intra-project `service:<name>` sharing is acceptable.
         if mode.starts_with("container:") && self.enforced(PolicyCheck::ContainerNamespace) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::ContainerNamespace),
                 service: service_name.to_string(),
                 field: field.to_string(),
                 reason: "joining another container's namespace via 'container:' is not allowed; \
@@ -1620,6 +1717,7 @@ impl ComposeExecutor {
             });
         if exposes_socket {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Some(PolicyCheck::DockerSocket),
                 service: service.to_string(), field: "volumes".to_string(),
                 reason: "this mount exposes a Docker daemon socket; the Docker socket policy must also be disabled".to_string(),
             });
@@ -1646,6 +1744,7 @@ impl ComposeExecutor {
         };
         let Some(entries) = volumes.as_sequence() else {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service_name.to_string(),
                 field: "volumes".to_string(),
                 reason: "volumes must be a sequence of validated mount entries".to_string(),
@@ -1659,6 +1758,7 @@ impl ComposeExecutor {
                     .and_then(YamlValue::as_str)
                 else {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "volumes.type".to_string(),
                         reason: "long-form volume mounts must declare a literal type of 'bind' or 'volume'"
@@ -1672,6 +1772,9 @@ impl ComposeExecutor {
                     || !matches!(mount_type, "bind" | "volume")
                 {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        // Disabling Tmpfs allows this mount (above); other
+                        // types are unsupported whatever the policy says.
+                        check: (mount_type == "tmpfs").then_some(PolicyCheck::Tmpfs),
                         service: service_name.to_string(),
                         field: "volumes.type".to_string(),
                         reason: format!(
@@ -1686,6 +1789,7 @@ impl ComposeExecutor {
             let Some(source) = Self::volume_source(entry) else {
                 if long_form_type == Some("bind") {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "volumes.source".to_string(),
                         reason: "long-form bind mounts must declare a literal source path"
@@ -1699,6 +1803,7 @@ impl ComposeExecutor {
             // statically validated, so a `/`-style check is trivially bypassed.
             if self.enforced(PolicyCheck::Interpolation) && Self::contains_interpolation(&source) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(PolicyCheck::Interpolation),
                     service: service_name.to_string(),
                     field: "volumes".to_string(),
                     reason: format!(
@@ -1715,6 +1820,7 @@ impl ComposeExecutor {
             if long_form_type == Some("volume") {
                 if !Self::is_named_volume_ref(&source) {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: service_name.to_string(),
                         field: "volumes.source".to_string(),
                         reason: format!(
@@ -1724,6 +1830,7 @@ impl ComposeExecutor {
                 }
                 if forbidden_named_volumes.contains(&source) {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::VolumeDrivers),
                         service: service_name.to_string(),
                         field: "volumes".to_string(),
                         reason: format!(
@@ -1737,6 +1844,7 @@ impl ComposeExecutor {
             if long_form_type.is_none() && Self::is_named_volume_ref(&source) {
                 if forbidden_named_volumes.contains(&source) {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Some(PolicyCheck::VolumeDrivers),
                         service: service_name.to_string(),
                         field: "volumes".to_string(),
                         reason: format!(
@@ -1751,6 +1859,11 @@ impl ComposeExecutor {
             // outside the sandbox or relative paths that escape the project dir.
             if self.bind_path_enforced(&source) && Self::is_dangerous_host_path(&source) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: Some(if Self::socket_source(&source) {
+                        PolicyCheck::DockerSocket
+                    } else {
+                        PolicyCheck::BindMounts
+                    }),
                     service: service_name.to_string(),
                     field: "volumes".to_string(),
                     reason: format!("host bind mount source '{source}' is not allowed"),
@@ -1900,6 +2013,7 @@ impl ComposeExecutor {
             Some(services) => services,
             None if !policy.enforced(PolicyCheck::InlineServices) && base.get("services").is_none() => &empty_services,
             None => return Err(ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: "base compose file must define a services mapping before an inline override can be applied".to_string(),
             }),
@@ -1907,6 +2021,7 @@ impl ComposeExecutor {
 
         let Some(override_root) = override_yaml.as_mapping() else {
             return Err(ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: "inline compose override must be a mapping".to_string(),
             });
@@ -1917,6 +2032,7 @@ impl ComposeExecutor {
                 && !(key == "include" && !policy.enforced(PolicyCheck::Include))
             {
                 return Err(ComposeError::InvalidOverride {
+                check: Some(PolicyCheck::InlineSections),
                     project: project_name.to_string(),
                     reason: format!(
                         "inline compose override cannot set top-level key '{key}'; an instance administrator can disable the Inline Sections check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
@@ -1935,6 +2051,7 @@ impl ComposeExecutor {
                 return Ok(());
             }
             return Err(ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason:
                     "inline compose override must define only service-level changes under services"
@@ -1947,6 +2064,7 @@ impl ComposeExecutor {
         for (service_name_value, service_config) in override_services {
             let service_name = Self::yaml_key(service_name_value).ok_or_else(|| {
                 ComposeError::InvalidOverride {
+                    check: None,
                     project: project_name.to_string(),
                     reason: "service names in inline compose override must be strings".to_string(),
                 }
@@ -1956,6 +2074,7 @@ impl ComposeExecutor {
                 && !base_service_names.contains(&service_name)
             {
                 return Err(ComposeError::InvalidOverride {
+                check: Some(PolicyCheck::InlineServices),
                     project: project_name.to_string(),
                     reason: format!(
                         "inline compose override cannot add service '{service_name}'; add it to the repository compose file, or an instance administrator can disable the Inline Services check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"
@@ -2009,6 +2128,7 @@ impl ComposeExecutor {
             return Ok(override_content.to_string());
         }
         yaml_serde::to_string(&override_yaml).map_err(|error| ComposeError::InvalidOverride {
+            check: None,
             project: project_name.to_string(),
             reason: format!("failed to serialize inline override after merging extends: {error}"),
         })
@@ -2049,6 +2169,7 @@ impl ComposeExecutor {
         yaml_serde::to_string(&Value::Mapping(root))
             .map(Some)
             .map_err(|error| ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: format!("failed to serialize port reset layer: {error}"),
             })
@@ -2061,12 +2182,14 @@ impl ComposeExecutor {
     ) -> Result<Value, ComposeError> {
         let mut compose =
             yaml_serde::from_str::<Value>(content).map_err(|e| ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: format!("failed to parse {label} YAML: {e}"),
             })?;
         compose
             .apply_merge()
             .map_err(|e| ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: format!("failed to expand YAML merge keys in {label}: {e}"),
             })?;
@@ -2092,6 +2215,7 @@ impl ComposeExecutor {
     ) -> Result<(), ComposeError> {
         let Some(service) = service_config.as_mapping() else {
             return Err(ComposeError::InvalidOverride {
+                check: None,
                 project: project_name.to_string(),
                 reason: format!("service '{service_name}' override must be a mapping"),
             });
@@ -2103,6 +2227,7 @@ impl ComposeExecutor {
                     .unwrap_or(PolicyCheck::InlineFields);
                 if policy.enforced(check) {
                     return Err(ComposeError::InvalidOverride {
+                check: Some(check),
                         project: project_name.to_string(),
                         reason: format!("service '{service_name}' uses '{key}', which the {check:?} check rejects; an instance administrator can disable that check in Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings for a trusted stack"),
                     });
@@ -2112,6 +2237,7 @@ impl ComposeExecutor {
                 && REPO_ONLY_OVERRIDE_KEYS.contains(&key.as_str())
             {
                 return Err(ComposeError::InvalidOverride {
+                check: Some(PolicyCheck::InlineFields),
                     project: project_name.to_string(),
                     reason: format!(
                         "service '{service_name}' cannot set '{key}' as an inline override; \

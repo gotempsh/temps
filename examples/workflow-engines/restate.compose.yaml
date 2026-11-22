@@ -1,0 +1,40 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+services:
+  gateway:
+    build:
+      context: ./gateway
+      args:
+        ENGINE: restate
+    environment:
+      ENGINE_USER: ${ENGINE_USER:-admin}
+      ENGINE_PASSWORD: ${ENGINE_PASSWORD:?Set a generated password of at least 24 characters}
+    ports:
+      - "127.0.0.1::8080"
+      - "127.0.0.1::8081"
+    cap_drop: [ALL]
+    mem_limit: 64m
+    cpus: 0.25
+    healthcheck:
+      test: [CMD, wget, -q, -O, /dev/null, "http://127.0.0.1:8080/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+  restate:
+    image: docker.restate.dev/restatedev/restate:1.6.0@sha256:33f227db946864b5482340a8621e32ec5eaf464f4dc41d5deccfd3282bb930ae
+    command: [--base-dir, /restate-data]
+    environment:
+      RESTATE_ROCKSDB_TOTAL_MEMORY_SIZE: 256MiB
+      RESTATE_ADMIN__QUERY_ENGINE__MEMORY_SIZE: 64MiB
+    volumes:
+      - restate-data:/restate-data
+    cap_drop: [ALL]
+    mem_limit: 768m
+    cpus: 1.0
+    healthcheck:
+      test: [CMD, curl, -fsS, "http://127.0.0.1:9070/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+volumes:
+  restate-data:

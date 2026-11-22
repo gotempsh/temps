@@ -71,6 +71,7 @@ impl TempsPlugin for GitPlugin {
                 encryption_service.clone(),
                 queue_service.clone(),
                 config_service.clone(),
+                audit_service.clone(),
             ));
             context.register_service(git_provider_manager.clone());
 
@@ -82,6 +83,13 @@ impl TempsPlugin for GitPlugin {
             // PR preview commenter — turns deployment lifecycle events into
             // sticky PR/MR comments. Failures never block deploys (see
             // GitPrCommenter::upsert_preview_comment).
+            // Issues and commits of a project's repository, for error tracking
+            // (ADR 111, D5).
+            let source_control: Arc<dyn temps_core::ProjectSourceControl> = Arc::new(
+                crate::GitSourceControl::new(db.clone(), git_provider_trait.clone()),
+            );
+            context.register_service(source_control);
+
             let pr_commenter: Arc<dyn crate::PrCommenter> =
                 Arc::new(crate::GitPrCommenter::new(db.clone(), git_provider_trait));
             context.register_service(pr_commenter.clone());
@@ -227,7 +235,7 @@ impl TempsPlugin for GitPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             if let Some(alarm_service) =
-                context.get_service::<temps_monitoring::alarm_service::AlarmService>()
+                context.get_service::<temps_alarms::alarm_service::AlarmService>()
             {
                 let connection_health_service =
                     context.require_service::<ConnectionHealthService>();

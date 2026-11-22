@@ -918,9 +918,9 @@ export function RedeploymentModal({
                   </TabsList>
                   <TabsContent value="branch" className="space-y-2">
                     {branchNotFound && (
-                      <Alert className="border-amber-200 bg-amber-50">
+                      <Alert className="border-amber-200 dark:border-amber-900 bg-amber-50 dark:bg-amber-950/30">
                         <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-600" />
-                        <AlertDescription className="text-amber-800">
+                        <AlertDescription className="text-amber-800 dark:text-amber-400">
                           The branch “{effectiveBranch}” for this environment
                           was not found in the repository. You can continue with
                           the current branch name, or switch to deploy by commit

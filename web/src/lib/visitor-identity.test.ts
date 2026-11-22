@@ -1,0 +1,75 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { describe, expect, test } from 'bun:test'
+import {
+  IDENTITY_MODE_OPTIONS,
+  cookielessFactLine,
+  cookielessSnippets,
+} from './visitor-identity'
+
+describe('IDENTITY_MODE_OPTIONS', () => {
+  test('offers both modes, persistent first', () => {
+    expect(IDENTITY_MODE_OPTIONS.map((option) => option.value)).toEqual([
+      'persistent',
+      'cookieless',
+    ])
+  })
+
+  test('the cookieless option states what it costs', () => {
+    const cookieless = IDENTITY_MODE_OPTIONS[1]
+    expect(cookieless.consequences.join(' ')).toContain(
+      'new visitor the next day'
+    )
+    expect(cookieless.consequences.join(' ')).toContain('session replay is off')
+  })
+})
+
+describe('cookielessSnippets', () => {
+  test('tell both tracker flavours to store nothing', () => {
+    const snippets = cookielessSnippets()
+    expect(snippets.react).toContain('<TempsAnalyticsProvider cookieless>')
+    expect(snippets.script).toContain('data-cookieless="true"')
+  })
+})
+
+describe('cookielessFactLine', () => {
+  test('each affected view gets its own sentence', () => {
+    const lines = (['visitors', 'journey', 'replays'] as const).map(
+      cookielessFactLine
+    )
+    expect(new Set(lines).size).toBe(3)
+    for (const line of lines)
+      expect(line.startsWith('Cookieless tracking:')).toBe(true)
+  })
+})
+
+describe('identify helpers (ADR 109 D4)', () => {
+  test('the snippets cover the page, the script tag and the backend', async () => {
+    const { identifySnippets } = await import('./visitor-identity')
+    const snippets = identifySnippets()
+    expect(snippets.react).toContain('identify(user.id')
+    expect(snippets.react).toContain('reset()')
+    expect(snippets.script).toContain('window.temps.identify')
+    expect(snippets.node).toContain('analytics.identify(request')
+  })
+
+  test('source labels distinguish a backend fact from a browser claim', async () => {
+    const { identitySourceLabel } = await import('./visitor-identity')
+    expect(identitySourceLabel('server')?.label).toBe('Verified by backend')
+    expect(identitySourceLabel('browser')?.label).toBe('Claimed by browser')
+    expect(identitySourceLabel(null)).toBeNull()
+  })
+
+  test('trait sources keep only known values', async () => {
+    const { traitSources } = await import('./visitor-identity')
+    expect(
+      traitSources({ plan: 'server', seats: 'browser', odd: 'x' })
+    ).toEqual({
+      plan: 'server',
+      seats: 'browser',
+    })
+    expect(traitSources(null)).toEqual({})
+    expect(traitSources(['server'])).toEqual({})
+  })
+})

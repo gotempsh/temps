@@ -639,13 +639,22 @@ impl PublicStatusPageService {
                 active.description = Set(description);
             }
             let model = active.update(&txn).await?;
+            let mut reselected = Vec::new();
             if let Some(selection) = &selection {
+                reselected = Self::page_monitor_ids(&txn, status_page_id).await?;
+                reselected.extend(selection.iter().map(|c| c.monitor_id));
                 Self::write_selection(&txn, status_page_id, selection).await?;
             }
-            Ok(model)
+            Ok((model, reselected))
         }
         .await;
-        let model = Self::finish(txn, result).await?;
+        let (model, reselected) = Self::finish(txn, result).await?;
+        // Maintenance windows only exclude checks while a page showing the
+        // monitor holds them, so a selection change alters completed days
+        // too: drop their cached uptime so every page recomputes it.
+        if !reselected.is_empty() {
+            self.cache.forget_history(&reselected).await;
+        }
 
         // Always rebuild: cheap for one page, and correct even if the page was
         // published concurrently (a draft simply stays out of the cache).
@@ -747,6 +756,7 @@ impl PublicStatusPageService {
     }
 
     pub async fn delete(&self, status_page_id: i32) -> Result<(), StatusPageError> {
+        let shown = Self::page_monitor_ids(self.db.as_ref(), status_page_id).await?;
         let result = status_pages::Entity::delete_by_id(status_page_id)
             .exec(self.db.as_ref())
             .await?;
@@ -754,6 +764,8 @@ impl PublicStatusPageService {
             return Err(StatusPageError::StatusPageNotFound { status_page_id });
         }
         self.cache.remove_page(status_page_id).await;
+        // Its maintenance windows no longer exclude checks on other pages.
+        self.cache.forget_history(&shown).await;
         info!(status_page_id, "deleted status page");
         Ok(())
     }
@@ -882,6 +894,20 @@ impl PublicStatusPageService {
             .map(|_| ())
     }
 
+    /// The monitors `status_page_id` shows now.
+    async fn page_monitor_ids<C: sea_orm::ConnectionTrait>(
+        conn: &C,
+        status_page_id: i32,
+    ) -> Result<Vec<i32>, StatusPageError> {
+        Ok(status_page_monitors::Entity::find()
+            .filter(status_page_monitors::Column::StatusPageId.eq(status_page_id))
+            .all(conn)
+            .await?
+            .into_iter()
+            .map(|row| row.monitor_id)
+            .collect())
+    }
+
     async fn write_selection<C: sea_orm::ConnectionTrait>(
         conn: &C,
         status_page_id: i32,
@@ -1005,10 +1031,16 @@ impl PublicStatusPageService {
             .map(|model| StatusPageResponse {
                 public_url: base.page_url(&model.slug),
                 public_json_url: base.json_url(&model.slug),
+                public_feed_url: if model.password_hash.is_some() {
+                    None
+                } else {
+                    base.feed_url(&model.slug)
+                },
                 public_url_status: base.status.clone(),
                 monitors: by_page.remove(&model.id).unwrap_or_default(),
                 projects: projects_by_page.remove(&model.id).unwrap_or_default(),
                 appearance: StatusPageAppearance::from_model(&model),
+                has_password: model.password_hash.is_some(),
                 id: model.id,
                 title: model.title,
                 description: model.description,
@@ -1038,7 +1070,7 @@ struct PublicUrlBase {
 }
 
 impl PublicUrlBase {
-    fn from_settings(settings: &temps_core::AppSettings) -> Self {
+    fn from_settings(settings: &temps_config::AppSettings) -> Self {
         let Some(base) = settings.configured_public_ingress_url() else {
             return Self::unavailable(
                 "Public URL is not configured. Set the external URL or the public ingress \
@@ -1064,7 +1096,7 @@ impl PublicUrlBase {
                 configured: true,
                 setup_path: reason
                     .is_some()
-                    .then(|| temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                    .then(|| temps_config::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
                 reason,
             },
             base: Some(base),
@@ -1077,7 +1109,9 @@ impl PublicUrlBase {
             status: PublicUrlStatus {
                 configured: false,
                 reason: Some(reason),
-                setup_path: Some(temps_core::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string()),
+                setup_path: Some(
+                    temps_config::public_ingress::PUBLIC_INGRESS_SETUP_PATH.to_string(),
+                ),
             },
         }
     }
@@ -1092,6 +1126,12 @@ impl PublicUrlBase {
         self.base
             .as_ref()
             .map(|base| format!("{base}/api/status/{slug}/summary.json"))
+    }
+
+    fn feed_url(&self, slug: &str) -> Option<String> {
+        self.base
+            .as_ref()
+            .map(|base| format!("{base}/api/status/{slug}/feed.atom"))
     }
 }
 
@@ -1145,8 +1185,8 @@ impl temps_core::ProjectDeletionHook for PublicStatusPageService {
 mod tests {
     use super::*;
 
-    fn settings(external: Option<&str>, ingress: Option<&str>) -> temps_core::AppSettings {
-        temps_core::AppSettings {
+    fn settings(external: Option<&str>, ingress: Option<&str>) -> temps_config::AppSettings {
+        temps_config::AppSettings {
             external_url: external.map(str::to_string),
             public_ingress_url: ingress.map(str::to_string),
             ..Default::default()
@@ -1161,6 +1201,7 @@ mod tests {
 
         assert_eq!(base.page_url(SLUG), None);
         assert_eq!(base.json_url(SLUG), None);
+        assert_eq!(base.feed_url(SLUG), None);
         assert!(!base.status.configured);
         assert_eq!(
             base.status.setup_path.as_deref(),
@@ -1194,6 +1235,10 @@ mod tests {
             Some(
                 "https://temps.example.com/api/status/0123456789abcdef0123456789abcdef/summary.json"
             )
+        );
+        assert_eq!(
+            base.feed_url(SLUG).as_deref(),
+            Some("https://temps.example.com/api/status/0123456789abcdef0123456789abcdef/feed.atom")
         );
         assert_eq!(
             base.status,

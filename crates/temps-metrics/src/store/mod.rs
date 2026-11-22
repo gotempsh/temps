@@ -62,6 +62,22 @@ pub const DELTA_COUNTER_METRICS: &[&str] = &[
     "proxy.log_entries_dropped",
     "proxy.ingress_shadow_evaluations",
     "proxy.ingress_shadow_mismatches",
+    // Internal DNS resolvers (ADR-095): queries per outcome and the latency
+    // sum, per interval.
+    "dns.internal.noerror",
+    "dns.internal.nodata",
+    "dns.internal.nxdomain",
+    "dns.internal.servfail",
+    "dns.internal.refused",
+    "dns.internal.error",
+    "dns.internal.latency_us",
+    "dns.external.noerror",
+    "dns.external.nodata",
+    "dns.external.nxdomain",
+    "dns.external.servfail",
+    "dns.external.refused",
+    "dns.external.error",
+    "dns.external.latency_us",
 ];
 
 /// Returns `true` when `metric_name` is a per-interval delta counter that

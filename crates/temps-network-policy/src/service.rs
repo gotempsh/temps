@@ -26,11 +26,11 @@ use crate::error::NetworkPolicyError;
 use crate::model::{compile_policies, profile_str, profiles_for, ParsedRule, PeerSpec, Profiles};
 
 /// Container-name prefix of today's per-sandbox egress proxy sidecar
-/// (`temps-ai-agents` `SANDBOX_EGRESS_PROXY_PREFIX`). Restricted sandboxes keep
+/// (`temps-sandbox-providers` `SANDBOX_EGRESS_PROXY_PREFIX`). Restricted sandboxes keep
 /// reaching it on its port until the shared proxy replaces it.
 pub const SANDBOX_SIDECAR_PREFIX: &str = "temps-sandbox-egress-proxy-";
 pub const SANDBOX_SIDECAR_PORT: u16 = 3128;
-/// `temps-ai-agents` `SANDBOX_NAME_PREFIX`.
+/// `temps-sandbox-providers` `SANDBOX_NAME_PREFIX`.
 pub const SANDBOX_CONTAINER_PREFIX: &str = "temps-sandbox-";
 /// `temps-sandbox` `PUBLIC_ID_PREFIX`, stripped from the container name.
 pub const SANDBOX_PUBLIC_ID_PREFIX: &str = "sbx_";
@@ -187,11 +187,15 @@ impl NameRow {
     /// may resolve the names of what its rules allow. A standalone service
     /// publishes as `service_role` (owner: the service), a cluster member as
     /// `service_member` (owner: the member row, joined to its service), an
-    /// environment as `environment`. Node and static names belong to no
-    /// workload.
+    /// environment as `environment` and its subdomain alias as
+    /// `environment_subdomain`. Node and static names belong to no workload.
     fn named_workload(self) -> Option<NamedWorkload> {
         let owner = match (self.owner_kind.as_str(), self.service_id) {
-            ("environment", _) => WorkloadRef::new(WorkloadKind::Deployment, self.owner_id),
+            // An environment's subdomain alias (ADR-105 D7) names the same
+            // workload as its `<env>.<project>` name.
+            ("environment" | temps_core::internal_access::ENVIRONMENT_ALIAS_OWNER_KIND, _) => {
+                WorkloadRef::new(WorkloadKind::Deployment, self.owner_id)
+            }
             ("service_role", _) => WorkloadRef::new(WorkloadKind::Service, self.owner_id),
             ("service_member", Some(service_id)) => {
                 WorkloadRef::new(WorkloadKind::Service, i64::from(service_id))
@@ -1473,6 +1477,19 @@ mod tests {
                 WorkloadRef::new(WorkloadKind::Deployment, 1)
             ))
         );
+        assert_eq!(
+            owner(name_row(
+                "alpha-production.temps.local",
+                "environment_subdomain",
+                1,
+                None
+            )),
+            Some((
+                "alpha-production.temps.local".into(),
+                WorkloadRef::new(WorkloadKind::Deployment, 1)
+            )),
+            "an environment's subdomain alias names the same workload as its name"
+        );
         assert_eq!(owner(name_row("w1.temps.local", "node", 3, None)), None);
         assert_eq!(
             owner(name_row("orphan.temps.local", "service_member", 9, None)),
@@ -1480,7 +1497,7 @@ mod tests {
             "a member whose row is gone names nothing"
         );
     }
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use temps_workload_netpol::{Peer, PolicySource};
 
     async fn exec(db: &DatabaseConnection, sql: &str) -> i64 {

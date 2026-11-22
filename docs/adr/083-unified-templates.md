@@ -4,7 +4,7 @@
 
 **Status:** Proposed
 **Date:** 2026-09-29
-**Related:** ADR-081 (monorepo path-filtered deploys); ADR-082 (path routes); `crates/temps-core/src/templates.rs`; `crates/temps-core/templates/`; `crates/temps-projects/src/handlers/templates.rs`; `crates/temps-project-groups`
+**Related:** ADR-081 (monorepo path-filtered deploys); ADR-082 (path routes); `crates/temps-presets/src/templates.rs`; `crates/temps-presets/templates/`; `crates/temps-projects/src/handlers/templates.rs`; `crates/temps-project-groups`
 
 ---
 

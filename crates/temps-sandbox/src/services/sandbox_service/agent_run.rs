@@ -103,7 +103,7 @@ impl SandboxService {
     /// Create a sandbox for an agent run (autofixer / workflow agent) as a
     /// first-class `sandboxes` row, then create the container through the
     /// shared provider. Called by the agents' `SandboxRegistry` via the
-    /// `RunSandboxService` seam (see `temps_ai_agents::sandbox::managed`).
+    /// `RunSandboxService` seam (see `temps_sandbox_providers::managed`).
     ///
     /// Unlike standalone sandboxes, the container keeps the historical
     /// `temps-sandbox-<run_id>` naming (no `container_name_override`) so
@@ -114,7 +114,7 @@ impl SandboxService {
     pub async fn create_for_agent_run(
         &self,
         config: SandboxCreateConfig,
-    ) -> Result<temps_ai_agents::sandbox::SandboxHandle, SandboxError> {
+    ) -> Result<temps_sandbox_providers::SandboxHandle, SandboxError> {
         let run_id = config.run_id;
 
         // A run can recreate its sandbox after a dead container — retire
@@ -148,7 +148,7 @@ impl SandboxService {
             name: Set(format!("temps-sandbox-{}", run_id)),
             status: Set("running".to_string()),
             image: Set(config.image.clone()),
-            work_dir: Set(temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string()),
+            work_dir: Set(temps_sandbox_providers::SANDBOX_WORK_DIR.to_string()),
             timeout_secs: Set(timeout as i32),
             metadata: Set(Some(serde_json::json!({ "source": "agent_run" }))),
             created_at: Set(now),
@@ -216,7 +216,7 @@ impl SandboxService {
     pub async fn release_for_agent_run(
         &self,
         run_id: i32,
-        handle: Option<&temps_ai_agents::sandbox::SandboxHandle>,
+        handle: Option<&temps_sandbox_providers::SandboxHandle>,
     ) -> Result<(), SandboxError> {
         let provider = self.registry.provider_arc();
         let resolved = match handle {

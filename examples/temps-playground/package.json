@@ -1,0 +1,25 @@
+{
+  "name": "temps-playground",
+  "version": "0.1.1",
+  "private": true,
+  "type": "module",
+  "description": "Explore plugin AI tools and project chat in Temps",
+  "scripts": {
+    "test": "bun test",
+    "build": "bun build src/index.ts --compile --outfile dist/temps-playground",
+    "check": "tsc --noEmit --module preserve --moduleResolution bundler --target esnext --types bun --skipLibCheck src/index.ts src/page.ts"
+  },
+  "dependencies": {
+    "@temps-sdk/plugin": "0.1.0-beta.1"
+  },
+  "temps": {
+    "name": "temps-playground",
+    "title": "Temps Playground",
+    "category": "Development",
+    "entrypoint": "src/index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "1.3.3",
+    "typescript": "5.9.3"
+  }
+}

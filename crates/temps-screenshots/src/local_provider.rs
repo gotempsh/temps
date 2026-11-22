@@ -5,6 +5,8 @@
 
 use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use temps_core::log_transitions::{FailureLatch, FailureLog, DEFAULT_REMINDER_INTERVAL};
@@ -13,7 +15,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::chromium_installer::chromium_executable;
 use crate::error::{ScreenshotError, ScreenshotResult};
+use crate::pinning_proxy::{system_lookup, Lookup, PinningProxy};
 use crate::provider::ScreenshotProvider;
+use crate::request_policy::{RequestDecision, RequestPolicy};
 
 /// `chromium_installer` downloads and caches a Chromium build to a shared
 /// path on first use, from inside the launch closure. Launching two browsers
@@ -136,6 +140,192 @@ fn report_chrome_available(status: &ChromeStatus) {
     }
 }
 
+/// Whether Chromium's own sandbox can start on this host.
+const SANDBOX_UNKNOWN: u8 = 0;
+const SANDBOX_WORKS: u8 = 1;
+const SANDBOX_UNAVAILABLE: u8 = 2;
+static SANDBOX_STATE: AtomicU8 = AtomicU8::new(SANDBOX_UNKNOWN);
+
+/// Why Chromium could not be started. The reasons carry the text of the
+/// browser library's own error, which is not a type this crate can name.
+#[derive(Debug, thiserror::Error)]
+enum ChromeLaunchError {
+    #[error("failed to build launch options: {reason}")]
+    InvalidOptions { reason: String },
+    /// `sandboxed` is whether the failure being reported was a start with
+    /// Chromium's own sandbox on (the first failure is reported when both
+    /// the sandboxed and the unsandboxed start fail).
+    #[error("failed to launch browser: {reason}")]
+    LaunchFailed { sandboxed: bool, reason: String },
+}
+
+/// Why the request filter could not be put on a tab.
+#[derive(Debug, thiserror::Error)]
+enum RequestFilterError {
+    #[error("failed to install the request filter: {reason}")]
+    InstallHandler { reason: String },
+    #[error("failed to enable request filtering: {reason}")]
+    EnableFetch { reason: String },
+}
+
+/// A loopback port nothing is listening on right now, for a launch that must
+/// not be retried by the browser library.
+fn free_loopback_port() -> Option<u16> {
+    std::net::TcpListener::bind(("127.0.0.1", 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .ok()
+}
+
+/// Launch Chromium with its own sandbox on, falling back to no sandbox when it
+/// cannot start (typically as root inside a container, or without the user
+/// namespaces it needs). The fallback is logged once at WARN, and remembered
+/// so later launches do not first try a sandbox that is known not to start.
+///
+/// With `proxy_server`, every connection the browser opens goes through that
+/// proxy (see [`crate::pinning_proxy`]): loopback included, which Chromium
+/// otherwise connects to directly, and WebRTC, which otherwise sends UDP
+/// straight to any address a page names.
+///
+/// The browser library waits up to 30 seconds for a starting Chromium to print
+/// its DevTools address, and when none comes it starts another process, up to
+/// eleven times. Chromium whose sandbox cannot start (no user namespaces, as a
+/// non-root user) exits without printing it, so the sandboxed trial is given a
+/// fixed port: the library then reports the failure after the one wait
+/// instead of repeating it, and the unsandboxed launch follows.
+fn launch_chrome(
+    chrome_path: Option<PathBuf>,
+    idle_timeout: Duration,
+    window_size: Option<(u32, u32)>,
+    proxy_server: Option<&str>,
+    extra_args: &[String],
+) -> Result<Browser, ChromeLaunchError> {
+    let mut proxy_args: Vec<&std::ffi::OsStr> = if proxy_server.is_some() {
+        vec![
+            std::ffi::OsStr::new("--proxy-bypass-list=<-loopback>"),
+            std::ffi::OsStr::new("--force-webrtc-ip-handling-policy=disable_non_proxied_udp"),
+        ]
+    } else {
+        Vec::new()
+    };
+    proxy_args.extend(extra_args.iter().map(std::ffi::OsStr::new));
+    let options = |sandbox: bool| {
+        LaunchOptions::default_builder()
+            .port(if sandbox { free_loopback_port() } else { None })
+            .path(chrome_path.clone())
+            .headless(true) // Must be headless for server environments
+            .sandbox(sandbox)
+            .idle_browser_timeout(idle_timeout)
+            .window_size(window_size)
+            .proxy_server(proxy_server)
+            .args(proxy_args.clone())
+            .build()
+            .map_err(|error| ChromeLaunchError::InvalidOptions {
+                reason: error.to_string(),
+            })
+    };
+
+    if SANDBOX_STATE.load(Ordering::Relaxed) != SANDBOX_UNAVAILABLE {
+        match Browser::new(options(true)?) {
+            Ok(browser) => {
+                SANDBOX_STATE.store(SANDBOX_WORKS, Ordering::Relaxed);
+                return Ok(browser);
+            }
+            Err(sandboxed_error) => {
+                return match Browser::new(options(false)?) {
+                    Ok(browser) => {
+                        if SANDBOX_STATE.swap(SANDBOX_UNAVAILABLE, Ordering::Relaxed)
+                            != SANDBOX_UNAVAILABLE
+                        {
+                            warn!(
+                                "Chromium could not start with its sandbox ({sandboxed_error}); \
+                                 local screenshots now run it without the sandbox. Requests the \
+                                 captured page makes are still limited to its own address and \
+                                 public addresses. Run Temps as a non-root user, or enable user \
+                                 namespaces, to keep the sandbox on."
+                            );
+                        }
+                        Ok(browser)
+                    }
+                    // Not a sandbox problem: report the first, sandboxed, failure.
+                    Err(_) => Err(ChromeLaunchError::LaunchFailed {
+                        sandboxed: true,
+                        reason: sandboxed_error.to_string(),
+                    }),
+                };
+            }
+        }
+    }
+    Browser::new(options(false)?).map_err(|error| ChromeLaunchError::LaunchFailed {
+        sandboxed: false,
+        reason: error.to_string(),
+    })
+}
+
+/// Limit what the page in `tab` may request to its own address and public
+/// addresses. Fails closed: when the filter cannot be installed the capture
+/// does not run.
+fn restrict_page_requests(
+    tab: &headless_chrome::Tab,
+    policy: RequestPolicy,
+    blocked: Arc<std::sync::atomic::AtomicUsize>,
+) -> Result<(), RequestFilterError> {
+    use headless_chrome::browser::tab::RequestPausedDecision;
+    use headless_chrome::protocol::cdp::Fetch::{FailRequest, RequestPattern, RequestStage};
+    use headless_chrome::protocol::cdp::Network::ErrorReason;
+
+    tab.enable_request_interception(Arc::new(
+        move |_transport,
+              _session,
+              event: headless_chrome::protocol::cdp::Fetch::events::RequestPausedEvent| {
+            match policy.decide(&event.params.request.url) {
+                RequestDecision::Allow => RequestPausedDecision::Continue(None),
+                RequestDecision::Block { reason } => {
+                    blocked.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Blocked a request made by the page being captured: {} ({})",
+                        redact_for_log(&event.params.request.url),
+                        reason
+                    );
+                    RequestPausedDecision::Fail(FailRequest {
+                        request_id: event.params.request_id,
+                        error_reason: ErrorReason::BlockedByClient,
+                    })
+                }
+            }
+        },
+    ))
+    .map_err(|error| RequestFilterError::InstallHandler {
+        reason: error.to_string(),
+    })?;
+    tab.enable_fetch(
+        Some(&[RequestPattern {
+            url_pattern: Some("*".to_string()),
+            resource_Type: None,
+            request_stage: Some(RequestStage::Request),
+        }]),
+        None,
+    )
+    .map_err(|error| RequestFilterError::EnableFetch {
+        reason: error.to_string(),
+    })?;
+    Ok(())
+}
+
+/// A request URL for the log without its query string or credentials.
+fn redact_for_log(url: &str) -> String {
+    match url::Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) => "(unparseable URL)".to_string(),
+    }
+}
+
 /// Local screenshot provider using headless Chrome
 pub struct LocalScreenshotProvider {
     /// Timeout for page load in seconds
@@ -144,6 +334,11 @@ pub struct LocalScreenshotProvider {
     viewport_width: u32,
     /// Viewport height
     viewport_height: u32,
+    /// How the capture's proxy resolves names. The system resolver, except
+    /// in tests that need a name to answer with a chosen address.
+    lookup: Lookup,
+    /// Extra Chromium switches. Empty outside tests.
+    extra_chrome_args: Vec<String>,
 }
 
 impl LocalScreenshotProvider {
@@ -153,6 +348,8 @@ impl LocalScreenshotProvider {
             timeout_seconds: 30,
             viewport_width: 1920,
             viewport_height: 1080,
+            lookup: system_lookup(),
+            extra_chrome_args: Vec::new(),
         }
     }
 
@@ -162,6 +359,8 @@ impl LocalScreenshotProvider {
             timeout_seconds,
             viewport_width,
             viewport_height,
+            lookup: system_lookup(),
+            extra_chrome_args: Vec::new(),
         }
     }
 }
@@ -184,6 +383,18 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         if url::Url::parse(url).is_err() {
             return Err(ScreenshotError::InvalidUrl(format!("Invalid URL: {}", url)));
         }
+        // What the captured page may request: its own address and public ones.
+        let policy = RequestPolicy::for_target(url)?;
+        // The browser's only route out. It checks the address each connection
+        // is actually made to, which the request filter below cannot see.
+        let refused = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let proxy = PinningProxy::start(policy.clone(), self.lookup.clone(), refused.clone())
+            .await
+            .map_err(|error| {
+                ScreenshotError::CaptureFailed(format!(
+                    "Failed to start the connection proxy for the capture of {url}: {error}"
+                ))
+            })?;
 
         // Hold the launch lock for the whole capture (not just the launch),
         // and inside the blocking task: a caller's timeout drops this future
@@ -196,39 +407,34 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             let width = self.viewport_width;
             let height = self.viewport_height;
             let url = url.to_string();
+            let policy = policy.clone();
+            let extra_args = self.extra_chrome_args.clone();
 
             move || -> ScreenshotResult<Vec<u8>> {
+                // Owned here so the proxy outlives the browser: a caller's
+                // timeout drops the future, not this closure.
+                let proxy = proxy;
+                let proxy_server = proxy.proxy_server();
                 // Downloads Chromium on first use. Failing here means it
                 // could not be installed — reported once by the latch.
                 let chrome_path = chromium_executable().inspect_err(|e| {
                     report_chrome_unavailable(&CHROME_UNAVAILABLE, &e.to_string());
                 })?;
 
-                // Use LaunchOptions builder pattern for cleaner config
-                let options = LaunchOptions::default_builder()
-                    .path(chrome_path)
-                    .headless(true) // Must be headless for server environments
-                    .sandbox(false) // Disable sandbox for Docker compatibility
-                    .idle_browser_timeout(Duration::from_secs(timeout))
-                    .window_size(Some((width, height))) // Set window size
-                    .build()
-                    .map_err(|e| {
-                        report_chrome_unavailable(
-                            &CHROME_UNAVAILABLE,
-                            &format!("failed to build launch options: {}", e),
-                        );
-                        ScreenshotError::ChromeError(format!("Failed to build options: {}", e))
-                    })?;
-
-                // Launch browser. Failing here means Chrome (an optional
+                // Launch browser, with Chromium's own sandbox where the host
+                // allows it. Failing here means Chrome (an optional
                 // dependency) is missing or broken on this host — reported
                 // once by the latch, and returned to the caller.
-                let browser = Browser::new(options).map_err(|e| {
-                    report_chrome_unavailable(
-                        &CHROME_UNAVAILABLE,
-                        &format!("failed to launch browser: {}", e),
-                    );
-                    ScreenshotError::ChromeError(format!("Failed to launch browser: {}", e))
+                let browser = launch_chrome(
+                    chrome_path,
+                    Duration::from_secs(timeout),
+                    Some((width, height)),
+                    Some(&proxy_server),
+                    &extra_args,
+                )
+                .map_err(|error| {
+                    report_chrome_unavailable(&CHROME_UNAVAILABLE, &error.to_string());
+                    ScreenshotError::ChromeError(format!("Failed to launch browser: {error}"))
                 })?;
 
                 report_chrome_available(&CHROME_UNAVAILABLE);
@@ -237,6 +443,15 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                 let tab = browser.new_tab().map_err(|e| {
                     warn!("Failed to create new Chrome tab for screenshot of {}: {}", url, e);
                     ScreenshotError::ChromeError(format!("Failed to create tab: {}", e))
+                })?;
+
+                // The page is the deployed app's code: it may only reach its
+                // own address and public addresses, whatever it embeds or
+                // redirects to. Installed before the first navigation.
+                let blocked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                restrict_page_requests(&tab, policy, blocked.clone()).map_err(|error| {
+                    warn!("Not capturing {}: {}", url, error);
+                    ScreenshotError::ChromeError(error.to_string())
                 })?;
 
                 // Disable all CSS animations/transitions before navigation so they
@@ -306,10 +521,16 @@ impl ScreenshotProvider for LocalScreenshotProvider {
                     })?;
 
                 info!(
-                    "Successfully captured screenshot of {} ({} bytes)",
+                    "Successfully captured screenshot of {} ({} bytes, {} requests blocked, {} connections refused)",
                     url,
-                    screenshot_data.len()
+                    screenshot_data.len(),
+                    blocked.load(Ordering::Relaxed),
+                    refused.load(Ordering::Relaxed)
                 );
+                // Shut the browser down before its proxy.
+                drop(tab);
+                drop(browser);
+                drop(proxy);
                 Ok(screenshot_data)
             }
         })
@@ -333,20 +554,9 @@ impl ScreenshotProvider for LocalScreenshotProvider {
             CHROME_PROBE_TIMEOUT,
             || {
                 let chrome_path = chromium_executable().map_err(|e| e.to_string())?;
-                let options = LaunchOptions::default_builder()
-                    .path(chrome_path)
-                    .headless(true)
-                    .sandbox(false)
-                    .idle_browser_timeout(Duration::from_secs(5))
-                    .build();
-
-                match options {
-                    Ok(opts) => match Browser::new(opts) {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
-                    },
-                    Err(e) => Err(format!("Failed to build launch options: {}", e)),
-                }
+                launch_chrome(chrome_path, Duration::from_secs(5), None, None, &[])
+                    .map(|_| ())
+                    .map_err(|error| format!("Failed to launch Chrome browser: {error}"))
             },
         )
         .await
@@ -377,7 +587,7 @@ const CHROME_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 ///   `timeout` for the supervisor's report, not for the launch itself.
 async fn probe_chrome_launch<F>(
     lock: Arc<AsyncMutex<()>>,
-    status: &ChromeStatus,
+    status: &'static ChromeStatus,
     timeout: Duration,
     launch: F,
 ) -> ScreenshotResult<()>
@@ -411,6 +621,12 @@ where
     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let outcome = handle.await;
+        // A launch that worked is recorded before the lock is released: once
+        // it is, another caller may record a newer failure, which a late
+        // "available" here would otherwise erase.
+        if matches!(outcome, Ok(Ok(()))) {
+            report_chrome_available(status);
+        }
         drop(launch_guard);
         let _ = done_tx.send(outcome);
     });
@@ -420,8 +636,8 @@ where
 
     let reason = match check_result {
         Ok(Ok(Ok(Ok(())))) => {
+            // Already recorded by the supervisor, under the launch lock.
             debug!("Chrome browser is available");
-            report_chrome_available(status);
             return Ok(());
         }
         Ok(Ok(Ok(Err(e)))) => e,
@@ -462,6 +678,53 @@ fn still_running_message(reason: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_free_loopback_port_can_be_bound_straight_away() {
+        let port = free_loopback_port().expect("a loopback port is free");
+        assert_ne!(port, 0);
+        std::net::TcpListener::bind(("127.0.0.1", port)).expect("the port is free to bind");
+    }
+
+    #[test]
+    fn launch_and_filter_failures_say_which_step_failed() {
+        let options = ChromeLaunchError::InvalidOptions {
+            reason: "bad path".into(),
+        };
+        assert_eq!(
+            options.to_string(),
+            "failed to build launch options: bad path"
+        );
+        let launch = ChromeLaunchError::LaunchFailed {
+            sandboxed: true,
+            reason: "no usable sandbox".into(),
+        };
+        assert_eq!(
+            launch.to_string(),
+            "failed to launch browser: no usable sandbox"
+        );
+        assert!(matches!(
+            launch,
+            ChromeLaunchError::LaunchFailed {
+                sandboxed: true,
+                ..
+            }
+        ));
+        let install = RequestFilterError::InstallHandler {
+            reason: "tab closed".into(),
+        };
+        assert_eq!(
+            install.to_string(),
+            "failed to install the request filter: tab closed"
+        );
+        let enable = RequestFilterError::EnableFetch {
+            reason: "tab closed".into(),
+        };
+        assert_eq!(
+            enable.to_string(),
+            "failed to enable request filtering: tab closed"
+        );
+    }
 
     #[tokio::test]
     async fn lock_outlives_a_timed_out_caller_until_the_blocking_work_ends() {
@@ -536,11 +799,11 @@ mod tests {
     #[tokio::test]
     async fn a_launch_that_never_returns_is_reported_and_blocks_no_later_probe() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let timeout = Duration::from_millis(200);
         let (launch, release) = stuck_launch();
 
-        let first = probe_chrome_launch(lock.clone(), &status, timeout, launch)
+        let first = probe_chrome_launch(lock.clone(), status, timeout, launch)
             .await
             .expect_err("a launch that does not report in time is a failure");
         assert!(
@@ -553,7 +816,7 @@ mod tests {
         // once, with the recorded reason, and launches nothing.
         let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let started = std::time::Instant::now();
-        let second = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(30), {
+        let second = probe_chrome_launch(lock.clone(), status, Duration::from_secs(30), {
             let launched = launched.clone();
             move || {
                 launched.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -573,14 +836,14 @@ mod tests {
     #[tokio::test]
     async fn a_busy_browser_that_is_not_failing_is_waited_for_then_probed() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let capture = lock.clone().lock_owned().await;
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(100)).await;
             drop(capture);
         });
 
-        let result = probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(())).await;
+        let result = probe_chrome_launch(lock, status, Duration::from_secs(5), || Ok(())).await;
         assert!(result.is_ok(), "{result:?}");
         assert!(!status.is_failing());
     }
@@ -588,11 +851,11 @@ mod tests {
     #[tokio::test]
     async fn a_long_capture_is_not_mistaken_for_a_broken_browser() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
         let _capture = lock.clone().lock_owned().await;
         let launched = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
-        let result = probe_chrome_launch(lock, &status, Duration::from_millis(100), {
+        let result = probe_chrome_launch(lock, status, Duration::from_millis(100), {
             let launched = launched.clone();
             move || {
                 launched.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -607,8 +870,8 @@ mod tests {
     #[tokio::test]
     async fn a_failed_launch_names_the_reason_and_a_later_success_clears_it() {
         let lock = Arc::new(AsyncMutex::new(()));
-        let status = ChromeStatus::new();
-        let error = probe_chrome_launch(lock.clone(), &status, Duration::from_secs(5), || {
+        let status: &'static ChromeStatus = Box::leak(Box::new(ChromeStatus::new()));
+        let error = probe_chrome_launch(lock.clone(), status, Duration::from_secs(5), || {
             Err("Failed to launch Chrome browser: libnss3.so missing".to_string())
         })
         .await
@@ -618,7 +881,7 @@ mod tests {
             .failure_reason()
             .is_some_and(|reason| reason.contains("libnss3.so missing")));
 
-        probe_chrome_launch(lock, &status, Duration::from_secs(5), || Ok(()))
+        probe_chrome_launch(lock, status, Duration::from_secs(5), || Ok(()))
             .await
             .expect("Chrome launches again");
         assert_eq!(status.failure_reason(), None);
@@ -698,6 +961,134 @@ mod tests {
             Err(ScreenshotError::InvalidUrl(_)) => (),
             _ => panic!("Expected InvalidUrl error"),
         }
+    }
+
+    /// A page that embeds resources on other local addresses is captured,
+    /// and none of those requests is made. Needs a launchable Chromium and
+    /// skips without one.
+    #[tokio::test]
+    async fn a_captured_page_cannot_reach_other_local_addresses() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let provider = LocalScreenshotProvider::with_config(15, 800, 600);
+        if !chrome_available(&provider).await {
+            return;
+        }
+
+        async fn serve(body: String) -> (u16, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            (port, hits)
+        }
+
+        let (other_port, other_hits) = serve("other".to_string()).await;
+        let (page_port, page_hits) = serve(format!(
+            "<html><body><h1>page</h1>\
+             <img src=\"http://localhost:{other_port}/by-name\">\
+             <img src=\"http://127.0.0.1:{other_port}/by-address\">\
+             </body></html>"
+        ))
+        .await;
+
+        let png = provider
+            .capture_screenshot(&format!("http://127.0.0.1:{page_port}/"))
+            .await
+            .expect("the page itself is captured");
+        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+        assert!(page_hits.load(Ordering::SeqCst) >= 1, "the page was loaded");
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "resources on other local addresses must not be requested"
+        );
+    }
+
+    /// DNS rebinding with a real browser. Chromium's own resolver is told that
+    /// `rebind.example.net` is 127.0.0.1, so a browser that connected by
+    /// itself would reach the internal server. The page's request has to go
+    /// through the capture's proxy, which judges the address it would dial
+    /// and refuses. Needs a launchable Chromium and skips without one.
+    #[tokio::test]
+    async fn a_name_chromium_resolves_to_loopback_is_not_reached() {
+        use std::net::SocketAddr;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let probe = LocalScreenshotProvider::with_config(15, 800, 600);
+        if !chrome_available(&probe).await {
+            return;
+        }
+
+        async fn serve(body: String) -> (u16, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let port = listener.local_addr().expect("local addr").port();
+            let hits = Arc::new(AtomicUsize::new(0));
+            let counter = hits.clone();
+            tokio::spawn(async move {
+                while let Ok((mut socket, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut buffer = [0u8; 4096];
+                    let _ = socket.read(&mut buffer).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\n\
+                         connection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                }
+            });
+            (port, hits)
+        }
+
+        let (internal_port, internal_hits) = serve("internal".to_string()).await;
+        let (page_port, page_hits) = serve(format!(
+            "<html><body><h1>page</h1>\
+             <img src=\"http://rebind.example.net:{internal_port}/secret\">\
+             </body></html>"
+        ))
+        .await;
+
+        let mut provider = LocalScreenshotProvider::with_config(15, 800, 600);
+        provider.extra_chrome_args =
+            vec!["--host-resolver-rules=MAP rebind.example.net 127.0.0.1".to_string()];
+        // What the proxy's own lookup answers: the same internal address.
+        provider.lookup = Arc::new(|_host: String, port: u16| {
+            Box::pin(async move { Ok(vec![SocketAddr::from(([127, 0, 0, 1], port))]) })
+        });
+
+        let png = provider
+            .capture_screenshot(&format!("http://127.0.0.1:{page_port}/"))
+            .await
+            .expect("the page itself is captured");
+        assert_eq!(&png[0..8], b"\x89PNG\r\n\x1a\n");
+        assert!(page_hits.load(Ordering::SeqCst) >= 1, "the page was loaded");
+        assert_eq!(
+            internal_hits.load(Ordering::SeqCst),
+            0,
+            "the browser must not connect to an address its own lookup returned"
+        );
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import type { WireguardMeshStatusResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { useClusterCaFingerprint } from '@/hooks/useClusterCaFingerprint'
@@ -133,10 +134,7 @@ export function RotateClusterCaDialog({
             </p>
             <label className="space-y-2 text-sm font-medium">
               <span>
-                Type{' '}
-                <span className="font-mono">
-                  {ROTATE_CLUSTER_CA_CONFIRMATION}
-                </span>
+                Type <ConfirmNameBadge value={ROTATE_CLUSTER_CA_CONFIRMATION} />
               </span>
               <Input
                 autoComplete="off"

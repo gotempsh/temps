@@ -26,12 +26,18 @@ use sea_orm::{
 use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
+
+mod cloud_sessions;
 use crate::oidc_types::{
     derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
     UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
+pub use cloud_sessions::{
+    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
+    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
+};
 use temps_core::EncryptionService;
 use temps_entities::oidc_login_states;
 use temps_entities::oidc_providers;
@@ -714,8 +720,10 @@ impl OidcService {
 
         txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
+            // The column holds the token's digest, never the token (see
+            // `auth_service::stored_session_token`).
             "DELETE FROM sessions WHERE session_token = $1",
-            vec![session_token.into()],
+            vec![crate::auth_service::stored_session_token(session_token).into()],
         ))
         .await?;
         txn.commit().await?;
@@ -2451,6 +2459,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2511,6 +2520,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2548,6 +2558,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: true,
             admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2742,9 +2753,8 @@ mod tests {
     // testcontainers); skips gracefully rather than failing the run when
     // Docker is unavailable, per CLAUDE.md.
 
-    async fn test_oidc_service() -> Option<(temps_database::test_utils::TestDatabase, OidcService)>
-    {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_oidc_service() -> Option<(temps_test_utils::TestDatabase, OidcService)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Docker not available, skipping test: {e}");
@@ -3529,10 +3539,11 @@ mod tests {
         .await
         .expect("test user must insert");
 
-        // A live provider: the login keeps its session.
+        // A live provider: the login keeps its session. The rows store the
+        // token's digest, the way `create_session` writes them.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("live-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("live-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3545,7 +3556,10 @@ mod tests {
             .await
             .expect("a login completing against a live provider must keep its session");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq("live-session"))
+            .filter(
+                sessions::Column::SessionToken
+                    .eq(crate::auth_service::stored_session_token("live-session"))
+            )
             .one(db.db.as_ref())
             .await
             .expect("query must succeed")
@@ -3560,7 +3574,7 @@ mod tests {
         // revocation already deleted everything it could see.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("raced-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("raced-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3579,7 +3593,10 @@ mod tests {
         ));
         assert!(
             sessions::Entity::find()
-                .filter(sessions::Column::SessionToken.eq("raced-session"))
+                .filter(
+                    sessions::Column::SessionToken
+                        .eq(crate::auth_service::stored_session_token("raced-session"))
+                )
                 .one(db.db.as_ref())
                 .await
                 .expect("query must succeed")
@@ -3680,12 +3697,10 @@ mod tests {
     }
     #[tokio::test]
     async fn managed_cloud_requires_verified_email_for_new_and_returning_subjects() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;
@@ -3780,12 +3795,10 @@ mod tests {
     }
     #[tokio::test]
     async fn login_state_is_single_use_expires_at_its_deadline_and_redacts_state() {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 return;

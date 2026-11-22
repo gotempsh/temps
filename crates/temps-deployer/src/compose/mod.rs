@@ -17,6 +17,8 @@
 //! - `files`: writing the compose files and env files Temps generates
 //! - `resolve`: resolving and checking the effective configuration, and
 //!   snapshotting the files it includes or references
+//! - `normalize`: the narrowing rewrites applied before the policy judges a
+//!   model (loopback ports, container names as network aliases)
 //! - `security_policy`: the deny-list applied to compose documents and overrides
 //! - `fs_confinement`: keeping every host path inside the project directory
 //! - `overrides`: generated env, network, security and label overrides
@@ -28,6 +30,7 @@ mod exec;
 mod files;
 mod fs_confinement;
 mod lifecycle;
+mod normalize;
 mod overrides;
 mod readiness;
 mod resolve;
@@ -40,6 +43,7 @@ mod test_support;
 pub use diagnostics::{redact_variable_text, SubstitutedValues};
 pub use exec::{ComposeOutputCallback, ComposeOutputSink};
 pub use files::{EnvFilePlan, EnvFileSource};
+pub use normalize::ComposeRewrite;
 pub use resolve::{CheckedComposeConfiguration, ComposeCheckInput, ResolvedComposeConfiguration};
 pub use support::{
     ComposeSupport, COMPOSE_CONFIG_FLAGS, COMPOSE_CONSISTENCY_FLAGS, MIN_COMPOSE_VERSION,
@@ -143,8 +147,12 @@ pub enum ComposeError {
     #[error("Failed to discover containers for project '{project}': {reason}")]
     DiscoveryFailed { project: String, reason: String },
 
-    #[error("Invalid compose override for project '{project}': {reason}")]
-    InvalidOverride { project: String, reason: String },
+    #[error("Invalid compose override [check={}] for project '{project}': {reason}", check.map(PolicyCheck::as_str).unwrap_or("unclassified"))]
+    InvalidOverride {
+        check: Option<PolicyCheck>,
+        project: String,
+        reason: String,
+    },
 
     #[error("Docker API error: {0}")]
     Docker(String),
@@ -154,8 +162,9 @@ pub enum ComposeError {
     )]
     ComposeUnavailable { reason: String },
 
-    #[error("Compose security policy rejected {field} for service '{service}': {reason}. Review Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings; only instance administrators can change security checks. Invalid Compose values must be corrected in the Compose file")]
+    #[error("Compose security policy rejected [check={}] {field} for service '{service}': {reason}. Review Project Settings → Build & deploy → Build → Docker Compose → Advanced security settings; only instance administrators can change security checks. Invalid Compose values must be corrected in the Compose file", check.map(PolicyCheck::as_str).unwrap_or("unclassified"))]
     SecurityPolicyViolation {
+        check: Option<PolicyCheck>,
         service: String,
         field: String,
         reason: String,
@@ -550,8 +559,8 @@ impl ComposeExecutor {
         self.policy.enforced(check)
     }
 
-    fn field_enforced(&self, field: &str) -> bool {
-        let check = match field {
+    fn field_check(field: &str) -> Option<PolicyCheck> {
+        Some(match field {
             "privileged" => PolicyCheck::Privileged,
             "use_api_socket" => PolicyCheck::DockerSocket,
             "cap_add" => PolicyCheck::Capabilities,
@@ -585,9 +594,12 @@ impl ComposeExecutor {
             "build.ssh" => PolicyCheck::BuildSsh,
             "build.shm_size" => PolicyCheck::BuildShm,
             "build.ulimits" => PolicyCheck::BuildUlimits,
-            _ => return true,
-        };
-        self.enforced(check)
+            _ => return None,
+        })
+    }
+
+    fn field_enforced(&self, field: &str) -> bool {
+        Self::field_check(field).is_none_or(|check| self.enforced(check))
     }
 
     /// Construct from a concrete Docker client.

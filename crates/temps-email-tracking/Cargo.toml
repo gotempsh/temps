@@ -12,10 +12,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-database = { path = "../temps-database" }
 temps-email = { path = "../temps-email" }
 temps-entities = { path = "../temps-entities" }
 
@@ -67,6 +66,7 @@ sha2-rsa = { workspace = true }
 x509-parser = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio-test = { workspace = true }
 
 [lints]

@@ -181,27 +181,42 @@ impl CertificateRepository for DefaultCertificateRepository {
         let mut cert_with_encrypted_key = cert.clone();
         cert_with_encrypted_key.private_key_pem = encrypted_private_key.clone();
 
-        let active_model: domains::ActiveModel = (&cert_with_encrypted_key).into();
+        let mut active_model: domains::ActiveModel = (&cert_with_encrypted_key).into();
+
+        let mut update_columns = vec![
+            domains::Column::Certificate,
+            domains::Column::PrivateKey,
+            domains::Column::ExpirationTime,
+            domains::Column::LastRenewed,
+            domains::Column::Status,
+            domains::Column::UpdatedAt,
+            // ADR-041 §7a step (b): VerificationMethod is still updated on
+            // conflict so that import (Path B) can set it to the declared
+            // renewal_method. The alias guard above ensures only valid values
+            // ("http-01", "dns-01", "manual") reach this point.
+            domains::Column::VerificationMethod,
+            domains::Column::IsWildcard,
+            domains::Column::LastError,
+            domains::Column::LastErrorType,
+        ];
+        // Installing a certificate ends whatever failed before it, as on every
+        // other installation path: without this a renewed or imported row
+        // kept its on-demand backoff and streak, and the next failure started
+        // high on the ladder (or a future deadline blocked retries).
+        if matches!(cert.status, CertificateStatus::Active) {
+            active_model.clear_certificate_failure();
+            update_columns.extend([
+                domains::Column::OnDemandBackoffUntil,
+                domains::Column::OnDemandFailureStreak,
+                domains::Column::OnDemandLastFailureAt,
+                domains::Column::FailureCause,
+            ]);
+        }
 
         let result = domains::Entity::insert(active_model.clone())
             .on_conflict(
                 OnConflict::column(domains::Column::Domain)
-                    .update_columns([
-                        domains::Column::Certificate,
-                        domains::Column::PrivateKey,
-                        domains::Column::ExpirationTime,
-                        domains::Column::LastRenewed,
-                        domains::Column::Status,
-                        domains::Column::UpdatedAt,
-                        // ADR-041 §7a step (b): VerificationMethod is still updated on
-                        // conflict so that import (Path B) can set it to the declared
-                        // renewal_method. The alias guard above ensures only valid values
-                        // ("http-01", "dns-01", "manual") reach this point.
-                        domains::Column::VerificationMethod,
-                        domains::Column::IsWildcard,
-                        domains::Column::LastError,
-                        domains::Column::LastErrorType,
-                    ])
+                    .update_columns(update_columns)
                     .to_owned(),
             )
             .exec_with_returning(self.db.as_ref())
@@ -1254,11 +1269,80 @@ pub mod test_utils {
         }
 
         #[tokio::test]
+        async fn saving_an_active_certificate_clears_the_previous_failure() {
+            use sea_orm::{ActiveModelTrait, Set};
+            use temps_entities::domains;
+
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+                Ok(db) => db,
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    return;
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            };
+            let db = test_db.db.clone();
+            let now = chrono::Utc::now();
+            domains::ActiveModel {
+                domain: Set("renewed.example.com".to_string()),
+                status: Set("on_demand_failed".to_string()),
+                is_wildcard: Set(false),
+                verification_method: Set("http-01".to_string()),
+                last_error: Set(Some("connection refused".to_string())),
+                last_error_type: Set(Some("challenge_mismatch".to_string())),
+                failure_cause: Set(Some("unreachable".to_string())),
+                on_demand_backoff_until: Set(Some(now + Duration::hours(4))),
+                on_demand_failure_streak: Set(3),
+                on_demand_last_failure_at: Set(Some(now)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let encryption_service = Arc::new(
+                temps_core::EncryptionService::new(
+                    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+                )
+                .unwrap(),
+            );
+            let repo = DefaultCertificateRepository::new(db.clone(), encryption_service);
+
+            repo.save_certificate(Certificate {
+                id: 0,
+                domain: "renewed.example.com".to_string(),
+                certificate_pem: "cert".to_string(),
+                private_key_pem: "key".to_string(),
+                expiration_time: now + Duration::days(90),
+                last_renewed: Some(now),
+                is_wildcard: false,
+                verification_method: "http-01".to_string(),
+                status: CertificateStatus::Active,
+            })
+            .await
+            .unwrap();
+
+            let row = domains::Entity::find()
+                .filter(domains::Column::Domain.eq("renewed.example.com"))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.status, "active");
+            assert_eq!(row.last_error, None);
+            assert_eq!(row.failure_cause, None);
+            assert_eq!(row.on_demand_backoff_until, None);
+            assert_eq!(row.on_demand_failure_streak, 0);
+            assert_eq!(row.on_demand_last_failure_at, None);
+        }
+
+        #[tokio::test]
         async fn test_list_all_orders_with_database() {
             use chrono::Utc;
             use sea_orm::{ActiveModelTrait, Set};
-            use temps_database::test_utils::TestDatabase;
             use temps_entities::{acme_orders, domains};
+            use temps_test_utils::TestDatabase;
 
             // Setup test database
             let test_db = TestDatabase::with_migrations().await.unwrap();

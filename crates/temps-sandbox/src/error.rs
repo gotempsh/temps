@@ -10,7 +10,7 @@
 
 use thiserror::Error;
 
-use temps_ai_agents::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 /// Typed errors for the snapshot sub-API (ADR-037).
 ///
@@ -170,6 +170,21 @@ pub enum SandboxError {
     #[error("Job {job_id} not found in sandbox {sandbox_id}")]
     JobNotFound { sandbox_id: String, job_id: String },
 
+    /// A create's progress was asked for by a `creation_id` this server is
+    /// not tracking for the caller: unknown, another user's, or finished
+    /// long enough ago to have been dropped.
+    #[error("No sandbox create with creation_id '{creation_id}' is tracked for user {user_id}")]
+    CreationNotFound { creation_id: String, user_id: i32 },
+
+    /// The client-chosen `creation_id` of a create is malformed.
+    #[error("creation_id '{creation_id}' is invalid: use 8 to 64 letters, digits, '-' or '_'")]
+    CreationIdInvalid { creation_id: String },
+
+    /// The client-chosen `creation_id` already names another create of the
+    /// same user.
+    #[error("creation_id '{creation_id}' is already used by another sandbox create of user {user_id}; generate a new one per create")]
+    CreationIdInUse { creation_id: String, user_id: i32 },
+
     /// The underlying provider failed to create the container.
     #[error("Failed to create sandbox for user {user_id}: {reason}")]
     CreateFailed { user_id: i32, reason: String },
@@ -194,6 +209,13 @@ pub enum SandboxError {
     /// path, etc.). Mapped to HTTP 400.
     #[error("Validation error: {message}")]
     Validation { message: String },
+    #[error("Sandbox {sandbox_id} requested {requested} CPU cores on a host with {host} cores (allowed range 0.01 to {max})")]
+    CpuLimit {
+        sandbox_id: String,
+        requested: f64,
+        host: f64,
+        max: f64,
+    },
 
     /// The container runtime could not pull the sandbox image: the tag is
     /// not published, the registry is unreachable or access was denied.
@@ -512,7 +534,7 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         let reason = if reason.contains("default-address-pools") {
             reason.to_string()
         } else {
-            temps_ai_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+            temps_agent_core::error::network_pool_exhausted_reason(sandbox_id, reason)
         };
         return SandboxError::NetworkCapacityExhausted {
             sandbox_id: sandbox_id.to_string(),
@@ -548,6 +570,14 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         },
         // A request the provider (or a worker node, ADR-048) rejected as
         // invalid is the caller's error, not a failed exec.
+        AgentError::SandboxCpuLimit {
+            requested, host, ..
+        } => SandboxError::CpuLimit {
+            sandbox_id: sandbox_id.into(),
+            requested,
+            host,
+            max: crate::services::create_policy::max_cpu_limit(None, Some(host)),
+        },
         AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
         // ADR-048: a feature sandboxes on worker nodes cannot serve yet — a
@@ -646,7 +676,7 @@ mod tests {
             AgentError::SandboxCreationFailed {
                 run_id: 3,
                 provider: "docker".into(),
-                reason: temps_ai_agents::error::image_pull_failure_reason(
+                reason: temps_agent_core::error::image_pull_failure_reason(
                     "registry.example.test/team/img:9.9.9",
                     "manifest unknown",
                 ),
@@ -932,7 +962,7 @@ mod tests {
         assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
         assert_eq!(
             problem.body["error_code"],
-            temps_ai_agents::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
+            temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
         );
         assert!(!problem.body.contains_key("setup_path"));
 
@@ -1005,7 +1035,7 @@ mod tests {
 
     #[test]
     fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
-        let reason = temps_ai_agents::error::network_pool_exhausted_reason(
+        let reason = temps_agent_core::error::network_pool_exhausted_reason(
             "temps-sandbox-abc",
             "all predefined address pools have been fully subnetted",
         );

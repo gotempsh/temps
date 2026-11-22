@@ -243,3 +243,34 @@ describe('withReachability', () => {
     ).toBe(live)
   })
 })
+
+describe('worker health in the environment bar', () => {
+  test('shows healthy, failing, and unknown observations independently of ingress', () => {
+    const live = { sleeping: false, current_deployment_id: 1 }
+    const healthy = environmentLiveStatus(live, {
+      monitorStatus: 'no_address',
+      runtimeStatus: 'healthy',
+    })
+    expect(healthy).toMatchObject({ tone: 'ok', label: 'Healthy' })
+    expect(
+      withReachability(healthy, {
+        kind: 'not_reachable',
+        reason: 'No ingress',
+        canFix: true,
+      })
+    ).toEqual(healthy)
+    expect(
+      environmentLiveStatus(live, {
+        monitorStatus: 'no_address',
+        runtimeStatus: 'unhealthy',
+        runtimeReason: 'Probe timed out',
+      })
+    ).toMatchObject({ tone: 'error', detail: 'Probe timed out' })
+    expect(
+      environmentLiveStatus(live, {
+        monitorStatus: 'no_address',
+        runtimeStatus: 'unknown',
+      })
+    ).toMatchObject({ tone: 'idle', label: 'Health unknown' })
+  })
+})

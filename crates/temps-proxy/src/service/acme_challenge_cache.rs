@@ -161,6 +161,30 @@ impl AcmeChallengeCache {
         Self::with_source(Arc::new(DbChallengeSource { db }), ReloadPolicy::default())
     }
 
+    /// A cache serving exactly `pending`, for proxy tests with no database.
+    #[cfg(test)]
+    pub(crate) fn with_pending_for_tests(pending: Vec<PendingChallenge>) -> Self {
+        struct Fixed(Vec<PendingChallenge>);
+
+        #[async_trait]
+        impl ChallengeSource for Fixed {
+            async fn load_pending(
+                &self,
+                _limit: u64,
+            ) -> Result<Vec<PendingChallenge>, sea_orm::DbErr> {
+                Ok(self.0.clone())
+            }
+        }
+
+        Self::with_source(
+            Arc::new(Fixed(pending)),
+            ReloadPolicy {
+                min_interval: Duration::ZERO,
+                ..ReloadPolicy::default()
+            },
+        )
+    }
+
     fn with_source(source: Arc<dyn ChallengeSource>, policy: ReloadPolicy) -> Self {
         Self {
             snapshot: ArcSwapOption::empty(),

@@ -45,7 +45,6 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Skeleton } from '@/components/ui/skeleton'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
 import {
@@ -67,6 +66,7 @@ import {
 import { Fragment, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { TimeAgo } from '../utils/TimeAgo'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 interface EventDetailProps {
   project: ProjectResponse
@@ -90,7 +90,7 @@ export function EventDetail({
   const perPage = 20
 
   // Fetch event detail analytics
-  const { data: detailData, isLoading: detailLoading } = useQuery({
+  const { data: detailData, isLoading: detailLoading } = useWindowQuery({
     ...getEventDetailOptions({
       query: {
         event_name: eventName,
@@ -104,7 +104,7 @@ export function EventDetail({
   })
 
   // Fetch visitors for this event
-  const { data: visitorsData, isLoading: visitorsLoading } = useQuery({
+  const { data: visitorsData, isLoading: visitorsLoading } = useWindowQuery({
     ...getEventVisitorsOptions({
       query: {
         event_name: eventName,
@@ -458,7 +458,7 @@ function EventEntriesCard({
     }
   }
 
-  const { data: entriesData, isLoading: entriesLoading } = useQuery({
+  const { data: entriesData, isLoading: entriesLoading } = useWindowQuery({
     ...getEventEntriesOptions({
       query: {
         event_name: eventName,

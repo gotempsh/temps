@@ -178,6 +178,27 @@ pub(super) fn summarize_for_recall(result: &str) -> String {
     )
 }
 
+/// Execution and approval receipts remain authoritative for the whole turn,
+/// including failures whose side effects may be uncertain. Classify the full
+/// result before recall truncation can make its JSON incomplete.
+fn is_api_execution_receipt(result: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(result) else {
+        return false;
+    };
+    (value
+        .get("operation")
+        .is_some_and(serde_json::Value::is_string)
+        && value
+            .get("status")
+            .is_some_and(serde_json::Value::is_number))
+        || value
+            .get("action_id")
+            .is_some_and(serde_json::Value::is_string)
+        || value
+            .get("plan_id")
+            .is_some_and(serde_json::Value::is_string)
+}
+
 /// Did a tool call produce something the model can reason from, or only a
 /// rejection?
 ///
@@ -298,7 +319,9 @@ pub(super) fn missing_backtest(
 
 #[derive(Default)]
 pub(super) struct ToolExecutionState {
+    pub(super) api_tools_revision: (Option<String>, Option<String>),
     pub(super) goals: Option<crate::goals::GoalToolSupport>,
+    pub(super) watches: Option<crate::watches::ConversationWatches>,
     pub(super) secrets: Option<crate::secret_slots::SecretToolSupport>,
     /// Present for assistant chats on a server with a sandbox backend.
     pub(super) sandbox: Option<crate::sandbox_link::SandboxLinkService>,
@@ -309,6 +332,8 @@ pub(super) struct ToolExecutionState {
     pub(super) blueprint_proposed: bool,
     pub(super) proposed_action_ids: Vec<i64>,
     pub(super) seen_calls: std::collections::HashMap<String, String>,
+    /// Only help, discovery and refusals may be retried after an index refresh.
+    pub(super) refreshable_api_calls: std::collections::HashSet<String>,
     /// Set when the chat belongs to an autofix incident (ADR-054): the
     /// tools such a chat may not run are refused at dispatch, whichever
     /// execution path (gateway rounds or harness executor) made the call.
@@ -448,7 +473,9 @@ pub(super) async fn dispatch_conversation_tool(
     // Shell commands and file reads legitimately repeat (`git status`, a
     // `curl` against the server just started) because the sandbox changes
     // between calls, so the repeat guard does not apply to them.
-    let repeatable = crate::sandbox_link::is_sandbox_tool(&call.name);
+    // A watch can be created, paused, resumed or removed between identical calls.
+    let repeatable =
+        crate::sandbox_link::is_sandbox_tool(&call.name) || call.name == crate::watches::TOOL;
     if let Some(previous) = state.seen_calls.get(&call_key).filter(|_| !repeatable) {
         return format!(
             "You already ran `{}` with these exact arguments earlier this turn. \
@@ -508,6 +535,11 @@ pub(super) async fn dispatch_conversation_tool(
             None => {
                 "Workspaces and architecture blueprints are not available in this chat.".to_string()
             }
+        }
+    } else if call.name == crate::watches::TOOL {
+        match &state.watches {
+            Some(watches) => watches.dispatch(auth, &call.arguments).await,
+            None => "Event watches are unavailable in this chat.".into(),
         }
     } else if call.name == TEMPS_GOAL_TOOL_NAME {
         match &state.goals {
@@ -589,6 +621,11 @@ pub(super) async fn dispatch_conversation_tool(
         format!("Tool '{}' is not available in this context.", call.name)
     };
     if !repeatable {
+        if (call.name == "temps" || is_temps_write_tool_name(&call.name))
+            && !is_api_execution_receipt(&result)
+        {
+            state.refreshable_api_calls.insert(call_key.clone());
+        }
         state
             .seen_calls
             .insert(call_key, summarize_for_recall(&result));
@@ -1220,6 +1257,8 @@ pub(super) fn pending_action_tool_result(
 /// the `unknown` of an in-process request.
 fn approver_origin(resolution: &PermissionResolution) -> temps_core::ai_tool_call::AiToolOrigin {
     temps_core::ai_tool_call::AiToolOrigin {
+        chat_id: None,
+        agent_name: None,
         ip_address: resolution.metadata.ip_address.clone(),
         user_agent: resolution.metadata.user_agent.clone(),
     }
@@ -1294,5 +1333,31 @@ async fn audit_action_transition_failed(
             %audit_error,
             "failed to audit inline AI action transition failure"
         );
+    }
+}
+
+#[cfg(test)]
+mod receipt_tests {
+    use super::*;
+
+    #[test]
+    fn publication_refresh_preserves_execution_and_approval_receipts_before_truncation() {
+        for result in [
+            serde_json::json!({"operation":"preview_alert","status":200,"data":{"payload":"x".repeat(5000)}}),
+            serde_json::json!({"operation":"plugin.reports.list","status":200,"data":{}}),
+            serde_json::json!({"operation":"create_project","status":"executed","action_id":"action"}),
+            serde_json::json!({"operation":"plugin.reports.create","status":"failed","action_id":"action"}),
+            serde_json::json!({"status":"executed","plan_id":"plan","steps":[]}),
+            serde_json::json!({"status":"rejected","plan_id":"plan"}),
+        ] {
+            assert!(is_api_execution_receipt(&result.to_string()));
+        }
+        for result in [
+            "Available operations",
+            "Plugin AI access is disabled",
+            r#"{"error":"not found"}"#,
+        ] {
+            assert!(!is_api_execution_receipt(result));
+        }
     }
 }

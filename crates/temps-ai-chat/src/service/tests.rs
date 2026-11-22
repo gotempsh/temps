@@ -9,6 +9,8 @@ macro_rules! mcp_request {
 }
 use super::*;
 
+mod watch_preparation;
+
 #[test]
 fn durable_failure_metadata_is_safe_preserved_and_clearable() {
     let existing = serde_json::json!({ "application_id": 42 });
@@ -326,6 +328,7 @@ async fn startup_missing_session_reacquires_once_before_answering() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let mut stream = stream;
@@ -389,6 +392,7 @@ async fn streamed_missing_session_discards_stale_metadata_before_retry() {
             None,
             false,
             None,
+            None,
         )
         .await;
     let output = drain(stream).await;
@@ -437,6 +441,7 @@ async fn absent_durable_session_resets_stale_retained_runtime_on_first_round() {
             vec![],
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -509,6 +514,7 @@ fn productive_results_are_distinguished_from_rejections() {
 
 fn inline_action(status: &str, error: Option<&str>) -> temps_entities::ai_pending_actions::Model {
     temps_entities::ai_pending_actions::Model {
+        plugin_revision: None,
         id: 1,
         public_id: "action-1".to_string(),
         conversation_id: 1,
@@ -1086,13 +1092,13 @@ async fn active_assistant_checkpoint_is_written_to_the_message_row() {
 /// round (a list of [`ChatStreamDelta`]s to stream, or an error to fail the
 /// call with) so a test can drive the agentic loop round-by-round, while
 /// counting how many model calls were made.
-struct ScriptedAi {
+pub(super) struct ScriptedAi {
     /// Front-to-back queue of rounds for successive `chat_stream_turn` calls.
     rounds: Mutex<std::collections::VecDeque<Result<Vec<ChatStreamDelta>, AiError>>>,
     /// Counts `chat_stream_turn` invocations (kept named `chat_calls` for the
     /// round-cap assertions).
-    chat_calls: Arc<std::sync::atomic::AtomicUsize>,
-    requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
+    pub(super) chat_calls: Arc<std::sync::atomic::AtomicUsize>,
+    pub(super) requests: Arc<Mutex<Vec<ChatTurnRequest>>>,
     available: bool,
     /// Advance the paused test clock by this much on every model call, so a
     /// deadline can be exercised without a test that actually waits.
@@ -1100,7 +1106,7 @@ struct ScriptedAi {
 }
 
 impl ScriptedAi {
-    fn new(rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>>) -> Self {
+    pub(super) fn new(rounds: Vec<Result<Vec<ChatStreamDelta>, AiError>>) -> Self {
         Self {
             rounds: Mutex::new(rounds.into_iter().collect()),
             chat_calls: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
@@ -1111,7 +1117,7 @@ impl ScriptedAi {
     }
 
     /// Advance the paused clock by `d` on each model call.
-    fn advancing(mut self, d: std::time::Duration) -> Self {
+    pub(super) fn advancing(mut self, d: std::time::Duration) -> Self {
         self.advance_per_round = Some(d);
         self
     }
@@ -1340,8 +1346,8 @@ impl AiService for HostHarnessOnlyAi {
 }
 
 /// A stub provider exposing a single `echo` tool, counting executions.
-struct StubProvider {
-    tool_calls: Arc<std::sync::atomic::AtomicUsize>,
+pub(super) struct StubProvider {
+    pub(super) tool_calls: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 struct AuthRecordingProvider {
@@ -1570,7 +1576,7 @@ async fn runtime_update_fails_closed_on_database_error() {
         .is_ok());
 }
 
-fn test_conversation() -> ai_conversations::Model {
+pub(super) fn test_conversation() -> ai_conversations::Model {
     let now = Utc::now();
     ai_conversations::Model {
         id: 1,
@@ -1600,7 +1606,7 @@ fn test_conversation() -> ai_conversations::Model {
     }
 }
 
-fn test_auth() -> AuthContext {
+pub(super) fn test_auth() -> AuthContext {
     let now = Utc::now();
     let user = temps_entities::users::Model {
         id: 1,
@@ -1706,6 +1712,8 @@ async fn authorization_revocation_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 74,
         name: "active-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1765,6 +1773,7 @@ async fn authorization_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1785,6 +1794,8 @@ async fn project_revocation_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 75,
         name: "project-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1859,6 +1870,7 @@ async fn project_revocation_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1879,6 +1891,8 @@ async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let active_key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 76,
         name: "runtime-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -1947,6 +1961,7 @@ async fn runtime_permission_downgrade_stops_an_active_native_provider_stream() {
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -1967,6 +1982,8 @@ async fn newly_linked_project_is_authorized_during_an_active_native_provider_str
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 77,
         name: "topology-turn".to_string(),
         key_hash: "hash".to_string(),
@@ -2064,6 +2081,7 @@ async fn newly_linked_project_is_authorized_during_an_active_native_provider_str
             None,
             false,
             None,
+            None,
         )
         .await;
 
@@ -2105,6 +2123,8 @@ async fn tool_authorization_uses_current_api_key_permissions() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 72,
         name: "current".to_string(),
         key_hash: "hash".to_string(),
@@ -2145,6 +2165,8 @@ async fn tool_authorization_caps_an_admin_key_whose_owner_was_demoted() {
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 73,
         name: "former-admin".to_string(),
         key_hash: "hash".to_string(),
@@ -2187,7 +2209,7 @@ async fn tool_authorization_caps_an_admin_key_whose_owner_was_demoted() {
     assert!(!refreshed.has_permission(&Permission::UsersWrite));
 }
 
-fn test_request_metadata() -> RequestMetadata {
+pub(super) fn test_request_metadata() -> RequestMetadata {
     RequestMetadata {
         ip_address: "127.0.0.1".to_string(),
         user_agent: "temps-ai-chat-test".to_string(),
@@ -2327,6 +2349,7 @@ fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> Conversati
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -2341,7 +2364,7 @@ fn service_with_db(ai: Arc<dyn AiService>, db: DatabaseConnection) -> Conversati
     }
 }
 
-fn echo_tools() -> Vec<ChatTool> {
+pub(super) fn echo_tools() -> Vec<ChatTool> {
     let tools = vec![ChatTool {
         name: "echo".to_string(),
         description: "Echoes its input.".to_string(),
@@ -2365,7 +2388,7 @@ fn service_with(ai: Arc<dyn AiService>) -> (ConversationService, Vec<ChatTool>) 
 /// request-only test session would now (correctly) fail closed.
 /// The `admin` role row `current_user_role` looks up when a refresh
 /// re-checks the key owner's role.
-fn owner_admin_role() -> temps_entities::roles::Model {
+pub(super) fn owner_admin_role() -> temps_entities::roles::Model {
     let now = Utc::now();
     temps_entities::roles::Model {
         id: 1,
@@ -2377,7 +2400,7 @@ fn owner_admin_role() -> temps_entities::roles::Model {
 
 /// The test user's grant of [`owner_admin_role`]: the key owner is still
 /// an admin, so the key keeps its full grant.
-fn owner_admin_grant() -> temps_entities::user_roles::Model {
+pub(super) fn owner_admin_grant() -> temps_entities::user_roles::Model {
     let now = Utc::now();
     temps_entities::user_roles::Model {
         id: 1,
@@ -2401,6 +2424,8 @@ fn service_with_current_tool_auth_and_session_clear(
     let now = Utc::now();
     let user = test_auth().user.expect("test user");
     let key = temps_entities::api_keys::Model {
+        project_id: None,
+        environment_id: None,
         id: 73,
         name: "tool-loop".to_string(),
         key_hash: "hash".to_string(),
@@ -2783,6 +2808,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -2817,6 +2843,7 @@ async fn first_application_turn_persists_and_publishes_harness_session_title() {
             Vec::new(),
             None,
             true,
+            None,
             None,
         )
         .await;
@@ -3013,6 +3040,7 @@ async fn native_tool_provider_error_is_not_reported_as_round_backstop_exhaustion
             Vec::new(),
             None,
             false,
+            None,
             None,
         )
         .await;
@@ -3697,13 +3725,14 @@ fn db_service(db: DatabaseConnection) -> ConversationService {
     db_service_from_arc(Arc::new(db))
 }
 
-fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationService {
+pub(super) fn db_service_from_arc(db: Arc<DatabaseConnection>) -> ConversationService {
     ConversationService {
         db,
         ai: Arc::new(ScriptedAi::new(vec![])),
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -3823,6 +3852,7 @@ fn db_service_with_ai(db: DatabaseConnection, ai: Arc<dyn AiService>) -> Convers
         providers: HashMap::new(),
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -4131,6 +4161,7 @@ async fn cancelled_claim_never_starts_provider_execution_after_registration() {
             Vec::new(),
             Some("turn-cancelled-during-setup".to_string()),
             false,
+            None,
             None,
         )
         .await;
@@ -4464,6 +4495,7 @@ fn project_with_toggle(
             temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
         cloud_analytics_write_mode:
             temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+        analytics_identity_mode: Default::default(),
         instantiation_token: None,
         cloud_telemetry_attribute_allowlist: Vec::new(),
         name: name.to_string(),
@@ -4541,6 +4573,7 @@ async fn two_users_get_separate_conversations_for_the_same_context() {
         providers,
         write_support: None,
         goal_support: None,
+        watch_tools: Default::default(),
         secret_support: None,
         config: None,
         application_workspaces: None,
@@ -4709,11 +4742,11 @@ async fn every_conversation_lookup_is_scoped_to_the_current_creator() {
         .is_empty());
     assert!(matches!(
         svc.get_by_public_id(7, 11, "owned-session").await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
     assert!(matches!(
         svc.get_by_id(7, 11, 99).await,
-        Err(ChatError::NotFound(_))
+        Err(ChatError::NotFound { .. })
     ));
 
     drop(svc);
@@ -4745,7 +4778,9 @@ async fn another_project_member_cannot_load_or_resume_an_owned_cli_session() {
         .get_by_public_id(7, 22, "user-11-claude-session")
         .await
         .expect_err("another member must receive the same not-found as an unknown id");
-    assert!(matches!(error, ChatError::NotFound(id) if id == "user-11-claude-session"));
+    assert!(
+        matches!(error, ChatError::NotFound { conversation_id: id } if id == "user-11-claude-session")
+    );
 
     drop(svc);
     let db = Arc::try_unwrap(db).expect("release mock database");
@@ -4771,7 +4806,7 @@ async fn test_get_by_id_retains_project_scope() {
         .get_by_id(8, 5, 1)
         .await
         .expect_err("cross-project child lookup must not resolve");
-    assert!(matches!(err, ChatError::NotFound(_)));
+    assert!(matches!(err, ChatError::NotFound { .. }));
 }
 
 // list_conversations: returns the project's active conversations.
@@ -5072,12 +5107,6 @@ async fn conversation_search_matches_title_or_project_before_pagination() {
     assert!(values.contains(r"%barber\\_50\\%%"), "{values}");
 }
 
-#[test]
-fn escape_like_matches_metacharacters_literally() {
-    assert_eq!(escape_like(r"50%_off\"), r"50\%\_off\\");
-    assert_eq!(escape_like("plain"), "plain");
-}
-
 // Legacy project toggle values no longer affect chat visibility. Access is
 // determined by the current user's project membership and permissions.
 #[tokio::test]
@@ -5157,7 +5186,9 @@ async fn test_get_by_public_id_not_found_is_scoped_error() {
         .await
         .expect_err("should not find a conversation in the wrong project");
     match err {
-        ChatError::NotFound(id) => assert_eq!(id, "pubA"),
+        ChatError::NotFound {
+            conversation_id: id,
+        } => assert_eq!(id, "pubA"),
         other => panic!("expected NotFound, got {other:?}"),
     }
 }
@@ -6296,7 +6327,7 @@ impl AiService for InterruptedStreamAi {
     }
 }
 
-async fn collect_all(
+pub(super) async fn collect_all(
     stream: Pin<Box<dyn Stream<Item = Result<ChatStreamEvent, ChatError>> + Send>>,
 ) -> Vec<Result<ChatStreamEvent, ChatError>> {
     let mut stream = stream;
@@ -6923,4 +6954,226 @@ fn prompt_composition_logging_accepts_empty_and_populated_prompts() {
         ],
         &managed_process_tools(),
     );
+}
+
+#[tokio::test]
+async fn plugin_write_waits_for_approval_then_executes_and_audits() {
+    use temps_ai_api_tools::{
+        InternalApiCaller, PluginToolAccess, PluginToolsIndex, PluginToolsRegistry,
+    };
+    use temps_entities::ai_pending_actions;
+    #[derive(Default)]
+    struct Audit(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for Audit {
+        async fn create_audit_log(
+            &self,
+            op: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            self.0.lock().unwrap().push(op.serialize()?);
+            Ok(())
+        }
+    }
+    let audit = Arc::new(Audit::default());
+    let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let observed = calls.clone();
+    let router = axum::Router::new().route(
+        "/x/reports/create",
+        axum::routing::post(
+            move |axum::Extension(origin): axum::Extension<
+                temps_core::ai_tool_call::AiToolOrigin,
+            >| {
+                assert_eq!(origin.agent_name.as_deref(), Some("Report editor"));
+                assert_eq!(origin.chat_id, Some(1));
+                observed.fetch_add(1, Ordering::SeqCst);
+                async { axum::Json(serde_json::json!({"created":true})) }
+            },
+        ),
+    );
+    let spec = serde_json::from_value(serde_json::json!({"openapi":"3.1.0","info":{"title":"reports","version":"1"},"paths":{"/create":{"post":{"operationId":"create","x-temps-ai-tool":{},"responses":{"200":{"description":"ok"}}}}}})).unwrap();
+    let registry = Arc::new(PluginToolsRegistry::default());
+    let handle = Arc::new(temps_ai_api_tools::WriteApiToolsHandle::new());
+    let target = handle.clone();
+    registry.bind(
+        InternalApiCaller::new_write_allowlisted(router, &spec, vec![]),
+        PluginToolAccess::Write,
+        audit.clone(),
+        move |caller| target.set(caller),
+    );
+    registry.publish(PluginToolsIndex::from_openapi("reports", &spec, true).unwrap());
+    let auth = test_auth();
+    let prepared = match handle.get().unwrap().prepare_write_cli(
+        "plugin.reports.create",
+        &temps_ai_api_tools::ApiCallScope {
+            auth: auth.clone(),
+            project_scope: temps_ai_api_tools::ProjectSelectorScope::Unrestricted,
+            origin: None,
+            secrets: None,
+        },
+    ) {
+        temps_ai_api_tools::WritePrepareOutcome::Prepared(prepared) => prepared,
+        _ => panic!("plugin operation should be preparable"),
+    };
+    let row = ai_pending_actions::Model {
+        plugin_revision: prepared.plugin_revision,
+        id: 1,
+        public_id: "plugin-approval".into(),
+        conversation_id: 1,
+        message_id: None,
+        project_id: None,
+        plan_public_id: None,
+        step_index: 0,
+        operation_id: "plugin.reports.create".into(),
+        method: "POST".into(),
+        summary: "Create report".into(),
+        params: serde_json::json!({}),
+        required_permission: None,
+        status: "awaiting_inline_approval".into(),
+        result: None,
+        error: None,
+        created_by: auth.user_id(),
+        confirmed_by: None,
+        created_at: chrono::Utc::now(),
+        confirmed_at: None,
+        executed_at: None,
+    };
+    let mut executed = row.clone();
+    executed.status = "executed".into();
+    executed.result = Some(serde_json::json!({"created":true}));
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![row.clone()], vec![row]])
+        .append_query_results(
+            [[std::collections::BTreeMap::<String, sea_orm::Value>::from(
+                [("title".into(), "Report editor".into())],
+            )]],
+        )
+        .append_query_results([vec![executed]])
+        .append_exec_results([sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        }])
+        .into_connection();
+    let db = Arc::new(db);
+    let pending = PendingActionService::new(
+        db.clone(),
+        handle.clone(),
+        Arc::new(temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap()),
+    );
+    let call = ToolCall {
+        id: "plugin-write".into(),
+        name: "temps_write".into(),
+        arguments: r#"{"command":"plugin.reports.create"}"#.into(),
+    };
+    let caller = handle.get().unwrap();
+    let mut execution = ToolExecutionState::default();
+    let missing = dispatch_conversation_tool(
+        &call,
+        None,
+        1,
+        "assistant",
+        &auth,
+        None,
+        None,
+        None,
+        None,
+        Some(&caller),
+        Some(&pending),
+        None,
+        None,
+        &mut execution,
+    )
+    .await;
+    assert!(missing.contains("cannot request approval"), "{missing}");
+    assert_eq!(calls.load(Ordering::SeqCst), 0);
+    // A later turn with an approval channel has a fresh duplicate-call cache.
+    execution = ToolExecutionState::default();
+    let approval_calls = calls.clone();
+    let approval_audit = audit.clone();
+    let approval_auth = auth.clone();
+    let interactions: PlatformInteractionExecutor = Arc::new(move |request| {
+        assert_eq!(request.tool_name, "temps_write");
+        assert_eq!(request.input["operation"], "plugin.reports.create");
+        assert_eq!(approval_calls.load(Ordering::SeqCst), 0);
+        assert!(approval_audit.0.lock().unwrap().is_empty());
+        let auth = approval_auth.clone();
+        Box::pin(async move {
+            Ok(PermissionResolution {
+                decision: PermissionDecision::AllowTool,
+                auth,
+                metadata: test_request_metadata(),
+            })
+        })
+    });
+    let result = dispatch_conversation_tool(
+        &call,
+        None,
+        1,
+        "assistant",
+        &auth,
+        None,
+        None,
+        None,
+        None,
+        Some(&caller),
+        Some(&pending),
+        None,
+        Some(&interactions),
+        &mut execution,
+    )
+    .await;
+    assert!(result.contains("executed"), "{result}");
+    drop(pending);
+    let transactions = Arc::try_unwrap(db).unwrap().into_transaction_log();
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "{result} {transactions:?}");
+    let events = audit.0.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert!(serde_json::from_str::<serde_json::Value>(&events[0]).unwrap()["succeeded"].is_null());
+    let event: serde_json::Value = serde_json::from_str(&events[1]).unwrap();
+    assert_eq!(event["plugin"], "reports");
+    assert_eq!(event["user_id"], auth.user_id());
+    assert_eq!(event["succeeded"], true);
+}
+
+#[test]
+fn sandbox_access_approval_requires_a_human_in_writes_and_plans() {
+    for kind in [PermissionKind::ToolApproval, PermissionKind::PlanApproval] {
+        let approval = serde_json::json!({"operation":"approve_sandbox_service","method":"POST","carries_handle":false});
+        let input = if kind == PermissionKind::PlanApproval {
+            serde_json::json!({"steps":[{"operation":"request_sandbox_service","method":"POST"},approval]})
+        } else {
+            approval
+        };
+        let request = PermissionRequest {
+            id: "approval".into(),
+            kind,
+            tool_name: TEMPS_WRITE_TOOL_NAME.into(),
+            input: redact_value(&input),
+        };
+        assert!(automatic_platform_decision(&request).is_none());
+    }
+}
+
+#[test]
+fn vault_sessions_always_require_human_consent_in_chat() {
+    for input in [
+        serde_json::json!({"operation":"create_access_session_general","method":"POST"}),
+        serde_json::json!({"operation":"create_vault_link","method":"POST"}),
+        serde_json::json!({"operation":"create_access_bundle_general","method":"POST"}),
+        serde_json::json!({"steps":[{"operation":"create_access_session_general","method":"POST"}]}),
+        // Granting internal access widens what a project or a sandbox can
+        // reach, so auto-approve never grants it either (ADR-105 D8).
+        serde_json::json!({"operation":"create_internal_access_sandbox_grant","method":"POST"}),
+        serde_json::json!({"operation":"create_internal_access_grant","method":"POST"}),
+        serde_json::json!({"steps":[{"operation":"create_internal_access_sandbox_grant","method":"POST"}]}),
+    ] {
+        for kind in [PermissionKind::ToolApproval, PermissionKind::PlanApproval] {
+            let request = PermissionRequest {
+                id: "fixture".into(),
+                kind,
+                tool_name: "temps_write".into(),
+                input: input.clone(),
+            };
+            assert!(automatic_platform_decision(&request).is_none());
+        }
+    }
 }

@@ -74,7 +74,7 @@ const MIB: f64 = 1024.0 * 1024.0;
 
 /// Today's sidecar, verbatim from the sandbox provider.
 fn sidecar_script() -> Option<&'static str> {
-    let source = include_str!("../../temps-ai-agents/src/sandbox/docker/egress.rs");
+    let source = include_str!("../../temps-sandbox-providers/src/docker/egress.rs");
     let start = source.find("const SANDBOX_EGRESS_PROXY_SCRIPT: &str = r#\"")?;
     let body = &source[start..];
     let open = body.find("r#\"")? + 3;

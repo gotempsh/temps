@@ -77,7 +77,7 @@ pub fn reconcilable_at_startup(row: &sandboxes::Model) -> bool {
 /// One row's liveness verdict in [`SandboxService::reconcile_running_vms`].
 enum VmCheck {
     Alive,
-    Down(temps_ai_agents::error::AgentError),
+    Down(temps_agent_core::error::AgentError),
     Unknown(String),
 }
 
@@ -92,7 +92,7 @@ impl SandboxService {
     pub(crate) async fn live_handle(
         &self,
         row: &sandboxes::Model,
-    ) -> Result<temps_ai_agents::sandbox::SandboxHandle, SandboxError> {
+    ) -> Result<temps_sandbox_providers::SandboxHandle, SandboxError> {
         match self.registry.probe(row.id, &row.public_id).await {
             VmProbe::Alive(handle) => Ok(handle),
             VmProbe::Down(error) => {
@@ -114,7 +114,7 @@ impl SandboxService {
     pub(crate) async fn mark_vm_lost(
         &self,
         row: &sandboxes::Model,
-        cause: &temps_ai_agents::error::AgentError,
+        cause: &temps_agent_core::error::AgentError,
         source: &'static str,
     ) -> bool {
         // Managed application workspaces report a lost runtime as the derived

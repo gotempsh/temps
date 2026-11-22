@@ -12,14 +12,16 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-ai-api-tools = { path = "../temps-ai-api-tools" }
 temps-auth = { path = "../temps-auth" }
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-plugin-protocol = { path = "../temps-plugin-protocol" }
 temps-entities = { path = "../temps-entities" }
 temps-presets = { path = "../temps-presets" }
 temps-ai = { path = "../temps-ai" }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
-anyhow = { workspace = true }
 base64 = { workspace = true }
 ed25519-dalek = { workspace = true }
 hex = { workspace = true }
@@ -43,15 +45,16 @@ tokio-tungstenite = "0.30"
 tower = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }
-utoipa = { workspace = true }
+utoipa = { workspace = true, features = ["chrono", "uuid"] }
 tempfile = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+temps-test-utils = { path = "../temps-test-utils" }
 tracing-subscriber = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-migrations = { path = "../temps-migrations" }
 
 [lints]

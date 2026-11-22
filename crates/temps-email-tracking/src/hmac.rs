@@ -8,6 +8,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use temps_core::crypto::constant_time_eq;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -34,18 +35,6 @@ pub fn verify_tracking_hmac(key: &[u8], email_id: &str, url: &str, expected: &st
     let computed = generate_tracking_hmac(key, email_id, url);
     // Constant-time comparison to prevent timing attacks
     constant_time_eq(computed.as_bytes(), expected.as_bytes())
-}
-
-/// Constant-time byte comparison
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut result = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        result |= x ^ y;
-    }
-    result == 0
 }
 
 #[cfg(test)]
@@ -148,12 +137,5 @@ mod tests {
             "https://example.com",
             "too-short"
         ));
-    }
-
-    #[test]
-    fn test_constant_time_eq() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-        assert!(!constant_time_eq(b"hello", b"world"));
-        assert!(!constant_time_eq(b"hello", b"hell"));
     }
 }

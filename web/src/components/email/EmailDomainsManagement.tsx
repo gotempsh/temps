@@ -13,7 +13,7 @@ import {
   type EmailProviderResponse,
 } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordListItem } from '@temps-sdk/ds'
 import { isAdvisoryDnsRecord } from '@/lib/email-dns-records'
 import { isSmtpProvider, smtpVerifyToast } from '@/lib/email-smtp-domains'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -656,7 +656,7 @@ export function EmailDomainsManagement() {
                 const isSmtp = isSmtpProvider(provider)
                 const canEnableSending = isSmtp && domain.status !== 'verified'
                 return (
-                  <li
+                  <RecordListItem
                     key={domain.id}
                     className="flex items-center gap-4 px-4 py-3"
                   >
@@ -795,7 +795,7 @@ export function EmailDomainsManagement() {
                         </DropdownMenuContent>
                       </DropdownMenu>
                     </div>
-                  </li>
+                  </RecordListItem>
                 )
               })}
             </ul>

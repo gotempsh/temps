@@ -60,7 +60,9 @@ pub struct JoinCommand {
     #[arg(long, env = "TEMPS_RELAY_URL")]
     pub relay_url: Option<String>,
 
-    /// Labels for node scheduling (key=value pairs)
+    /// Labels for node scheduling (key=value pairs). `temps.sh/role=builder`
+    /// makes a build-only node, `temps.sh/role=dedicated` a dedicated one.
+    /// Change them later with `temps agent labels set`
     #[arg(long, value_delimiter = ',')]
     pub labels: Vec<String>,
 
@@ -142,6 +144,11 @@ pub struct JoinCommand {
     /// mesh enrollment showed neither (ADR 060).
     #[arg(skip)]
     withhold_prior_token: bool,
+
+    /// On a Mac: the Docker app whose VM holds this worker's containers and
+    /// its end of the mesh (ADR 090), found before anything else runs.
+    #[arg(skip)]
+    mac: Option<super::mac_worker::MacJoinContext>,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -283,7 +290,7 @@ async fn occupied_ranges_for_registration(
     match temps_network::occupied::collect(
         docker.as_ref(),
         &owned_devices,
-        &config.docker_network_name,
+        &[config.docker_network_name.as_str()],
     )
     .await
     {
@@ -704,12 +711,80 @@ fn apply_saved_public_ingress_settings(
     config.public_ingress_https_port = https_port;
 }
 
-/// How to start the worker once it has joined.
-fn print_start_agent_hint() {
+/// End a join with the agent on the config just saved: restart the managed
+/// service if one runs from this data directory, else say how to start it.
+/// `mac_worker` when this Mac joined with its Docker app (ADR 090). Never
+/// fails the join: the token is spent and the config saved, so a service
+/// that could not be restarted is a warning with the command to run.
+async fn finish_agent_after_join(mac_worker: bool) {
+    use crate::commands::agent_service::{restart_after_join, start_agent_hint, ServiceAfterJoin};
+    let data_dir = crate::commands::agent::agent_data_dir();
+    let outcome = tokio::task::spawn_blocking(move || restart_after_join(&data_dir)).await;
     println!();
-    println!("Start the worker:");
-    println!("  temps agent service install   as a systemd service, restarted on failure and at boot (root)");
-    println!("  temps agent                   in the foreground, or under your own supervisor");
+    match outcome {
+        Ok(ServiceAfterJoin::Restarted(service)) => {
+            println!(
+                "Restarted {}: the worker now runs on this config.",
+                service.name
+            );
+            println!("  temps agent service status    to check it");
+        }
+        Ok(ServiceAfterJoin::NotRestarted {
+            service,
+            reason,
+            fix,
+        }) => {
+            println!(
+                "Warning: {} was not restarted onto this config: {reason}",
+                service.name
+            );
+            println!("Until it runs on this config, this control plane sees the worker offline.");
+            if let Some(fix) = fix {
+                println!("Once that is dealt with, run:");
+                println!("  {fix}");
+            }
+        }
+        Ok(ServiceAfterJoin::Stopped(service)) => {
+            println!(
+                "{} is installed but stopped, so the worker stays offline until it runs:",
+                service.name
+            );
+            println!("  {}", service.start);
+        }
+        Ok(ServiceAfterJoin::NotInstalled) => {
+            for line in start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
+                println!("{line}");
+            }
+            println!(
+                "If `temps agent` already runs under your own supervisor, restart it: it reads \
+                 its config only at start."
+            );
+        }
+        Err(error) => {
+            println!(
+                "Warning: could not check the agent service ({error}). If it is running, restart \
+                 it: it reads its config only at start."
+            );
+            for line in start_agent_hint(cfg!(target_os = "macos"), mac_worker) {
+                println!("{line}");
+            }
+        }
+    }
+}
+
+/// Save the Mac worker's sidecar settings, the last file the agent reads at
+/// start. A failure here comes after agent.json was rewritten and the token
+/// spent, so it says what a running agent is left on.
+fn save_mac_worker(worker: &temps_node_agent::mac_worker::MacWorker) -> anyhow::Result<()> {
+    worker
+        .save(&crate::commands::agent::agent_data_dir())
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "{error}. agent.json is already rewritten for this control plane, but a running \
+                 agent keeps its previous config until it restarts: fix this and run `temps join` \
+                 again"
+            )
+        })
 }
 
 /// Extract the port `temps agent` will listen on from `--agent-address`.
@@ -898,7 +973,14 @@ async fn detect_local_platform() -> Option<String> {
 }
 
 impl JoinCommand {
-    pub fn execute(self) -> anyhow::Result<()> {
+    pub fn execute(mut self) -> anyhow::Result<()> {
+        if cfg!(target_os = "macos") && self.uses_docker_app_vm() {
+            let context = super::mac_worker::detect()?;
+            // Everything in this process (the platform check, preflight)
+            // talks to that app's daemon, while still single-threaded.
+            std::env::set_var("DOCKER_HOST", &context.endpoint.host);
+            self.mac = Some(context);
+        }
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?;
@@ -907,7 +989,12 @@ impl JoinCommand {
     }
 
     async fn run(mut self) -> anyhow::Result<()> {
-        let labels = self.parse_labels();
+        let labels = self.parse_labels()?;
+        // Refused before anything is registered: a root join must not save
+        // its config where another user could redirect it.
+        super::agent_labels::check_join_target(
+            &crate::commands::agent::agent_data_dir().join("agent.json"),
+        )?;
 
         let node_name = self
             .name
@@ -960,6 +1047,10 @@ impl JoinCommand {
             }
         }
 
+        // Last, after every file the agent reads at start is written (on a
+        // Mac, the sidecar's mac_worker.json follows agent.json).
+        finish_agent_after_join(self.mac.is_some()).await;
+
         Ok(())
     }
 
@@ -984,8 +1075,9 @@ impl JoinCommand {
             JoinMode::Paired(_) | JoinMode::Relay(_) => None,
         };
         // Who the target is decides whether this is the saved control plane
-        // (ADR 060); asked before the join token goes anywhere.
-        if let (Some(_), Some(target)) = (&facts.saved, target.as_deref()) {
+        // (ADR 060), and which VXLAN network ID its overlay needs (ADR 062);
+        // asked before the join token goes anywhere.
+        if let Some(target) = target.as_deref() {
             facts.target_identity = Some(super::host_preflight::fetch_plane_identity(target).await);
         }
         // Without `--ingress` a rejoin keeps the saved mode and a new worker
@@ -1045,6 +1137,12 @@ impl JoinCommand {
     /// How this machine joins, from the flags: `--pair`, then
     /// `--private-address`, then `--relay-url`; with none of them, outbound
     /// only (ADR 055).
+    /// Whether a Mac join puts its end of the mesh in the Docker app's VM
+    /// (ADR 090): only an outbound join does; a direct one needs no Docker app.
+    fn uses_docker_app_vm(&self) -> bool {
+        matches!(self.mode(), JoinMode::Outbound)
+    }
+
     fn mode(&self) -> JoinMode {
         if let Some(code) = self.pair.clone() {
             JoinMode::Paired(code)
@@ -1074,14 +1172,10 @@ impl JoinCommand {
 
         let config_path = temps_dir.join("agent.json");
         let json = serde_json::to_string_pretty(config)?;
-        std::fs::write(&config_path, &json)?;
-
-        // Set file permissions to 0600 (owner read/write only)
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        // Owner-only (0600), renamed into place under the lock `temps agent
+        // labels` and `temps agent ingress` take, so an edit overlapping
+        // this join cannot write the old enrollment back over the new one.
+        super::agent_labels::replace_agent_config(&config_path, &json)?;
 
         println!("Agent config saved to {}", config_path.display());
         Ok(())
@@ -1338,8 +1432,6 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        print_start_agent_hint();
-
         Ok(())
     }
 
@@ -1571,14 +1663,26 @@ impl JoinCommand {
     ) -> anyhow::Result<()> {
         use temps_deployments::handlers::nodes::MeshEnrollResponse;
 
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", target_os = "macos")) {
             anyhow::bail!(
                 "With no --private-address, this machine joins over a WireGuard tunnel it \
-                 dials itself, which needs kernel WireGuard: run `temps join` on Linux. On \
-                 another OS, pass --private-address <ip> with an address the control plane can \
-                 reach."
+                 dials itself, which needs Linux kernel WireGuard (or, on a Mac, a Docker \
+                 app's VM): run `temps join` on Linux or macOS. On another OS, pass \
+                 --private-address <ip> with an address the control plane can reach."
             );
         }
+        // A Mac checks its Docker app's VM before the token is spent.
+        let mac = self.mac.clone();
+        let mac_agent_port = match &mac {
+            Some(context) => {
+                let port = super::mac_worker::agent_port(&self.agent_address)?;
+                let checked = context.clone();
+                tokio::task::spawn_blocking(move || super::mac_worker::preflight(&checked))
+                    .await??;
+                Some(port)
+            }
+            None => None,
+        };
         println!(
             "Joining outbound only: this machine dials the control plane and needs no inbound \
              port. (Pass --private-address <ip> to register at an address instead.)"
@@ -1725,6 +1829,25 @@ impl JoinCommand {
             );
         }
 
+        // On a Mac the mesh lives in the Docker app's VM, held by the mesh
+        // sidecar, which also carries the agent's calls to the control plane.
+        let mac_worker = match (&mac, mac_agent_port) {
+            (Some(context), Some(agent_port)) => {
+                temps_wireguard::vm::set_docker_endpoint(context.endpoint.clone())?;
+                Some(
+                    super::mac_worker::start_sidecar(
+                        context,
+                        node_address,
+                        control_plane_address,
+                        answer.node_api_port,
+                        agent_port,
+                    )
+                    .await?,
+                )
+            }
+            _ => None,
+        };
+
         // 2. The mesh, with the control plane as the only peer. No endpoint
         // of our own: the control plane learns it from our handshakes.
         let private_address = node_address.to_string();
@@ -1787,13 +1910,23 @@ impl JoinCommand {
             ),
         })?;
 
-        // 3. Register over the mesh, under our own mesh address.
+        // 3. Register over the mesh, under our own mesh address. A Mac
+        // reaches the node API through the sidecar's egress forwarder; TLS
+        // still pins the cluster CA and the control plane's reserved name.
+        let node_api = match &mac_worker {
+            Some(sidecar) => {
+                super::mac_worker::wait_for_egress(&sidecar.worker).await?;
+                let port = sidecar.worker.egress_port;
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+            }
+            None => std::net::SocketAddr::new(
+                std::net::IpAddr::V4(control_plane_address),
+                answer.node_api_port,
+            ),
+        };
         self.register_over_mesh(
             MeshRegistration {
-                node_api: std::net::SocketAddr::new(
-                    std::net::IpAddr::V4(control_plane_address),
-                    answer.node_api_port,
-                ),
+                node_api,
                 ca_fingerprint: &answer.ca_fingerprint,
                 join_token: &answer.join_token,
                 node_name: &answer.name,
@@ -1803,7 +1936,17 @@ impl JoinCommand {
             labels,
             platform,
         )
-        .await
+        .await?;
+        if let Some(sidecar) = mac_worker {
+            save_mac_worker(&sidecar.worker)?;
+            let worker = sidecar.keep();
+            println!(
+                "This Mac is a worker. Its containers and its end of the mesh run in {}'s VM; \
+                 it suits development and personal use (it goes offline while the Mac sleeps).",
+                worker.docker_app.display_name()
+            );
+        }
+        Ok(())
     }
 
     /// Relay mode: use an operator-run relay for WireGuard key exchange.
@@ -2043,8 +2186,6 @@ impl JoinCommand {
         apply_saved_public_ingress_settings(&mut config, matching_saved);
         self.save_agent_config(&config)?;
 
-        print_start_agent_hint();
-
         Ok(())
     }
 
@@ -2082,17 +2223,13 @@ impl JoinCommand {
         }
     }
 
-    fn parse_labels(&self) -> serde_json::Value {
-        let mut map = serde_json::Map::new();
-        for label in &self.labels {
-            if let Some((key, value)) = label.split_once('=') {
-                map.insert(
-                    key.to_string(),
-                    serde_json::Value::String(value.to_string()),
-                );
-            }
-        }
-        serde_json::Value::Object(map)
+    /// `--labels`, checked by the rules `temps agent labels set` applies
+    /// (ADR-091 D2) before anything is registered, so a typo such as
+    /// `temps.sh/role=dedicatd` stops the join instead of doing nothing.
+    fn parse_labels(&self) -> anyhow::Result<serde_json::Value> {
+        let labels = temps_core::node_labels::parse_labels(&self.labels)
+            .map_err(|error| anyhow::anyhow!("--labels: {error}"))?;
+        Ok(temps_core::node_labels::to_json(&labels))
     }
 }
 
@@ -2300,6 +2437,7 @@ mod tests {
         }
         let join = parse_join(&["https://cp.example.com", "token"]).unwrap();
         assert_eq!(join.mode(), JoinMode::Outbound);
+        assert!(join.uses_docker_app_vm());
         assert_eq!(join.target.as_deref(), Some("https://cp.example.com"));
 
         let join = parse_join(&[
@@ -2310,6 +2448,10 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(join.mode(), JoinMode::Direct("10.0.0.5".into()));
+        assert!(
+            !join.uses_docker_app_vm(),
+            "a direct Mac join needs no Docker app"
+        );
         let join = parse_join(&[
             "abc123",
             "token",

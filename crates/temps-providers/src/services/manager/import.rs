@@ -16,7 +16,9 @@ use temps_entities::external_services;
 
 impl ExternalServiceManager {
     /// List available Docker containers that can be imported as services
-    pub async fn list_available_containers(&self) -> Result<Vec<AvailableContainer>> {
+    pub async fn list_available_containers(
+        &self,
+    ) -> Result<Vec<AvailableContainer>, ExternalServiceError> {
         use bollard::query_parameters::ListContainersOptions;
 
         // Get list of managed services (we use their service names to exclude them)
@@ -38,7 +40,9 @@ impl ExternalServiceManager {
                 ..Default::default()
             }))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to list Docker containers: {}", e))?;
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to list Docker containers: {}", e),
+            })?;
 
         let mut available: Vec<AvailableContainer> = Vec::new();
 
@@ -68,25 +72,26 @@ impl ExternalServiceManager {
 
             // Detect service type based on image name
             #[allow(deprecated)]
-            let service_type = if crate::mariadb_query::is_mariadb_compatible_image(&image) {
-                ServiceType::Mariadb
-            } else if image.contains("postgres")
-                || image.contains("timescaledb")
-                || image.contains("pgvector")
-            {
-                ServiceType::Postgres
-            } else if image.contains("redis") {
-                ServiceType::Redis
-            } else if image.contains("mongo") {
-                ServiceType::Mongodb
-            } else if image.contains("rustfs") {
-                ServiceType::Rustfs
-            } else if image.contains("minio") {
-                // Existing MinIO containers are detected as deprecated Minio type
-                ServiceType::Minio
-            } else {
-                continue; // Skip unknown service types
-            };
+            let service_type =
+                if temps_providers_mariadb::query::is_mariadb_compatible_image(&image) {
+                    ServiceType::Mariadb
+                } else if image.contains("postgres")
+                    || image.contains("timescaledb")
+                    || image.contains("pgvector")
+                {
+                    ServiceType::Postgres
+                } else if image.contains("redis") {
+                    ServiceType::Redis
+                } else if image.contains("mongo") {
+                    ServiceType::Mongodb
+                } else if image.contains("rustfs") {
+                    ServiceType::Rustfs
+                } else if image.contains("minio") {
+                    // Existing MinIO containers are detected as deprecated Minio type
+                    ServiceType::Minio
+                } else {
+                    continue; // Skip unknown service types
+                };
 
             // Extract version from image tag
             let version = if let Some(tag_pos) = image.rfind(':') {
@@ -128,7 +133,7 @@ impl ExternalServiceManager {
     pub async fn import_service(
         &self,
         request: ImportExternalServiceRequest,
-    ) -> Result<ExternalServiceInfo> {
+    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         self.import_service_with_creator(request, None).await
     }
 
@@ -138,7 +143,7 @@ impl ExternalServiceManager {
         &self,
         request: ImportExternalServiceRequest,
         user_id: i32,
-    ) -> Result<ExternalServiceInfo> {
+    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         self.import_service_with_creator(request, Some(user_id))
             .await
     }
@@ -147,25 +152,22 @@ impl ExternalServiceManager {
         &self,
         request: ImportExternalServiceRequest,
         created_by_user_id: Option<i32>,
-    ) -> Result<ExternalServiceInfo> {
+    ) -> Result<ExternalServiceInfo, ExternalServiceError> {
         let name_transaction = self.db.begin().await?;
         reserve_service_name(&name_transaction, &request.name, None).await?;
         // Get the service-specific implementation based on Docker inspection
-        let docker = self
-            .require_docker()
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
+        let docker = self.require_docker()?;
         let container = docker
             .inspect_container(
                 &request.container_id,
                 None::<bollard::query_parameters::InspectContainerOptions>,
             )
             .await
-            .map_err(|e| {
-                anyhow::anyhow!(
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
                     "Failed to inspect container '{}': {}",
-                    request.container_id,
-                    e
-                )
+                    request.container_id, e
+                ),
             })?;
 
         let container_name = container
@@ -189,10 +191,12 @@ impl ExternalServiceManager {
             .await?;
 
         let _image = container.config.and_then(|c| c.image).ok_or_else(|| {
-            anyhow::anyhow!(
-                "Could not determine image for container '{}'",
-                request.container_id
-            )
+            ExternalServiceError::InternalError {
+                reason: format!(
+                    "Could not determine image for container '{}'",
+                    request.container_id
+                ),
+            }
         })?;
 
         // Convert request parameters to credentials and additional_config for compatibility
@@ -348,14 +352,19 @@ impl ExternalServiceManager {
         };
 
         // Store in database
-        let config_json = serde_json::to_string(&service_config.parameters)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize config: {}", e))?;
+        let config_json = serde_json::to_string(&service_config.parameters).map_err(|e| {
+            ExternalServiceError::InternalError {
+                reason: format!("Failed to serialize config: {}", e),
+            }
+        })?;
 
         // Encrypt the config
         let encrypted_config = self
             .encryption_service
             .encrypt(config_json.as_bytes())
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt service configuration: {}", e))?;
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!("Failed to encrypt service configuration: {}", e),
+            })?;
 
         // Plaintext real container name so the log collector can map the
         // imported (label-less) container back to this service without
@@ -379,7 +388,9 @@ impl ExternalServiceManager {
         }
         .insert(&name_transaction)
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to save service to database: {}", e))?;
+        .map_err(|e| ExternalServiceError::DatabaseError {
+            reason: format!("Failed to save service to database: {}", e),
+        })?;
 
         name_transaction.commit().await?;
 

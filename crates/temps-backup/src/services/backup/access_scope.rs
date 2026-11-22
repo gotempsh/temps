@@ -522,6 +522,34 @@ impl BackupService {
             })
     }
 
+    /// A backup by either of its ids: `backups.id`, the number a run
+    /// returns (`backup_id` of `POST /backups/external-services/{id}/run`,
+    /// `id` of the other runs) and `/backups/{id}/cancel` and `/children`
+    /// take, or `backups.backup_id`, its UUID. A UUID is never all digits,
+    /// so a reference names at most one backup.
+    pub async fn backup_with_access_scope_by_reference(
+        &self,
+        reference: &str,
+    ) -> Result<BackupWithAccessScope, BackupError> {
+        match backup_row_id(reference) {
+            Some(id) => {
+                self.backup_with_access_scope_by_id(id)
+                    .await
+                    .map_err(|error| match error {
+                        BackupError::NotFound { resource, .. } => BackupError::NotFound {
+                            resource,
+                            detail: format!(
+                                "Backup {reference} not found: no backup has that id \
+                             (a number is read as the backup's id, not its UUID)"
+                            ),
+                        },
+                        other => other,
+                    })
+            }
+            None => self.backup_with_access_scope_by_uuid(reference).await,
+        }
+    }
+
     pub async fn backup_with_access_scope_by_uuid(
         &self,
         backup_uuid: &str,
@@ -597,6 +625,15 @@ impl BackupService {
             })
             .collect())
     }
+}
+
+/// The `backups.id` a reference names, when it is one: ASCII digits only
+/// (no sign, no spaces), within `i32`.
+fn backup_row_id(reference: &str) -> Option<i32> {
+    if reference.is_empty() || !reference.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    reference.parse().ok()
 }
 
 #[cfg(test)]
@@ -826,6 +863,118 @@ mod tests {
         // Assert.
         assert!(matches!(error, BackupError::Database(_)));
         assert!(error.to_string().contains("scope lookup failed"));
+    }
+
+    /// The reported 404: an external service's run returns the backup's
+    /// numeric id (`backup_id`), and `GET /backups/{id}` looked that up as
+    /// a UUID. Both forms now name the backup.
+    #[tokio::test]
+    async fn test_backup_by_reference_resolves_the_run_id_and_the_uuid() {
+        // Arrange: the run's numeric id, then the same backup by its UUID.
+        let backup = make_test_backup_model(812);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![backup.clone()]])
+                .append_query_results(vec![vec![make_external_service_backup(5, 812, 101)]])
+                .append_query_results(vec![vec![backup.clone()]])
+                .append_query_results(vec![vec![make_external_service_backup(5, 812, 101)]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db.clone());
+
+        // Act.
+        let by_id = service
+            .backup_with_access_scope_by_reference("812")
+            .await
+            .expect("the run's numeric id resolves");
+        let by_uuid = service
+            .backup_with_access_scope_by_reference(&backup.backup_id)
+            .await
+            .expect("the UUID resolves");
+
+        // Assert: the same backup, scoped to the service that produced it.
+        for scoped in [&by_id, &by_uuid] {
+            assert_eq!(scoped.backup.id, 812);
+            assert_eq!(
+                scoped.access_scope,
+                BackupAccessScope::Services {
+                    backup_id: 812,
+                    service_ids: vec![101],
+                }
+            );
+        }
+        drop(service);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db)
+                .expect("service dropped, leaving one database reference")
+                .into_transaction_log()
+        )
+        // Debug escapes the SQL's quotes.
+        .replace('\\', "");
+        assert!(
+            log.contains("\"backups\".\"id\" IN ($1)"),
+            "a number is looked up as backups.id: {log}"
+        );
+        assert!(
+            log.contains("\"backups\".\"backup_id\" ="),
+            "a UUID is looked up as backups.backup_id: {log}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_by_reference_missing_id_names_what_was_looked_up() {
+        // Arrange: no backup with that id.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<temps_entities::backups::Model>::new()])
+                .append_query_results(vec![Vec::<temps_entities::backups::Model>::new()])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        // Act.
+        let by_id = service.backup_with_access_scope_by_reference("4040").await;
+        let by_uuid = service
+            .backup_with_access_scope_by_reference("0b9a1c2e-0000-4000-8000-000000000000")
+            .await;
+
+        // Assert: typed 404s carrying the reference.
+        match by_id {
+            Err(BackupError::NotFound { resource, detail }) => {
+                assert_eq!(resource, "Backup");
+                assert!(detail.contains("4040"), "{detail}");
+                assert!(detail.contains("id"), "{detail}");
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+        match by_uuid {
+            Err(BackupError::NotFound { detail, .. }) => {
+                assert!(
+                    detail.contains("0b9a1c2e-0000-4000-8000-000000000000"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_backup_row_id_reads_only_plain_numbers() {
+        assert_eq!(backup_row_id("812"), Some(812));
+        assert_eq!(backup_row_id("0"), Some(0));
+        for not_an_id in [
+            "",
+            " 812",
+            "+812",
+            "-1",
+            "8_12",
+            "99999999999",
+            "0b9a1c2e-0000-4000-8000-000000000000",
+            "uuid-812",
+        ] {
+            assert_eq!(backup_row_id(not_an_id), None, "{not_an_id:?}");
+        }
     }
 
     #[tokio::test]

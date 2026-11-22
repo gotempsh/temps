@@ -192,6 +192,7 @@ impl ComposeExecutor {
         // override silently clobber each other depending on write order.
         if is_reserved_generated_compose_file(Path::new(compose_file)) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<compose-files>".to_string(),
                 field: "compose_path".to_string(),
                 reason: format!(
@@ -274,6 +275,7 @@ impl ComposeExecutor {
             // is worse to debug than an explicit "rename this file" error.
             if is_reserved_generated_compose_file(Path::new(&plan.path)) {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<compose-files>".to_string(),
                     field: "env_file".to_string(),
                     reason: format!(

@@ -188,8 +188,10 @@ pub struct NetworkAttachment {
 }
 
 /// Answers the resolvers a new instance should use, read at each create:
-/// the node's cluster DNS resolver (ADR-024) and its public fallbacks, or
-/// `None` while that resolver is not up (the runtime's default then).
+/// the node's cluster DNS resolver (ADR-024) alone, since it forwards outside
+/// names itself and another nameserver would bypass internal policy
+/// (ADR-096), or `None` while that resolver is not up (the runtime's default
+/// then).
 #[derive(Clone)]
 pub struct ResolverSource(std::sync::Arc<dyn Fn() -> Option<Vec<String>> + Send + Sync>);
 

@@ -4,7 +4,6 @@
 import {
   externalServiceBackupPreflightOptions,
   externalServiceBackupPreflightQueryKey,
-  listS3SourcesOptions,
   runExternalServiceBackupMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -36,6 +35,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { backupDestinationsOptions } from './backup-destinations-query'
 import { announceOperation } from '@/components/operations/operations-tray-store'
 import { AlertTriangle, HardDrive, Loader2, Star } from 'lucide-react'
 import { useEffect } from 'react'
@@ -43,6 +43,7 @@ import { useForm, useWatch } from 'react-hook-form'
 import {
   DestinationsLoadError,
   DestinationsRefreshWarning,
+  DestinationsRestricted,
   DestinationsSkeleton,
   NoDestinationsConfigured,
 } from './TriggerBackupDestinationStatus'
@@ -52,6 +53,7 @@ import {
   confirmRestartParam,
   deriveDestinationState,
   deriveRestartGate,
+  destinationToSubmit,
   restartGateAllowsSubmit,
   type RestartGate,
   knownDestinations,
@@ -82,7 +84,7 @@ export function TriggerBackupDialog({
   onSuccess,
 }: TriggerBackupDialogProps) {
   const destinationsQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     enabled: open,
     retry: shouldRetryDestinationRead,
   })
@@ -133,8 +135,10 @@ export function TriggerBackupDialog({
     ? selectionStatus(s3Sources, selectedSourceId)
     : 'none'
   const canSubmit =
-    canSubmitBackup(destinationState, selectedSourceId) &&
-    restartGateAllowsSubmit(restartGate, restartConfirmed)
+    canSubmitBackup(
+      destinationState,
+      destinationToSubmit(destinationState, selectedSourceId)
+    ) && restartGateAllowsSubmit(restartGate, restartConfirmed)
 
   // The user's explicitly-flagged default S3 source, if any. Used in
   // the FormDescription render below ("Defaults to ⭐ Cloudflare …") and
@@ -185,12 +189,12 @@ export function TriggerBackupDialog({
   })
 
   const onSubmit = (values: FormValues) => {
-    const sourceId = values.s3_source_id
-    // Never submit while destination availability is unknown, or to a
-    // destination the loaded list no longer contains. The submit button is
+    // A refused list names no destination, so none is sent and the server uses
+    // the default. Otherwise never submit while availability is unknown, or to
+    // a destination the loaded list no longer contains. The submit button is
     // already disabled in those states; this guards Enter-key submission.
-    if (sourceId === undefined || !canSubmitBackup(destinationState, sourceId))
-      return
+    const sourceId = destinationToSubmit(destinationState, values.s3_source_id)
+    if (!canSubmitBackup(destinationState, sourceId)) return
     const confirmed = values.confirm_restart === true
     if (!restartGateAllowsSubmit(restartGate, confirmed)) return
     runBackupMutation.mutate({
@@ -256,9 +260,12 @@ export function TriggerBackupDialog({
             ) : null}
           </DialogFooter>
         ) : null}
-        {s3Sources ? (
+        {s3Sources || destinationState.kind === 'restricted' ? (
           <Form {...form}>
             <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-4">
+              {destinationState.kind === 'restricted' ? (
+                <DestinationsRestricted />
+              ) : null}
               {destinationState.kind === 'stale' ? (
                 <DestinationsRefreshWarning
                   failure={destinationState.failure}
@@ -266,24 +273,26 @@ export function TriggerBackupDialog({
                   isRetrying={destinationsQuery.isFetching}
                 />
               ) : null}
-              <FormField
-                control={form.control}
-                name="s3_source_id"
-                render={({ field }) => {
-                  const selectedSource = s3Sources?.find(
-                    (s) => s.id === field.value
-                  )
-                  const selectedIsDefault = selectedSource?.is_default === true
-                  return (
-                    <FormItem>
-                      <FormLabel>Storage destination</FormLabel>
-                      <Select
-                        onValueChange={(v) => field.onChange(Number(v))}
-                        value={field.value?.toString()}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            {/* Explicit children override Radix's default
+              {s3Sources ? (
+                <FormField
+                  control={form.control}
+                  name="s3_source_id"
+                  render={({ field }) => {
+                    const selectedSource = s3Sources?.find(
+                      (s) => s.id === field.value
+                    )
+                    const selectedIsDefault =
+                      selectedSource?.is_default === true
+                    return (
+                      <FormItem>
+                        <FormLabel>Storage destination</FormLabel>
+                        <Select
+                          onValueChange={(v) => field.onChange(Number(v))}
+                          value={field.value?.toString()}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              {/* Explicit children override Radix's default
                               behavior of mirroring the selected SelectItem's
                               full two-line (name + bucket-path) content into
                               the trigger, which has no width/height budget
@@ -291,82 +300,83 @@ export function TriggerBackupDialog({
                               single-line summary here instead; the bucket
                               path is still visible in the open dropdown and
                               in the FormDescription below. */}
-                            <SelectValue placeholder="Select an S3 source">
-                              {selectedSource && (
-                                <span className="flex min-w-0 items-center gap-1.5">
-                                  <span className="truncate">
-                                    {selectedSource.name}
-                                  </span>
-                                  {selectedIsDefault ? (
-                                    <span
-                                      title="Default source"
-                                      className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
-                                    >
-                                      <Star className="h-3 w-3 fill-current" />
-                                      Default
+                              <SelectValue placeholder="Select an S3 source">
+                                {selectedSource && (
+                                  <span className="flex min-w-0 items-center gap-1.5">
+                                    <span className="truncate">
+                                      {selectedSource.name}
                                     </span>
-                                  ) : null}
-                                </span>
-                              )}
-                            </SelectValue>
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {s3Sources?.map((source) => {
-                            const isDefault = source.is_default === true
-                            return (
-                              // pl-2 overrides the shadcn SelectItem default of
-                              // pl-8 (which reserves a check-mark gutter we
-                              // don't render here). Without this override the
-                              // menu rows look indented relative to the trigger
-                              // when an option is selected. The hidden check
-                              // <span> inside SelectItem still positions
-                              // absolutely at left-2; we accept the slight
-                              // visual overlap because we never render it.
-                              <SelectItem
-                                key={source.id}
-                                value={source.id.toString()}
-                                className="pl-2"
-                              >
-                                <div className="flex flex-col items-start text-left">
-                                  <span className="flex items-center gap-1.5">
-                                    {source.name}
-                                    {isDefault ? (
+                                    {selectedIsDefault ? (
                                       <span
                                         title="Default source"
-                                        className="inline-flex items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
+                                        className="inline-flex shrink-0 items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
                                       >
                                         <Star className="h-3 w-3 fill-current" />
                                         Default
                                       </span>
                                     ) : null}
                                   </span>
-                                  <span className="text-xs text-muted-foreground">
-                                    {source.bucket_name}
-                                    {source.bucket_path &&
-                                      `/${source.bucket_path}`}
-                                  </span>
-                                </div>
-                              </SelectItem>
-                            )
-                          })}
-                        </SelectContent>
-                      </Select>
-                      {selection === 'missing' ? (
-                        <p className="text-sm font-medium text-destructive">
-                          {SELECTED_DESTINATION_MISSING_MESSAGE}
-                        </p>
-                      ) : null}
-                      <FormDescription>
-                        {defaultSource
-                          ? `Defaults to ⭐ ${defaultSource.name}. Pick a different source to override.`
-                          : 'The S3-compatible storage where the backup will be saved.'}
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )
-                }}
-              />
+                                )}
+                              </SelectValue>
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {s3Sources?.map((source) => {
+                              const isDefault = source.is_default === true
+                              return (
+                                // pl-2 overrides the shadcn SelectItem default of
+                                // pl-8 (which reserves a check-mark gutter we
+                                // don't render here). Without this override the
+                                // menu rows look indented relative to the trigger
+                                // when an option is selected. The hidden check
+                                // <span> inside SelectItem still positions
+                                // absolutely at left-2; we accept the slight
+                                // visual overlap because we never render it.
+                                <SelectItem
+                                  key={source.id}
+                                  value={source.id.toString()}
+                                  className="pl-2"
+                                >
+                                  <div className="flex flex-col items-start text-left">
+                                    <span className="flex items-center gap-1.5">
+                                      {source.name}
+                                      {isDefault ? (
+                                        <span
+                                          title="Default source"
+                                          className="inline-flex items-center gap-0.5 text-xs text-amber-700 dark:text-amber-400"
+                                        >
+                                          <Star className="h-3 w-3 fill-current" />
+                                          Default
+                                        </span>
+                                      ) : null}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground">
+                                      {source.bucket_name}
+                                      {source.bucket_path &&
+                                        `/${source.bucket_path}`}
+                                    </span>
+                                  </div>
+                                </SelectItem>
+                              )
+                            })}
+                          </SelectContent>
+                        </Select>
+                        {selection === 'missing' ? (
+                          <p className="text-sm font-medium text-destructive">
+                            {SELECTED_DESTINATION_MISSING_MESSAGE}
+                          </p>
+                        ) : null}
+                        <FormDescription>
+                          {defaultSource
+                            ? `Defaults to ⭐ ${defaultSource.name}. Pick a different source to override.`
+                            : 'The S3-compatible storage where the backup will be saved.'}
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }}
+                />
+              ) : null}
 
               <FormField
                 control={form.control}

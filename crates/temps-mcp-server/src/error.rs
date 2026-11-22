@@ -10,17 +10,19 @@ use thiserror::Error;
 /// to produce a meaningful JSON-RPC error or HTTP Problem Details response.
 #[derive(Debug, Error)]
 pub enum McpError {
+    #[error("Virtual CLI is not initialised")]
+    CliUnavailable,
+    #[error("Virtual CLI request failed: {}", temps_ai_api_tools::redaction::redact_text(&source.to_string()))]
+    Cli {
+        #[from]
+        source: temps_ai_api_tools::ApiToolError,
+    },
+    #[error("Proposal belongs to a different API key or user")]
+    ProposalOwnerMismatch,
+
     /// Feature flag is off — the operator has not enabled MCP in Settings.
     #[error("MCP server is disabled; enable it in Settings → Platform → MCP Server")]
     FeatureDisabled,
-
-    /// The requested project does not exist on this instance.
-    #[error("Project {project_id} not found")]
-    ProjectNotFound { project_id: i32 },
-
-    /// The requested deployment does not exist in the given project.
-    #[error("Deployment not found in project {project_id}")]
-    DeploymentNotFound { project_id: i32 },
 
     /// The proposal token was not found or was already consumed.
     #[error("Proposal token not found or already used")]
@@ -36,28 +38,12 @@ pub enum McpError {
     )]
     WriteNotEnabled,
 
-    /// The caller holds a token but lacks a required permission for the
-    /// operation.  Distinct from `WriteNotEnabled` (which is an opt-in
-    /// gate), this indicates the token's role does not carry the capability.
-    #[error("This operation requires the {permission} permission")]
-    InsufficientPermission { permission: String },
-
-    /// The caller's token is valid but they are not allowed to access the
-    /// given project (per the registered `ProjectAccessChecker`).
-    #[error("Access to project {project_id} is denied for this token")]
-    ProjectAccessDenied { project_id: i32 },
-
-    /// The caller may access the project, but their role on it (e.g. a team
-    /// viewer) does not include the permission the operation needs.
-    #[error("Your role on project {project_id} does not include the {permission} permission")]
-    ProjectPermissionDenied { project_id: i32, permission: String },
-
     /// The `jsonrpc` field in the request was not the required value `"2.0"`.
     #[error("Invalid JSON-RPC version '{received}'; this server requires jsonrpc == \"2.0\"")]
     InvalidJsonRpcVersion { received: String },
 
     /// The tool name supplied in tools/call does not exist.
-    #[error("Unknown tool '{name}'")]
+    #[error("Unknown tool '{name}'; use temps with command 'temps --help'")]
     UnknownTool { name: String },
 
     /// A required argument was absent from the tool arguments object.
@@ -67,35 +53,6 @@ pub enum McpError {
     /// An argument was present but had an invalid value.
     #[error("Invalid argument '{arg}': {reason}")]
     InvalidArgument { arg: String, reason: String },
-
-    /// The upstream ProjectService returned an error.
-    #[error("Project service error: {0}")]
-    ProjectService(String),
-
-    /// The upstream DeploymentService returned an error.
-    #[error("Deployment service error: {0}")]
-    DeploymentService(String),
-
-    /// The edge rule does not exist in the project.
-    #[error("Edge rule {rule_id} not found in project {project_id}")]
-    EdgeRuleNotFound { project_id: i32, rule_id: i32 },
-
-    /// The edge rule change was refused: invalid rule, stale revision, the
-    /// 100-rule limit, an unknown environment or an incomplete order.
-    #[error("Edge rule change refused: {reason}")]
-    EdgeRuleRejected { reason: String },
-
-    /// The edge rule service could not read or store a project's rules.
-    #[error("Edge rule service failed: {source}")]
-    EdgeRuleService {
-        #[source]
-        source: temps_proxy::service::edge_rule_service::EdgeRuleServiceError,
-    },
-
-    /// The edge rule service is not registered on this server, so the edge
-    /// rule tools cannot run.
-    #[error("Edge rules are not initialised on this server")]
-    EdgeRulesUnavailable,
 
     /// The ConfigService failed to load settings.
     #[error("Config error: {0}")]
@@ -110,25 +67,29 @@ impl McpError {
     /// MCP JSON-RPC error code appropriate for this variant.
     pub fn rpc_code(&self) -> i32 {
         match self {
+            Self::CliUnavailable => crate::protocol::INTERNAL_ERROR,
+            Self::Cli {
+                source: temps_ai_api_tools::ApiToolError::Upstream { status: 403, .. },
+            } => -32006,
+            Self::Cli {
+                source:
+                    temps_ai_api_tools::ApiToolError::Upstream {
+                        status: 500..=599, ..
+                    }
+                    | temps_ai_api_tools::ApiToolError::RouterError { .. }
+                    | temps_ai_api_tools::ApiToolError::BodyReadError { .. },
+            } => crate::protocol::INTERNAL_ERROR,
+            Self::Cli { .. } => crate::protocol::INVALID_PARAMS,
+            Self::ProposalOwnerMismatch => -32005,
             Self::FeatureDisabled => -32001,
-            Self::ProjectNotFound { .. }
-            | Self::DeploymentNotFound { .. }
-            | Self::EdgeRuleNotFound { .. } => -32002,
             Self::ProposalNotFound | Self::ProposalExpired => -32003,
             Self::WriteNotEnabled => -32004,
-            Self::ProjectAccessDenied { .. } | Self::ProjectPermissionDenied { .. } => -32005,
-            Self::InsufficientPermission { .. } => -32006,
             Self::InvalidJsonRpcVersion { .. } => crate::protocol::INVALID_REQUEST,
             Self::UnknownTool { .. } => crate::protocol::METHOD_NOT_FOUND,
-            Self::MissingArgument { .. }
-            | Self::InvalidArgument { .. }
-            | Self::EdgeRuleRejected { .. } => crate::protocol::INVALID_PARAMS,
-            Self::ProjectService(_)
-            | Self::DeploymentService(_)
-            | Self::EdgeRuleService { .. }
-            | Self::EdgeRulesUnavailable
-            | Self::Config(_)
-            | Self::Serialization(_) => crate::protocol::INTERNAL_ERROR,
+            Self::MissingArgument { .. } | Self::InvalidArgument { .. } => {
+                crate::protocol::INVALID_PARAMS
+            }
+            Self::Config(_) | Self::Serialization(_) => crate::protocol::INTERNAL_ERROR,
         }
     }
 }
@@ -136,14 +97,17 @@ impl McpError {
 impl From<McpError> for Problem {
     fn from(error: McpError) -> Self {
         match error {
+            McpError::CliUnavailable => problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("CLI Unavailable")
+                .with_detail(error.to_string()),
+            McpError::Cli { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("CLI Request Failed")
+                .with_detail(error.to_string()),
+            McpError::ProposalOwnerMismatch => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Proposal Owner Mismatch")
+                .with_detail(error.to_string()),
             McpError::FeatureDisabled => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("MCP Server Disabled")
-                .with_detail(error.to_string()),
-
-            McpError::ProjectNotFound { .. }
-            | McpError::DeploymentNotFound { .. }
-            | McpError::EdgeRuleNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Resource Not Found")
                 .with_detail(error.to_string()),
 
             McpError::ProposalNotFound | McpError::ProposalExpired => {
@@ -154,18 +118,6 @@ impl From<McpError> for Problem {
 
             McpError::WriteNotEnabled => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Write Mode Disabled")
-                .with_detail(error.to_string()),
-
-            McpError::InsufficientPermission { .. } => problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Insufficient Permission")
-                .with_detail(error.to_string()),
-
-            McpError::ProjectAccessDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Project Access Denied")
-                .with_detail(error.to_string()),
-
-            McpError::ProjectPermissionDenied { .. } => problemdetails::new(StatusCode::FORBIDDEN)
-                .with_title("Project Permission Denied")
                 .with_detail(error.to_string()),
 
             McpError::InvalidJsonRpcVersion { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
@@ -182,18 +134,57 @@ impl From<McpError> for Problem {
                     .with_detail(error.to_string())
             }
 
-            McpError::EdgeRuleRejected { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Edge Rule Change Refused")
-                .with_detail(error.to_string()),
-
-            McpError::ProjectService(_)
-            | McpError::DeploymentService(_)
-            | McpError::EdgeRuleService { .. }
-            | McpError::EdgeRulesUnavailable
-            | McpError::Config(_)
-            | McpError::Serialization(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail(error.to_string()),
+            McpError::Config(_) | McpError::Serialization(_) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(error.to_string())
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use temps_ai_api_tools::ApiToolError;
+
+    #[test]
+    fn cli_failures_keep_server_permission_and_argument_classes_distinct() {
+        for (status, expected) in [
+            (400, -32602),
+            (403, -32006),
+            (422, -32602),
+            (500, -32603),
+            (503, -32603),
+        ] {
+            let error = McpError::from(ApiToolError::Upstream {
+                status,
+                detail: "fixture failure".into(),
+                operation_id: "get_projects".into(),
+            });
+            assert_eq!(error.rpc_code(), expected, "HTTP {status}");
+        }
+        for source in [
+            ApiToolError::RouterError {
+                operation_id: "get_projects".into(),
+                reason: "unavailable".into(),
+            },
+            ApiToolError::BodyReadError {
+                operation_id: "get_projects".into(),
+                reason: "incomplete body".into(),
+            },
+        ] {
+            assert_eq!(
+                McpError::from(source).rpc_code(),
+                crate::protocol::INTERNAL_ERROR
+            );
+        }
+        assert_eq!(
+            McpError::from(ApiToolError::InvalidCommand {
+                detail: "use --help".into()
+            })
+            .rpc_code(),
+            crate::protocol::INVALID_PARAMS
+        );
     }
 }

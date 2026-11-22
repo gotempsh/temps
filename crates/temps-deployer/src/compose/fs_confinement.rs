@@ -250,6 +250,23 @@ impl ComposeExecutor {
         Ok(())
     }
 
+    fn filesystem_check(field: &str, raw_path: &str) -> Option<PolicyCheck> {
+        match field {
+            "configs.file" => Some(PolicyCheck::ConfigPaths),
+            "secrets.file" => Some(PolicyCheck::SecretPaths),
+            "volumes.driver_opts.device" => Some(PolicyCheck::VolumeHostPaths),
+            "volumes" => Some(if Self::socket_source(raw_path) {
+                PolicyCheck::DockerSocket
+            } else {
+                PolicyCheck::BindMounts
+            }),
+            "build.context" => Some(PolicyCheck::BuildContext),
+            "build.dockerfile" => Some(PolicyCheck::Dockerfile),
+            "env_file" => Some(PolicyCheck::EnvFiles),
+            _ => None,
+        }
+    }
+
     fn canonicalize_confined_existing_path(
         canonical_root: &Path,
         base_dir: &Path,
@@ -259,6 +276,7 @@ impl ComposeExecutor {
     ) -> Result<PathBuf, ComposeError> {
         if Self::is_dangerous_host_path(raw_path) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Self::filesystem_check(field, raw_path),
                 service: service.to_string(),
                 field: field.to_string(),
                 reason: format!(
@@ -270,6 +288,7 @@ impl ComposeExecutor {
         let candidate = base_dir.join(raw_path);
         let canonical = std::fs::canonicalize(&candidate).map_err(|e| {
             ComposeError::SecurityPolicyViolation {
+                check: Self::filesystem_check(field, raw_path),
                 service: service.to_string(),
                 field: field.to_string(),
                 reason: format!(
@@ -279,6 +298,7 @@ impl ComposeExecutor {
         })?;
         if !canonical.starts_with(canonical_root) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Self::filesystem_check(field, raw_path),
                 service: service.to_string(),
                 field: field.to_string(),
                 reason: format!(
@@ -306,6 +326,7 @@ impl ComposeExecutor {
     ) -> Result<PathBuf, ComposeError> {
         if Self::is_dangerous_host_path(raw_path) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: Self::filesystem_check(field, raw_path),
                 service: service.to_string(),
                 field: field.to_string(),
                 reason: format!(
@@ -322,6 +343,7 @@ impl ComposeExecutor {
                 Component::Normal(name) => cursor.push(name),
                 Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Self::filesystem_check(field, raw_path),
                         service: service.to_string(),
                         field: field.to_string(),
                         reason: format!(
@@ -335,6 +357,7 @@ impl ComposeExecutor {
                 Ok(_) => {
                     cursor = std::fs::canonicalize(&cursor).map_err(|error| {
                         ComposeError::SecurityPolicyViolation {
+                            check: Self::filesystem_check(field, raw_path),
                             service: service.to_string(),
                             field: field.to_string(),
                             reason: format!(
@@ -344,6 +367,7 @@ impl ComposeExecutor {
                     })?;
                     if !cursor.starts_with(canonical_root) {
                         return Err(ComposeError::SecurityPolicyViolation {
+                            check: Self::filesystem_check(field, raw_path),
                             service: service.to_string(),
                             field: field.to_string(),
                             reason: format!(
@@ -359,6 +383,7 @@ impl ComposeExecutor {
                 }
                 Err(error) => {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: Self::filesystem_check(field, raw_path),
                         service: service.to_string(),
                         field: field.to_string(),
                         reason: format!(
@@ -523,6 +548,7 @@ impl ComposeExecutor {
             match std::fs::symlink_metadata(&canonical_parent) {
                 Ok(metadata) if metadata.file_type().is_symlink() => {
                     return Err(ComposeError::SecurityPolicyViolation {
+                        check: None,
                         service: "<compose-files>".to_string(),
                         field: field.to_string(),
                         reason: format!(
@@ -563,6 +589,7 @@ impl ComposeExecutor {
         })?;
         if !canonical_parent.starts_with(&canonical_root) {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: "<compose-files>".to_string(),
                 field: field.to_string(),
                 reason: "compose write destination resolves outside the project directory"
@@ -582,6 +609,7 @@ impl ComposeExecutor {
         match std::fs::symlink_metadata(&destination) {
             Ok(metadata) if metadata.file_type().is_symlink() => {
                 return Err(ComposeError::SecurityPolicyViolation {
+                    check: None,
                     service: "<compose-files>".to_string(),
                     field: field.to_string(),
                     reason: format!(

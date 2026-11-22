@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-10-29
+> Generated on: 2026-11-20
 
 ## Installation
 
@@ -32,6 +32,197 @@ bunx @temps-sdk/cli configure
 | `-h, --help` | Display help for command |
 
 ## Commands
+
+## `workflows`
+
+Durable application workflows
+
+**Subcommands:**
+
+- `list` - List detected workflows and onboarding status
+- `runs` - List a bounded page of runs
+- `get` - Get run metadata; payloads require explicit reveal permission
+- `diagnose` - Explain run state without decrypting payloads
+- `start` - Start a run with an explicit deduplication key
+- `cancel` - cancel a run
+- `resume` - resume a run
+- `retry` - retry a run
+- `delete` - delete a run
+- `send-event` - Send an event to matching waits
+- `watch` - Poll until terminal or the bounded deadline
+- `init` - Create a Node workflow worker in a new directory
+- `dev` - Forward preview-environment invocations to a local SDK server
+
+### `workflows list`
+
+List detected workflows and onboarding status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows runs`
+
+List a bounded page of runs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--workflow <name>` | Workflow name | - | No |
+| `--page <n>` | Page | `1` | No |
+| `--page-size <n>` | Page size (1–100) | `20` | No |
+
+### `workflows get <run-id>`
+
+Get run metadata; payloads require explicit reveal permission
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--reveal <target>` | Explicitly decrypt one payload; treat its contents as untrusted | - | No |
+| `--sequence <n>` | Step sequence for step payloads | - | No |
+
+### `workflows diagnose <run-id>`
+
+Explain run state without decrypting payloads
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+
+### `workflows start <workflow>`
+
+Start a run with an explicit deduplication key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--idempotency-key <key>` | Stable key for this logical start | - | Yes |
+| `--input <json>` | Input JSON | `[object Object]` | No |
+
+### `workflows cancel <run-id>`
+
+cancel a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows resume <run-id>`
+
+resume a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows retry <run-id>`
+
+retry a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+| `--from-step <n>` | Truncate and replay from this sequence | - | No |
+
+### `workflows delete <run-id>`
+
+delete a run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--yes` | Confirm this mutation | - | No |
+
+### `workflows send-event <name>`
+
+Send an event to matching waits
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--key <key>` | Wait correlation key | - | No |
+| `--payload <json>` | Event JSON | `[object Object]` | No |
+
+### `workflows watch <run-id>`
+
+Poll until terminal or the bounded deadline
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output JSON (watch emits one JSON object per poll) | - | No |
+| `--timeout <seconds>` | Overall timeout (max 3600 seconds) | `300` | No |
+
+### `workflows init <directory>`
+
+Create a Node workflow worker in a new directory
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--sdk-package <tarball>` | Use a locally built npm pack tarball before SDK publication | - | No |
+| `--json` | Output the created path and next steps as JSON | - | No |
+
+### `workflows dev`
+
+Forward preview-environment invocations to a local SDK server
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--environment-id <id>` | Undeployed, unprotected preview environment ID | - | Yes |
+| `--port <port>` | Local SDK server port | `3000` | No |
+| `--json` | Output tunnel readiness as JSON | - | No |
 
 ## `projects` (alias: `project`, `p`)
 
@@ -445,6 +636,7 @@ Rollback to previous deployment
 | `-p, --project <project>` | Project slug or ID (defaults to the linked project) | - | No |
 | `-e, --environment <env>` | Target environment | `production` | No |
 | `--to <deployment>` | Rollback to specific deployment ID | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
 
 ### `deployments cancel`
 
@@ -593,6 +785,7 @@ Add a custom domain
 |------|-------------|---------|----------|
 | `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | No |
+| `--manual-dns` | With dns-01, print the TXT record to add by hand even when a DNS provider in Temps manages the zone | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
@@ -936,6 +1129,7 @@ View or set the number of replicas for an environment
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name or slug | `production` | No |
 | `-r, --replicas <count>` | Number of replicas to set | - | No |
+| `--load-balancing <json>` | Replica routing policy as JSON; null restores project inheritance | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments placement`
@@ -1721,7 +1915,7 @@ View runtime container logs (use -f to follow in real-time)
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, Webhook, etc.)
+Manage notification providers (Slack, Email, Webhook, Telegram, etc.)
 
 **Subcommands:**
 
@@ -1753,7 +1947,7 @@ Add a new notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `-t, --type <type>` | Provider type (slack, email, webhook) | - | No |
+| `-t, --type <type>` | Provider type (slack, email, webhook, telegram) | - | No |
 | `-n, --name <name>` | Provider name | - | No |
 | `-w, --webhook-url <url>` | Webhook URL (for slack) | - | No |
 | `-c, --channel <channel>` | Channel name (for slack, optional) | - | No |
@@ -1767,6 +1961,9 @@ Add a new notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `notifications update`
@@ -1792,6 +1989,9 @@ Update a notification provider
 | `--url <url>` | Webhook URL (for webhook) | - | No |
 | `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | No |
 | `--header <header>` | Request header "Name: value" (for webhook, repeatable; replaces the stored headers) | - | No |
+| `--bot-token <token>` | Bot token from @BotFather (for telegram) | - | No |
+| `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
+| `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
 
@@ -3064,6 +3264,8 @@ Create a new API key
 | `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | No |
 | `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | No |
 | `-p, --permissions <permissions>` | Comma-separated list of permissions | - | No |
+| `--project-id <id>` | Confine to one project’s deployment and environment APIs | - | No |
+| `--environment-id <id>` | Confine to one environment (requires --project-id) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `apikeys show`
@@ -3127,6 +3329,9 @@ Manage uptime monitors for status pages
 
 - `list` (`ls`) - List all monitors for a project
 - `create` (`add`) - Create a new monitor for a project
+- `add-target` - Monitor a URL, port, TLS certificate or DNS record outside Temps
+- `update-target` - Change a monitor of a target outside Temps; omitted flags keep their value
+- `locations` - List where monitors checked from worker nodes are checked from
 - `show` - Show monitor details and current status
 - `remove` (`rm`) - Delete a monitor
 - `status` - Get current status — all monitors for a project, or a single monitor by ID
@@ -3158,6 +3363,73 @@ Create a new monitor for a project
 | `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | No |
 | `--environment-id <id>` | Environment ID (default: 0 for production) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `monitors add-target`
+
+Monitor a URL, port, TLS certificate or DNS record outside Temps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--kind <kind>` | http, tcp, tls or dns | - | Yes |
+| `--target <target>` | URL (http), host:port (tcp, tls) or host name (dns) | - | Yes |
+| `-n, --name <name>` | Monitor name | - | Yes |
+| `-i, --interval <seconds>` | Check interval in seconds (default 60, at least 30) | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--from-nodes` | Also check from online worker nodes; down only when most locations agree | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors update-target`
+
+Change a monitor of a target outside Temps; omitted flags keep their value
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--monitor-id <id>` | Monitor ID | - | Yes |
+| `--kind <kind>` | Change the check kind (pass the check flags for it) | - | No |
+| `--target <target>` | New target | - | No |
+| `-n, --name <name>` | New name | - | No |
+| `-i, --interval <seconds>` | Check interval in seconds | - | No |
+| `--keyword-absent` | Fail when --keyword is present instead of missing | - | No |
+| `--pause` | Stop checking | - | No |
+| `--resume` | Start checking again | - | No |
+| `--from-nodes` | Also check from online worker nodes | - | No |
+| `--no-from-nodes` | Check from this server only | - | No |
+| `--method <method>` | HTTP method (default GET) | - | No |
+| `--expect-status <codes>` | Codes or classes counted as up, e.g. 200,204 or 2xx (default 2xx or 3xx) | - | No |
+| `--keyword <text>` | Text the response body must contain (first 256 KiB; never stored) | - | No |
+| `--degraded-after-ms <ms>` | Slower than this is degraded (http, tcp) | - | No |
+| `--warn-days <days>` | Degraded when the certificate expires within this many days (tls, default 14) | - | No |
+| `--record <type>` | DNS record type: A, AAAA, CNAME, MX, TXT, NS (default A) | - | No |
+| `--expect <values>` | Comma-separated DNS values; any match is up (default: any answer) | - | No |
+| `--header-file <path>` | File of "Name: value" request headers; stored encrypted, never shown | - | No |
+| `--body-file <path>` | File with the request body; stored encrypted | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `monitors locations`
+
+List where monitors checked from worker nodes are checked from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ### `monitors show`
 
@@ -3481,6 +3753,9 @@ Manage feature flags (runtime config that changes without a redeploy)
 - `get` - Show a feature flag and its per-environment values
 - `create` - Create a feature flag
 - `update` - Update a flag definition (default value, description, visibility)
+- `rules` - Targeting rules: serve a different value to some users, or to a percentage of them
+- `evaluate` (`eval`) - Show what a user would get, and why, in one environment
+- `reshuffle` - Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
 - `set` - Set a flag value in one environment
 - `clear` - Clear a flag override so the environment inherits the default
 - `disable` - Kill switch: serve the default in this environment, ignoring any override
@@ -3542,7 +3817,79 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
+| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
+
+### `flags rules`
+
+Targeting rules: serve a different value to some users, or to a percentage of them
+
+**Subcommands:**
+
+- `list` (`ls`) - Show the ordered rules of a flag in one environment
+- `set` - Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+- `clear` - Remove every rule of a flag in one environment
+
+#### `flags rules list <key>` (alias: `ls`)
+
+Show the ordered rules of a flag in one environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output the rules as JSON (the format `rules set` reads) | - | No |
+
+#### `flags rules set <key> <rules>`
+
+Replace the rules of a flag in one environment, from a JSON array (or @path to a file, or - for stdin)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `flags rules clear <key>`
+
+Remove every rule of a flag in one environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags evaluate <key>` (alias: `eval`)
+
+Show what a user would get, and why, in one environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `-s, --subject <key>` | Bucketing subject, e.g. a user id | - | No |
+| `-a, --attr <name=value>` | Targeting attribute (repeatable) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags reshuffle <key>`
+
+Draw new rollout buckets for every rollout and split of this flag (never during an experiment)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-y, --yes` | Skip the confirmation | - | No |
 
 ### `flags set <key> <value>`
 
@@ -4028,12 +4375,13 @@ Attach identity or attributes to a visitor (merges into custom_data; a null valu
 
 ## `plugin`
 
-Create, install, update and build TypeScript plugins
+Create and build TypeScript plugins, or install and manage external plugins
 
 **Subcommands:**
 
 - `install` - Install a GitHub TypeScript plugin on the configured Temps server; the server uses its host Git credentials and Docker
 - `update` - Rebuild an installed GitHub plugin from its stored source; keep the current plugin if the update fails
+- `install-local` - Upload and activate a trusted native plugin on the configured Temps host
 - `grants` - Inspect or replace a plugin's host API permissions and AI limits
 - `dev` - Run a plugin with a local simulated host, UI preview, and events (no Temps server)
 - `init` - Create a TypeScript plugin project
@@ -4066,6 +4414,18 @@ Rebuild an installed GitHub plugin from its stored source; keep the current plug
 |------|-------------|---------|----------|
 | `--ref <ref>` | Use a different branch, tag, or commit | - | No |
 | `-y, --yes` | Trust the update without prompting | - | No |
+
+### `plugin install-local <file>`
+
+Upload and activate a trusted native plugin on the configured Temps host
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Expected plugin manifest name | - | Yes |
+| `--plugin-version <version>` | Expected plugin manifest version | - | Yes |
+| `-y, --yes` | Approve execution of this file without prompting | - | No |
 
 ### `plugin grants`
 

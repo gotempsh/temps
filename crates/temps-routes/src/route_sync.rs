@@ -37,6 +37,8 @@
 
 use std::sync::Arc;
 use std::time::Duration;
+use temps_core::crypto::constant_time_eq;
+use temps_core::crypto::sha256_hex;
 
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -109,6 +111,18 @@ pub struct RouteEntryDto {
     /// an agent that declared `shield-v1`; an older one never reads it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shield: Option<temps_core::worker_shield::ShieldRoutePolicy>,
+    /// Callers from other projects this internal route admits (ADR 101 D5).
+    /// Set only on routes in `RouteSnapshot::routes`. An agent that predates
+    /// grants ignores it and admits its route's own project only, which is
+    /// the default; an empty list means the same, so it is not sent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_callers: Vec<temps_core::internal_access::InternalAccessCaller>,
+    /// Sandboxes on this snapshot's node this internal route admits (ADR
+    /// 105). A separate list so an agent that predates sandbox grants, which
+    /// reads `allowed_callers` as project callers, parses the snapshot and
+    /// ignores this one: it then admits no sandbox, which fails closed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_sandboxes: Vec<temps_core::internal_access::InternalAccessSandboxCaller>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -691,7 +705,7 @@ pub async fn worker_route_policy(
         .one(db)
         .await
         .map_err(|source| ("load public-ingress request policy", source))?
-        .map(|row| temps_core::AppSettings::from_json(row.data))
+        .map(|row| temps_config::AppSettings::from_json(row.data))
         .unwrap_or_default();
     let ip_policy_count = ip_access_control::Entity::find()
         .count(db)
@@ -806,9 +820,9 @@ pub async fn worker_public_routes(
     let mut unsupported_reasons = blocking_policies.clone();
     if public_route_count > routes.len() && unsupported_reasons.is_empty() {
         unsupported_reasons.push(if shield {
-            "some routes require redirects, static-file serving, wake-up, project security policy, project-group path routing, or a remotely reachable backend".to_string()
+            "some routes require redirects, static-file serving, wake-up, project security policy, project-group path routing, replica routing policies, or a remotely reachable backend".to_string()
         } else {
-            "some routes require redirects, static-file serving, wake-up, a Shield mode that acts on verdicts (selective or attack), project security policy, project-group path routing, or a remotely reachable backend; update the agent to serve Shield routes on workers".to_string()
+            "some routes require redirects, static-file serving, wake-up, a Shield mode that acts on verdicts (selective or attack), project security policy, project-group path routing, replica routing policies, or a remotely reachable backend; update the agent to serve Shield routes on workers".to_string()
         });
     }
     Ok(WorkerPublicRoutes {
@@ -1070,13 +1084,17 @@ pub(crate) async fn build_snapshot(
         tailnet_identity,
         runs_shield,
     } = capabilities;
-    let raw = state.peer_table.snapshot_internal_routes();
-    let mut routes = Vec::with_capacity(raw.len());
-    for (host, info) in raw {
-        if let Some(entry) = entry_from_route(host, &info) {
-            routes.push(entry);
-        }
-    }
+    let routes = internal_route_entries(
+        &state.peer_table,
+        state.db.as_ref(),
+        crate::internal_access_grants::SnapshotNode::Worker(node.id),
+    )
+    .await
+    .map_err(|source| SnapshotBuildError::Database {
+        node_id: node.id,
+        operation: "load internal access grants",
+        source,
+    })?;
     // A node running an ingress connector (ADR 058) serves public routes on
     // its loopback tunnel origin even without a public listener.
     let runs_connector = {
@@ -1523,6 +1541,33 @@ fn certificate_has_single_exact_dns_identity(certificate_pem: &str, expected: &s
         })
 }
 
+/// The internal routes an internal proxy serves: every `*.temps.local` route
+/// of `peer_table`, each with the callers from other projects its grants
+/// admit (ADR 101 D5).
+///
+/// One function for both consumers, so they cannot drift: the worker
+/// snapshot (`build_snapshot`) and the control plane's own internal proxy on
+/// a single-server install (ADR-104 D2), which applies the result to the same
+/// `RouteStore` a worker does.
+pub async fn internal_route_entries<C: sea_orm::ConnectionTrait>(
+    peer_table: &CachedPeerTable,
+    db: &C,
+    node: crate::internal_access_grants::SnapshotNode,
+) -> Result<Vec<RouteEntryDto>, sea_orm::DbErr> {
+    let raw = peer_table.snapshot_internal_routes();
+    let mut routes = Vec::with_capacity(raw.len());
+    for (host, info) in raw {
+        if let Some(entry) = entry_from_route(host, &info) {
+            routes.push(entry);
+        }
+    }
+    let grants = crate::internal_access_grants::load_live_grants(db).await?;
+    crate::internal_access_grants::attach_allowed_callers(&mut routes, &grants);
+    let sandbox_grants = crate::internal_access_grants::load_live_sandbox_grants(db, node).await?;
+    crate::internal_access_grants::attach_allowed_sandboxes(&mut routes, &sandbox_grants);
+    Ok(routes)
+}
+
 fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
     // Internal zone is always proxied to live containers; static-dir
     // routes don't make sense here and are skipped.
@@ -1545,6 +1590,8 @@ fn entry_from_route(host: String, info: &RouteInfo) -> Option<RouteEntryDto> {
         environment_id: info.environment.as_ref().map(|e| e.id),
         gate: None,
         shield: None,
+        allowed_callers: Vec::new(),
+        allowed_sandboxes: Vec::new(),
     })
 }
 
@@ -1574,7 +1621,7 @@ pub async fn authenticate_node(
                 format!("Node {} does not exist", node_id),
             )
         })?;
-    let token_hash = sha256_hash(&token);
+    let token_hash = sha256_hex(&token);
     if !constant_time_eq(node.token_hash.as_bytes(), token_hash.as_bytes()) {
         warn!(node_id, "Invalid route sync token");
         return Err((
@@ -1606,34 +1653,14 @@ fn extract_bearer_token(headers: &HeaderMap) -> Result<String, (StatusCode, Stri
     Ok(token.to_string())
 }
 
-fn sha256_hash(input: &str) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(input.as_bytes());
-    hex::encode(hasher.finalize())
-}
-
-/// Constant-time equality for the SHA-256 token hash check.
-///
-/// Delegates to `subtle::ConstantTimeEq`, which is the same primitive used
-/// by Stripe webhook signature verification in `temps-revenue`. The hand-
-/// rolled XOR loop this replaced returned early on length mismatch — for
-/// fixed-length hashes (always 64 hex chars in our case) the practical
-/// risk was minimal, but the new impl removes the timing channel entirely
-/// and is also auditor-friendly (no DIY crypto).
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    use subtle::ConstantTimeEq;
-    a.ct_eq(b).into()
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::AtomicUsize;
 
     use sea_orm::{ActiveModelTrait, DatabaseBackend, DbErr, MockDatabase};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::domains;
+    use temps_test_utils::TestDatabase;
 
     use super::*;
     use crate::route_table::BackendEntry;
@@ -1695,6 +1722,8 @@ pub(crate) mod tests {
             environment_id: None,
             gate: None,
             shield: None,
+            allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 
@@ -1922,6 +1951,7 @@ pub(crate) mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }
@@ -1949,9 +1979,7 @@ pub(crate) mod tests {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("skipping worker snapshot test: test database unavailable: {error}");
                 return Ok(());
@@ -1974,6 +2002,13 @@ pub(crate) mod tests {
             RouteInfo {
                 backend: BackendType::Upstream {
                     backends: vec![BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "192.0.2.7:32000".to_string(),
                         container_id: Some("worker-container".to_string()),
                         container_name: Some("worker-app".to_string()),
@@ -2265,6 +2300,9 @@ pub(crate) mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         }
@@ -2455,6 +2493,8 @@ mod gate_hold_back_tests {
                 access: None,
             }),
             shield: None,
+            allowed_callers: Vec::new(),
+            allowed_sandboxes: Vec::new(),
         }
     }
 

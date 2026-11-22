@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::workflow::JobStatus as CoreJobStatus;
+use crate::workflow::WorkflowError;
+use crate::workflow_executor::JobTracker;
 use async_trait::async_trait;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::sync::Arc;
-use temps_core::{JobStatus as CoreJobStatus, JobTracker, WorkflowError};
 use temps_database::DbConnection;
 use temps_deployment_logs::LogService;
 use temps_entities::{
@@ -69,7 +71,7 @@ impl DeploymentJobTracker {
         });
     }
 
-    /// Convert temps_core::JobStatus to temps_entities::types::JobStatus
+    /// Convert crate::workflow::JobStatus to temps_entities::types::JobStatus
     fn convert_status(status: CoreJobStatus) -> EntityJobStatus {
         match status {
             CoreJobStatus::Pending => EntityJobStatus::Pending,
@@ -321,10 +323,10 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use std::time::Duration;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployments, environments, preset::Preset, projects, upstream_config::UpstreamList,
     };
+    use temps_test_utils::TestDatabase;
 
     /// Polls `check` every 10ms until it returns `Some`, up to `timeout`.
     ///

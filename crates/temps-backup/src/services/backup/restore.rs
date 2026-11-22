@@ -7,6 +7,18 @@ use super::*;
 
 impl BackupService {
     pub async fn restore_backup(&self, backup_id: &str) -> Result<(), BackupError> {
+        let started = std::time::Instant::now();
+        let result = self.restore_backup_inner(backup_id).await;
+        self.telemetry.report(crate::telemetry::operation_outcome(
+            true,
+            "control_plane",
+            started.elapsed(),
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        ));
+        result
+    }
+
+    async fn restore_backup_inner(&self, backup_id: &str) -> Result<(), BackupError> {
         use sea_orm::{ConnectionTrait, DatabaseBackend};
 
         info!(
@@ -556,7 +568,7 @@ impl BackupService {
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
+            force_path_style: s3_source.effective_path_style(true).force_path_style,
         };
         if let Some(resolved_endpoint) = s3_creds
             .resolve_endpoint_for_container(&docker, &container_id)
@@ -564,7 +576,7 @@ impl BackupService {
         {
             walg_env.push(format!("AWS_ENDPOINT={}", resolved_endpoint));
         }
-        if s3_source.force_path_style.unwrap_or(true) {
+        if s3_source.effective_path_style(true).force_path_style {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
@@ -964,6 +976,33 @@ mod tests {
     use temps_core::EncryptionService;
 
     #[tokio::test]
+    async fn legacy_restore_reports_one_failure_on_early_database_error() {
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<temps_core::telemetry::TelemetryEvent>>);
+        impl temps_core::telemetry::TelemetryReporter for Recorder {
+            fn report(&self, event: temps_core::telemetry::TelemetryEvent) {
+                self.0.lock().unwrap().push(event);
+            }
+            fn is_enabled(&self) -> bool {
+                true
+            }
+        }
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom("database unavailable".into())])
+            .into_connection();
+        let recorder = Arc::new(Recorder::default());
+        let service = make_scope_test_service(Arc::new(db)).with_telemetry(recorder.clone());
+        assert!(service.restore_backup("sample-backup").await.is_err());
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "restore_failed");
+        assert_eq!(events[0].properties["engine"], "control_plane");
+        assert!(!serde_json::to_string(&events[0])
+            .unwrap()
+            .contains("sample-backup"));
+    }
+
+    #[tokio::test]
     async fn test_restore_postgres_from_url() {
         let docker = match bollard::Docker::connect_with_local_defaults() {
             Ok(docker) => docker,
@@ -977,7 +1016,7 @@ mod tests {
             return;
         }
 
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         use testcontainers::runners::AsyncRunner;
 
         // Start RustFS (S3-compatible) container
@@ -1137,6 +1176,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
+            use_tls: None,
         };
 
         let s3_source = source_backup_service
@@ -1206,6 +1247,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
+            use_tls: None,
         };
 
         let target_s3_source = target_backup_service

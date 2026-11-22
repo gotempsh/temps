@@ -209,9 +209,8 @@ impl DockerRuntime {
     /// The per-node Hickory resolver goes first (static `dns_servers` wins
     /// when set — test/manual setups — otherwise the dynamic
     /// `overlay_dns_slot` the agent's `network_sync` loop publishes), but
-    /// [`dns_with_fallback`] ensures it's never the *only* entry, so a
-    /// crashed or unreachable resolver degrades to "no `*.temps.local`"
-    /// instead of "no DNS at all" for every container on the node.
+    /// external lookups are forwarded by that resolver, never bypassing
+    /// its network policy through a host nameserver.
     ///
     /// Returns `None` when no primary resolver is configured yet (overlay
     /// not bootstrapped), leaving `HostConfig.dns` unset so Docker falls
@@ -352,14 +351,9 @@ mod tests {
     use crate::docker::test_support::{create_test_docker_runtime, test_runtime};
     use crate::docker::{DockerRuntime, SharedHostBindAddress};
     use crate::{ContainerDeployer, ImageBuilder};
-    use crate::{
-        ContainerLogConfig, DeployRequest, PortMapping, Protocol, ResourceLimits, RestartPolicy,
-    };
-    use futures::StreamExt;
-    use serial_test::serial;
+    use crate::{DeployRequest, PortMapping, Protocol, ResourceLimits, RestartPolicy};
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use tokio::time::{timeout, Duration};
 
     #[test]
     fn test_dns_for_container_none_when_no_resolver_configured() {
@@ -487,137 +481,7 @@ mod tests {
 
         let dns = runtime.dns_for_container().expect("static servers set");
 
-        assert_eq!(dns[0], "10.0.0.53");
-        assert!(dns.len() <= 3);
-    }
-
-    /// Runs `cmd` inside `container_id` and returns combined stdout+stderr,
-    /// bounded so a hung DNS query (the exact failure mode this crate
-    /// exists to prevent) can't hang the test suite.
-    async fn exec_capture(docker: &Docker, container_id: &str, cmd: Vec<&str>) -> String {
-        let exec_config = bollard::models::ExecConfig {
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            cmd: Some(cmd.into_iter().map(str::to_string).collect()),
-            ..Default::default()
-        };
-        let exec = docker
-            .create_exec(container_id, exec_config)
-            .await
-            .expect("create_exec");
-
-        timeout(Duration::from_secs(15), async {
-            let mut combined = String::new();
-            if let Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) = docker
-                .start_exec(&exec.id, None::<bollard::exec::StartExecOptions>)
-                .await
-            {
-                while let Some(Ok(msg)) = output.next().await {
-                    match msg {
-                        bollard::container::LogOutput::StdOut { message }
-                        | bollard::container::LogOutput::StdErr { message } => {
-                            combined.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            combined
-        })
-        .await
-        .unwrap_or_else(|_| "TIMED OUT".to_string())
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_dns_fallback_survives_unreachable_primary_resolver() {
-        let runtime = match create_test_docker_runtime().await {
-            Ok(r) => r,
-            Err(e) => {
-                println!("🔧 Docker not available, skipping: {}", e);
-                return;
-            }
-        };
-        let docker = match Docker::connect_with_local_defaults() {
-            Ok(d) => d,
-            Err(e) => {
-                println!("🔧 Docker not available, skipping: {}", e);
-                return;
-            }
-        };
-        if docker.ping().await.is_err() {
-            println!("🔧 Docker ping failed, skipping");
-            return;
-        }
-
-        // RFC 5737 TEST-NET-3 — guaranteed non-routable, so a query to it
-        // times out exactly like a crashed/hung resolver process would,
-        // without depending on any real IP actually being unreachable.
-        let dead_resolver = "203.0.113.1";
-        let slot = Arc::new(std::sync::RwLock::new(Some(
-            dead_resolver.parse::<std::net::IpAddr>().unwrap(),
-        )));
-        let runtime = runtime.with_overlay_dns_slot(slot);
-
-        let name = "temps-dns-fallback-test";
-        let _ = runtime.remove_container(name).await;
-
-        let deploy_request = DeployRequest {
-            image_name: "alpine:latest".to_string(),
-            container_name: name.to_string(),
-            environment_vars: HashMap::new(),
-            secrets: HashMap::new(),
-            port_mappings: vec![],
-            network_name: None,
-            extra_networks: Vec::new(),
-            resource_limits: ResourceLimits {
-                cpu_limit: None,
-                memory_limit_mb: None,
-                disk_limit_mb: None,
-            },
-            restart_policy: RestartPolicy::Never,
-            log_path: PathBuf::from("/tmp/temps-dns-fallback-test.log"),
-            command: Some(vec!["sleep".to_string(), "60".to_string()]),
-            entrypoint: None,
-            log_config: Some(ContainerLogConfig::app_default()),
-            labels: HashMap::new(),
-            project_slug: None,
-            control_plane_grants_socket: false,
-        };
-
-        let info = match runtime.deploy_container(deploy_request).await {
-            Ok(i) => i,
-            Err(e) => {
-                println!("🔧 Container deployment failed (may be expected): {}", e);
-                return;
-            }
-        };
-
-        let resolv_conf =
-            exec_capture(&docker, &info.container_id, vec!["cat", "/etc/resolv.conf"]).await;
-        println!("container /etc/resolv.conf:\n{resolv_conf}");
-        assert!(
-            resolv_conf.contains(dead_resolver),
-            "simulated dead resolver missing from resolv.conf — production \
-             wiring wouldn't match what this test exercises: {resolv_conf}"
-        );
-
-        // The actual incident repro: a real query must still succeed even
-        // though the FIRST nameserver never answers. Bounded well under the
-        // suite-level 15s exec timeout so a regression fails fast instead
-        // of hanging CI.
-        let lookup =
-            exec_capture(&docker, &info.container_id, vec!["nslookup", "google.com"]).await;
-        println!("nslookup google.com ->\n{lookup}");
-
-        let _ = runtime.remove_container(&info.container_id).await;
-
-        assert!(
-            lookup.contains("Address") && !lookup.contains("TIMED OUT"),
-            "external DNS resolution did not fail over to the host's own \
-             default DNS servers when the primary resolver was unreachable \
-             — temps-node-dns is still a SPOF: {lookup}"
-        );
+        assert_eq!(dns, vec!["10.0.0.53"]);
     }
 
     #[tokio::test]

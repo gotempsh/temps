@@ -11,8 +11,12 @@ import {
   runConnectionHealthCheckMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
+  authorizationRejectedMessage,
   canReauthorizeConnection,
+  displayedHealthStatus,
+  GITLAB_OAUTH_SETUP_PATH,
   needsReauthorization,
+  providerSupportsReauthorization,
 } from './reauthorization'
 import { UpdateTokenDialog } from '@/components/git/UpdateTokenDialog'
 import { Badge } from '@/components/ui/badge'
@@ -52,6 +56,8 @@ import { toast } from 'sonner'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 type Variant = 'single-line' | 'two-line' | 'avatar'
+
+const EXPIRED_STATUS = 'The access token has expired'
 
 interface ConnectionsCompactListProps {
   connections: ConnectionResponse[]
@@ -122,7 +128,10 @@ export function ConnectionsCompactList({
         toast.success(`Connection "${data.account_name}" is healthy`)
       } else if (data.health_status === 'unhealthy') {
         toast.error(`Connection "${data.account_name}" is unhealthy`, {
-          description: data.health_message ?? undefined,
+          description:
+            authorizationRejectedMessage(data, provider) ??
+            data.health_message ??
+            undefined,
         })
       } else {
         toast.message(`Health status: ${data.health_status}`)
@@ -175,6 +184,35 @@ export function ConnectionsCompactList({
           : 'Reauthorize'}
       </Button>
     ) : null
+
+  const hasReauthorize = providerSupportsReauthorization(provider)
+
+  // The message sits beside the action that resolves it, in every variant. A
+  // provider's response never reaches this list for a rejected authorization.
+  // A provider with no Reauthorize action links to the way out it does have.
+  const renderReauthorizeAction = (c: ConnectionResponse) => {
+    const message = authorizationRejectedMessage(c, provider)
+    const button = renderReauthorizeButton(c)
+    if (!message && !button) return null
+    return (
+      <div className="flex min-w-0 flex-wrap items-center justify-end gap-2">
+        {message && (
+          <span className="text-xs font-medium text-destructive">
+            {message}
+          </span>
+        )}
+        {message && !hasReauthorize && (
+          <Link
+            to={GITLAB_OAUTH_SETUP_PATH}
+            className="text-xs font-medium underline"
+          >
+            Add a GitLab OAuth provider
+          </Link>
+        )}
+        {button}
+      </div>
+    )
+  }
 
   const isPATProvider =
     provider &&
@@ -329,7 +367,7 @@ export function ConnectionsCompactList({
   const HealthBadge = ({ c }: { c: ConnectionResponse }) => {
     const checkedAt = c.last_health_check_at
     const label = (() => {
-      switch (c.health_status) {
+      switch (displayedHealthStatus(c)) {
         case 'healthy':
           return {
             variant: 'secondary' as const,
@@ -352,9 +390,12 @@ export function ConnectionsCompactList({
     })()
 
     const tooltip = (() => {
-      if (c.health_status === 'unhealthy' && c.health_message) {
+      const rejected = authorizationRejectedMessage(c, provider)
+      if (rejected) return rejected
+      if (displayedHealthStatus(c) === 'unhealthy' && c.health_message) {
         return c.health_message
       }
+      if (c.is_expired) return EXPIRED_STATUS
       if (!checkedAt) return 'No health check has run yet'
       return `Last checked: ${new Date(checkedAt).toLocaleString()}`
     })()
@@ -381,8 +422,9 @@ export function ConnectionsCompactList({
 
   const renderRow = (c: ConnectionResponse) => {
     if (variant === 'single-line') {
-      const unhealthy = c.health_status === 'unhealthy'
-      const healthy = c.health_status === 'healthy'
+      const status = displayedHealthStatus(c)
+      const unhealthy = status === 'unhealthy'
+      const healthy = status === 'healthy'
       const railColor = unhealthy
         ? 'bg-destructive'
         : healthy
@@ -404,7 +446,7 @@ export function ConnectionsCompactList({
             <StatusBadge c={c} />
             <SyncBadge c={c} />
             <div className="ml-auto flex items-center gap-2">
-              {renderReauthorizeButton(c)}
+              {renderReauthorizeAction(c)}
               <ActionsMenu c={c} />
             </div>
           </div>
@@ -418,11 +460,16 @@ export function ConnectionsCompactList({
                     : ''
               }
             >
-              {unhealthy && c.health_message
-                ? c.health_message
-                : healthy
-                  ? 'Healthy'
-                  : 'Not checked yet'}
+              {authorizationRejectedMessage(c, provider)
+                ? hasReauthorize
+                  ? 'Reauthorization required'
+                  : 'Reconnection required'
+                : unhealthy
+                  ? (c.health_message ??
+                    (c.is_expired ? EXPIRED_STATUS : 'Unhealthy'))
+                  : healthy
+                    ? 'Healthy'
+                    : 'Not checked yet'}
             </span>
             <span aria-hidden>·</span>
             <span className="flex items-center gap-1">
@@ -481,7 +528,7 @@ export function ConnectionsCompactList({
               </span>
             </div>
           </div>
-          {renderReauthorizeButton(c)}
+          {renderReauthorizeAction(c)}
           <ActionsMenu c={c} />
         </li>
       )
@@ -527,7 +574,7 @@ export function ConnectionsCompactList({
           <StatusBadge c={c} />
           <HealthBadge c={c} />
           <SyncBadge c={c} />
-          {renderReauthorizeButton(c)}
+          {renderReauthorizeAction(c)}
           <ActionsMenu c={c} />
         </div>
       </li>

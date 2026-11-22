@@ -10,9 +10,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::permissions::Permission;
-use temps_auth::{AuthContext, RequireAuth};
+use temps_authz::permission_guard;
+use temps_authz::permissions::Permission;
+use temps_authz::{AuthContext, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::secret_string::SecretString;

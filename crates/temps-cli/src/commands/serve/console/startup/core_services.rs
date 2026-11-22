@@ -17,6 +17,7 @@ pub(super) struct CoreServices {
     pub(super) docker_available: bool,
     pub(super) profile: crate::commands::serve::ServeProfile,
     pub(super) route_table: Arc<temps_proxy::CachedPeerTable>,
+    pub(super) runtime_context: Arc<temps_core::RuntimeContext>,
     pub(super) retention_resolver_slot: Arc<temps_core::RetentionResolverSlot>,
     pub(super) project_ip_gate_slot: Arc<temps_core::ProjectIpGateSlot>,
     pub(super) request_policy_gate_slot: Arc<temps_core::RequestPolicyGateSlot>,
@@ -54,6 +55,7 @@ pub(super) async fn register_core_services(
         docker_available,
         profile,
         route_table,
+        runtime_context,
         retention_resolver_slot,
         project_ip_gate_slot,
         request_policy_gate_slot,
@@ -93,6 +95,9 @@ pub(super) async fn register_core_services(
         temps_core::LocalWorkloadPolicy::control_plane(docker_available)
     });
     service_context.register_service(local_workload_policy.clone());
+    // Host or container: how a deployment container's internal address is
+    // reached from this process (workflow executors, ADR-106).
+    service_context.register_service(runtime_context);
     // Pre-registered here (rather than left solely to AuthPlugin, which also
     // registers an equivalent instance) because TeamsPlugin, GitPlugin,
     // DomainsPlugin, and DeploymentsPlugin all gate sensitive mutations via
@@ -127,6 +132,12 @@ pub(super) async fn register_core_services(
     // Registered behind the trait so temps-config depends only on the
     // temps-core contract, never on the CLI crate that implements it.
     service_context.register_service(self_updater.clone() as Arc<dyn temps_core::SelfUpdater>);
+    // The version this binary was built as, so the commands the server
+    // generates for a new worker (the pairing command) install the release
+    // it runs, as the console's Add worker panel does.
+    service_context.register_service(Arc::new(temps_core::worker_install::PlaneBuild::new(env!(
+        "TEMPS_VERSION"
+    ))));
     // Traefik label discovery status, resolved in serve/mod.rs. Pre-registered
     // before any plugin runs so DeploymentsPlugin's `/traefik-discovery/*`
     // handlers report this process's real state instead of falling back to a
@@ -174,7 +185,7 @@ pub(super) async fn register_core_services(
                 unrecognised presets are skipped with a warning; valid presets are: {}",
                 additional_path,
                 e,
-                temps_core::templates::VALID_PRESETS.join(", ")
+                temps_presets::templates::VALID_PRESETS.join(", ")
             ));
         }
     }

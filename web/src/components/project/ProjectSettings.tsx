@@ -10,6 +10,7 @@ import { EdgeRulesPage } from './settings/edge-rules/EdgeRulesPage'
 import { LegacyProjectRouteRedirect } from './LegacyProjectRouteRedirect'
 import { CombinedProjectSettings } from './settings/CombinedProjectSettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
+import { InternalAccessCard } from './settings/InternalAccessCard'
 import { ProjectIpAccessCard } from './settings/ProjectIpAccessCard'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { SecretPage } from './settings/SecretPage'
@@ -119,12 +120,17 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
             <div className="space-y-6">
               <PageHeader
                 title="Protection"
-                description="Shield, security headers, rate limits and IP access for this service. Empty fields inherit the instance-wide settings."
+                description="Shield, security headers, rate limits, IP access and internal access for this service. Empty fields inherit the instance-wide settings."
               />
               <ProjectSecuritySettings project={project} refetch={refetch} />
               <ProjectIpAccessCard
                 projectId={project.id}
                 scopeName={project.name}
+              />
+              <InternalAccessCard
+                projectId={project.id}
+                projectName={project.name}
+                projectSlug={project.slug}
               />
             </div>
           }

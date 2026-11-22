@@ -9,12 +9,8 @@ import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { Check } from 'lucide-react'
 import { Link } from 'react-router'
-import {
-  fetchEmailDomains,
-  fetchEmailProviders,
-  fetchEmailStats,
-  fetchEventStats,
-} from './email-queries'
+import { useEmailSetupInput } from './useEmailSetup'
+import { fetchEmailStats, fetchEventStats } from './email-queries'
 
 function SetupStep({
   step,
@@ -62,18 +58,7 @@ function SetupStep({
  * real answers, so a failed lookup never claims a step is still to do.
  */
 export function EmailGetStarted() {
-  const providers = useQuery({
-    queryKey: ['email-providers'],
-    queryFn: fetchEmailProviders,
-  })
-  const domains = useQuery({
-    queryKey: ['email-domains'],
-    queryFn: fetchEmailDomains,
-  })
-  const stats = useQuery({
-    queryKey: ['email-stats', undefined],
-    queryFn: () => fetchEmailStats(),
-  })
+  const { providers, domains, stats } = useEmailSetupInput()
 
   if (!providers.data || !domains.data || !stats.data) return null
 

@@ -52,6 +52,8 @@ Show active alarm counts by status, severity, and type
 
 Acknowledge alarms by ID, or every alarm matching the filters with --all
 
+**Usage:** `alarms ack [alarmIds...] [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -70,6 +72,8 @@ Acknowledge alarms by ID, or every alarm matching the filters with --all
 ### `alarms resolve`
 
 Resolve alarms by ID, or every alarm matching the filters with --all
+
+**Usage:** `alarms resolve [alarmIds...] [options]`
 
 **Options:**
 

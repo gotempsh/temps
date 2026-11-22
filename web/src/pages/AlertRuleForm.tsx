@@ -53,6 +53,13 @@ import {
 } from '@/lib/form-draft'
 import { errorRulePrioritySeverity } from '@/lib/notification-severity'
 import { isReturnFromSetup } from '@/lib/safe-return-to'
+import {
+  needsTriggerConfig,
+  refineTriggerConfig,
+  triggerConfigForRequest,
+  triggerConfigFromRule,
+  triggerConfigSchema,
+} from './alert-rule-trigger-config'
 
 const TRIGGER_TYPES = [
   {
@@ -100,30 +107,22 @@ const PRIORITIES = [
   { value: 'Critical', label: 'Critical' },
 ] as const
 
-const alertRuleSchema = z.object({
-  name: z.string().min(1, 'Name is required'),
-  trigger_type: z.string().min(1, 'Trigger type is required'),
-  trigger_config: z
-    .object({
-      count: z.number().min(1).optional(),
-      window_minutes: z.number().min(1).optional(),
-      threshold: z.number().min(1).optional(),
-    })
-    .optional(),
-  cooldown_minutes: z
-    .number({ message: 'Cooldown must be a number' })
-    .min(0, 'Cooldown cannot be negative'),
-  notification_priority: z.string(),
-  environment_filter: z.number().nullable().optional(),
-  error_level_filter: z.string().nullable().optional(),
-  enabled: z.boolean(),
-})
+const alertRuleSchema = z
+  .object({
+    name: z.string().min(1, 'Name is required'),
+    trigger_type: z.string().min(1, 'Trigger type is required'),
+    trigger_config: triggerConfigSchema,
+    cooldown_minutes: z
+      .number({ message: 'Cooldown must be a number' })
+      .min(0, 'Cooldown cannot be negative'),
+    notification_priority: z.string(),
+    environment_filter: z.number().nullable().optional(),
+    error_level_filter: z.string().nullable().optional(),
+    enabled: z.boolean(),
+  })
+  .superRefine(refineTriggerConfig)
 
 type AlertRuleFormData = z.infer<typeof alertRuleSchema>
-
-function needsConfig(triggerType: string): boolean {
-  return ['frequency', 'user_count'].includes(triggerType)
-}
 
 interface AlertRuleFormProps {
   projectId: number
@@ -173,19 +172,14 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
 
   const defaultValues = useMemo<AlertRuleFormData>(() => {
     if (existingRule) {
-      const config = (existingRule.trigger_config ?? {}) as Record<
-        string,
-        unknown
-      >
       return mergeFormDraft<AlertRuleFormData>(
         {
           name: existingRule.name,
           trigger_type: existingRule.trigger_type,
-          trigger_config: {
-            count: (config.count as number) ?? undefined,
-            window_minutes: (config.window_minutes as number) ?? undefined,
-            threshold: (config.threshold as number) ?? undefined,
-          },
+          trigger_config: triggerConfigFromRule(
+            existingRule.trigger_type,
+            existingRule.trigger_config as Record<string, unknown> | null
+          ),
           cooldown_minutes: existingRule.cooldown_minutes,
           notification_priority: existingRule.notification_priority,
           environment_filter: existingRule.environment_filter ?? null,
@@ -247,9 +241,10 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
   const isMutating = createMutation.isPending || updateMutation.isPending
 
   const onSubmit = (data: AlertRuleFormData) => {
-    const triggerConfig = needsConfig(data.trigger_type)
-      ? data.trigger_config
-      : undefined
+    const triggerConfig = triggerConfigForRequest(
+      data.trigger_type,
+      data.trigger_config
+    )
 
     if (isEditing) {
       updateMutation.mutate({
@@ -390,7 +385,7 @@ export function AlertRuleForm({ projectId, projectName }: AlertRuleFormProps) {
                 )}
               />
 
-              {needsConfig(watchedTriggerType) && (
+              {needsTriggerConfig(watchedTriggerType) && (
                 <div className="space-y-4 rounded-md border p-4">
                   <p className="text-sm font-medium">Trigger Configuration</p>
                   {watchedTriggerType === 'frequency' && (

@@ -119,7 +119,7 @@ impl ProjectService {
         let config = WebhookConfig {
             url: github_repo_webhook_url(&self.git_webhook_base_url().await, project_id),
             secret: Some(secret.clone()),
-            events: vec!["push".to_string()],
+            events: vec!["push".to_string(), "pull_request".to_string()],
         };
 
         let provider_service = self

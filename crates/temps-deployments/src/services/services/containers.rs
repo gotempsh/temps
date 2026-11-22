@@ -5,6 +5,7 @@
 //! start/stop/restart, environment variables and metrics.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 /// Boxed log stream so local-Docker and remote-agent paths share one return type.
 pub type ContainerLogStream =
@@ -38,7 +39,7 @@ pub struct EnvironmentContainer {
 #[derive(Debug, Clone)]
 pub struct ContainerPresentationContext {
     pub node_names: HashMap<i32, String>,
-    pub app_settings: temps_core::AppSettings,
+    pub app_settings: temps_config::AppSettings,
     pub environment_subdomain: String,
     pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
     pub resource_limits: ResolvedContainerResourceLimits,
@@ -273,7 +274,17 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound(format!("Node {} not found", node_id)))?;
+        self.remote_container_operations(node).await
+    }
 
+    /// [`Self::container_operations_for_node`] for a worker whose row the
+    /// caller already holds, so a caller going over many nodes reads them in
+    /// one query rather than one per node.
+    pub(crate) async fn remote_container_operations(
+        &self,
+        node: nodes::Model,
+    ) -> Result<Arc<dyn ContainerOperations>, DeploymentError> {
+        let node_id = node.id;
         let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
             DeploymentError::Other(format!(
                 "Node {} has no agent token; cannot reach remote agent",
@@ -948,109 +959,6 @@ impl DeploymentService {
             .await
             .ok()
             .and_then(|info| info.restart_count)
-    }
-
-    /// Stop all containers in an environment
-    pub async fn stop_all_containers(
-        &self,
-        project_id: i32,
-        environment_id: i32,
-    ) -> Result<(), DeploymentError> {
-        use temps_entities::environments;
-
-        // Verify environment exists and belongs to project
-        let _environment = environments::Entity::find_by_id(environment_id)
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
-
-        // Get all active containers in this environment
-        let containers = deployment_containers::Entity::find()
-            .inner_join(deployments::Entity)
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
-
-        for container in containers {
-            let _ = self.deployer.stop_container(&container.container_id).await;
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("stopped".to_string()));
-            let _ = active_container.update(self.db.as_ref()).await;
-        }
-
-        info!("Stopped containers in environment: {}", environment_id);
-        Ok(())
-    }
-
-    /// Start all containers in an environment
-    pub async fn start_all_containers(
-        &self,
-        project_id: i32,
-        environment_id: i32,
-    ) -> Result<(), DeploymentError> {
-        use temps_entities::environments;
-
-        // Verify environment exists and belongs to project
-        let _environment = environments::Entity::find_by_id(environment_id)
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
-
-        // Get all active containers in this environment
-        let containers = deployment_containers::Entity::find()
-            .inner_join(deployments::Entity)
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
-
-        for container in containers {
-            let _ = self.deployer.start_container(&container.container_id).await;
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("running".to_string()));
-            let _ = active_container.update(self.db.as_ref()).await;
-        }
-
-        info!("Started containers in environment: {}", environment_id);
-        Ok(())
-    }
-
-    /// Restart all containers in an environment
-    pub async fn restart_all_containers(
-        &self,
-        project_id: i32,
-        environment_id: i32,
-    ) -> Result<(), DeploymentError> {
-        use temps_entities::environments;
-
-        // Verify environment exists and belongs to project
-        let _environment = environments::Entity::find_by_id(environment_id)
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
-
-        // Get all active containers in this environment
-        let containers = deployment_containers::Entity::find()
-            .inner_join(deployments::Entity)
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
-
-        for container in containers {
-            let _ = self.deployer.stop_container(&container.container_id).await;
-            let _ = self.deployer.start_container(&container.container_id).await;
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("running".to_string()));
-            let _ = active_container.update(self.db.as_ref()).await;
-        }
-
-        info!("Restarted containers in environment: {}", environment_id);
-        Ok(())
     }
 
     /// Get metrics/stats for a specific container

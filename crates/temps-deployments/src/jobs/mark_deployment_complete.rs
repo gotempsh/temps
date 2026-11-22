@@ -8,6 +8,10 @@
 //! Optional jobs (screenshots, crons) depend on this job, ensuring the deployment
 //! is live before they run.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait,
@@ -16,10 +20,7 @@ use sea_orm::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_core::{
-    Job, JobQueue, JobReceiver, JobResult, UtcDateTime, WorkflowContext, WorkflowError,
-    WorkflowTask,
-};
+use temps_core::{Job, JobQueue, JobReceiver, UtcDateTime};
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::{
@@ -33,8 +34,21 @@ use tracing::{debug, info, warn};
 /// lagging worker ever waits this long.
 const WORKER_APPLY_TIMEOUT_SECS: u64 = temps_core::worker_sync::WORKER_SYNC_RECOVERY_SECS + 5;
 
-/// Deployment states the previous-deployment teardown sweep picks up.
-const TEARDOWN_SWEPT_STATES: [&str; 4] = ["pending", "running", "built", "completed"];
+mod paused_sweep;
+mod stop_grace;
+mod workflow_drain;
+mod workflow_warning;
+pub(crate) use paused_sweep::{
+    deployment_still_swept, environment_lifecycle_lock, MAX_CONCURRENT_REPLICA_STOPS,
+};
+pub(crate) use stop_grace::{superseded_stop_grace, teardown_budget};
+
+/// Deployment states the previous-deployment teardown sweeps pick up. "deployed"
+/// is what `resume_deployment` leaves behind, and a later deploy supersedes it
+/// like "completed". "paused" is not here: it stays resumable, so its containers
+/// are stopped rather than removed (see `paused_sweep`).
+pub(crate) const TEARDOWN_SWEPT_STATES: [&str; 5] =
+    ["pending", "running", "built", "completed", "deployed"];
 
 /// Process-level locks keyed by environment_id to serialize mark_complete
 /// operations for the same environment. This replaces PostgreSQL advisory
@@ -102,7 +116,7 @@ const MAX_TEARDOWN_DEPLOYMENTS_PER_PASS: u64 = 25;
 /// Docker's graceful stop alone can take ~10s; without a ceiling a single hung
 /// container would block the whole teardown loop indefinitely. On timeout we
 /// log and move on — the container row is left for the next sweep to retry.
-const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
+pub(crate) const CONTAINER_TEARDOWN_TIMEOUT_SECS: u64 = 30;
 
 /// Output from MarkDeploymentCompleteJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,6 +143,7 @@ pub struct MarkDeploymentCompleteJob {
     /// ADR 068 D5: whether anyone can open what was deployed. Empty in a
     /// binary without the ingress plugin.
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: Option<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 /// Longest the D5 reachability check may hold a finished deploy.
@@ -164,6 +179,7 @@ impl MarkDeploymentCompleteJob {
             encryption_service,
             workload_plane: None,
             environment_addresses: None,
+            workflow_control: None,
         }
     }
 
@@ -449,9 +465,15 @@ impl MarkDeploymentCompleteJob {
             environment_id, "Acquired environment lock"
         );
 
+        let drain = self
+            .drain_workflow_invocations(deployment.project_id, environment_id)
+            .await?;
         let result = self
-            .mark_complete_inner(context, &deployment, environment_id)
+            .mark_complete_inner(context, &deployment, environment_id, drain.as_ref())
             .await;
+        if let Some(drain) = drain {
+            drain.finish().await;
+        }
 
         // Lock is released when `_guard` is dropped (on all exit paths)
         drop(_guard);
@@ -479,7 +501,11 @@ impl MarkDeploymentCompleteJob {
         context: &WorkflowContext,
         deployment: &deployments::Model,
         environment_id: i32,
+        drain: Option<&workflow_drain::DrainGuard>,
     ) -> Result<MarkCompleteOutput, WorkflowError> {
+        self.warn_about_active_workflows(deployment.project_id, environment_id)
+            .await;
+
         // Update deployment with workflow outputs
         let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
 
@@ -878,6 +904,9 @@ impl MarkDeploymentCompleteJob {
             "Rollback target resolved for route-table timeout"
         );
 
+        if let Some(drain) = drain {
+            drain.check().await?;
+        }
         if !self.promote_if_latest(self.deployment_id).await? {
             return Err(WorkflowError::JobExecutionFailed(format!(
                 "Deployment {} was cancelled or superseded before route promotion",
@@ -2148,6 +2177,7 @@ WHERE project.id = $2
                         token,
                         node.name.clone(),
                     )
+                    .map(|remote| remote.with_sealing(node.request_sealing()))
                     .map_err(|e| {
                         format!(
                             "Failed to create remote deployer for node '{}': {}",
@@ -2290,6 +2320,7 @@ WHERE project.id = $2
         container: deployment_containers::Model,
         project_id: i32,
         environment_id: i32,
+        stop_grace: std::time::Duration,
     ) -> Result<(), String> {
         let container_id = container.container_id.clone();
         let plane_workload = crate::services::plane_deployer::deployment_replica_workload(
@@ -2346,7 +2377,19 @@ WHERE project.id = $2
         }
 
         match (plane_workload, deployer) {
-            (Some(workload), _) => {
+            (Some(workload), deployer) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give it the configured grace first. Without a reachable
+                // deployer the replica is still retired, only without it.
+                if let Some(deployer) = deployer.as_ref() {
+                    crate::services::plane_deployer::stop_replica_before_retiring(
+                        deployer.as_ref(),
+                        &container_id,
+                        workload,
+                        stop_grace,
+                    )
+                    .await;
+                }
                 if let Err(e) = crate::services::plane_deployer::retire_replica_workload(
                     self.workload_plane.as_deref(),
                     container.deployment_id,
@@ -2368,7 +2411,7 @@ WHERE project.id = $2
                 .ok();
             }
             (None, Some(deployer)) => {
-                self.stop_and_remove_container(deployer.as_ref(), &container_id)
+                self.stop_and_remove_container(deployer.as_ref(), &container_id, stop_grace)
                     .await?;
             }
             (None, None) => {
@@ -2386,61 +2429,6 @@ WHERE project.id = $2
             .update(self.db.as_ref())
             .await
             .map_err(|e| format!("Failed to mark container {container_id} removed: {e}"))?;
-
-        Ok(())
-    }
-
-    /// Stop (best effort) and remove a legacy container through its node's
-    /// deployer. An already-removed container counts as removed.
-    async fn stop_and_remove_container(
-        &self,
-        deployer: &dyn temps_deployer::ContainerDeployer,
-        container_id: &str,
-    ) -> Result<(), String> {
-        // Stop container first
-        match deployer.stop_container(container_id).await {
-            Ok(_) => {
-                self.log(format!("Stopped container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(e) => {
-                self.log(format!("Failed to stop container {}: {}", container_id, e))
-                    .await
-                    .ok();
-            }
-        }
-
-        // Remove container from Docker. A container that is already gone
-        // (pruned, removed by hand, lost with its node's disk) is torn down:
-        // retrying could never succeed and would keep the deployment in the
-        // sweep forever.
-        match deployer.remove_container(container_id).await {
-            Ok(_) => {
-                self.log(format!("Removed container {}", container_id))
-                    .await
-                    .ok();
-            }
-            Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
-                self.log(format!(
-                    "Container {} was already removed from Docker",
-                    container_id
-                ))
-                .await
-                .ok();
-            }
-            Err(e) => {
-                self.log(format!(
-                    "Failed to remove container {}: {}",
-                    container_id, e
-                ))
-                .await
-                .ok();
-                return Err(format!(
-                    "Failed to remove rejected container {container_id}: {e}"
-                ));
-            }
-        }
 
         Ok(())
     }
@@ -2507,12 +2495,17 @@ WHERE project.id = $2
         let teardowns = containers.into_iter().map(|container| {
             let container_id = container.container_id.clone();
             async move {
+                // A rejected deployment never went live, so it has no
+                // traffic to drain: the default grace period.
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
                     self.teardown_container(
                         container,
                         deployment.project_id,
                         deployment.environment_id,
+                        std::time::Duration::from_secs(
+                            temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+                        ),
                     ),
                 )
                 .await
@@ -2541,6 +2534,21 @@ WHERE project.id = $2
         }
     }
 
+    /// Deployments created before `current_created_at`; ID is the deterministic
+    /// tie-breaker for equal timestamps.
+    fn created_before_this_deployment(
+        &self,
+        current_created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Condition {
+        Condition::any()
+            .add(deployments::Column::CreatedAt.lt(current_created_at))
+            .add(
+                Condition::all()
+                    .add(deployments::Column::CreatedAt.eq(current_created_at))
+                    .add(deployments::Column::Id.lt(self.deployment_id)),
+            )
+    }
+
     /// Teardown all running/pending deployments for the same environment.
     /// This ensures only one active deployment per environment.
     ///
@@ -2556,6 +2564,9 @@ WHERE project.id = $2
         environment_id: i32,
         current_created_at: chrono::DateTime<chrono::Utc>,
     ) {
+        self.stop_paused_deployments(environment_id, current_created_at)
+            .await;
+
         self.log("Checking for previous deployments to teardown...".to_string())
             .await
             .ok();
@@ -2566,9 +2577,9 @@ WHERE project.id = $2
         // deployment is torn down here its state is flipped to "stopped" (see
         // below), so it drops out of this filter and is never re-scanned — that
         // is what keeps this query bounded as deployment history grows. We still
-        // include "completed" to catch a previously-current deployment that this
-        // new deploy is superseding (and any legacy rows left un-torn-down before
-        // the state-flip fix existed).
+        // include "completed" and "deployed" (a resumed deployment) to catch a
+        // previously-current deployment that this new deploy is superseding (and
+        // any legacy rows left un-torn-down before the state-flip fix existed).
         //
         // The result is additionally capped (newest-first) so that even a large
         // backlog of un-processed rows can't make a single pass run for minutes;
@@ -2579,15 +2590,7 @@ WHERE project.id = $2
         // deterministic tie-breaker for equal timestamps.
         let previous_deployments = match deployments::Entity::find()
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(
-                Condition::any()
-                    .add(deployments::Column::CreatedAt.lt(current_created_at))
-                    .add(
-                        Condition::all()
-                            .add(deployments::Column::CreatedAt.eq(current_created_at))
-                            .add(deployments::Column::Id.lt(self.deployment_id)),
-                    ),
-            )
+            .filter(self.created_before_this_deployment(current_created_at))
             .filter(deployments::Column::State.is_in(TEARDOWN_SWEPT_STATES))
             .order_by_desc(deployments::Column::CreatedAt)
             .limit(MAX_TEARDOWN_DEPLOYMENTS_PER_PASS)
@@ -2617,9 +2620,47 @@ WHERE project.id = $2
         .await
         .ok();
 
+        // The previous deployment drains its in-flight requests for the
+        // project's stop timeout before it is killed (#1806).
+        let stop_grace = superseded_stop_grace(self.db.as_ref(), environment_id).await;
+        let teardown_timeout = teardown_budget(
+            std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
+            stop_grace,
+        );
+        if !previous_deployments.is_empty() {
+            self.log(format!(
+                "Stopping previous containers with a {}s grace period",
+                stop_grace.as_secs()
+            ))
+            .await
+            .ok();
+        }
+
         let mut incomplete_teardowns = 0usize;
         for deployment in previous_deployments {
             let deployment_id = deployment.id;
+            let lifecycle_lock = environment_lifecycle_lock(environment_id);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let deployment = match deployment_still_swept(self.db.as_ref(), deployment_id).await {
+                Ok(Some(deployment)) => deployment,
+                Ok(None) => {
+                    self.log(format!(
+                        "Deployment {deployment_id} changed state before teardown; leaving it as is"
+                    ))
+                    .await
+                    .ok();
+                    continue;
+                }
+                Err(e) => {
+                    self.log(format!(
+                        "Failed to re-read deployment {deployment_id} before teardown: {e}"
+                    ))
+                    .await
+                    .ok();
+                    incomplete_teardowns += 1;
+                    continue;
+                }
+            };
             self.log(format!(
                 "Tearing down deployment {} (state: {})",
                 deployment_id, deployment.state
@@ -2689,8 +2730,8 @@ WHERE project.id = $2
                 async move {
                     let container_id = container.container_id.clone();
                     let result = tokio::time::timeout(
-                        std::time::Duration::from_secs(CONTAINER_TEARDOWN_TIMEOUT_SECS),
-                        self.teardown_container(container, project_id, env_id),
+                        teardown_timeout,
+                        self.teardown_container(container, project_id, env_id, stop_grace),
                     )
                     .await;
                     match result {
@@ -2704,7 +2745,8 @@ WHERE project.id = $2
                         Err(_) => {
                             self.log(format!(
                                 "Timed out tearing down container {} after {}s — will retry on next sweep",
-                                container_id, CONTAINER_TEARDOWN_TIMEOUT_SECS
+                                container_id,
+                                teardown_timeout.as_secs()
                             ))
                             .await
                             .ok();
@@ -2924,6 +2966,7 @@ pub struct MarkDeploymentCompleteJobBuilder {
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     workload_plane: Option<Arc<temps_workload_plane::WorkloadPlane>>,
     environment_addresses: Option<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: Option<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 impl MarkDeploymentCompleteJobBuilder {
@@ -2940,6 +2983,7 @@ impl MarkDeploymentCompleteJobBuilder {
             encryption_service: None,
             workload_plane: None,
             environment_addresses: None,
+            workflow_control: None,
         }
     }
 
@@ -3009,6 +3053,14 @@ impl MarkDeploymentCompleteJobBuilder {
         self
     }
 
+    pub fn workflow_control(
+        mut self,
+        control: Option<Arc<dyn temps_core::WorkflowControl>>,
+    ) -> Self {
+        self.workflow_control = control;
+        self
+    }
+
     pub fn build(self) -> Result<MarkDeploymentCompleteJob, WorkflowError> {
         let job_id = self
             .job_id
@@ -3048,6 +3100,7 @@ impl MarkDeploymentCompleteJobBuilder {
             job = job.with_log_service(log_service);
         }
         job = job.with_config_service(config_service);
+        job.workflow_control = self.workflow_control;
         if let Some(plane) = self.workload_plane {
             job = job.with_workload_plane(plane);
         }
@@ -3204,7 +3257,6 @@ mod teardown_tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex as StdMutex;
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployer::{
         ContainerDeployer, ContainerInfo, ContainerStats, DeployRequest, DeployResult,
         DeployerError,
@@ -3212,6 +3264,7 @@ mod teardown_tests {
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
     use temps_entities::{deployment_containers, environments, projects};
+    use temps_test_utils::TestDatabase;
 
     struct RouteEvents(std::collections::VecDeque<Job>);
 
@@ -3442,6 +3495,28 @@ mod teardown_tests {
         fail_remove: std::sync::atomic::AtomicBool,
         /// When set, `remove_container` reports the container as already gone.
         container_missing: std::sync::atomic::AtomicBool,
+        /// When set, `stop_container` fails like an unreachable daemon.
+        fail_stop: std::sync::atomic::AtomicBool,
+        started: Arc<StdMutex<Vec<String>>>,
+        /// Every operation in order, so a test can see which side of a race won.
+        operations: Arc<StdMutex<Vec<String>>>,
+        /// When set, `stop_container` waits here until the test releases it.
+        stop_gate: StdMutex<Option<Arc<OperationGate>>>,
+        /// When set, `start_container` waits here until the test releases it.
+        start_gate: StdMutex<Option<Arc<OperationGate>>>,
+        /// When set, every stop takes this long, so stops overlap.
+        stop_delay: StdMutex<Option<std::time::Duration>>,
+        stops_in_flight: std::sync::atomic::AtomicUsize,
+        most_stops_in_flight: std::sync::atomic::AtomicUsize,
+        /// The grace period of every graceful stop, by container.
+        stop_graces: Arc<StdMutex<Vec<(String, std::time::Duration)>>>,
+    }
+
+    /// Holds a deployer operation open so a test can run something against it.
+    #[derive(Default)]
+    struct OperationGate {
+        entered: tokio::sync::Notify,
+        released: tokio::sync::Notify,
     }
 
     impl RecordingDeployer {
@@ -3451,7 +3526,45 @@ mod teardown_tests {
                 removed: Arc::new(StdMutex::new(Vec::new())),
                 fail_remove: std::sync::atomic::AtomicBool::new(false),
                 container_missing: std::sync::atomic::AtomicBool::new(false),
+                fail_stop: std::sync::atomic::AtomicBool::new(false),
+                started: Arc::new(StdMutex::new(Vec::new())),
+                operations: Arc::new(StdMutex::new(Vec::new())),
+                stop_gate: StdMutex::new(None),
+                start_gate: StdMutex::new(None),
+                stop_delay: StdMutex::new(None),
+                stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                most_stops_in_flight: std::sync::atomic::AtomicUsize::new(0),
+                stop_graces: Arc::new(StdMutex::new(Vec::new())),
             }
+        }
+
+        fn hold_stops(&self) -> Arc<OperationGate> {
+            let gate = Arc::new(OperationGate::default());
+            *self.stop_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+
+        fn hold_starts(&self) -> Arc<OperationGate> {
+            let gate = Arc::new(OperationGate::default());
+            *self.start_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+    }
+
+    impl OperationGate {
+        /// Wait for the operation to arrive. Bounded so a failure before it
+        /// fails the test instead of hanging the whole run.
+        async fn reached(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(120), self.entered.notified())
+                .await
+                .expect("the held deployer operation was never reached");
+        }
+    }
+
+    async fn pass_through(gate: Option<Arc<OperationGate>>) {
+        if let Some(gate) = gate {
+            gate.entered.notify_one();
+            gate.released.notified().await;
         }
     }
 
@@ -3478,12 +3591,43 @@ mod teardown_tests {
                 request.container_name
             )))
         }
-        async fn start_container(&self, _id: &str) -> Result<(), DeployerError> {
+        async fn start_container(&self, id: &str) -> Result<(), DeployerError> {
+            let gate = self.start_gate.lock().unwrap().clone();
+            pass_through(gate).await;
+            self.started.lock().unwrap().push(id.to_string());
+            self.operations.lock().unwrap().push(format!("start {id}"));
             Ok(())
         }
         async fn stop_container(&self, id: &str) -> Result<(), DeployerError> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let in_flight = self.stops_in_flight.fetch_add(1, SeqCst) + 1;
+            self.most_stops_in_flight.fetch_max(in_flight, SeqCst);
+            let delay = *self.stop_delay.lock().unwrap();
+            if let Some(delay) = delay {
+                tokio::time::sleep(delay).await;
+            }
+            let gate = self.stop_gate.lock().unwrap().clone();
+            pass_through(gate).await;
+            self.stops_in_flight.fetch_sub(1, SeqCst);
+            if self.fail_stop.load(SeqCst) {
+                return Err(DeployerError::Other(format!(
+                    "stop of container {id} failed"
+                )));
+            }
             self.stopped.lock().unwrap().push(id.to_string());
+            self.operations.lock().unwrap().push(format!("stop {id}"));
             Ok(())
+        }
+        async fn stop_container_with_grace(
+            &self,
+            id: &str,
+            grace: std::time::Duration,
+        ) -> Result<(), DeployerError> {
+            self.stop_graces
+                .lock()
+                .unwrap()
+                .push((id.to_string(), grace));
+            self.stop_container(id).await
         }
         async fn pause_container(&self, _id: &str) -> Result<(), DeployerError> {
             Ok(())
@@ -3807,7 +3951,7 @@ mod teardown_tests {
             )
             .await;
 
-        assert_eq!(result.status, temps_core::JobStatus::Success);
+        assert_eq!(result.status, crate::workflow::JobStatus::Success);
         assert_eq!(
             result
                 .context
@@ -4361,11 +4505,134 @@ mod teardown_tests {
         );
     }
 
+    /// #1806: a superseded deployment's containers drain for the stop timeout
+    /// the environment sets, else the project's, else the default 10 s.
+    #[tokio::test]
+    async fn test_teardown_stops_previous_containers_with_the_configured_grace() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+
+        async fn graces_after_a_deploy(
+            db: &Arc<DbConnection>,
+            project_id: i32,
+            environment_id: i32,
+            round: &str,
+        ) -> Vec<(String, std::time::Duration)> {
+            let prev = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("prev-{round}"),
+                "completed",
+            )
+            .await;
+            insert_container(db, prev.id, &format!("prev-container-{round}")).await;
+            let new = insert_deployment(
+                db,
+                project_id,
+                environment_id,
+                &format!("new-{round}"),
+                "completed",
+            )
+            .await;
+            let deployer = Arc::new(RecordingDeployer::new());
+            let job = make_job(db.clone(), new.id, deployer.clone());
+            job.cancel_previous_deployments(environment_id, new.created_at)
+                .await;
+            let graces = deployer.stop_graces.lock().unwrap().clone();
+            // Leave only `new` live, so the next round starts clean.
+            deployments::Entity::update_many()
+                .col_expr(
+                    deployments::Column::State,
+                    sea_orm::sea_query::Expr::value("stopped"),
+                )
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+            graces
+        }
+
+        // Nothing configured: the 10 s Temps has always used.
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "default").await,
+            [(
+                "prev-container-default".to_string(),
+                std::time::Duration::from_secs(10)
+            )]
+        );
+
+        // The project's stop timeout.
+        let mut active: projects::ActiveModel = project.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(120),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "project").await,
+            [(
+                "prev-container-project".to_string(),
+                std::time::Duration::from_secs(120)
+            )]
+        );
+
+        // An environment override wins over the project.
+        let mut active: environments::ActiveModel = env.clone().into();
+        active.deployment_config = Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            stop_timeout_seconds: Some(30),
+            ..Default::default()
+        }));
+        active.update(db.as_ref()).await.unwrap();
+        assert_eq!(
+            graces_after_a_deploy(&db, project.id, env.id, "environment").await,
+            [(
+                "prev-container-environment".to_string(),
+                std::time::Duration::from_secs(30)
+            )]
+        );
+    }
+
     /// Regression: a previous deployment whose container could not be removed
     /// used to be flipped to "stopped" anyway. "stopped" deployments are never
     /// swept again, so the container row stayed live forever and the health
     /// monitor reported the leftover exited container as a crash on every
     /// poll. The deployment must stay sweepable until teardown succeeds.
+    /// The stop-and-remove helper tears down every superseded container, not
+    /// only a rejected deployment's, so its failure must not call the
+    /// container rejected: the sweep logs it as the teardown failure.
+    #[tokio::test]
+    async fn a_failed_container_removal_does_not_call_the_container_rejected() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_remove
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db, 42, deployer.clone());
+
+        let error = job
+            .stop_and_remove_container(
+                deployer.as_ref(),
+                "prev-container",
+                std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a refused removal is an error");
+
+        assert_eq!(
+            error,
+            "Failed to remove container prev-container: Other error: removal of container \
+             prev-container is already in progress"
+        );
+    }
+
     #[tokio::test]
     async fn test_failed_teardown_keeps_previous_deployment_sweepable() {
         let test_db = match TestDatabase::with_migrations().await {
@@ -4430,6 +4697,611 @@ mod teardown_tests {
             .unwrap()
             .unwrap();
         assert_eq!(prev_after.state, "stopped");
+    }
+
+    /// A deploy must leave nothing of an older paused deployment running, even
+    /// a container whose row claims it stopped (a pause used to record that
+    /// without having reached the container). It stays resumable: stopped,
+    /// never removed, and the deployment stays paused. A paused deployment
+    /// newer than the one finishing is not this deploy's to touch.
+    #[tokio::test]
+    async fn test_sweep_stops_but_keeps_containers_of_older_paused_deployments() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let still_running = insert_container(&db, paused.id, "paused-running").await;
+        let claims_stopped = insert_container(&db, paused.id, "paused-claims-stopped").await;
+        let mut active: deployment_containers::ActiveModel = claims_stopped.clone().into();
+        active.status = Set(Some("stopped".to_string()));
+        active.update(db.as_ref()).await.unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer-deploy", "paused").await;
+        insert_container(&db, newer.id, "newer-paused").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let mut stopped = deployer.stopped.lock().unwrap().clone();
+        stopped.sort();
+        assert_eq!(stopped, ["paused-claims-stopped", "paused-running"]);
+        assert!(
+            deployer.removed.lock().unwrap().is_empty(),
+            "a paused deployment must stay resumable"
+        );
+        let paused_after = deployments::Entity::find_by_id(paused.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(paused_after.state, "paused");
+        let row = deployment_containers::Entity::find_by_id(still_running.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+        assert!(row.finished_at.is_some());
+        assert!(row.deleted_at.is_none());
+    }
+
+    /// A microVM paused before pause refused them has no stopped state: the
+    /// only way to leave it not running next to the new deployment is to
+    /// retire it through the plane, and Docker is never asked about it.
+    #[tokio::test]
+    async fn test_sweep_retires_a_micro_vm_replica_of_a_paused_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-vm").await;
+        let plane =
+            crate::services::services::tests::plane_with_micro_vm_replica(&db, &paused, &container)
+                .await
+                .unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone()).with_workload_plane(plane);
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        let workload = crate::services::plane_deployer::deployment_replica_workload(
+            db.as_ref(),
+            paused.id,
+            "paused-vm",
+        )
+        .await
+        .unwrap()
+        .expect("the replica's workload");
+        assert!(workload.retired, "the plane retired the microVM");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+    }
+
+    /// A stop that fails leaves the row saying what is true, so the next
+    /// deploy tries again.
+    #[tokio::test]
+    async fn test_sweep_keeps_paused_container_running_when_its_stop_fails() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-running").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+        assert!(row.finished_at.is_none());
+
+        deployer
+            .fail_stop
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+        assert_eq!(
+            deployer.stopped.lock().unwrap().as_slice(),
+            ["paused-running"]
+        );
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("stopped"));
+    }
+
+    /// Without a plane nothing here can retire a microVM, and Docker would
+    /// answer 404 for it. The row must keep saying the replica runs, so the next
+    /// deployment asks again, rather than the 404 reading as stopped.
+    #[tokio::test]
+    async fn test_sweep_without_a_plane_keeps_a_micro_vm_replica_for_a_later_retry() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-vm").await;
+        crate::services::services::tests::plane_with_micro_vm_replica(&db, &paused, &container)
+            .await
+            .unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.stop_paused_deployments(env.id, new.created_at).await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+        assert!(row.deleted_at.is_none());
+        let workload = crate::services::plane_deployer::deployment_replica_workload(
+            db.as_ref(),
+            paused.id,
+            "paused-vm",
+        )
+        .await
+        .unwrap()
+        .expect("the replica's workload");
+        assert!(!workload.retired);
+    }
+
+    /// A state something else moved the deployment to during an incomplete
+    /// pause is neither overwritten nor misreported, and no retry is advised
+    /// that a pause would refuse.
+    #[tokio::test]
+    async fn test_incomplete_pause_reports_the_state_a_concurrent_change_left() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let live = insert_deployment(&db, project.id, env.id, "live-deploy", "deployed").await;
+        insert_container(&db, live.id, "cannot-stop").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        deployer
+            .fail_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let stops = deployer.hold_stops();
+        let service = crate::services::services::tests::create_cleanup_service_for_test(
+            db.clone(),
+            deployer.clone(),
+        );
+        let (project_id, live_id) = (project.id, live.id);
+        let pause =
+            tokio::spawn(async move { service.pause_deployment(project_id, live_id).await });
+        stops.reached().await;
+
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("stopped"))
+            .filter(deployments::Column::Id.eq(live.id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        stops.released.notify_one();
+
+        let error = pause.await.unwrap().expect_err("the stop failed");
+        let message = error.to_string();
+        assert!(message.contains("'stopped'"), "{message}");
+        assert!(!message.contains("pause it again"), "{message}");
+        let after = deployments::Entity::find_by_id(live.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, "stopped");
+    }
+
+    /// A resume leaves a deployment "deployed", and a later deploy supersedes it
+    /// like any other: nothing else would ever stop its containers.
+    #[tokio::test]
+    async fn test_teardown_includes_an_older_resumed_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let resumed =
+            insert_deployment(&db, project.id, env.id, "resumed-deploy", "deployed").await;
+        let container = insert_container(&db, resumed.id, "resumed-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert_eq!(*deployer.removed.lock().unwrap(), ["resumed-container"]);
+        let after = deployments::Entity::find_by_id(resumed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.state, "stopped");
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(row.deleted_at.is_some());
+    }
+
+    /// A deployment paused after a sweep selected it must keep its containers,
+    /// or a resume has nothing to start. So the sweep holds the lifecycle lock
+    /// while it removes containers, and reads the state again under it.
+    #[tokio::test]
+    async fn test_teardown_keeps_a_deployment_paused_after_it_was_selected() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let older = insert_deployment(&db, project.id, env.id, "older-deploy", "deployed").await;
+        let older_container = insert_container(&db, older.id, "older-container").await;
+        let newer = insert_deployment(&db, project.id, env.id, "newer-deploy", "deployed").await;
+        insert_container(&db, newer.id, "newer-container").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        // Newest first, so holding this stop leaves `older` selected but not
+        // yet torn down, which is where a pause can land.
+        let deployer = Arc::new(RecordingDeployer::new());
+        let stops = deployer.hold_stops();
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        let (env_id, new_created_at) = (env.id, new.created_at);
+        let sweep = tokio::spawn(async move {
+            job.cancel_previous_deployments(env_id, new_created_at)
+                .await;
+        });
+        stops.reached().await;
+        assert!(
+            environment_lifecycle_lock(env.id).try_lock().is_err(),
+            "removing containers must hold the lock a pause takes"
+        );
+
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("paused"))
+            .filter(deployments::Column::Id.eq(older.id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        *deployer.stop_gate.lock().unwrap() = None;
+        stops.released.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(120), sweep)
+            .await
+            .expect("the sweep finishes")
+            .unwrap();
+
+        assert_eq!(*deployer.removed.lock().unwrap(), ["newer-container"]);
+        let older_row = deployment_containers::Entity::find_by_id(older_container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(older_row.deleted_at.is_none());
+        let older_after = deployments::Entity::find_by_id(older.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(older_after.state, "paused");
+    }
+
+    /// A sweep that read "paused" must finish before a resume starts anything:
+    /// otherwise its stop lands on the container the resume just started, and
+    /// a "deployed" deployment has nothing running.
+    #[tokio::test]
+    async fn test_resume_waits_for_a_sweep_stopping_the_same_deployment() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "raced").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let stops = deployer.hold_stops();
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        let new_created_at = new.created_at;
+        let env_id = env.id;
+        let sweep = tokio::spawn(async move {
+            job.stop_paused_deployments(env_id, new_created_at).await;
+        });
+        stops.reached().await;
+
+        let service = crate::services::services::tests::create_cleanup_service_for_test(
+            db.clone(),
+            deployer.clone(),
+        );
+        let (project_id, paused_id) = (project.id, paused.id);
+        let resume =
+            tokio::spawn(async move { service.resume_deployment(project_id, paused_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            deployer.started.lock().unwrap().is_empty(),
+            "a resume must not start a container a sweep is stopping"
+        );
+
+        stops.released.notify_one();
+        sweep.await.unwrap();
+        resume.await.unwrap().unwrap();
+
+        assert_eq!(
+            *deployer.operations.lock().unwrap(),
+            ["stop raced", "start raced"]
+        );
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
+        let deployment = deployments::Entity::find_by_id(paused.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(deployment.state, "deployed");
+    }
+
+    /// A sweep arriving during a resume reads the state only once the resume
+    /// is done, so it finds nothing paused to stop.
+    #[tokio::test]
+    async fn test_sweep_leaves_alone_a_deployment_being_resumed() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        insert_container(&db, paused.id, "resumed").await;
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let starts = deployer.hold_starts();
+        let service = crate::services::services::tests::create_cleanup_service_for_test(
+            db.clone(),
+            deployer.clone(),
+        );
+        let (project_id, paused_id) = (project.id, paused.id);
+        let resume =
+            tokio::spawn(async move { service.resume_deployment(project_id, paused_id).await });
+        starts.reached().await;
+
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        let new_created_at = new.created_at;
+        let env_id = env.id;
+        let sweep = tokio::spawn(async move {
+            job.stop_paused_deployments(env_id, new_created_at).await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        starts.released.notify_one();
+        resume.await.unwrap().unwrap();
+        sweep.await.unwrap();
+
+        assert_eq!(*deployer.operations.lock().unwrap(), ["start resumed"]);
+    }
+
+    /// A resume arriving while a pause is stopping waits for it, so the pause's
+    /// stop cannot land after the resume's start.
+    #[tokio::test]
+    async fn test_resume_waits_for_a_pause_in_progress() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let live = insert_deployment(&db, project.id, env.id, "live-deploy", "deployed").await;
+        insert_container(&db, live.id, "paused-then-resumed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let stops = deployer.hold_stops();
+        let service = Arc::new(
+            crate::services::services::tests::create_cleanup_service_for_test(
+                db.clone(),
+                deployer.clone(),
+            ),
+        );
+        let (project_id, live_id) = (project.id, live.id);
+        let pausing = service.clone();
+        let pause =
+            tokio::spawn(async move { pausing.pause_deployment(project_id, live_id).await });
+        stops.reached().await;
+
+        let resuming = service.clone();
+        let resume =
+            tokio::spawn(async move { resuming.resume_deployment(project_id, live_id).await });
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            deployer.started.lock().unwrap().is_empty(),
+            "a resume must not start a container a pause is stopping"
+        );
+
+        stops.released.notify_one();
+        pause.await.unwrap().unwrap();
+        resume.await.unwrap().unwrap();
+        assert_eq!(
+            *deployer.operations.lock().unwrap(),
+            ["stop paused-then-resumed", "start paused-then-resumed"]
+        );
+    }
+
+    /// A deployment with many replicas does not hit its runtime with all of
+    /// the stops at once, but they do still overlap.
+    #[tokio::test]
+    async fn test_pause_and_sweep_bound_how_many_replicas_they_stop_at_once() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let replicas = MAX_CONCURRENT_REPLICA_STOPS * 3;
+        let assert_bounded = |deployer: &RecordingDeployer, operation: &str| {
+            assert_eq!(deployer.stopped.lock().unwrap().len(), replicas);
+            let most = deployer
+                .most_stops_in_flight
+                .load(std::sync::atomic::Ordering::SeqCst);
+            assert_eq!(
+                most, MAX_CONCURRENT_REPLICA_STOPS,
+                "{operation} stopped {most} replicas at once"
+            );
+        };
+        let slow_deployer = || {
+            let deployer = RecordingDeployer::new();
+            *deployer.stop_delay.lock().unwrap() = Some(std::time::Duration::from_millis(20));
+            Arc::new(deployer)
+        };
+
+        let live = insert_deployment(&db, project.id, env.id, "live-deploy", "deployed").await;
+        for replica in 0..replicas {
+            insert_container(&db, live.id, &format!("live-{replica}")).await;
+        }
+        let deployer = slow_deployer();
+        let service = crate::services::services::tests::create_cleanup_service_for_test(
+            db.clone(),
+            deployer.clone(),
+        );
+        service.pause_deployment(project.id, live.id).await.unwrap();
+        assert_bounded(&deployer, "a pause");
+
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+        let deployer = slow_deployer();
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.stop_paused_deployments(env.id, new.created_at).await;
+        assert_bounded(&deployer, "a sweep");
+    }
+
+    /// A worker's container is never looked for on this host: if the worker
+    /// cannot be reached, nothing is stopped and nothing is recorded.
+    #[tokio::test]
+    async fn test_sweep_never_stops_a_worker_container_on_the_local_runtime() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(_) => {
+                println!("Postgres not available, skipping");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (project, env) = seed_project_env(&db).await;
+        let paused = insert_deployment(&db, project.id, env.id, "paused-deploy", "paused").await;
+        let container = insert_container(&db, paused.id, "paused-on-worker").await;
+        // No agent token, so this worker can never be dialled.
+        let node = nodes::ActiveModel {
+            name: Set("worker-unreachable".to_string()),
+            token_hash: Set("unused".to_string()),
+            token_encrypted: Set(None),
+            address: Set("https://127.0.0.1:1".to_string()),
+            private_address: Set("127.0.0.1".to_string()),
+            role: Set("worker".to_string()),
+            status: Set("offline".to_string()),
+            labels: Set(serde_json::json!({})),
+            capacity: Set(serde_json::json!({})),
+            dns_resolver_consecutive_failures: Set(0),
+            build_limits: Set(None),
+            public_ingress_enabled: Set(false),
+            public_ingress_unsupported_reasons: Set(serde_json::json!([])),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        let mut active: deployment_containers::ActiveModel = container.clone().into();
+        active.node_id = Set(Some(node.id));
+        active.update(db.as_ref()).await.unwrap();
+        let new = insert_deployment(&db, project.id, env.id, "new-deploy", "completed").await;
+
+        let deployer = Arc::new(RecordingDeployer::new());
+        let job = make_job(db.clone(), new.id, deployer.clone());
+        job.cancel_previous_deployments(env.id, new.created_at)
+            .await;
+
+        assert!(deployer.stopped.lock().unwrap().is_empty());
+        let row = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status.as_deref(), Some("running"));
     }
 
     /// A container that is already gone from Docker (pruned, removed by hand)

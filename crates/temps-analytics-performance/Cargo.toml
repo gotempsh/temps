@@ -16,7 +16,7 @@ temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 temps-routes = { path = "../temps-routes" }
 temps-geo = { path = "../temps-geo" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 # ADR-040 analytics ingest keys. Downward-only: temps-analytics depends on
 # neither temps-routes nor this crate, so there is no cycle.
 temps-analytics = { path = "../temps-analytics" }
@@ -53,11 +53,11 @@ utoipa = { workspace = true }
 woothee = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 maplit = { workspace = true }
 sea-orm = { workspace = true }
 async-trait = { workspace = true }
 # Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
-temps-database = { path = "../temps-database" }
 tower = { workspace = true }
 
 [lints]

@@ -4,8 +4,7 @@
 import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { traceDetailPath } from '@/lib/traces-time-window'
 import { ChartGantt, Layers } from 'lucide-react'
-import { ProjectCardMedia } from '@/components/dashboard/ProjectCardMedia'
-import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import {
   durationBarClass,
   durationShare,
@@ -22,10 +21,13 @@ import {
   canonicalAttributeFilter,
   planAttributeUrlSync,
 } from '@/lib/attribute-facets'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { Link } from 'react-router'
-import { useQuery } from '@tanstack/react-query'
-import { queryGlobalTraceSummariesOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  queryGlobalTraceSummariesOptions,
+  queryGlobalTraceSummariesQueryKey,
+} from '@/api/client/@tanstack/react-query.gen'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   GlobalPage,
   GlobalPagination,
@@ -44,6 +46,9 @@ import { Badge } from '@/components/ui/badge'
 import { SortableTableHead } from '@/components/ui/sortable-table-head'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { OBSERVABILITY_PAGE_SIZE } from '@/lib/global-observability'
+import { useGlobalPageInRange } from '@/hooks/useGlobalView'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 
 export default function GlobalTraces() {
   const view = useGlobalView()
@@ -105,7 +110,7 @@ export default function GlobalTraces() {
     urlValue,
     patchView,
   ])
-  const query = useQuery({
+  const query = useWindowQuery({
     ...queryGlobalTraceSummariesOptions({
       query: {
         project_id: view.projectId,
@@ -122,21 +127,16 @@ export default function GlobalTraces() {
     }),
     retry: false,
   })
-  const projectIds = [
-    ...new Set(query.data?.data.map((trace) => trace.project_id) ?? []),
-  ].sort((a, b) => a - b)
-  const media = useLatestDeploymentMedia(projectIds)
   const projectImage = (id: number, name: string) => (
-    <ProjectCardMedia
-      name={name}
-      className="size-6 [&_img]:p-0.5"
-      deploymentUrl={media.data?.projects?.[String(id)]?.url}
-      screenshotLocation={
-        media.data?.projects?.[String(id)]?.screenshot_location
-      }
-    />
+    <ServiceIcon service={{ id, name }} size="sm" />
   )
   const traces = query.data?.data ?? []
+  useGlobalPageInRange(
+    view,
+    query.data && !query.isPlaceholderData
+      ? { rows: traces.length, total: query.data.total }
+      : undefined
+  )
   // Bars compare traces on this page, so the slowest one fills its track.
   const slowestMs = Math.max(0, ...traces.map((trace) => trace.duration_ms))
   return (
@@ -144,8 +144,7 @@ export default function GlobalTraces() {
       title="Traces"
       description="Follow requests across services."
       view={view}
-      fetching={query.isFetching}
-      refresh={() => void query.refetch()}
+      refreshQueryKeys={[queryKeyPrefix(queryGlobalTraceSummariesQueryKey)]}
       searchLabel="Search span names"
       filterNotice={attribute.notice}
       filters={
@@ -185,6 +184,11 @@ export default function GlobalTraces() {
         error={query.error}
         empty={!traces.length}
         retry={() => void query.refetch()}
+        setup={
+          !view.search && status === 'all' ? (
+            <ObservabilitySetupGuide kind="traces" projectId={view.projectId} />
+          ) : undefined
+        }
       >
         <div className="rounded-lg border">
           <Table>
@@ -256,7 +260,7 @@ export function TraceRow({
   const outcome = OUTCOME[traceOutcome(trace)]
   const projectPath = `/projects/${encodeURIComponent(trace.project_slug)}`
   return (
-    <TableRow>
+    <RecordRow>
       <TableCell className="min-w-36 py-2.5">
         <p className="mb-1 flex items-center gap-2 text-xs text-muted-foreground md:hidden">
           {projectImage}
@@ -335,6 +339,6 @@ export function TraceRow({
       <TableCell className="hidden whitespace-nowrap py-2.5 text-sm text-muted-foreground md:table-cell">
         <TimeAgo date={trace.start_time} />
       </TableCell>
-    </TableRow>
+    </RecordRow>
   )
 }

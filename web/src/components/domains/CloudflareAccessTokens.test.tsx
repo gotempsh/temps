@@ -1,11 +1,30 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { cleanup, render as renderDom, waitFor } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
+import { MemoryRouter } from 'react-router'
 import type { AccessProviderResponse } from '@/api/client'
 import { deleteBlockedReason } from '@/lib/cloudflare-access'
-import { SavedAccessToken } from './CloudflareAccessTokens'
+import {
+  CONSOLE_MAX_SCROLL,
+  ConsoleShell,
+  NEAR_THE_END,
+  expectOnlyConsoleScrolled,
+} from '@/test/console-shell'
+import { installBrowserWindow } from '@/test/dom'
+import { installFakeScrollLayout } from '@/test/fake-scroll-layout'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+import {
+  CloudflareAccessTokens,
+  SavedAccessToken,
+} from './CloudflareAccessTokens'
+
+installBrowserWindow()
+const layout = installFakeScrollLayout()
+afterEach(cleanup)
 
 const provider = (addresses: number): AccessProviderResponse => ({
   id: 7,
@@ -47,5 +66,27 @@ describe('SavedAccessToken', () => {
 
   test('someone who cannot delete is not told how to unblock it', () => {
     expect(render(2, false)).not.toContain('delete-blocked')
+  })
+})
+
+describe('CloudflareAccessTokens', () => {
+  test('a #cloudflare-access link scrolls the page to the card and leaves the shell in place', async () => {
+    mockApi({ 'GET /cloudflare-access/providers': () => jsonResponse([]) })
+    layout.place('#cloudflare-access', NEAR_THE_END)
+    renderDom(
+      <QueryClientProvider
+        client={
+          new QueryClient({ defaultOptions: { queries: { retry: false } } })
+        }
+      >
+        <MemoryRouter initialEntries={['/domains#cloudflare-access']}>
+          <ConsoleShell>
+            <CloudflareAccessTokens canManage />
+          </ConsoleShell>
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    await waitFor(() => expect(layout.scrolls.length).toBeGreaterThan(0))
+    expectOnlyConsoleScrolled(layout, CONSOLE_MAX_SCROLL)
   })
 })

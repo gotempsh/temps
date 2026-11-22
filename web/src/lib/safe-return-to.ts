@@ -26,6 +26,9 @@ export function safeReturnTo(value: string | null | undefined): string | null {
     return null
   }
   if (url.origin !== PLACEHOLDER_ORIGIN) return null
+  // Dot segments are resolved only now: `/projects/..//host` normalises to
+  // `//host`, which a link would treat as another origin.
+  if (url.pathname.startsWith('//')) return null
   return `${url.pathname}${url.search}${url.hash}`
 }
 

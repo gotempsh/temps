@@ -85,7 +85,7 @@ underneath it is not reusable as-is:
 1. **It buffers.** `.oneshot()` then `.collect().await.to_bytes()`
    (`host_api.rs:441–451`), capped at `MAX_RESPONSE_BYTES = 8 MiB`
    (`host_api.rs:65`) / `MAX_CALL_BODY_BYTES = 32 MiB`
-   (`crates/temps-core/src/external_plugin/channel.rs:401`). A log tail
+   (`crates/temps-plugin-protocol/src/channel.rs:401`). A log tail
    never completes; buffering it just hangs forever.
 2. **No WebSocket-upgrade concept.** A `oneshot` call returns one
    `Response`; there is nothing for the raw duplex byte stream a `101`
@@ -825,7 +825,7 @@ instance, and quota behaviour (head-sampling, never silent drops) applies.
 - `crates/temps-auth/src/rate_limit.rs:112–128` — `auth_rate_limit_middleware`, verified to already key on `resolve_client_ip`, not the raw peer socket
 - `crates/temps-auth/src/oidc_service.rs`, `oidc_handler.rs`, `audit.rs` — `OidcService`, `resolve_user`, `evaluate_role`, `trust_idp_email`, existing audit types
 - `crates/temps-entities/src/s3_sources.rs`, `m20260830_000001_add_managed_by_cloud_to_s3_sources.rs` — the `managed_by_cloud` precedent
-- `crates/temps-core/src/app_settings.rs:249–312` — `CloudSettings`; `web/src/pages/settings/CloudSettingsPage.tsx` — switches this ADR's joins
+- `crates/temps-config/src/app_settings/mod.rs:249–312` — `CloudSettings`; `web/src/pages/settings/CloudSettingsPage.tsx` — switches this ADR's joins
 - ADR-039 (capability negotiation), ADR-040 (compromised-Cloud trust boundary this ADR extends), ADR-044 (provisioning/disconnect ordering this ADR's OIDC lifecycle follows)
 
 ### Browser-bound callback correlation

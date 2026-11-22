@@ -284,7 +284,7 @@ fn apply_managed_service_bindings(
         return Ok(());
     };
     let instance =
-        serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(value.clone())
+        serde_json::from_value::<temps_presets::templates::ServiceTemplateInstance>(value.clone())
             .map_err(
                 |error| DeploymentEnvResolutionError::InvalidServiceTemplate {
                     project_id,
@@ -307,7 +307,7 @@ fn apply_managed_service_bindings(
         .unwrap_or_default();
 
     for (service, bindings) in bindings_by_type {
-        let normalized_service = temps_core::templates::canonical_managed_service_type(&service);
+        let normalized_service = temps_presets::templates::canonical_managed_service_type(&service);
         let service_candidates = linked_service_vars_by_type
             .get(&normalized_service)
             .ok_or_else(|| DeploymentEnvResolutionError::ManagedServiceTypeMissing {
@@ -557,7 +557,7 @@ impl DeploymentEnvResolver {
                 }
             };
             let service_type =
-                temps_core::templates::canonical_managed_service_type(&service.service_type);
+                temps_presets::templates::canonical_managed_service_type(&service.service_type);
             match self
                 .external_service_manager
                 .get_runtime_env_vars(project_service.service_id, project.id, environment.id)
@@ -847,9 +847,9 @@ mod tests {
     };
 
     fn keycloak_release_json() -> serde_json::Value {
-        serde_json::to_value(temps_core::templates::ServiceTemplateInstance::new(
-            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
-            temps_core::templates::bundled_template_by_slug("keycloak")
+        serde_json::to_value(temps_presets::templates::ServiceTemplateInstance::new(
+            temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+            temps_presets::templates::bundled_template_by_slug("keycloak")
                 .expect("Keycloak service template must be bundled"),
         ))
         .expect("service release should serialize")
@@ -1095,11 +1095,10 @@ mod tests {
             ("POSTGRES_USER".to_string(), "temps".to_string()),
             ("POSTGRES_PASSWORD".to_string(), "secret".to_string()),
         ]);
-        let mut instance =
-            serde_json::from_value::<temps_core::templates::ServiceTemplateInstance>(
-                keycloak_release_json(),
-            )
-            .expect("valid Keycloak service instance");
+        let mut instance = serde_json::from_value::<
+            temps_presets::templates::ServiceTemplateInstance,
+        >(keycloak_release_json())
+        .expect("valid Keycloak service instance");
         let bindings = instance.template.services[0]
             .database_bindings
             .remove("postgres")
@@ -1127,7 +1126,7 @@ mod tests {
 
     #[test]
     fn each_service_of_an_app_gets_its_own_bindings() {
-        let template: temps_core::templates::ProjectTemplate = yaml_serde::from_str(
+        let template: temps_presets::templates::ProjectTemplate = yaml_serde::from_str(
             r#"
 slug: secrets-manager
 name: Secrets manager
@@ -1150,8 +1149,8 @@ services:
 "#,
         )
         .expect("multi-service template");
-        let release = temps_core::templates::ServiceTemplateInstance::new(
-            temps_core::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
+        let release = temps_presets::templates::ServiceTemplateInstance::new(
+            temps_presets::templates::SERVICE_TEMPLATE_SCHEMA_VERSION,
             template,
         );
         let linked = HashMap::from([(

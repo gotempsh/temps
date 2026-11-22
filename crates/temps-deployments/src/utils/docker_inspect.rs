@@ -28,7 +28,7 @@ use tracing::{debug, warn};
 ///
 /// # async fn example() -> Result<(), anyhow::Error> {
 /// let docker = Docker::connect_with_local_defaults()?;
-/// let ports = get_exposed_ports(&docker, TEST_IMAGE).await?;
+/// let ports = get_exposed_ports(&docker, "nginx:latest").await?;
 /// println!("Exposed ports: {:?}", ports); // [80, 443]
 /// # Ok(())
 /// # }

@@ -7,6 +7,10 @@
 //! This job is used for remote deployments where static files are built externally
 //! and uploaded as a tar.gz or zip bundle.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -16,7 +20,6 @@ use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tar::EntryType;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployment_logs::{LogLevel, LogService};
 use tracing::{debug, error, info, warn};

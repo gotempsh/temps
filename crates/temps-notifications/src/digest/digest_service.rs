@@ -4,9 +4,9 @@
 //! Weekly digest service for aggregating data and sending weekly emails
 
 use super::digest_data::*;
+use crate::error::{NotificationError, Result};
 use crate::services::NotificationService;
 use crate::types::{Notification, NotificationPriority, NotificationType};
-use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
@@ -129,7 +129,8 @@ impl DigestService {
             .filter(projects::Column::IsDeleted.eq(false))
             .order_by_asc(projects::Column::Id)
             .one(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("load the digest project name"))?;
 
         Ok(project
             .map(|p| p.name)
@@ -151,14 +152,18 @@ impl DigestService {
             .column(events::Column::SessionId)
             .distinct()
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database("count digest visitors"))?
+            as i64;
 
         // Count page views (events)
         let page_views = events::Entity::find()
             .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database("count digest page views"))?
+            as i64;
 
         // Calculate previous week for comparison
         let prev_week_start = week_start - Duration::days(7);
@@ -172,7 +177,10 @@ impl DigestService {
             .column(events::Column::SessionId)
             .distinct()
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database(
+                "count digest visitors for the previous week",
+            ))? as i64;
 
         let week_over_week_change = if prev_visitors > 0 {
             ((total_visitors - prev_visitors) as f64 / prev_visitors as f64) * 100.0
@@ -243,7 +251,10 @@ impl DigestService {
         let avg_seconds: f64 = self
             .db
             .query_one(stmt)
-            .await?
+            .await
+            .map_err(NotificationError::database(
+                "query the digest session duration",
+            ))?
             .and_then(|row| row.try_get::<f64>("", "avg_seconds").ok())
             .unwrap_or(0.0);
 
@@ -278,7 +289,12 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        if let Some(row) = self.db.query_one(stmt).await? {
+        if let Some(row) = self
+            .db
+            .query_one(stmt)
+            .await
+            .map_err(NotificationError::database("query the digest bounce rate"))?
+        {
             let bounced: f64 = row.try_get("", "bounced").unwrap_or(0.0);
             let total: f64 = row.try_get("", "total").unwrap_or(0.0);
             if total > 0.0 {
@@ -314,7 +330,11 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        let rows = self.db.query_all(stmt).await?;
+        let rows = self
+            .db
+            .query_all(stmt)
+            .await
+            .map_err(NotificationError::database("query the digest top pages"))?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -356,7 +376,11 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        let rows = self.db.query_all(stmt).await?;
+        let rows = self
+            .db
+            .query_all(stmt)
+            .await
+            .map_err(NotificationError::database("query the digest geography"))?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -401,7 +425,13 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        let rows = self.db.query_all(stmt).await?;
+        let rows = self
+            .db
+            .query_all(stmt)
+            .await
+            .map_err(NotificationError::database(
+                "query the digest visitor trend",
+            ))?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -423,20 +453,28 @@ impl DigestService {
         let total_deployments = deployments::Entity::find()
             .filter(deployments::Column::CreatedAt.between(week_start, week_end))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database("count digest deployments"))?
+            as i64;
 
         // Count successful vs failed deployments
         let successful_deployments = deployments::Entity::find()
             .filter(deployments::Column::CreatedAt.between(week_start, week_end))
             .filter(deployments::Column::State.eq("completed"))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database(
+                "count successful digest deployments",
+            ))? as i64;
 
         let failed_deployments = deployments::Entity::find()
             .filter(deployments::Column::CreatedAt.between(week_start, week_end))
             .filter(deployments::Column::State.eq("failed"))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database(
+                "count failed digest deployments",
+            ))? as i64;
 
         let success_rate = if total_deployments > 0 {
             (successful_deployments as f64 / total_deployments as f64) * 100.0
@@ -471,14 +509,18 @@ impl DigestService {
             .filter(error_events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(error_events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database("count digest error events"))?
+            as i64;
 
         // Error groups first seen this week — "new error types".
         let new_error_types = error_groups::Entity::find()
             .filter(error_groups::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(error_groups::Column::FirstSeen.between(week_start, week_end))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database("count new digest error groups"))?
+            as i64;
 
         // Distinct visitors affected by errors this week.
         let affected_users = error_events::Entity::find()
@@ -489,7 +531,10 @@ impl DigestService {
             .column(error_events::Column::VisitorId)
             .distinct()
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database(
+                "count users affected by digest errors",
+            ))? as i64;
 
         // Most common errors this week, grouped by error group.
         let most_common_errors = self
@@ -521,7 +566,13 @@ impl DigestService {
                 "#,
                 [week_start.into(), week_end.into()],
             );
-            match self.db.query_one(stmt).await? {
+            match self
+                .db
+                .query_one(stmt)
+                .await
+                .map_err(NotificationError::database(
+                    "query the digest error trend change",
+                ))? {
                 Some(row) => {
                     let operational: f64 = row.try_get("", "operational").unwrap_or(0.0);
                     let failed: i64 = row.try_get("", "failed").unwrap_or(0);
@@ -542,7 +593,10 @@ impl DigestService {
             .filter(events::Column::ProjectId.in_subquery(live_project_ids()))
             .filter(events::Column::Timestamp.between(week_start, week_end))
             .count(self.db.as_ref())
-            .await? as i64;
+            .await
+            .map_err(NotificationError::database(
+                "count digest page views for the error rate",
+            ))? as i64;
         let error_rate = if page_views > 0 {
             (total_errors as f64 / page_views as f64) * 1000.0
         } else {
@@ -589,7 +643,13 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        let rows = self.db.query_all(stmt).await?;
+        let rows = self
+            .db
+            .query_all(stmt)
+            .await
+            .map_err(NotificationError::database(
+                "query the most common digest errors",
+            ))?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -627,7 +687,11 @@ impl DigestService {
             [week_start.into(), week_end.into()],
         );
 
-        let rows = self.db.query_all(stmt).await?;
+        let rows = self
+            .db
+            .query_all(stmt)
+            .await
+            .map_err(NotificationError::database("query the digest error trend"))?;
         Ok(rows
             .into_iter()
             .filter_map(|row| {
@@ -654,7 +718,8 @@ impl DigestService {
             .filter(funnels::Column::IsActive.eq(true))
             .filter(funnels::Column::ProjectId.in_subquery(live_project_ids()))
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("load digest funnels"))?;
 
         let total_funnels = funnels.len() as i64;
         let prev_week_start = week_start - Duration::days(7);
@@ -665,7 +730,12 @@ impl DigestService {
                 .filter(funnel_steps::Column::FunnelId.eq(funnel.id))
                 .order_by_asc(funnel_steps::Column::StepOrder)
                 .all(self.db.as_ref())
-                .await?;
+                .await
+                .map_err(|source| NotificationError::DigestFunnelQuery {
+                    funnel_id: funnel.id,
+                    metric: "funnel steps",
+                    source,
+                })?;
 
             // A funnel needs at least one step to be measurable.
             let Some(first_step) = steps.first() else {
@@ -777,11 +847,16 @@ impl DigestService {
             ],
         );
 
-        // `funnel_id` is accepted for future per-funnel event filtering; the
-        // current model identifies funnel membership purely by event name.
-        let _ = funnel_id;
+        // `funnel_id` only names the funnel in errors; the current model
+        // identifies funnel membership purely by event name.
 
-        if let Some(row) = self.db.query_one(stmt).await? {
+        if let Some(row) = self.db.query_one(stmt).await.map_err(|source| {
+            NotificationError::DigestFunnelQuery {
+                funnel_id,
+                metric: "entries and completions",
+                source,
+            }
+        })? {
             let entries: i64 = row.try_get("", "entries").unwrap_or(0);
             let completions: i64 = row.try_get("", "completions").unwrap_or(0);
             return Ok((entries, completions));
@@ -802,7 +877,8 @@ impl DigestService {
         let all_projects = projects::Entity::find()
             .filter(projects::Column::IsDeleted.eq(false))
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(NotificationError::database("load digest projects"))?;
 
         let mut project_stats = Vec::new();
 
@@ -816,21 +892,36 @@ impl DigestService {
                 .column(events::Column::SessionId)
                 .distinct()
                 .count(self.db.as_ref())
-                .await? as i64;
+                .await
+                .map_err(|source| NotificationError::DigestProjectQuery {
+                    project_id: project.id,
+                    metric: "unique sessions",
+                    source,
+                })? as i64;
 
             // Count page views for this project
             let page_views = events::Entity::find()
                 .filter(events::Column::ProjectId.eq(project.id))
                 .filter(events::Column::Timestamp.between(week_start, week_end))
                 .count(self.db.as_ref())
-                .await? as i64;
+                .await
+                .map_err(|source| NotificationError::DigestProjectQuery {
+                    project_id: project.id,
+                    metric: "page views",
+                    source,
+                })? as i64;
 
             // Count deployments for this project
             let deployment_count = deployments::Entity::find()
                 .filter(deployments::Column::ProjectId.eq(project.id))
                 .filter(deployments::Column::CreatedAt.between(week_start, week_end))
                 .count(self.db.as_ref())
-                .await? as i64;
+                .await
+                .map_err(|source| NotificationError::DigestProjectQuery {
+                    project_id: project.id,
+                    metric: "deployments",
+                    source,
+                })? as i64;
 
             // Calculate previous week visitors for trend
             let prev_week_start = week_start - Duration::days(7);
@@ -844,7 +935,12 @@ impl DigestService {
                 .column(events::Column::SessionId)
                 .distinct()
                 .count(self.db.as_ref())
-                .await? as i64;
+                .await
+                .map_err(|source| NotificationError::DigestProjectQuery {
+                    project_id: project.id,
+                    metric: "previous week sessions",
+                    source,
+                })? as i64;
 
             let week_over_week_change = if prev_visitors > 0 {
                 ((visitors - prev_visitors) as f64 / prev_visitors as f64) * 100.0
@@ -948,7 +1044,9 @@ impl DigestService {
             .await
             .map_err(|e| {
                 error!("Failed to send weekly digest email: {}", e);
-                anyhow::anyhow!("Failed to send weekly digest: {}", e)
+                NotificationError::DigestSend {
+                    source: Box::new(e),
+                }
             })?;
 
         info!("Weekly digest email sent successfully");
@@ -961,8 +1059,8 @@ mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{deployments, environments, events, projects, users};
+    use temps_test_utils::TestDatabase;
 
     async fn setup_test_service() -> Result<(DigestService, TestDatabase), String> {
         let test_db = TestDatabase::with_migrations()
@@ -989,7 +1087,7 @@ mod tests {
             match setup_test_service().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                    if temps_test_utils::is_container_runtime_unavailable(&error) {
                         eprintln!("Skipping Docker-dependent digest test: {error}");
                         return;
                     }

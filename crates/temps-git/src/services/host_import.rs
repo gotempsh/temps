@@ -392,12 +392,10 @@ mod tests {
     async fn bootstrap_persistence_and_owner_guards() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
         use temps_entities::{roles, user_roles, users};
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping host import integration test: {error}");
                 return;

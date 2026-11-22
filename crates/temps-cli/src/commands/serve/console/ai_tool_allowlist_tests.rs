@@ -205,8 +205,16 @@ fn global_notification_operations_are_available_to_workspace_chats() {
     )
     .indexed_operation_ids();
     for operation in [
-        "create_notification_provider",
-        "update_notification_provider",
+        "create_slack_provider",
+        "update_slack_provider",
+        "create_notification_email_provider",
+        "update_notification_email_provider",
+        "create_webhook_provider",
+        "update_webhook_provider",
+        "create_cloudflare_provider",
+        "update_cloudflare_provider",
+        "create_telegram_provider",
+        "update_telegram_provider",
         "delete_notification_provider",
         "create_notification_route",
         "update_notification_route",
@@ -215,6 +223,16 @@ fn global_notification_operations_are_available_to_workspace_chats() {
         assert!(
             writes.contains(&operation.to_string()),
             "missing {operation}"
+        );
+    }
+    // An untyped `config` hides its credentials from the secret-slot layer.
+    for operation in [
+        "create_notification_provider",
+        "update_notification_provider",
+    ] {
+        assert!(
+            !writes.contains(&operation.to_string()),
+            "`{operation}` takes an untyped config; a credential in it would pass through the chat"
         );
     }
 

@@ -11,9 +11,6 @@ use tokio::fs;
 use tokio::process::Command;
 
 use temps_core::jobs::GitPushEventJob;
-use temps_core::workflow_memory::{
-    memory_install_command, WorkflowMemoryFact, WorkflowMemoryProvider,
-};
 use temps_core::{EncryptionService, Job, JobQueue};
 use temps_deployments::services::deployment_token_service::{
     CreateDeploymentTokenRequest, DeploymentTokenService,
@@ -23,6 +20,7 @@ use temps_entities::{
     projects, settings, status_checks, status_monitors,
 };
 use temps_git::services::git_provider_manager_trait::GitProviderManagerTrait;
+use temps_memory::{memory_install_command, WorkflowMemoryFact, WorkflowMemoryProvider};
 use temps_notifications::services::NotificationService;
 use temps_notifications::types::{Notification, NotificationPriority};
 
@@ -289,6 +287,148 @@ pub(crate) async fn sandbox_git_credential(
             ),
         },
     }
+}
+
+/// Why [`clone_with_scoped_token`] did not produce a checkout.
+#[derive(Debug, thiserror::Error)]
+enum ScopedCloneError {
+    /// The owner, repository, branch or token holds characters that could
+    /// change the URL or the command line they are placed in. The value
+    /// itself is not echoed: for the token it would be the secret.
+    #[error(
+        "the {field} for {owner}/{repo} (branch {branch}) has unexpected characters, so it \
+         was not passed to git"
+    )]
+    UnexpectedCharacters {
+        field: &'static str,
+        owner: String,
+        repo: String,
+        branch: String,
+    },
+    #[error("git clone of {owner}/{repo} (branch {branch}) timed out after {seconds} seconds")]
+    TimedOut {
+        owner: String,
+        repo: String,
+        branch: String,
+        seconds: u64,
+    },
+    #[error("could not run git to clone {owner}/{repo} (branch {branch}): {source}")]
+    Spawn {
+        owner: String,
+        repo: String,
+        branch: String,
+        #[source]
+        source: std::io::Error,
+    },
+    /// Git's own message names no secret: the token never appears in a URL.
+    #[error("git clone of {owner}/{repo} (branch {branch}) exited with {status}: {stderr}")]
+    GitFailed {
+        owner: String,
+        repo: String,
+        branch: String,
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+}
+
+/// Clone `owner/repo` from GitHub with a read-only token limited to that
+/// repository. The token reaches git through the environment (a one-shot
+/// credential helper reads it), never the command line or a file.
+async fn clone_with_scoped_token(
+    owner: &str,
+    repo: &str,
+    branch: &str,
+    target_dir: &std::path::Path,
+    token: &str,
+) -> Result<(), ScopedCloneError> {
+    const CLONE_TIMEOUT_SECONDS: u64 = 300;
+    // Names are interpolated into a URL and a command line: only the
+    // characters repository and branch names are made of.
+    let plain = |value: &str| {
+        !value.is_empty()
+            && !value.starts_with('-')
+            && value
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/'))
+    };
+    let unexpected = [
+        ("owner", plain(owner)),
+        ("repository name", plain(repo)),
+        ("branch name", plain(branch)),
+        ("token", is_plain_token(token)),
+    ]
+    .into_iter()
+    .find_map(|(field, ok)| (!ok).then_some(field));
+    if let Some(field) = unexpected {
+        return Err(ScopedCloneError::UnexpectedCharacters {
+            field,
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+        });
+    }
+    let output = tokio::time::timeout(
+        Duration::from_secs(CLONE_TIMEOUT_SECONDS),
+        Command::new("git")
+            .arg("clone")
+            .arg("--quiet")
+            .arg("--depth=1")
+            .arg(format!("--branch={branch}"))
+            .arg("--")
+            .arg(format!("https://github.com/{owner}/{repo}.git"))
+            .arg(target_dir)
+            .envs(scoped_token_git_env(token))
+            .stdin(Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .map_err(|_| ScopedCloneError::TimedOut {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        seconds: CLONE_TIMEOUT_SECONDS,
+    })?
+    .map_err(|source| ScopedCloneError::Spawn {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        source,
+    })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(ScopedCloneError::GitFailed {
+            owner: owner.to_string(),
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            status: output.status,
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
+/// Environment that makes `git` authenticate with `token` and nothing else.
+///
+/// `GIT_CONFIG_*` entries are added after the system and global config, so
+/// on their own they would only append a helper: one the host already has
+/// (`credential.helper=store`, a keychain) would still be asked first, and
+/// would be handed the scoped token to save once the clone succeeds. An
+/// empty `credential.helper` value clears the list before ours is added.
+fn scoped_token_git_env(token: &str) -> [(&'static str, String); 7] {
+    [
+        ("GIT_TERMINAL_PROMPT", "0".to_string()),
+        ("TEMPS_SCOPED_TOKEN", token.to_string()),
+        ("GIT_CONFIG_COUNT", "2".to_string()),
+        ("GIT_CONFIG_KEY_0", "credential.helper".to_string()),
+        ("GIT_CONFIG_VALUE_0", String::new()),
+        ("GIT_CONFIG_KEY_1", "credential.helper".to_string()),
+        (
+            "GIT_CONFIG_VALUE_1",
+            "!f() { echo username=x-access-token; echo \"password=$TEMPS_SCOPED_TOKEN\"; }; f"
+                .to_string(),
+        ),
+    ]
 }
 
 fn is_plain_token(token: &str) -> bool {
@@ -603,14 +743,14 @@ impl AgentExecutor {
             .as_ref()
             .and_then(|s| {
                 s.data.get("agent_sandbox").cloned().and_then(|v| {
-                    serde_json::from_value::<temps_core::AgentSandboxSettings>(v).ok()
+                    serde_json::from_value::<temps_config::AgentSandboxSettings>(v).ok()
                 })
             })
             .unwrap_or_default();
 
         let app_external_url = settings_row
             .as_ref()
-            .and_then(|s| serde_json::from_value::<temps_core::AppSettings>(s.data.clone()).ok())
+            .and_then(|s| serde_json::from_value::<temps_config::AppSettings>(s.data.clone()).ok())
             .and_then(|app| app.external_url)
             .map(|u| u.trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty());
@@ -798,9 +938,6 @@ impl AgentExecutor {
             .and_then(|y| yaml_serde::from_str::<temps_core::WorkflowYamlConfig>(y).ok())
             .map(|y| (y.cpu_limit, y.memory_limit_mb))
             .unwrap_or((None, None));
-        let cpu_limit = yaml_cpu.unwrap_or(global_sandbox.cpu_limit);
-        let memory_limit_mb = yaml_mem.unwrap_or(global_sandbox.memory_limit_mb);
-
         // Per-run named volume for `/workspace`. Retained so follow-up phases
         // (autofixer fix → PR) or workspace sandboxes can re-mount it.
         let workspace_volume = format!("temps-wfrun-{}", run_id);
@@ -827,7 +964,7 @@ impl AgentExecutor {
             .ok()
             .and_then(|r| r.triggered_by_user_id);
 
-        let sandbox_config = SandboxCreateConfig {
+        let mut sandbox_config = SandboxCreateConfig {
             node_id: None,
             run_id,
             owner_user_id,
@@ -835,8 +972,8 @@ impl AgentExecutor {
             host_work_dir: host_work_dir.clone(),
             workspace_volume: Some(workspace_volume),
             image: resolved_image,
-            cpu_limit: Some(cpu_limit),
-            memory_limit_mb: Some(memory_limit_mb),
+            cpu_limit: Some(yaml_cpu.unwrap_or(global_sandbox.cpu_limit)),
+            memory_limit_mb: Some(yaml_mem.unwrap_or(global_sandbox.memory_limit_mb)),
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
@@ -846,6 +983,23 @@ impl AgentExecutor {
             idle_timeout: Duration::from_secs(timeout_seconds as u64 + 60),
             backend: None,
         };
+        let (cpu_limit, memory_limit_mb) = match self
+            .sandbox_registry
+            .provider()
+            .capacity_for_create(&sandbox_config)
+            .await?
+        {
+            Some(host) => (
+                host.cpu_limit(run_id, yaml_cpu, global_sandbox.cpu_limit)?,
+                host.memory_limit(run_id, yaml_mem, global_sandbox.memory_limit_mb)?,
+            ),
+            None => (
+                yaml_cpu.unwrap_or(global_sandbox.cpu_limit),
+                yaml_mem.unwrap_or(global_sandbox.memory_limit_mb),
+            ),
+        };
+        sandbox_config.cpu_limit = Some(cpu_limit);
+        sandbox_config.memory_limit_mb = Some(memory_limit_mb);
         self.run_service
             .append_log(
                 run_id,
@@ -1118,7 +1272,7 @@ impl AgentExecutor {
                 s.data
                     .get("ai_config")
                     .cloned()
-                    .and_then(|v| serde_json::from_value::<temps_core::AiConfigSettings>(v).ok())
+                    .and_then(|v| serde_json::from_value::<temps_config::AiConfigSettings>(v).ok())
             })
             .unwrap_or_default();
 
@@ -1158,21 +1312,53 @@ impl AgentExecutor {
         }
 
         // ── Phase 2: Clone and overlay per-agent config repo (overrides global) ──
+        //
+        // The per-agent value comes from the project's `.temps.yaml` (or an API
+        // write by a project member), so it is only used when it names the
+        // project's own repository or one the administrator has allowed.
         if let Some(ref repo_url) = config.config_repo_url {
             if !repo_url.is_empty() {
-                if let Some(conn_id) = connection_id {
-                    let branch = config.config_repo_branch.as_deref().unwrap_or("main");
-                    self.inject_config_repo(
-                        run_id,
-                        conn_id,
-                        repo_url,
-                        branch,
-                        "per-agent",
-                        &secret_map,
-                    )
-                    .await?;
-                } else {
-                    self.run_service
+                let approved = match crate::services::config_repo_policy::check_project_config_repo(
+                    self.db.as_ref(),
+                    project_id,
+                    repo_url,
+                )
+                .await
+                {
+                    Ok(repo) => Some(repo),
+                    Err(refusal) => {
+                        tracing::warn!(
+                            run_id,
+                            project_id,
+                            "Per-agent config repo not used: {refusal}"
+                        );
+                        self.run_service
+                            .append_log(
+                                run_id,
+                                "warning",
+                                &format!("Per-agent config repo not used: {refusal}"),
+                                None,
+                            )
+                            .await?;
+                        None
+                    }
+                };
+                if let Some(repo) = approved {
+                    if let Some(conn_id) = connection_id {
+                        let branch = config.config_repo_branch.as_deref().unwrap_or("main");
+                        // Clone the repository the policy approved, in
+                        // `owner/repo` form: `repo_url` may be a GitHub URL.
+                        self.inject_config_repo(
+                            run_id,
+                            conn_id,
+                            &repo.to_string(),
+                            branch,
+                            "per-agent",
+                            &secret_map,
+                        )
+                        .await?;
+                    } else {
+                        self.run_service
                         .append_log(
                             run_id,
                             "warning",
@@ -1183,7 +1369,10 @@ impl AgentExecutor {
                             None,
                         )
                         .await?;
+                    }
                 }
+                // Not approved: skip the clone; the run continues without the
+                // overlay.
             }
         }
 
@@ -1737,16 +1926,47 @@ impl AgentExecutor {
             )
             .await?;
 
-        // Clone the config repo
-        self.git_provider_manager
-            .clone_repository(connection_id, owner, repo, &clone_dir, Some(branch))
-            .await
-            .map_err(|e| AgentError::GitError {
-                message: format!(
-                    "Failed to clone {} config repo {}/{}: {}",
-                    label, owner, repo, e
-                ),
-            })?;
+        // Clone the config repo, with a read-only token limited to this one
+        // repository when the connection can mint one (a GitHub App
+        // installation), and with the connection's own credential otherwise.
+        let scoped_clone_failed = match sandbox_git_credential(
+            self.git_provider_manager.as_ref(),
+            connection_id,
+            owner,
+            repo,
+        )
+        .await
+        {
+            SandboxGitCredential::RepoScopedRead { token, .. } => {
+                clone_with_scoped_token(owner, repo, branch, &clone_dir, &token)
+                    .await
+                    .err()
+                    .map(|error| error.to_string())
+            }
+            SandboxGitCredential::Withheld { reason } => Some(reason),
+        };
+        if let Some(reason) = scoped_clone_failed {
+            tracing::debug!(
+                run_id,
+                "Cloning {label} config repo {owner}/{repo} with the git connection's credential: {reason}"
+            );
+            // A failed scoped attempt may have left a partial checkout.
+            let _ = fs::remove_dir_all(&clone_dir).await;
+            fs::create_dir_all(&clone_dir)
+                .await
+                .map_err(|e| AgentError::GitError {
+                    message: format!("Failed to create temp dir for config repo: {}", e),
+                })?;
+            self.git_provider_manager
+                .clone_repository(connection_id, owner, repo, &clone_dir, Some(branch))
+                .await
+                .map_err(|e| AgentError::GitError {
+                    message: format!(
+                        "Failed to clone {} config repo {}/{}: {}",
+                        label, owner, repo, e
+                    ),
+                })?;
+        }
 
         // Check if .claude/ directory exists in the cloned repo
         let claude_dir = clone_dir.join(".claude");
@@ -2111,6 +2331,34 @@ impl AgentExecutor {
         })
     }
 
+    /// Cancel a run and stop its work: mark it cancelled, revoke its run-scoped
+    /// token and destroy its sandbox, which ends whatever the agent is running
+    /// there. The task executing the run (if any) stops when its next sandbox
+    /// call fails or its next status write returns
+    /// [`AgentError::RunCancelled`], and it cannot overwrite `cancelled`.
+    ///
+    /// A step already running outside the sandbox on this server, such as a
+    /// clone or a push to the git provider, is not interrupted: it finishes,
+    /// and the run stops at the status write after it.
+    pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
+        let run = self.run_service.cancel_run(run_id).await?;
+
+        if let Err(error) = self
+            .run_service
+            .append_log(run_id, "info", "Run cancelled by user", None)
+            .await
+        {
+            tracing::warn!("Failed to log the cancel of run {}: {}", run_id, error);
+        }
+        if let Some(token_id) = self.run_token_ids.write().await.remove(&run_id) {
+            self.revoke_run_token(run_id, token_id).await;
+        }
+        // Logs its own failure: the run stays cancelled either way.
+        let _ = self.sandbox_registry.release(run_id).await;
+
+        Ok(run)
+    }
+
     /// Execute a single autopilot run. Handles the full lifecycle from cloning to PR creation.
     pub async fn execute_run(&self, run_id: i32) {
         tracing::info!("Starting autopilot run {}", run_id);
@@ -2122,8 +2370,7 @@ impl AgentExecutor {
                 tracing::info!("Autopilot run {} completed successfully", run_id);
             }
             Err(e) => {
-                tracing::error!("Autopilot run {} failed: {}", run_id, e);
-                let _ = self
+                let recorded = self
                     .run_service
                     .update_status(
                         run_id,
@@ -2135,13 +2382,24 @@ impl AgentExecutor {
                         },
                     )
                     .await;
-                let _ = self
-                    .run_service
-                    .append_log(run_id, "error", &format!("Run failed: {}", e), None)
-                    .await;
+                if recorded.is_ok_and(|run| run.status == "cancelled") {
+                    // What ended it is the cancel (often its sandbox being
+                    // stopped), not a failure to tell anyone about.
+                    tracing::info!(
+                        "Autopilot run {} stopped after being cancelled: {}",
+                        run_id,
+                        e
+                    );
+                } else {
+                    tracing::error!("Autopilot run {} failed: {}", run_id, e);
+                    let _ = self
+                        .run_service
+                        .append_log(run_id, "error", &format!("Run failed: {}", e), None)
+                        .await;
 
-                // Send failure notification (best-effort — load context from DB)
-                self.send_failure_notification(run_id, &e).await;
+                    // Send failure notification (best-effort — load context from DB)
+                    self.send_failure_notification(run_id, &e).await;
+                }
             }
         }
 
@@ -3625,7 +3883,7 @@ impl AgentExecutor {
             .await
             .ok()
             .flatten()?;
-        let app_settings: temps_core::AppSettings = serde_json::from_value(settings.data).ok()?;
+        let app_settings: temps_config::AppSettings = serde_json::from_value(settings.data).ok()?;
         let base = app_settings.external_url.as_deref()?.trim_end_matches('/');
         Some(format!(
             "{}/projects/{}/agents/{}",
@@ -4127,7 +4385,126 @@ fn skipped_overlay_entries_message(
 }
 
 #[cfg(test)]
-mod tests {
+mod scoped_token_git_env_tests {
+    use super::{clone_with_scoped_token, scoped_token_git_env, ScopedCloneError};
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    /// The credentials `git` would use for github.com with `env` applied, on
+    /// a host whose own config already has a credential stored.
+    fn credential_fill(env: &[(&'static str, String)]) -> Option<String> {
+        let home = tempfile::tempdir().ok()?;
+        std::fs::write(
+            home.path().join(".gitconfig"),
+            "[credential]\n\thelper = store\n",
+        )
+        .ok()?;
+        std::fs::write(
+            home.path().join(".git-credentials"),
+            "https://host-user:host-secret@github.com\n",
+        )
+        .ok()?;
+        let mut child = Command::new("git")
+            .args(["credential", "fill"])
+            .env("HOME", home.path())
+            .env("XDG_CONFIG_HOME", home.path().join(".config"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .envs(env.iter().map(|(k, v)| (*k, v.as_str())))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        child
+            .stdin
+            .take()?
+            .write_all(b"protocol=https\nhost=github.com\n\n")
+            .ok()?;
+        let output = child.wait_with_output().ok()?;
+        output
+            .status
+            .success()
+            .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    #[tokio::test]
+    async fn a_scoped_clone_names_the_field_with_unexpected_characters() {
+        let dir = std::path::Path::new("/nonexistent-clone-target");
+        let token = "ghs_abcdef0123456789";
+        for (owner, repo, branch, token, field) in [
+            ("-bad", "repo", "main", token, "owner"),
+            ("acme", "re po", "main", token, "repository name"),
+            ("acme", "repo", "--upload-pack=x", token, "branch name"),
+            ("acme", "repo", "main", "tok en\n", "token"),
+        ] {
+            let error = clone_with_scoped_token(owner, repo, branch, dir, token)
+                .await
+                .expect_err("input with unexpected characters must be refused");
+            match &error {
+                ScopedCloneError::UnexpectedCharacters { field: got, .. } => {
+                    assert_eq!(*got, field, "{error}");
+                }
+                other => panic!("expected UnexpectedCharacters for {field}, got {other}"),
+            }
+            let message = error.to_string();
+            assert!(message.contains(field), "{message}");
+            assert!(
+                !message.contains("tok en"),
+                "the token is never echoed: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failed_scoped_clone_reports_the_repository_status_and_git_message() {
+        #[cfg(unix)]
+        let status = {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(128 << 8)
+        };
+        #[cfg(unix)]
+        {
+            let message = ScopedCloneError::GitFailed {
+                owner: "acme".into(),
+                repo: "config".into(),
+                branch: "main".into(),
+                status,
+                stderr: "fatal: repository not found".into(),
+            }
+            .to_string();
+            assert!(message.contains("acme/config"), "{message}");
+            assert!(message.contains("branch main"), "{message}");
+            assert!(message.contains("fatal: repository not found"), "{message}");
+        }
+        let message = ScopedCloneError::TimedOut {
+            owner: "acme".into(),
+            repo: "config".into(),
+            branch: "main".into(),
+            seconds: 300,
+        }
+        .to_string();
+        assert!(
+            message.contains("acme/config") && message.contains("300 seconds"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn a_credential_the_host_has_stored_is_not_used_instead_of_the_scoped_token() {
+        if Command::new("git").arg("--version").output().is_err() {
+            println!("git is not installed, skipping");
+            return;
+        }
+        let filled = credential_fill(&scoped_token_git_env("scoped-token"))
+            .expect("git credential fill runs");
+        assert!(filled.contains("password=scoped-token"), "{filled}");
+        assert!(filled.contains("username=x-access-token"), "{filled}");
+        assert!(!filled.contains("host-secret"), "{filled}");
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
     use super::*;
     use async_trait::async_trait;
     use sea_orm::{DatabaseBackend, MockDatabase};
@@ -4544,7 +4921,7 @@ mod tests {
         }
     }
 
-    fn make_project(id: i32) -> projects::Model {
+    pub(crate) fn make_project(id: i32) -> projects::Model {
         projects::Model {
             id,
             image_retention_hours: None,
@@ -4556,6 +4933,7 @@ mod tests {
                 temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
             cloud_analytics_write_mode:
                 temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode::Local,
+            analytics_identity_mode: Default::default(),
             instantiation_token: None,
             cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test-app".into(),
@@ -4620,6 +4998,17 @@ mod tests {
             total_count: 47,
             status: "unresolved".into(),
             assigned_to: None,
+            merged_into_group_id: None,
+            ignore_until: None,
+            ignore_until_event_count: None,
+            ignore_until_user_count: None,
+            ignore_user_count: 0,
+            ignore_forever: false,
+            resolved_in_next_release: false,
+            resolved_in_release_after_id: None,
+            assignee_user_id: None,
+            assignee_team_id: None,
+            issue_type: "error".to_string(),
             project_id: 1,
             environment_id: None,
             deployment_id: None,
@@ -5740,9 +6129,7 @@ mod tests {
     // Feature: workflow memory wiring on AgentExecutor
     // ---------------------------------------------------------------------------
 
-    use temps_core::workflow_memory::{
-        WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider,
-    };
+    use temps_memory::{WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider};
 
     /// Fake memory provider for executor unit tests. Records calls and
     /// returns whatever facts/errors the test set up.
@@ -5866,6 +6253,71 @@ mod tests {
         assert_eq!(run_svc.redact(9, "pw=evicted-run-secret"), "pw=[redacted]");
     }
 
+    /// A per-agent config repository that is neither the project's own nor on
+    /// the administrator's list is not cloned, and the run's log says so.
+    #[tokio::test]
+    async fn a_config_repo_outside_the_projects_and_the_allow_list_is_not_cloned() {
+        let settings_row = || temps_entities::settings::Model {
+            id: 1,
+            data: serde_json::json!({
+                "ai_config": { "config_repo": "", "config_repo_branch": "main",
+                               "config_repo_allowlist": ["shared/claude-config"] }
+            }),
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![settings_row()]])
+                .append_query_results([Vec::<temps_entities::agent_secrets::Model>::new()])
+                .append_query_results([vec![make_project(3)]])
+                .append_query_results([vec![settings_row()]])
+                .append_query_results([vec![make_log(9)]])
+                .into_connection(),
+        );
+        let enc = make_encryption_service();
+        let recorder = Arc::new(GitRecorder::default());
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: recorder.clone(),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db.clone()),
+        );
+        let mut agent = synthetic_agent_config(3, "claude_cli", "reviewer");
+        agent.config_repo_url = Some("someone-else/private-notes".to_string());
+
+        // Later phases may need more rows than this test provides; only the
+        // config repo decision is under test.
+        let _ = executor
+            .inject_config_repos_and_secrets(9, &agent, 3, Some(5))
+            .await;
+
+        assert!(
+            recorder.cloned.lock().unwrap().is_empty(),
+            "the repository must not be cloned"
+        );
+        drop(executor);
+        let log = format!(
+            "{:?}",
+            Arc::try_unwrap(db).map(|db| db.into_transaction_log())
+        );
+        assert!(log.contains("Per-agent config repo not used"), "{log}");
+        assert!(log.contains("someone-else/private-notes"), "{log}");
+    }
+
     fn make_executor_for_memory_tests() -> AgentExecutor {
         // Build a minimal executor — we only call the memory helpers, which
         // don't touch the DB or git provider.
@@ -5893,6 +6345,156 @@ mod tests {
             make_secret_service(db.clone()),
             make_definition_service(db),
         )
+    }
+
+    /// Records which runs had their sandbox released.
+    #[derive(Default)]
+    struct RecordingRunSandboxes {
+        released: Mutex<Vec<i32>>,
+    }
+
+    #[async_trait]
+    impl crate::sandbox::managed::RunSandboxService for RecordingRunSandboxes {
+        async fn create_for_run(
+            &self,
+            config: crate::sandbox::SandboxCreateConfig,
+        ) -> Result<crate::sandbox::SandboxHandle, AgentError> {
+            Err(AgentError::SandboxNotFound {
+                run_id: config.run_id,
+                sandbox: "this test creates no sandboxes".to_string(),
+            })
+        }
+
+        async fn release_for_run(
+            &self,
+            run_id: i32,
+            _handle: Option<&crate::sandbox::SandboxHandle>,
+        ) -> Result<(), AgentError> {
+            self.released.lock().unwrap().push(run_id);
+            Ok(())
+        }
+    }
+
+    fn make_executor_for_cancel_tests(
+        db: sea_orm::DatabaseConnection,
+    ) -> (AgentExecutor, Arc<RecordingRunSandboxes>) {
+        let db = Arc::new(db);
+        let enc = make_encryption_service();
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: Arc::new(GitRecorder::default()),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let sandboxes = Arc::new(RecordingRunSandboxes::default());
+        let registry = make_sandbox_registry();
+        registry.set_managed(sandboxes.clone());
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            registry,
+            make_secret_service(db.clone()),
+            make_definition_service(db),
+        );
+        (executor, sandboxes)
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_run_stops_its_sandbox_and_forgets_its_token() {
+        let run_id = 77;
+        let cancelled = agent_runs::Model {
+            status: "cancelled".to_string(),
+            ..make_run(run_id, 1)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run(run_id, 1)]]) // get_run
+            .append_query_results(vec![vec![cancelled]]) // guarded write
+            .append_query_results(vec![vec![make_log(run_id)]]) // append_log
+            .into_connection();
+        let (executor, sandboxes) = make_executor_for_cancel_tests(db);
+        executor.run_token_ids.write().await.insert(run_id, 999);
+
+        let run = executor.cancel_run(run_id).await.expect("cancel");
+
+        assert_eq!(run.status, "cancelled");
+        assert_eq!(*sandboxes.released.lock().unwrap(), vec![run_id]);
+        assert!(executor.run_token_ids.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_that_already_finished_keeps_its_sandbox_state_on_cancel() {
+        let run_id = 78;
+        let finished = agent_runs::Model {
+            status: "completed".to_string(),
+            ..make_run(run_id, 1)
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![finished]])
+            .into_connection();
+        let (executor, sandboxes) = make_executor_for_cancel_tests(db);
+
+        let error = executor.cancel_run(run_id).await.expect_err("finished");
+
+        assert!(matches!(error, AgentError::Validation { .. }), "{error}");
+        assert!(sandboxes.released.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_run_stopped_by_its_cancel_reports_no_failure() {
+        let run_id = 79;
+        let cancelled = agent_runs::Model {
+            status: "cancelled".to_string(),
+            ..make_run(run_id, 1)
+        };
+        // Every query after the failure write would need a result here: the
+        // failure log and notification are not written for a cancelled run.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![cancelled.clone()]]) // execute_run_inner: get_run
+                .append_query_results(vec![Vec::<project_agents::Model>::new()]) // no such agent
+                .append_query_results(vec![vec![cancelled.clone()]]) // update_status: get_run
+                .append_query_results(vec![vec![cancelled]]) // update_status: UPDATE
+                .into_connection(),
+        );
+        let enc = make_encryption_service();
+        let git: Arc<dyn GitProviderManagerTrait> = Arc::new(FakeGitProvider {
+            recorder: Arc::new(GitRecorder::default()),
+            clone_should_fail: false,
+        });
+        let queue: Arc<dyn JobQueue> = Arc::new(FakeJobQueue {
+            sent: Mutex::new(vec![]),
+        });
+        let executor = AgentExecutor::new(
+            db.clone(),
+            git,
+            enc.clone(),
+            queue,
+            Arc::new(AgentRunService::new(db.clone())),
+            Arc::new(AgentConfigService::new(db.clone(), enc)),
+            make_notification_service(db.clone()),
+            make_sandbox_registry(),
+            make_secret_service(db.clone()),
+            make_definition_service(db.clone()),
+        );
+
+        executor.execute_run(run_id).await;
+        drop(executor);
+
+        let log = Arc::into_inner(db)
+            .expect("only reference")
+            .into_transaction_log();
+        assert!(
+            !log.iter()
+                .flat_map(|transaction| transaction.statements())
+                .any(|statement| statement.sql.contains("agent_run_logs")),
+            "a cancelled run must not log a failure: {log:?}"
+        );
     }
 
     #[test]

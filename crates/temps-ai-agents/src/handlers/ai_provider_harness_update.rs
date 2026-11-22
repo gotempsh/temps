@@ -22,7 +22,7 @@ use axum::{
 use serde::Deserialize;
 use utoipa::IntoParams;
 
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
 
@@ -47,7 +47,7 @@ pub struct HarnessUpdateQuery {
     pub refresh: bool,
 }
 
-fn authorize(auth: &temps_auth::AuthContext, provider_id: &str) -> Result<(), Problem> {
+fn authorize(auth: &temps_authz::AuthContext, provider_id: &str) -> Result<(), Problem> {
     permission_guard!(auth, SettingsWrite);
     ensure_workspace_model_discovery_permission(auth)?;
     find_provider(provider_id).ok_or_else(|| {

@@ -15,7 +15,7 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordListItem } from '@temps-sdk/ds'
 import {
   Dialog,
   DialogContent,
@@ -254,7 +254,7 @@ function ProviderRow({
   onEditClick: (provider: EmailProvider) => void
 }) {
   return (
-    <li className="flex items-center gap-3 px-4 py-3">
+    <RecordListItem className="flex items-center gap-3 px-4 py-3">
       <ProviderIcon type={provider.provider_type} />
       <div className="min-w-0 flex-1">
         <RecordLink to={`/email/providers/${provider.id}`} className="min-h-0">
@@ -294,7 +294,7 @@ function ProviderRow({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
-    </li>
+    </RecordListItem>
   )
 }
 

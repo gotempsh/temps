@@ -15,14 +15,21 @@
     )
 )]
 pub mod auth;
+pub(crate) mod backup_outcomes;
 mod build_admission;
 pub mod build_handler;
 pub mod compose_handlers;
 pub mod connectors;
+pub mod dns_report;
 mod exec_timeout;
 pub mod gate;
 pub mod handlers;
+pub mod internal_access;
 pub mod internal_proxy;
+pub mod internal_redirect;
+pub mod internal_routing;
+pub mod labels;
+pub mod mac_worker;
 pub mod mesh_listener;
 pub mod netpol_guard;
 pub mod network_policy;
@@ -31,21 +38,29 @@ pub mod node_runtime;
 mod output_buffer;
 pub mod overlay_addresses;
 mod overlay_driver;
-mod plugin_build_handler;
+pub mod plugin_build_handler;
 pub mod private_check;
 pub mod public_ingress;
 pub mod public_ingress_manager;
+pub(crate) mod restore_outcomes;
 mod rewind;
 pub mod route_store;
 pub mod route_sync_client;
 mod runtime_health;
 pub mod sandbox_handlers;
+pub mod sealed_requests;
 pub mod server;
+pub mod service_data_handlers;
 pub mod service_handlers;
+pub mod service_mariadb_handlers;
+pub mod service_observe_handlers;
 pub mod shield;
 pub mod tailnet_identity;
 pub mod tailscale_api;
 pub mod tailscale_serve;
+#[cfg(test)]
+mod test_engines;
+pub mod uptime_probe;
 pub mod worker_metrics;
 
 use serde::{Deserialize, Serialize};
@@ -358,7 +373,8 @@ pub struct AgentConfig {
     /// against an older IP-only control plane. Never downloaded automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_plane_legacy_cert_path: Option<std::path::PathBuf>,
-    /// X25519 private key used only to decrypt this node's certificate bundles.
+    /// X25519 private key that decrypts what the control plane seals to this
+    /// node: certificate bundles, Shield keys and requests carrying values.
     #[serde(default)]
     pub public_ingress_private_key: Option<String>,
     /// What this worker lets its control plane do with public ingress (ADR
@@ -505,6 +521,12 @@ impl AgentConfig {
             "Resolved agent data paths; sandbox work directories on this node live under sandbox_work_root"
         );
         Ok(work_root)
+    }
+
+    /// Where the ingress manager saves the key it provisions when `temps
+    /// join` gave none.
+    pub fn provisioned_key_file(&self) -> std::path::PathBuf {
+        self.compose_data_dir().join("public-ingress.key")
     }
 
     /// The agent data directory (the parent of `dns_data_dir`), where Compose
@@ -741,6 +763,12 @@ pub struct PullImageRequest {
     /// **never** logged or echoed in error messages.
     #[serde(default)]
     pub credentials: Option<RegistryCredentials>,
+    /// Pull even when the daemon already holds `image`. The control plane sets
+    /// it when the cached copy is for another architecture: without it the
+    /// cached copy is returned as-is and the container fails with `exec format
+    /// error`. Absent (an older control plane) means the cached copy is used.
+    #[serde(default)]
+    pub replace_cached: bool,
 }
 
 /// Registry credentials for private-registry access.

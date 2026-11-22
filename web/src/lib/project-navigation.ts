@@ -37,6 +37,7 @@ import {
   FileCode,
   FileText,
   Filter,
+  MessageSquareText,
   Gauge,
   GitBranch,
   GitFork,
@@ -52,6 +53,7 @@ import {
   Lock,
   MessageSquare,
   Network,
+  Paperclip,
   Plug,
   Puzzle,
   Radar,
@@ -64,6 +66,7 @@ import {
   Sparkles,
   Tag,
   Ticket,
+  UserCheck,
   UserCog,
   Users,
   Variable,
@@ -241,6 +244,13 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           { title: 'Feedback', icon: MessageSquare, url: 'errors/feedback' },
           { title: 'Releases', icon: Tag, url: 'releases' },
           { title: 'Source maps', icon: FileCode, url: 'errors/source-maps' },
+          {
+            title: 'Inbound filters',
+            icon: ListFilter,
+            url: 'errors/inbound-filters',
+          },
+          { title: 'Attachments', icon: Paperclip, url: 'errors/attachments' },
+          { title: 'Ownership', icon: UserCheck, url: 'errors/ownership' },
           { title: 'SDK health', icon: HeartPulse, url: 'client-outcomes' },
           { title: 'Setup', icon: Plug, url: 'errors/setup' },
         ],
@@ -278,6 +288,11 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           },
           { title: 'Pages', icon: FileText, url: 'analytics/pages' },
           { title: 'Funnels', icon: Filter, url: 'analytics/funnels' },
+          {
+            title: 'Surveys',
+            icon: MessageSquareText,
+            url: 'analytics/surveys',
+          },
           {
             title: 'Activity report',
             icon: CalendarRange,
@@ -327,6 +342,11 @@ export const PROJECT_NAV_GROUPS: ProjectNavGroup[] = [
           // Jobs scheduled elsewhere, reporting through the Sentry SDK: a
           // different feature from the jobs Temps runs, so its own tab.
           { title: 'Check-ins', icon: CalendarCheck, url: 'check-ins' },
+          {
+            title: 'Durable workflows',
+            icon: Workflow,
+            url: 'durable-workflows',
+          },
         ],
       },
     ],

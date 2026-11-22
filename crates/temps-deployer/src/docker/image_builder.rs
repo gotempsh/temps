@@ -4,9 +4,11 @@
 //! The `ImageBuilder` impl of [`DockerRuntime`] and the build-context packing
 //! it relies on.
 
+use super::build_dns::BuildDnsWatch;
 use super::build_failure::build_stream_error_text;
 use super::build_limits::describe_build_memory_request;
 use super::guards::{combine_extraction_and_cleanup, DockerContainerCleanupGuard};
+use super::secret_mounts::emit_buildkit_status;
 use super::static_archive::{
     static_archive_root, unpack_static_archive_stream, MAX_STATIC_ARCHIVE_STREAM_BYTES,
 };
@@ -110,7 +112,10 @@ fn append_root_owned_entry<W: Write>(
     }
 }
 
-fn docker_build_args(request: &BuildRequest, use_buildkit: bool) -> HashMap<String, String> {
+pub(super) fn docker_build_args(
+    request: &BuildRequest,
+    use_buildkit: bool,
+) -> HashMap<String, String> {
     let mut args = request.build_args.clone();
     if use_buildkit {
         args.extend(request.build_args_buildkit.clone());
@@ -123,10 +128,101 @@ fn docker_build_args(request: &BuildRequest, use_buildkit: bool) -> HashMap<Stri
     args
 }
 
+/// Label every image Temps builds carries, whoever asked for the build.
+pub const BUILT_BY_LABEL: (&str, &str) = ("built-by", "temps");
+
+/// The labels for `request`'s image: the caller's, then `built-by=temps`,
+/// which a caller cannot override.
+pub(super) fn image_labels(request: &BuildRequest) -> HashMap<String, String> {
+    let mut labels = request.labels.clone();
+    labels.insert(BUILT_BY_LABEL.0.to_string(), BUILT_BY_LABEL.1.to_string());
+    labels
+}
+
 fn split_repository_and_tag(image: &str) -> (&str, &str) {
     match image.rsplit_once(':') {
         Some((repository, image_tag)) if !image_tag.contains('/') => (repository, image_tag),
         _ => (image, "latest"),
+    }
+}
+
+/// Which of an image's manifests [`manifest_platforms`] reports.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ManifestScope {
+    /// Only those whose content is all present: what this daemon can run.
+    Available,
+    /// Every one the image's index declares, downloaded or not: what a pull
+    /// of the same reference can fetch for each architecture.
+    Declared,
+}
+
+/// The platforms of `manifests`: image manifests, never attestations, limited
+/// to the locally runnable ones for [`ManifestScope::Available`]. A manifest
+/// list pulled for one architecture still lists the others, unavailable.
+fn manifest_platforms(
+    manifests: &[bollard::models::ImageManifestSummary],
+    scope: ManifestScope,
+) -> Vec<String> {
+    let mut platforms: Vec<String> = Vec::new();
+    for manifest in manifests {
+        if (scope == ManifestScope::Available && !manifest.available)
+            || manifest.kind != Some(bollard::models::ImageManifestSummaryKindEnum::IMAGE)
+        {
+            continue;
+        }
+        let Some(platform) = manifest.image_data.as_ref().map(|data| &data.platform) else {
+            continue;
+        };
+        push_platform(
+            &mut platforms,
+            platform.os.as_deref(),
+            platform.architecture.as_deref(),
+            platform.variant.as_deref(),
+        );
+    }
+    platforms
+}
+
+/// The platforms a registry index offers, as Docker's distribution inspect
+/// reports them. Build attestations are listed as `unknown/unknown`; they are
+/// not images and are skipped.
+fn registry_index_platforms(platforms: &[bollard::models::OciPlatform]) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for platform in platforms {
+        push_platform(
+            &mut found,
+            platform.os.as_deref(),
+            platform.architecture.as_deref(),
+            platform.variant.as_deref(),
+        );
+    }
+    found
+}
+
+/// Append the canonical form of `os`/`architecture`/`variant` to `platforms`
+/// unless it is incomplete, `unknown`, or already there.
+fn push_platform(
+    platforms: &mut Vec<String>,
+    os: Option<&str>,
+    architecture: Option<&str>,
+    variant: Option<&str>,
+) {
+    let (Some(os), Some(architecture)) = (
+        os.map(str::trim).filter(|os| !os.is_empty()),
+        architecture.map(str::trim).filter(|arch| !arch.is_empty()),
+    ) else {
+        return;
+    };
+    if os == "unknown" || architecture == "unknown" {
+        return;
+    }
+    let architecture = match variant.map(str::trim) {
+        Some(variant) if !variant.is_empty() => format!("{architecture}/{variant}"),
+        _ => architecture.to_string(),
+    };
+    let platform = crate::platform::normalize_platform(os, &architecture);
+    if !platforms.contains(&platform) {
+        platforms.push(platform);
     }
 }
 
@@ -234,15 +330,69 @@ fn stream_file_owning_dir(file: tokio::fs::File, dir: TempDir) -> ImageImportStr
 }
 
 impl DockerRuntime {
+    /// The platforms of the local index `image_name` (image `image_id`)
+    /// resolves to, within `scope`. Empty when the daemon keeps no index for
+    /// it (the classic image store) or cannot list it.
+    async fn indexed_platforms(
+        &self,
+        image_name: &str,
+        image_id: &str,
+        scope: ManifestScope,
+    ) -> Vec<String> {
+        let Ok(docker) = self.require_docker_for_build() else {
+            return Vec::new();
+        };
+        let filters = std::collections::HashMap::from([("reference", vec![image_name])]);
+        let options = bollard::query_parameters::ListImagesOptionsBuilder::new()
+            .filters(&filters)
+            .manifests(true)
+            .build();
+        let listed = match docker.list_images(Some(options)).await {
+            Ok(listed) => listed,
+            Err(error) => {
+                debug!(
+                    image = %image_name,
+                    %error,
+                    "Could not list the image's manifests"
+                );
+                return Vec::new();
+            }
+        };
+        listed
+            .iter()
+            .find(|summary| summary.id == image_id)
+            .and_then(|summary| summary.manifests.as_deref())
+            .map(|manifests| manifest_platforms(manifests, scope))
+            .unwrap_or_default()
+    }
+
     async fn create_tar_context_body(
         &self,
         context_path: PathBuf,
         dockerfile_path: Option<PathBuf>,
     ) -> Result<ImageImportStream, BuilderError> {
+        let tmp = Self::write_tar_context_file(context_path, dockerfile_path).await?;
+        // Read back in bounded chunks rather than a Vec.
+        let file = tokio::fs::File::from_std(tmp.reopen().map_err(BuilderError::IoError)?);
+        Ok(Box::pin(
+            tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new()).map(
+                move |result| {
+                    let _owner = &tmp;
+                    result.map(|chunk| chunk.freeze())
+                },
+            ),
+        ))
+    }
+
+    /// The build context, as a tar in a temporary file.
+    pub(super) async fn write_tar_context_file(
+        context_path: PathBuf,
+        dockerfile_path: Option<PathBuf>,
+    ) -> Result<tempfile::NamedTempFile, BuilderError> {
         let tmp = tempfile::NamedTempFile::new().map_err(BuilderError::IoError)?;
         // Keep ownership in the blocking task; cancellation must not leave
-        // an orphan archive. Read back in bounded chunks rather than a Vec.
-        let tmp = tokio::task::spawn_blocking(move || {
+        // an orphan archive.
+        tokio::task::spawn_blocking(move || {
             let dockerfile = dockerfile_path
                 .as_deref()
                 .and_then(|path| path.strip_prefix(&context_path).ok())
@@ -255,18 +405,7 @@ impl DockerRuntime {
             Ok::<_, BuilderError>(tmp)
         })
         .await
-        .map_err(|error| {
-            BuilderError::Other(format!("Build context tar task failed: {error}"))
-        })??;
-        let file = tokio::fs::File::from_std(tmp.reopen().map_err(BuilderError::IoError)?);
-        Ok(Box::pin(
-            tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new()).map(
-                move |result| {
-                    let _owner = &tmp;
-                    result.map(|chunk| chunk.freeze())
-                },
-            ),
-        ))
+        .map_err(|error| BuilderError::Other(format!("Build context tar task failed: {error}")))?
     }
 
     /// Detect the native platform for Docker builds.
@@ -276,7 +415,7 @@ impl DockerRuntime {
     /// fallback is never cached, so a daemon that comes up late (or recovers)
     /// is picked up by the next refresh — see the build paths, which refresh
     /// before using this.
-    fn detect_native_platform(&self) -> String {
+    pub(super) fn detect_native_platform(&self) -> String {
         self.daemon_platform
             .get()
             .cloned()
@@ -417,6 +556,12 @@ impl ImageBuilder for DockerRuntime {
             request.image_name, request.context_path
         );
 
+        if !request.build_secrets.is_empty() {
+            return self
+                .build_image_with_secret_mounts(request, None, start_time)
+                .await;
+        }
+
         // Create tar archive body from build context
         let tar_body = self
             .create_tar_context_body(
@@ -445,8 +590,7 @@ impl ImageBuilder for DockerRuntime {
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
-        let mut labels = HashMap::new();
-        labels.insert("built-by".to_string(), "temps".to_string());
+        let labels = image_labels(&request);
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request
                 .dockerfile_path
@@ -504,6 +648,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log
         let mut step_timer = BuildStepTimer::new();
+        let mut dns_watch = BuildDnsWatch::default();
         let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
@@ -511,9 +656,17 @@ impl ImageBuilder for DockerRuntime {
                     if let Some(stream) = info.stream {
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                        dns_watch.observe_stream(&stream);
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(ref res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
+                        for log in &res.logs {
+                            dns_watch.observe(
+                                &log.vertex,
+                                log.stream,
+                                &String::from_utf8_lossy(&log.msg),
+                            );
+                        }
                     }
                     if let Some(error_detail) = info.error_detail {
                         let error = error_detail
@@ -523,9 +676,13 @@ impl ImageBuilder for DockerRuntime {
                         let _ = log_file
                             .write_all(format!("ERROR: {}\n", error).as_bytes())
                             .await;
-                        let (err, memory_line) =
-                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
-                        if let Some(line) = memory_line {
+                        let (err, log_notes) = self.classify_build_failure(
+                            error,
+                            &build_start,
+                            i64::from(memory_i32),
+                            &dns_watch,
+                        );
+                        if let Some(line) = log_notes {
                             let _ = log_file.write_all(line.as_bytes()).await;
                         }
                         build_error = Some(err);
@@ -540,12 +697,13 @@ impl ImageBuilder for DockerRuntime {
                     let _ = log_file
                         .write_all(format!("ERROR: Build failed: {}\n", error_text).as_bytes())
                         .await;
-                    let (err, memory_line) = self.classify_build_failure(
+                    let (err, log_notes) = self.classify_build_failure(
                         error_text,
                         &build_start,
                         i64::from(memory_i32),
+                        &dns_watch,
                     );
-                    if let Some(line) = memory_line {
+                    if let Some(line) = log_notes {
                         let _ = log_file.write_all(line.as_bytes()).await;
                     }
                     build_error = Some(err);
@@ -642,6 +800,12 @@ impl ImageBuilder for DockerRuntime {
             request.image_name, request.context_path
         );
 
+        if !request.build_secrets.is_empty() {
+            return self
+                .build_image_with_secret_mounts(request, log_callback, start_time)
+                .await;
+        }
+
         // Create tar archive body from build context
         let tar_body = self
             .create_tar_context_body(
@@ -666,8 +830,7 @@ impl ImageBuilder for DockerRuntime {
             describe_build_memory_request(&request.image_name, memory_i32, self.use_buildkit)
         );
 
-        let mut labels = HashMap::new();
-        labels.insert("built-by".to_string(), "temps".to_string());
+        let labels = image_labels(&request);
 
         let build_options = bollard::query_parameters::BuildImageOptions {
             dockerfile: request
@@ -727,6 +890,7 @@ impl ImageBuilder for DockerRuntime {
 
         // Stream build output and write to log and callback
         let mut step_timer = BuildStepTimer::new();
+        let mut dns_watch = BuildDnsWatch::default();
         let mut build_error = None;
         while let Some(build_info) = build_stream.next().await {
             match build_info {
@@ -735,6 +899,7 @@ impl ImageBuilder for DockerRuntime {
                         // Write to file
                         let _ = log_file.write_all(stream.as_bytes()).await;
                         debug!("Build: {}", stream.trim());
+                        dns_watch.observe_stream(&stream);
 
                         // Call log callback if provided
                         if let Some(ref callback) = log_callback {
@@ -757,9 +922,13 @@ impl ImageBuilder for DockerRuntime {
                             callback(error_line.clone()).await;
                         }
 
-                        let (err, memory_line) =
-                            self.classify_build_failure(error, &build_start, i64::from(memory_i32));
-                        if let Some(line) = memory_line {
+                        let (err, log_notes) = self.classify_build_failure(
+                            error,
+                            &build_start,
+                            i64::from(memory_i32),
+                            &dns_watch,
+                        );
+                        if let Some(line) = log_notes {
                             let _ = log_file.write_all(line.as_bytes()).await;
                             if let Some(ref callback) = log_callback {
                                 callback(line).await;
@@ -770,47 +939,8 @@ impl ImageBuilder for DockerRuntime {
                     }
                     if let Some(bollard::models::BuildInfoAux::BuildKit(res)) = info.aux {
                         step_timer.observe_vertices(&res.vertexes);
-                        // Emit vertex names (build step descriptions) when they
-                        // start or complete.  This gives visibility into cached
-                        // layers and overall build progress even when there is
-                        // no command output (logs).
-                        for vertex in &res.vertexes {
-                            if vertex.name.is_empty() {
-                                continue;
-                            }
-                            let status = if vertex.error.is_empty() {
-                                if vertex.completed.is_some() {
-                                    if vertex.cached {
-                                        "CACHED"
-                                    } else {
-                                        "DONE"
-                                    }
-                                } else if vertex.started.is_some() {
-                                    "RUNNING"
-                                } else {
-                                    continue; // Not started yet, skip
-                                }
-                            } else {
-                                "ERROR"
-                            };
-                            let line = format!("[{}] {}\n", status, vertex.name);
-                            let _ = log_file.write_all(line.as_bytes()).await;
-                            debug!("BuildKit vertex: {}", line.trim());
-
-                            if let Some(ref callback) = log_callback {
-                                callback(line).await;
-                            }
-                        }
-
-                        // Emit actual command output from build steps
-                        for log in res.logs {
-                            let _ = log_file.write_all(&log.msg[..]).await;
-                            debug!("BuildKit: {}", String::from_utf8_lossy(&log.msg));
-
-                            if let Some(ref callback) = log_callback {
-                                callback(String::from_utf8_lossy(&log.msg[..]).to_string()).await;
-                            }
-                        }
+                        emit_buildkit_status(&res, &mut log_file, &log_callback, &mut dns_watch)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -826,12 +956,13 @@ impl ImageBuilder for DockerRuntime {
                         callback(error_line).await;
                     }
 
-                    let (err, memory_line) = self.classify_build_failure(
+                    let (err, log_notes) = self.classify_build_failure(
                         error_text,
                         &build_start,
                         i64::from(memory_i32),
+                        &dns_watch,
                     );
-                    if let Some(line) = memory_line {
+                    if let Some(line) = log_notes {
                         let _ = log_file.write_all(line.as_bytes()).await;
                         if let Some(ref callback) = log_callback {
                             callback(line).await;
@@ -1163,6 +1294,60 @@ impl ImageBuilder for DockerRuntime {
             id: inspect.id.unwrap_or_default(),
             repo_digests: inspect.repo_digests.unwrap_or_default(),
         })
+    }
+
+    /// Lists the image's manifests (Docker's multi-platform image store) and
+    /// reports each architecture whose content is fully present locally. A
+    /// daemon without that store lists no manifests, and an image it cannot
+    /// list is answered by inspection: one platform, as before.
+    async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
+        let inspected = self.inspect_image(image_name).await?;
+        let platforms = self
+            .indexed_platforms(image_name, &inspected.id, ManifestScope::Available)
+            .await;
+        if platforms.is_empty() {
+            return Ok(vec![inspected.platform]);
+        }
+        Ok(platforms)
+    }
+
+    /// The pulled index is read first: the containerd image store keeps a
+    /// pulled tag's whole manifest list, including the architectures it did
+    /// not download, so no registry round-trip is needed. The classic store
+    /// keeps only the platform it pulled, and an image this daemon does not
+    /// hold has no local index at all; both are answered by the registry.
+    async fn registry_image_platforms(
+        &self,
+        image_name: &str,
+        credentials: Option<crate::remote::RemotePullCredentials>,
+    ) -> Result<Vec<String>, BuilderError> {
+        if let Ok(inspected) = self.inspect_image(image_name).await {
+            let declared = self
+                .indexed_platforms(image_name, &inspected.id, ManifestScope::Declared)
+                .await;
+            if !declared.is_empty() {
+                return Ok(declared);
+            }
+        }
+
+        let docker = self.require_docker_for_build()?;
+        let auth = credentials.map(|c| bollard::auth::DockerCredentials {
+            username: c.username,
+            password: c.password,
+            identitytoken: c.identity_token,
+            serveraddress: c.server_address,
+            ..Default::default()
+        });
+        let distribution = docker
+            .inspect_registry_image(image_name, auth)
+            .await
+            .map_err(|e| {
+                BuilderError::Other(format!(
+                    "Failed to read the registry index of '{}': {}",
+                    image_name, e
+                ))
+            })?;
+        Ok(registry_index_platforms(&distribution.platforms))
     }
 
     async fn inspect_image(&self, image_name: &str) -> Result<crate::ImageInfo, BuilderError> {

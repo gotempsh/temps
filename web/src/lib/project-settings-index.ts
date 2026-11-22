@@ -72,6 +72,38 @@ export function settingAnchor(id: string): string {
   return `setting-${id}`
 }
 
+/** Instance-wide settings use absolute pages, never a service URL prefix. */
+export const PLATFORM_SETTINGS_INDEX: readonly Pick<
+  ProjectSettingEntry,
+  'anchor' | 'title' | 'page' | 'keywords'
+>[] = [
+  {
+    anchor: settingAnchor('trusted-proxy-cidrs'),
+    title: 'Resolve client IPs through trusted proxies',
+    page: '/settings/security',
+    keywords: [
+      'trusted proxy',
+      'CIDR',
+      'load balancer',
+      'reverse proxy',
+      'client IP',
+      'forwarded headers',
+    ],
+  },
+  {
+    anchor: settingAnchor('response-branding'),
+    title: 'Show Temps branding in responses',
+    page: '/settings/security',
+    keywords: [
+      'branding',
+      'response privacy',
+      'fingerprinting',
+      'headers',
+      'platform identity',
+    ],
+  },
+]
+
 const GENERAL = 'settings/general'
 const DELIVERY = 'settings/delivery'
 const PROTECTION = 'settings/security'
@@ -242,6 +274,9 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
       'health path',
       'healthcheck',
       'startup timeout',
+      'stop timeout',
+      'graceful shutdown',
+      'sigterm',
       'liveness',
       'readiness',
     ],
@@ -361,6 +396,13 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
     keywords: ['timeout', 'request timeout', 'proxy timeout'],
   },
   {
+    anchor: settingAnchor('environment-stop-timeout'),
+    title: 'Stop timeout',
+    page: ENVIRONMENT,
+    query: ENVIRONMENT_SETTINGS,
+    keywords: ['stop timeout', 'graceful shutdown', 'sigterm', 'drain'],
+  },
+  {
     anchor: settingAnchor('environment-connection-limits'),
     title: 'Connection limits',
     page: ENVIRONMENT,
@@ -441,4 +483,21 @@ export function projectSettingUrl(entry: ProjectSettingEntry): string {
   if (entry.section) params.set(SETTINGS_SECTION_PARAM, entry.section)
   const query = params.toString()
   return `${entry.page}${query ? `?${query}` : ''}#${entry.anchor}`
+}
+
+/** Per-installation settings join the command palette without a project prefix. */
+export function pluginAiToolSetting(name: string): ProjectSettingEntry {
+  return {
+    anchor: 'setting-plugin-ai-tools',
+    title: `${name}: AI chat tools`,
+    page: `/plugins/${encodeURIComponent(name)}`,
+    keywords: [
+      'plugin AI access',
+      'AI tools',
+      'chat tools',
+      'consent',
+      'allow AI',
+      name,
+    ],
+  }
 }

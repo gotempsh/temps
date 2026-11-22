@@ -25,7 +25,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
-import { RecordLink } from '@temps-sdk/ds'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import { AlertCircle, Globe, Monitor } from 'lucide-react'
@@ -155,7 +155,7 @@ export function EmailEventLog() {
               </TableHeader>
               <TableBody>
                 {events.events.map((event) => (
-                  <TableRow key={event.id}>
+                  <RecordRow key={event.id}>
                     <TableCell>
                       <RecordLink
                         to={`/email/${event.email_id}`}
@@ -201,7 +201,7 @@ export function EmailEventLog() {
                         addSuffix: true,
                       })}
                     </TableCell>
-                  </TableRow>
+                  </RecordRow>
                 ))}
               </TableBody>
             </Table>

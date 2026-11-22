@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use crate::externalsvc::error::{EngineError, Result};
 use crate::externalsvc::{
-    garage::GarageService, managed_instance_name, mariadb::MariaDbService, mongodb::MongodbService,
+    garage::GarageService, mariadb::MariaDbService, mongodb::MongodbService,
     postgres::PostgresService, redis::RedisService, rustfs::RustfsService, s3::S3Service,
-    ExternalService, ManagedS3BackendKind, ManagedS3BackendSelection, ServiceType,
+    ExternalService, ManagedS3BackendKind, ServiceType,
 };
-use anyhow::Result;
 use bollard::Docker;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use std::collections::HashMap;
@@ -18,9 +18,15 @@ use temps_core::EncryptionService;
 
 mod cluster_state;
 mod cluster_topology;
-mod errors;
+mod engine_selection;
+mod healthcheck_defaults;
 mod manager;
+pub use manager::{
+    cpu_utilization_percent, ContainerStatsBaseline, CpuLimit, PolledContainerStats,
+    CPU_LIMIT_REFRESH,
+};
 mod schema;
+mod service_metadata;
 #[cfg(test)]
 mod test_support;
 mod transactions;
@@ -28,8 +34,19 @@ mod types;
 
 pub use cluster_state::*;
 pub(crate) use cluster_topology::*;
-pub use errors::*;
+use engine_selection::{EngineKind, EngineSelection};
+pub use healthcheck_defaults::*;
+pub(crate) use manager::record_wal_outcome;
+pub use manager::{
+    service_overrides, HealthcheckApplied, HealthcheckCapability, ServiceHealthcheck,
+    ServiceHealthcheckUpdate,
+};
+pub use manager::{ArchiveTargetTestError, ArchiveTargetTestOutcome};
+pub use manager::{WalHealthReading, WalHealthUnchecked, WalProbeOutcome};
+#[cfg(test)]
+pub(crate) use manager::{HEALTHCHECK_CHANNEL, HEALTHCHECK_REGISTRY_TEST_LOCK};
 pub use schema::*;
+pub use temps_providers_core::service_errors::*;
 pub use transactions::*;
 pub use types::*;
 
@@ -116,11 +133,27 @@ pub struct ExternalServiceManager {
             HashMap<i32, Arc<crate::externalsvc::postgres_role_reconciler::ReconcilerShutdown>>,
         >,
     >,
+    /// One lock per service, held by a TLS mode change (through its
+    /// rollback), by every pass that switches a cluster's data nodes, and by
+    /// a standalone service's initialization and start, which read the TLS
+    /// mode they create the container with (ADR 093), so they never
+    /// interleave and none acts on a stale setting. Taken before a
+    /// container's recreate lock, never after.
+    service_tls_locks: Arc<manager::ServiceTlsLocks>,
     /// The control plane's cluster resolver address (ADR-024), published by
     /// the deployer's probe only while cluster DNS is enabled and the
     /// resolver answers. Empty otherwise, and on processes that run no
     /// resolver: local cluster members then keep Docker's embedded DNS.
     cluster_dns_slot: temps_dns::OverlayDnsSlot,
+    /// Derives the S3 credential a worker node receives (ADR-102). Each
+    /// constructor builds one that scopes through STS and refuses managed
+    /// sources; the plugin replaces it with the process's shared one, which
+    /// holds the Temps Cloud minter.
+    worker_credentials: Arc<crate::worker_s3_scope::WorkerCredentialScoper>,
+    /// Bumped whenever Temps applies CPU/memory limits to a service's
+    /// containers, so pollers caching a container's CPU limit
+    /// (`stats_poll`) re-read it on their next tick. Shared by every clone.
+    cpu_limits_epoch: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl ExternalServiceManager {
@@ -145,6 +178,9 @@ impl ExternalServiceManager {
         docker: Arc<Docker>,
         dns_registry: Arc<temps_dns::DnsRegistry>,
     ) -> Self {
+        let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
+            encryption_service.clone(),
+        ));
         Self {
             db,
             encryption_service,
@@ -152,7 +188,10 @@ impl ExternalServiceManager {
             local_workloads_enabled: true,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            worker_credentials,
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -166,6 +205,9 @@ impl ExternalServiceManager {
         local_workloads_enabled: bool,
         dns_registry: Arc<temps_dns::DnsRegistry>,
     ) -> Self {
+        let worker_credentials = Arc::new(crate::worker_s3_scope::WorkerCredentialScoper::new(
+            encryption_service.clone(),
+        ));
         Self {
             db,
             encryption_service,
@@ -173,8 +215,20 @@ impl ExternalServiceManager {
             local_workloads_enabled,
             dns_registry,
             reconciler_shutdowns: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            service_tls_locks: Arc::default(),
             cluster_dns_slot: Arc::new(std::sync::RwLock::new(None)),
+            worker_credentials,
+            cpu_limits_epoch: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Derive worker credentials with `scoper`, the process's shared one.
+    pub fn with_worker_credentials(
+        mut self,
+        scoper: Arc<crate::worker_s3_scope::WorkerCredentialScoper>,
+    ) -> Self {
+        self.worker_credentials = scoper;
+        self
     }
 
     /// Follow the control plane's cluster resolver slot, so local cluster
@@ -287,52 +341,68 @@ impl ExternalServiceManager {
         Ok(candidates)
     }
 
-    #[allow(deprecated)]
+    /// The engine for a service of `service_type` on its type's default
+    /// backend. Needs a local Docker handle; a service on a worker node is
+    /// addressed through [`EngineSelection`] instead.
     fn create_service_instance(
         &self,
         name: String,
         service_type: ServiceType,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
+        self.build_engine(EngineSelection::for_type(&name, service_type), service_type)
+    }
+
+    /// The engine `selection` names, for a service of `service_type`.
+    fn build_engine(
+        &self,
+        selection: EngineSelection,
+        service_type: ServiceType,
+    ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
         let docker = self.require_docker()?;
-        Ok(match service_type {
-            ServiceType::Mariadb => Box::new(MariaDbService::new(name, docker)),
-            ServiceType::Mongodb => Box::new(MongodbService::new(name, docker)),
-            ServiceType::Postgres => Box::new(PostgresService::new(name, docker)),
-            // Note: PostgresCluster is handled via create_cluster_service_instance, not here
-            ServiceType::Redis => Box::new(RedisService::new(name, docker)),
-            // S3 now uses RustFS by default (high-performance S3-compatible storage)
-            ServiceType::S3 => Box::new(RustfsService::new(
+        Ok(self.engine_with(selection, service_type, docker))
+    }
+
+    /// The engine `selection` names, over `docker`. Callers decide which
+    /// client that is: [`Self::build_engine`] requires the real one,
+    /// [`Self::service_metadata`] may pass an inert one because it exposes
+    /// no method that uses it.
+    #[allow(
+        deprecated,
+        reason = "existing MinIO services keep running on the MinIO engine"
+    )]
+    fn engine_with(
+        &self,
+        selection: EngineSelection,
+        service_type: ServiceType,
+        docker: Arc<Docker>,
+    ) -> Box<dyn ExternalService> {
+        let EngineSelection {
+            kind,
+            instance_name: name,
+        } = selection;
+        match kind {
+            EngineKind::Mariadb => Box::new(MariaDbService::new(name, docker)),
+            EngineKind::Mongodb => Box::new(MongodbService::new(name, docker)),
+            EngineKind::Postgres => Box::new(PostgresService::new(name, docker)),
+            EngineKind::Redis => Box::new(RedisService::new(name, docker)),
+            EngineKind::Rustfs => Box::new(RustfsService::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
             )),
-            // Temps KV uses Redis backend. The instance name must come from
-            // `managed_instance_name` so this agrees with the kv plugin —
-            // see the module docs on `externalsvc::naming` and issue #495.
-            ServiceType::Kv => Box::new(RedisService::new(
-                managed_instance_name(&name, service_type),
-                docker,
-            )),
-            // Temps Blob uses RustfsService (high-performance S3-compatible
-            // storage). Same naming contract as `Kv` above.
-            ServiceType::Blob => Box::new(RustfsService::new(
-                managed_instance_name(&name, service_type),
-                docker,
-                self.encryption_service.clone(),
-            )),
-            // RustFS standalone S3-compatible storage
-            ServiceType::Rustfs => Box::new(RustfsService::new(
+            EngineKind::Minio => Box::new(S3Service::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
             )),
-            // MinIO (deprecated) - kept for backward compatibility with existing services
-            ServiceType::Minio => Box::new(S3Service::new(
+            // Garage serves both S3 and Blob, and keeps which one it is.
+            EngineKind::Garage => Box::new(GarageService::new(
                 name,
                 docker,
                 self.encryption_service.clone(),
+                service_type,
             )),
-        })
+        }
     }
 
     /// Parameter-strategy key for updating a stored service. An S3/Blob
@@ -356,6 +426,8 @@ impl ExternalServiceManager {
         }
     }
 
+    /// The engine for a stored service, following the S3/Blob backend in its
+    /// decrypted `parameters`. Needs a local Docker handle.
     #[allow(deprecated)]
     fn create_service_instance_for_parameters(
         &self,
@@ -370,49 +442,16 @@ impl ExternalServiceManager {
         self.create_service_instance_for_parameter_value(name, service_type, &parameter_value)
     }
 
-    #[allow(deprecated)]
+    /// [`Self::create_service_instance_for_parameters`] for parameters held
+    /// as one JSON value.
     fn create_service_instance_for_parameter_value(
         &self,
         name: String,
         service_type: ServiceType,
         parameters: &serde_json::Value,
     ) -> Result<Box<dyn ExternalService>, ExternalServiceError> {
-        if !matches!(service_type, ServiceType::S3 | ServiceType::Blob) {
-            return self.create_service_instance(name, service_type);
-        }
-
-        let backend_selection =
-            ManagedS3BackendSelection::from_parameters(parameters).map_err(|e| {
-                ExternalServiceError::ParameterValidationFailed {
-                    service_id: 0,
-                    reason: e.to_string(),
-                }
-            })?;
-        match backend_selection.backend {
-            ManagedS3BackendKind::Rustfs => self.create_service_instance(name, service_type),
-            ManagedS3BackendKind::Minio if service_type == ServiceType::S3 => {
-                let docker = self.require_docker()?;
-                Ok(Box::new(S3Service::new(
-                    name,
-                    docker,
-                    self.encryption_service.clone(),
-                )))
-            }
-            ManagedS3BackendKind::Minio => Err(ExternalServiceError::ParameterValidationFailed {
-                service_id: 0,
-                reason: "managed S3 backend 'minio' is only supported for S3 services; use the default 'rustfs' backend for Blob services"
-                    .to_string(),
-            }),
-            ManagedS3BackendKind::Garage => {
-                let docker = self.require_docker()?;
-                Ok(Box::new(GarageService::new(
-                    name,
-                    docker,
-                    self.encryption_service.clone(),
-                    service_type,
-                )))
-            }
-        }
+        let selection = EngineSelection::for_parameters(0, &name, service_type, parameters)?;
+        self.build_engine(selection, service_type)
     }
 
     // -----------------------------------------------------------------------
@@ -437,11 +476,20 @@ impl ExternalServiceManager {
         service_id_val: i32,
     ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
         let service = self.get_service(service_id_val).await?;
+        self.parameters_of(&service)
+    }
 
+    /// The decrypted parameters of a service row already read.
+    pub(crate) fn parameters_of(
+        &self,
+        service: &external_services::Model,
+    ) -> Result<HashMap<String, serde_json::Value>, ExternalServiceError> {
+        let service_id_val = service.id;
         // Get encrypted config from service record
         let encrypted_config =
             service
                 .config
+                .as_deref()
                 .ok_or_else(|| ExternalServiceError::InternalError {
                     reason: format!("Service {} has no config", service_id_val),
                 })?;
@@ -449,7 +497,7 @@ impl ExternalServiceManager {
         // Decrypt config
         let config_json = self
             .encryption_service
-            .decrypt_string(&encrypted_config)
+            .decrypt_string(encrypted_config)
             .map_err(|e| ExternalServiceError::InternalError {
                 reason: format!(
                     "Failed to decrypt config for service {}: {}",

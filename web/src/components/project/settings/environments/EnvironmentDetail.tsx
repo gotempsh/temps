@@ -17,14 +17,15 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Globe, HardDrive, Loader2, RefreshCw, Trash2 } from 'lucide-react'
+import { Globe, Loader2, Trash2 } from 'lucide-react'
 import { useState } from 'react'
 import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
 import { EnvironmentIngressCard } from './EnvironmentIngressCard'
 import { EnvironmentVolumesCard } from './EnvironmentVolumesCard'
-import { EnvironmentWorkloadCard } from './EnvironmentWorkloadCard'
+import { PurgeAssetCacheCard } from './PurgeAssetCacheCard'
+import { InternalAccessCard } from '../InternalAccessCard'
 import { ProjectIpAccessCard } from '../ProjectIpAccessCard'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
@@ -182,62 +183,6 @@ function SubdomainCard({
   )
 }
 
-function PurgeAssetCacheCard({
-  projectId,
-  environmentId,
-  environmentName,
-}: {
-  projectId: number
-  environmentId: number
-  environmentName: string
-}) {
-  const [isPurging, setIsPurging] = useState(false)
-  const [showConfirm, setShowConfirm] = useState(false)
-
-  const handlePurge = async () => {
-    setIsPurging(true)
-    try {
-      const response = await fetch(
-        `/api/projects/${projectId}/environments/${environmentId}/asset-cache`,
-        { method: 'DELETE' }
-      )
-      const data = await response.json()
-      const deleted = data?.deleted ?? 0
-      toast.success(`Purged ${deleted} cached asset${deleted !== 1 ? 's' : ''}`)
-    } catch {
-      toast.error('Failed to purge asset cache')
-    } finally {
-      setIsPurging(false)
-      setShowConfirm(false)
-    }
-  }
-
-  return (
-    <SettingsSection
-      id="setting-environment-asset-cache"
-      title="Asset cache"
-      icon={HardDrive}
-      description="Static assets (JS chunks, CSS, fonts) are cached for stale-chunk fallback. Purge if you need to force-clear cached assets for this environment."
-    >
-      <Button variant="outline" size="sm" onClick={() => setShowConfirm(true)}>
-        <RefreshCw className="h-4 w-4 mr-2" />
-        Purge asset cache
-      </Button>
-      <ConfirmDeleteDialog
-        open={showConfirm}
-        onOpenChange={setShowConfirm}
-        verb="Purge"
-        confirmLabel="Purge cache"
-        resourceType="asset cache of environment"
-        resourceName={environmentName}
-        consequences="All cached static assets for this environment are deleted. In-flight users with old HTML may see broken pages until they refresh. Orphaned blobs are cleaned up automatically overnight."
-        isPending={isPurging}
-        onConfirm={() => void handlePurge()}
-      />
-    </SettingsSection>
-  )
-}
-
 export function EnvironmentDetail({
   project,
   environmentId: propEnvironmentId,
@@ -339,14 +284,19 @@ export function EnvironmentDetail({
         scopeName={environment.name}
       />
 
+      <InternalAccessCard
+        key={`internal-access:${environment.id}`}
+        projectId={project.id}
+        projectName={project.name}
+        projectSlug={project.slug}
+        environmentId={environment.id}
+        environmentName={environment.name}
+        environmentSlug={environment.slug}
+      />
+
       <EnvironmentIngressCard
         key={`ingress:${environment.id}`}
         projectId={project.id}
-        environmentId={environment.id}
-      />
-
-      <EnvironmentWorkloadCard
-        key={`workload:${environment.id}`}
         environmentId={environment.id}
       />
 

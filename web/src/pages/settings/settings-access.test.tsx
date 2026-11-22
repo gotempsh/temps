@@ -13,7 +13,7 @@ import {
   getAdminGateOptions,
   nodeMetricsGetAlertRulesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { AgentSandboxSandboxPage } from '@/pages/agent-sandbox/AgentSandboxSandboxPage'
+import { SandboxRuntimeSettings } from '@/pages/sandbox-settings/SandboxRuntimeSettings'
 import DeliveryProfiles from '@/pages/DeliveryProfiles'
 import { Settings } from '@/pages/Settings'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
@@ -26,6 +26,7 @@ import { MonitoringSettingsPage } from './MonitoringSettingsPage'
 import { RateLimitingPage } from './RateLimitingPage'
 import { RequestTimeoutsPage } from './RequestTimeoutsPage'
 import { SecurityPage } from './SecurityPage'
+import { ServiceHealthchecksPage } from './ServiceHealthchecksPage'
 
 const refused = {
   title: 'Forbidden',
@@ -81,10 +82,14 @@ const SETTINGS_PAGES: [string, ReactElement][] = [
   ['Rate limiting', <RateLimitingPage key="rate" />],
   ['Build limits', <BuildLimitsPage key="build" />],
   ['Request timeouts', <RequestTimeoutsPage key="timeouts" />],
+  [
+    'Service health checks',
+    <ServiceHealthchecksPage key="service-healthchecks" />,
+  ],
   ['Docker registry', <DockerRegistryPage key="registry" />],
   ['Disk monitoring', <DiskMonitoringPage key="disk" />],
   ['Metrics monitoring', <MonitoringSettingsPage key="metrics" />],
-  ['Sandbox configuration', <AgentSandboxSandboxPage key="sandbox" />],
+  ['Sandbox configuration', <SandboxRuntimeSettings key="sandbox" />],
 ]
 
 describe('settings pages for a role that cannot read platform settings', () => {

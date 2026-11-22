@@ -23,6 +23,13 @@ pub enum GitProviderError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    /// The provider's token endpoint answered 400 `invalid_grant`: it will never
+    /// accept this refresh token again, so retrying cannot help. Any other
+    /// refresh failure (5xx, 429, a network error, `invalid_client`) says nothing
+    /// about the token and must not use this variant.
+    #[error("{provider} rejected the stored refresh token (invalid_grant); the connection must be reauthorized")]
+    RefreshTokenRejected { provider: String },
+
     #[error(
         "Permission denied while trying to {operation}. Required permission: {required_permission}. Git provider response: {provider_message}"
     )]
@@ -72,6 +79,46 @@ pub enum GitProviderError {
 
     #[error("Other error: {0}")]
     Other(String),
+}
+
+/// Tokens issued by one successful call to a provider's OAuth token endpoint.
+pub struct RefreshedOAuthToken {
+    pub access_token: String,
+    /// `None` when the provider did not rotate the refresh token.
+    pub refresh_token: Option<String>,
+    /// From the provider's `expires_in`; `None` when it reported no usable
+    /// lifetime. Never a guessed value, so a recorded expiry is always real.
+    pub expires_at: Option<temps_core::UtcDateTime>,
+}
+
+// Hand-written so a token cannot reach a log through `{:?}`.
+impl std::fmt::Debug for RefreshedOAuthToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RefreshedOAuthToken")
+            .field("access_token", &"***")
+            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "***"))
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+/// When a token issued in a response to a request sent at `requested_at`
+/// expires. Counted from before the request, so the recorded expiry errs early.
+/// An absent, non-numeric or non-positive `expires_in` gives `None`: a malformed
+/// lifetime must not cost the tokens, which the provider has already issued.
+pub(crate) fn oauth_token_expiry(
+    requested_at: temps_core::UtcDateTime,
+    expires_in: Option<&serde_json::Value>,
+) -> Option<temps_core::UtcDateTime> {
+    let seconds = expires_in.and_then(|value| {
+        value
+            .as_i64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })?;
+    if seconds <= 0 {
+        return None;
+    }
+    requested_at.checked_add_signed(chrono::Duration::try_seconds(seconds)?)
 }
 
 /// Header value carrying a provider credential. A token that contains bytes
@@ -553,6 +600,19 @@ pub trait GitProviderService: Send + Sync {
         access_token: &str,
         refresh_token: Option<&str>,
     ) -> Result<(String, Option<String>), GitProviderError>;
+
+    /// Exchange a refresh token for new tokens with exactly one request.
+    ///
+    /// Refresh tokens can be single-use: a repeated POST could use up the token
+    /// an earlier attempt already exchanged, so implementations must not retry.
+    /// A 400 `invalid_grant` must be reported as
+    /// [`GitProviderError::RefreshTokenRejected`], and nothing else may be.
+    async fn refresh_oauth_token(
+        &self,
+        _refresh_token: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
 
     /// Mint a per-operation, narrowly-scoped credential for a single
     /// repository. The returned token MUST live only as long as one
@@ -1118,6 +1178,35 @@ pub fn guarded_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(OutboundGuardResolver))
+}
+
+#[cfg(test)]
+mod oauth_token_expiry_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn uses_the_reported_lifetime_and_refuses_to_invent_one() {
+        let now = chrono::Utc::now();
+        assert_eq!(
+            oauth_token_expiry(now, Some(&json!(7200))),
+            Some(now + chrono::Duration::seconds(7200))
+        );
+        assert_eq!(
+            oauth_token_expiry(now, Some(&json!("7200"))),
+            Some(now + chrono::Duration::seconds(7200))
+        );
+        for unusable in [
+            json!(0),
+            json!(-1),
+            json!("soon"),
+            json!(null),
+            json!(i64::MAX),
+        ] {
+            assert_eq!(oauth_token_expiry(now, Some(&unusable)), None, "{unusable}");
+        }
+        assert_eq!(oauth_token_expiry(now, None), None);
+    }
 }
 
 #[cfg(test)]

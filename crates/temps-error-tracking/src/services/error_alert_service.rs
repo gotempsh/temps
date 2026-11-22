@@ -18,6 +18,11 @@ use super::types::ErrorTrackingError;
 /// cost an API caller controls.
 pub const MAX_ERROR_ALERT_RULES_PER_PROJECT: u64 = 100;
 
+/// Status-change notifications one bulk triage request may send. A bulk
+/// resolve can select up to 1,000 groups; delivering one notification per
+/// group per rule would turn a single click into an unbounded fan-out.
+pub const BULK_STATUS_CHANGE_NOTIFICATION_LIMIT: usize = 50;
+
 /// Trigger types that can fire an error alert
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
@@ -72,11 +77,10 @@ fn validate_trigger_config(
     trigger_type: &str,
     trigger_config: &serde_json::Value,
 ) -> Result<(), ErrorTrackingError> {
-    if !matches!(
-        AlertTriggerType::from_str(trigger_type),
-        Some(AlertTriggerType::Frequency)
-    ) {
-        return Ok(());
+    match AlertTriggerType::from_str(trigger_type) {
+        Some(AlertTriggerType::Frequency) => {}
+        Some(AlertTriggerType::UserCount) => return validate_user_count_config(trigger_config),
+        _ => return Ok(()),
     }
     let config: FrequencyConfig =
         serde_json::from_value(trigger_config.clone()).map_err(|error| {
@@ -101,6 +105,26 @@ fn validate_trigger_config(
     Ok(())
 }
 
+/// A user count rule without a count of at least 1 could never fire, and
+/// nothing would say so.
+fn validate_user_count_config(
+    trigger_config: &serde_json::Value,
+) -> Result<(), ErrorTrackingError> {
+    let config: UserCountConfig =
+        serde_json::from_value(trigger_config.clone()).map_err(|error| {
+            ErrorTrackingError::Validation(format!(
+                "Invalid trigger config for 'user_count': expected count: {error}"
+            ))
+        })?;
+    if config.count < 1 {
+        return Err(ErrorTrackingError::Validation(format!(
+            "User count rule count must be at least 1, got {}",
+            config.count
+        )));
+    }
+    Ok(())
+}
+
 /// Start of a frequency rule's window, or `None` when `window_minutes` can't be
 /// represented. Saves refuse such a value, but a rule stored before that check
 /// existed still reaches here on the ingest path, which must not panic.
@@ -120,8 +144,33 @@ pub struct FrequencyConfig {
 
 /// Configuration for user count triggers
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(try_from = "StoredUserCountConfig")]
 pub struct UserCountConfig {
     pub count: i64,
+}
+
+/// A user count config as stored. Consoles before #1749 saved the value as
+/// `threshold`, which the server never read, and could also carry a `count`
+/// left over from a frequency rule. `count` wins when both are present (as the
+/// console reads it back); `threshold` alone is read as the count. A serde
+/// alias would refuse the both-present shape as a duplicate field, silencing
+/// rules that worked before.
+#[derive(Deserialize)]
+struct StoredUserCountConfig {
+    count: Option<i64>,
+    threshold: Option<i64>,
+}
+
+impl TryFrom<StoredUserCountConfig> for UserCountConfig {
+    type Error = &'static str;
+
+    fn try_from(stored: StoredUserCountConfig) -> Result<Self, Self::Error> {
+        stored
+            .count
+            .or(stored.threshold)
+            .map(|count| Self { count })
+            .ok_or("missing field `count`")
+    }
 }
 
 /// Configuration for status change triggers
@@ -311,6 +360,163 @@ impl ErrorAlertService {
         }
 
         notifications
+    }
+
+    /// Evaluate `status_change` rules for many groups changed by one bulk
+    /// triage request (ADR 111, D1).
+    ///
+    /// Same rules, filters and cooldown as [`Self::evaluate_status_change`],
+    /// but the work is bounded by the number of rules rather than by the
+    /// number of groups: one cooldown query and one fire insert per rule, not
+    /// per group. Notifications are capped at
+    /// [`BULK_STATUS_CHANGE_NOTIFICATION_LIMIT`], because one triage click
+    /// must not fan out into a thousand deliveries; a fire is recorded only
+    /// for a group that is actually notified, so the rest stay eligible for
+    /// the next request.
+    pub async fn evaluate_status_change_many(
+        &self,
+        project_id: i32,
+        groups: &[error_groups::Model],
+        new_status: &str,
+    ) -> Vec<AlertNotification> {
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let rules = match self.get_enabled_rules(project_id).await {
+            Ok(rules) => rules,
+            Err(e) => {
+                error!("Failed to load alert rules for project {project_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let mut notifications = Vec::new();
+        let mut budget = BULK_STATUS_CHANGE_NOTIFICATION_LIMIT;
+        let mut suppressed = 0_usize;
+        for rule in &rules {
+            if AlertTriggerType::from_str(&rule.trigger_type)
+                != Some(AlertTriggerType::StatusChange)
+            {
+                continue;
+            }
+            let fires_on_this_status =
+                match serde_json::from_value::<StatusChangeConfig>(rule.trigger_config.clone()) {
+                    Ok(config) => config.statuses.iter().any(|s| s == new_status),
+                    // No config means "any status change", as for one group.
+                    Err(_) => true,
+                };
+            if !fires_on_this_status {
+                continue;
+            }
+            let candidates: Vec<&error_groups::Model> = groups
+                .iter()
+                .filter(|group| self.matches_filters(rule, group))
+                .collect();
+            if candidates.is_empty() {
+                continue;
+            }
+            let cooling_down = self
+                .groups_in_cooldown(rule, &candidates.iter().map(|g| g.id).collect::<Vec<_>>())
+                .await;
+            let eligible: Vec<&error_groups::Model> = candidates
+                .into_iter()
+                .filter(|group| !cooling_down.contains(&group.id))
+                .collect();
+            let (notify, over_budget) = eligible.split_at(eligible.len().min(budget));
+            suppressed += over_budget.len();
+            if notify.is_empty() {
+                continue;
+            }
+            budget -= notify.len();
+            self.record_fires(rule.id, &notify.iter().map(|g| g.id).collect::<Vec<_>>())
+                .await;
+            for group in notify {
+                info!(
+                    "Alert rule '{}' (type: status_change) fired for error group {} in project {}",
+                    rule.name, group.id, group.project_id
+                );
+                notifications.push(AlertNotification {
+                    rule_name: rule.name.clone(),
+                    trigger_type: AlertTriggerType::StatusChange.as_str().to_string(),
+                    group_title: group.title.clone(),
+                    group_id: group.id,
+                    project_id: group.project_id,
+                    environment_id: group.environment_id,
+                    priority: rule.notification_priority.clone(),
+                    message: format!("Error group status changed to '{new_status}'."),
+                    project_name: None,
+                    project_slug: None,
+                    environment_name: None,
+                    error_type: group.error_type.clone(),
+                    total_count: group.total_count,
+                    first_seen: group.first_seen.to_rfc3339(),
+                    last_seen: group.last_seen.to_rfc3339(),
+                });
+            }
+        }
+        if suppressed > 0 {
+            warn!(
+                project_id,
+                suppressed,
+                "Bulk status change produced more alert notifications than the per-request limit of {}; the rest were not sent and not recorded as fired",
+                BULK_STATUS_CHANGE_NOTIFICATION_LIMIT
+            );
+        }
+        notifications
+    }
+
+    /// Which of `group_ids` have fired `rule` inside its cooldown window.
+    /// One query for the whole set.
+    async fn groups_in_cooldown(
+        &self,
+        rule: &error_alert_rules::Model,
+        group_ids: &[i32],
+    ) -> std::collections::HashSet<i32> {
+        let threshold = Utc::now() - Duration::minutes(i64::from(rule.cooldown_minutes));
+        match error_alert_fires::Entity::find()
+            .filter(error_alert_fires::Column::RuleId.eq(rule.id))
+            .filter(error_alert_fires::Column::ErrorGroupId.is_in(group_ids.to_vec()))
+            .filter(error_alert_fires::Column::FiredAt.gte(threshold))
+            .all(self.db.as_ref())
+            .await
+        {
+            Ok(fires) => fires.into_iter().map(|fire| fire.error_group_id).collect(),
+            Err(e) => {
+                error!(
+                    "Failed to read alert fires for rule {}: {}; treating every group as cooling down",
+                    rule.id, e
+                );
+                group_ids.iter().copied().collect()
+            }
+        }
+    }
+
+    /// Record one fire per group in a single insert.
+    async fn record_fires(&self, rule_id: i32, group_ids: &[i32]) {
+        if group_ids.is_empty() {
+            return;
+        }
+        let now = Utc::now();
+        let fires = group_ids
+            .iter()
+            .map(|group_id| error_alert_fires::ActiveModel {
+                rule_id: Set(rule_id),
+                error_group_id: Set(*group_id),
+                fired_at: Set(now),
+                notification_sent: Set(true),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        if let Err(e) = error_alert_fires::Entity::insert_many(fires)
+            .exec(self.db.as_ref())
+            .await
+        {
+            error!(
+                "Failed to record {} alert fires for rule {}: {}",
+                group_ids.len(),
+                rule_id,
+                e
+            );
+        }
     }
 
     // === CRUD operations for alert rules ===
@@ -896,6 +1102,55 @@ mod tests {
         assert_eq!(config.count, 10);
     }
 
+    /// #1749: rules the console saved under `threshold` never fired, because
+    /// the server only read `count`. They now read the same.
+    #[test]
+    fn user_count_rule_saved_as_threshold_reads_its_count() {
+        let config: UserCountConfig =
+            serde_json::from_value(serde_json::json!({"threshold": 3})).unwrap();
+        assert_eq!(config.count, 3);
+        assert!(
+            validate_trigger_config("user_count", &serde_json::json!({"threshold": 3})).is_ok()
+        );
+    }
+
+    /// A rule saved by an older console can hold both keys (a `count` left
+    /// from a frequency rule plus the `threshold` it showed). It must still
+    /// load, reading `count` first, rather than fail as a duplicate field.
+    #[test]
+    fn user_count_rule_with_both_count_and_threshold_reads_the_count() {
+        let both = serde_json::json!({"count": 5, "threshold": 9, "window_minutes": 60});
+        let config: UserCountConfig = serde_json::from_value(both.clone()).unwrap();
+        assert_eq!(config.count, 5);
+        assert!(validate_trigger_config("user_count", &both).is_ok());
+        assert_eq!(
+            serde_json::to_value(&config).unwrap(),
+            serde_json::json!({"count": 5})
+        );
+    }
+
+    /// #1749: a user count rule saved with no count never fired, silently.
+    #[test]
+    fn user_count_rule_config_is_refused_without_a_positive_count() {
+        assert!(validate_trigger_config("user_count", &serde_json::json!({"count": 1})).is_ok());
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"count": 0}),
+            serde_json::json!({"count": -2}),
+            serde_json::json!({"count": "ten"}),
+        ] {
+            match validate_trigger_config("user_count", &bad) {
+                Err(ErrorTrackingError::Validation(message)) => {
+                    assert!(
+                        message.contains("user_count") || message.contains("User count"),
+                        "{message}"
+                    );
+                }
+                other => panic!("{bad} must be refused, got {other:?}"),
+            }
+        }
+    }
+
     #[test]
     fn test_status_change_config_deserialization() {
         let json = serde_json::json!({"statuses": ["resolved", "assigned"]});
@@ -927,7 +1182,7 @@ mod tests {
     /// project's own rules, and reports a missing project as not found.
     #[tokio::test]
     async fn create_rule_stops_at_the_per_project_limit() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error) if is_container_runtime_unavailable(&error.to_string()) => {

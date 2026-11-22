@@ -74,12 +74,15 @@ import {
   waitForServer,
   withLock,
   writeState,
+  originWarning,
+  type OriginCheck,
   type RemovedWorkloads,
 } from './steps.js'
 
 interface StartOptions {
   channel?: string
   runtimeVersion?: string
+  allowUnsigned?: boolean
   skills?: string
   port?: string
   makeDefault?: boolean
@@ -137,6 +140,24 @@ class Steps {
     const text = `${[...this.pending].join(', ')}…`
     if (this.spinner) this.spinner.text = text
     else this.spinner = startSpinner(text)
+  }
+}
+
+/** How the downloaded binary's origin was checked, for the progress line. */
+function originText(origin: OriginCheck | undefined): string {
+  switch (origin?.kind) {
+    case 'cosign':
+      return 'signature verified with cosign'
+    case 'gh':
+      return 'build provenance verified with gh'
+    case 'unsigned':
+      return colors.warning('UNSIGNED release, checksum only (--allow-unsigned)')
+    case 'unverified':
+      return colors.warning(
+        'checksum verified; origin NOT verified: install cosign or sign in to gh to check the signature',
+      )
+    default:
+      return 'checksum verified'
   }
 }
 
@@ -315,8 +336,8 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
     const [binary, , skills] = await Promise.all([
       steps.time(
         'Downloading Temps',
-        () => ensureBinary(paths, current.version, target),
-        (b) => (b.downloaded ? `Downloaded Temps ${current.version} (${Math.round(b.bytes / 1048576)} MB)` : `Temps ${current.version} ready`),
+        () => ensureBinary(paths, current.version, target, options.allowUnsigned === true),
+        (b) => (b.downloaded ? `Downloaded Temps ${current.version} (${Math.round(b.bytes / 1048576)} MB, ${originText(b.origin)})` : `Temps ${current.version} ready`),
       ),
       running
         ? Promise.resolve(null)
@@ -333,6 +354,9 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
           )
         : Promise.resolve(null),
     ])
+
+    const warning = originWarning(current.version, target, binary.origin, binary.sha256)
+    if (warning) console.error(colors.warning(warning))
 
     const setupRan = !current.setupComplete
     if (setupRan) {
@@ -389,6 +413,12 @@ async function startLocked(options: StartOptions, paths: LocalPaths): Promise<vo
             api_key_created: cli.minted,
             admin_email: current.adminEmail,
             credentials_file: paths.state,
+            binary: {
+              path: binary.path,
+              downloaded: binary.downloaded,
+              sha256: binary.sha256 ?? null,
+              origin: binary.origin ?? null,
+            },
             skill: skills ? { scope, name: BUNDLED_SKILL, directories: skills } : { scope, name: null, directories: [] },
             elapsed_ms: elapsed,
           },
@@ -544,6 +574,7 @@ export function registerStartCommands(program: Command): void {
     .description('Run Temps on this computer, sign in the CLI and add the Temps skill for your coding agent')
     .option('--channel <channel>', 'Release channel for a fresh install: stable, beta or nightly', 'beta')
     .option('--runtime-version <tag>', 'Run this exact Temps release')
+    .option('--allow-unsigned', 'Run a release that publishes no Sigstore signature (only releases from before signing), trusting its checksum alone')
     .option('--skills <scope>', 'Where to add the Temps agent skill: project, global or none (default: project inside a project, otherwise global)')
     .option('--port <port>', 'Port for your apps and the console on a fresh install (default: 8080 or the next free port)')
     .option('--make-default', 'Make "local" the default CLI context even if another one is active')

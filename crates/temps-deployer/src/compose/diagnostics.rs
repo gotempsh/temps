@@ -275,12 +275,29 @@ fn find_occurrences(haystack: &[u8], needle: &[u8]) -> Vec<std::ops::Range<usize
 /// messages built outside the executor from interpolated Compose input,
 /// such as a referenced path that contains a substituted value.
 pub fn redact_variable_text(text: &str, values: &[String]) -> String {
-    let values: Vec<String> = values
-        .iter()
-        .filter(|value| value.len() >= 3)
-        .cloned()
-        .collect();
+    let values: Vec<String> = values.iter().flat_map(redaction_forms).collect();
     redact_compose_text(text, &values)
+}
+
+/// Every form a substituted value takes in text derived from a resolved
+/// model: the value itself, and — when it contains a `$` — the form
+/// interpolation wrote into the model, where every literal dollar is doubled
+/// so Compose cannot expand it again
+/// ([`crate::compose_interpolation`]). Masking only the original would leave
+/// `alpha$$bravo` in a message that quotes the model, which is the value
+/// back again.
+///
+/// Values shorter than three bytes are dropped, as everywhere else: they
+/// cannot hide a secret and masking them would mangle the message.
+pub(super) fn redaction_forms(value: &String) -> Vec<String> {
+    if value.len() < 3 {
+        return Vec::new();
+    }
+    let escaped = value.replace('$', "$$");
+    if escaped == *value {
+        return vec![value.clone()];
+    }
+    vec![escaped, value.clone()]
 }
 
 /// Every variable value substituted into a resolved Compose model: the
@@ -292,8 +309,7 @@ pub struct SubstitutedValues(Vec<String>);
 
 impl SubstitutedValues {
     pub(super) fn extend<'a>(&mut self, values: impl IntoIterator<Item = &'a String>) {
-        self.0
-            .extend(values.into_iter().filter(|value| value.len() >= 3).cloned());
+        self.0.extend(values.into_iter().flat_map(redaction_forms));
     }
 
     /// `text` with every substituted value and credential-shaped token
@@ -1018,5 +1034,35 @@ mod tests {
         let sanitized = sanitize_config_stderr(&long, &[]);
         assert_eq!(sanitized.lines().count(), MAX_SANITIZED_STDERR_LINES + 1);
         assert!(sanitized.ends_with("line 99"));
+    }
+
+    /// Interpolation writes a substituted value into the model with every
+    /// literal `$` doubled, so a message quoting the model carries that
+    /// form, not the original. Both must be masked.
+    #[test]
+    fn a_substituted_value_is_masked_in_its_compose_escaped_form_too() {
+        let secret = "alpha$bravo$charlie".to_string();
+        let mut values = SubstitutedValues::default();
+        values.extend([&secret]);
+
+        // As the value was given.
+        assert_eq!(
+            values.redact("container_name: alpha$bravo$charlie"),
+            "container_name: <redacted>"
+        );
+        // As `compose_interpolation` escaped it into the resolved model.
+        assert_eq!(
+            values.redact("container_name: alpha$$bravo$$charlie"),
+            "container_name: <redacted>"
+        );
+        assert_eq!(
+            redact_variable_text("ports: \"alpha$$bravo$$charlie:80\"", &[secret]),
+            "ports: \"<redacted>:80\""
+        );
+
+        // A value with no dollar sign contributes one form, not two.
+        assert_eq!(redaction_forms(&"plain-value".to_string()).len(), 1);
+        // And a value too short to mask contributes none.
+        assert!(redaction_forms(&"$".to_string()).is_empty());
     }
 }

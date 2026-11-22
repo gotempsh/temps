@@ -3,7 +3,6 @@
 
 //! Audit operations for metric dashboard write endpoints.
 
-use anyhow::Result;
 use serde::Serialize;
 pub use temps_core::AuditContext;
 use temps_core::AuditOperation;
@@ -50,9 +49,8 @@ impl AuditOperation for OtelDashboardCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -73,9 +71,8 @@ impl AuditOperation for OtelDashboardUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -96,9 +93,8 @@ impl AuditOperation for OtelDashboardDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -133,9 +129,8 @@ impl AuditOperation for CrossProjectTraceSiblingsReadAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -167,9 +162,8 @@ impl AuditOperation for UnifiedTraceReadAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -218,9 +212,8 @@ impl AuditOperation for FacetCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -241,9 +234,8 @@ impl AuditOperation for FacetDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -264,9 +256,8 @@ impl AuditOperation for FacetBackfillRetriedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -306,9 +297,8 @@ impl AuditOperation for CloudTelemetryWriteModeChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -344,9 +334,8 @@ impl AuditOperation for CloudAnalyticsWriteModeChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -397,9 +386,8 @@ impl AuditOperation for CloudTelemetryBulkActivationStartedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -437,9 +425,8 @@ impl AuditOperation for CloudTelemetryBulkActivationCancelledAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -487,9 +474,8 @@ impl AuditOperation for OtelMetricAlertCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -510,9 +496,8 @@ impl AuditOperation for OtelMetricAlertUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -533,8 +518,7 @@ impl AuditOperation for OtelMetricAlertDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }

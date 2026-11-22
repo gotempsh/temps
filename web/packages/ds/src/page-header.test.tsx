@@ -12,13 +12,13 @@ test('a page container is full width unless asked otherwise', () => {
   expect(html).not.toContain('max-w-')
 })
 
-test('a form page is a capped column aligned with the bar above it', () => {
+test('a form page is a centered capped column', () => {
   const form = renderToStaticMarkup(
     <PageContainer width="form">Body</PageContainer>
   )
   expect(form).toContain('data-page-width="form"')
   expect(form).toContain('max-w-5xl')
-  expect(form).not.toContain('mx-auto')
+  expect(form).toContain('mx-auto')
 })
 
 test('a page container inside another adds no second gutter or cap', () => {
@@ -67,4 +67,15 @@ test('inside a frame that has the top heading, a page title is an h2', () => {
 test('outside a frame a page title stays an h1', () => {
   const html = renderToStaticMarkup(<PageHeader title="Projects" />)
   expect(html).toContain('<h1 class="text-2xl font-semibold tracking-tight">')
+})
+
+test('a nested form inherits its full-width route shell without a second gutter', () => {
+  const html = renderToStaticMarkup(
+    <PageContainer>
+      <PageContainer width="form">Fields</PageContainer>
+    </PageContainer>
+  )
+  expect(html).toContain('data-page-container-nested')
+  expect(html).not.toContain('max-w-5xl')
+  expect(html.match(/px-4 py-6/g)).toHaveLength(1)
 })

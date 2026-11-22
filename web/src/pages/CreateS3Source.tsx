@@ -3,7 +3,10 @@
 
 'use client'
 
-import { Checkbox } from '@/components/ui/checkbox'
+import {
+  S3EndpointPreviewLine,
+  S3PathStyleField,
+} from '@/components/backups/S3EndpointHints'
 import { createS3SourceMutation } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import {
@@ -226,30 +229,18 @@ export function CreateS3Source() {
                     setFormData({ ...formData, endpoint: e.target.value })
                   }
                 />
+                <S3EndpointPreviewLine endpoint={formData.endpoint} />
               </div>
 
               <div className="grid gap-2 md:col-span-2">
-                <Label
-                  htmlFor="forcePathStyle"
-                  className="flex items-center space-x-2"
-                >
-                  <Checkbox
-                    id="forcePathStyle"
-                    checked={formData.force_path_style || false}
-                    onCheckedChange={(checked) =>
-                      setFormData({
-                        ...formData,
-                        force_path_style: checked === true,
-                      })
-                    }
-                  />
-                  <div>
-                    <span>Force path style</span>
-                    <p className="text-xs text-muted-foreground">
-                      Enable for RustFS/MinIO compatibility
-                    </p>
-                  </div>
-                </Label>
+                <S3PathStyleField
+                  id="forcePathStyle"
+                  endpoint={formData.endpoint}
+                  checked={formData.force_path_style || false}
+                  onCheckedChange={(checked) =>
+                    setFormData({ ...formData, force_path_style: checked })
+                  }
+                />
               </div>
 
               <div className="space-y-1 border-t pt-5 md:col-span-2">

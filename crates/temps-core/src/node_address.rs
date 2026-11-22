@@ -46,6 +46,24 @@ pub fn is_private_node_address(address: &str) -> bool {
 /// old to report it).
 pub const AGENT_MESH_LISTENER_KEY: &str = "agent_mesh_listener";
 
+/// Heartbeat `capacity` key describing the machine the agent runs on, when
+/// that is not the Docker host itself: `{"os": "macos", "docker_app": "colima"}`
+/// for a Mac worker (ADR 090), whose containers run in its Docker app's VM.
+/// Absent on Linux workers.
+pub const AGENT_HOST_KEY: &str = "host";
+
+/// The `os` a Mac worker reports under [`AGENT_HOST_KEY`].
+pub const HOST_OS_MACOS: &str = "macos";
+
+/// Whether a node's heartbeat `capacity` says it is a Mac worker.
+pub fn capacity_is_mac_worker(capacity: &serde_json::Value) -> bool {
+    capacity
+        .get(AGENT_HOST_KEY)
+        .and_then(|host| host.get("os"))
+        .and_then(serde_json::Value::as_str)
+        == Some(HOST_OS_MACOS)
+}
+
 /// Resolve the mesh listener a heartbeat leaves on the node, editing the
 /// heartbeat's `capacity` in place (`previous` is the stored capacity).
 ///
@@ -236,6 +254,20 @@ pub fn url_host(host: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_reported_macos_host_is_a_mac_worker() {
+        assert!(capacity_is_mac_worker(
+            &serde_json::json!({"host": {"os": "macos", "docker_app": "colima"}})
+        ));
+        assert!(!capacity_is_mac_worker(
+            &serde_json::json!({"host": {"os": "linux"}})
+        ));
+        assert!(!capacity_is_mac_worker(
+            &serde_json::json!({"cpu_percent": 3.0})
+        ));
+        assert!(!capacity_is_mac_worker(&serde_json::Value::Null));
+    }
 
     #[test]
     fn local_service_hosts_are_recognised() {

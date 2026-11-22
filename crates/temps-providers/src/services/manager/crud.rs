@@ -27,6 +27,27 @@ fn generated_schedule_loses_last_target(
     generated_kind.is_some() && remaining_targets == 0
 }
 
+/// The operator's container behind an imported service, as import stamped it
+/// into the stored parameters. Managed services have no such parameter.
+fn imported_container_name(
+    parameters: &std::collections::HashMap<String, serde_json::Value>,
+) -> Option<&str> {
+    parameters
+        .get("container_name")
+        .and_then(|name| name.as_str())
+        .filter(|name| !name.is_empty())
+}
+
+/// Why an image change of a service on a worker node is refused: the
+/// engines replace containers on this server's Docker only.
+fn worker_image_change_refusal(service_name: &str, node_id: i32) -> String {
+    format!(
+        "Service '{service_name}' runs on worker node {node_id}, and an image change replaces \
+         its container on this server's Docker, where it has none. Nothing was changed; take a \
+         backup, create a service with the new image on the node and restore into it"
+    )
+}
+
 impl ExternalServiceManager {
     pub async fn get_service_by_name(
         &self,
@@ -222,6 +243,13 @@ impl ExternalServiceManager {
 
         let topology = request.topology.clone();
         let topology_for_txn = topology.clone();
+        // ADR 093: new PostgreSQL services (standalone local, and clusters) offer TLS.
+        let default_tls_mode = super::server_tls::default_tls_mode_for_new_service(
+            request.service_type,
+            &topology,
+            request.node_id,
+            &parameters,
+        );
 
         // Start transaction
         let service = self
@@ -247,6 +275,9 @@ impl ExternalServiceManager {
                         // default stays `false` so existing rows and out-of-band inserts
                         // are unaffected.
                         metrics_enabled: Set(true),
+                        // Explicit setup completes the legacy enrollment decision;
+                        // existing instance-wide schedules still apply.
+                        default_backup_provisioned: Set(true),
                         created_by_user_id: Set(created_by_user_id),
                         created_at: Set(Utc::now()),
                         updated_at: Set(Utc::now()),
@@ -254,6 +285,8 @@ impl ExternalServiceManager {
                     };
 
                     let service = new_service.insert(txn).await?;
+                    super::server_tls::record_initial_tls_mode(txn, service.id, default_tls_mode)
+                        .await?;
 
                     Ok(service)
                 })
@@ -331,6 +364,8 @@ impl ExternalServiceManager {
             let init_result = async {
                 self.ensure_new_local_service_resources_unused(&service)
                     .await?;
+                // Before its first container, which looks the name up.
+                self.claim_healthcheck_container(service.id).await;
                 self.initialize_service(service.id).await
             }
             .await;
@@ -351,16 +386,27 @@ impl ExternalServiceManager {
                     );
                 }
 
-                if matches!(e, ExternalServiceError::ServiceResourceConflict { .. }) {
-                    return Err(e);
-                }
-                return Err(ExternalServiceError::InitializationFailed {
-                    id: service.id,
-                    reason: e.to_string(),
-                });
+                return Err(Self::creation_failure(service.id, e));
             }
 
             self.get_service_info(service.id).await
+        }
+    }
+
+    /// The error to return when a new service failed to initialize and its
+    /// record was rolled back. A resource conflict keeps its own variant, and
+    /// a parameter validation failure stays one, under this service's ID:
+    /// the caller has a value to fix, not a failed start to retry.
+    fn creation_failure(service_id: i32, error: ExternalServiceError) -> ExternalServiceError {
+        match error {
+            ExternalServiceError::ServiceResourceConflict { .. } => error,
+            ExternalServiceError::ParameterValidationFailed { reason, .. } => {
+                ExternalServiceError::ParameterValidationFailed { service_id, reason }
+            }
+            other => ExternalServiceError::InitializationFailed {
+                id: service_id,
+                reason: other.to_string(),
+            },
         }
     }
 
@@ -452,12 +498,13 @@ impl ExternalServiceManager {
             service_type,
             &config.parameters,
         )?;
-        instance
-            .apply_ingest_key(config)
-            .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to restart container with ingest key: {}", e),
+        instance.apply_ingest_key(config).await.map_err(|error| {
+            ExternalServiceError::from_engine(service_id, error, |e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to restart container with ingest key: {}", e),
+                }
             })
+        })
     }
 
     /// Force-recreate a service's container so a CMD-baked config change
@@ -470,10 +517,18 @@ impl ExternalServiceManager {
     /// from the container's own image — it just drives the engine's
     /// `force_recreate` (see `ExternalService::force_recreate`) with a
     /// properly hydrated config so the recreate step has what it needs.
+    ///
+    /// Holds the service's TLS lock from reading its TLS mode through the
+    /// recreate (ADR 093): a mode change finishing in between would
+    /// otherwise be undone by a recreate with the mode read before it.
     pub async fn force_recreate_service_container(
         &self,
         service_id: i32,
     ) -> Result<(), ExternalServiceError> {
+        // Before the container's recreate lock, in the order a TLS mode
+        // change takes them.
+        let tls_lock = self.service_tls_locks.for_service(service_id).await;
+        let _held = tls_lock.lock().await;
         let service = self.get_service(service_id).await?;
         self.ensure_unambiguous_service_name(&service).await?;
         let service_type = ServiceType::from_str(&service.service_type).map_err(|_| {
@@ -482,18 +537,25 @@ impl ExternalServiceManager {
                 service_type: service.service_type.clone(),
             }
         })?;
-        let config = self.get_service_config(service_id).await?;
+        let mut config = self.get_service_config(service_id).await?;
         let instance = self.create_service_instance_for_parameter_value(
             service.name.clone(),
             service_type,
             &config.parameters,
         )?;
-        instance
-            .force_recreate(config)
-            .await
-            .map_err(|e| ExternalServiceError::InternalError {
-                reason: format!("Failed to recreate container: {}", e),
-            })?;
+        // ADR 093: a recreate keeps (or applies) the service's server TLS.
+        let parameters = self.get_service_parameters(service_id).await?;
+        let tls_parameters = self.server_tls_parameters(&service, &parameters).await?;
+        if let Some(object) = config.parameters.as_object_mut() {
+            object.extend(tls_parameters);
+        }
+        instance.force_recreate(config).await.map_err(|error| {
+            ExternalServiceError::from_engine(service_id, error, |e| {
+                ExternalServiceError::InternalError {
+                    reason: format!("Failed to recreate container: {}", e),
+                }
+            })
+        })?;
 
         // A recreated container gets a new Docker IP, so the previously
         // published A record now points at nothing. Re-publish it.
@@ -668,6 +730,15 @@ impl ExternalServiceManager {
         self.ensure_no_active_upgrade(service_id).await?;
 
         let service = self.get_service(service_id).await?;
+        // The engines replace the container on this server's Docker. A
+        // service on a worker node has none here, and an engine that finds
+        // no container creates one: an empty server beside the real one.
+        if let Some(node_id) = service.node_id {
+            return Err(ExternalServiceError::UpgradeRejected {
+                id: service_id,
+                reason: worker_image_change_refusal(&service.name, node_id),
+            });
+        }
         self.ensure_unambiguous_service_name(&service).await?;
         let old_parameters = self.get_service_parameters(service_id).await?;
 
@@ -724,29 +795,22 @@ impl ExternalServiceManager {
             &new_config.parameters,
         )?;
 
-        // Call the upgrade method on the service instance. `upgrade()`
-        // returns `anyhow::Result` (shared across every provider), so a
-        // same-version rejection is downcast here -- before the error is
-        // stringified below -- into a typed `UpgradeRejected` variant the
-        // handler can match on directly instead of substring-matching the
-        // message text.
+        // A same-version rejection becomes the `UpgradeRejected` variant the
+        // handler matches on.
         service_instance
             .upgrade(old_config, new_config.clone())
             .await
-            .map_err(|e| {
-                if let Some(rejected) =
-                    e.downcast_ref::<crate::externalsvc::postgres::PostgresUpgradeRejected>()
-                {
-                    ExternalServiceError::UpgradeRejected {
-                        id: service_id,
-                        reason: rejected.to_string(),
-                    }
-                } else {
+            .map_err(|e| match e {
+                EngineError::UpgradeRejected(rejected) => ExternalServiceError::UpgradeRejected {
+                    id: service_id,
+                    reason: rejected.to_string(),
+                },
+                other => ExternalServiceError::from_engine(service_id, other, |e| {
                     ExternalServiceError::InitializationFailed {
                         id: service_id,
                         reason: format!("Upgrade failed: {}", e),
                     }
-                }
+                }),
             })?;
 
         // Update the service configuration in the database with the new Docker image
@@ -943,6 +1007,7 @@ impl ExternalServiceManager {
         // before the original container is stopped.
         self.persist_service_config(service_id, service_update)
             .await?;
+        let renamed = pre_rename_instance.is_some();
 
         if let Some(old_instance) = pre_rename_instance {
             if let Err(e) = old_instance.stop().await {
@@ -953,12 +1018,22 @@ impl ExternalServiceManager {
             }
         }
 
+        // Before the container is created under the new name, which is
+        // where the engines look its healthcheck overrides up.
+        if renamed {
+            self.republish_healthcheck_overrides(service_id).await?;
+        }
+
         // Reinitialize the service (this will stop, remove, and recreate the container with new image)
         self.initialize_service(service_id).await?;
 
         self.get_service_info(service_id).await
     }
 
+    /// Delete a service that no project links to: its record first, then its
+    /// containers and volumes, through the node's agent for a service on a
+    /// worker. An imported service is only forgotten; its container is the
+    /// operator's.
     pub async fn delete_service(&self, service_id: i32) -> Result<(), ExternalServiceError> {
         // Get service to check if it exists
         let service = self.get_service(service_id).await?;
@@ -995,6 +1070,15 @@ impl ExternalServiceManager {
         // get_service_parameters looks the service up by ID, which would fail
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
+
+        // Deleting an imported service only forgets it. An engine's removal
+        // works on the derived name, which an imported service has no container
+        // under, or worse, one the operator happens to own.
+        let imported_container = service
+            .node_id
+            .is_none()
+            .then(|| imported_container_name(&parameters))
+            .flatten();
 
         // Delete from database first
         self.db
@@ -1092,6 +1176,10 @@ impl ExternalServiceManager {
             })
             .await
             .map_err(ExternalServiceError::from)?;
+        // A later service that reuses the name must not inherit these, here
+        // or in another process.
+        Self::forget_healthcheck_overrides(service_id).await;
+        self.notify_healthcheck_change(service_id).await;
 
         // Stop the per-cluster role reconciler before dropping its records,
         // otherwise a tick mid-deletion could re-write what we just removed.
@@ -1222,15 +1310,22 @@ impl ExternalServiceManager {
         } else {
             // Standalone: remove single container
             info!("Removing service {} container", service_id);
-            if let Some(node_id) = service.node_id {
+            if let Some(container) = imported_container {
+                info!(
+                    service_id,
+                    container,
+                    "Deregistered imported service; its container and volumes belong to the operator and were left in place"
+                );
+            } else if let Some(node_id) = service.node_id {
                 let client = self.get_remote_client(node_id).await?;
-                let service_instance = self.create_service_instance_for_parameters(
-                    service.name.clone(),
-                    service_type_enum,
-                    &parameters,
-                )?;
                 let container_name = self
-                    .resolve_remote_container_name(&client, service_instance.as_ref(), &parameters)
+                    .resolve_remote_container_name(
+                        &client,
+                        service_id,
+                        &service.name,
+                        service_type_enum,
+                        &parameters,
+                    )
                     .await?;
                 client.remove_service(&container_name).await.map_err(|e| {
                     ExternalServiceError::DeletionFailed {
@@ -1256,10 +1351,12 @@ impl ExternalServiceManager {
                     .await;
                 }
                 service_instance.remove().await.map_err(|e| {
-                    ExternalServiceError::DeletionFailed {
-                        id: service_id,
-                        reason: e.to_string(),
-                    }
+                    ExternalServiceError::from_engine(service_id, e, |reason| {
+                        ExternalServiceError::DeletionFailed {
+                            id: service_id,
+                            reason,
+                        }
+                    })
                 })?;
             }
         }
@@ -1276,7 +1373,7 @@ impl ExternalServiceManager {
         // Best-effort. A missing legacy container is the normal case on any
         // install created after the fix, and a Docker hiccup here must not
         // turn an otherwise successful delete into a 500.
-        if service.node_id.is_none() {
+        if service.node_id.is_none() && imported_container.is_none() {
             for legacy_name in legacy_managed_instance_names(&service.name, service_type_enum) {
                 match self.create_service_instance(legacy_name.clone(), service_type_enum) {
                     Ok(instance) => match instance.remove().await {

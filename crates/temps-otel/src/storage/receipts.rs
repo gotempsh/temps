@@ -94,7 +94,7 @@ mod tests {
     // rather than reporting a skipped storage test as evidence of success.
     #[tokio::test]
     async fn adapter_receipts_atomic_concurrent_rollback_capacity_expiry_and_anonymous() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let db = test_db.connection_arc();

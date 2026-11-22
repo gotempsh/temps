@@ -5,6 +5,7 @@
 //! tenant resource ceilings.
 
 use super::*;
+use temps_config::deployment_config::DeploymentConfigExt;
 
 impl ProjectService {
     /// Override the host Docker socket grant this service answers from.
@@ -365,10 +366,10 @@ impl ProjectService {
     /// Pulled out of the two call sites below so the error-mapping (join the
     /// violations into one `InvalidInput`) has a single place to test without
     /// standing up a full `ProjectService` — the ceiling logic itself is
-    /// covered independently on [`temps_entities::deployment_config::DeploymentConfig::check_against_tenant_ceilings`].
+    /// covered independently on [`temps_config::deployment_config::DeploymentConfigExt::check_against_tenant_ceilings`].
     pub(super) fn enforce_tenant_ceilings(
         deployment_config: &temps_entities::deployment_config::DeploymentConfig,
-        app_settings: &temps_core::AppSettings,
+        app_settings: &temps_config::AppSettings,
     ) -> Result<(), ProjectError> {
         deployment_config
             .check_against_tenant_ceilings(&app_settings.tenant_resource_ceilings)
@@ -393,7 +394,7 @@ mod tests {
             request_timeout_seconds: Some(0),
             ..Default::default()
         };
-        let app_settings = temps_core::AppSettings::default();
+        let app_settings = temps_config::AppSettings::default();
 
         assert!(ProjectService::enforce_tenant_ceilings(&config, &app_settings).is_ok());
     }
@@ -408,8 +409,8 @@ mod tests {
             max_concurrent_connections: Some(500),
             ..Default::default()
         };
-        let app_settings = temps_core::AppSettings {
-            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+        let app_settings = temps_config::AppSettings {
+            tenant_resource_ceilings: temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 4096,
                 max_concurrent_connections: 200,
                 allow_unlimited_request_timeouts: true,
@@ -437,8 +438,8 @@ mod tests {
             max_concurrent_connections: Some(100),
             ..Default::default()
         };
-        let app_settings = temps_core::AppSettings {
-            tenant_resource_ceilings: temps_core::TenantResourceCeilings {
+        let app_settings = temps_config::AppSettings {
+            tenant_resource_ceilings: temps_config::TenantResourceCeilings {
                 max_memory_limit_mb: 4096,
                 max_concurrent_connections: 200,
                 allow_unlimited_request_timeouts: true,

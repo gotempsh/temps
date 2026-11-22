@@ -27,14 +27,14 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use hickory_proto::op::{Header, HeaderCounts, Metadata, ResponseCode};
-use hickory_proto::rr::{Name, Record};
+use hickory_proto::rr::{Name, Record, RecordType};
 use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
 use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::net::{DnsError, NetError};
 use hickory_resolver::Resolver;
 use hickory_server::server::{Request, ResponseHandler, ResponseInfo};
 use hickory_server::zone_handler::MessageResponseBuilder;
-use tracing::{trace, warn};
+use tracing::{debug, trace, warn};
 
 type TokioResolver = Resolver<TokioRuntimeProvider>;
 
@@ -154,13 +154,26 @@ impl UpstreamResolver {
                     // thrown away. We therefore forward the real response code and
                     // reserve SERVFAIL for genuine transport failures (timeout,
                     // refused, malformed) so the client retries another server.
-                    let code = upstream_error_response_code(&e);
-                    if code == ResponseCode::ServFail {
-                        warn!(qname = %qname, qtype = ?qtype, error = %e, "upstream lookup failed");
+                    if refused_single_label_address(&qname, qtype, &e) {
+                        // A bare name such as `db` that no search domain
+                        // completed, asked of a host stub that will not
+                        // resolve single-label names over unicast DNS.
+                        debug!(
+                            qname = %qname,
+                            qtype = ?qtype,
+                            "upstream refused a single-label name (the host's resolver, \
+                             e.g. systemd-resolved, does not resolve those); answering NXDOMAIN"
+                        );
+                        (Vec::new(), ResponseCode::NXDomain)
                     } else {
-                        trace!(qname = %qname, qtype = ?qtype, ?code, "upstream negative answer");
+                        let code = upstream_error_response_code(&e);
+                        if code == ResponseCode::ServFail {
+                            warn!(qname = %qname, qtype = ?qtype, error = %e, "upstream lookup failed");
+                        } else {
+                            trace!(qname = %qname, qtype = ?qtype, ?code, "upstream negative answer");
+                        }
+                        (Vec::new(), code)
                     }
-                    (Vec::new(), code)
                 }
             },
         };
@@ -227,6 +240,27 @@ fn upstream_error_response_code(error: &NetError) -> ResponseCode {
     }
 }
 
+/// Whether `error` is an upstream REFUSED for an A/AAAA lookup of a
+/// single-label name (`db.`, `my-service.`).
+///
+/// The forwarder's first upstream is the host's own resolver, on most Linux
+/// hosts the systemd-resolved stub at `127.0.0.53`. With its default
+/// `ResolveUnicastSingleLabel=no` it answers exactly these queries REFUSED,
+/// where a public resolver answers NXDOMAIN (no such top-level domain).
+/// Neither can ever resolve the name, so the forwarder answers NXDOMAIN: a
+/// bare name that no search domain completed is an ordinary miss (an app
+/// probing for a peer, a typo), not an upstream failure worth SERVFAIL, a
+/// client retry and a warning. A REFUSED for any other name still means the
+/// upstream will not serve this resolver, and stays SERVFAIL.
+fn refused_single_label_address(qname: &Name, qtype: RecordType, error: &NetError) -> bool {
+    matches!(qtype, RecordType::A | RecordType::AAAA)
+        && qname.num_labels() == 1
+        && matches!(
+            error,
+            NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused))
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +310,52 @@ mod tests {
             upstream_error_response_code(&NetError::Busy),
             ResponseCode::ServFail
         );
+    }
+
+    #[test]
+    fn a_refused_single_label_address_lookup_is_an_ordinary_miss() {
+        let refused = NetError::Dns(DnsError::ResponseCode(ResponseCode::Refused));
+        let bare = Name::from_ascii("dns-a.").unwrap();
+
+        // What systemd-resolved answers for a bare name: not a failure.
+        for qtype in [RecordType::A, RecordType::AAAA] {
+            assert!(
+                refused_single_label_address(&bare, qtype, &refused),
+                "{qtype}"
+            );
+        }
+
+        // A REFUSED for a qualified name means the upstream will not serve
+        // us: still a failure, still a warning.
+        let qualified = Name::from_ascii("api.example.com.").unwrap();
+        assert!(!refused_single_label_address(
+            &qualified,
+            RecordType::A,
+            &refused
+        ));
+        // systemd-resolved only refuses address lookups of bare names.
+        assert!(!refused_single_label_address(
+            &bare,
+            RecordType::TXT,
+            &refused
+        ));
+        // Other errors for a bare name keep their own mapping.
+        let servfail = NetError::Dns(DnsError::ResponseCode(ResponseCode::ServFail));
+        assert!(!refused_single_label_address(
+            &bare,
+            RecordType::A,
+            &servfail
+        ));
+        assert!(!refused_single_label_address(
+            &bare,
+            RecordType::A,
+            &NetError::Busy
+        ));
+        // The root itself has no labels.
+        assert!(!refused_single_label_address(
+            &Name::root(),
+            RecordType::A,
+            &refused
+        ));
     }
 }

@@ -319,6 +319,7 @@ async fn stored_member_endpoint_resolves_local_and_remote_members() {
         overlay_ready_cidr: None,
         overlay_remediation: None,
         overlay_network_name: None,
+        overlay_vxlan_vni: None,
         created_at: chrono::Utc::now(),
         updated_at: chrono::Utc::now(),
     };
@@ -620,7 +621,10 @@ async fn test_remove_cluster_member_not_found() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ExternalServiceError::InitializationFailed { .. }
+        ExternalServiceError::ClusterMemberNotFound {
+            member_id: 99999,
+            ..
+        }
     ));
 }
 
@@ -911,7 +915,10 @@ async fn test_promote_cluster_member_not_found() {
         .unwrap_err();
     assert!(matches!(
         err,
-        ExternalServiceError::InitializationFailed { .. }
+        ExternalServiceError::ClusterMemberNotFound {
+            member_id: 99999,
+            ..
+        }
     ));
 }
 

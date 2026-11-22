@@ -13,7 +13,11 @@ from database_image_matrix import (
     PINNED_MINORS_PER_MAJOR,
     GhcrRegistry,
     RegistryLookupError,
+    candidates,
     main,
+    majors_upstream,
+    new_majors,
+    newest_release,
     pinned_minors,
     plan,
     unpublished,
@@ -24,8 +28,25 @@ UPSTREAM_TAGS = [
     "18.0-bookworm", "18.1-bookworm", "18.2-bookworm", "18.3-bookworm",
     "18.4-bookworm", "18.6-bookworm", "17.9-bookworm", "17.10-bookworm",
     "17.11-bookworm", "16.15-bookworm", "15.19-bookworm", "14.20-bookworm",
-    "18.7rc1-bookworm", "latest",
+    "18.7rc1-bookworm", "latest", "17.11", "16.15", "15.19",
 ]
+
+# Mirrors upstream as it is: Debian bookworm builds stop at 8.4.0, and every
+# later release (8.4.x, 8.6, 8.8, 8.10) is published for trixie only.
+REDIS_UPSTREAM_TAGS = [
+    "8", "8-bookworm", "8-trixie", "8-alpine", "latest",
+    "8.2.11", "8.2.11-bookworm", "8.4.0", "8.4.0-bookworm", "8.4-bookworm",
+    "8.4.6", "8.4.6-trixie", "8.8.4", "8.8.4-trixie", "8.10.0", "8.10.0-trixie",
+    "8.10.1", "8.10.1-trixie", "8.10.2", "8.10.2-trixie", "8.10.3",
+    "8.10.3-trixie", "8.10.3-alpine", "8.10-rc2-trixie", "8.8-m03-trixie",
+    "7.4.10", "7.4.10-bookworm",
+]
+
+UPSTREAM = {"library/postgres": UPSTREAM_TAGS, "library/redis": REDIS_UPSTREAM_TAGS}
+
+# What `redis-server --version` prints.
+REDIS_8_10_3 = "Redis server v=8.10.3 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=1"
+REDIS_8_4_0 = "Redis server v=8.4.0 sha=00000000:1 malloc=jemalloc-5.3.0 bits=64 build=1"
 
 
 class FakeRegistry:
@@ -46,7 +67,7 @@ def run_plan(registry, forced=frozenset(), missing_only=False):
     """The full plan: (builds, retags)."""
     return plan(
         "gotempsh",
-        {"library/postgres": UPSTREAM_TAGS},
+        UPSTREAM,
         registry,
         set(forced),
         missing_only=missing_only,
@@ -74,6 +95,139 @@ class PinnedMinorsTests(unittest.TestCase):
     def test_unsupported_majors_are_not_published(self):
         minors = pinned_minors(UPSTREAM_TAGS, ["18"], 4)
         self.assertNotIn("14", minors)
+
+
+class RedisTests(unittest.TestCase):
+    """Redis 8 stopped shipping bookworm builds after 8.4.0, so an image built
+    `FROM redis:8-bookworm` was republished every week with an unpatched
+    server. These pin the image to a variant that still gets releases."""
+
+    def redis(self, include=None):
+        return [e for e in include or run(FakeRegistry()) if e["image"] == "redis-walg"]
+
+    def test_floating_tag_is_built_from_a_variant_that_still_gets_releases(self):
+        floating = next(e for e in self.redis() if e["tag"] == "8-trixie")
+        self.assertEqual(floating["build_arg"], "REDIS_VERSION=8")
+        self.assertEqual(floating["version_command"], "redis-server")
+        self.assertRegex(REDIS_8_10_3, floating["expect_version"])
+        # The last bookworm build must not pass for "Redis 8".
+        self.assertNotRegex(REDIS_8_4_0, floating["expect_version"])
+
+    def test_no_bookworm_tag_is_published(self):
+        self.assertFalse([e["tag"] for e in self.redis() if "bookworm" in e["tag"]])
+
+    def test_newest_releases_are_published_as_pinned_tags(self):
+        pinned = [e for e in self.redis() if e["tag"] != "8-trixie"]
+        self.assertEqual(
+            [e["tag"] for e in pinned],
+            ["8.10.3-trixie", "8.10.2-trixie", "8.10.1-trixie", "8.10.0-trixie"],
+        )
+        newest = pinned[0]
+        self.assertEqual(newest["build_arg"], "REDIS_VERSION=8.10.3")
+        self.assertRegex(REDIS_8_10_3, newest["expect_version"])
+        self.assertNotRegex(REDIS_8_10_3.replace("8.10.3", "8.10.30"), newest["expect_version"])
+        self.assertNotRegex(REDIS_8_10_3, pinned[1]["expect_version"])
+
+    def test_a_variant_upstream_stopped_publishing_fails_verification(self):
+        # The image as it was: built from bookworm. Its newest bookworm release
+        # is 8.4.0, but the floating tag is held to the newest Redis 8 release
+        # in any variant, so the frozen base fails the build instead of
+        # publishing.
+        spec = next(s for s in CATALOG if s["image"] == "redis-walg")
+        bookworm = dict(spec, floating_tag="{major}-bookworm", pinned_tag="{version}-bookworm")
+        include = [entry for entry, _ in candidates("gotempsh", UPSTREAM, [bookworm])]
+        floating = next(e for e in include if e["tag"] == "8-bookworm")
+        self.assertNotRegex(REDIS_8_4_0, floating["expect_version"])
+        self.assertEqual(include[1]["tag"], "8.4.0-bookworm")
+
+    def test_newest_release_ignores_variants_and_prereleases(self):
+        spec = next(s for s in CATALOG if s["image"] == "redis-walg")
+        self.assertEqual(newest_release(REDIS_UPSTREAM_TAGS, spec, "8"), "8.10.3")
+
+    def test_major_without_upstream_releases_is_an_error(self):
+        spec = next(s for s in CATALOG if s["image"] == "redis-walg")
+        with self.assertRaisesRegex(RuntimeError, "redis-walg major 9"):
+            newest_release(REDIS_UPSTREAM_TAGS, spec, "9")
+
+
+def spec(image):
+    return next(s for s in CATALOG if s["image"] == image)
+
+
+class NewMajorTests(unittest.TestCase):
+    """A new upstream major must be noticed: the weekly run fails until it is
+    supported or explicitly deferred."""
+
+    def test_newer_postgres_major_is_reported_and_prereleases_are_not(self):
+        tags = UPSTREAM_TAGS + ["19beta1", "19beta1-bookworm", "19rc1"]
+        self.assertEqual(new_majors(spec("postgres-walg"), tags), [])
+        self.assertEqual(new_majors(spec("postgres-walg"), tags + ["19.0"]), ["19"])
+        self.assertEqual(new_majors(spec("postgres-ha"), tags + ["19.0", "20.1"]), ["19", "20"])
+
+    def test_older_unsupported_majors_are_not_reported(self):
+        # PostgreSQL 14 is still published upstream and unsupported on purpose.
+        self.assertEqual(new_majors(spec("postgres-walg"), ["14.20", "14.20-bookworm"]), [])
+
+    def test_newer_redis_major_is_reported(self):
+        self.assertEqual(new_majors(spec("redis-walg"), REDIS_UPSTREAM_TAGS), [])
+        tags = REDIS_UPSTREAM_TAGS + ["9.0.0", "9.0.0-trixie", "9.2-rc1-trixie"]
+        self.assertEqual(new_majors(spec("redis-walg"), tags), ["9"])
+
+    def test_mongodb_watches_x0_lines_only_and_honours_deferred_majors(self):
+        mongo = spec("mongodb-walg")
+        self.assertIn("9.0", mongo["deferred_majors"])
+        tags = ["8.0.12", "8.2.1", "8.3.0", "9.0.4", "9.0.4-noble", "10.0.0-rc0"]
+        # 8.2 and 8.3 are rapid releases; 9.0 is acknowledged as deferred.
+        self.assertEqual(new_majors(mongo, tags), [])
+        self.assertEqual(new_majors(mongo, tags + ["10.0.1"]), ["10.0"])
+        undeferred = dict(mongo, deferred_majors=[])
+        self.assertEqual(new_majors(undeferred, tags), ["9.0"])
+
+    def test_pgvector_and_timescaledb_watch_their_own_upstreams(self):
+        for image in ("pgvector-walg", "timescaledb-walg"):
+            self.assertEqual(new_majors(spec(image), ["pg17", "pg18", "0.8.1-pg18"]), [])
+            self.assertEqual(new_majors(spec(image), ["pg18", "pg19", "pg19-ts2.22"]), ["19"])
+
+    def test_majors_sort_numerically(self):
+        tags = ["10.0.0", "9.0.1", "11.0.0"]
+        self.assertEqual(new_majors(spec("redis-walg"), tags), ["9", "10", "11"])
+
+    def test_every_image_watches_an_upstream(self):
+        for entry in CATALOG:
+            self.assertIsNotNone(majors_upstream(entry), entry["image"])
+
+    def run_main(self, tags_by_repository):
+        upstream = mock.patch.object(
+            database_image_matrix, "upstream_tags", side_effect=tags_by_repository.__getitem__
+        )
+        with upstream, mock.patch("sys.stderr", new_callable=io.StringIO) as stderr, mock.patch(
+            "sys.stdout", new_callable=io.StringIO
+        ):
+            return main(["--owner", "gotempsh", "--new-majors"]), stderr.getvalue()
+
+    def current_upstreams(self):
+        return {
+            "library/postgres": UPSTREAM_TAGS,
+            "library/redis": REDIS_UPSTREAM_TAGS,
+            "library/mongo": ["8.0.12", "8.2.1", "9.0.4"],
+            "pgvector/pgvector": ["pg17", "pg18"],
+            "timescale/timescaledb-ha": ["pg17", "pg18"],
+        }
+
+    def test_main_passes_when_every_major_is_supported_or_deferred(self):
+        self.assertEqual(self.run_main(self.current_upstreams()), (0, ""))
+
+    def test_main_fails_naming_the_image_and_the_new_major(self):
+        tags = self.current_upstreams()
+        tags["library/redis"] = REDIS_UPSTREAM_TAGS + ["9.0.0"]
+        code, stderr = self.run_main(tags)
+        self.assertEqual(code, 1)
+        self.assertIn("`redis-walg`: docker.io/library/redis released 9", stderr)
+        self.assertIn("deferred_majors", stderr)
+
+    def test_new_majors_excludes_the_other_modes(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO), self.assertRaises(SystemExit):
+            main(["--owner", "gotempsh", "--new-majors", "--check"])
 
 
 class PlanTests(unittest.TestCase):
@@ -116,22 +270,26 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(entry["repository"], "ghcr.io/gotempsh/postgres-walg")
         self.assertEqual(entry["context"], "images/postgres-walg")
         self.assertEqual(entry["build_arg"], "PG_VERSION=18.3")
+        self.assertEqual(entry["version_command"], "postgres")
 
     def test_postgres_version_expectation_is_exact(self):
         include = run(FakeRegistry())
         pinned = next(e for e in include if e["tag"] == "18.3-bookworm")
         floating = next(e for e in include if e["tag"] == "18-bookworm")
         ok = "postgres (PostgreSQL) 18.3 (Debian 18.3-1.pgdg12+1)"
-        self.assertRegex(ok, pinned["expect_postgres"])
-        self.assertNotRegex("postgres (PostgreSQL) 18.30", pinned["expect_postgres"])
-        self.assertNotRegex("postgres (PostgreSQL) 18.6 (Debian)", pinned["expect_postgres"])
-        self.assertRegex("postgres (PostgreSQL) 18.6 (Debian)", floating["expect_postgres"])
-        self.assertNotRegex("postgres (PostgreSQL) 17.11", floating["expect_postgres"])
+        self.assertRegex(ok, pinned["expect_version"])
+        self.assertNotRegex("postgres (PostgreSQL) 18.30", pinned["expect_version"])
+        self.assertNotRegex("postgres (PostgreSQL) 18.6 (Debian)", pinned["expect_version"])
+        self.assertRegex("postgres (PostgreSQL) 18.6 (Debian)", floating["expect_version"])
+        self.assertNotRegex("postgres (PostgreSQL) 17.11", floating["expect_version"])
+        # A floating tag must carry the newest minor, not any minor of its major.
+        self.assertNotRegex("postgres (PostgreSQL) 18.4 (Debian)", floating["expect_version"])
 
-    def test_non_postgres_images_skip_the_version_check(self):
+    def test_images_without_an_upstream_skip_the_version_check(self):
         for entry in run(FakeRegistry()):
-            if entry["image"] in {"redis-walg", "mongodb-walg", "timescaledb-walg", "pgvector-walg"}:
-                self.assertEqual(entry["expect_postgres"], "")
+            if entry["image"] in {"mongodb-walg", "timescaledb-walg", "pgvector-walg"}:
+                self.assertEqual(entry["expect_version"], "")
+                self.assertEqual(entry["version_command"], "")
 
     def test_matrix_stays_within_github_limit(self):
         self.assertLessEqual(len(run(FakeRegistry(), {"*"})), 256)
@@ -147,7 +305,7 @@ class PlanTests(unittest.TestCase):
             "pgvector-walg:pg17", "pgvector-walg:pg18", "timescaledb-walg:pg18",
             "postgres-ha:17-bookworm", "postgres-ha:18-bookworm",
             "postgres-ha:18-bookworm-walg",
-            "redis-walg:8-bookworm", "mongodb-walg:7.0", "mongodb-walg:8.0",
+            "redis-walg:8-trixie", "mongodb-walg:7.0", "mongodb-walg:8.0",
         ]:
             self.assertIn(reference, published)
 
@@ -192,7 +350,7 @@ class AliasTests(unittest.TestCase):
                 }
             ],
         )
-        missing = unpublished("gotempsh", {"library/postgres": UPSTREAM_TAGS}, FakeRegistry(published))
+        missing = unpublished("gotempsh", UPSTREAM, FakeRegistry(published))
         self.assertEqual([e["tag"] for e in missing], ["18-bookworm"])
 
     def test_missing_primary_tag_is_retagged_from_its_published_alias(self):
@@ -223,7 +381,7 @@ class AliasTests(unittest.TestCase):
 
     def test_pinned_minors_have_no_aliases(self):
         for entry in run(FakeRegistry()):
-            if "." in entry["version"] and entry["image"].startswith("postgres"):
+            if "." in entry["version"] and entry["image"] in {"postgres-walg", "postgres-ha", "redis-walg"}:
                 self.assertEqual(entry["tags"], [entry["tag"]])
 
 
@@ -231,11 +389,11 @@ class ReleaseModeTests(unittest.TestCase):
     def test_missing_only_never_moves_published_tags(self):
         # A release must not rebuild 18-bookworm under running databases just
         # because Temps shipped; only absent tags are built.
-        published = every_tag() - {("postgres-walg", "16-bookworm"), ("redis-walg", "8-bookworm")}
+        published = every_tag() - {("postgres-walg", "16-bookworm"), ("redis-walg", "8-trixie")}
         include = run(FakeRegistry(published), missing_only=True)
         self.assertEqual(
             {(e["image"], e["tag"]) for e in include},
-            {("postgres-walg", "16-bookworm"), ("redis-walg", "8-bookworm")},
+            {("postgres-walg", "16-bookworm"), ("redis-walg", "8-trixie")},
         )
 
     def test_missing_only_with_everything_published_builds_nothing(self):
@@ -255,11 +413,11 @@ class ReleaseModeTests(unittest.TestCase):
 
     def test_unpublished_lists_exactly_the_gaps(self):
         published = every_tag() - {("postgres-ha", "18.3-bookworm")}
-        missing = unpublished("gotempsh", {"library/postgres": UPSTREAM_TAGS}, FakeRegistry(published))
+        missing = unpublished("gotempsh", UPSTREAM, FakeRegistry(published))
         self.assertEqual([(e["image"], e["tag"]) for e in missing], [("postgres-ha", "18.3-bookworm")])
 
     def test_unpublished_is_empty_when_everything_is_public(self):
-        missing = unpublished("gotempsh", {"library/postgres": UPSTREAM_TAGS}, FakeRegistry(every_tag()))
+        missing = unpublished("gotempsh", UPSTREAM, FakeRegistry(every_tag()))
         self.assertEqual(missing, [])
 
     def test_check_and_missing_only_are_mutually_exclusive(self):
@@ -339,7 +497,7 @@ class GhcrRegistryTests(unittest.TestCase):
         with mock.patch.object(
             database_image_matrix.urllib.request, "urlopen", side_effect=http_error(503)
         ), mock.patch.object(database_image_matrix.time, "sleep"), mock.patch.object(
-            database_image_matrix, "upstream_tags", return_value=UPSTREAM_TAGS
+            database_image_matrix, "upstream_tags", side_effect=UPSTREAM.__getitem__
         ), mock.patch("sys.stderr", new_callable=io.StringIO) as stderr:
             for mode in ("--missing-only", "--check"):
                 with self.subTest(mode=mode):

@@ -115,8 +115,30 @@ export function serverBaseUrl(rawApiUrl: string): string {
   return /\/api$/.test(trimmed) ? trimmed : `${trimmed}/api`
 }
 
+/**
+ * Pick how `temps login` authenticates. An `--api-key` that was passed but is
+ * empty (`--api-key "$TEMPS_API_KEY"` with the variable unset, because the
+ * line that should have read it failed) is an error, not a request for the
+ * browser flow: falling through used to mint a separate `cli-device:` key and
+ * log in anyway, so the key the caller meant to use was silently never used.
+ */
+export function resolveLoginMethod(
+  options: Pick<LoginOptions, 'apiKey'>,
+): 'api-key' | 'device' {
+  if (options.apiKey === undefined) return 'device'
+  if (options.apiKey.trim().length === 0) {
+    throw new AuthenticationError(
+      '--api-key was passed an empty value, so no key reached the CLI. ' +
+        'Check that the variable holding the key is set, or omit --api-key to approve this login in the browser.',
+    )
+  }
+  return 'api-key'
+}
+
 export async function login(options: LoginOptions): Promise<void> {
   newline()
+
+  const method = resolveLoginMethod(options)
 
   const debug = debugEnabled(options)
   if (debug) {
@@ -140,7 +162,7 @@ export async function login(options: LoginOptions): Promise<void> {
   }
 
   // Headless / CI path: caller supplied a pre-minted API key.
-  if (options.apiKey) {
+  if (method === 'api-key' && options.apiKey) {
     await loginWithApiKey(options.apiKey, {
       url: options.url,
       context: options.context,

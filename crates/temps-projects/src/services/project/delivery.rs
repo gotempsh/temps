@@ -111,7 +111,7 @@ impl ProjectService {
         let defaults = settings::Entity::find_by_id(1)
             .one(self.db.as_ref())
             .await?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .map(|row| temps_config::AppSettings::from_json(row.data))
             .unwrap_or_default();
         let provider = dns_providers::Entity::find()
             .filter(dns_providers::Column::ProviderType.eq("cloudflare"))

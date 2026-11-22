@@ -57,6 +57,8 @@ Update an existing secret (alias for create — upserts)
 
 Delete a secret
 
+**Usage:** `secrets delete <name> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |

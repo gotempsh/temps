@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, test } from 'bun:test'
+import { afterEach, beforeEach, expect, test } from 'bun:test'
 import { cleanup, fireEvent, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -47,9 +48,11 @@ const chat = (publicId: string, contextType: string, title: string | null) => ({
 })
 
 const originalConfig = client.getConfig()
+// A chat another test opened is remembered and would open instead of the list.
+beforeEach(() => window.localStorage.clear())
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 /** Answers the chat list and the one chat; everything else stays pending. */
@@ -130,4 +133,33 @@ test('an untitled workspace chat shows its kind, not an internal id', async () =
 
   await view.findByText('Workspace chat')
   expect(view.queryByText(/global-context/)).toBeNull()
+})
+
+test('the chat search survives opening a chat and coming back', async () => {
+  serve(
+    [],
+    [
+      chat('conv_application', 'application', 'Plan the migration'),
+      chat('conv_global', 'global', 'Tidy the sandbox'),
+    ]
+  )
+  const view = renderDock()
+
+  await view.findByText('Tidy the sandbox')
+  fireEvent.change(view.getByLabelText('Search chats'), {
+    target: { value: 'migration' },
+  })
+  await waitFor(() => expect(view.queryByText('Tidy the sandbox')).toBeNull())
+  fireEvent.click(view.getByText('Plan the migration'))
+  // The list unmounts while the chat is open.
+  await waitFor(() => expect(view.queryByLabelText('Search chats')).toBeNull())
+
+  fireEvent.click(view.getByLabelText('Back to all conversations'))
+
+  const search = (await view.findByLabelText(
+    'Search chats'
+  )) as HTMLInputElement
+  expect(search.value).toBe('migration')
+  expect(view.queryByText('Tidy the sandbox')).toBeNull()
+  expect(view.getByText('Plan the migration')).toBeTruthy()
 })

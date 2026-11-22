@@ -60,11 +60,15 @@ import { serviceTemplateDeployOverrides } from '@/lib/template-runtime-defaults'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import CronMonitors from './CronMonitors'
+import { EnvironmentWorkflows } from './workflows/EnvironmentWorkflows'
 import { CronJobs, MovedToCheckIns } from './CronJobs'
 import ProjectFeedback from './ProjectFeedback'
 import TelemetryReleases from './TelemetryReleases'
 import ClientOutcomes from './ClientOutcomes'
 import { SourceMapArtifacts, SourceMapCredentials } from './SourceMapArtifacts'
+import { InboundFilters } from '@/components/error-tracking/InboundFilters'
+import { ErrorAttachmentsSettings } from '@/components/error-tracking/ErrorAttachmentsSettings'
+import { OwnershipRulesSettings } from '@/components/error-tracking/OwnershipRulesSettings'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
 import {
   LegacyStatusPageRedirect,
@@ -112,8 +116,6 @@ import Metrics from './Metrics'
 import { ProjectTour } from '@/components/project/ProjectTour'
 import { ProjectAgentActivity } from './AiGateway'
 import { AutofixRedirect } from '@/components/autofixer/AutofixRedirect'
-import { AgentDetailPage } from '@/components/agents/AgentDetailPage'
-import { AgentEditPage } from '@/components/agents/AgentEditPage'
 import { AutopilotRunDetail } from '@/components/agents/AutopilotRunDetail'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { type ReactNode, useEffect, useRef, useState } from 'react'
@@ -133,6 +135,7 @@ import { toast } from 'sonner'
 
 export function ProjectDetail() {
   const { slug } = useParams()
+  const showOverviewWarning = Boolean(useMatch('/projects/:slug/project'))
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const variableRoute = useMatch('/projects/:slug/environment-variables/*')
@@ -514,7 +517,10 @@ export function ProjectDetail() {
       <ProjectFrame project={project}>
         <div className="flex h-full min-w-0 flex-col overflow-hidden">
           <MonitoringProjectHeader project={project} />
-          <div className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+          <div
+            data-console-scroll
+            className="min-w-0 flex-1 overflow-y-auto overflow-x-hidden"
+          >
             <PageWidthShell project={project}>
               <ProjectSectionChrome project={project}>
                 <Routes>
@@ -597,6 +603,20 @@ export function ProjectDetail() {
                   <Route
                     path="errors/source-maps/credentials"
                     element={<SourceMapCredentials project={project} />}
+                  />
+                  <Route
+                    path="errors/inbound-filters"
+                    element={<InboundFilters projectId={project.id} />}
+                  />
+                  <Route
+                    path="errors/attachments"
+                    element={
+                      <ErrorAttachmentsSettings projectId={project.id} />
+                    }
+                  />
+                  <Route
+                    path="errors/ownership"
+                    element={<OwnershipRulesSettings projectId={project.id} />}
                   />
                   <Route
                     path="errors/:errorGroupId"
@@ -729,7 +749,10 @@ export function ProjectDetail() {
           }
           isLoading={createDeployment.isPending || deployImage.isPending}
         />
-        <div className="flex-1 overflow-y-auto overflow-x-hidden">
+        <div
+          data-console-scroll
+          className="flex-1 overflow-y-auto overflow-x-hidden"
+        >
           {/* One column, as wide as the page needs, holding the banners, the
               section tabs and the page so they line up. */}
           <PageWidthShell project={project}>
@@ -755,8 +778,11 @@ export function ProjectDetail() {
               </Alert>
             )}
             <ReachabilityWarningBanner
-              warning={project.reachability_warning}
+              warning={
+                showOverviewWarning ? project.reachability_warning : null
+              }
               projectSlug={project.slug}
+              projectId={project.id}
               className="mb-4"
             />
             <ProjectTour />
@@ -942,6 +968,10 @@ export function ProjectDetail() {
                   element={<ProjectFeedback project={project} />}
                 />
                 <Route
+                  path="durable-workflows"
+                  element={<EnvironmentWorkflows project={project} />}
+                />
+                <Route
                   path="cron-jobs"
                   element={<CronJobs project={project} />}
                 />
@@ -1014,13 +1044,16 @@ export function ProjectDetail() {
                     />
                   }
                 />
+                {/* Workflow definitions were retired; autofix runs still open
+                    at agents/:runId below. */}
                 <Route
-                  path="agents/detail/:agentSlug"
-                  element={<AgentDetailPage project={project} />}
-                />
-                <Route
-                  path="agents/detail/:agentSlug/edit"
-                  element={<AgentEditPage project={project} />}
+                  path="agents/detail/*"
+                  element={
+                    <LegacyProjectRouteRedirect
+                      projectSlug={project.slug}
+                      route="agents"
+                    />
+                  }
                 />
                 <Route
                   path="agents/:runId"
@@ -1072,6 +1105,18 @@ export function ProjectDetail() {
                 <Route
                   path="errors/source-maps/credentials"
                   element={<SourceMapCredentials project={project} />}
+                />
+                <Route
+                  path="errors/inbound-filters"
+                  element={<InboundFilters projectId={project.id} />}
+                />
+                <Route
+                  path="errors/attachments"
+                  element={<ErrorAttachmentsSettings projectId={project.id} />}
+                />
+                <Route
+                  path="errors/ownership"
+                  element={<OwnershipRulesSettings projectId={project.id} />}
                 />
                 <Route
                   path="errors/:errorGroupId"

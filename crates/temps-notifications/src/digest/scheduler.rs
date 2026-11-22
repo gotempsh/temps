@@ -224,7 +224,7 @@ impl Drop for DigestScheduler {
 mod tests {
     use super::*;
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// Helper to create a DigestScheduler with real DB-backed services.
     async fn create_test_scheduler() -> Result<(DigestScheduler, TestDatabase), String> {
@@ -259,7 +259,7 @@ mod tests {
             match create_test_scheduler().await {
                 Ok(setup) => setup,
                 Err(error) => {
-                    if temps_database::test_utils::is_container_runtime_unavailable(&error) {
+                    if temps_test_utils::is_container_runtime_unavailable(&error) {
                         eprintln!("Skipping Docker-dependent digest scheduler test: {error}");
                         return;
                     }

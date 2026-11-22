@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { afterEach, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, expect, spyOn, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import {
   act,
@@ -23,6 +23,10 @@ import {
 import { ASSISTANT_CONTEXT_TYPE } from './assistant-state'
 
 installBrowserWindow()
+// The dock reopens the chat it last remembered (`temps.ai.activeChat` in
+// localStorage), and storage outlives a test file: start from none.
+beforeEach(() => localStorage.clear())
+
 afterEach(() => {
   cleanup()
   spyOn(toast, 'error').mockRestore()

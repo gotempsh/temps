@@ -205,11 +205,13 @@ async fn setup() -> Option<(
     let url = format!("http://127.0.0.1:{host_port}");
     let config = ClickHouseOtelConfig::new(&url, "temps_otel_e2e", "default", "test");
 
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_otel_e2e")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_otel_e2e",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     // Wait until the HTTP listener accepts queries.
     let mut last_err = String::new();

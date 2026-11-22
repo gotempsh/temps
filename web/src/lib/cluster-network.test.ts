@@ -4,9 +4,12 @@
 import { describe, expect, test } from 'bun:test'
 import {
   clusterNetworkFormSchema,
+  networkIdAction,
+  networkIdChangedMessage,
   nodeOverlayStatus,
   validatePoolInput,
   type ClusterNetworkNode,
+  type ClusterNetworkStatus,
 } from './cluster-network'
 
 const node = (overrides: Partial<ClusterNetworkNode>): ClusterNetworkNode => ({
@@ -20,6 +23,7 @@ const node = (overrides: Partial<ClusterNetworkNode>): ClusterNetworkNode => ({
   in_use: false,
   in_use_reason: null,
   occupied_ranges: [],
+  vxlan_id_in_use: false,
   ...overrides,
 })
 
@@ -95,5 +99,68 @@ describe('nodeOverlayStatus', () => {
       })
     )
     expect(view.description).toContain('Automatically moved from 10.202.0.0/24')
+  })
+})
+
+describe('networkIdAction', () => {
+  const status = (
+    overrides: Partial<ClusterNetworkStatus>
+  ): ClusterNetworkStatus => ({
+    can_change: true,
+    can_change_network_id: true,
+    change_blocked_by: [],
+    compute_pool_cidr: '10.202.0.0/16',
+    control_plane: { overlay_ready: false },
+    default_compute_pool_cidr: '10.202.0.0/16',
+    mesh_enabled: false,
+    mesh_pool_cidr: '10.201.0.0/16',
+    network_id_change_blocked_by: [],
+    nodes: [],
+    overlay_network_name: 'temps0',
+    pool_confirmed: true,
+    subnet_prefix_len: 24,
+    vxlan_network_id: 42,
+    vxlan_port: 4789,
+    ...overrides,
+  })
+
+  test('is offered only when a node is blocked by a network ID in use', () => {
+    expect(networkIdAction(undefined).offered).toBe(false)
+    expect(
+      networkIdAction(
+        status({ nodes: [node({ overlay_status: 'unavailable' })] })
+      ).offered
+    ).toBe(false)
+    const action = networkIdAction(
+      status({
+        nodes: [
+          node({ name: 'web-1', vxlan_id_in_use: true }),
+          node({ name: 'worker-2' }),
+        ],
+      })
+    )
+    expect(action.offered).toBe(true)
+    expect(action.blockedNodes).toEqual(['web-1'])
+    expect(action.canChange).toBe(true)
+  })
+
+  test('carries why a change is refused', () => {
+    const action = networkIdAction(
+      status({
+        can_change_network_id: false,
+        network_id_change_blocked_by: [
+          "node 'worker-1' has not reported that it can follow a new network ID",
+        ],
+        nodes: [node({ vxlan_id_in_use: true })],
+      })
+    )
+    expect(action.canChange).toBe(false)
+    expect(action.refusedBecause[0]).toContain('worker-1')
+  })
+
+  test('the change message names both IDs', () => {
+    const message = networkIdChangedMessage({ from: 42, to: 5000123 })
+    expect(message).toContain('5000123')
+    expect(message).toContain('was 42')
   })
 })

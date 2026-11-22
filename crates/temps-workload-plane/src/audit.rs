@@ -48,8 +48,8 @@ impl AuditOperation for AdmissionRefusedAudit {
         PLANE_ACTOR
     }
 
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        Ok(serde_json::to_string(self)?)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 

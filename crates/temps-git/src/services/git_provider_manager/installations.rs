@@ -171,7 +171,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_delete_installation_deactivates_provider() {
@@ -244,6 +244,7 @@ mod tests {
             encryption_service,
             queue_service,
             config_service,
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         // Test delete_installation
@@ -276,6 +277,7 @@ mod tests {
             encryption_service,
             queue_service,
             config_service,
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         // Should succeed even if installation not found (idempotent)

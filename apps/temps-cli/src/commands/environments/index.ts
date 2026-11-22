@@ -177,6 +177,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <env>', 'Environment name or slug', 'production')
     .option('-r, --replicas <count>', 'Number of replicas to set')
+    .option('--load-balancing <json>', 'Replica routing policy as JSON; null restores project inheritance')
     .option('--json', 'Output in JSON format')
     .action(scaleCmd)
 
@@ -1599,8 +1600,20 @@ export function parseReplicaCount(
 }
 
 async function scaleCmd(
-  options: { project?: string; environment: string; replicas?: string; json?: boolean }
+  options: { project?: string; environment: string; replicas?: string; loadBalancing?: string; json?: boolean }
 ): Promise<void> {
+  let routing: NonNullable<Parameters<typeof updateEnvironmentSettings>[0]>['body'] = {}
+  if (options.loadBalancing !== undefined) {
+    try {
+      const parsed = JSON.parse(options.loadBalancing)
+      if (parsed !== null && (typeof parsed !== 'object' || Array.isArray(parsed))) throw new Error('Expected a policy object or null')
+      routing = { load_balancing: parsed }
+    } catch {
+      errorOutput('Invalid --load-balancing JSON: expected a policy object or null')
+      process.exitCode = 1
+      return
+    }
+  }
   // Validate before any network call so a bad count fails fast and non-zero.
   const parsedReplicas = options.replicas !== undefined ? parseReplicaCount(options.replicas) : undefined
   if (parsedReplicas && 'error' in parsedReplicas) {
@@ -1641,18 +1654,18 @@ async function scaleCmd(
     return
   }
 
-  if (parsedReplicas) {
+  if (parsedReplicas || options.loadBalancing !== undefined) {
     // Set replicas
-    const replicaCount = parsedReplicas.replicas
-    if (parsedReplicas.warning) {
+    const replicaCount = parsedReplicas?.replicas
+    if (parsedReplicas?.warning) {
       warning(parsedReplicas.warning)
     }
 
-    const updatedEnv = await withSpinner(`Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {
+    const updatedEnv = await withSpinner(options.loadBalancing !== undefined ? 'Updating replica routing...' : `Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {
       const { data, error } = await updateEnvironmentSettings({
         client,
         path: { project_id: projectId, env_id: targetEnv.id },
-        body: { replicas: replicaCount },
+        body: { ...routing, ...(replicaCount !== undefined ? { replicas: replicaCount } : {}) },
       })
       if (error) throw new Error(getErrorMessage(error))
       return data
@@ -1662,14 +1675,15 @@ async function scaleCmd(
       json({
         environment: updatedEnv?.slug,
         replicas: updatedEnv?.deployment_config?.replicas ?? 1,
+        load_balancing: updatedEnv?.deployment_config?.loadBalancing ?? null,
       })
       return
     }
 
     newline()
-    success(`Scaled ${resolved.slug}/${environment} to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}`)
+    success(options.loadBalancing !== undefined ? `Updated routing for ${resolved.slug}/${environment}` : `Scaled ${resolved.slug}/${environment} to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}`)
     newline()
-    info(`Note: Scaling takes effect on the next deployment or restart`)
+    info(options.loadBalancing !== undefined ? 'Routing changes apply on the next route-table refresh.' : 'Note: Scaling takes effect on the next deployment or restart')
   } else {
     // Display current replicas
     const currentReplicas = targetEnv.deployment_config?.replicas ?? 1
@@ -1678,6 +1692,7 @@ async function scaleCmd(
       json({
         environment: targetEnv.slug,
         replicas: currentReplicas,
+        load_balancing: targetEnv.deployment_config?.loadBalancing ?? null,
       })
       return
     }

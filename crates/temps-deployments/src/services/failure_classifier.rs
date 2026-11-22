@@ -61,10 +61,80 @@ use utoipa::ToSchema;
 /// v7: a static bundle entry refused for its path (absolute, escaping the
 /// extraction directory, or a link) is `static_output_rejected` rather than
 /// `static_deploy_failed`.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
+///
+/// v8: executor task failures and deployment persistence failures are platform
+/// errors, while terminal-state readiness errors are runtime container exits.
+/// Explicit Compose policy rejections take precedence over resource words in
+/// their diagnostics. Matching still ignores embedded application log tails.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 8;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
+
+const COMPOSE_CHECK_MARKERS: [&str; 2] = [
+    "compose security policy rejected [check=",
+    "invalid compose override [check=",
+];
+
+/// Peel only wrappers produced by the workflow and Compose jobs. Never search
+/// arbitrary command output or user-controlled error fields for metadata.
+fn compose_policy_error_head(mut reason: &str) -> Option<&str> {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if COMPOSE_CHECK_MARKERS
+            .iter()
+            .any(|marker| reason.starts_with(marker))
+        {
+            return Some(reason);
+        }
+        if let Some(inner) = [
+            "job execution failed: ",
+            "job failed: ",
+            "workflow error: ",
+            "compose prepare/pull failed: ",
+            "compose deploy failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("required job 'deploy_compose' failed: ") {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("compose configuration check failed for project ")
+        {
+            let (project_id, rest) = inner.split_once(" (")?;
+            project_id.parse::<i32>().ok()?;
+            let (_, inner) = rest.split_once("): ")?;
+            reason = inner;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Check labels are metadata, not failure signals (e.g. `oom_killer`).
+/// Removing only the newly introduced annotation preserves the existing
+/// stage/code matching semantics of the diagnostic text around it.
+fn without_compose_check_annotation(reason: &str) -> Option<String> {
+    let policy_error = compose_policy_error_head(reason)?;
+    let marker = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find(|marker| policy_error.starts_with(*marker))?;
+    let label_start = reason.len() - policy_error.len() + marker.len();
+    let label_end = label_start + reason[label_start..].find(']')? + 1;
+    let annotation_start = label_start - "[check=".len();
+    Some(format!(
+        "{}{}",
+        &reason[..annotation_start],
+        &reason[label_end..]
+    ))
+}
 
 /// The pipeline stage a deployment failed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -428,6 +498,28 @@ pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
     })
 }
 
+/// Read only the typed check label written before any user-controlled error
+/// fields. Older failures and non-configurable validation errors have no label.
+/// Never infer a check from Compose content, service names or diagnostic text.
+pub fn compose_security_check(
+    reason: Option<&str>,
+) -> Option<temps_entities::compose_security::ComposeSecurityCheck> {
+    use temps_entities::compose_security::ComposeSecurityCheck;
+    let reason = reason?.to_lowercase();
+    let head = classification_head(&reason);
+    let policy_error = compose_policy_error_head(head)?;
+    let label = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find_map(|marker| policy_error.strip_prefix(marker))?
+        .split_once(']')?
+        .0;
+    if label.len() > 64 || !label.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
+        return None;
+    }
+    serde_json::from_value::<ComposeSecurityCheck>(serde_json::Value::String(label.to_string()))
+        .ok()
+}
+
 /// Static guidance per code. Never interpolates the raw reason.
 pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
     use DeploymentFailureCode as C;
@@ -590,7 +682,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
+            "The app process exited (or kept restarting) right after starting. Check the deployment's retained container logs, when they were captured, or the runtime logs for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -824,6 +916,45 @@ fn classification_head(lower: &str) -> &str {
         .map_or(lower, |idx| &lower[..idx])
 }
 
+/// The executor's error body after its own wrappers, not arbitrary build
+/// diagnostics that happen to contain an executor-shaped message.
+fn workflow_error_body(mut reason: &str) -> &str {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if let Some(inner) = [
+            "workflow execution failed: ",
+            "workflow error: ",
+            "other error: ",
+            "job execution failed: ",
+            "job failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(rest) = reason.strip_prefix("required job '") {
+            let Some((job, inner)) = rest.split_once("' failed: ") else {
+                break;
+            };
+            if job.is_empty()
+                || job.len() > 64
+                || !job
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            {
+                break;
+            }
+            reason = inner;
+            continue;
+        }
+        break;
+    }
+    reason
+}
+
 /// Parse the first unsigned integer that immediately follows `prefix`.
 fn number_after(text: &str, prefix: &str) -> Option<u64> {
     text.match_indices(prefix).find_map(|(idx, _)| {
@@ -885,7 +1016,13 @@ pub fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let reason = reason.to_lowercase();
+    let lower = reason.to_lowercase();
+    let head = classification_head(&lower);
+    let semantic_reason = without_compose_check_annotation(head).map(|mut reason| {
+        reason.push_str(&lower[head.len()..]);
+        reason
+    });
+    let reason = semantic_reason.as_deref().unwrap_or(&lower);
 
     if reason.contains("out of memory")
         || reason.contains("oom")
@@ -946,10 +1083,37 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     use DeploymentFailureStage as S;
 
     let full = raw.to_lowercase();
-    let r = classification_head(&full);
+    let head = classification_head(&full);
+    let semantic_reason = without_compose_check_annotation(head);
+    let r = semantic_reason.as_deref().unwrap_or(head);
     let phase = job_phase(failed_job_id(raw));
     let is_compose = phase == Some(JobPhase::Compose) || r.contains("compose");
     let make = DeploymentFailureClassification::new;
+
+    // A failed executor task is an infrastructure fault, even when its panic
+    // payload happens to mention a build, timeout, health check or resource.
+    let executor_error = workflow_error_body(r);
+    if executor_error.starts_with("task execution failed: ")
+        || executor_error.starts_with("internal error executing job '")
+    {
+        return make(S::Platform, C::PlatformInternal);
+    }
+
+    // Persistence failures belong to the platform even when their cause is a
+    // pool timeout. Match only the workflow error body, never embedded build
+    // diagnostics, before attributing timeout words to the current job phase.
+    if [
+        "failed to find deployment:",
+        "failed to find environment:",
+        "failed to find project:",
+        "failed to update project last_deployment:",
+        "database error:",
+    ]
+    .iter()
+    .any(|prefix| executor_error.starts_with(prefix))
+    {
+        return make(S::Platform, C::PlatformInternal);
+    }
 
     let timeout_signal = contains_any(
         r,
@@ -1049,6 +1213,20 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
         )
     {
         return make(S::Configuration, C::InvalidConfiguration);
+    }
+
+    // An explicit policy rejection happened before any workload ran. Its
+    // diagnostic may name the OOM killer or other resources without exhausting them.
+    if is_compose
+        && contains_any(
+            r,
+            &[
+                "compose security policy rejected",
+                "invalid compose override",
+            ],
+        )
+    {
+        return make(S::Configuration, C::ComposePolicyRejected);
     }
 
     // ── Resources ───────────────────────────────────────────────────────
@@ -1250,6 +1428,8 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "' dead",
             "exited with code",
             "exited before",
+            "is in terminal state exited",
+            "is in terminal state dead",
         ],
     ) {
         return make(S::Runtime, C::ContainerExited);
@@ -1718,6 +1898,137 @@ mod tests {
     fn assert_class(reason: &str, stage: S, code: C) {
         let got = classify_failure_reason(Some(reason));
         assert_eq!((got.stage, got.code), (stage, code), "reason: {reason}");
+    }
+
+    #[test]
+    fn infrastructure_and_terminal_state_messages_do_not_fall_through() {
+        let cases = [
+            ("deploy_compose", "Compose security policy rejected oom_kill_disable for service 'app': disabling the OOM killer is not allowed", S::Configuration, C::ComposePolicyRejected),
+            ("deploy_container", "Task execution failed: task 7 panicked", S::Platform, C::PlatformInternal),
+            ("build_image", "Internal error executing job 'build_image' for deployment 42: task panicked", S::Platform, C::PlatformInternal),
+            ("build_image", "Internal error executing job 'build_image' for deployment 42: deadline elapsed during health check", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find deployment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find environment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find project: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to update project last_deployment: query failed", S::Platform, C::PlatformInternal),
+            ("deploy_compose", "Compose prepare/pull failed: Docker Compose command failed for project 'app': docker compose build failed: Database error: relation items does not exist", S::Build, C::ComposeBuildFailed),
+            ("deploy_compose", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Container candidate-1 is in terminal state Exited and will not become ready", S::Runtime, C::ContainerExited),
+            ("deploy_container", "Container candidate-1 is in terminal state Dead and will not become ready", S::Runtime, C::ContainerExited),
+        ];
+        for (job, message, stage, code) in cases {
+            assert_class(&wrapped(job, message), stage, code);
+        }
+    }
+
+    #[test]
+    fn persistence_timeouts_stay_platform_failures() {
+        for prefix in [
+            "Failed to find deployment:",
+            "Failed to find environment:",
+            "Failed to find project:",
+            "Failed to update project last_deployment:",
+            "Database error:",
+        ] {
+            let message = format!("{prefix} Connection pool timed out after 30 seconds");
+            for reason in [
+                message.clone(),
+                wrapped("mark_deployment_complete", &message),
+            ] {
+                assert_class(&reason, S::Platform, C::PlatformInternal);
+                assert_eq!(legacy_failure_reason(Some(&reason)), "timeout");
+            }
+        }
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Failed to build image: Build failed: Database error: Connection pool timed out after 30 seconds",
+            ),
+            S::Build,
+            C::BuildTimeout,
+        );
+    }
+
+    #[test]
+    fn application_log_tails_cannot_claim_platform_failures() {
+        for marker in [
+            "Last log lines:",
+            "Container logs for unhealthy/stopped services:",
+        ] {
+            let reason = wrapped("deploy_container", &format!("Container exited during startup (exit code 1). {marker} Database error: task execution failed: connection refused"));
+            assert_class(&reason, S::Runtime, C::ContainerExited);
+        }
+        assert_class(
+            &wrapped("deploy_container", "an entirely novel failure"),
+            S::Deploy,
+            C::Unknown,
+        );
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Build failed: application generator: Database error: schema missing",
+            ),
+            S::Build,
+            C::BuildError,
+        );
+    }
+
+    #[test]
+    fn executor_markers_in_application_build_output_stay_build_failures() {
+        for (job, message, code) in [
+            ("build_image", "Failed to build image: Build failed: process \"/bin/sh -c echo 'Task execution failed: invalid schema' >&2; exit 1\" did not complete successfully: exit code: 1", C::BuildError),
+            ("build_image", "Failed to build image: Build failed: Internal error executing job 'generate'", C::BuildError),
+            ("deploy_compose", "Compose prepare/pull failed: docker compose build failed: Task execution failed: invalid schema", C::ComposeBuildFailed),
+            ("deploy_compose", "Compose prepare/pull failed: docker compose build failed: Internal error executing job 'generate'", C::ComposeBuildFailed),
+        ] {
+            assert_class(&wrapped(job, message), S::Build, code);
+        }
+        assert_class(
+            "Workflow error: Other error: Task execution failed: task 7 panicked",
+            S::Platform,
+            C::PlatformInternal,
+        );
+        assert_class("Workflow execution failed: Job execution failed: Internal error executing job 'build_image' in workflow 'deployment-42' for deployment 42: task panicked", S::Platform, C::PlatformInternal);
+    }
+
+    #[test]
+    fn compose_check_metadata_survives_workflow_wrappers() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        let inner = "Compose configuration check failed for project 42 (policy_violation): Compose security policy rejected [check=privileged] privileged for service 'app': refused";
+        for reason in [
+            inner.to_string(),
+            wrapped("deploy_compose", inner),
+            format!("Job execution failed: Required job 'deploy_compose' failed: {inner}"),
+        ] {
+            assert_eq!(
+                compose_security_check(Some(&reason)),
+                Some(ComposeSecurityCheck::Privileged)
+            );
+        }
+    }
+
+    #[test]
+    fn container_exit_guidance_covers_startup_diagnostics() {
+        let info = describe_failure(Some(
+            "Container exited during startup (exit code 1) after 2s",
+        ))
+        .unwrap();
+        assert_eq!(info.code, C::ContainerExited);
+        for hint in [
+            "retained container logs",
+            "environment variable",
+            "0.0.0.0",
+            "listen port",
+            "137",
+            "OOM",
+            "start command",
+        ] {
+            assert!(info.remediation.contains(hint), "missing hint: {hint}");
+        }
+        // Not every surface shows logs under the guidance (the compact row
+        // only has a tooltip, and logs are only present when captured).
+        assert!(!info.remediation.contains("below"));
     }
 
     #[test]
@@ -2715,7 +3026,7 @@ mod tests {
     fn bundle_entries_refused_for_their_path_are_rejected_output() {
         // The exact text `WorkflowError::InvalidArchiveEntry` renders, so a
         // reworded error cannot silently fall back to `static_deploy_failed`.
-        let entry = temps_core::WorkflowError::InvalidArchiveEntry {
+        let entry = crate::workflow::WorkflowError::InvalidArchiveEntry {
             path: "../escape.txt".to_string(),
             reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".to_string(),
         }

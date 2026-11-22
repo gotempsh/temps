@@ -9,6 +9,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
+use temps_core::crypto::constant_time_eq;
 
 /// Cookie name for password-protected environments
 pub const PASSWORD_COOKIE_NAME: &str = "_temps_pw";
@@ -63,10 +64,36 @@ pub fn generate_password_form_html_for_route(
     environment_name: &str,
     routed_path: Option<&str>,
 ) -> String {
+    generate_password_form_with_identity(
+        redirect_path,
+        show_error,
+        project_name,
+        environment_name,
+        routed_path,
+        false,
+    )
+}
+
+/// Render only the template's branding neutrally, preserving operator-supplied names.
+pub fn generate_password_form_with_identity(
+    redirect_path: &str,
+    show_error: bool,
+    project_name: &str,
+    environment_name: &str,
+    routed_path: Option<&str>,
+    hide_identity: bool,
+) -> String {
+    let template = if hide_identity {
+        std::borrow::Cow::Owned(crate::branded_404::neutralize_access_response(
+            PASSWORD_FORM_HTML.to_string(),
+        ))
+    } else {
+        std::borrow::Cow::Borrowed(PASSWORD_FORM_HTML)
+    };
     let redirect_path = sanitize_redirect_path(redirect_path);
     // The client-controlled value goes in last: a redirect that spells a
     // placeholder name must not be rewritten by a later substitution.
-    PASSWORD_FORM_HTML
+    template
         .replace("{{PROJECT_NAME}}", &html_escape(project_name))
         .replace("{{ENVIRONMENT_NAME}}", &html_escape(environment_name))
         .replace(
@@ -332,23 +359,30 @@ fn compute_hmac(data: &str, key: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Constant-time comparison to prevent timing attacks.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter()
-        .zip(b.iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
-        == 0
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const TEST_ENV_ID: i32 = 42;
     const TEST_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$test_salt$test_hash_value";
+
+    #[test]
+    fn hidden_branding_preserves_operator_supplied_names() {
+        let html = generate_password_form_with_identity(
+            "/",
+            false,
+            "Temps console",
+            "production",
+            None,
+            true,
+        );
+        assert!(html.contains("Temps console"));
+        assert!(!html.contains("Protected by Temps"));
+        assert_eq!(
+            generate_password_form_with_identity("/", false, "App", "production", None, false),
+            generate_password_form_html("/", false, "App", "production")
+        );
+    }
 
     #[test]
     fn test_create_and_validate_cookie() {

@@ -869,7 +869,13 @@ mod tests {
                 },
             );
         }
-        for name in crate::DELTA_COUNTER_METRICS {
+        // The list also carries other emitters' counters (the DNS resolvers'
+        // `dns.*` family is guarded by its own test in `temps-dns`); only the
+        // proxy's own names must come from this sampler.
+        for name in crate::DELTA_COUNTER_METRICS
+            .iter()
+            .filter(|name| name.starts_with("proxy."))
+        {
             assert!(
                 counters.contains(name),
                 "{name} is listed as a delta counter in temps-metrics but the proxy no longer emits it as one"

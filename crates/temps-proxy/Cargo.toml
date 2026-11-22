@@ -13,8 +13,9 @@ homepage.workspace = true
 
 [dependencies]
 temps-analytics = { path = "../temps-analytics" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-config = { path = "../temps-config" }
+temps-config-handlers = { path = "../temps-config-handlers" }
 temps-core = { path = "../temps-core" }
 temps-clickhouse = { path = "../temps-clickhouse" }
 temps-database = { path = "../temps-database" }
@@ -74,6 +75,7 @@ url = { workspace = true }
 integration = []
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 temp-dir = { workspace = true }
 hyper = { workspace = true }
@@ -83,6 +85,10 @@ anyhow = { workspace = true }
 temps-presets = { path = "../temps-presets" }
 # The edge rule change-feed test listens on Postgres NOTIFY directly.
 sqlx = { workspace = true }
+
+[[bench]]
+name = "request_path"
+harness = false
 
 [lints]
 workspace = true

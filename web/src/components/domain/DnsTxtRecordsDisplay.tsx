@@ -107,7 +107,7 @@ export function DnsTxtRecordsDisplay({
       </div>
 
       {showPropagationLinks && variant === 'default' && (
-        <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+        <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
           <Info className="h-4 w-4 text-blue-600" />
           <AlertDescription>
             <p className="mb-2 text-sm">

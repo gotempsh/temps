@@ -5,10 +5,13 @@
 //!
 //! Deploys static files (Vite, React, etc.) to the filesystem instead of containers
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
 use temps_deployer::ImageBuilder;
 use temps_deployment_logs::{LogLevel, LogService};

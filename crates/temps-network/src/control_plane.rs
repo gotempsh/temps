@@ -193,6 +193,22 @@ impl ControlPlaneOverlay {
                         warn!(error = %error, "could not read the WireGuard mesh settings")
                     }
                 }
+                // A new network ID (ADR 062) means a new VXLAN device:
+                // setup builds the overlay again on it.
+                match network_config::Entity::find_by_id(1).one(db.as_ref()).await {
+                    Ok(Some(cfg)) if transport_changed(&config.transport, &cfg) => {
+                        info!(
+                            vni = cfg.vxlan_vni,
+                            port = cfg.vxlan_port,
+                            "the cluster's VXLAN network ID changed; setting the control-plane overlay up again"
+                        );
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(error = %error, "could not read the cluster's VXLAN network ID")
+                    }
+                }
                 // WireGuard first: a new node's VXLAN peer is useless until
                 // its tunnel exists.
                 if let Some(end) = &mesh {
@@ -250,6 +266,18 @@ impl ControlPlaneOverlay {
                 tokio::time::sleep(PEER_RECONCILE_INTERVAL).await;
             }
         })
+    }
+}
+
+/// Whether the stored VXLAN network ID or port differ from the transport the
+/// overlay was built with. A native overlay has neither.
+fn transport_changed(built: &Transport, stored: &network_config::Model) -> bool {
+    match built {
+        Transport::Vxlan { vni, port } => {
+            i64::from(*vni) != i64::from(stored.vxlan_vni)
+                || i64::from(*port) != i64::from(stored.vxlan_port)
+        }
+        Transport::Native => false,
     }
 }
 

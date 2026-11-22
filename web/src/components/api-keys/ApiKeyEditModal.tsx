@@ -78,6 +78,13 @@ export function ApiKeyEditModal({
               <Label htmlFor="edit-is_active">Active</Label>
             </div>
 
+            <p className="text-sm text-muted-foreground">
+              Scope:{' '}
+              {apiKey?.project_id
+                ? `Project #${apiKey.project_id}${apiKey.environment_id ? ` · Environment #${apiKey.environment_id}` : ' · All environments'}`
+                : 'Account-wide'}
+              . To change scope, revoke this key and create another.
+            </p>
             <div className="space-y-2">
               <Label htmlFor="edit-expires_at">
                 Expiration Date (optional)

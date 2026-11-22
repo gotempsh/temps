@@ -12,14 +12,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-entities = { path = "../temps-entities" }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sea-orm = { workspace = true }
-anyhow = { workspace = true }
 reqwest = { workspace = true }
 chrono = { workspace = true }
 utoipa = { workspace = true, features = ["chrono"] }

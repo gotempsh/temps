@@ -5,6 +5,7 @@
 
 import {
   getBackupOptions,
+  getBackupQueryKey,
   getS3SourceOptions,
   listUsersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -20,6 +21,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import {
   Card,
   CardContent,
@@ -479,6 +481,12 @@ export function BackupDetail() {
         facts={facts}
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getBackupQueryKey({ path: { id: backupId! } }),
+                listBackupChildrenOptions(backup.id).queryKey,
+              ]}
+            />
             {backAction}
             <CopyAction value={backup.s3_location}>Copy S3 path</CopyAction>
             {/* Restore — a completed backup of a database opens that

@@ -12,6 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 temps-migrations = { path = "../temps-migrations" }
 bollard = { workspace = true }
 tower = { workspace = true }
@@ -32,7 +33,6 @@ serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 sea-orm = { workspace = true }
-anyhow = { workspace = true }
 utoipa = { workspace = true }
 serde_json = { workspace = true }
 chrono = { workspace = true }

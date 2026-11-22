@@ -642,7 +642,7 @@ impl GitProviderManager {
 mod tests {
     use super::*;
     use crate::services::git_provider_manager::test_support::*;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     /// A sync runs detached, so its failure used to reach only the server log:
     /// the console saw `syncing` flip back to false and could not tell a failed
@@ -702,6 +702,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db.clone()),
+            Arc::new(temps_core::NoopAuditLogger),
         ));
 
         manager.clone().run_sync_guarded(connection.id).await;

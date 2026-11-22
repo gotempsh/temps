@@ -4,6 +4,7 @@ import { PageTitle } from '@temps-sdk/ds'
 import {
   getGenaiTraceOptions,
   queryGenaiTracesOptions,
+  queryGenaiTracesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   GenAiSpanDetail,
@@ -22,7 +23,10 @@ import { CloudAiMetadataNotice } from '@/components/ai/CloudAiMetadataNotice'
 import { problemDetail } from '@/lib/api-problem'
 import { AiProviderSelect } from '@/components/ai/AiProviderSelect'
 import { AiActivityEmptyState } from '@/components/ai/AiActivityEmptyState'
+import { aiTracesSetupHref } from '@/components/ai/ai-traces-setup'
 import { DateTimeRange } from '@/components/ui/date-time-range'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import type { DateTimeRangeValue } from '@/lib/date-time-range'
 
 import {
@@ -214,6 +218,7 @@ import {
   compareAiModelIdsByRelevance,
   sortAiModelIdsByRelevance,
 } from '@/lib/ai-model-ranking'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 // Mutation errors here are thrown ProblemDetails response bodies, not Error
 // instances -- String(error) on an object stringifies to "[object Object]"
@@ -239,6 +244,10 @@ interface UsageSummary {
   error_count: number
   streaming_count: number
   byok_count: number
+  /** Requests that used tokens but whose cost no known price gave. */
+  unpriced_requests: number
+  /** Requests that used tokens and were priced, free models included. */
+  priced_requests: number
 }
 
 interface ProviderUsage {
@@ -266,6 +275,8 @@ interface ModelUsage {
   output_tokens: number
   total_tokens: number
   avg_latency_ms: number
+  /** Recorded cost of the model's requests in the window, in microcents. */
+  estimated_cost_microcents: number
 }
 
 interface UsageLogEntry {
@@ -277,6 +288,8 @@ interface UsageLogEntry {
   output_tokens: number
   latency_ms: number
   estimated_cost_microcents: number
+  /** Used tokens, but no known price gave its cost: unknown, not free. */
+  unpriced: boolean
   status: number
   is_streaming: boolean
   is_byok: boolean
@@ -288,17 +301,6 @@ interface UsageLogEntry {
 interface UsageLogPage {
   entries: UsageLogEntry[]
   total: number
-}
-
-interface ModelPricing {
-  model: string
-  provider: string
-  input_per_million: number
-  output_per_million: number
-}
-
-interface PricingResponse {
-  models: ModelPricing[]
 }
 
 async function fetchJson<T>(url: string): Promise<T> {
@@ -544,6 +546,7 @@ function ProviderKeyModelDetail({
       updateProviderKey({
         path: { id: providerKey.id },
         body: { default_model: modelId },
+        throwOnError: true,
       }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey })
@@ -803,48 +806,14 @@ function formatCost(dollars: number): string {
   return `$${dollars.toFixed(6)}`
 }
 
-function findPricing(
-  model: string,
-  pricingMap: Map<string, ModelPricing>
-): ModelPricing | undefined {
-  // Exact match first
-  const exact = pricingMap.get(model)
-  if (exact) return exact
-
-  // Strip common suffixes: -preview, -latest, date stamps like -20250101
-  const stripped = model
-    .replace(/-preview$/, '')
-    .replace(/-latest$/, '')
-    .replace(/-\d{6,8}$/, '')
-  if (stripped !== model) {
-    const match = pricingMap.get(stripped)
-    if (match) return match
-  }
-
-  // Prefix match: find the longest pricing key that the model starts with
-  let best: ModelPricing | undefined
-  let bestLen = 0
-  for (const [key, pricing] of pricingMap) {
-    if (model.startsWith(key) && key.length > bestLen) {
-      best = pricing
-      bestLen = key.length
-    }
-  }
-  return best
-}
-
-function computeCost(
-  model: string,
-  inputTokens: number,
-  outputTokens: number,
-  pricingMap: Map<string, ModelPricing>
-): number {
-  const pricing = findPricing(model, pricingMap)
-  if (!pricing) return 0
-  return (
-    (inputTokens / 1_000_000) * pricing.input_per_million +
-    (outputTokens / 1_000_000) * pricing.output_per_million
-  )
+/**
+ * A recorded cost in dollars. Usage logs store each request's cost in
+ * microcents (1e-6 USD) as the spend caps and budgets count it, cache prices
+ * and long-context rates included, so the console shows that figure instead
+ * of recomputing one from list prices.
+ */
+function microcentsToDollars(microcents: number): number {
+  return microcents / 1_000_000
 }
 
 type TimeRange = { label: string; hours: number }
@@ -852,6 +821,7 @@ type TimeRange = { label: string; hours: number }
 function useTimeRangeSelection(): [
   { range: TimeRange; endMs: number },
   (value: DateTimeRangeValue) => void,
+  () => void,
 ] {
   const [selection, setSelection] = useState(() => ({
     range: { label: '1d', hours: 24 },
@@ -867,6 +837,13 @@ function useTimeRangeSelection(): [
         },
         endMs: Date.parse(value.to),
       }),
+    // Refresh: a preset ("last 24 hours") ends now again; a custom range stays.
+    () =>
+      setSelection((current) =>
+        current.range.label === 'custom'
+          ? current
+          : { ...current, endMs: Date.now() }
+      ),
   ]
 }
 
@@ -954,24 +931,73 @@ const providerChartConfig = {
   request_count: { label: 'Requests', color: 'var(--chart-1)' },
 } satisfies ChartConfig
 
-function LogCostCell({
-  log,
-  pricingMap,
+/**
+ * A usage read that failed with nothing loaded. Says so instead of showing
+ * zero or "no data", which would read as a quiet gateway.
+ */
+function UsageReadFailed({
+  label,
+  onRetry,
 }: {
-  log: UsageLogEntry
-  pricingMap: Map<string, ModelPricing>
+  label: string
+  onRetry: () => void
 }) {
-  const cost = computeCost(
-    log.model,
-    log.input_tokens,
-    log.output_tokens,
-    pricingMap
+  return (
+    <div className="flex h-[200px] flex-col items-center justify-center gap-2 text-center text-sm">
+      <p className="text-destructive">Couldn&apos;t load {label}.</p>
+      <Button variant="outline" size="sm" onClick={onRetry}>
+        Retry
+      </Button>
+    </div>
   )
-  return <>{cost > 0 ? formatCost(cost) : '—'}</>
+}
+
+/** A stat card's value when its read failed with nothing loaded. */
+function UsageStatFailed() {
+  return <p className="text-sm text-destructive">Couldn&apos;t load</p>
+}
+
+/**
+ * The window's recorded spend. Requests with no recorded cost (logged before
+ * costs were estimated, or from a model with no published price) are not in
+ * the total, so it says so instead of reading as free.
+ */
+function EstimatedCostStat({ summary }: { summary: UsageSummary | undefined }) {
+  const unpriced = summary?.unpriced_requests ?? 0
+  const priced = summary?.priced_requests ?? 0
+  // Requests that used no tokens (failures) are neither, so they cannot turn
+  // a window with no priced request into a $0.00 total.
+  if (unpriced > 0 && priced === 0) {
+    return (
+      <>
+        <div className="text-2xl font-bold">—</div>
+        <p className="text-xs text-muted-foreground">No recorded cost</p>
+      </>
+    )
+  }
+  return (
+    <>
+      <div className="text-2xl font-bold">
+        {formatCost(microcentsToDollars(summary?.total_cost_microcents ?? 0))}
+      </div>
+      {unpriced > 0 && (
+        <p className="text-xs text-muted-foreground">
+          Excludes {formatTokenCount(unpriced)} unpriced{' '}
+          {unpriced === 1 ? 'request' : 'requests'}
+        </p>
+      )}
+    </>
+  )
+}
+
+function LogCostCell({ log }: { log: UsageLogEntry }) {
+  if (log.unpriced) return <>—</>
+  return <>{formatCost(microcentsToDollars(log.estimated_cost_microcents))}</>
 }
 
 export function UsageAnalytics() {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -980,21 +1006,34 @@ export function UsageAnalytics() {
     return { from, to, bucket }
   }, [endMs, timeRange])
 
-  const { data: summary, isLoading: summaryLoading } = useQuery({
-    queryKey: ['aiUsage', 'summary', timeParams.from, timeParams.to],
+  // The window is named in each key ({ from, to }), so a Refresh that moves
+  // it keeps the numbers on screen and picking another range does not.
+  const {
+    data: summary,
+    isLoading: summaryLoading,
+    isError: summaryError,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<UsageSummary>(
         buildUsageUrl('summary', { from: timeParams.from, to: timeParams.to })
       ),
   })
 
-  const { data: timeseries, isLoading: timeseriesLoading } = useQuery({
+  const {
+    data: timeseries,
+    isLoading: timeseriesLoading,
+    isError: timeseriesError,
+    refetch: refetchTimeseries,
+  } = useWindowQuery({
     queryKey: [
       'aiUsage',
       'timeseries',
-      timeParams.from,
-      timeParams.to,
-      timeParams.bucket,
+      { from: timeParams.from, to: timeParams.to, bucket: timeParams.bucket },
     ],
     queryFn: () =>
       fetchJson<TimeseriesBucket[]>(
@@ -1006,8 +1045,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: byProvider } = useQuery({
-    queryKey: ['aiUsage', 'by-provider', timeParams.from, timeParams.to],
+  const {
+    data: byProvider,
+    isLoading: byProviderLoading,
+    isError: byProviderError,
+    refetch: refetchByProvider,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'by-provider',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ProviderUsage[]>(
         buildUsageUrl('by-provider', {
@@ -1017,8 +1065,17 @@ export function UsageAnalytics() {
       ),
   })
 
-  const { data: topModels } = useQuery({
-    queryKey: ['aiUsage', 'top-models', timeParams.from, timeParams.to],
+  const {
+    data: topModels,
+    isLoading: topModelsLoading,
+    isError: topModelsError,
+    refetch: refetchTopModels,
+  } = useWindowQuery({
+    queryKey: [
+      'aiUsage',
+      'top-models',
+      { from: timeParams.from, to: timeParams.to },
+    ],
     queryFn: () =>
       fetchJson<ModelUsage[]>(
         buildUsageUrl('top-models', {
@@ -1046,11 +1103,12 @@ export function UsageAnalytics() {
   // The filter row is collapsed by default and only revealed on demand.
   const [recentFiltersOpen, setRecentFiltersOpen] = useState(false)
 
-  // Cost is entered by the user in dollars; the API expects microcents.
+  // Cost is entered by the user in dollars; the API expects microcents
+  // (1e-6 USD), the unit costs are recorded in.
   const recentCostMicrocents = useMemo(() => {
     const dollars = parseFloat(recentCostInput)
     if (!Number.isFinite(dollars) || dollars < 0) return undefined
-    return Math.round(dollars * 1_000_000 * 100)
+    return Math.round(dollars * 1_000_000)
   }, [recentCostInput])
 
   // Tokens are entered as a plain integer count.
@@ -1116,28 +1174,11 @@ export function UsageAnalytics() {
     setRecentPage(0)
   }
 
-  const { data: pricingData } = useQuery({
-    queryKey: ['aiPricing'],
-    queryFn: () => fetchJson<PricingResponse>('/api/ai/pricing'),
-    staleTime: 60 * 60 * 1000,
-  })
-
-  const pricingMap = useMemo(() => {
-    const map = new Map<string, ModelPricing>()
-    for (const m of pricingData?.models ?? []) {
-      map.set(m.model, m)
-    }
-    return map
-  }, [pricingData])
-
-  const totalEstimatedCost = useMemo(() => {
-    if (!topModels || pricingMap.size === 0) return 0
-    return topModels.reduce(
-      (sum, m) =>
-        sum + computeCost(m.model, m.input_tokens, m.output_tokens, pricingMap),
-      0
-    )
-  }, [topModels, pricingMap])
+  // Failed with nothing to show: never rendered as zero usage.
+  const summaryFailed = summaryError && !summary
+  const timeseriesFailed = timeseriesError && !timeseries
+  const byProviderFailed = byProviderError && !byProvider
+  const topModelsFailed = topModelsError && !topModels
 
   const chartTimeseries = useMemo(
     () =>
@@ -1162,7 +1203,8 @@ export function UsageAnalytics() {
       {/* Time range selector */}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <h3 className="text-lg font-semibold">Usage analytics</h3>
-        <div className="flex gap-1">
+        <div className="flex flex-wrap items-center gap-2">
+          <RefreshButton queryKeys={[['aiUsage']]} onRefresh={moveToNow} />
           <AiTimeRange
             range={timeRange}
             endMs={endMs}
@@ -1183,6 +1225,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_requests ?? 0)}
@@ -1200,6 +1244,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {formatTokenCount(summary?.total_tokens ?? 0)}
@@ -1217,6 +1263,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {Math.round(summary?.avg_latency_ms ?? 0)}ms
@@ -1234,6 +1282,8 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
               <div className="text-2xl font-bold">
                 {summary && summary.total_requests > 0
@@ -1253,10 +1303,10 @@ export function UsageAnalytics() {
           <CardContent>
             {summaryLoading ? (
               <Skeleton className="h-7 w-16" />
+            ) : summaryFailed ? (
+              <UsageStatFailed />
             ) : (
-              <div className="text-2xl font-bold">
-                {formatCost(totalEstimatedCost)}
-              </div>
+              <EstimatedCostStat summary={summary} />
             )}
           </CardContent>
         </Card>
@@ -1270,6 +1320,11 @@ export function UsageAnalytics() {
         <CardContent>
           {timeseriesLoading ? (
             <Skeleton className="h-[200px] w-full" />
+          ) : timeseriesFailed ? (
+            <UsageReadFailed
+              label="requests over time"
+              onRetry={() => void refetchTimeseries()}
+            />
           ) : chartTimeseries.length === 0 ? (
             <EmptyState
               icon={Activity}
@@ -1311,6 +1366,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1362,6 +1422,11 @@ export function UsageAnalytics() {
           <CardContent>
             {timeseriesLoading ? (
               <Skeleton className="h-[200px] w-full" />
+            ) : timeseriesFailed ? (
+              <UsageReadFailed
+                label="usage over time"
+                onRetry={() => void refetchTimeseries()}
+              />
             ) : chartTimeseries.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
@@ -1407,7 +1472,14 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">By provider</CardTitle>
           </CardHeader>
           <CardContent>
-            {!byProvider || byProvider.length === 0 ? (
+            {byProviderLoading ? (
+              <Skeleton className="h-[200px] w-full" />
+            ) : byProviderFailed ? (
+              <UsageReadFailed
+                label="usage by provider"
+                onRetry={() => void refetchByProvider()}
+              />
+            ) : !byProvider || byProvider.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
@@ -1456,19 +1528,25 @@ export function UsageAnalytics() {
             <CardTitle className="text-base">Top models</CardTitle>
           </CardHeader>
           <CardContent>
-            {!topModels || topModels.length === 0 ? (
+            {topModelsLoading ? (
+              <div className="space-y-3">
+                {['a', 'b', 'c', 'd'].map((key) => (
+                  <Skeleton key={key} className="h-5 w-full" />
+                ))}
+              </div>
+            ) : topModelsFailed ? (
+              <UsageReadFailed
+                label="top models"
+                onRetry={() => void refetchTopModels()}
+              />
+            ) : !topModels || topModels.length === 0 ? (
               <div className="h-[200px] flex items-center justify-center text-sm text-muted-foreground">
                 No data
               </div>
             ) : (
               <div className="space-y-3">
                 {topModels.map((m) => {
-                  const cost = computeCost(
-                    m.model,
-                    m.input_tokens,
-                    m.output_tokens,
-                    pricingMap
-                  )
+                  const cost = microcentsToDollars(m.estimated_cost_microcents)
                   return (
                     <div
                       key={m.model}
@@ -1699,7 +1777,7 @@ export function UsageAnalytics() {
                         {log.latency_ms}ms
                       </TableCell>
                       <TableCell className="hidden md:table-cell text-muted-foreground">
-                        <LogCostCell log={log} pricingMap={pricingMap} />
+                        <LogCostCell log={log} />
                       </TableCell>
                       <TableCell>
                         <div className="flex items-center gap-1.5">
@@ -3380,7 +3458,8 @@ export function AgentActivity() {
   const [selectedProjectId, setSelectedProjectId] = useState<
     number | undefined
   >(projects[0]?.id)
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [selectedTraceId, setSelectedTraceId] = useState<string | null>(null)
   const [selectedTraceBounds, setSelectedTraceBounds] =
@@ -3391,6 +3470,7 @@ export function AgentActivity() {
   }
 
   const projectId = selectedProjectId ?? projects[0]?.id
+  const projectSlug = projects.find((project) => project.id === projectId)?.slug
 
   const timeParams = useMemo(() => {
     const to = new Date(endMs).toISOString()
@@ -3402,7 +3482,7 @@ export function AgentActivity() {
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3476,7 +3556,15 @@ export function AgentActivity() {
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -3489,9 +3577,7 @@ export function AgentActivity() {
       {projectId && (
         <CloudAiMetadataNotice
           projectId={projectId}
-          projectSlug={
-            projects.find((project) => project.id === projectId)?.slug
-          }
+          projectSlug={projectSlug}
         />
       )}
 
@@ -3519,7 +3605,7 @@ export function AgentActivity() {
                 <Link to="/projects/new">Deploy a service</Link>
               </Button>
               <Button asChild variant="outline">
-                <Link to="/ai-gateway/setup">Set up the AI gateway</Link>
+                <Link to="/ai-gateway">Set up the AI gateway</Link>
               </Button>
             </div>
           }
@@ -3540,7 +3626,7 @@ export function AgentActivity() {
           )}
         />
       ) : traces.length === 0 ? (
-        <AiActivityEmptyState setupHref="/ai-gateway/setup" />
+        <AiActivityEmptyState setupHref={aiTracesSetupHref(projectSlug)} />
       ) : (
         <Card>
           <CardContent className="p-0">
@@ -3720,7 +3806,8 @@ export function ProjectAgentActivity({
   projectId: number
   projectSlug: string
 }) {
-  const [{ range: timeRange, endMs }, selectTimeRange] = useTimeRangeSelection()
+  const [{ range: timeRange, endMs }, selectTimeRange, moveToNow] =
+    useTimeRangeSelection()
   const [systemFilter, setSystemFilter] = useState<string>('')
   const [searchParams, setSearchParams] = useSearchParams()
   const selectedTraceId = searchParams.get('trace') || null
@@ -3753,7 +3840,7 @@ export function ProjectAgentActivity({
     data: tracesResponse,
     isLoading: tracesLoading,
     error: tracesError,
-  } = useQuery({
+  } = useWindowQuery({
     ...queryGenaiTracesOptions({
       query: {
         project_id: projectId,
@@ -3805,7 +3892,15 @@ export function ProjectAgentActivity({
               setSystemFilter(value === 'all' ? '' : value)
             }
           />
-          <div className="flex gap-1">
+          <div className="flex flex-wrap items-center gap-2">
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(queryGenaiTracesQueryKey, {
+                  query: { project_id: projectId },
+                }),
+              ]}
+              onRefresh={moveToNow}
+            />
             <AiTimeRange
               range={timeRange}
               endMs={endMs}
@@ -4157,7 +4252,8 @@ export function AiGatewayPage() {
 
   // Delete mutation
   const deleteMutation = useMutation({
-    mutationFn: (id: number) => deleteProviderKey({ path: { id } }),
+    mutationFn: (id: number) =>
+      deleteProviderKey({ path: { id }, throwOnError: true }),
     meta: { errorTitle: 'Failed to delete provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4170,7 +4266,11 @@ export function AiGatewayPage() {
   // Toggle active mutation
   const toggleMutation = useMutation({
     mutationFn: ({ id, is_active }: { id: number; is_active: boolean }) =>
-      updateProviderKey({ path: { id }, body: { is_active } }),
+      updateProviderKey({
+        path: { id },
+        body: { is_active },
+        throwOnError: true,
+      }),
     meta: { errorTitle: 'Failed to update provider key' },
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
@@ -4446,9 +4546,6 @@ console.log(response.choices[0].message.content);`,
                 <CopyButton value={gatewayEndpoint} className="shrink-0" />
               </div>
               <div className="flex flex-wrap items-center gap-2">
-                <Button size="sm" asChild>
-                  <Link to="/ai-gateway/setup">View code examples</Link>
-                </Button>
                 {shouldPromptForFirstProviderKey(
                   keysRead,
                   SUPPORTED_PROVIDERS.map((p) => p.id)

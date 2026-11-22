@@ -3,6 +3,7 @@
 
 import {
   Activity,
+  Workflow,
   BarChart3,
   Boxes,
   Cpu,
@@ -17,6 +18,7 @@ import {
   Network,
   Puzzle,
   Radio,
+  Rocket,
   ScrollText,
   ShieldAlert,
   type LucideIcon,
@@ -77,6 +79,7 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Applications',
     items: [
+      { title: 'Get started', url: '/get-started', icon: Rocket },
       {
         title: 'Projects',
         url: '/projects',
@@ -87,6 +90,8 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
           path.startsWith('/projects/') ||
           path.startsWith('/p/'),
       },
+      { title: 'Workflows', url: '/workflows', icon: Workflow },
+      { title: 'Vault', url: '/vault', icon: ShieldAlert },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       {

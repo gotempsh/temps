@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use futures::future::BoxFuture;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
@@ -10,13 +9,12 @@ use sea_orm::{
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 use temps_config::ConfigService;
 use temps_core::{Job, JobQueue, MonitorCreatedJob, UtcDateTime};
 use temps_entities::{environments, status_checks, status_monitors};
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
+use super::db_retry::with_db_retry;
 use super::types::{
     normalize_check_interval_seconds, validate_check_path, CreateMonitorRequest, MonitorResponse,
     MonitorStatus, StatusBucket, StatusCheckResponse, StatusPageError, UpdateMonitorRequest,
@@ -232,6 +230,36 @@ fn project_monitor_status(
     }
 }
 
+// External failures retain precedence. A private worker is never declared
+// healthy from deployment readiness or an expired observation.
+fn runtime_monitor_status(
+    external: &str,
+    count: i64,
+    healthy: i64,
+    unhealthy: i64,
+) -> Option<&'static str> {
+    if external != "no_address" || count == 0 {
+        return None;
+    }
+    Some(if unhealthy > 0 {
+        "unhealthy"
+    } else if healthy == count {
+        "healthy"
+    } else {
+        "unknown"
+    })
+}
+
+fn worker_failure_detail(reason: &str) -> &'static str {
+    match reason {
+        "http_status_mismatch" => "The worker received an unexpected HTTP status.",
+        "connection_failed" => "The worker could not connect to the container's declared port.",
+        "probe_timeout" => "The worker's container health check timed out.",
+        "not_running" => "The worker reports that the container is not running.",
+        _ => "The worker's container health check failed.",
+    }
+}
+
 fn is_managed_monitor_unique_violation(error: &DbErr) -> bool {
     let rendered = error.to_string();
     rendered.contains("idx_status_monitors_managed_environment")
@@ -325,88 +353,6 @@ impl MonitorService {
             }
         }
         response
-    }
-
-    /// Execute a database operation with retry logic
-    async fn with_retry<F, T, E>(
-        operation_name: &str,
-        mut operation: F,
-    ) -> Result<T, StatusPageError>
-    where
-        F: FnMut() -> BoxFuture<'static, Result<T, E>>,
-        E: Into<sea_orm::DbErr> + std::fmt::Debug,
-    {
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 50;
-
-        let mut last_error = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = INITIAL_DELAY_MS * (2_u64.pow(attempt - 1));
-                debug!(
-                    "Retrying {} (attempt {}/{}), waiting {}ms",
-                    operation_name, attempt, MAX_RETRIES, delay
-                );
-                sleep(Duration::from_millis(delay)).await;
-            }
-
-            match operation().await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        debug!(
-                            "{} succeeded after {} attempts",
-                            operation_name,
-                            attempt + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    let db_err: sea_orm::DbErr = e.into();
-
-                    // Check if it's a transient error that we should retry
-                    let should_retry = match &db_err {
-                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
-                        sea_orm::DbErr::Query(runtime_err) => {
-                            let err_str = runtime_err.to_string();
-                            err_str.contains("deadlock")
-                                || err_str.contains("timeout")
-                                || err_str.contains("connection")
-                        }
-                        _ => false,
-                    };
-
-                    if should_retry && attempt < MAX_RETRIES {
-                        warn!(
-                            "{} failed (attempt {}), will retry: {:?}",
-                            operation_name,
-                            attempt + 1,
-                            db_err
-                        );
-                        last_error = Some(db_err);
-                        continue;
-                    }
-
-                    // Non-retryable error or final attempt
-                    error!(
-                        "{} failed after {} attempts: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        db_err
-                    );
-                    return Err(StatusPageError::Database(db_err));
-                }
-            }
-        }
-
-        // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "{} failed after all retry attempts",
-                operation_name
-            ))
-        })))
     }
 
     /// Create a default monitor for an environment if it doesn't exist
@@ -763,6 +709,15 @@ impl MonitorService {
         &self,
         project_ids: &[i32],
     ) -> Result<Vec<super::types::ProjectMonitorHealth>, StatusPageError> {
+        self.get_projects_monitor_health_for_environment(project_ids, None)
+            .await
+    }
+
+    pub async fn get_projects_monitor_health_for_environment(
+        &self,
+        project_ids: &[i32],
+        environment_id: Option<i32>,
+    ) -> Result<Vec<super::types::ProjectMonitorHealth>, StatusPageError> {
         use sea_orm::FromQueryResult;
 
         if project_ids.is_empty() {
@@ -790,6 +745,11 @@ impl MonitorService {
             .map(|(i, _)| format!("${}", i + 1))
             .collect();
         let placeholders_str = placeholders.join(", ");
+        let environment_filter = if environment_id.is_some() {
+            format!("e.id = ${}", project_ids.len() + 1)
+        } else {
+            "e.name = 'production'".to_string()
+        };
 
         #[derive(FromQueryResult)]
         struct ProjectHealth {
@@ -799,6 +759,10 @@ impl MonitorService {
             operational_count: i64,
             major_outage_count: i64,
             no_address_count: i64,
+            runtime_count: i64,
+            runtime_healthy: i64,
+            runtime_unhealthy: i64,
+            runtime_reason: Option<String>,
         }
 
         // Single query: for each project, get latest check status of production monitors.
@@ -834,10 +798,15 @@ impl MonitorService {
                 ) as major_outage_count,
                 COUNT(lc.status) FILTER (
                     WHERE e.current_deployment_id IS NOT NULL AND lc.status = 'no_address'
-                ) as no_address_count
+                ) as no_address_count,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker) AS runtime_count,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'healthy') AS runtime_healthy,
+                COUNT(*) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'unhealthy') AS runtime_unhealthy,
+                MIN(rh.reason) FILTER (WHERE lc.status = 'no_address' AND rh.has_worker AND rh.state = 'unhealthy') AS runtime_reason
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
-                AND e.name = 'production'
+                AND e.project_id = sm.project_id
+                AND {environment_filter}
                 AND e.deleted_at IS NULL
             LEFT JOIN LATERAL (
                 SELECT sc.status
@@ -847,6 +816,40 @@ impl MonitorService {
                 ORDER BY sc.checked_at DESC
                 LIMIT 1
             ) lc ON true
+            LEFT JOIN LATERAL (
+                SELECT
+                    EXISTS (SELECT 1 FROM deployment_containers c
+                        WHERE c.deployment_id = e.current_deployment_id
+                          AND c.deleted_at IS NULL AND c.node_id IS NOT NULL) AS has_worker,
+                    CASE WHEN h.enabled AND NOT h.paused AND NOT e.sleeping
+                        AND h.valid_until > NOW() AND h.revision_id = r.id
+                        AND r.configuration->>'unavailable_reason' IS NULL
+                        AND EXISTS (SELECT 1 FROM runtime_health_assignments a
+                            WHERE a.revision_id = r.id AND a.retired_at IS NULL)
+                        AND NOT EXISTS (SELECT 1 FROM deployment_containers c
+                            WHERE c.deployment_id = d.id AND c.deleted_at IS NULL
+                              AND NOT EXISTS (SELECT 1 FROM runtime_health_assignments a
+                                WHERE a.container_record_id = c.id AND a.revision_id = r.id AND a.retired_at IS NULL))
+                        AND NOT EXISTS (
+                            SELECT 1 FROM runtime_health_assignments a
+                            JOIN deployment_containers c ON c.id = a.container_record_id
+                            WHERE a.revision_id = r.id AND a.retired_at IS NULL
+                              AND (a.valid_until IS NULL OR a.valid_until <= NOW()
+                                OR a.lease_until IS NULL OR a.lease_until <= NOW()
+                                OR a.observed_at > h.accounted_at
+                                OR c.deleted_at IS NOT NULL OR c.status = 'stopped'
+                                OR c.node_id IS DISTINCT FROM a.node_id))
+                        THEN h.state ELSE 'unknown' END AS state,
+                    (SELECT MIN(a.reason) FROM runtime_health_assignments a
+                        WHERE a.revision_id = r.id AND a.retired_at IS NULL
+                          AND a.state = 'unhealthy' AND a.valid_until > NOW()
+                          AND a.lease_until > NOW()) AS reason
+                FROM deployments d
+                LEFT JOIN runtime_health_revisions r ON r.deployment_id = d.id
+                    AND r.environment_id = e.id AND r.project_id = e.project_id
+                LEFT JOIN runtime_health_environments h ON h.environment_id = e.id
+                WHERE d.id = e.current_deployment_id AND d.state IN ('completed', 'deployed')
+            ) rh ON lc.status = 'no_address'
             WHERE sm.project_id IN ({placeholders})
               AND sm.is_active = true
             GROUP BY sm.project_id
@@ -855,7 +858,10 @@ impl MonitorService {
         );
 
         let db_backend = sea_orm::DatabaseBackend::Postgres;
-        let values: Vec<sea_orm::Value> = project_ids.iter().map(|&id| id.into()).collect();
+        let mut values: Vec<sea_orm::Value> = project_ids.iter().map(|&id| id.into()).collect();
+        if let Some(id) = environment_id {
+            values.push(id.into());
+        }
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
 
         let results = status_monitors::Entity::find()
@@ -881,6 +887,18 @@ impl MonitorService {
                 super::types::ProjectMonitorHealth {
                     project_id: r.project_id,
                     status: status.to_string(),
+                    runtime_status: runtime_monitor_status(
+                        status,
+                        r.runtime_count,
+                        r.runtime_healthy,
+                        r.runtime_unhealthy,
+                    )
+                    .map(str::to_string),
+                    runtime_reason: r
+                        .runtime_reason
+                        .as_deref()
+                        .map(worker_failure_detail)
+                        .map(str::to_string),
                 },
             );
         }
@@ -894,6 +912,8 @@ impl MonitorService {
                     .unwrap_or(super::types::ProjectMonitorHealth {
                         project_id: id,
                         status: "no_monitors".to_string(),
+                        runtime_status: None,
+                        runtime_reason: None,
                     })
             })
             .collect();
@@ -983,7 +1003,7 @@ impl MonitorService {
 
         let db = self.db.clone();
 
-        let result = Self::with_retry(&format!("record_check for monitor {}", monitor_id), || {
+        let result = with_db_retry(&format!("record_check for monitor {}", monitor_id), || {
             let check = check.clone();
             let db = db.clone();
             Box::pin(async move { check.insert(db.as_ref()).await })
@@ -1521,8 +1541,8 @@ mod tests {
         }
     }
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests
@@ -1588,6 +1608,12 @@ mod tests {
             is_active: true,
             is_managed: true,
             next_check_at: None,
+            check_kind: "environment".to_string(),
+            target: None,
+            check_spec: None,
+            request_encrypted: None,
+            probe_from_nodes: false,
+            location_results: None,
             created_at: now,
             updated_at: now,
         }
@@ -2949,5 +2975,27 @@ mod tests {
         assert_eq!(project_monitor_status(2, 1, 0, 0, 1), "no_address");
         assert_eq!(project_monitor_status(2, 0, 1, 0, 1), "operational");
         assert_eq!(project_monitor_status(2, 0, 0, 1, 1), "down");
+    }
+}
+
+#[cfg(test)]
+mod worker_runtime_status_tests {
+    use super::runtime_monitor_status;
+    #[test]
+    fn only_fresh_worker_health_answers_when_external_uptime_has_no_address() {
+        assert_eq!(
+            runtime_monitor_status("no_address", 1, 1, 0),
+            Some("healthy")
+        );
+        assert_eq!(
+            runtime_monitor_status("no_address", 2, 1, 1),
+            Some("unhealthy")
+        );
+        assert_eq!(
+            runtime_monitor_status("no_address", 2, 1, 0),
+            Some("unknown")
+        );
+        assert_eq!(runtime_monitor_status("down", 1, 1, 0), None);
+        assert_eq!(runtime_monitor_status("no_address", 0, 0, 0), None);
     }
 }

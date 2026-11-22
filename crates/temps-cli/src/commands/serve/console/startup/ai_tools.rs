@@ -57,7 +57,15 @@ pub(super) fn install_ai_api_tools(plugin_manager: &PluginManager, admin: &Route
                          an OpenAPI operation and are unavailable — check the operation_id"
                     );
                 }
-                handle.set(caller);
+                let registry =
+                    service_context.require_service::<temps_ai_api_tools::PluginToolsRegistry>();
+                let audit = service_context.require_service::<dyn temps_core::AuditLogger>();
+                registry.bind(
+                    caller,
+                    temps_ai_api_tools::PluginToolAccess::Read,
+                    audit.clone(),
+                    move |caller| handle.set(caller),
+                );
                 debug!("ADR-024: InternalApiCaller populated in ApiToolsHandle");
 
                 // ── Approval-aware WRITE tool ──
@@ -100,7 +108,12 @@ pub(super) fn install_ai_api_tools(plugin_manager: &PluginManager, admin: &Route
                              an OpenAPI operation and are unavailable — check the operation_id"
                         );
                     }
-                    write_handle.set(write_caller);
+                    registry.bind(
+                        write_caller,
+                        temps_ai_api_tools::PluginToolAccess::Write,
+                        audit,
+                        move |caller| write_handle.set(caller),
+                    );
                     debug!("AI write tool: WriteApiToolsHandle populated (curated allowlist)");
                 } else {
                     debug!("AI write tool: WriteApiToolsHandle not registered; skipping");

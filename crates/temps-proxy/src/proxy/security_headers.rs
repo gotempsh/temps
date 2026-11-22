@@ -8,8 +8,10 @@ use super::*;
 /// Say a response came from this proxy. Upstream responses get this in
 /// `upstream_response_filter`; anything the proxy answers itself bypasses that
 /// filter, so it marks its own. Monitors and the reachability check read it.
-pub(super) fn mark_served_by_proxy(response: &mut ResponseHeader) -> Result<()> {
-    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+pub(super) fn mark_served_by_proxy(response: &mut ResponseHeader, expose: bool) -> Result<()> {
+    if expose {
+        response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    }
     Ok(())
 }
 

@@ -11,6 +11,10 @@ Inspect distributed traces and operation latency
 **Subcommands:**
 
 - `span-stats` (`operations`, `ops`) - Rank operations by time spent, latency percentiles, or inconsistency
+- `trend` - Show how one operation's latency moved, day by day, with deployments
+- `regressions` - List the operations that got slower or faster after a deployment
+- `breakdown` - Show where the time inside one operation goes: queries, downstream calls, its own code
+- `page` - Compare a page's web vitals with the backend requests that served it
 
 ### `traces span-stats` (alias: `operations`, `ops`)
 
@@ -35,8 +39,62 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--attributes <pairs>` | Span attribute filters, e.g. db.system=postgresql | - | No |
 | `--min-duration-ms <ms>` | Ignore spans faster than this | - | No |
 | `--min-count <n>` | Drop operations with fewer samples than this | - | No |
+| `--apdex-ms <ms>` | Apdex threshold: calls at or under this satisfy, up to 4x tolerate (default 500) | - | No |
 | `--sort-by <field>` | Ranking (total_time, p50, p95, p99, max, avg, stddev, count, errors, error_rate, variability, tail_ratio) | `total_time` | No |
 | `--sort-order <order>` | asc or desc | `desc` | No |
 | `--limit <n>` | Rows to show (max 100) | `20` | No |
 | `--offset <n>` | Page offset | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces trend`
+
+Show how one operation's latency moved, day by day, with deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--days <n>` | Days to show (max 30) | `14` | No |
+| `--json` | Output the hourly points in JSON format | - | No |
+
+### `traces regressions`
+
+List the operations that got slower or faster after a deployment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--deployment-id <id>` | Deployment to compare across | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces breakdown`
+
+Show where the time inside one operation goes: queries, downstream calls, its own code
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--service <name>` | Service of the operation | - | No |
+| `--operation <name>` | The operation (span name) | - | No |
+| `--sample <kind>` | Calls to sample (recent, slow) | `recent` | No |
+| `--attribute <key>` | Also split the calls by this attribute, e.g. http.route | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `traces page`
+
+Compare a page's web vitals with the backend requests that served it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | No |
+| `--path <path>` | The page path, e.g. /checkout | - | No |
 | `--json` | Output in JSON format | - | No |

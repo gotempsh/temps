@@ -30,9 +30,10 @@ pub(super) struct MeshDiagnosis {
     pub checks: Vec<MeshCheck>,
 }
 
+/// `database_url` is the resolver's answer: the URL, or why none was found.
 pub(super) async fn run(
     args: &MeshDoctorArgs,
-    database_url: Option<&str>,
+    database_url: Result<&str, String>,
     data_dir: &Path,
 ) -> anyhow::Result<()> {
     let diagnosis = diagnose_this_host(database_url, data_dir).await?;
@@ -89,20 +90,21 @@ pub(super) fn add_to_report(checks: &[MeshCheck], report: &mut DiagnosticReport)
 }
 
 async fn diagnose_this_host(
-    database_url: Option<&str>,
+    database_url: Result<&str, String>,
     data_dir: &Path,
 ) -> anyhow::Result<MeshDiagnosis> {
     let agent_config = crate::commands::agent::agent_data_dir().join("agent.json");
     if agent_config.is_file() {
         return diagnose_node(&agent_config).await;
     }
-    let Some(database_url) = database_url else {
-        anyhow::bail!(
-            "This host is neither a node ({} does not exist) nor a control plane \
-             (TEMPS_DATABASE_URL is not set). On a node, run this as the user that ran \
-             `temps join`; on the control plane, with the same environment as `temps serve`.",
-            agent_config.display()
-        );
+    let database_url = match database_url {
+        Ok(database_url) => database_url,
+        Err(not_found) => anyhow::bail!(
+            "This host is neither a node ({} does not exist) nor a control plane with a \
+             database it can reach. On a node, run this as the user that ran `temps join`.\n{}",
+            agent_config.display(),
+            not_found
+        ),
     };
     let db = sea_orm::Database::connect(database_url)
         .await

@@ -20,6 +20,9 @@ import {
 } from '@/lib/cluster-network'
 import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { NetworkIdAction } from '@/components/nodes/NetworkIdAction'
+import { NodeAddressRanges } from '@/components/nodes/NodeAddressRanges'
+import { meshRangeToShow } from '@/lib/node-address-ranges'
 import { RotateClusterCaDialog } from '@/components/nodes/RotateClusterCaDialog'
 import { useClusterCaFingerprint } from '@/hooks/useClusterCaFingerprint'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
@@ -34,10 +37,13 @@ import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
 import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { workerIngressWay } from '@/lib/worker-ingress'
 import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NodeLabelsCard } from '@/components/nodes/NodeLabelsCard'
 import { NodeRowActions } from '@/components/nodes/NodeRowActions'
 import { useNodeRemoval } from '@/components/nodes/useNodeRemoval'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
@@ -62,6 +68,8 @@ import {
   nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
   WORKER_NODES_URL,
+  macWorkerHost,
+  nodeStatusLabel,
   nodesAdvancedSection,
 } from '@/lib/worker-nodes'
 import {
@@ -78,6 +86,9 @@ import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
+  adminListNodesQueryKey,
+  clusterNetworkGetQueryKey,
+  wireguardMeshStatusGetQueryKey,
   adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
@@ -110,7 +121,6 @@ import {
   RefreshCw,
   Server,
   Shield,
-  Tag,
   Terminal,
   Trash2,
 } from 'lucide-react'
@@ -155,6 +165,7 @@ import {
 import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
 import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
 import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 // ── Helpers ──
 
@@ -170,13 +181,44 @@ const nodeStatusVariant: Record<
   pending: 'warning-subtle',
 }
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({
+  status,
+  capacity,
+}: {
+  status: string
+  /** The node's last heartbeat capacity: says whether it is a Mac. */
+  capacity?: unknown
+}) {
+  const shown = nodeStatusLabel(status, macWorkerHost(capacity))
   return (
     <Badge
-      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      variant={
+        shown.hint
+          ? 'neutral-subtle'
+          : (nodeStatusVariant[status] ?? 'neutral-subtle')
+      }
       className="text-xs capitalize"
+      title={shown.hint ?? undefined}
     >
-      {status}
+      {shown.label}
+    </Badge>
+  )
+}
+
+/**
+ * Marks a Mac worker (ADR 090): fine for development and personal use, and
+ * offline whenever the Mac sleeps.
+ */
+function MacWorkerBadge({ capacity }: { capacity: unknown }) {
+  const mac = macWorkerHost(capacity)
+  if (!mac) return null
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px]"
+      title={`Containers run in ${mac.dockerApp ?? 'a Docker app'} on a Mac. Suited to development and personal use: it goes offline while the Mac sleeps.`}
+    >
+      Mac · development
     </Badge>
   )
 }
@@ -635,7 +677,7 @@ function NodeTable({
             <TableHead className="hidden sm:table-cell">Arch</TableHead>
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
-            <TableHead className="hidden md:table-cell">Address</TableHead>
+            <TableHead className="hidden md:table-cell">Node address</TableHead>
             <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
             {showOverlay && <TableHead>Cross-node</TableHead>}
@@ -669,12 +711,13 @@ function NodeTable({
                           {node.role}
                         </Badge>
                         <NodeRoleBadge labels={node.labels} />
+                        <MacWorkerBadge capacity={node.capacity} />
                       </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell>
-                  <StatusBadge status={node.status} />
+                  <StatusBadge status={node.status} capacity={node.capacity} />
                 </TableCell>
                 <TableCell className="hidden sm:table-cell">
                   <NodeArchitecture architecture={node.architecture} />
@@ -779,32 +822,6 @@ function MetricCard({
             className={`h-full rounded-full transition-all ${barColor}`}
             style={{ width: `${Math.min(percent, 100)}%` }}
           />
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function NodeDetailLabels({ labels }: { labels: unknown }) {
-  if (!labels || typeof labels !== 'object') return null
-  const entries = Object.entries(labels as Record<string, unknown>)
-  if (entries.length === 0) return null
-
-  return (
-    <Card>
-      <CardHeader className="py-3 px-4">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <Tag className="h-4 w-4" />
-          Labels
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4 pb-3">
-        <div className="flex flex-wrap gap-1.5">
-          {entries.map(([key, value]) => (
-            <Badge key={key} variant="secondary" className="text-xs font-mono">
-              {key}={String(value)}
-            </Badge>
-          ))}
         </div>
       </CardContent>
     </Card>
@@ -1269,7 +1286,8 @@ function NodeDetail({
             <h3 className="max-w-full min-w-0 text-lg font-semibold truncate">
               {node.name}
             </h3>
-            <StatusBadge status={node.status} />
+            <StatusBadge status={node.status} capacity={node.capacity} />
+            <MacWorkerBadge capacity={node.capacity} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
             <WorkerIngressBadge node={node} />
@@ -1655,7 +1673,10 @@ function NodeDetail({
               nodeId={node.id}
             />
           )}
-          <NodeDetailLabels labels={node.labels} />
+          <NodeLabelsCard
+            labels={node.labels}
+            showChangeHint={node.role === 'worker'}
+          />
           {(node.role === 'worker' || node.role === 'control-plane') && (
             <NodeStateStreamStatus />
           )}
@@ -1806,9 +1827,7 @@ export function NodesPage() {
   useEffect(() => {
     if (!linkedSection) return
     const frame = requestAnimationFrame(() =>
-      document
-        .getElementById(linkedSection)
-        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+      scrollToElementId(linkedSection, { behavior: 'smooth' })
     )
     return () => cancelAnimationFrame(frame)
   }, [linkedSection, isLoading])
@@ -1859,6 +1878,17 @@ export function NodesPage() {
               nodes run the Temps agent and receive containers from the control
               plane.
             </>
+          }
+          actions={
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(adminListNodesQueryKey),
+                allTunnelsOptions().queryKey,
+                // The mesh and overlay badges and network warnings in the table.
+                wireguardMeshStatusGetQueryKey(),
+                clusterNetworkGetQueryKey(),
+              ]}
+            />
           }
         />
         <Card>
@@ -1947,6 +1977,7 @@ export function NodesPage() {
                       </li>
                     ))}
                   </ul>
+                  <NetworkIdAction status={clusterNetwork} />
                 </AlertDescription>
               </Alert>
             )}
@@ -1969,11 +2000,19 @@ export function NodesPage() {
                 </p>
               </div>
             ) : (
-              <NodeTable
-                nodes={nodes}
-                mesh={mesh}
-                overlay={clusterNetwork?.nodes}
-              />
+              <div className="space-y-3">
+                <NodeAddressRanges
+                  meshCidr={meshRangeToShow(mesh)?.cidr}
+                  meshReady={meshRangeToShow(mesh)?.ready}
+                  computeCidr={clusterNetwork?.compute_pool_cidr}
+                  subnetPrefixLen={clusterNetwork?.subnet_prefix_len}
+                />
+                <NodeTable
+                  nodes={nodes}
+                  mesh={mesh}
+                  overlay={clusterNetwork?.nodes}
+                />
+              </div>
             )}
           </CardContent>
         </Card>

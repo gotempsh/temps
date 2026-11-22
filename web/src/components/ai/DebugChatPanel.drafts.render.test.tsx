@@ -13,6 +13,7 @@ import {
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import {
   AiAssistantContext,
@@ -114,7 +115,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 function renderPanel(initialMessage?: string, initialDraft?: string) {

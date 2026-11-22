@@ -12,7 +12,7 @@
 //! API, it has no multi-phase workflow or PR creation.
 //!
 //! Architecture:
-//! - One shared [`SandboxProvider`](temps_ai_agents::sandbox::SandboxProvider)
+//! - One shared [`SandboxProvider`](temps_sandbox_providers::SandboxProvider)
 //!   instance is registered by the `temps-ai-agents` plugin and consumed here.
 //! - Sandboxes are persisted in the `sandboxes` table so that the API can
 //!   enumerate them and recover container handles across restarts.

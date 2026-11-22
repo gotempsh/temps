@@ -64,7 +64,9 @@ async fn conversation_workspace_id(
 ) -> Result<String, Problem> {
     if conversation.context_type == "application" {
         let public_id = conversation.context_id.split(':').next().ok_or_else(|| {
-            ApplicationError::ConversationNotFound(conversation.public_id.clone())
+            ApplicationError::ConversationNotFound {
+                conversation_id: conversation.public_id.clone(),
+            }
         })?;
         let application = state.applications.get(auth.user_id(), public_id).await?;
         state
@@ -100,16 +102,16 @@ pub(super) async fn resolve_chat_attachments(
     let mut attachments = Vec::with_capacity(references.len());
     for reference in references {
         if !seen.insert(reference.id.as_str()) {
-            return Err(ApplicationError::InvalidAttachment(
-                "the same attachment cannot be included twice".to_string(),
-            )
+            return Err(ApplicationError::InvalidAttachment {
+                reason: "the same attachment cannot be included twice".to_string(),
+            }
             .into());
         }
         let name = sanitized_attachment_name(Some(&reference.name));
         if name != reference.name {
-            return Err(ApplicationError::InvalidAttachment(
-                "attachment name does not match the uploaded file".to_string(),
-            )
+            return Err(ApplicationError::InvalidAttachment {
+                reason: "attachment name does not match the uploaded file".to_string(),
+            }
             .into());
         }
         let contents = state
@@ -349,7 +351,10 @@ pub async fn upload_user_conversation_attachment(
             .with_detail(format!("Could not read the uploaded file: {error}"))
     })?;
     if bytes.is_empty() {
-        return Err(ApplicationError::InvalidAttachment("file is empty".to_string()).into());
+        return Err(ApplicationError::InvalidAttachment {
+            reason: "file is empty".to_string(),
+        }
+        .into());
     }
     if bytes.len() > MAX_CHAT_ATTACHMENT_BYTES {
         return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
@@ -499,9 +504,9 @@ pub async fn get_user_conversation_attachment(
     let workspace_id = conversation_workspace_id(&state, &auth, &conversation).await?;
     let name = sanitized_attachment_name(Some(&query.name));
     if name != query.name {
-        return Err(ApplicationError::InvalidAttachment(
-            "attachment name contains unsupported characters".to_string(),
-        )
+        return Err(ApplicationError::InvalidAttachment {
+            reason: "attachment name contains unsupported characters".to_string(),
+        }
         .into());
     }
     let bytes = state

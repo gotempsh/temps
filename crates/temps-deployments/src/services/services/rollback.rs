@@ -302,6 +302,9 @@ impl DeploymentService {
             promoted_from_deployment_id: Set(None),
             upload_request_id: Set(None),
             docker_socket_mounted: Set(false),
+            // Re-checked by this deployment's own deploy job.
+            runs_as_root: Set(false),
+            image_user: Set(None),
             created_at: Set(now),
             updated_at: Set(now),
         };
@@ -529,7 +532,6 @@ impl DeploymentService {
                         network: Some(temps_core::NETWORK_NAME.to_string()),
                     })
                     .service_name(rollback_slug.clone())
-                    .health_check_path(None)
                     .health_check_path_override(rollback_health_check_path)
                     .health(self.reused_image_health(rollback_asset_origin.deployment_id, &environment, &project).await?)
                     .command(target_deployment.metadata.as_ref()
@@ -614,7 +616,7 @@ impl DeploymentService {
 
             // Create workflow context for the NEW rollback deployment
             let mock_log_writer = Arc::new(crate::test_utils::MockLogWriter::new(0));
-            let mut rollback_context = temps_core::WorkflowContext::new(
+            let mut rollback_context = crate::workflow::WorkflowContext::new(
                 format!("rollback-{}", rollback_deployment_id),
                 rollback_deployment_id,
                 project_id,

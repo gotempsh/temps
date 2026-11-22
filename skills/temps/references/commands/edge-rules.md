@@ -39,6 +39,8 @@ List the rules in evaluation order
 
 Show one rule
 
+**Usage:** `edge-rules get <rule-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -61,13 +63,15 @@ Add a rule. New rules start in log-only mode unless --mode enforce is given
 | `--environment-id <id>` | Apply only to this environment | - | No |
 | `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
-| `--mode <mode>` | enforce or log-only | `log-only` | No |
+| `--mode <mode>` | enforce or log-only (default: the file's mode, else log-only) | - | No |
 | `--disabled` | Create it disabled | - | No |
 | `--position <n>` | Insert at this 1-based position (default: last) | - | No |
 
 ### `edge-rules update`
 
 Change a rule; only the given parts change
+
+**Usage:** `edge-rules update <rule-id> [options]`
 
 **Options:**
 
@@ -88,6 +92,8 @@ Change a rule; only the given parts change
 
 Delete a rule
 
+**Usage:** `edge-rules delete <rule-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -99,6 +105,8 @@ Delete a rule
 ### `edge-rules move`
 
 Move a rule to another position
+
+**Usage:** `edge-rules move <rule-id> [options]`
 
 **Options:**
 
@@ -112,6 +120,8 @@ Move a rule to another position
 
 Enable a rule
 
+**Usage:** `edge-rules enable <rule-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -122,6 +132,8 @@ Enable a rule
 ### `edge-rules disable`
 
 Disable a rule (kept, never evaluated)
+
+**Usage:** `edge-rules disable <rule-id> [options]`
 
 **Options:**
 
@@ -134,6 +146,8 @@ Disable a rule (kept, never evaluated)
 
 Act on matches
 
+**Usage:** `edge-rules enforce <rule-id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -144,6 +158,8 @@ Act on matches
 ### `edge-rules log-only`
 
 Only record matches, never act on them
+
+**Usage:** `edge-rules log-only <rule-id> [options]`
 
 **Options:**
 

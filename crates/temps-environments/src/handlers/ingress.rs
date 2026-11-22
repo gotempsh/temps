@@ -1496,7 +1496,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -1592,7 +1592,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             if let Ok(mut seen) = self.0.lock() {
                 seen.push(operation.operation_type());
             }

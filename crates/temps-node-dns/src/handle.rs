@@ -15,10 +15,13 @@
 //!
 //! `ResolverHandle::shutdown()` stops all child tasks and awaits them.
 
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use hickory_server::server::Server;
+use hickory_proto::rr::{Name, RecordType};
+use hickory_server::net::runtime::Time;
+use hickory_server::server::{Request, RequestHandler, ResponseHandler, ResponseInfo, Server};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -27,6 +30,8 @@ use tracing::{info, warn};
 use crate::authority::ZoneAuthority;
 use crate::config::ResolverConfig;
 use crate::error::ResolverError;
+use crate::observe::{DnsObserver, DnsResolverState};
+use crate::resolve::ResolveAnswer;
 use crate::sync_client::{SyncClient, SyncStatus};
 use crate::upstream::UpstreamResolver;
 use crate::zone_store::ZoneStore;
@@ -52,8 +57,87 @@ pub struct ResolverStatus {
     pub zone_generation: i64,
 }
 
+/// The server owns its handler; the handle keeps the same authority to
+/// answer test resolutions in-process ([`ResolverHandle::resolve_as`]).
+struct SharedAuthority(Arc<ZoneAuthority>);
+
+#[async_trait::async_trait]
+impl RequestHandler for SharedAuthority {
+    async fn handle_request<R: ResponseHandler, T: Time>(
+        &self,
+        request: &Request,
+        response_handle: R,
+    ) -> ResponseInfo {
+        self.0
+            .handle_request::<R, T>(request, response_handle)
+            .await
+    }
+}
+
+/// A cheap, cloneable view of a running resolver for whoever reports on
+/// it (ADR-095): its state and in-process test resolution, without owning
+/// its lifecycle. Reads go to the live zone and sync status.
+#[derive(Clone)]
+pub struct ResolverView {
+    authority: Arc<ZoneAuthority>,
+    zone: Arc<ZoneStore>,
+    sync_status: Arc<RwLock<SyncStatus>>,
+    listen_addrs: Vec<SocketAddr>,
+    /// The zone is fed locally (the control plane's resolver), not synced.
+    local_feed: bool,
+}
+
+impl ResolverView {
+    /// The resolver's state, in the shape a DNS report carries.
+    /// `tasks_alive` comes from the handle's owner.
+    pub fn state(&self, tasks_alive: bool) -> DnsResolverState {
+        let snapshot = self.zone.snapshot();
+        let sync = self
+            .sync_status
+            .read()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+        let last_sync_age_secs = if self.local_feed {
+            None
+        } else {
+            sync.last_success_at.map(|at| {
+                SystemTime::now()
+                    .duration_since(at)
+                    .map_or(0, |age| age.as_secs())
+            })
+        };
+        DnsResolverState {
+            running: true,
+            tasks_alive,
+            listen_addrs: self.listen_addrs.iter().map(ToString::to_string).collect(),
+            zone_generation: snapshot.generation(),
+            record_count: u64::try_from(snapshot.records().len()).unwrap_or(u64::MAX),
+            last_sync_age_secs,
+            consecutive_sync_failures: sync.consecutive_failures,
+            last_error: sync.last_error,
+        }
+    }
+
+    /// The first address the resolver listens on.
+    pub fn listen_addr(&self) -> Option<SocketAddr> {
+        self.listen_addrs.first().copied()
+    }
+
+    /// Answer a test resolution as this resolver would answer `source`
+    /// (ADR-095 §5). Not counted or logged.
+    pub async fn resolve_as(
+        &self,
+        source: IpAddr,
+        name: Name,
+        qtype: RecordType,
+    ) -> Result<ResolveAnswer, ResolverError> {
+        self.authority.resolve_as(source, name, qtype).await
+    }
+}
+
 pub struct ResolverHandle {
     pub zone: Arc<ZoneStore>,
+    view: ResolverView,
     shutdown: Arc<Notify>,
     sync_task: JoinHandle<()>,
     server_task: JoinHandle<()>,
@@ -83,6 +167,17 @@ impl ResolverHandle {
         config: ResolverConfig,
         policy: Option<crate::DnsPolicySlot>,
     ) -> Result<Self, ResolverError> {
+        Self::start_observed(config, policy, None).await
+    }
+
+    /// [`ResolverHandle::start_with_policy`], recording every answered
+    /// query into `observer` (ADR-095). Pass the same observer to every
+    /// restart, so the counters and the query log survive it.
+    pub async fn start_observed(
+        config: ResolverConfig,
+        policy: Option<crate::DnsPolicySlot>,
+        observer: Option<Arc<DnsObserver>>,
+    ) -> Result<Self, ResolverError> {
         let zone = Arc::new(ZoneStore::new(config.snapshot_path()));
         zone.load_from_disk();
 
@@ -111,7 +206,11 @@ impl ResolverHandle {
         if let Some(policy) = policy {
             authority = authority.with_policy(policy);
         }
-        let mut server = Server::new(authority);
+        if let Some(observer) = observer {
+            authority = authority.with_observer(observer);
+        }
+        let authority = Arc::new(authority);
+        let mut server = Server::new(SharedAuthority(authority.clone()));
 
         for addr in &config.listen_addrs {
             let udp =
@@ -192,6 +291,13 @@ impl ResolverHandle {
         });
 
         Ok(Self {
+            view: ResolverView {
+                authority,
+                zone: zone.clone(),
+                sync_status: sync_status.clone(),
+                listen_addrs: config.listen_addrs.clone(),
+                local_feed: config.disable_sync,
+            },
             zone,
             shutdown,
             sync_task,
@@ -206,7 +312,7 @@ impl ResolverHandle {
     pub fn status(&self) -> ResolverStatus {
         let snapshot = self.zone.snapshot();
         ResolverStatus {
-            tasks_alive: !self.sync_task.is_finished() && !self.server_task.is_finished(),
+            tasks_alive: self.tasks_alive(),
             sync: self
                 .sync_status
                 .read()
@@ -215,6 +321,20 @@ impl ResolverHandle {
             record_count: snapshot.records().len(),
             zone_generation: snapshot.generation(),
         }
+    }
+
+    /// [`ResolverHandle::status`], in the shape a DNS report carries.
+    pub fn state(&self) -> DnsResolverState {
+        self.view.state(self.tasks_alive())
+    }
+
+    fn tasks_alive(&self) -> bool {
+        !self.sync_task.is_finished() && !self.server_task.is_finished()
+    }
+
+    /// A view for reporting on this resolver (ADR-095).
+    pub fn view(&self) -> ResolverView {
+        self.view.clone()
     }
 
     /// Stop both background tasks and wait until their sockets are closed.

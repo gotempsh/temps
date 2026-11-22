@@ -27,8 +27,8 @@ use temps_otel::types::*;
 ///
 /// Uses `TestDatabase::with_migrations()` which acquires a global lock to avoid
 /// concurrent extension creation conflicts on the shared container.
-async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+async fn setup_storage() -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -46,8 +46,8 @@ async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, Ti
 /// `facets` maps attribute key -> slot (1..=20).
 async fn setup_storage_with_facets(
     facets: &[(&str, u8)],
-) -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+) -> Option<(temps_test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
         Err(e) => {
             println!("Docker/TestDatabase not available, skipping test: {}", e);
@@ -864,8 +864,8 @@ async fn test_trace_summary_reconciliation_handles_out_of_order_commit() {
             .expect("lower-ID transaction commits after reconciliation starts");
     };
     let (reconciliation, competing_reconciliation, ()) = tokio::join!(
-        temps_database::reconcile_otel_trace_summaries(&reconcile_db),
-        temps_database::reconcile_otel_trace_summaries(&competing_db),
+        temps_schema::reconcile_otel_trace_summaries(&reconcile_db),
+        temps_schema::reconcile_otel_trace_summaries(&competing_db),
         release_held,
     );
     reconciliation.expect("reconciliation succeeds");
@@ -2459,6 +2459,7 @@ fn stats_query(project_ids: Vec<i32>, start: DateTime<Utc>, end: DateTime<Utc>) 
         sort_order: SortOrder::default(),
         limit: None,
         offset: None,
+        apdex_threshold_ms: None,
     }
 }
 
@@ -2543,6 +2544,26 @@ async fn test_span_stats_aggregates_percentiles_and_ratios() {
     // steady one is not meaningfully faster on average.
     assert!(erratic.tail_ratio > steady.tail_ratio);
     assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+    assert_eq!(erratic.apdex, None, "no threshold asked for, no score");
+
+    // Apdex with T = 100ms: steady has one satisfied call (100ms) and 19
+    // tolerating ones; erratic has 18 satisfied and the two 2s calls
+    // frustrate.
+    let scored = storage
+        .query_span_stats(SpanStatsQuery {
+            apdex_threshold_ms: Some(100.0),
+            ..stats_query(vec![1], window_start, now)
+        })
+        .await
+        .expect("query span stats with apdex");
+    let steady = scored.iter().find(|r| r.span_name == "steady").unwrap();
+    assert_eq!(steady.satisfied_count, Some(1));
+    assert_eq!(steady.tolerating_count, Some(19));
+    assert_eq!(steady.apdex, Some(0.525));
+    let erratic = scored.iter().find(|r| r.span_name == "erratic").unwrap();
+    assert_eq!(erratic.satisfied_count, Some(18));
+    assert_eq!(erratic.frustrated_count, Some(2));
+    assert_eq!(erratic.apdex, Some(0.9));
 }
 
 #[tokio::test]
@@ -3179,5 +3200,111 @@ async fn typed_log_column_default_preserves_compressed_history() {
     assert!(
         logs[0].attribute_types.is_empty(),
         "historical types must not be invented"
+    );
+}
+
+/// `http.target` carries the query string, so a page path matches it with or
+/// without one, and nothing that merely starts with the same characters,
+/// through the JSON attributes and through a facet column alike.
+#[tokio::test]
+async fn test_query_spans_matches_a_request_path_with_or_without_its_query() {
+    for faceted in [false, true] {
+        let setup = if faceted {
+            setup_storage_with_facets(&[("http.target", 2)]).await
+        } else {
+            setup_storage().await
+        };
+        let Some((_db, storage)) = setup else {
+            return;
+        };
+        let project_id = 31;
+        let targets = [
+            ("p001", "/products/42"),
+            ("p002", "/products/42?ref=home"),
+            ("p003", "/products/42#reviews"),
+            ("p004", "/products/420"),
+            ("p005", "/products/42/reviews"),
+        ];
+        let spans = targets
+            .iter()
+            .map(|(span_id, target)| {
+                let mut span = sample_span(
+                    project_id,
+                    &format!("trace_{span_id}"),
+                    span_id,
+                    None,
+                    "GET /products/:id",
+                    SpanKind::Server,
+                    SpanStatusCode::Ok,
+                    20.0,
+                );
+                span.attributes
+                    .insert("http.target".to_string(), target.to_string());
+                span
+            })
+            .collect();
+        storage.store_spans(spans).await.unwrap();
+
+        let mut found: Vec<String> = storage
+            .query_spans(TraceQuery {
+                project_id,
+                attribute_path: Some(AttributePath {
+                    key: "http.target".to_string(),
+                    path: "/products/42".to_string(),
+                }),
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|span| span.span_id)
+            .collect();
+        found.sort();
+        assert_eq!(found, vec!["p001", "p002", "p003"], "faceted: {faceted}");
+    }
+}
+
+/// A bounded trace read returns the first spans by start time and no more.
+#[tokio::test]
+async fn test_get_trace_spans_reads_only_the_first_spans_of_a_trace() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let project_id = 32;
+    let base = Utc::now() - Duration::minutes(10);
+    let spans = (0..5)
+        .map(|index| {
+            let mut span = sample_span(
+                project_id,
+                "trace_bounded",
+                &format!("s{index}"),
+                None,
+                "SELECT row",
+                SpanKind::Client,
+                SpanStatusCode::Ok,
+                1.0,
+            );
+            span.start_time = base + Duration::seconds(index);
+            span.end_time = span.start_time + Duration::milliseconds(1);
+            span
+        })
+        .collect();
+    storage.store_spans(spans).await.unwrap();
+
+    let first: Vec<String> = storage
+        .get_trace_spans(project_id, "trace_bounded", 3)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|span| span.span_id)
+        .collect();
+    assert_eq!(first, vec!["s0", "s1", "s2"]);
+    assert_eq!(
+        storage
+            .get_trace(project_id, "trace_bounded")
+            .await
+            .unwrap()
+            .len(),
+        5
     );
 }

@@ -21,7 +21,8 @@ use std::io::{self, Write};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
+use temps_config::AppSettings;
+use temps_core::{url_validation::validate_ipv4, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -84,7 +85,7 @@ pub enum TlsMode {
 pub struct SetupCommand {
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -1088,7 +1089,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     println!(
         "   {} {}",
         "📍".bright_yellow(),
-        "GeoLite2-City.mmdb is required to run the application".bright_white()
+        "GeoLite2-City.mmdb is needed for geolocation".bright_white()
     );
     println!(
         "{}",
@@ -1129,7 +1130,7 @@ fn show_geolite2_missing_warning(data_dir: &Path) {
     );
     println!();
     println!(
-        "   {} Setup can continue, but {} will fail without this file.",
+        "   {} Setup can continue; {} runs without geolocation until this file is provided.",
         "ℹ️ ".bright_blue(),
         "temps serve".bright_cyan()
     );
@@ -1299,8 +1300,8 @@ async fn import_external_certificate(
         domain_update.expiration_time = Set(Some(expiration_time));
         domain_update.status = Set("active".to_string());
         domain_update.last_renewed = Set(Some(Utc::now()));
-        domain_update.last_error = Set(None);
-        domain_update.last_error_type = Set(None);
+        // An imported certificate ends any failed ACME or on-demand streak.
+        domain_update.clear_certificate_failure();
         domain_update.verification_method = Set("manual".to_string());
         domain_update.updated_at = Set(Utc::now());
 
@@ -1686,6 +1687,12 @@ impl SetupCommand {
     }
 
     pub fn execute(mut self) -> anyhow::Result<()> {
+        // Setup provisions the database it is given, never a discovered one.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         self.resolve_installation_inputs()?;
         print_header();
 
@@ -1772,7 +1779,7 @@ impl SetupCommand {
         print_section("Database Setup");
         print_substep("Checking database connectivity...");
 
-        let db = match rt.block_on(temps_database::establish_connection(&self.database_url)) {
+        let db = match rt.block_on(temps_schema::establish_connection(&database_url)) {
             Ok(db) => {
                 print_substep(&format!("{} Database reachable", "✓".bright_green()));
                 print_substep("Running migrations...");
@@ -3283,6 +3290,66 @@ fn finish_setup(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    /// Importing a certificate over a domain whose ACME or on-demand attempts
+    /// failed leaves no trace of that failure: the console would otherwise
+    /// show a stale cause next to a working certificate, and the next
+    /// on-demand failure would start high on the backoff ladder.
+    #[tokio::test]
+    async fn importing_a_certificate_clears_the_previous_failure() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let now = chrono::Utc::now();
+        domains::ActiveModel {
+            domain: Set("imported.example.com".to_string()),
+            status: Set("on_demand_failed".to_string()),
+            is_wildcard: Set(false),
+            verification_method: Set("http-01".to_string()),
+            last_error: Set(Some("connection refused".to_string())),
+            last_error_type: Set(Some("challenge_mismatch".to_string())),
+            failure_cause: Set(Some("unreachable".to_string())),
+            on_demand_backoff_until: Set(Some(now + chrono::Duration::hours(4))),
+            on_demand_failure_streak: Set(4),
+            on_demand_last_failure_at: Set(Some(now)),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("failed domain inserted");
+        let encryption = EncryptionService::new(
+            "0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("test key");
+
+        let imported = import_external_certificate(
+            db,
+            &encryption,
+            "imported.example.com",
+            "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
+            "-----BEGIN PRIVATE KEY-----\nMIIE\n-----END PRIVATE KEY-----\n",
+            now + chrono::Duration::days(90),
+        )
+        .await
+        .expect("import succeeds");
+
+        assert_eq!(imported.status, "active");
+        assert_eq!(imported.verification_method, "manual");
+        assert_eq!(imported.last_error, None);
+        assert_eq!(imported.last_error_type, None);
+        assert_eq!(imported.failure_cause, None);
+        assert_eq!(imported.on_demand_backoff_until, None);
+        assert_eq!(imported.on_demand_failure_streak, 0);
+        assert_eq!(imported.on_demand_last_failure_at, None);
+    }
 
     fn parse_setup(extra_args: &[&str]) -> Box<SetupCommand> {
         let mut args = vec!["temps", "setup", "--database-url", "postgres://example"];

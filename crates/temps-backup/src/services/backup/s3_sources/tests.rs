@@ -28,6 +28,7 @@ async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -84,6 +85,7 @@ async fn delete_s3_source_refuses_a_cloud_managed_row() {
         managed_by_cloud: true,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -133,6 +135,7 @@ async fn update_s3_source_refuses_a_cloud_managed_row() {
         managed_by_cloud: true,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     };
@@ -155,6 +158,8 @@ async fn update_s3_source_refuses_a_cloud_managed_row() {
                 region: None,
                 endpoint: None,
                 force_path_style: None,
+                worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -214,6 +219,7 @@ async fn test_create_s3_client() {
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
         backing_service_id: None,
@@ -269,6 +275,7 @@ async fn test_create_s3_source() {
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
         backing_service_id: None,
@@ -309,6 +316,8 @@ async fn test_create_s3_source() {
         force_path_style: Some(true),
         is_default: None,
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(request).await;
@@ -351,6 +360,8 @@ async fn test_create_s3_source_empty_name() {
         force_path_style: Some(true),
         is_default: None,
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(request).await;
@@ -422,6 +433,8 @@ async fn test_create_s3_client_from_request_valid() {
         force_path_style: Some(true),
         is_default: None,
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_client_from_request(&request).await;
@@ -471,6 +484,8 @@ async fn test_create_s3_source_with_bucket_creation() {
         force_path_style: Some(true),
         is_default: None,
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     };
 
     // This test requires a real MinIO instance running
@@ -520,6 +535,8 @@ async fn test_create_s3_source_request_validation() {
         force_path_style: None,
         is_default: None,
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     };
 
     let result = backup_service.create_s3_source(invalid_request).await;
@@ -550,6 +567,8 @@ fn s3_probe_test_request(endpoint: &str) -> CreateS3SourceRequest {
         force_path_style: Some(true),
         is_default: Some(false),
         backing_service_id: None,
+        worker_credentials: None,
+        use_tls: None,
     }
 }
 
@@ -631,6 +650,7 @@ fn operator_s3_source(encryption: &EncryptionService) -> s3_sources::Model {
         managed_by_cloud: false,
         lifecycle_reconcile_failed_at: None,
         lifecycle_reconcile_generation: 0,
+        worker_credentials: "scoped".to_string(),
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -662,6 +682,8 @@ async fn test_update_s3_source_to_an_unreachable_endpoint_saves_nothing() {
                 region: None,
                 endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                 force_path_style: None,
+                worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -722,6 +744,8 @@ async fn test_update_s3_source_replaces_credentials_that_cannot_be_decrypted() {
                 region: None,
                 endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
                 force_path_style: None,
+                worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -766,10 +790,57 @@ async fn test_update_s3_source_resubmitting_stored_values_does_not_probe() {
                 region: Some(source.region.clone()),
                 endpoint: source.endpoint.clone(),
                 force_path_style: source.force_path_style,
+                worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
         .expect("unchanged connection settings need no connectivity check");
+    assert_eq!(updated.name, "renamed");
+}
+
+/// A source saved before endpoints were normalised stores a bare
+/// `host:port`. An edit form sends it back as it was; it normalises to the
+/// `http://` form clients always used, the same destination, so a rename
+/// still probes nothing (the destination here is unreachable).
+#[tokio::test]
+async fn test_update_s3_source_resubmitting_a_legacy_bare_endpoint_does_not_probe() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("temps-s3-probe.invalid:9000".to_string());
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        endpoint: Some("http://temps-s3-probe.invalid:9000".to_string()),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source.clone()]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(
+            31,
+            crate::handlers::backup_handler::UpdateS3SourceRequest {
+                name: Some("renamed".to_string()),
+                bucket_name: Some(source.bucket_name.clone()),
+                bucket_path: None,
+                access_key_id: None,
+                secret_key: None,
+                region: Some(source.region.clone()),
+                endpoint: source.endpoint.clone(),
+                force_path_style: source.force_path_style,
+                worker_credentials: None,
+                use_tls: None,
+            },
+        )
+        .await
+        .expect("the same destination in its legacy form needs no connectivity check");
     assert_eq!(updated.name, "renamed");
 }
 
@@ -806,6 +877,8 @@ async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
                 region: None,
                 endpoint: None,
                 force_path_style: None,
+                worker_credentials: None,
+                use_tls: None,
             },
         )
         .await
@@ -824,3 +897,196 @@ async fn test_update_s3_source_keeps_credentials_sent_back_masked() {
 // -------------------------------------------------------------------------
 // Bug 4: list_source_backups must include pending/failed rows without s3_location
 // -------------------------------------------------------------------------
+
+/// ADR-102: an operator can allow full credentials on a source that cannot
+/// scope them, and nothing else changes: no probe, no credential rewrite.
+#[tokio::test]
+async fn update_s3_source_sets_only_the_worker_credentials_policy() {
+    let stored = s3_sources::Model {
+        id: 23,
+        backing_service_id: None,
+        name: "offsite".to_string(),
+        bucket_name: "backups".to_string(),
+        bucket_path: "/".to_string(),
+        access_key_id: "ciphertext-key".to_string(),
+        secret_key: "ciphertext-secret".to_string(),
+        session_token: None,
+        credentials_expire_at: None,
+        region: "us-east-1".to_string(),
+        endpoint: Some("https://store.example.test".to_string()),
+        force_path_style: Some(true),
+        is_default: false,
+        managed_by_cloud: false,
+        lifecycle_reconcile_failed_at: None,
+        lifecycle_reconcile_generation: 0,
+        worker_credentials: s3_sources::WORKER_CREDENTIALS_SCOPED.to_string(),
+        created_at: Utc::now(),
+        updated_at: Utc::now(),
+    };
+    let updated = s3_sources::Model {
+        worker_credentials: s3_sources::WORKER_CREDENTIALS_ALLOW_FULL.to_string(),
+        ..stored.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![stored]])
+            .append_query_results(vec![vec![updated]])
+            .into_connection(),
+    );
+    let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+    let source = service
+        .update_s3_source(
+            23,
+            crate::handlers::backup_handler::UpdateS3SourceRequest {
+                name: None,
+                bucket_name: None,
+                bucket_path: None,
+                access_key_id: None,
+                secret_key: None,
+                region: None,
+                endpoint: None,
+                force_path_style: None,
+                worker_credentials: Some(
+                    crate::handlers::backup_handler::WorkerCredentialsPolicy::AllowFull,
+                ),
+                use_tls: None,
+            },
+        )
+        .await
+        .expect("setting the policy alone needs no probe");
+    assert_eq!(
+        source.worker_credentials,
+        s3_sources::WORKER_CREDENTIALS_ALLOW_FULL
+    );
+
+    drop(service);
+    let db = Arc::try_unwrap(db).expect("service must release the mock database");
+    let log = db.into_transaction_log();
+    assert_eq!(log.len(), 2, "one read, one update: {log:?}");
+    let update = format!("{:?}", log[1]);
+    assert!(update.contains("worker_credentials"), "{update}");
+    assert!(update.contains("allow_full"), "{update}");
+    assert!(
+        !update.contains("\"access_key_id\""),
+        "the credential columns must not be rewritten: {update}"
+    );
+}
+
+fn tls_only_request(
+    name: Option<&str>,
+    use_tls: bool,
+) -> crate::handlers::backup_handler::UpdateS3SourceRequest {
+    crate::handlers::backup_handler::UpdateS3SourceRequest {
+        name: name.map(str::to_string),
+        bucket_name: None,
+        bucket_path: None,
+        access_key_id: None,
+        secret_key: None,
+        region: None,
+        endpoint: None,
+        force_path_style: None,
+        worker_credentials: None,
+        use_tls: Some(use_tls),
+    }
+}
+
+/// Turning TLS on without retyping the endpoint applies it to the stored
+/// endpoint: the `https://` form is what gets verified, and a destination
+/// that refuses it leaves the row untouched.
+#[tokio::test]
+async fn test_update_s3_source_tls_alone_probes_the_stored_endpoint_with_https() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let error = service
+        .update_s3_source(31, tls_only_request(None, true))
+        .await
+        .expect_err("the https endpoint is unreachable, so nothing may be saved");
+
+    match &error {
+        BackupError::S3Unreachable { endpoint, .. } => {
+            assert_eq!(endpoint, "https://temps-s3-probe.invalid:9000");
+        }
+        other => panic!("expected S3Unreachable, got {other:?}"),
+    }
+    drop(service);
+    let db = Arc::try_unwrap(db).expect("service must release the mock database");
+    assert_eq!(
+        db.into_transaction_log().len(),
+        1,
+        "only the source lookup may run; nothing is written"
+    );
+}
+
+/// A TLS choice that matches the stored scheme is not a change: nothing is
+/// probed (the destination here is unreachable) and the stored endpoint is
+/// written back as it was.
+#[tokio::test]
+async fn test_update_s3_source_tls_matching_the_stored_scheme_changes_nothing() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = Some("http://temps-s3-probe.invalid:9000".to_string());
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(31, tls_only_request(Some("renamed"), false))
+        .await
+        .expect("an unchanged scheme needs no connectivity check");
+    assert_eq!(updated.name, "renamed");
+    drop(service);
+    let db = Arc::try_unwrap(db).expect("service must release the mock database");
+    let log = format!("{:?}", db.into_transaction_log());
+    assert!(log.contains("http://temps-s3-probe.invalid:9000"), "{log}");
+    assert!(!log.contains("https://"), "{log}");
+}
+
+/// An AWS S3 source has no endpoint for a TLS choice to apply to; the flag
+/// is ignored and the update saves without a probe.
+#[tokio::test]
+async fn test_update_s3_source_tls_on_an_aws_source_is_ignored() {
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let mut source = operator_s3_source(&encryption);
+    source.endpoint = None;
+    let renamed = s3_sources::Model {
+        name: "renamed".to_string(),
+        ..source.clone()
+    };
+    let db = Arc::new(
+        MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![source]])
+            .append_query_results(vec![vec![renamed]])
+            .into_connection(),
+    );
+    let Ok(service) = build_service_for_mock(db.clone()) else {
+        return;
+    };
+
+    let updated = service
+        .update_s3_source(31, tls_only_request(Some("renamed"), true))
+        .await
+        .expect("no endpoint, so nothing to verify");
+    assert_eq!(updated.name, "renamed");
+    assert_eq!(updated.endpoint, None);
+}

@@ -4,6 +4,7 @@
 //! Step 1: check what the plugins need before any of them is constructed.
 
 use super::*;
+use crate::commands::serve::startup_failure::error_chain_text;
 
 /// Validate the console's hard dependencies before the plugin manager exists:
 /// the Docker daemon (fatal only in the `full` profile), the GeoLite2
@@ -41,11 +42,13 @@ pub(super) async fn validate_deps(
         // reporting `docker: true` on that basis would be a lie the console
         // shows to the operator.
         let client = bollard::Docker::connect_with_defaults()
-            .map_err(|e| docker_unavailable_error(&e.to_string()))?;
+            .map_err(|e| docker_unavailable_error(&error_chain_text(&e)))?;
 
         match tokio::time::timeout(DOCKER_PROBE_TIMEOUT, client.ping()).await {
             Ok(Ok(_)) => debug!("✓ Docker daemon is accessible"),
-            Ok(Err(e)) => return Err(docker_unavailable_error(&e.to_string())),
+            // The whole chain: bollard's own message hides whether the socket
+            // was missing or refused this user (`Permission denied`).
+            Ok(Err(e)) => return Err(docker_unavailable_error(&error_chain_text(&e))),
             Err(_) => {
                 return Err(docker_unavailable_error(&format!(
                     "the daemon did not answer a ping within {}s",
@@ -81,18 +84,11 @@ pub(super) async fn validate_deps(
 
     // 2. Validate GeoPlugin dependencies (GeoLite2 database)
     debug!("Checking GeoLite2 database...");
-    let geo_db_path = config.data_dir.join("GeoLite2-City.mmdb");
     // The license key is an admin setting on the `settings` row, not an env
     // var, so a startup download uses whatever the admin configured through
     // the UI -- the same value the scheduled refresh job reads each tick.
     let maxmind_license_key = configured_maxmind_license_key(db, encryption_service).await;
-    validate_geolite2_database(&geo_db_path, maxmind_license_key.as_deref()).await?;
-    debug!("✓ GeoLite2 database file found");
-    ensure_geolite2_asn_database(
-        &config.data_dir.join(temps_geo::ASN_DB_FILENAME),
-        maxmind_license_key.as_deref(),
-    )
-    .await;
+    ensure_geolite2_databases(&config.data_dir, maxmind_license_key).await;
 
     // 3. Validate logs directory is writable
     debug!("Checking logs directory...");

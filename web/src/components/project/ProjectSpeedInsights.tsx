@@ -9,11 +9,16 @@ import { ProjectResponse } from '@/api/client'
 import {
   getEnvironmentsOptions,
   getGroupedPageMetricsOptions,
+  getGroupedPageMetricsQueryKey,
   getMetricsOverTimeOptions,
+  getMetricsOverTimeQueryKey,
   hasPerformanceMetricsOptions,
+  hasPerformanceMetricsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import {
   Card,
   CardContent,
@@ -42,6 +47,7 @@ import {
   Table,
   TableBody,
   TableCell,
+  TableHead,
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
@@ -49,7 +55,8 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { SegmentedControl } from '@/components/ui/segmented-control'
+import { PageBackendSheet } from '@/components/project/PageBackendSheet'
 import { SpeedWorldMap } from '@/components/project/SpeedWorldMap'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
@@ -60,13 +67,14 @@ import {
   Code2,
   Info,
   Monitor,
-  RefreshCw,
+  Server,
   Smartphone,
   X,
   Zap,
 } from 'lucide-react'
-import { useMemo, useState } from 'react'
+import { useMemo, useReducer, useState } from 'react'
 import { Link } from 'react-router'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 type MetricKey = 'lcp' | 'inp' | 'cls' | 'ttfb' | 'fcp'
 
@@ -256,6 +264,11 @@ type BreakdownDimension =
   | 'browser'
   | 'operating_system'
 
+const DEVICE_OPTIONS = [
+  { value: 'desktop', label: 'Desktop', icon: Monitor },
+  { value: 'mobile', label: 'Mobile', icon: Smartphone },
+] as const
+
 const BREAKDOWN_DIMENSIONS: {
   value: BreakdownDimension
   label: string
@@ -333,6 +346,7 @@ function BreakdownMetricCell({
 
 interface SpeedBreakdownCardProps {
   projectId: number
+  projectSlug: string
   environmentId: number | null
   startDate: string
   endDate: string
@@ -344,6 +358,7 @@ interface SpeedBreakdownCardProps {
 
 function SpeedBreakdownCard({
   projectId,
+  projectSlug,
   environmentId,
   startDate,
   endDate,
@@ -355,8 +370,9 @@ function SpeedBreakdownCard({
   const [dimension, setDimension] = useState<BreakdownDimension>('path')
   const [sortKey, setSortKey] = useState<BreakdownSortKey>('events')
   const [sortDirection, setSortDirection] = useState<SortDirection>('desc')
+  const [backendPath, setBackendPath] = useState<string | null>(null)
 
-  const { data, isLoading, isError } = useQuery({
+  const { data, isLoading, isError } = useWindowQuery({
     ...getGroupedPageMetricsOptions({
       query: {
         start_date: startDate,
@@ -429,26 +445,16 @@ function SpeedBreakdownCard({
               Average per group · sorted by samples · click a value to filter
             </CardDescription>
           </div>
-          <Tabs
+          <SegmentedControl
+            label="Break down by"
             value={dimension}
-            onValueChange={(v) => {
-              setDimension(v as BreakdownDimension)
+            onValueChange={(next) => {
+              setDimension(next)
               setSortKey('events')
               setSortDirection('desc')
             }}
-          >
-            <TabsList className="h-8">
-              {BREAKDOWN_DIMENSIONS.map((d) => (
-                <TabsTrigger
-                  key={d.value}
-                  value={d.value}
-                  className="h-6 px-2.5 text-xs"
-                >
-                  {d.label}
-                </TabsTrigger>
-              ))}
-            </TabsList>
-          </Tabs>
+            options={BREAKDOWN_DIMENSIONS}
+          />
         </div>
       </CardHeader>
       <CardContent>
@@ -497,6 +503,9 @@ function SpeedBreakdownCard({
                       align="right"
                     />
                   ))}
+                  {dimension === 'path' && (
+                    <TableHead className="text-right">Backend</TableHead>
+                  )}
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -527,6 +536,21 @@ function SpeedBreakdownCard({
                       {BREAKDOWN_METRICS.map((m) => (
                         <BreakdownMetricCell key={m} value={g[m]} metric={m} />
                       ))}
+                      {dimension === 'path' && (
+                        <TableCell className="text-right">
+                          {g.group_key.startsWith('/') && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              aria-label={`Backend requests for ${g.group_key}`}
+                              onClick={() => setBackendPath(g.group_key)}
+                            >
+                              <Server className="h-3.5 w-3.5" />
+                              <span className="max-sm:sr-only">Backend</span>
+                            </Button>
+                          )}
+                        </TableCell>
+                      )}
                     </TableRow>
                   )
                 })}
@@ -541,6 +565,12 @@ function SpeedBreakdownCard({
           </div>
         )}
       </CardContent>
+      <PageBackendSheet
+        projectId={projectId}
+        projectSlug={projectSlug}
+        path={backendPath}
+        onClose={() => setBackendPath(null)}
+      />
     </Card>
   )
 }
@@ -583,7 +613,13 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
   const effectiveEnvironment =
     selectedEnvironment ?? environmentsData?.[0]?.id ?? null
 
-  const window = useMemo(() => resolveTimeRange(timeRange), [timeRange])
+  // A preset ("last 24 hours") is resolved against now; Refresh resolves it
+  // again so the refetch asks for the window that ends now.
+  const [windowMoves, moveWindow] = useReducer((n: number) => n + 1, 0)
+  const window = useMemo(() => {
+    void windowMoves
+    return resolveTimeRange(timeRange)
+  }, [timeRange, windowMoves])
   const startDate = window.from
   const endDate = window.to
 
@@ -597,8 +633,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
     data: metrics,
     isLoading,
     error,
-    refetch,
-  } = useQuery({
+  } = useWindowQuery({
     ...getMetricsOverTimeOptions({
       query: {
         start_date: startDate,
@@ -828,27 +863,12 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               </SelectContent>
             </Select>
 
-            <Tabs
+            <SegmentedControl
+              label="Device"
               value={device}
-              onValueChange={(v) => setDevice(v as 'desktop' | 'mobile')}
-            >
-              <TabsList className="h-8">
-                <TabsTrigger
-                  value="desktop"
-                  icon={Monitor}
-                  className="h-6 px-2 text-xs"
-                >
-                  Desktop
-                </TabsTrigger>
-                <TabsTrigger
-                  value="mobile"
-                  icon={Smartphone}
-                  className="h-6 px-2 text-xs"
-                >
-                  Mobile
-                </TabsTrigger>
-              </TabsList>
-            </Tabs>
+              onValueChange={setDevice}
+              options={DEVICE_OPTIONS}
+            />
 
             <TimeRangeFilter value={timeRange} onChange={setTimeRange} />
 
@@ -865,18 +885,20 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
               </SelectContent>
             </Select>
 
-            <Button
-              aria-label="Refresh"
-              variant="outline"
-              size="sm"
-              className="h-8"
-              onClick={() => refetch()}
-              disabled={isLoading}
-            >
-              <RefreshCw
-                className={cn('h-3.5 w-3.5', isLoading && 'animate-spin')}
-              />
-            </Button>
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(hasPerformanceMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getMetricsOverTimeQueryKey, {
+                  query: { project_id: project.id },
+                }),
+                queryKeyPrefix(getGroupedPageMetricsQueryKey, {
+                  query: { project_id: project.id },
+                }),
+              ]}
+              onRefresh={moveWindow}
+            />
           </div>
         }
       />
@@ -976,22 +998,15 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
                     thresholds
                   </CardDescription>
                 </div>
-                <Tabs
+                <SegmentedControl
+                  label="Chart metric"
                   value={activeMetric}
-                  onValueChange={(v) => setActiveMetric(v as MetricKey)}
-                >
-                  <TabsList className="h-8">
-                    {tileMetrics.map((m) => (
-                      <TabsTrigger
-                        key={m}
-                        value={m}
-                        className="h-6 px-2.5 text-xs"
-                      >
-                        {METRIC_THRESHOLDS[m].short}
-                      </TabsTrigger>
-                    ))}
-                  </TabsList>
-                </Tabs>
+                  onValueChange={setActiveMetric}
+                  options={tileMetrics.map((m) => ({
+                    value: m,
+                    label: METRIC_THRESHOLDS[m].short,
+                  }))}
+                />
               </div>
             </CardHeader>
             <CardContent>
@@ -1036,6 +1051,7 @@ export function ProjectSpeedInsights({ project }: ProjectSpeedInsightsProps) {
           {/* Per-page / per-dimension breakdown */}
           <SpeedBreakdownCard
             projectId={project.id}
+            projectSlug={project.slug}
             environmentId={effectiveEnvironment}
             startDate={startDate}
             endDate={endDate}

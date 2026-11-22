@@ -36,7 +36,7 @@ permissions:
 jobs:
   select-skills:
     name: Select agent skills
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       scan-mode: ${{ steps.select.outputs.scan-mode }}
@@ -184,7 +184,7 @@ jobs:
     name: Scan ${{ matrix.skill-path }}
     needs: select-skills
     if: needs.select-skills.outputs.skill-paths != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -251,7 +251,7 @@ jobs:
       - select-skills
       - skill-security
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     permissions: {}
     env:

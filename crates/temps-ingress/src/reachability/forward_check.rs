@@ -123,7 +123,7 @@ async fn lookup_within(
 }
 
 /// Ask `https://<host>/` once, without reading a body.
-pub async fn probe(host: &str) -> ForwardProbe {
+pub async fn probe(host: &str, key: &str) -> ForwardProbe {
     let lookup = resolve_and_validate_domain(host, 443);
     let addresses = match lookup_within(LOOKUP_TIMEOUT, host, lookup).await {
         Ok(addresses) => addresses,
@@ -140,7 +140,16 @@ pub async fn probe(host: &str) -> ForwardProbe {
         Ok(client) => client,
         Err(error) => return ForwardProbe::Unchecked(format!("no HTTP client: {error}")),
     };
-    match client.head(format!("https://{host}/")).send().await {
+    match client
+        .head(format!("https://{host}/"))
+        .header(
+            temps_core::probe_auth::HEADER,
+            temps_core::probe_auth::sign(key, host, temps_core::probe_auth::now()),
+        )
+        .header("cache-control", "no-cache, no-store")
+        .send()
+        .await
+    {
         Ok(response) => classify(response.status().as_u16(), response.headers()),
         Err(error) => ForwardProbe::Unchecked(format!("https://{host}/ did not answer: {error}")),
     }
@@ -394,7 +403,7 @@ mod tests {
     #[tokio::test]
     async fn the_probe_never_dials_a_loopback_address() {
         assert!(matches!(
-            probe("localhost").await,
+            probe("localhost", "test-key").await,
             ForwardProbe::Unchecked(_)
         ));
     }

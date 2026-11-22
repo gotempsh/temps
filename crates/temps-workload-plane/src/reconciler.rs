@@ -3112,7 +3112,7 @@ mod tests {
     }
 
     impl OnWorkerFive {
-        fn new(db: &temps_database::test_utils::TestDatabase, stream: bool) -> Arc<Self> {
+        fn new(db: &temps_test_utils::TestDatabase, stream: bool) -> Arc<Self> {
             Arc::new(Self {
                 rpc: FakeDriver::new(),
                 stream,
@@ -3122,10 +3122,7 @@ mod tests {
             })
         }
 
-        fn plane(
-            self: &Arc<Self>,
-            db: &temps_database::test_utils::TestDatabase,
-        ) -> Arc<WorkloadPlane> {
+        fn plane(self: &Arc<Self>, db: &temps_test_utils::TestDatabase) -> Arc<WorkloadPlane> {
             Arc::new(
                 WorkloadPlane::new(
                     db.db.clone(),
@@ -3181,7 +3178,7 @@ mod tests {
         }
     }
 
-    async fn instance_rows(db: &temps_database::test_utils::TestDatabase, id: i64) -> usize {
+    async fn instance_rows(db: &temps_test_utils::TestDatabase, id: i64) -> usize {
         workload_instances::Entity::find()
             .filter(workload_instances::Column::WorkloadId.eq(id))
             .all(&*db.db)

@@ -12,7 +12,7 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
@@ -29,6 +29,8 @@ axum = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+temps-schema = { path = "../temps-schema" }
 # `mock` powers MockDatabase for the handler authorization tests.
 sea-orm = { workspace = true, features = ["mock"] }
 

@@ -66,11 +66,11 @@ use uuid::Uuid;
 use yaml_serde;
 
 use cron::Schedule;
+use temps_alarms::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_core::notifications::BackupFailureData;
 use temps_core::secret_string::SecretString;
 use temps_core::BackupScheduleAuthority;
 use temps_entities::{backup_schedules::Model as BackupSchedule, s3_sources::Model as S3Source};
-use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use temps_providers::ExternalServiceManager;
 use tokio_stream::StreamExt;
 
@@ -79,6 +79,7 @@ mod deletion;
 mod error;
 mod external_service;
 mod index;
+mod internal_archive;
 mod postgres_backup;
 mod queries;
 mod recovery_set;
@@ -99,6 +100,7 @@ pub use access_scope::{
     BackupWithAccessScope, ServiceProjectScope,
 };
 pub use error::BackupError;
+pub use internal_archive::{InternalArchiveReconcile, NO_ARCHIVE_DESTINATION_COMMAND};
 pub use recovery_set::RecoverySetPublication;
 use retention::{retention_cutoff, retention_expiry, validate_retention_period};
 pub use retention::{
@@ -194,6 +196,7 @@ fn json_contains_backup_identity(value: &serde_json::Value, backup_id: &str) -> 
 
 #[derive(Clone)]
 pub struct BackupService {
+    telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     db: Arc<DatabaseConnection>,
     external_service_manager: Arc<ExternalServiceManager>,
     alarm_service: Arc<AlarmService>,
@@ -209,9 +212,30 @@ pub struct BackupService {
 }
 
 impl BackupService {
+    pub fn with_telemetry(
+        mut self,
+        telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    ) -> Self {
+        self.telemetry = telemetry;
+        self
+    }
+
     /// Why running a backup of external service `service_id` with
     /// `engine_key` would restart its database now, or `None`. Only the
     /// WAL-G PostgreSQL engine can restart a service (to turn archiving on).
+    /// The backup engine of `service`: [`crate::engines::dispatch`]'s choice,
+    /// asking a worker's agent where the service runs on one.
+    pub async fn resolve_engine_key(
+        &self,
+        service: &temps_entities::external_services::Model,
+    ) -> Result<&'static str, crate::engines::dispatch::ResolveEngineError> {
+        crate::engines::dispatch::resolve_engine_key_on_this_host(
+            service,
+            self.external_service_manager.as_ref(),
+        )
+        .await
+    }
+
     pub async fn backup_restart_reason(
         &self,
         service_id: i32,
@@ -240,6 +264,7 @@ impl BackupService {
         queue: Arc<dyn temps_core::JobQueue>,
     ) -> Self {
         Self {
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             db,
             external_service_manager,
             alarm_service,

@@ -80,7 +80,7 @@ export function previewGatewayErrorMessage(
     PORT_CONFLICT_MARKERS.some((marker) => normalizedDetail.includes(marker))
   ) {
     const port = configuredPort ? ` ${configuredPort}` : ''
-    return `Host port${port} is already in use, so Docker could not start the preview gateway. Change the configured host port below, save settings, and try again.`
+    return `Host port${port} is already in use, so Docker could not start the preview gateway. Choose a free host port and save settings.`
   }
 
   if (

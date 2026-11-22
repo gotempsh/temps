@@ -204,9 +204,12 @@ pub fn decrypt_bundle_with_info(
     info: &[u8],
 ) -> Result<Vec<u8>, EciesError> {
     // Decode private key
-    let sk_bytes = BASE64
-        .decode(private_key_b64)
-        .map_err(|e| EciesError::InvalidPrivateKey(format!("base64 decode: {}", e)))?;
+    let sk_bytes = BASE64.decode(private_key_b64).map_err(|e| {
+        EciesError::InvalidPrivateKey(format!(
+            "base64 decode: {}",
+            crate::encryption::describe_base64_error(&e)
+        ))
+    })?;
     if sk_bytes.len() != 32 {
         return Err(EciesError::InvalidPrivateKey(format!(
             "expected 32 bytes, got {}",
@@ -312,6 +315,21 @@ pub fn cert_fingerprint(cert_pem: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn invalid_private_key_error_does_not_name_the_rejected_symbol() {
+        let bundle = EncryptedBundle {
+            ciphertext: String::new(),
+            nonce: String::new(),
+        };
+        // `!` is byte 33.
+        let error = decrypt_bundle_with_info("secret!key", "", &bundle, b"info").unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid private key: base64 decode: Invalid symbol at offset 6."
+        );
+    }
 
     struct FailingCryptoRng;
 

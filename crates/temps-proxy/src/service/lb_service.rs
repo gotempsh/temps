@@ -11,6 +11,10 @@ use arc_swap::ArcSwap;
 use chrono::Utc;
 use sea_orm::*;
 use std::net::IpAddr;
+use temps_config::AppSettings;
+use temps_core::route_policy::{
+    normalize_route_hostname, validate_upstream, RouteHostnameError, RouteUpstreamError,
+};
 use temps_entities::custom_routes::RouteType;
 use tracing::{info, warn};
 
@@ -42,6 +46,31 @@ pub enum LbServiceError {
 
     #[error("Failed to get public IP address")]
     PublicIpError(String),
+
+    #[error("route domain '{domain}' is not accepted: {source}")]
+    InvalidHostname {
+        domain: String,
+        source: RouteHostnameError,
+    },
+
+    /// The name is one the platform generates or reserves (console and ingress
+    /// hostnames, anything at or below the preview domain).
+    #[error(
+        "route domain '{domain}' belongs to the platform (console, ingress or preview domain); \
+         choose a name outside the preview domain"
+    )]
+    PlatformHostname { domain: String },
+
+    /// Another record already serves the name.
+    #[error("route domain '{domain}' is already {owner}; remove it there first")]
+    HostnameInUse { domain: String, owner: &'static str },
+
+    #[error("route upstream '{host}:{port}' is not accepted: {source}")]
+    InvalidUpstream {
+        host: String,
+        port: i32,
+        source: RouteUpstreamError,
+    },
 
     #[error("DNS resolution error for domain {domain}: {source}")]
     DnsResolutionError {
@@ -193,6 +222,71 @@ impl LbService {
         }
     }
 
+    /// Check a route's public hostname against the platform: it must not be a
+    /// reserved or generated name, and no environment address or project
+    /// custom domain may already use it. Pure part of the check, no queries.
+    fn check_hostname_policy(settings: &AppSettings, host: &str) -> Result<(), LbServiceError> {
+        if settings.is_platform_hostname(host) {
+            return Err(LbServiceError::PlatformHostname {
+                domain: host.to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Everything that decides whether `host` may be claimed by a custom
+    /// route, apart from the route table itself. `host` is already normalised.
+    async fn ensure_hostname_available(&self, host: &str) -> Result<(), LbServiceError> {
+        use temps_entities::{environment_domains, project_custom_domains, settings};
+
+        let app_settings = settings::Entity::find()
+            .one(self.db.as_ref())
+            .await
+            .map_err(LbServiceError::DatabaseError)?
+            .map(|row| AppSettings::from_json(row.data))
+            .unwrap_or_default();
+        Self::check_hostname_policy(&app_settings, host)?;
+
+        let lowered = |column: environment_domains::Column| {
+            sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                sea_orm::sea_query::Expr::col(column),
+            ))
+        };
+        // Environment addresses are stored as full hostnames (tunnels, manual
+        // addresses) or as the bare label of a generated address; both are
+        // compared as written.
+        if environment_domains::Entity::find()
+            .filter(lowered(environment_domains::Column::Domain).eq(host))
+            .one(self.db.as_ref())
+            .await
+            .map_err(LbServiceError::DatabaseError)?
+            .is_some()
+        {
+            return Err(LbServiceError::HostnameInUse {
+                domain: host.to_string(),
+                owner: "an environment's address",
+            });
+        }
+        if project_custom_domains::Entity::find()
+            .filter(
+                sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                    sea_orm::sea_query::Expr::col(project_custom_domains::Column::Domain),
+                ))
+                .eq(host),
+            )
+            .one(self.db.as_ref())
+            .await
+            .map_err(LbServiceError::DatabaseError)?
+            .is_some()
+        {
+            return Err(LbServiceError::HostnameInUse {
+                domain: host.to_string(),
+                owner: "a project's custom domain",
+            });
+        }
+        Ok(())
+    }
+
     pub async fn create_route(
         &self,
         domain: String,
@@ -200,6 +294,21 @@ impl LbService {
         port: i32,
         route_type: Option<RouteType>,
     ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
+        let domain = normalize_route_hostname(&domain).map_err(|source| {
+            LbServiceError::InvalidHostname {
+                domain: domain.clone(),
+                source,
+            }
+        })?;
+        self.ensure_hostname_available(&domain).await?;
+        validate_upstream(&host, port)
+            .await
+            .map_err(|source| LbServiceError::InvalidUpstream {
+                host: host.clone(),
+                port,
+                source,
+            })?;
+
         info!(
             "Creating new route for domain: {} (type: {:?})",
             domain, route_type
@@ -333,6 +442,26 @@ impl LbService {
     ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
         use temps_entities::custom_routes;
 
+        // A route being switched off may be one the current rules would refuse
+        // (written before they existed); letting it be disabled is how an
+        // operator retires it. Anything that stays live is checked again.
+        if enabled_val {
+            let domain = normalize_route_hostname(domain_val).map_err(|source| {
+                LbServiceError::InvalidHostname {
+                    domain: domain_val.to_string(),
+                    source,
+                }
+            })?;
+            self.ensure_hostname_available(&domain).await?;
+            validate_upstream(&host_val, port_val)
+                .await
+                .map_err(|source| LbServiceError::InvalidUpstream {
+                    host: host_val.clone(),
+                    port: port_val,
+                    source,
+                })?;
+        }
+
         let mut update_model = custom_routes::ActiveModel {
             updated_at: Set(Utc::now()),
             enabled: Set(enabled_val),
@@ -377,8 +506,19 @@ impl LbService {
         Ok(updated)
     }
 
-    pub async fn delete_route(&self, domain_val: &str) -> Result<(), LbServiceError> {
+    pub async fn delete_route(
+        &self,
+        domain_val: &str,
+    ) -> Result<temps_entities::custom_routes::Model, LbServiceError> {
         use temps_entities::custom_routes;
+
+        // Read the row first so the caller can record what was removed.
+        let existing = custom_routes::Entity::find()
+            .filter(custom_routes::Column::Domain.eq(domain_val))
+            .one(self.db.as_ref())
+            .await
+            .map_err(LbServiceError::DatabaseError)?
+            .ok_or_else(|| LbServiceError::NotFound(domain_val.to_string()))?;
 
         let deleted = custom_routes::Entity::delete_many()
             .filter(custom_routes::Column::Domain.eq(domain_val))
@@ -390,11 +530,8 @@ impl LbService {
         }
 
         // Write-through: refresh the snapshot on this instance after the DB
-        // write. This is immediately visible to hot-path reads on the SAME
-        // instance, but in the current process topology admin-API writes are
-        // handled by the console-owned LbService, which is a separate object
-        // from the Pingora hot-path instance. The 60-second periodic loop in
-        // that instance is what propagates this deletion to real traffic.
+        // write; the 60-second periodic loop propagates the deletion to the
+        // proxy instance that serves traffic.
         if let Err(e) = self.refresh_snapshot().await {
             warn!(
                 "Failed to refresh custom-route snapshot after delete: {}",
@@ -402,7 +539,7 @@ impl LbService {
             );
         }
 
-        Ok(())
+        Ok(existing)
     }
 
     pub async fn get_route_by_host(
@@ -467,7 +604,7 @@ mod missing_route_tests {
     #[tokio::test]
     async fn deleting_a_route_that_is_not_there_says_so() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_results([nothing_affected()])
+            .append_query_results([Vec::<custom_routes::Model>::new()])
             .into_connection();
         let result = LbService::new(Arc::new(db))
             .delete_route("nothing.invalid")
@@ -482,7 +619,7 @@ mod missing_route_tests {
             .append_query_results([Vec::<custom_routes::Model>::new()])
             .into_connection();
         let result = LbService::new(Arc::new(db))
-            .update_route("nothing.invalid", "host".to_string(), 80, true, None)
+            .update_route("nothing.invalid", "host".to_string(), 80, false, None)
             .await;
         assert!(matches!(result, Err(LbServiceError::NotFound(d)) if d == "nothing.invalid"));
     }

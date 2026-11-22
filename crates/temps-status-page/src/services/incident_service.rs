@@ -2,18 +2,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use chrono::Utc;
-use futures::future::BoxFuture;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
-use std::time::Duration;
 use temps_core::UtcDateTime;
 use temps_entities::{environments, status_incident_updates, status_incidents, status_monitors};
-use tokio::time::sleep;
-use tracing::{debug, error, warn};
 
+use super::db_retry::with_db_retry;
 use super::types::{
     CreateIncidentRequest, IncidentResponse, IncidentUpdateResponse, StatusPageError,
     UpdateIncidentStatusRequest,
@@ -69,82 +66,6 @@ pub struct IncidentService {
 impl IncidentService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
-    }
-
-    /// Execute a database operation with retry logic
-    async fn with_retry<F, T>(operation_name: &str, mut operation: F) -> Result<T, StatusPageError>
-    where
-        F: FnMut() -> BoxFuture<'static, Result<T, sea_orm::DbErr>>,
-    {
-        const MAX_RETRIES: u32 = 3;
-        const INITIAL_DELAY_MS: u64 = 50;
-
-        let mut last_error = None;
-
-        for attempt in 0..=MAX_RETRIES {
-            if attempt > 0 {
-                let delay = INITIAL_DELAY_MS * (2_u64.pow(attempt - 1));
-                debug!(
-                    "Retrying {} (attempt {}/{}), waiting {}ms",
-                    operation_name, attempt, MAX_RETRIES, delay
-                );
-                sleep(Duration::from_millis(delay)).await;
-            }
-
-            match operation().await {
-                Ok(result) => {
-                    if attempt > 0 {
-                        debug!(
-                            "{} succeeded after {} attempts",
-                            operation_name,
-                            attempt + 1
-                        );
-                    }
-                    return Ok(result);
-                }
-                Err(e) => {
-                    // Check if it's a transient error that we should retry
-                    let should_retry = match &e {
-                        sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_) => true,
-                        sea_orm::DbErr::Query(runtime_err) => {
-                            let err_str = runtime_err.to_string();
-                            err_str.contains("deadlock")
-                                || err_str.contains("timeout")
-                                || err_str.contains("connection")
-                        }
-                        _ => false,
-                    };
-
-                    if should_retry && attempt < MAX_RETRIES {
-                        warn!(
-                            "{} failed (attempt {}), will retry: {:?}",
-                            operation_name,
-                            attempt + 1,
-                            e
-                        );
-                        last_error = Some(e);
-                        continue;
-                    }
-
-                    // Non-retryable error or final attempt
-                    error!(
-                        "{} failed after {} attempts: {:?}",
-                        operation_name,
-                        attempt + 1,
-                        e
-                    );
-                    return Err(StatusPageError::Database(e));
-                }
-            }
-        }
-
-        // Should not reach here
-        Err(StatusPageError::Database(last_error.unwrap_or_else(|| {
-            sea_orm::DbErr::Custom(format!(
-                "{} failed after all retry attempts",
-                operation_name
-            ))
-        })))
     }
 
     /// Create a new incident with retry logic
@@ -239,7 +160,7 @@ impl IncidentService {
         let title = request.title.clone();
 
         // Create incident with retry
-        let result = Self::with_retry(
+        let result = with_db_retry(
             &format!("create_incident for project {}", project_id),
             || {
                 let incident = incident.clone();
@@ -261,6 +182,7 @@ impl IncidentService {
                 message: Set(message),
                 is_public: Set(request.is_public),
                 is_system: Set(false),
+                published_at: Set(request.is_public.then(chrono::Utc::now)),
                 ..Default::default()
             },
             None => status_incident_updates::ActiveModel {
@@ -272,7 +194,7 @@ impl IncidentService {
             },
         };
 
-        Self::with_retry(
+        with_db_retry(
             &format!("create_incident_update for incident {}", incident_id),
             || {
                 let update = initial_update.clone();
@@ -384,6 +306,7 @@ impl IncidentService {
             status: Set(request.status),
             message: Set(request.message),
             is_public: Set(request.is_public),
+            published_at: Set(request.is_public.then(chrono::Utc::now)),
             ..Default::default()
         };
 
@@ -418,8 +341,13 @@ impl IncidentService {
                 update_id,
             });
         }
+        let becomes_public = is_public && !update.is_public;
         let mut update: status_incident_updates::ActiveModel = update.into();
         update.is_public = Set(is_public);
+        if becomes_public {
+            // Subscribers hear of it from now, however old the draft is.
+            update.published_at = Set(Some(chrono::Utc::now()));
+        }
         let update = update.update(self.db.as_ref()).await?;
         Ok(update.into())
     }
@@ -633,8 +561,8 @@ impl IncidentService {
 mod tests {
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{environments, projects, status_monitors, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     async fn create_test_project(db: &Arc<DatabaseConnection>) -> projects::Model {
         // Use nanoseconds for better uniqueness in parallel tests

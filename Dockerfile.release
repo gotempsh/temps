@@ -21,6 +21,30 @@ RUN apt-get update && apt-get upgrade -y --no-install-recommends && \
     dpkg --compare-versions "$(dpkg-query -W -f='${Version}' libbrotli1)" ge '1.0.9-2+deb12u1' && \
     rm -rf /var/lib/apt/lists/*
 
+# PostgreSQL client tools for the control-plane backup. Without a local Docker
+# daemon (the hosted control plane) it runs this image's own pg_dump and
+# pg_dumpall, and refuses when they are older than the database's major
+# version (ADR-100); Debian bookworm only carries PostgreSQL 15. Install the
+# PostgreSQL 18 client from the PostgreSQL apt repository, trusting the
+# repository key that Debian's own signed postgresql-common package ships
+# (copied out so the helper package can be purged again). Fail the build if
+# the installed tools do not report that major version.
+ARG PG_CLIENT_MAJOR=18
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends postgresql-common && \
+    install -d -m 0755 /etc/apt/keyrings && \
+    cp /usr/share/postgresql-common/pgdg/apt.postgresql.org.gpg /etc/apt/keyrings/pgdg.gpg && \
+    . /etc/os-release && \
+    echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends "postgresql-client-${PG_CLIENT_MAJOR}" && \
+    apt-get purge -y postgresql-common && \
+    apt-get autoremove -y && \
+    pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
+    pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
+    rm -rf /var/lib/apt/lists/*
+
 # Create non-root user
 RUN groupadd --gid 1000 temps && \
     useradd --uid 1000 --gid temps --create-home --shell /usr/sbin/nologin temps

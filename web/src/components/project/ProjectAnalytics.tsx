@@ -10,6 +10,17 @@ import { PageHeader } from '@/components/layout/PageContainer'
 
 import { AnalyticsTrafficChart } from '@/components/analytics/overview/AnalyticsTrafficChart'
 import { AnalyticsBreakdowns } from '@/components/analytics/overview/AnalyticsBreakdowns'
+import {
+  FileDownloadsCard,
+  NotFoundCard,
+  OutboundLinksCard,
+} from '@/components/analytics/overview/AutoEventsCards'
+import { ConversionsCard } from '@/components/analytics/overview/ConversionsCard'
+import {
+  CookielessFactLine,
+  VisitorIdentityCard,
+} from '@/components/analytics/VisitorIdentityCard'
+import { IdentifyUsersCard } from '@/components/analytics/IdentifyUsersCard'
 
 import { DateTimeRange } from '@/components/ui/date-time-range'
 
@@ -19,8 +30,28 @@ import {
   getEventsCountOptions,
   getHourlyVisitsOptions,
   hasAnalyticsEventsOptions,
+  getAiAgentBreakdownQueryKey,
+  getAiPageBreakdownQueryKey,
+  getAiStatusBreakdownQueryKey,
+  getAiAgentTimelineQueryKey,
+  getEventDetailQueryKey,
+  getEventEntriesQueryKey,
+  getEventVisitorsQueryKey,
+  getEventsCountQueryKey,
+  getHourlyVisitsQueryKey,
+  getPageFlowQueryKey,
+  getPagePathDetailQueryKey,
+  getPagePathVisitorsQueryKey,
+  getPagePathsQueryKey,
+  getPagePathsSparklinesQueryKey,
+  getProjectSessionReplaysQueryKey,
+  getPropertyBreakdownQueryKey,
+  getUniqueCountsQueryKey,
+  getVisitorsQueryKey,
+  hasAnalyticsEventsQueryKey,
   listAnalyticsIngestKeysOptions,
   getAnalyticsIngestKeyEndpointOptions,
+  getProjectIngestSetupQueryKey,
   revokeAnalyticsIngestKeyMutation,
   rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -55,6 +86,7 @@ import { ApiTrafficTab } from '@/components/analytics/ApiTraffic'
 import { AnalyticsTrafficSettings } from '@/components/analytics/AnalyticsTrafficSettings'
 import { FunnelDetail } from '@/components/funnel/FunnelDetail'
 import { FunnelManagement } from '@/components/funnel/FunnelManagement'
+import { ProjectSurveys } from '@/components/project/surveys/ProjectSurveys'
 import { LiveVisitors } from '@/pages/LiveVisitors'
 import { AnalyticsOnboardingGate } from '@/components/analytics/AnalyticsOnboardingGate'
 import { RequestLogsRedirect } from '@/components/analytics/RequestLogsRedirect'
@@ -113,6 +145,9 @@ import {
   ScrollableTabsList,
   TabsTrigger,
 } from '@/components/ui/tabs'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   analyticsIngestBaseUrl,
@@ -123,7 +158,12 @@ import { cn } from '@/lib/utils'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+  useMutation,
+  useQuery,
+  useQueryClient,
+  type QueryKey,
+} from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { toast } from 'sonner'
 import { useUrlState } from '@temps-sdk/ds'
@@ -136,17 +176,19 @@ import {
   type QuickFilter,
   type AnalyticsDateFilter,
 } from '@/hooks/useAnalyticsDateRange'
+import { useAdvancingDateRange } from '@/hooks/useAdvancingDateRange'
+import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
 import {
   ArrowLeft,
   ArrowRight,
   Ban,
   Check,
+  Code2,
   FileCode,
   Globe,
   Info,
   KeyRound,
   Loader2,
-  RefreshCw,
   RotateCcw,
   Terminal,
 } from 'lucide-react'
@@ -195,7 +237,7 @@ export function VisitorChart({
     'events' | 'sessions' | 'visitors'
   >('visitors')
 
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getHourlyVisitsOptions({
       path: {
         project_id: project.id,
@@ -233,9 +275,14 @@ export interface AnalyticsFiltersProps {
   onFilterChange: (filter: QuickFilter) => void
   onDateRangeChange: (range: DateRange | undefined) => void
   onEnvironmentChange: (environment: number | undefined) => void
-  onRefresh: () => void
-  isRefreshing: boolean
-  /** Extra page-level actions rendered before the refresh button. */
+  /**
+   * The queries the page shows; with them the bar offers Refresh (see
+   * `RefreshButton`). Leave out on a page that should offer only the filters.
+   */
+  refreshQueryKeys?: readonly QueryKey[]
+  /** Moves a relative range to now before refreshing (`useAdvancingDateRange`'s `advance`). */
+  onRefresh?: () => void
+  /** Extra page-level actions rendered after the refresh button. */
   actions?: React.ReactNode
   /** Extra controls rendered next to the environment selector, on the left side. */
   leftActions?: React.ReactNode
@@ -249,8 +296,8 @@ export function AnalyticsFilters({
   onFilterChange,
   onDateRangeChange,
   onEnvironmentChange,
+  refreshQueryKeys,
   onRefresh,
-  isRefreshing,
   actions,
   leftActions,
 }: AnalyticsFiltersProps) {
@@ -293,18 +340,10 @@ export function AnalyticsFilters({
 
       <div className="flex flex-wrap items-center gap-2">
         <div className="flex flex-wrap items-center gap-2">
+          {refreshQueryKeys ? (
+            <RefreshButton queryKeys={refreshQueryKeys} onRefresh={onRefresh} />
+          ) : null}
           {actions}
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={onRefresh}
-            disabled={isRefreshing}
-          >
-            <RefreshCw
-              className={cn('h-4 w-4', isRefreshing && 'animate-spin')}
-            />
-            Refresh
-          </Button>
           <DateTimeRange
             value={(() => {
               const { startDate, endDate } = getDateRangeFromFilter({
@@ -367,33 +406,11 @@ function PagesTab({ project }: PagesTabProps) {
     [filterParam, fromParam, toParam]
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(async () => {
-    setIsRefreshing(true)
-    try {
-      await queryClient.invalidateQueries({
-        predicate: (query) => {
-          const key = query.queryKey[0] as {
-            _id?: string
-            query?: { project_id?: number }
-          }
-          return (
-            !!key?._id?.startsWith('getPage') &&
-            key.query?.project_id === project.id
-          )
-        },
-      })
-    } finally {
-      setIsRefreshing(false)
-    }
-  }, [queryClient, project.id])
 
   // Sync date filter to URL search params (preserves path param)
   const updateDateFilter = React.useCallback(
@@ -449,8 +466,14 @@ function PagesTab({ project }: PagesTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getPagePathsQueryKey),
+          queryKeyPrefix(getPagePathsSparklinesQueryKey),
+          queryKeyPrefix(getPagePathDetailQueryKey),
+          queryKeyPrefix(getPagePathVisitorsQueryKey),
+          queryKeyPrefix(getAiPageBreakdownQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       {/* Show PageDetail when a path is selected, otherwise show Pages list */}
@@ -507,12 +530,10 @@ function EventDetailTab({ project }: EventDetailTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
 
   // Sync date filter to URL so deep links and back-navigation keep the range.
@@ -536,21 +557,6 @@ function EventDetailTab({ project }: EventDetailTabProps) {
     },
     [searchParams, setSearchParams]
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getEventDetail') || key.includes('getEventVisitors'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   if (!eventName) {
     return (
@@ -577,8 +583,12 @@ function EventDetailTab({ project }: EventDetailTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getEventDetailQueryKey),
+          queryKeyPrefix(getEventEntriesQueryKey),
+          queryKeyPrefix(getEventVisitorsQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <EventDetail
@@ -637,29 +647,11 @@ function DimensionTab({ project }: DimensionTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getPropertyBreakdown') ||
-            key.includes('getEventsCount'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -711,8 +703,11 @@ function DimensionTab({ project }: DimensionTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getPropertyBreakdownQueryKey),
+          queryKeyPrefix(getEventsCountQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <DimensionList
@@ -772,29 +767,11 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('getAiAgentBreakdown') ||
-            key.includes('getAiPageBreakdown'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
@@ -872,8 +849,13 @@ function AiAgentsTab({ project, view = 'overview' }: AiAgentsTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[
+          queryKeyPrefix(getAiAgentBreakdownQueryKey),
+          queryKeyPrefix(getAiPageBreakdownQueryKey),
+          queryKeyPrefix(getAiStatusBreakdownQueryKey),
+          queryKeyPrefix(getAiAgentTimelineQueryKey),
+        ]}
+        onRefresh={advance}
       />
 
       <AiAgentsDetail
@@ -928,12 +910,10 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
     }
   )
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
 
   const updateDateFilter = React.useCallback(
@@ -956,17 +936,6 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
     },
     [searchParams, setSearchParams]
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(key && typeof key === 'string' && key.includes('getVisitors'))
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   if (!isDimensionKey(rawDimension) || !rawValue) {
     return (
@@ -1008,8 +977,8 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
           })
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getVisitorsQueryKey)]}
+        onRefresh={advance}
       />
 
       <SegmentVisitors
@@ -1018,6 +987,7 @@ function SegmentVisitorsTab({ project }: SegmentVisitorsTabProps) {
         value={value}
         startDate={startDate}
         endDate={endDate}
+        rangeScope={`${dateFilter.quickFilter}\u0000${dateFilter.dateRange?.from?.getTime() ?? ''}\u0000${dateFilter.dateRange?.to?.getTime() ?? ''}`}
         environment={selectedEnvironment}
         onBack={() => {
           const params = new URLSearchParams()
@@ -1051,28 +1021,11 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
     dateRange: undefined,
   })
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(
-          key &&
-          typeof key === 'string' &&
-          (key.includes('visitors') || key.includes('sessions'))
-        )
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   return (
     <div className="space-y-6">
@@ -1092,9 +1045,11 @@ function SessionReplaysTab({ project }: SessionReplaysTabProps) {
           }))
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getProjectSessionReplaysQueryKey)]}
+        onRefresh={advance}
       />
+
+      <CookielessFactLine project={project} view="replays" />
 
       {/* Session Replays Component */}
       <SessionReplays
@@ -1117,24 +1072,11 @@ function JourneyTab({ project }: JourneyTabProps) {
     dateRange: undefined,
   })
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const queryClient = useQueryClient()
-
-  const { startDate, endDate } = React.useMemo(
-    () => getDateRangeFromFilter(dateFilter),
-    [dateFilter]
+  // Moves only when the user refreshes: these tabs never polled.
+  const { startDate, endDate, advance } = useAdvancingDateRange(
+    dateFilter,
+    null
   )
-
-  const handleRefresh = React.useCallback(() => {
-    setIsRefreshing(true)
-    queryClient.invalidateQueries({
-      predicate: (query) => {
-        const key = query.queryKey[0] as string
-        return !!(key && typeof key === 'string' && key.includes('getPageFlow'))
-      },
-    })
-    setTimeout(() => setIsRefreshing(false), 1000)
-  }, [queryClient])
 
   return (
     <div className="space-y-6">
@@ -1153,9 +1095,11 @@ function JourneyTab({ project }: JourneyTabProps) {
           }))
         }
         onEnvironmentChange={setSelectedEnvironment}
-        onRefresh={handleRefresh}
-        isRefreshing={isRefreshing}
+        refreshQueryKeys={[queryKeyPrefix(getPageFlowQueryKey)]}
+        onRefresh={advance}
       />
+
+      <CookielessFactLine project={project} view="journey" />
 
       <PageFlow
         project={project}
@@ -1184,6 +1128,7 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
         element={<RequestLogsRedirect projectSlug={project.slug} />}
       />
       <Route path="funnels/*" element={<FunnelAnalytics project={project} />} />
+      <Route path="surveys/*" element={<ProjectSurveys project={project} />} />
       <Route
         path="live-visitors"
         element={
@@ -1219,7 +1164,13 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
       <Route path="setup" element={<AnalyticsSetup project={project} />} />
       <Route
         path="settings"
-        element={<AnalyticsTrafficSettings project={project} />}
+        element={
+          <div className="space-y-6">
+            <AnalyticsTrafficSettings project={project} />
+            <VisitorIdentityCard project={project} />
+            <IdentifyUsersCard project={project} />
+          </div>
+        }
       />
       <Route
         path="live"
@@ -1244,7 +1195,9 @@ export function ProjectAnalytics({ project }: ProjectAnalyticsProps) {
 interface ProjectAnalyticsOverviewProps {
   project: ProjectResponse
 }
-function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
+export function ProjectAnalyticsOverview({
+  project,
+}: ProjectAnalyticsOverviewProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   const { patch: patchUrl } = useUrlState<'filter' | 'from' | 'to'>()
@@ -1285,17 +1238,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   )
 
   const [selectedEnvironment, setSelectedEnvironment] = useEnvironmentFilter()
-  const [isRefreshing, setIsRefreshing] = React.useState(false)
-  const [dateRangeRefreshKey, setDateRangeRefreshKey] = React.useState(0)
   // While the guided tour is showing off this page, don't yank the user to
   // /setup — the empty-state banner below already covers "no data yet".
   const showSetupOverride = useProjectTourActive()
   const [insightsOpen, setInsightsOpen] = useInsightsOpen()
-  const queryClient = useQueryClient()
-  const { startDate, endDate } = React.useMemo(() => {
-    void dateRangeRefreshKey
-    return getDateRangeFromFilter(dateFilter)
-  }, [dateFilter, dateRangeRefreshKey])
+  // A relative range moves forward on its own; Refresh moves it right away.
+  const { startDate, endDate, advance } = useAdvancingDateRange(dateFilter)
 
   // Keep chart selections provisional until the user reviews the timestamps.
   const handleChartZoom = React.useCallback((from: Date, to: Date) => {
@@ -1332,52 +1280,43 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
     }
   }, [hasNoData, showSetupOverride, project.slug, navigate])
 
-  const handleRefresh = React.useCallback(async () => {
-    setDateRangeRefreshKey((current) => current + 1)
-    setIsRefreshing(true)
-    try {
-      // Invalidate all analytics queries for this project
-      await queryClient.invalidateQueries({
-        predicate: (query) => {
-          const queryKey = query.queryKey
-          return (
-            Array.isArray(queryKey) &&
-            queryKey.some(
-              (key) =>
-                typeof key === 'object' &&
-                key &&
-                'query' in key &&
-                typeof key.query === 'object' &&
-                key.query &&
-                'project_id_or_slug' in key.query &&
-                key.query.project_id_or_slug === project.slug
-            )
-          )
-        },
-      })
-      // Also invalidate the hasAnalyticsEvents query specifically
-      await hasAnalyticsEventsQuery.refetch()
-    } finally {
-      setIsRefreshing(false)
-    }
-  }, [queryClient, project.slug, hasAnalyticsEventsQuery])
-
   return (
     <>
       <div className="space-y-6">
         <PageHeader
           title="Analytics"
           description={`Traffic, audience, and engagement for ${project.name}.`}
+          className="sm:items-center"
           actions={
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() =>
-                navigate(`/projects/${project.slug}/analytics/globe`)
+            <AnalyticsFilters
+              project={project}
+              activeFilter={dateFilter.quickFilter}
+              dateRange={dateFilter.dateRange}
+              selectedEnvironment={selectedEnvironment}
+              onFilterChange={(filter) =>
+                updateDateFilter({
+                  ...dateFilter,
+                  quickFilter: filter,
+                  dateRange: undefined,
+                })
               }
-            >
-              <Globe className="mr-2 size-4" /> Visitor globe
-            </Button>
+              onDateRangeChange={(range) =>
+                updateDateFilter({
+                  quickFilter: range ? 'custom' : dateFilter.quickFilter,
+                  dateRange: range,
+                })
+              }
+              onEnvironmentChange={setSelectedEnvironment}
+              refreshQueryKeys={[
+                queryKeyPrefix(hasAnalyticsEventsQueryKey),
+                queryKeyPrefix(getUniqueCountsQueryKey),
+                queryKeyPrefix(getHourlyVisitsQueryKey),
+                queryKeyPrefix(getEventsCountQueryKey),
+                queryKeyPrefix(getPropertyBreakdownQueryKey),
+                queryKeyPrefix(getAiAgentBreakdownQueryKey),
+              ]}
+              onRefresh={advance}
+            />
           }
         />
 
@@ -1407,35 +1346,6 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
         )}
 
         <div className="flex flex-col gap-6">
-          <AnalyticsFilters
-            project={project}
-            activeFilter={dateFilter.quickFilter}
-            dateRange={dateFilter.dateRange}
-            selectedEnvironment={selectedEnvironment}
-            onFilterChange={(filter) =>
-              updateDateFilter({
-                ...dateFilter,
-                quickFilter: filter,
-                dateRange: undefined,
-              })
-            }
-            onDateRangeChange={(range) =>
-              updateDateFilter({
-                quickFilter: range ? 'custom' : dateFilter.quickFilter,
-                dateRange: range,
-              })
-            }
-            onEnvironmentChange={setSelectedEnvironment}
-            onRefresh={handleRefresh}
-            isRefreshing={isRefreshing}
-            actions={
-              <InsightsToggleButton
-                open={insightsOpen}
-                onToggle={setInsightsOpen}
-              />
-            }
-          />
-
           {/* Analytics Metrics */}
           <AnalyticsMetrics
             project={project}
@@ -1443,6 +1353,13 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
             endDate={endDate}
             environment={selectedEnvironment}
           />
+          <div className="flex justify-end">
+            <InsightsToggleButton
+              open={insightsOpen}
+              onToggle={setInsightsOpen}
+              showLabel
+            />
+          </div>
           {insightsOpen && (
             <OverviewInsights
               project={project}
@@ -1486,6 +1403,12 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               />
             )}
           </div>
+          <ConversionsCard
+            project={project}
+            startDate={startDate}
+            endDate={endDate}
+            environment={selectedEnvironment}
+          />
           <AnalyticsBreakdowns
             traffic={
               <div className="grid min-w-0 grid-cols-1 gap-4 md:grid-cols-2">
@@ -1567,6 +1490,24 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
                   endDate={endDate}
                   environment={selectedEnvironment}
                 />
+                <NotFoundCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <OutboundLinksCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
+                <FileDownloadsCard
+                  project={project}
+                  startDate={startDate}
+                  endDate={endDate}
+                  environment={selectedEnvironment}
+                />
               </div>
             }
           />
@@ -1585,7 +1526,7 @@ interface ChartProps {
 function EventsChart({ project, startDate, endDate, environment }: ChartProps) {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, error } = useWindowQuery({
     ...getEventsCountOptions({
       path: {
         project_id: project.id,
@@ -1834,8 +1775,15 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
   })
 
-  const invalidateKeys = () =>
-    queryClient.invalidateQueries({ queryKey: keysQueryKey })
+  const invalidateKeys = () => {
+    void queryClient.invalidateQueries({ queryKey: keysQueryKey })
+    // The plain HTTP setup reports whether an active key exists.
+    void queryClient.invalidateQueries({
+      queryKey: getProjectIngestSetupQueryKey({
+        path: { project_id: project.id },
+      }),
+    })
+  }
 
   const createKey = useMutation({
     ...createAnalyticsIngestKeyMutation(),
@@ -2068,6 +2016,7 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
               showCopy
             />
             <CodeBlock
+              title="layout.tsx"
               language="tsx"
               code={`import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
 
@@ -2082,7 +2031,8 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
           </TabsContent>
           <TabsContent value="script" className="space-y-3 pt-3">
             <CodeBlock
-              language="text"
+              title="index.html"
+              language="html"
               code={`<script
   defer
   data-base-path="${baseUrl}"
@@ -2152,6 +2102,9 @@ function MarkExternalNotice({ project }: ProjectAnalyticsProps) {
     </div>
   )
 }
+
+/** The framework-agnostic option of the analytics setup. */
+const PLAIN_HTTP_OPTION = 'plain-http'
 
 function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
   // An app hosted elsewhere sends its data with an ingest key.
@@ -2380,11 +2333,20 @@ export default function App() {
       description: 'Vercel, Netlify, static hosting, or anywhere else',
       setupCode: '',
     },
+    {
+      id: PLAIN_HTTP_OPTION,
+      name: 'Any language or framework',
+      category: 'Other',
+      icon: () => <Code2 className="h-5 w-5" />,
+      description: 'The SDK, a script tag, or plain fetch',
+      setupCode: '',
+    },
   ]
 
   const selectedFrameworkData =
     frameworks.find((f) => f.id === selectedFramework) || frameworks[0]
   const isExternal = selectedFramework === 'external'
+  const isPlainHttp = selectedFramework === PLAIN_HTTP_OPTION
 
   // Generate AI prompt for coding agents based on the selected framework
   const getAnalyticsAiPrompt = () => {
@@ -2606,7 +2568,8 @@ After implementation:
                 )}
               </div>
             </div>
-            {!isExternal && (
+            {/* The plain HTTP view carries its own prompt. */}
+            {!isPlainHttp && !isExternal && (
               <CopyButton
                 value={getAnalyticsAiPrompt()}
                 className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
@@ -2616,7 +2579,22 @@ After implementation:
             )}
           </div>
 
-          {isExternal ? (
+          {isPlainHttp ? (
+            <>
+              <IngestKeySetup project={project} />
+              {/* The key card above already shows the key. */}
+              <PlainHttpSetup
+                project={project}
+                signal="analytics"
+                showCredentialStep={false}
+              />
+              <PlainHttpSetup
+                project={project}
+                signal="session_replay"
+                showCredentialStep={false}
+              />
+            </>
+          ) : isExternal ? (
             <>
               {project.hosting !== 'external' && (
                 <MarkExternalNotice project={project} />

@@ -30,13 +30,19 @@ List all configured contexts
 
 Switch the active context
 
+**Usage:** `context use <name>`
+
 ### `context remove` (alias: `rm`)
 
 Remove a context (does NOT revoke the key on the server)
 
+**Usage:** `context remove <name>`
+
 ### `context rename`
 
 Rename a context
+
+**Usage:** `context rename <old-name> <new-name>`
 
 ### `context current`
 

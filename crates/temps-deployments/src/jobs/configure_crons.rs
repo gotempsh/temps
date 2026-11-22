@@ -5,11 +5,15 @@
 //!
 //! Configures cron jobs from .temps.yaml configuration file after deployment
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::TempsConfig;
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
@@ -39,6 +43,23 @@ pub struct CronConfig {
     pub schedule: String,
     /// Set for a `job` cron (ADR-055 §14); `None` for `http`.
     pub job: Option<JobCronConfig>,
+    /// Set for a `workflow` cron (ADR-106 §9); `None` otherwise.
+    pub workflow: Option<WorkflowCronConfig>,
+}
+
+/// Prefix of a `workflow` cron's key in `crons.path`.
+pub const WORKFLOW_KEY_PREFIX: &str = "workflow:";
+
+/// Longest workflow name, as the workflows engine accepts it.
+pub const MAX_WORKFLOW_NAME_LEN: usize = 128;
+
+/// A `workflow` cron's settings, as written in `.temps.yaml`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkflowCronConfig {
+    pub workflow: String,
+    pub input: Option<serde_json::Value>,
+    pub concurrency_policy: temps_core::CronConcurrencyPolicy,
+    pub starting_deadline_seconds: Option<u32>,
 }
 
 /// Prefix of a `job` cron's key in `crons.path`. An `http` path cannot
@@ -70,10 +91,20 @@ impl CronConfig {
             (None, false) => format!("cron '{}' (schedule '{}')", entry.path, entry.schedule),
             (None, true) => format!("cron with schedule '{}'", entry.schedule),
         };
+        if let Some(workflow) = &entry.workflow {
+            return Self::workflow_from_repo(entry, workflow, describe());
+        }
+        if entry.input.is_some() {
+            return Err(CronConfigError::ConfigError(format!(
+                "{} sets `input`, which only applies to a workflow cron (one with `workflow`)",
+                describe()
+            )));
+        }
         let Some(command) = &entry.command else {
             if entry.path.is_empty() {
                 return Err(CronConfigError::ConfigError(format!(
-                    "{} sets neither `path` (an HTTP cron) nor `command` (a job cron)",
+                    "{} sets none of `path` (an HTTP cron), `command` (a job cron) or \
+                     `workflow` (a workflow cron)",
                     describe()
                 )));
             }
@@ -86,16 +117,30 @@ impl CronConfig {
                     job_fields.join(", ")
                 )));
             }
-            if entry.path.starts_with(JOB_KEY_PREFIX) {
+            if let Some(prefix) = [JOB_KEY_PREFIX, WORKFLOW_KEY_PREFIX]
+                .into_iter()
+                .find(|prefix| entry.path.starts_with(prefix))
+            {
                 return Err(CronConfigError::ConfigError(format!(
-                    "{}: an HTTP cron path cannot start with '{JOB_KEY_PREFIX}'",
+                    "{}: an HTTP cron path cannot start with '{prefix}'",
                     describe()
+                )));
+            }
+            // The path is appended to the address of the app's container on
+            // every run, so a repository must not be able to make it name
+            // another host.
+            if let Err(error) = temps_core::request_path::validate_request_path(&entry.path) {
+                return Err(CronConfigError::ConfigError(format!(
+                    "{}: invalid HTTP cron path '{}': path {error}",
+                    describe(),
+                    entry.path.escape_debug()
                 )));
             }
             return Ok(Self {
                 path: entry.path.clone(),
                 schedule: entry.schedule.clone(),
                 job: None,
+                workflow: None,
             });
         };
         if !entry.path.is_empty() {
@@ -138,6 +183,65 @@ impl CronConfig {
                 retry_limit: entry.retry_limit.unwrap_or(0),
                 timeout_seconds: entry.timeout_seconds,
                 ttl_seconds_after_finished: entry.ttl_seconds_after_finished,
+            }),
+            workflow: None,
+        })
+    }
+
+    fn workflow_from_repo(
+        entry: &temps_core::CronJobConfig,
+        workflow: &str,
+        describe: String,
+    ) -> Result<Self, CronConfigError> {
+        let refuse =
+            |reason: String| Err(CronConfigError::ConfigError(format!("{describe} {reason}")));
+        if !entry.path.is_empty() || entry.command.is_some() {
+            return refuse(
+                "sets `workflow` with `path` or `command`; a cron is an HTTP call, a job or \
+                 a workflow"
+                    .into(),
+            );
+        }
+        let run_fields = entry.run_only_fields();
+        if !run_fields.is_empty() {
+            return refuse(format!(
+                "is a workflow cron but sets {}, which only apply to a job cron; a workflow \
+                 retries its own steps",
+                run_fields.join(", ")
+            ));
+        }
+        let valid_name = !workflow.is_empty()
+            && workflow.chars().count() <= MAX_WORKFLOW_NAME_LEN
+            && workflow
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ':' | '/'));
+        if !valid_name {
+            return refuse(format!(
+                "names workflow '{workflow}', which is not a valid workflow name: use 1-\
+                 {MAX_WORKFLOW_NAME_LEN} letters, digits, '.', '_', '-', ':' or '/'"
+            ));
+        }
+        let identity = match entry.name.as_deref().map(str::trim) {
+            Some(name) if !name.is_empty() => name.to_string(),
+            _ => workflow.to_string(),
+        };
+        let mut key = format!("{WORKFLOW_KEY_PREFIX}{identity}");
+        if key.len() > MAX_JOB_KEY_LEN {
+            let mut end = MAX_JOB_KEY_LEN;
+            while !key.is_char_boundary(end) {
+                end -= 1;
+            }
+            key.truncate(end);
+        }
+        Ok(Self {
+            path: key,
+            schedule: entry.schedule.clone(),
+            job: None,
+            workflow: Some(WorkflowCronConfig {
+                workflow: workflow.to_string(),
+                input: entry.input.clone(),
+                concurrency_policy: entry.concurrency_policy.unwrap_or_default(),
+                starting_deadline_seconds: entry.starting_deadline_seconds,
             }),
         })
     }
@@ -835,6 +939,7 @@ cron:
         let cron_configs: Vec<CronConfig> = cron_jobs
             .iter()
             .map(|job| CronConfig {
+                workflow: None,
                 path: job.path.clone(),
                 schedule: job.schedule.clone(),
                 job: None,
@@ -924,6 +1029,111 @@ cron:
     }
 
     #[test]
+    fn from_repo_keys_a_workflow_cron_and_keeps_its_input() {
+        let entry = temps_core::CronJobConfig {
+            schedule: "0 8 * * 1".into(),
+            workflow: Some("send-digest".into()),
+            input: Some(serde_json::json!({ "period": "weekly" })),
+            starting_deadline_seconds: Some(600),
+            ..Default::default()
+        };
+        let config = CronConfig::from_repo(&entry).unwrap();
+        assert_eq!(config.path, "workflow:send-digest");
+        assert!(config.job.is_none());
+        assert_eq!(
+            config.workflow,
+            Some(WorkflowCronConfig {
+                workflow: "send-digest".into(),
+                input: Some(serde_json::json!({ "period": "weekly" })),
+                concurrency_policy: temps_core::CronConcurrencyPolicy::Forbid,
+                starting_deadline_seconds: Some(600),
+            })
+        );
+        // A name keys it, so one workflow can have several schedules.
+        let named = CronConfig::from_repo(&temps_core::CronJobConfig {
+            name: Some("digest-daily".into()),
+            ..entry.clone()
+        })
+        .unwrap();
+        assert_eq!(named.path, "workflow:digest-daily");
+
+        let refused = |entry: temps_core::CronJobConfig, expected: &str| {
+            let error = CronConfig::from_repo(&entry).unwrap_err().to_string();
+            assert!(
+                error.contains(expected),
+                "expected '{expected}' in '{error}'"
+            );
+        };
+        refused(
+            temps_core::CronJobConfig {
+                path: "/api/x".into(),
+                ..entry.clone()
+            },
+            "with `path` or `command`",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                retry_limit: Some(2),
+                timeout_seconds: Some(5),
+                ..entry.clone()
+            },
+            "retry_limit, timeout_seconds",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                workflow: Some("bad name".into()),
+                ..entry.clone()
+            },
+            "not a valid workflow name",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                workflow: None,
+                path: "/api/x".into(),
+                ..entry.clone()
+            },
+            "only applies to a workflow cron",
+        );
+        refused(
+            temps_core::CronJobConfig {
+                path: "workflow:send-digest".into(),
+                schedule: "0 8 * * 1".into(),
+                ..Default::default()
+            },
+            "cannot start with 'workflow:'",
+        );
+    }
+
+    #[test]
+    fn from_repo_refuses_an_http_path_that_names_another_host() {
+        let http = |path: &str| temps_core::CronJobConfig {
+            path: path.to_string(),
+            schedule: "0 3 * * *".into(),
+            ..Default::default()
+        };
+        for path in [
+            "@10.0.0.5:8500/v1/agent/self",
+            "//10.0.0.5:8500/x",
+            "x",
+            "api/cron",
+            "/x@10.0.0.5",
+            "/go?to=http://10.0.0.5/",
+            "/a\nb",
+            "/a\0b",
+            "/a\\b",
+        ] {
+            let error = CronConfig::from_repo(&http(path))
+                .expect_err(path)
+                .to_string();
+            assert!(error.contains("invalid HTTP cron path"), "{path}: {error}");
+        }
+        // Ordinary paths, with a query string, still pass.
+        for path in ["/", "/api/cron/report", "/api/run?job=nightly"] {
+            assert_eq!(CronConfig::from_repo(&http(path)).unwrap().path, path);
+        }
+    }
+
+    #[test]
     fn from_repo_refuses_ambiguous_or_misplaced_fields() {
         let refused = |entry: temps_core::CronJobConfig, expected: &str| {
             let error = CronConfig::from_repo(&entry).unwrap_err().to_string();
@@ -937,7 +1147,7 @@ cron:
                 schedule: "0 3 * * *".into(),
                 ..Default::default()
             },
-            "neither `path`",
+            "sets none of `path`",
         );
         refused(
             temps_core::CronJobConfig {
@@ -988,6 +1198,7 @@ cron:
     fn test_noop_cron_service() {
         let service = NoOpCronConfigService;
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/test".to_string(),
             schedule: "* * * * *".to_string(),
             job: None,
@@ -1003,11 +1214,13 @@ cron:
         let service = MockCronConfigService::new();
         let configs = vec![
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task1".to_string(),
                 schedule: "0 0 * * *".to_string(),
                 job: None,
             },
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task2".to_string(),
                 schedule: "0 12 * * *".to_string(),
                 job: None,
@@ -1027,6 +1240,7 @@ cron:
     async fn test_mock_cron_service_failure() {
         let service = MockCronConfigService::with_failure();
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * *".to_string(),
             job: None,
@@ -1121,6 +1335,7 @@ cron: []
         let cron_configs: Vec<CronConfig> = cron_jobs
             .iter()
             .map(|job| CronConfig {
+                workflow: None,
                 path: job.path.clone(),
                 schedule: job.schedule.clone(),
                 job: None,

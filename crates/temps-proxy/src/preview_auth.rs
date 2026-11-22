@@ -64,33 +64,6 @@ pub use temps_core::{
     PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
 };
 
-/// Default local port the preview gateway listens on, when the instance has
-/// not configured one.
-const DEFAULT_PREVIEW_GATEWAY_PORT: u16 = 8090;
-
-/// The local TCP address where the preview gateway listens. Pingora forwards
-/// authenticated preview requests to this peer.
-///
-/// Read per call from `PREVIEW_GATEWAY_HOST_PORT`, which the gateway
-/// supervisor exports at reconcile time from `settings.host_port` — the same
-/// way it exports the shared secret. This used to be a `const` pinned to
-/// 8090, which made `host_port` a setting that moved the container but not
-/// the proxy: previews then 403'd with "missing or invalid
-/// X-Temps-Preview-Token", because the proxy was signing for our gateway and
-/// dialling whatever else held 8090.
-pub fn preview_gateway_peer() -> String {
-    #[allow(
-        clippy::disallowed_methods,
-        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). PREVIEW_GATEWAY_HOST_PORT"
-    )]
-    let port = std::env::var("PREVIEW_GATEWAY_HOST_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok())
-        .filter(|p| *p != 0)
-        .unwrap_or(DEFAULT_PREVIEW_GATEWAY_PORT);
-    format!("127.0.0.1:{port}")
-}
-
 /// Maximum number of failed auth attempts allowed per (client_ip, sandbox_hex)
 /// inside [`RATE_LIMIT_WINDOW`] before the proxy starts rejecting with 429.
 const MAX_FAILURES: u32 = 10;
@@ -863,6 +836,21 @@ impl SandboxLookupCache {
     #[cfg(test)]
     async fn seed(&self, hex: &str, lookup: PreviewSandboxLookup) {
         self.cache.insert(hex.to_string(), lookup).await;
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn seed_public_local(&self, hex: &str) {
+        self.seed(
+            hex,
+            PreviewSandboxLookup::Found(Arc::new(PreviewGate {
+                sandbox_id: 42,
+                on_worker: false,
+                allowed: Vec::new(),
+                restricted: false,
+                access: PreviewGateAccess::Public,
+            })),
+        )
+        .await;
     }
 
     /// Look up a sandbox by its hex suffix, using the in-memory cache.

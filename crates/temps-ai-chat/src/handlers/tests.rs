@@ -197,7 +197,7 @@ fn workspace_import_body_limit_fits_the_bounded_base64_request() {
 
 #[test]
 fn workspace_file_upload_decodes_only_safe_bounded_paths() {
-    let limits = temps_core::AiWorkspaceFileLimitsSettings::default();
+    let limits = temps_config::AiWorkspaceFileLimitsSettings::default();
     let decoded = decode_workspace_file_writes(
         WriteApplicationWorkspaceFilesRequest {
             files: vec![ApplicationWorkspaceFileWrite {
@@ -274,10 +274,10 @@ fn workspace_file_upload_decodes_only_safe_bounded_paths() {
 
 #[test]
 fn workspace_file_upload_enforces_the_runtime_policy() {
-    let limits = temps_core::AiWorkspaceFileLimitsSettings {
+    let limits = temps_config::AiWorkspaceFileLimitsSettings {
         max_file_size_mb: 1,
         max_upload_size_mb: 2,
-        ..temps_core::AiWorkspaceFileLimitsSettings::default()
+        ..temps_config::AiWorkspaceFileLimitsSettings::default()
     };
     let oversized = decode_workspace_file_writes(
         WriteApplicationWorkspaceFilesRequest {
@@ -298,7 +298,7 @@ fn oversized_workspace_download_maps_to_payload_too_large() {
     let error = Problem::from(ApplicationError::WorkspaceDownloadTooLarge {
         path: "large.bin".to_string(),
         max_bytes: mb_bytes(
-            temps_core::AiWorkspaceFileLimitsSettings::default().max_download_size_mb,
+            temps_config::AiWorkspaceFileLimitsSettings::default().max_download_size_mb,
         ),
     });
 
@@ -347,9 +347,9 @@ fn normal_workspace_user_can_read_effective_file_policy_without_settings_access(
     assert!(auth.has_permission(&Permission::SandboxesRead));
     assert!(!auth.has_permission(&Permission::SettingsRead));
 
-    let effective = effective_workspace_file_limits(temps_core::AiWorkspaceFileLimitsSettings {
+    let effective = effective_workspace_file_limits(temps_config::AiWorkspaceFileLimitsSettings {
         max_download_size_mb: 128,
-        ..temps_core::AiWorkspaceFileLimitsSettings::default()
+        ..temps_config::AiWorkspaceFileLimitsSettings::default()
     });
     assert_eq!(effective.max_download_size_mb, 32);
 }
@@ -499,7 +499,7 @@ fn application_drop_archive_rejects_workspace_symlinks() {
     let error =
         prepare_application_drop_archive(workspace.path()).expect_err("symlink must be rejected");
 
-    assert!(matches!(error, ApplicationDropArchiveError::Symlink(_)));
+    assert!(matches!(error, ApplicationDropArchiveError::Symlink { .. }));
 }
 
 #[cfg(unix)]
@@ -761,10 +761,53 @@ fn application_workspace_image_pull_failure_is_a_503() {
         reason: "manifest unknown".to_string(),
     };
 
-    let problem = application_workspace_failure_problem(&error);
-
-    assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
     assert!(application_workspace_failure_detail(&error).contains("image tag is published"));
+    let problem = application_workspace_failure_problem(error);
+    assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+}
+
+#[test]
+fn workspace_status_preserves_configured_limits_and_diagnostics_during_capacity_outage() {
+    let configured = temps_sandbox::services::ApplicationWorkspaceConfig {
+        cpu_limit: Some(1.5),
+        ..Default::default()
+    };
+    let mut diagnostic = Some("Workspace startup failed.".into());
+    let unavailable = || {
+        Err(temps_sandbox::error::SandboxError::Unavailable {
+            reason: "provider connection detail".into(),
+        })
+    };
+    assert_eq!(
+        workspace_status_limits("workspace", &configured, unavailable(), &mut diagnostic),
+        (1.5, 8192)
+    );
+    assert_eq!(diagnostic.as_deref(), Some("Workspace startup failed. Host capacity is temporarily unavailable. Showing configured workspace limits."));
+    let mut global_diagnostic = None;
+    assert_eq!(
+        workspace_status_limits(
+            "global",
+            &Default::default(),
+            unavailable(),
+            &mut global_diagnostic
+        ),
+        (4.0, 8192)
+    );
+    assert!(global_diagnostic.is_some());
+}
+
+#[test]
+fn application_workspace_cpu_override_explains_host_range() {
+    let problem =
+        application_workspace_failure_problem(temps_sandbox::error::SandboxError::CpuLimit {
+            sandbox_id: "workspace".into(),
+            requested: 4.0,
+            host: 2.0,
+            max: 2.0,
+        });
+    assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    let message = serde_json::to_string(&problem.body).unwrap_or_default();
+    assert!(message.contains("4") && message.contains("0.01") && message.contains("2"));
 }
 
 #[test]
@@ -917,7 +960,10 @@ fn title_of(p: &Problem) -> Option<String> {
 
 #[test]
 fn test_not_found_maps_to_404() {
-    let p: Problem = ChatError::NotFound("abc".to_string()).into();
+    let p: Problem = ChatError::NotFound {
+        conversation_id: "abc".to_string(),
+    }
+    .into();
     assert_eq!(p.status_code, StatusCode::NOT_FOUND);
     assert_eq!(title_of(&p).as_deref(), Some("Conversation Not Found"));
 }
@@ -931,7 +977,10 @@ fn test_project_not_found_maps_to_404() {
 
 #[test]
 fn test_no_provider_maps_to_404_context_unavailable() {
-    let p: Problem = ChatError::NoProvider("deployment".to_string()).into();
+    let p: Problem = ChatError::NoProvider {
+        context_type: "deployment".to_string(),
+    }
+    .into();
     assert_eq!(p.status_code, StatusCode::NOT_FOUND);
     assert_eq!(title_of(&p).as_deref(), Some("Context Not Available"));
 }

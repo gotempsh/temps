@@ -30,6 +30,7 @@ interface RetainedFailedContainersProps {
   environmentId: number
   deploymentId: number
   deploymentStatus: string | null | undefined
+  showLogsInitially?: boolean
 }
 
 export function RetainedFailedContainersLoadError({
@@ -69,10 +70,18 @@ export function RetainedFailedContainers({
   environmentId,
   deploymentId,
   deploymentStatus,
+  showLogsInitially = false,
 }: RetainedFailedContainersProps) {
-  const [expandedContainerId, setExpandedContainerId] = useState<string | null>(
-    null
-  )
+  // Scoped to the deployment it was made on, so a choice made on one
+  // deployment never hides (or points at) another deployment's containers.
+  const [expandedChoice, setExpandedChoice] = useState<{
+    deploymentId: number
+    containerId: string | null
+  }>()
+  const expandedContainerId =
+    expandedChoice?.deploymentId === deploymentId
+      ? expandedChoice.containerId
+      : undefined
   const isFailed = deploymentStatus === 'failed'
   const { data, isPending, isError, refetch } = useQuery({
     ...listContainerHistoryOptions({
@@ -105,6 +114,12 @@ export function RetainedFailedContainers({
 
   const retained = currentRetainedContainers(data?.containers)
   if (retained.length === 0) return null
+  const visibleContainerId =
+    expandedContainerId === undefined
+      ? showLogsInitially
+        ? retained[0].container_id
+        : null
+      : expandedContainerId
 
   return (
     <Card className="border-amber-500/40 bg-amber-500/5">
@@ -126,7 +141,7 @@ export function RetainedFailedContainers({
 
         <div className="flex flex-col gap-2">
           {retained.map((container) => {
-            const isExpanded = expandedContainerId === container.container_id
+            const isExpanded = visibleContainerId === container.container_id
             const panelId = `retained-container-logs-${container.id}`
 
             return (
@@ -153,12 +168,13 @@ export function RetainedFailedContainers({
                       aria-expanded={isExpanded}
                       aria-controls={panelId}
                       onClick={() =>
-                        setExpandedContainerId((current) =>
-                          toggleRetainedContainerLogs(
-                            current,
+                        setExpandedChoice({
+                          deploymentId,
+                          containerId: toggleRetainedContainerLogs(
+                            visibleContainerId,
                             container.container_id
-                          )
-                        )
+                          ),
+                        })
                       }
                     >
                       {isExpanded ? 'Hide logs' : 'Show logs'}

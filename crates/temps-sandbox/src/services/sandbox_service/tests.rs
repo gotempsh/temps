@@ -176,6 +176,8 @@ fn application_workspace_config_preserves_explicit_image_and_maps_null_runtime()
         desired_state: "running".to_string(),
         runtime: "python".to_string(),
         image: None,
+        cpu_limit_explicit: false,
+        memory_limit_explicit: false,
         cpu_limit: 1.0,
         memory_limit_mb: 1024,
         pids_limit: 128,
@@ -198,6 +200,28 @@ fn application_workspace_config_preserves_explicit_image_and_maps_null_runtime()
         explicit.image.as_deref(),
         Some("ghcr.io/gotempsh/temps-sandbox-all:0.2.0")
     );
+
+    // Earlier versions stored numeric defaults for every row. Preserve custom legacy limits,
+    // and distinguish a newly selected default-sized value from an inherited one.
+    assert_eq!(
+        (mapped.cpu_limit, mapped.memory_limit_mb),
+        (Some(1.0), Some(1024))
+    );
+    row.cpu_limit = ApplicationWorkspaceConfig::DEFAULT_CPU;
+    row.memory_limit_mb = ApplicationWorkspaceConfig::DEFAULT_MEMORY_MB as i64;
+    let inherited = ApplicationWorkspaceConfig::from(&row);
+    assert_eq!(
+        (inherited.cpu_limit, inherited.memory_limit_mb),
+        (None, None)
+    );
+    row.memory_limit_explicit = true;
+    let pinned = ApplicationWorkspaceConfig::from(&row);
+    assert_eq!(
+        (pinned.cpu_limit, pinned.memory_limit_mb),
+        (None, Some(8192))
+    );
+    row.cpu_limit_explicit = true;
+    assert_eq!(ApplicationWorkspaceConfig::from(&row).cpu_limit, Some(4.0));
 }
 
 #[test]
@@ -244,7 +268,7 @@ fn stripped_git_metadata_targets_only_the_imported_repository() {
 
 #[test]
 fn requested_backend_accepts_public_backends_only() {
-    use temps_ai_agents::sandbox::SandboxBackend;
+    use temps_sandbox_providers::SandboxBackend;
     assert_eq!(parse_requested_backend(None).unwrap(), None);
     assert_eq!(
         parse_requested_backend(Some("docker")).unwrap(),
@@ -273,13 +297,13 @@ fn requested_backend_accepts_public_backends_only() {
 #[test]
 fn unavailable_microsandbox_explains_itself() {
     let message =
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Microsandbox);
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Microsandbox);
     assert!(
         message.starts_with("backend 'microsandbox' is not available on this host: "),
         "{message}"
     );
     let firecracker =
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Firecracker);
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Firecracker);
     assert!(
         firecracker.starts_with("backend 'firecracker' is not available on this host: "),
         "{firecracker}"
@@ -290,7 +314,7 @@ fn unavailable_microsandbox_explains_itself() {
     );
     assert!(firecracker.contains("restart temps"), "{firecracker}");
     assert_eq!(
-        backend_unavailable_message(temps_ai_agents::sandbox::SandboxBackend::Docker),
+        backend_unavailable_message(temps_sandbox_providers::SandboxBackend::Docker),
         "backend 'docker' is not available on this host"
     );
 }
@@ -298,11 +322,11 @@ fn unavailable_microsandbox_explains_itself() {
 #[test]
 fn microvm_backends_stage_source_imports_under_root_home() {
     assert_eq!(
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Microsandbox, 42),
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Microsandbox, 42),
         "/root/.temps-source-import-42"
     );
     assert_eq!(
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Firecracker, 42),
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Firecracker, 42),
         "/root/.temps-source-import-42"
     );
 }
@@ -310,13 +334,12 @@ fn microvm_backends_stage_source_imports_under_root_home() {
 #[test]
 fn source_imports_use_bounded_staging_and_process_deadlines() {
     let nested_stage =
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Docker, 42);
+        source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Docker, 42);
     assert_eq!(
         nested_stage,
         "/run/temps-source-import/.temps-source-import-42"
     );
-    let local_stage =
-        source_import_staging_dir(temps_ai_agents::sandbox::SandboxBackend::Local, 42);
+    let local_stage = source_import_staging_dir(temps_sandbox_providers::SandboxBackend::Local, 42);
     assert_eq!(local_stage, "/tmp/.temps-source-import-42");
 
     let command = source_import_command_script(&nested_stage, "git clone repo target");
@@ -433,7 +456,7 @@ fn application_workspace_reuse_requires_server_attestation() {
         name: "ai-application:app_example".to_string(),
         status: "running".to_string(),
         image: config.image.clone(),
-        work_dir: temps_ai_agents::sandbox::SANDBOX_WORK_DIR.to_string(),
+        work_dir: temps_sandbox_providers::SANDBOX_WORK_DIR.to_string(),
         timeout_secs: 3600,
         metadata: Some(serde_json::json!({
             "managed_application_id": "app_example",
@@ -556,6 +579,33 @@ fn preview_test_service(
     (service, db)
 }
 
+/// Start tracking a create on `service`, as `create_sandbox` does, for
+/// handler tests of the progress routes.
+pub(crate) fn track_creation(
+    service: &SandboxService,
+    user_id: i32,
+    creation_id: &str,
+) -> crate::services::creation_progress::CreationProgress {
+    service
+        .creations
+        .begin(user_id, Some(creation_id))
+        .expect("a valid, unused creation id")
+}
+
+/// The image-preparation service over `service`'s database and provider,
+/// for handler tests that build a `SandboxAppState`.
+pub(crate) fn image_preparation_for(
+    service: &Arc<SandboxService>,
+) -> Arc<crate::services::image_preparation::ImagePreparationService> {
+    Arc::new(
+        crate::services::image_preparation::ImagePreparationService::new(
+            service.db.clone(),
+            service.registry.provider_arc(),
+            service.clone(),
+        ),
+    )
+}
+
 pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> SandboxService {
     let platform_config = Arc::new(ConfigService::new(
         Arc::new(test_server_config()),
@@ -566,9 +616,10 @@ pub(crate) fn preview_test_service_with_db(db: Arc<DatabaseConnection>) -> Sandb
         Arc::new(temps_core::EncryptionService::new_from_password("test")),
         Arc::new(NoopJobQueue),
         platform_config.clone(),
+        Arc::new(temps_core::NoopAuditLogger),
     ));
     let registry = Arc::new(StandaloneSandboxRegistry::local_only(Arc::new(
-        temps_ai_agents::sandbox::local::LocalSandboxProvider::new(),
+        temps_sandbox_providers::local::LocalSandboxProvider::new(),
     )));
     SandboxService::new(
         db.clone(),
@@ -596,7 +647,7 @@ fn default_request_is_empty() {
 
 #[test]
 fn allow_docker_requires_explicit_microsandbox_backend() {
-    use temps_ai_agents::sandbox::SandboxBackend;
+    use temps_sandbox_providers::SandboxBackend;
     for backend in [
         None,
         Some(SandboxBackend::Docker),
@@ -661,7 +712,7 @@ fn work_dir_to_remove_refuses_ids_that_escape_the_data_root() {
 
 /// The cross-crate half of the naming agreement.
 ///
-/// `temps-sandbox` decides the container label; `temps-ai-agents` turns a
+/// `temps-sandbox` decides the container label; `temps-sandbox-providers` turns a
 /// container name into a volume name. Nothing at the type level forces
 /// those to line up, and the leak this PR fixes was exactly one identity
 /// derived independently in two places. If either side changes its
@@ -675,13 +726,13 @@ fn sandbox_service_and_provider_agree_on_volume_naming() {
     // What the provider will name the volume for a container built from
     // this label, i.e. what `destroy` will try to remove.
     assert_eq!(
-        temps_ai_agents::sandbox::home_volume_name_for_label(label),
+        temps_sandbox_providers::home_volume_name_for_label(label),
         "temps-sandbox-home-v2-a1b2c3d4e5f60718"
     );
 
     // And it must not be a name from the pre-fix namespace, where a
     // stranded volume from another tenant could still be sitting.
-    assert!(!temps_ai_agents::sandbox::home_volume_name_for_label(label)
+    assert!(!temps_sandbox_providers::home_volume_name_for_label(label)
         .trim_start_matches("temps-sandbox-home-")
         .chars()
         .all(|c| c.is_ascii_digit()));
@@ -1058,7 +1109,7 @@ fn run_status_is_terminal_matches_run_lifecycle() {
     for s in TERMINAL_RUN_STATUSES {
         assert!(run_status_is_terminal(Some(s)), "{} must be terminal", s);
     }
-    for s in temps_ai_agents::services::run_service::ACTIVE_RUN_STATUSES {
+    for s in temps_agent_core::run_status::ACTIVE_RUN_STATUSES {
         assert!(
             !run_status_is_terminal(Some(s)),
             "{} must NOT be terminal",

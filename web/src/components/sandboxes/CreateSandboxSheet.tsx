@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, type ReactNode } from 'react'
+import { useEffect, useState, type ReactNode } from 'react'
 import { useNavigate } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -11,6 +11,7 @@ import { toast } from 'sonner'
 import {
   createSandboxMutation,
   getSandboxPlacementOptions,
+  getSandboxResourceDefaultsOptions,
   listSandboxesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -50,13 +51,25 @@ import {
   PREVIEW_PASSWORD_MIN_LEN,
   backendChoices,
   createSandboxFormDefaults,
-  createSandboxFormSchema,
+  placementSchema,
+  defaultHint,
+  SELECTABLE_BACKENDS,
   nodeRunsBackend,
   targetNode,
   toCreateSandboxBody,
   type CreateSandboxFormValues,
 } from './sandbox-create'
 import { SandboxBackendLogo } from './SandboxBackendLogo'
+import { SandboxCreationSteps } from './SandboxCreationSteps'
+import { useSandboxCreation } from './useSandboxCreation'
+import { creationUntracked, newCreationId } from './sandbox-creation'
+
+function resourceQuery(node: string, backend: string) {
+  return {
+    node: node === AUTO_NODE ? undefined : node,
+    backend: SELECTABLE_BACKENDS.find((value) => value === backend),
+  }
+}
 
 const LIFECYCLES = [
   {
@@ -73,10 +86,14 @@ const LIFECYCLES = [
   },
 ] as const
 
-const BACKEND_DESCRIPTIONS: Record<string, { title: string; description: string }> = {
+const BACKEND_DESCRIPTIONS: Record<
+  string,
+  { title: string; description: string }
+> = {
   docker: {
     title: 'Docker',
-    description: 'A namespaced container. Starts fastest and runs on every node.',
+    description:
+      'A namespaced container. Starts fastest and runs on every node.',
   },
   firecracker: {
     title: 'Firecracker',
@@ -114,7 +131,16 @@ export function CreateSandboxSheet({
   const queryClient = useQueryClient()
 
   const form = useForm<CreateSandboxFormValues>({
-    resolver: zodResolver(createSandboxFormSchema),
+    resolver: (values, context, options) =>
+      zodResolver(
+        placementSchema(
+          queryClient.getQueryData(
+            getSandboxResourceDefaultsOptions({
+              query: resourceQuery(values.node, values.backend),
+            }).queryKey
+          )
+        )
+      )(values, context, options),
     defaultValues: createSandboxFormDefaults,
   })
 
@@ -130,12 +156,22 @@ export function CreateSandboxSheet({
   })
   const { reset: resetCreate } = create
 
+  // The id the current attempt's steps are tracked under. Set on submit,
+  // kept after a failure so the failed step stays on screen.
+  const [creationId, setCreationId] = useState<string | null>(null)
+  // When this attempt's create request ended: a 404 read before then may
+  // predate the server registering the id, so it is read again after.
+  const [requestEndedAt, setRequestEndedAt] = useState<number | null>(null)
+  const creation = useSandboxCreation(creationId, requestEndedAt)
+
   // Start from a clean form, and without the previous attempt's error, each
   // time the sheet is opened (it stays mounted while closed).
   useEffect(() => {
     if (!open) return
     form.reset(createSandboxFormDefaults)
     resetCreate()
+    setCreationId(null)
+    setRequestEndedAt(null)
   }, [open, form, resetCreate])
 
   const placement = useQuery({
@@ -147,11 +183,35 @@ export function CreateSandboxSheet({
   const nodes = allNodes.filter((node) => node.eligible)
   const selectedNode = form.watch('node')
   const selectedBackend = form.watch('backend')
+  const { data: hints } = useQuery({
+    ...getSandboxResourceDefaultsOptions({
+      query: resourceQuery(selectedNode, selectedBackend),
+    }),
+    enabled: open && available,
+    retry: false,
+  })
   const backends = backendChoices(allNodes, selectedNode)
   const target = targetNode(allNodes, selectedNode)
 
-  const submit = (values: CreateSandboxFormValues) =>
-    create.mutate({ body: toCreateSandboxBody(values) })
+  const submit = (values: CreateSandboxFormValues) => {
+    const id = newCreationId()
+    setCreationId(id)
+    setRequestEndedAt(null)
+    create.mutate(
+      { body: { ...toCreateSandboxBody(values), creation_id: id } },
+      { onSettled: () => setRequestEndedAt(Date.now()) }
+    )
+  }
+  // A refused create the server never tracked has no steps: its error
+  // alone says what happened. Steps the server stopped tracking (a 404
+  // after they were read: it restarted) would stay "running" forever, so
+  // they are dropped too.
+  const showSteps =
+    creationId !== null &&
+    (create.isPending ||
+      (create.isError &&
+        creation.data !== undefined &&
+        !(creation.isError && creationUntracked(creation.error))))
 
   return (
     <Sheet
@@ -282,7 +342,11 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints && hints.timeout_secs / 60,
+                          'minutes',
+                          hints && hints.max_timeout_secs / 60
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -316,7 +380,12 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="decimal"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.cpu,
+                          'cores',
+                          hints?.max_cpu,
+                          hints?.host_cpu_cores
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -333,7 +402,12 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.memory_mb,
+                          'MB',
+                          hints?.max_memory_mb,
+                          hints?.host_memory_mb
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -350,7 +424,11 @@ export function CreateSandboxSheet({
                     <FormControl>
                       <Input
                         inputMode="numeric"
-                        placeholder="platform default"
+                        placeholder={defaultHint(
+                          hints?.pids,
+                          'processes',
+                          hints?.max_pids
+                        )}
                         {...field}
                       />
                     </FormControl>
@@ -371,7 +449,8 @@ export function CreateSandboxSheet({
                         // A backend the new node cannot run goes back to the
                         // default rather than failing the create.
                         const still = backendChoices(allNodes, value).find(
-                          (choice) => choice.backend === form.getValues('backend')
+                          (choice) =>
+                            choice.backend === form.getValues('backend')
                         )
                         if (still && !still.available) {
                           form.setValue('backend', DEFAULT_BACKEND)
@@ -441,7 +520,9 @@ export function CreateSandboxSheet({
                             title={text?.title ?? choice.backend}
                             description={text?.description ?? ''}
                             reason={choice.available ? null : choice.reason}
-                            logo={<SandboxBackendLogo backend={choice.backend} />}
+                            logo={
+                              <SandboxBackendLogo backend={choice.backend} />
+                            }
                           />
                         )
                       })}
@@ -480,15 +561,16 @@ export function CreateSandboxSheet({
               )}
             />
 
-            {create.isPending && (
-              <Alert>
-                <AlertDescription>
-                  Starting the sandbox. The first one on a node builds its
-                  image, which can take several minutes. You can close this
-                  panel: it keeps starting and appears in the sandbox list
-                  when it is ready.
-                </AlertDescription>
-              </Alert>
+            {showSteps && (
+              <div className="space-y-2 rounded-lg border p-3">
+                <SandboxCreationSteps creation={creation.data} />
+                {create.isPending && (
+                  <p className="text-xs text-muted-foreground">
+                    You can close this panel: the sandbox keeps starting and
+                    appears in the sandbox list when it is ready.
+                  </p>
+                )}
+              </div>
             )}
 
             {create.isError && (

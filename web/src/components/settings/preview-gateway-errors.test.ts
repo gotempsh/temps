@@ -21,7 +21,7 @@ describe('previewGatewayErrorMessage', () => {
     )
 
     expect(message).toContain('Host port 18090 is already in use')
-    expect(message).toContain('Change the configured host port below')
+    expect(message).toContain('Choose a free host port and save settings')
     expect(message).not.toContain('container gateway')
   })
 

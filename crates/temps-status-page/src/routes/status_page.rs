@@ -13,7 +13,7 @@ use axum::{
     Json, Router,
 };
 use serde::Deserialize;
-use temps_auth::{
+use temps_authz::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     RequireAuth,
 };
@@ -23,7 +23,10 @@ use temps_core::{AuditLogger, DateTime, RequestMetadata};
 use utoipa::OpenApi;
 
 use super::audit::{StatusPageMutationAction, StatusPageMutationAudit};
-use super::public::{__path_get_public_status_page, __path_get_public_status_page_json};
+use super::public::{
+    __path_get_public_status_page, __path_get_public_status_page_feed,
+    __path_get_public_status_page_json, __path_unlock_public_status_page,
+};
 use super::status_pages::{
     __path_add_status_page_domain, __path_create_status_page, __path_delete_status_page,
     __path_get_status_page, __path_list_status_page_domains, __path_list_status_pages,
@@ -38,12 +41,12 @@ use super::status_pages::{
 use crate::services::public_pages::{
     AddStatusPageDomainRequest, CreateStatusPageRequest, DnsRecordInstruction,
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, StatusPageAppearance, StatusPageAppearanceInput, StatusPageDomainResponse,
-    StatusPageDomainService, StatusPageDomainStatus, StatusPageListResponse,
-    StatusPageMonitorInput, StatusPageMonitorResponse, StatusPagePreviewResponse,
-    StatusPageProject, StatusPageResponse, StatusPageTheme, UpdateStatusPageRequest,
-    VerificationMethod,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    StatusPageAppearanceInput, StatusPageDomainResponse, StatusPageDomainService,
+    StatusPageDomainStatus, StatusPageListResponse, StatusPageMonitorInput,
+    StatusPageMonitorResponse, StatusPagePreviewResponse, StatusPageProject, StatusPageResponse,
+    StatusPageTheme, UpdateStatusPageRequest, VerificationMethod,
 };
 use crate::services::{
     CreateIncidentRequest, CreateMonitorRequest, CurrentStatusResponse, IncidentBucketedResponse,
@@ -104,6 +107,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
         remove_status_page_domain,
         get_public_status_page,
         get_public_status_page_json,
+        get_public_status_page_feed,
+        unlock_public_status_page,
     ),
     components(
         schemas(
@@ -144,6 +149,8 @@ pub trait StatusPageAppState: Send + Sync + 'static {
             PublicIncidentSeverity,
             PublicIncidentStatus,
             PublicIncidentUpdate,
+            PublicMaintenance,
+            PublicMaintenanceStatus,
             AddStatusPageDomainRequest,
             StatusPageDomainResponse,
             StatusPageDomainStatus,
@@ -1203,6 +1210,8 @@ where
 pub struct ProjectsHealthQuery {
     /// Comma-separated list of project IDs
     pub project_ids: String,
+    /// Select one environment within the authorized projects; defaults to production.
+    pub environment_id: Option<i32>,
 }
 
 /// Batch response for projects health
@@ -1264,7 +1273,7 @@ where
     let summaries = app_state
         .status_page_service()
         .monitor_service()
-        .get_projects_monitor_health(&project_ids)
+        .get_projects_monitor_health_for_environment(&project_ids, query.environment_id)
         .await
         .map_err(map_error)?;
 
@@ -1284,7 +1293,7 @@ where
 /// request with up to 100 project ids does not cause one authorization query
 /// sequence per project.
 async fn require_projects_monitor_health_access(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     checker: Option<&dyn temps_core::ProjectAccessChecker>,
     project_ids: &[i32],
 ) -> Result<(), Problem> {
@@ -1315,7 +1324,7 @@ async fn require_projects_monitor_health_access(
 
     // Instance administrators retain the same bypass as the single-project
     // project access and permission guards.
-    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::permissions::Role::PlatformAdmin) {
         return Ok(());
     }
 
@@ -1331,7 +1340,7 @@ async fn require_projects_monitor_health_access(
         return Err(projects_monitor_health_access_check_failed());
     };
 
-    let required_permission = temps_auth::permissions::Permission::StatusPageRead.to_string();
+    let required_permission = temps_authz::permissions::Permission::StatusPageRead.to_string();
     let permissions = checker
         .effective_project_permissions_batch(user_id, &unique_project_ids)
         .await
@@ -1518,6 +1527,7 @@ where
 pub(crate) fn map_error(error: StatusPageError) -> Problem {
     match error {
         StatusPageError::NotFound => not_found().detail("Resource not found").build(),
+        StatusPageError::TargetMonitor(error) => Problem::from(error),
         error @ (StatusPageError::StatusPageNotFound { .. }
         | StatusPageError::IncidentUpdateNotFound { .. }
         | StatusPageError::IncidentNotFound { .. }
@@ -1662,15 +1672,15 @@ mod tests {
             Mutex,
         },
     };
-    use temps_auth::context::AuthContext;
-    use temps_auth::permissions::{Permission, Role};
+    use temps_authz::context::AuthContext;
+    use temps_authz::permissions::{Permission, Role};
     use temps_config::ConfigService;
     use temps_core::{NoopTelemetryReporter, ProjectAccessChecker, TelemetryReporter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_tokens::DeploymentTokenPermission, environments, projects,
         upstream_config::UpstreamList, users,
     };
+    use temps_test_utils::TestDatabase;
 
     /// Mock team-based project access checker: allows only the projects
     /// listed in `allowed`, mirroring the plugin `TeamProjectAccessChecker`
@@ -1848,7 +1858,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -1861,10 +1871,13 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::AuditOperation,
-        ) -> anyhow::Result<()> {
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.attempts.fetch_add(1, Ordering::SeqCst);
-            Err(anyhow::anyhow!("simulated audit persistence failure"))
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "simulated audit persistence failure",
+            ))
         }
     }
 

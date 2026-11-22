@@ -10,6 +10,7 @@
 //! code relocated behind the trait.
 
 use std::sync::Arc;
+use temps_core::escape::escape_like;
 
 use async_trait::async_trait;
 use sea_orm::{
@@ -507,6 +508,7 @@ fn pg_dimension_expression(dimension: TrafficDimension) -> &'static str {
         TrafficDimension::OperatingSystem => "NULLIF(operating_system, '')",
         TrafficDimension::DeviceType => "NULLIF(device_type, '')",
         TrafficDimension::CacheStatus => "NULLIF(cache_status, '')",
+        TrafficDimension::Referrer => "NULLIF(referrer, '')",
     }
 }
 
@@ -596,12 +598,6 @@ fn bind_filter_value(
         }),
         _ => Ok(raw.to_owned().into()),
     }
-}
-
-fn escape_like(raw: &str) -> String {
-    raw.replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 fn append_pg_filter(
@@ -986,6 +982,43 @@ mod tests {
         let _store = make_store();
     }
 
+    /// The not-found report (ADR 109 D1) groups 404s by path and by the page
+    /// that linked to them. An empty `Referer` must group as null so that
+    /// "no referrer" can be filtered out rather than ranked as a source.
+    #[test]
+    fn traffic_query_groups_by_referrer_with_empty_values_as_null() {
+        let request = TrafficAggregationRequest {
+            start_time: chrono::Utc::now() - chrono::Duration::days(7),
+            end_time: chrono::Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::Path, TrafficDimension::Referrer],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![
+                TrafficFilter {
+                    dimension: TrafficDimension::StatusCode,
+                    operator: TrafficFilterOperator::Eq,
+                    values: vec!["404".to_string()],
+                },
+                TrafficFilter {
+                    dimension: TrafficDimension::Referrer,
+                    operator: TrafficFilterOperator::NotEq,
+                    values: vec![String::new()],
+                },
+            ],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, values, count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("CAST(NULLIF(referrer, '') AS TEXT) AS d1"));
+        assert!(sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert!(sql.contains("status_code = $4"));
+        assert!(sql.contains("NULLIF(referrer, '') <> $5"));
+        assert!(count_sql.contains("GROUP BY path, NULLIF(referrer, '')"));
+        assert_eq!(values.len(), 5);
+    }
+
     #[test]
     fn traffic_query_supports_multi_dimension_metrics_and_excludes_monitor() {
         let mut request = TrafficAggregationRequest {
@@ -1039,7 +1072,7 @@ mod tests {
     /// whole-batch retry cannot insert them a second time.
     #[tokio::test]
     async fn a_multi_statement_batch_lands_whole_or_not_at_all() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1111,7 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn timescale_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

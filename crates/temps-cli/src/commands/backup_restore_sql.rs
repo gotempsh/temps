@@ -951,7 +951,7 @@ ALTER ROLE temps_reader WITH LOGIN PASSWORD 'SCRAM-reader';
     async fn restoring_mode_reaches_later_sessions_and_is_always_left() {
         use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 
-        let Ok(test_db) = temps_database::test_utils::TestDatabase::new_isolated().await else {
+        let Ok(test_db) = temps_test_utils::TestDatabase::new_isolated().await else {
             eprintln!("Docker unavailable; skipping the restoring mode test");
             return;
         };

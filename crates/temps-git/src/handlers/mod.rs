@@ -10,6 +10,7 @@ pub mod gitea;
 pub mod github;
 pub mod gitlab;
 pub mod public;
+mod pull_request;
 pub mod reauthorize;
 pub mod repositories;
 pub mod types;
@@ -27,6 +28,14 @@ pub use public::PublicRepositoriesApiDoc;
 /// what these routes accepted before they declared a limit (axum's default),
 /// so no delivery that worked is refused; the other providers set their own.
 pub(crate) const PROVIDER_EVENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// Extract a branch without changing occurrences of the prefix inside its name.
+fn branch_from_ref(git_ref: &str, allow_bare: bool) -> Option<String> {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| (allow_bare && !git_ref.starts_with("refs/")).then_some(git_ref))
+        .map(str::to_owned)
+}
 
 /// Configure the session-authenticated routes for git providers: provider and
 /// connection management, repository browsing, and the OAuth/installation
@@ -81,7 +90,7 @@ mod public_route_tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -116,7 +125,15 @@ mod public_route_tests {
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
     pub(super) fn state() -> Arc<AppState> {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        state_over(MockDatabase::new(DatabaseBackend::Postgres))
+    }
+
+    /// Like [`state`], over a database the test has queued results on.
+    pub(super) fn state_over(database: MockDatabase) -> Arc<AppState> {
+        state_with_db(Arc::new(database.into_connection()))
+    }
+
+    pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(
@@ -141,6 +158,7 @@ mod public_route_tests {
                 ),
                 queue.clone(),
                 config_service.clone(),
+                Arc::new(temps_core::NoopAuditLogger),
             ),
         );
         let github_service = Arc::new(crate::services::github::GithubAppService::new(
@@ -231,6 +249,7 @@ mod public_route_tests {
     #[tokio::test]
     async fn browser_callbacks_and_management_routes_stay_off_the_public_router() {
         for path in [
+            "/git-providers/github/manifest/start",
             "/webhook/git/github/auth",
             "/webhook/git/github/callback",
             "/webhook/git/github/install",

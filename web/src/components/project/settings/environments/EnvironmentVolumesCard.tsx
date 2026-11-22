@@ -43,7 +43,6 @@ import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { useIsInstanceAdmin } from '@/hooks/useIsInstanceAdmin'
 import { problemDetail } from '@/lib/api-problem'
 import {
-  WORKLOAD_PLANE_SECTION_ID,
   attachEnvironmentVolume,
   attachVolumeFormSchema,
   createEnvironmentVolume,
@@ -56,10 +55,10 @@ import {
   getEnvironmentVolumeStatus,
   isPermissionDenied,
   listEnvironmentVolumes,
-  placementExplanationQueryKey,
   toCreateVolumeRequest,
   volumeDeleteConsequence,
   volumeDeletedMessage,
+  volumeBlockerText,
   volumeLocation,
   type AttachVolumeFormValues,
   type CreateVolumeFormValues,
@@ -71,14 +70,6 @@ const PAGE_SIZE = 20
 const TITLE = 'Volumes'
 const DESCRIPTION =
   'Keep data such as uploads or a SQLite file across deployments by mounting a volume into every replica.'
-
-/** Open the workload-plane section on this page and scroll to it. */
-function revealWorkloadPlane() {
-  const section = document.getElementById(WORKLOAD_PLANE_SECTION_ID)
-  if (!section) return
-  if (section instanceof HTMLDetailsElement) section.open = true
-  section.scrollIntoView({ behavior: 'smooth', block: 'start' })
-}
 
 /**
  * An environment's volumes (ADR-055 §12): create, attach at a mount path,
@@ -129,10 +120,6 @@ export function EnvironmentVolumesCard({
   const refresh = () => {
     void queryClient.invalidateQueries({
       queryKey: environmentVolumesQueryKey(environmentId),
-    })
-    // An attached volume pins the environment; the explanation shows it.
-    void queryClient.invalidateQueries({
-      queryKey: placementExplanationQueryKey(environmentId),
     })
   }
 
@@ -620,37 +607,21 @@ function StatusView({
       </Callout>
     )
   }
-  const fixInWorkloadPlane = status.workload_mode !== 'enforce'
-  const requirement =
-    'Volumes are mounted only when the workload mode is Enforce, the environment runs one replica, and the data lives on the control plane.'
+  const reason = volumeBlockerText(status)
   if (status.attached === 0) {
     return (
       <Callout tone="info" title="No volume attached">
-        <p>{requirement}</p>
-        {status.reason ? (
-          <p className="mt-1 text-muted-foreground">{status.reason}</p>
-        ) : null}
+        <p>{reason}</p>
       </Callout>
     )
   }
   return (
     <Callout tone="warning" title="Attached volumes would not be mounted">
-      <p>{status.reason ?? requirement}</p>
+      <p>{reason}</p>
       <p className="mt-1 text-muted-foreground">
         Until this is fixed, the next deployment of this environment fails with
         this reason.
       </p>
-      {fixInWorkloadPlane ? (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          className="mt-2"
-          onClick={revealWorkloadPlane}
-        >
-          Open workload plane settings
-        </Button>
-      ) : null}
     </Callout>
   )
 }

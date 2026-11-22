@@ -67,7 +67,7 @@ impl ExternalServiceManager {
         // host once, pins the approved addresses, requires TLS on both TLS
         // rungs, and permits an unverified certificate or cleartext only for
         // those exact private addresses.
-        let client = temps_query_postgres::connect_with_private_tls_ladder(
+        let client = temps_providers_postgres::query::connect_with_private_tls_ladder(
             &host,
             port,
             admin_user,

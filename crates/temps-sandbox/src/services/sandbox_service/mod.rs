@@ -25,9 +25,8 @@ use sea_orm::{
     QuerySelect, Statement, TransactionTrait,
 };
 
-use temps_ai_agents::error::AgentError;
-use temps_ai_agents::sandbox::SandboxCreateConfig;
-use temps_ai_agents::services::run_service::TERMINAL_RUN_STATUSES;
+use temps_agent_core::error::AgentError;
+use temps_agent_core::run_status::TERMINAL_RUN_STATUSES;
 use temps_config::ConfigService;
 use temps_entities::ingress_mode::SandboxPreviewAccess;
 use temps_entities::{
@@ -36,6 +35,7 @@ use temps_entities::{
     sandboxes, service_members, users,
 };
 use temps_git::GitProviderManager;
+use temps_sandbox_providers::SandboxCreateConfig;
 
 use crate::error::{from_agent_error, SandboxError};
 use crate::services::create_policy;
@@ -50,6 +50,7 @@ use crate::services::row_status::{self, Expect};
 use crate::services::snapshot_service::SnapshotService;
 
 mod agent_run;
+mod application_resources;
 mod application_workspace;
 mod create;
 mod data_network;
@@ -234,7 +235,7 @@ pub struct CreateSandboxRequest {
     /// is created via `provider.create_from_snapshot` instead of
     /// `provider.create`. Mutually exclusive with `image`; validated in the
     /// handler before this field is populated.
-    pub from_snapshot_artifact: Option<temps_ai_agents::sandbox::SnapshotArtifact>,
+    pub from_snapshot_artifact: Option<temps_sandbox_providers::SnapshotArtifact>,
     /// Trusted host work directory for an internal caller. HTTP handlers
     /// always leave this unset; it exists so the AI application workspace can
     /// remain in its user-owned `<TEMPS_DATA_DIR>/ai-applications` tree while
@@ -248,13 +249,18 @@ pub struct CreateSandboxRequest {
     /// `internet`, is any public destination on ports 80 and 443; a
     /// `restricted` policy needs a backend that can enforce it (docker), and
     /// create fails with a 422 rather than starting the sandbox without it.
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
     /// Check the request against the operator's sandbox limits
     /// (`agent_sandbox.max_*` settings, the host's memory and the per-user
     /// cap; see [`crate::services::create_policy`]). Set by the HTTP create
     /// handler. Internal callers (application workspaces, agent runs) leave
     /// it `false`: they choose their own limits and are not the abuse case.
     pub enforce_operator_limits: bool,
+    /// Client-chosen id under which this create's steps can be read while
+    /// it runs (`GET /v1/sandboxes/creations/{creation_id}`). `None` = the
+    /// server generates one; the steps are still readable by sandbox id once
+    /// the row exists.
+    pub creation_id: Option<String>,
 }
 
 /// Output DTO — what the service returns to handlers and what handlers
@@ -306,7 +312,7 @@ pub struct SandboxSummary {
     /// return summaries replace the placeholder with the real node name.
     pub node_name: String,
     /// The egress policy the sandbox enforces.
-    pub egress_policy: temps_ai_agents::sandbox::SandboxEgressPolicy,
+    pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -394,6 +400,25 @@ const MIN_TIMEOUT_SECS: u64 = 60;
 const MAX_TIMEOUT_SECS: u64 = 24 * 60 * 60; // 24 hours
 const DEFAULT_TIMEOUT_SECS: u64 = 60 * 60; // 1 hour
 
+#[derive(Debug, serde::Serialize, utoipa::ToSchema)]
+pub struct SandboxResourceHints {
+    /// Configured agent-run defaults bounded by the host. Agent runs are
+    /// exempt from the ceilings on sandbox API requests.
+    pub agent_cpu: f64,
+    pub agent_memory_mb: u64,
+    pub node_id: Option<i32>,
+    pub host_cpu_cores: Option<f64>,
+    pub host_memory_mb: Option<u64>,
+    pub cpu: Option<f64>,
+    pub max_cpu: f64,
+    pub memory_mb: Option<u64>,
+    pub max_memory_mb: u64,
+    pub pids: Option<i64>,
+    pub max_pids: i64,
+    pub timeout_secs: u64,
+    pub max_timeout_secs: u64,
+}
+
 pub struct SandboxService {
     db: Arc<DatabaseConnection>,
     registry: Arc<StandaloneSandboxRegistry>,
@@ -436,6 +461,8 @@ pub struct SandboxService {
     /// as `starting`, and exec/filesystem calls are refused instead of
     /// trying to wake a container that was never made.
     creates_in_progress: Arc<CreatesInProgress>,
+    /// The steps of every create this process is running or ran recently.
+    creations: Arc<crate::services::creation_progress::CreationTracker>,
     /// This server is a control plane that runs no workloads (ADR 063):
     /// placement never picks it, and anything that needs its own host is
     /// refused with a typed error. `false` on every install that runs
@@ -554,6 +581,7 @@ impl SandboxService {
             node_probe,
             evicting_nodes: Arc::new(EvictingNodes::default()),
             creates_in_progress: Arc::new(CreatesInProgress::default()),
+            creations: Arc::default(),
             control_plane_runs_no_workloads: false,
         }
     }
@@ -676,7 +704,7 @@ impl SandboxService {
     /// disks). Powers the management API's inspection endpoint.
     pub async fn rootfs_report(
         &self,
-    ) -> Result<temps_ai_agents::sandbox::RootfsReport, SandboxError> {
+    ) -> Result<temps_sandbox_providers::RootfsReport, SandboxError> {
         self.registry
             .provider_arc()
             .rootfs_report()
@@ -687,9 +715,7 @@ impl SandboxService {
     }
 
     /// Reclaim rootfs cache entries not backing any live sandbox.
-    pub async fn gc_rootfs(
-        &self,
-    ) -> Result<temps_ai_agents::sandbox::RootfsGcReport, SandboxError> {
+    pub async fn gc_rootfs(&self) -> Result<temps_sandbox_providers::RootfsGcReport, SandboxError> {
         self.registry
             .provider_arc()
             .gc_rootfs()

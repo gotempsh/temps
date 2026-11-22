@@ -18,9 +18,9 @@ use hickory_resolver::TokioResolver;
 use reqwest::StatusCode;
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
 use sha2::{Digest, Sha256};
-use temps_database::test_utils::TestDatabase;
 use temps_dns::handlers::dns_sync::DnsChangesResponse;
 use temps_dns::services::{DnsRegistry, EndpointDraft, OwnerKind, RecordType};
+use temps_test_utils::TestDatabase;
 
 #[tokio::test]
 async fn worker_dns_sync_works_without_console_and_preserves_node_auth() {

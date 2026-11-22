@@ -58,6 +58,10 @@ const SOURCES: &[(&str, &str)] = &[
         include_str!("../harness/connect-a-service.md"),
     ),
     (
+        "add-a-provider-credential.md",
+        include_str!("../harness/add-a-provider-credential.md"),
+    ),
+    (
         "host-with-temps.md",
         include_str!("../harness/host-with-temps.md"),
     ),
@@ -363,6 +367,66 @@ mod tests {
         assert!(build.body.contains("the `build-a-website` playbook"));
     }
 
+    /// The credential playbook may only name operations the assistant can
+    /// call: a model that read about an operation it cannot reach told a user
+    /// it did not exist, after first inventing a call to it.
+    #[test]
+    fn the_credential_playbook_names_only_operations_the_assistant_can_call() {
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "add-a-provider-credential")
+            .expect("add-a-provider-credential playbook");
+        let callable: std::collections::HashSet<&str> =
+            temps_ai_api_tools::allowlists::AI_WRITE_ALLOWLIST
+                .iter()
+                .chain(temps_ai_api_tools::allowlists::AI_READ_ALLOWLIST)
+                .chain(temps_ai_api_tools::allowlists::AI_READ_SAFE_POSTS)
+                .copied()
+                .collect();
+        let named: Vec<&str> = playbook
+            .body
+            .split('`')
+            .skip(1)
+            .step_by(2)
+            .filter(|token| {
+                [
+                    "create_", "update_", "list_", "check_", "test_", "run_", "delete_",
+                ]
+                .iter()
+                .any(|verb| token.starts_with(verb))
+                    && token.chars().all(|c| c.is_ascii_lowercase() || c == '_')
+            })
+            .collect();
+        assert!(named.contains(&"create_dns_provider"), "{named:?}");
+        assert!(named.contains(&"check_cloudflare_token"), "{named:?}");
+        for operation in named {
+            assert!(
+                callable.contains(operation),
+                "the playbook names `{operation}`, which the assistant cannot call"
+            );
+        }
+    }
+
+    /// ADR-107: a single-server install runs its tunnel on the control
+    /// plane. The playbook used to send the user off to add a worker first.
+    #[test]
+    fn the_credential_playbook_places_a_single_servers_tunnel_on_the_control_plane() {
+        let playbook = all()
+            .iter()
+            .find(|playbook| playbook.name == "add-a-provider-credential")
+            .expect("add-a-provider-credential playbook");
+        assert!(
+            playbook.body.contains("`--node_ids 0`"),
+            "{}",
+            playbook.body
+        );
+        assert!(playbook.body.contains("no worker is needed"));
+        assert!(!playbook.body.contains("only runs on a worker"));
+        assert!(!playbook
+            .body
+            .contains("Do not propose `create_ingress_connector`"));
+    }
+
     #[test]
     fn playbook_names_are_unique() {
         let mut names: Vec<&str> = all()
@@ -429,19 +493,19 @@ mod tests {
     fn connect_playbook_names_variables_the_providers_set() {
         let providers: &[(&str, &str)] = &[
             (
-                include_str!("../../temps-providers/src/externalsvc/postgres/lifecycle.rs"),
+                include_str!("../../temps-providers-postgres/src/postgres/lifecycle.rs"),
                 "POSTGRES_URL POSTGRES_HOST POSTGRES_PORT POSTGRES_DB POSTGRES_USER POSTGRES_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/redis.rs"),
+                include_str!("../../temps-providers-redis/src/redis.rs"),
                 "REDIS_URL REDIS_HOST REDIS_PORT REDIS_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/mongodb.rs"),
+                include_str!("../../temps-providers-mongodb/src/mongodb.rs"),
                 "MONGODB_HOST MONGODB_PORT MONGODB_DATABASE MONGODB_USERNAME MONGODB_PASSWORD",
             ),
             (
-                include_str!("../../temps-providers/src/externalsvc/s3.rs"),
+                include_str!("../../temps-providers-s3/src/s3.rs"),
                 "S3_ENDPOINT S3_BUCKET S3_ACCESS_KEY S3_SECRET_KEY S3_REGION",
             ),
         ];
@@ -461,6 +525,93 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn connect_playbook_grants_internal_access_only_with_human_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+        for operation in [
+            "list_sandbox_internal_addresses",
+            "list_internal_access_sandbox_grants",
+            "list_internal_access_grants",
+            "create_internal_access_sandbox_grant",
+            "create_internal_access_grant",
+            "delete_internal_access_sandbox_grant",
+            "delete_internal_access_grant",
+        ] {
+            assert!(playbook.body.contains(operation), "{operation}");
+            assert!(
+                allowlists.contains(&format!("\"{operation}\"")),
+                "{operation} must be available to chat"
+            );
+        }
+        // The playbook starts from the sandbox's 403, as the node agent
+        // words it, and holds the grant to the person's own confirmation.
+        let refusal = include_str!("../../temps-node-agent/src/internal_access.rs");
+        assert!(refusal.contains("internal route is not accessible from sandbox"));
+        assert!(playbook
+            .body
+            .contains("internal route is not accessible from sandbox"));
+        let words = playbook
+            .body
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(words.contains(
+            "The person must confirm that pending action in the console, including in Auto mode"
+        ));
+        assert!(playbook.description.contains("*.temps.local"));
+    }
+
+    #[test]
+    fn connect_playbook_supports_chat_only_vault_consent() {
+        let playbook = all()
+            .iter()
+            .find(|p| p.name == "connect-a-service")
+            .unwrap();
+        for operation in [
+            "sandbox_access_vaults",
+            "list_access_bundles_general",
+            "get_access_vault_general",
+            "create_vault_link",
+            "create_access_bundle_general",
+            "create_access_session_general",
+            "get_access_session_general",
+            "revoke_access_session_general",
+        ] {
+            assert!(playbook.body.contains(operation));
+            let allowlists = include_str!("../../temps-ai-api-tools/src/allowlists.rs");
+            assert!(
+                allowlists.contains(operation),
+                "{operation} must be available to chat"
+            );
+        }
+        // An ordinary sandbox owner may read their sandbox's vaults but not
+        // the instance-wide service list, so the match starts from the vaults.
+        let vaults = playbook.body.find("sandbox_access_vaults").unwrap();
+        let all_services = playbook.body.find("list_access_services_general").unwrap();
+        assert!(
+            vaults < all_services,
+            "the playbook must start from the sandbox's vaults"
+        );
+        assert!(playbook.body.contains("anyone else gets a 403"));
+        assert!(playbook
+            .body
+            .contains("Service access is unavailable for this sandbox"));
+        assert!(playbook.body.contains("is not retryable"));
+        assert!(playbook.body.contains("authorization header"));
+        assert!(playbook.description.contains("Notion"));
+        assert!(playbook.body.contains(r#""kind":"sandbox""#));
+        assert!(playbook.body.contains("is not the vault id"));
+        assert!(playbook.body.contains("/bundles/new"));
+        assert!(playbook.body.contains("allows the method and path"));
+        assert!(playbook.body.contains("explicitly confirm"));
+        assert!(playbook.body.contains("does not need a project"));
+        assert!(playbook.body.contains("including in Auto mode"));
     }
 
     /// The variables the observability playbook tells the model to read are
@@ -550,13 +701,14 @@ mod tests {
 
         let without = applicable("assistant", &[]);
         let names: Vec<&str> = without.iter().map(|p| p.name.as_str()).collect();
-        // Designing and debugging happen before any sandbox exists, so those
-        // playbooks are listed without one.
+        // Designing, debugging and connecting a provider happen before any
+        // sandbox exists, so those playbooks are listed without one.
         assert_eq!(
             names,
             [
                 "build-an-app",
                 "connect-a-service",
+                "add-a-provider-credential",
                 "host-with-temps",
                 "debug-a-deployment"
             ]

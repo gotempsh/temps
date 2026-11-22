@@ -88,15 +88,37 @@ import {
   type InternetJoinMethod,
   type JoinPath,
 } from '@/lib/wireguard-mesh'
-
-const INSTALL_COMMAND = 'curl -fsSL https://temps.sh/install.sh | bash'
-const AGENT_SERVICE_COMMAND = 'temps agent service install'
+import { AGENT_SERVICE_COMMAND, installCommand } from '@/lib/worker-join-script'
+import { usePlaneRelease } from '@/hooks/usePlaneRelease'
+import {
+  WorkerInstallNote,
+  WorkerJoinScript,
+} from '@/components/nodes/WorkerJoinScript'
 const WITHOUT_SYSTEMD = (
   <>
     Without systemd, run <code>temps agent</code> under your own supervisor
     instead.
   </>
 )
+
+/**
+ * Install Temps as root, pinned to the release this server runs so the worker
+ * matches it (the newest nightly build for a build between releases). It
+ * waits (a bounded time) for that before offering a command, and says what
+ * it installs whenever that is not this server's release.
+ */
+function InstallCommandLine() {
+  const release = usePlaneRelease()
+  if (release.pending) return <Skeleton className="mt-1 h-8 w-full" />
+  return (
+    <>
+      <CommandLine command={installCommand(release.install)} />
+      {release.install.kind !== 'release' && (
+        <WorkerInstallNote install={release.install} />
+      )}
+    </>
+  )
+}
 
 /** Mesh state for the Worker Nodes page; polls faster while it comes up. */
 export function useWireguardMesh() {
@@ -262,7 +284,7 @@ export function WorkerJoinGuide({
             server — for example a Hetzner vSwitch or an AWS VPC.
           </p>
           <Step number={1} title="Install Temps on the worker">
-            <CommandLine command={INSTALL_COMMAND} />
+            <InstallCommandLine />
           </Step>
           <Step number={2} title="Join the cluster">
             {missingToken ? (
@@ -278,7 +300,7 @@ export function WorkerJoinGuide({
               </>
             )}
           </Step>
-          <Step number={3} title="Start the agent, as root">
+          <Step number={3} title="Start the agent">
             <CommandLine command={AGENT_SERVICE_COMMAND} />
             <p className="mt-1 text-xs">
               Runs the worker as a systemd service that restarts on failure and
@@ -518,7 +540,7 @@ function UrlJoin({
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <InstallCommandLine />
       </Step>
       <Step number={3} title="Join the cluster">
         {missingToken ? (
@@ -534,7 +556,7 @@ function UrlJoin({
           </>
         )}
       </Step>
-      <Step number={4} title="Start the agent, as root">
+      <Step number={4} title="Start the agent">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker registers on the mesh and shows as Connected below within a
@@ -648,9 +670,9 @@ function OutboundJoin({
         </p>
       </Step>
       <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
+        <InstallCommandLine />
       </Step>
-      <Step number={3} title="Join the cluster, as root">
+      <Step number={3} title="Join the cluster">
         <OutboundJoinCommand url={url} />
         <p className="mt-1 text-xs">
           The worker sends its WireGuard key to this server over HTTPS, brings
@@ -658,7 +680,7 @@ function OutboundJoin({
           registers under its mesh address. It needs no public IP.
         </p>
       </Step>
-      <Step number={4} title="Start the agent, as root">
+      <Step number={4} title="Start the agent">
         <CommandLine command={AGENT_SERVICE_COMMAND} />
         <p className="mt-1 text-xs">
           The worker shows as Connected below within a minute. {WITHOUT_SYSTEMD}
@@ -743,6 +765,12 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
         server — for example this server runs on a laptop or behind NAT. This
         server dials the worker; no private key leaves either machine.
       </p>
+      <p className="text-xs">
+        For a Linux worker. A Mac cannot be paired: its end of the mesh runs
+        inside its Docker app, which nothing can dial. Add a Mac with{' '}
+        <strong>Add worker</strong> and choose <strong>Mac</strong>; it dials
+        this server instead.
+      </p>
       <Step number={1} title="Open the mesh port on the worker">
         <p className="mt-1">
           Allow UDP <code>{mesh.listen_port}</code> in on the worker (your
@@ -750,10 +778,7 @@ function PairNode({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           needs to reach out.
         </p>
       </Step>
-      <Step number={2} title="Install Temps on the worker">
-        <CommandLine command={INSTALL_COMMAND} />
-      </Step>
-      <Step number={3} title="Create the pairing">
+      <Step number={2} title="Create the pairing">
         <form
           className="mt-2 grid gap-2 sm:grid-cols-[1fr_1fr_auto] sm:items-end"
           onSubmit={(event) => {
@@ -826,6 +851,9 @@ function CreatedPairing({
 }) {
   const { data } = usePairings()
   const now = useNow(15_000)
+  // The server pins the command to the release it runs; this reads the
+  // same version to say which one, as the Add worker panel does.
+  const release = usePlaneRelease()
   const listed = data?.pairings.find((pairing) => pairing.id === created.id)
   const pairing = pairingAsOf(listed ?? created, now)
   const { label, tone, hint } = pairingProgress(pairing)
@@ -837,7 +865,7 @@ function CreatedPairing({
 
   if (pairingEnded(pairing)) {
     return (
-      <Step number={4} title={`Run the pairing command on ${pairing.name}`}>
+      <Step number={3} title={`Run the pairing command on ${pairing.name}`}>
         <Alert className="mt-1 border-amber-500/30 bg-amber-500/5">
           <AlertTriangle className="h-4 w-4 text-amber-500" />
           <AlertTitle className="text-amber-700 dark:text-amber-400">
@@ -881,20 +909,30 @@ function CreatedPairing({
 
   if (pairing.status === 'completed') {
     return (
-      <Step number={4} title={`Start the agent on ${pairing.name}, as root`}>
+      <Step number={3} title={`${pairing.name} joined`}>
         <div className="mt-1 flex items-center gap-2">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <span>{pairing.name} is on the mesh.</span>
           {badge}
         </div>
+        <p className="mt-1 text-xs">
+          The command starts the agent service once the worker has joined. If it
+          stopped before that, start it on the worker with:
+        </p>
         <CommandLine command={AGENT_SERVICE_COMMAND} />
       </Step>
     )
   }
 
   return (
-    <Step number={4} title={`Run this on ${pairing.name}, as root`}>
-      <CommandLine command={command} />
+    <Step number={3} title={`Run this on ${pairing.name}`}>
+      <div className="mt-1">
+        <WorkerJoinScript
+          command={command}
+          install={release.install}
+          pending={release.pending}
+        />
+      </div>
       <div className="mt-1 flex flex-wrap items-center gap-2 text-xs">
         {badge}
         <span>
@@ -907,16 +945,15 @@ function CreatedPairing({
         </p>
       )}
       <p className="mt-1 text-xs">
-        It holds a one-time secret and is shown only now. It waits until this
-        server reaches it at <code>{pairing.node_endpoint}</code>, brings the
-        mesh up and registers. Then start the worker with{' '}
-        <code>{AGENT_SERVICE_COMMAND}</code>.
+        It holds a one-time secret and is shown only now. It installs Temps,
+        then waits until this server reaches it at{' '}
+        <code>{pairing.node_endpoint}</code>, brings the mesh up and registers,
+        then starts the agent service.
       </p>
       <p className="mt-1 text-xs">
-        The code is piped to <code>temps join --pair -</code> so it never shows
-        in the process list, and the leading space keeps the line out of the
-        shell history. Not in a root shell? Put <code>sudo</code> right before{' '}
-        <code>temps join</code>, after the <code>|</code>.
+        The code is piped to <code>temps join --pair -</code>, so it never shows
+        in the process list or in sudo&apos;s log, and the leading space keeps
+        the command out of the shell history.
       </p>
     </Step>
   )
@@ -1056,7 +1093,10 @@ function MeshOnboarding({ mesh }: { mesh: WireguardMeshStatusResponse }) {
           Every node must accept UDP <code>{mesh.listen_port}</code> from the
           other nodes.
         </li>
-        <li>Nodes run Linux with kernel WireGuard (5.6 or newer).</li>
+        <li>
+          Nodes run Linux with kernel WireGuard (5.6 or newer), or macOS with a
+          Docker app whose VM holds the node&apos;s end of the mesh.
+        </li>
         <li>
           Workers already on your private network keep using it. Once on, the
           mesh stays on.

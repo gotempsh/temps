@@ -32,6 +32,9 @@ use tracing::{error, info, warn};
 pub enum GateOutcome {
     /// Forward it, as this user.
     Admit(GateClaims),
+    /// Forward it with Cloudflare Access's identity headers: it came through
+    /// this control plane's tunnel with a valid Access JWT (ADR-107 D3).
+    AdmitAccess(Vec<(&'static str, HeaderValue)>),
     /// Answer it here; the second field is the proxy log's routing status.
     Respond(GateResponse, &'static str),
 }
@@ -103,9 +106,14 @@ impl ProxyGate {
             GateDecision::NotFound => {
                 GateOutcome::Respond(GateResponse::not_found(), "gate_not_found")
             }
-            // Cloudflare Access (D9) only sees tunnel traffic, and tunnels end
-            // at a worker's tunnel origin, never at this proxy: an Access
-            // address is refused here whatever the request carries.
+            // Cloudflare Access (D9) only sees tunnel traffic: `decide`
+            // admits only a request that came in on a tunnel origin with a
+            // valid Access JWT. On this proxy that is the control plane's
+            // own tunnel origin (ADR-107 D3); everywhere else it is refused
+            // whatever the request carries.
+            GateDecision::AdmitAccess(identity) if request.via_tunnel => {
+                GateOutcome::AdmitAccess(gate_access::access_identity_headers(&identity))
+            }
             GateDecision::AdmitAccess(_) => GateOutcome::Respond(
                 gate_access::access_denied(AccessRejection::NotThroughTunnel),
                 "gate_access_denied",
@@ -253,6 +261,19 @@ pub fn strip_gate_cookies(request: &mut RequestHeader) -> pingora::Result<()> {
 
 /// An admitted request: the gate's cookies never reach the app, and the app
 /// learns who signed in.
+/// Forward a request Cloudflare Access let through this control plane's
+/// tunnel: the app sees Access's identity, never one the visitor wrote.
+pub fn admit_access(
+    request: &mut RequestHeader,
+    headers: Vec<(&'static str, HeaderValue)>,
+) -> pingora::Result<()> {
+    strip_client_identity(request);
+    for (name, value) in headers {
+        request.insert_header(name, value)?;
+    }
+    Ok(())
+}
+
 pub fn admit(request: &mut RequestHeader, claims: &GateClaims) -> pingora::Result<()> {
     strip_gate_cookies(request)?;
     strip_client_identity(request);
@@ -383,8 +404,10 @@ mod tests {
             .collect()
     }
 
+    /// A request on the proxy's public listeners never came through a
+    /// tunnel, so an Access address refuses it whatever it carries.
     #[tokio::test]
-    async fn a_cloudflare_access_address_is_always_refused_on_the_proxy() {
+    async fn a_cloudflare_access_address_is_refused_off_the_tunnel_origin() {
         let policy = GatePolicy {
             address_id: "custom:7".into(),
             gate: GateKind::CloudflareAccess,
@@ -413,6 +436,69 @@ mod tests {
             assert_eq!(answer.status, 403);
             assert_eq!(header(&answer, GATE_HEADER), vec![gate::GATE_ACCESS]);
         }
+    }
+
+    /// ADR-107 D3: on the control plane's own tunnel origin an Access
+    /// address goes on to the JWT check instead of the blanket refusal, so
+    /// a bad token is refused as such.
+    #[tokio::test]
+    async fn an_access_address_through_the_control_planes_tunnel_checks_the_jwt() {
+        let policy = GatePolicy {
+            address_id: "custom:7".into(),
+            gate: GateKind::CloudflareAccess,
+            temps: None,
+            access: Some(temps_core::gate::AccessGate {
+                issuer: "https://team.cloudflareaccess.com".into(),
+                audience: "aud-1".into(),
+                keys: vec![],
+            }),
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            gate_access::ACCESS_JWT_HEADER,
+            HeaderValue::from_static("a.b.c"),
+        );
+        let via_tunnel = GateRequest {
+            via_tunnel: true,
+            ..request(&Method::GET, "/", None, &headers)
+        };
+        let GateOutcome::Respond(answer, status) =
+            proxy_gate().evaluate(&policy, &via_tunnel, 1_000).await
+        else {
+            panic!("a malformed Access JWT was admitted");
+        };
+        assert_eq!(status, "gate_access_denied");
+        assert_eq!(answer.status, 403);
+        assert_eq!(
+            answer.body,
+            gate_access::access_denied(AccessRejection::Malformed).body
+        );
+        assert_ne!(
+            answer.body,
+            gate_access::access_denied(AccessRejection::NotThroughTunnel).body
+        );
+    }
+
+    #[test]
+    fn an_access_admission_carries_only_accesss_identity() {
+        let mut request = RequestHeader::build("GET", b"/", None).unwrap();
+        request
+            .insert_header(gate::USER_EMAIL_HEADER, "spoofed@example.test")
+            .unwrap();
+        admit_access(
+            &mut request,
+            vec![(
+                gate::USER_EMAIL_HEADER,
+                HeaderValue::from_static("person@example.test"),
+            )],
+        )
+        .unwrap();
+        let values: Vec<_> = request
+            .headers
+            .get_all(gate::USER_EMAIL_HEADER)
+            .iter()
+            .collect();
+        assert_eq!(values, vec!["person@example.test"]);
     }
 
     #[tokio::test]

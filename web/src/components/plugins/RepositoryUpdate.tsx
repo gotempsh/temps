@@ -41,13 +41,26 @@ export function RepositoryUpdateButton({
   name,
   disabled,
   onClick,
+  onFileUpdate,
 }: {
   name: string
   disabled: boolean
   onClick: () => void
+  onFileUpdate: () => void
 }) {
   const status = useRepositorySource(name)
   if (status.isPending) return <Skeleton className="h-8 w-24" />
+  if (status.data?.source?.kind === 'local-file')
+    return (
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onFileUpdate}
+        disabled={disabled}
+      >
+        Update from file
+      </Button>
+    )
   if (status.isSuccess && !status.data?.source)
     return (
       <span className="text-xs text-muted-foreground">
@@ -79,10 +92,12 @@ export function RepositoryUpdate({
     defaultValues: { ref_name: '' },
   })
   const status = useRepositorySource(name)
+  const source =
+    status.data?.source?.kind === 'github' ? status.data.source : undefined
   const { reset } = form
   useEffect(() => {
     reset({ ref_name: '' })
-  }, [reset, status.data?.source?.ref_name, status.data?.source?.commit])
+  }, [reset, source?.ref_name, source?.commit])
   const update = useMutation({
     mutationFn: async (ref: string) => {
       const response = await updateRepository({
@@ -134,9 +149,8 @@ export function RepositoryUpdate({
         <Skeleton aria-hidden="true" className="h-8 w-44" />
       </div>
     )
-  if (!status.data?.source)
+  if (!source)
     return <p>This plugin has no GitHub source available for updates.</p>
-  const source = status.data.source
   return (
     <form
       onSubmit={form.handleSubmit((values) => runUpdate(values.ref_name || ''))}

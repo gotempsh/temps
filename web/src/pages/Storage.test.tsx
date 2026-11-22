@@ -8,7 +8,7 @@ import { MemoryRouter, useLocation } from 'react-router'
 import { AuthContext } from '@/contexts/AuthContext-shared'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { installBrowserWindow } from '@/test/dom'
-import { mockApi } from '@/test/fetch-mock'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { Storage } from './Storage'
 
 installBrowserWindow()
@@ -18,10 +18,13 @@ function CurrentSearch() {
   return <output aria-label="search">{useLocation().search}</output>
 }
 
-function renderPage(url = '/storage') {
-  // Every request answers 404: these tests are about the page's tabs, not
-  // what each tab loads.
-  mockApi({})
+function renderPage(
+  url = '/storage',
+  routes: Parameters<typeof mockApi>[0] = {}
+) {
+  // Unless a test says otherwise every request answers 404: most tests are
+  // about the page's tabs, not what each tab loads.
+  mockApi(routes)
   return render(
     <QueryClientProvider
       client={
@@ -87,4 +90,47 @@ test('an existing ?tab=platform link opens Platform services, and switching tabs
     expect(view.getByLabelText('search').textContent).toBe('?tab=external')
   )
   expect(view.queryByText(/Shared by every deployed service/)).toBeNull()
+})
+
+test('a failed Refresh keeps the service cards and says the list may be stale', async () => {
+  let calls = 0
+  const view = renderPage('/storage', {
+    'GET /external-services': () =>
+      ++calls === 1
+        ? jsonResponse([
+            {
+              id: 3,
+              name: 'orders-db',
+              service_type: 'postgres',
+              status: 'running',
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:00:00Z',
+            },
+          ])
+        : jsonResponse({ title: 'Internal Server Error', status: 500 }, 500),
+  })
+  await view.findByText('orders-db')
+
+  fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+
+  await view.findByText("Couldn't refresh services")
+  expect(view.getByText('orders-db')).toBeTruthy()
+  expect(view.queryByText('Failed to load services')).toBeNull()
+})
+
+test('a failed Refresh over an empty list says so, not only that there are no services', async () => {
+  let calls = 0
+  const view = renderPage('/storage', {
+    'GET /external-services': () =>
+      ++calls === 1
+        ? jsonResponse([])
+        : jsonResponse({ title: 'Internal Server Error', status: 500 }, 500),
+  })
+  await waitFor(() => expect(calls).toBe(1))
+  await new Promise((resolve) => setTimeout(resolve, 5))
+
+  fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+
+  await view.findByText("Couldn't refresh services")
+  expect(view.queryByText('Failed to load services')).toBeNull()
 })

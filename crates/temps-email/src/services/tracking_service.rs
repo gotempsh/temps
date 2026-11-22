@@ -550,7 +550,7 @@ mod tests {
     fn service_with_settings(external: Option<&str>, ingress: Option<&str>) -> TrackingService {
         use sea_orm::{DatabaseBackend, MockDatabase};
 
-        let settings = temps_core::AppSettings {
+        let settings = temps_config::AppSettings {
             external_url: external.map(str::to_string),
             public_ingress_url: ingress.map(str::to_string),
             ..Default::default()

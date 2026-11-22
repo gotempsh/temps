@@ -16,6 +16,7 @@
 //! - `log_tail`: bounded container log capture
 //! - `guards`: drop guards that clean up probe execs and helper containers
 
+mod build_dns;
 mod build_failure;
 mod build_limits;
 mod deployer;
@@ -24,6 +25,7 @@ mod image_builder;
 mod log_tail;
 mod network;
 mod runtime;
+mod secret_mounts;
 mod static_archive;
 #[cfg(test)]
 mod test_support;
@@ -148,19 +150,17 @@ pub struct DockerRuntime {
     /// fixed-IP setups; in the live agent we use
     /// [`Self::with_overlay_dns_slot`] instead, which reads the bridge
     /// IP dynamically from the network_sync loop's shared slot (the
-    /// bridge IP isn't known until the overlay has bootstrapped). Never
-    /// used as-is: [`Self::dns_for_container`] appends the host's own
-    /// default DNS servers ([`dns_with_fallback`]) so this is never the
-    /// sole nameserver.
+    /// bridge IP isn't known until the overlay has bootstrapped). Passed
+    /// through [`dns_with_fallback`], which adds no other nameserver: the
+    /// resolver forwards outside names itself (ADR-096).
     dns_servers: Vec<String>,
     /// Optional dynamic DNS slot — populated by the agent's
     /// `network_sync` loop after the overlay bridge is up. Read on
     /// every `deploy_container` so containers booted after the
     /// overlay is up get the per-node Hickory resolver wired in. The
     /// static `dns_servers` field takes precedence when both are set.
-    /// Never used as-is: [`Self::dns_for_container`] appends the host's
-    /// own default DNS servers ([`dns_with_fallback`]) so this is never the
-    /// sole nameserver.
+    /// Passed through [`dns_with_fallback`], which adds no other
+    /// nameserver (ADR-096).
     overlay_dns_slot: Option<Arc<std::sync::RwLock<Option<std::net::IpAddr>>>>,
     /// Shared snapshot of overlay peers, refreshed by the agent's
     /// `network_sync` loop. After dual-attaching a container to the

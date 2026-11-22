@@ -5,6 +5,7 @@ use super::cleanup::{recorded_container_ownership, RecordedContainerOwnership};
 use super::redeploy::check_redeploy_plan_batch;
 use super::reuse::deployment_asset_origin;
 use super::*;
+use temps_presets::stored_preset::StoredPresetConfigExt;
 
 use chrono::Utc;
 use mockall::mock;
@@ -106,11 +107,11 @@ fn unrelated_database_errors_are_not_treated_as_a_unique_violation() {
     )));
 }
 
-use temps_database::test_utils::TestDatabase;
 use temps_entities::{
     deployment_config::DeploymentConfig, deployments, env_vars, environments, preset::Preset,
     projects, upstream_config::UpstreamList,
 };
+use temps_test_utils::TestDatabase;
 
 // Mock for other services
 mock! {
@@ -252,9 +253,7 @@ pub(super) async fn setup_test_data(
 async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service() {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return;
         }
@@ -306,7 +305,7 @@ async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service
     .failed_container_retention(db.clone(), deployment.id)
     .build(Arc::new(MockContainerDeployer::new()))
     .expect("valid deploy job");
-    let context = temps_core::WorkflowContext::new(
+    let context = crate::workflow::WorkflowContext::new(
         "run-persist".to_string(),
         deployment.id,
         project.id,
@@ -338,9 +337,7 @@ async fn persist_docker_socket_mounted_is_visible_through_the_deployment_service
 async fn externally_hosted_projects_are_refused_before_a_deployment_is_created() {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             println!("Docker unavailable; skipping: {error}");
             return;
         }
@@ -389,8 +386,8 @@ async fn externally_hosted_projects_are_refused_before_a_deployment_is_created()
 struct NoopLogWriter;
 
 #[async_trait::async_trait]
-impl temps_core::LogWriter for NoopLogWriter {
-    async fn write_log(&self, _message: String) -> Result<(), temps_core::WorkflowError> {
+impl crate::workflow::LogWriter for NoopLogWriter {
+    async fn write_log(&self, _message: String) -> Result<(), crate::workflow::WorkflowError> {
         Ok(())
     }
 
@@ -657,6 +654,88 @@ fn spawn_test_readiness_proxy() -> String {
     address.to_string()
 }
 
+/// A deployer whose containers always start, and whose published port is
+/// `host_port`, so a test decides what the deploy job's readiness probe sees.
+fn mock_deployer_serving_on_port(host_port: u16) -> MockContainerDeployer {
+    let mut deployer = MockContainerDeployer::new();
+    deployer.expect_deploy_container().returning(move |_| {
+        Ok(temps_deployer::DeployResult {
+            container_id: "test-container".to_string(),
+            container_name: "test-container".to_string(),
+            container_port: 3000,
+            host_port,
+            status: temps_deployer::ContainerStatus::Running,
+            docker_socket_mounted: false,
+        })
+    });
+    deployer.expect_start_container().returning(|_| Ok(()));
+    deployer.expect_stop_container().returning(|_| Ok(()));
+    deployer.expect_pause_container().returning(|_| Ok(()));
+    deployer.expect_resume_container().returning(|_| Ok(()));
+    deployer.expect_remove_container().returning(|_| Ok(()));
+    deployer
+        .expect_get_container_logs()
+        .returning(|_| Ok("test logs".to_string()));
+    deployer.expect_get_container_info().returning(|_| {
+        use std::collections::HashMap;
+        Ok(temps_deployer::ContainerInfo {
+            container_id: "test-container".to_string(),
+            container_name: "test-container".to_string(),
+            image_name: "nginx:latest".to_string(),
+            created_at: chrono::Utc::now(),
+            ports: vec![],
+            environment_vars: HashMap::new(),
+            status: temps_deployer::ContainerStatus::Running,
+            restart_count: Some(0),
+            labels: std::collections::HashMap::new(),
+            ..Default::default()
+        })
+    });
+    deployer.expect_list_containers().returning(|| Ok(vec![]));
+    deployer.expect_stream_container_logs().returning(|_| {
+        use futures::stream;
+        let stream = stream::empty();
+        Ok(Box::new(stream))
+    });
+    deployer.expect_image_exists().times(0);
+    deployer
+}
+
+/// Stands in for the candidate container's HTTP server: answers every
+/// request with `status_line` and records each request line it received.
+fn spawn_recording_app_server(
+    status_line: &'static str,
+) -> (u16, Arc<std::sync::Mutex<Vec<String>>>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind fake app server");
+    listener
+        .set_nonblocking(true)
+        .expect("make fake app server nonblocking");
+    let port = listener.local_addr().expect("read fake app port").port();
+    let listener =
+        tokio::net::TcpListener::from_std(listener).expect("create async fake app server");
+    let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let recorded = recorded.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let mut request = [0_u8; 1024];
+                let read = stream.read(&mut request).await.unwrap_or(0);
+                let text = String::from_utf8_lossy(&request[..read]);
+                if let Some(line) = text.lines().next() {
+                    recorded.lock().unwrap().push(line.to_string());
+                }
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    (port, requests)
+}
+
 pub(super) fn create_deployment_service_for_test(
     db: Arc<temps_database::DbConnection>,
 ) -> DeploymentService {
@@ -772,49 +851,8 @@ pub(super) fn create_deployment_service_for_test(
         docker_handle.clone(),
     ));
 
-    // Create mock deployer with all required methods
-    let mut deployer = MockContainerDeployer::new();
-    deployer.expect_deploy_container().returning(move |_| {
-        Ok(temps_deployer::DeployResult {
-            container_id: "test-container".to_string(),
-            container_name: "test-container".to_string(),
-            container_port: 3000,
-            host_port: readiness_host_port,
-            status: temps_deployer::ContainerStatus::Running,
-            docker_socket_mounted: false,
-        })
-    });
-    deployer.expect_start_container().returning(|_| Ok(()));
-    deployer.expect_stop_container().returning(|_| Ok(()));
-    deployer.expect_pause_container().returning(|_| Ok(()));
-    deployer.expect_resume_container().returning(|_| Ok(()));
-    deployer.expect_remove_container().returning(|_| Ok(()));
-    deployer
-        .expect_get_container_logs()
-        .returning(|_| Ok("test logs".to_string()));
-    deployer.expect_get_container_info().returning(|_| {
-        use std::collections::HashMap;
-        Ok(temps_deployer::ContainerInfo {
-            container_id: "test-container".to_string(),
-            container_name: "test-container".to_string(),
-            image_name: "nginx:latest".to_string(),
-            created_at: chrono::Utc::now(),
-            ports: vec![],
-            environment_vars: HashMap::new(),
-            status: temps_deployer::ContainerStatus::Running,
-            restart_count: Some(0),
-            labels: std::collections::HashMap::new(),
-            ..Default::default()
-        })
-    });
-    deployer.expect_list_containers().returning(|| Ok(vec![]));
-    deployer.expect_stream_container_logs().returning(|_| {
-        use futures::stream;
-        let stream = stream::empty();
-        Ok(Box::new(stream))
-    });
-    deployer.expect_image_exists().times(0);
-    let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+    let deployer: Arc<dyn temps_deployer::ContainerDeployer> =
+        Arc::new(mock_deployer_serving_on_port(readiness_host_port));
 
     // For tests, we'll create a service that directly accepts the trait
     DeploymentService {
@@ -883,7 +921,7 @@ fn expect_owned_container_info(
     });
 }
 
-fn create_cleanup_service_for_test(
+pub(crate) fn create_cleanup_service_for_test(
     db: Arc<temps_database::DbConnection>,
     deployer: Arc<dyn temps_deployer::ContainerDeployer>,
 ) -> DeploymentService {
@@ -1143,7 +1181,7 @@ impl temps_core::AuditLogger for AcceptingPlaneAudit {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> temps_core::anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
@@ -1151,7 +1189,7 @@ impl temps_core::AuditLogger for AcceptingPlaneAudit {
 /// A workload plane holding `container` as the Firecracker microVM
 /// replica of `deployment`, as an `enforce` deploy with microVM isolation
 /// records it.
-async fn plane_with_micro_vm_replica(
+pub(crate) async fn plane_with_micro_vm_replica(
     db: &Arc<temps_database::DbConnection>,
     deployment: &deployments::Model,
     container: &deployment_containers::Model,
@@ -2349,6 +2387,500 @@ async fn test_pause_deployment_stops_real_container() -> Result<(), Box<dyn std:
         .unwrap();
     assert_eq!(updated_container.status.as_deref(), Some("stopped"));
 
+    Ok(())
+}
+
+/// A worker agent for pause/resume tests: answers container stop/start with a
+/// scripted status and records which container ids it was asked about.
+#[derive(Clone)]
+struct FakeWorkerAgent {
+    /// HTTP status the next stop/start answers with.
+    status: Arc<std::sync::atomic::AtomicU16>,
+    stopped: Arc<std::sync::Mutex<Vec<String>>>,
+    started: Arc<std::sync::Mutex<Vec<String>>>,
+}
+
+impl FakeWorkerAgent {
+    async fn spawn() -> Result<(Self, String), Box<dyn std::error::Error>> {
+        use axum::extract::{Path, State};
+        use axum::http::StatusCode;
+        use axum::routing::post;
+
+        fn answer(agent: &FakeWorkerAgent) -> (StatusCode, axum::Json<serde_json::Value>) {
+            let status =
+                StatusCode::from_u16(agent.status.load(std::sync::atomic::Ordering::SeqCst))
+                    .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let body = if status.is_success() {
+                serde_json::json!({"success": true, "data": "ok", "error": null})
+            } else {
+                serde_json::json!({"success": false, "data": null, "error": "scripted failure"})
+            };
+            (status, axum::Json(body))
+        }
+
+        let agent = Self {
+            status: Arc::new(std::sync::atomic::AtomicU16::new(200)),
+            stopped: Arc::default(),
+            started: Arc::default(),
+        };
+        let router = axum::Router::new()
+            .route(
+                "/agent/containers/{id}/stop",
+                post(
+                    |State(agent): State<FakeWorkerAgent>, Path(id): Path<String>| async move {
+                        agent.stopped.lock().expect("stopped ids").push(id);
+                        answer(&agent)
+                    },
+                ),
+            )
+            .route(
+                "/agent/containers/{id}/start",
+                post(
+                    |State(agent): State<FakeWorkerAgent>, Path(id): Path<String>| async move {
+                        agent.started.lock().expect("started ids").push(id);
+                        answer(&agent)
+                    },
+                ),
+            )
+            .with_state(agent.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = format!("http://{}", listener.local_addr()?);
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        Ok((agent, address))
+    }
+
+    fn answer_with(&self, status: u16) {
+        self.status
+            .store(status, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> Vec<String> {
+        self.stopped.lock().expect("stopped ids").clone()
+    }
+
+    fn started(&self) -> Vec<String> {
+        self.started.lock().expect("started ids").clone()
+    }
+}
+
+/// Register a worker reachable at `address` and place `container` on it.
+async fn place_on_worker(
+    db: &Arc<temps_database::DbConnection>,
+    container: &deployment_containers::Model,
+    address: &str,
+) -> Result<(nodes::Model, deployment_containers::Model), Box<dyn std::error::Error>> {
+    let node = nodes::ActiveModel {
+        name: Set("worker-a".to_string()),
+        token_hash: Set("unused".to_string()),
+        token_encrypted: Set(Some(
+            create_test_encryption_service().encrypt(b"agent-token")?,
+        )),
+        address: Set(address.to_string()),
+        private_address: Set("127.0.0.1".to_string()),
+        role: Set("worker".to_string()),
+        status: Set("active".to_string()),
+        labels: Set(serde_json::json!({})),
+        capacity: Set(serde_json::json!({})),
+        dns_resolver_consecutive_failures: Set(0),
+        build_limits: Set(None),
+        public_ingress_enabled: Set(false),
+        public_ingress_unsupported_reasons: Set(serde_json::json!([])),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+    let mut active: deployment_containers::ActiveModel = container.clone().into();
+    active.node_id = Set(Some(node.id));
+    let container = active.update(db.as_ref()).await?;
+    Ok((node, container))
+}
+
+/// The reported bug: this host's Docker cannot see a worker's container, so a
+/// pause must reach it through the worker's agent, and only then call it
+/// stopped.
+#[tokio::test]
+async fn pause_stops_a_worker_container_through_its_node() -> Result<(), Box<dyn std::error::Error>>
+{
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping worker pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let (agent, address) = FakeWorkerAgent::spawn().await?;
+    let (_node, container) = place_on_worker(&db, &container, &address).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await?;
+
+    assert_eq!(agent.stopped(), vec![container.container_id.clone()]);
+    let deployment = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(deployment.state, "paused");
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("stopped"));
+    assert!(row.finished_at.is_some());
+    Ok(())
+}
+
+/// A stop that fails means the container is still running. The pause says so,
+/// records nothing false, and can be asked for again once the worker is back.
+#[tokio::test]
+async fn pause_fails_and_stays_retryable_when_a_worker_cannot_stop_the_container(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping failed worker pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let (agent, address) = FakeWorkerAgent::spawn().await?;
+    let (node, container) = place_on_worker(&db, &container, &address).await?;
+    agent.answer_with(500);
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    let error = service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("a container that did not stop must fail the pause");
+    assert!(
+        matches!(
+            error,
+            DeploymentError::DeploymentPauseIncomplete {
+                stopped: 0,
+                total: 1,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let message = error.to_string();
+    assert!(message.contains(&container.container_id), "{message}");
+    assert!(
+        message.contains(&format!("node {}", node.id)),
+        "the failure must name the node: {message}"
+    );
+
+    let after_failure = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after_failure.state, "deployed", "it is still running");
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("running"));
+    assert!(row.finished_at.is_none());
+
+    // The worker recovers: the same request now completes.
+    agent.answer_with(200);
+    service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await?;
+    let after_retry = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after_retry.state, "paused");
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("stopped"));
+    Ok(())
+}
+
+/// One replica failing does not stop the others from being stopped, and the
+/// report counts both. A replica that did stop is not started again: the
+/// operator is pausing to stop work overlapping.
+#[tokio::test]
+async fn pause_reports_a_partial_stop_and_keeps_stopped_replicas_stopped(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping partial pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, worker_container) = setup_test_deployment(&db).await?;
+    let (agent, address) = FakeWorkerAgent::spawn().await?;
+    let (_node, worker_container) = place_on_worker(&db, &worker_container, &address).await?;
+    agent.answer_with(500);
+    let now = Utc::now();
+    let local_container = deployment_containers::ActiveModel {
+        deployment_id: Set(deployment.id),
+        container_id: Set("container-local".to_string()),
+        container_name: Set("test-container-2".to_string()),
+        container_port: Set(Some(8080)),
+        image_name: Set(Some("nginx:latest".to_string())),
+        status: Set(Some("running".to_string())),
+        created_at: Set(now),
+        deployed_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+
+    let mut local = MockContainerDeployer::new();
+    local
+        .expect_stop_container()
+        .withf(|id| id == "container-local")
+        .times(1)
+        .returning(|_| Ok(()));
+    local.expect_start_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    let error = service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("one replica is still running");
+    assert!(
+        matches!(
+            error,
+            DeploymentError::DeploymentPauseIncomplete {
+                stopped: 1,
+                total: 2,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    let stopped = deployment_containers::Entity::find_by_id(local_container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("local row")?;
+    assert_eq!(stopped.status.as_deref(), Some("stopped"));
+    let running = deployment_containers::Entity::find_by_id(worker_container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("worker row")?;
+    assert_eq!(running.status.as_deref(), Some("running"));
+    Ok(())
+}
+
+/// A container its own node no longer has (pruned, removed by hand) is not
+/// running, which is all a pause asks for. Failing here would make such a
+/// deployment impossible to pause.
+#[tokio::test]
+async fn pause_counts_a_container_gone_from_its_node_as_stopped(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping missing container pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let (agent, address) = FakeWorkerAgent::spawn().await?;
+    let (_node, container) = place_on_worker(&db, &container, &address).await?;
+    agent.answer_with(404);
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await?;
+
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("stopped"));
+    Ok(())
+}
+
+/// The plane can only retire a microVM for good, so a pause would either
+/// leave it running or destroy what a resume needs. It is refused up front,
+/// before the deployment reads as paused.
+#[tokio::test]
+async fn pause_refuses_a_micro_vm_replica_before_changing_anything(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping microVM pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let plane = plane_with_micro_vm_replica(&db, &deployment, &container).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+    service.set_workload_plane(plane);
+
+    let error = service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("a microVM replica cannot be paused");
+    assert!(
+        matches!(error, DeploymentError::MicroVmReplicaCannotBePaused { .. }),
+        "{error:?}"
+    );
+    assert!(error.to_string().contains(&container.container_id));
+
+    let after = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after.state, "deployed");
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("running"));
+    Ok(())
+}
+
+/// What a replica is does not depend on a plane running in this process: one
+/// that failed to start must not let a pause ask Docker about a microVM, whose
+/// 404 would read as stopped and leave the VM running under a "paused" row.
+#[tokio::test]
+async fn pause_refuses_a_micro_vm_replica_without_a_workload_plane(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping microVM pause integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    plane_with_micro_vm_replica(&db, &deployment, &container).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_stop_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    let error = service
+        .pause_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("a microVM replica cannot be paused");
+    assert!(
+        matches!(error, DeploymentError::MicroVmReplicaCannotBePaused { .. }),
+        "{error:?}"
+    );
+    let after = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after.state, "deployed");
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_starts_a_worker_container_through_its_node(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping worker resume integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let (agent, address) = FakeWorkerAgent::spawn().await?;
+    let (node, container) = place_on_worker(&db, &container, &address).await?;
+    let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+    active_deployment.state = Set("paused".to_string());
+    let deployment = active_deployment.update(db.as_ref()).await?;
+    let mut active_container: deployment_containers::ActiveModel = container.clone().into();
+    active_container.status = Set(Some("stopped".to_string()));
+    let container = active_container.update(db.as_ref()).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_start_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+
+    // A failed start names the container and node, and leaves it paused.
+    agent.answer_with(500);
+    let error = service
+        .resume_deployment(deployment.project_id, deployment.id)
+        .await
+        .expect_err("the worker refused the start");
+    let message = error.to_string();
+    assert!(message.contains(&container.container_id), "{message}");
+    assert!(message.contains(&format!("node {}", node.id)), "{message}");
+    let after_failure = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(after_failure.state, "paused");
+
+    agent.answer_with(200);
+    service
+        .resume_deployment(deployment.project_id, deployment.id)
+        .await?;
+    assert_eq!(
+        agent.started(),
+        [
+            container.container_id.clone(),
+            container.container_id.clone()
+        ]
+    );
+    let resumed = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(resumed.state, "deployed");
+    let row = deployment_containers::Entity::find_by_id(container.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("container row")?;
+    assert_eq!(row.status.as_deref(), Some("running"));
+    Ok(())
+}
+
+/// A microVM paused before pause refused them never stopped, and no runtime
+/// can start it: resuming only has to put the deployment back.
+#[tokio::test]
+async fn resume_leaves_a_micro_vm_replica_to_the_plane() -> Result<(), Box<dyn std::error::Error>> {
+    if !database_integration_tests_available().await {
+        eprintln!("Docker unavailable; skipping microVM resume integration test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+    let plane = plane_with_micro_vm_replica(&db, &deployment, &container).await?;
+    let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+    active_deployment.state = Set("paused".to_string());
+    let deployment = active_deployment.update(db.as_ref()).await?;
+
+    let mut local = MockContainerDeployer::new();
+    local.expect_start_container().never();
+    let service = create_cleanup_service_for_test(db.clone(), Arc::new(local));
+    service.set_workload_plane(plane);
+
+    service
+        .resume_deployment(deployment.project_id, deployment.id)
+        .await?;
+
+    let resumed = deployments::Entity::find_by_id(deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("deployment row")?;
+    assert_eq!(resumed.state, "deployed");
     Ok(())
 }
 
@@ -3656,6 +4188,194 @@ async fn tearing_down_a_missing_environment_is_not_found() -> Result<(), Box<dyn
     Ok(())
 }
 
+/// A rollback runs the old image against the environment's *current*
+/// variables, so the image having passed once proves nothing about whether
+/// it works now. With no health path configured the candidate must still
+/// face the default `/` probe, and the live deployment must survive it.
+#[tokio::test]
+async fn rollback_without_health_path_refuses_an_app_failing_the_default_probe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, target_deployment) = setup_test_data(&db).await?;
+    assert_eq!(
+        target_deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.health_check_path.as_deref()),
+        None,
+        "this test is about a target with no recorded health path"
+    );
+
+    let current_deployment = deployments::ActiveModel {
+        project_id: Set(project.id),
+        environment_id: Set(environment.id),
+        slug: Set("current-deployment-before-unhealthy-rollback".to_string()),
+        state: Set("completed".to_string()),
+        metadata: Set(Some(
+            temps_entities::deployments::DeploymentMetadata::default(),
+        )),
+        image_name: Set(Some("nginx:current".to_string())),
+        created_at: Set(Utc::now()),
+        updated_at: Set(Utc::now()),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+    let mut active_environment: environments::ActiveModel = environment.clone().into();
+    active_environment.current_deployment_id = Set(Some(current_deployment.id));
+    // The shortest budget accepted, so the probe gives up within the test.
+    active_environment.deployment_config =
+        Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            health_check_timeout_seconds: Some(
+                temps_entities::deployment_config::MIN_HEALTH_CHECK_TIMEOUT_SECONDS,
+            ),
+            ..Default::default()
+        }));
+    active_environment.update(db.as_ref()).await?;
+
+    let (app_port, requests) = spawn_recording_app_server("500 Internal Server Error");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    let error = service
+        .rollback_to_deployment(project.id, target_deployment.id)
+        .await
+        .expect_err("an app answering 500 on / must not go live");
+
+    assert!(
+        error.to_string().contains("HTTP 500"),
+        "the failure should say what the probe saw, got: {error}"
+    );
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        !requests.is_empty() && requests.iter().all(|line| line.starts_with("GET / ")),
+        "with no configured path the probe targets /, got: {requests:?}"
+    );
+    let persisted_environment = environments::Entity::find_by_id(environment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("environment disappeared")?;
+    assert_eq!(
+        persisted_environment.current_deployment_id,
+        Some(current_deployment.id),
+        "an unhealthy rollback must not replace the active deployment"
+    );
+    let persisted_current = deployments::Entity::find_by_id(current_deployment.id)
+        .one(db.as_ref())
+        .await?
+        .ok_or("current deployment disappeared")?;
+    assert_eq!(
+        persisted_current.state, "completed",
+        "an unhealthy rollback must not stop the active deployment"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn promotion_without_health_path_runs_the_default_probe(
+) -> Result<(), Box<dyn std::error::Error>> {
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, _source_environment, source) = setup_test_data(&db).await?;
+
+    let now = Utc::now();
+    let target_environment = environments::ActiveModel {
+        project_id: Set(project.id),
+        name: Set("Promotion Target".to_string()),
+        slug: Set("promotion-target".to_string()),
+        host: Set("promotion-target.example.com".to_string()),
+        upstreams: Set(UpstreamList::default()),
+        current_deployment_id: Set(None),
+        subdomain: Set("promotion-target.example.com".to_string()),
+        created_at: Set(now),
+        updated_at: Set(now),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+
+    let (app_port, requests) = spawn_recording_app_server("200 OK");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    service
+        .promote_deployment(project.id, source.id, target_environment.id)
+        .await?;
+
+    let requests = requests.lock().unwrap().clone();
+    assert!(
+        requests.iter().any(|line| line.starts_with("GET / ")),
+        "a promoted image runs against another environment's variables and \
+         must be probed before going live, got: {requests:?}"
+    );
+
+    Ok(())
+}
+
+/// Dropping the rollback's blanket skip must not start HTTP-probing services
+/// that declare they have no HTTP endpoint.
+#[tokio::test]
+async fn rollback_with_process_health_does_not_probe_http() -> Result<(), Box<dyn std::error::Error>>
+{
+    let test_db = match TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
+            println!("Docker unavailable; skipping: {error}");
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let db = test_db.connection_arc();
+    let (project, environment, target_deployment) = setup_test_data(&db).await?;
+
+    let mut active_environment: environments::ActiveModel = environment.into();
+    active_environment.deployment_config =
+        Set(Some(temps_entities::deployment_config::DeploymentConfig {
+            health: Some(temps_core::repo_config::HealthCheckConfig {
+                probe_type: Some("process".to_string()),
+                stable_for: 1,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }));
+    active_environment.update(db.as_ref()).await?;
+
+    let (app_port, requests) = spawn_recording_app_server("500 Internal Server Error");
+    let mut service = create_deployment_service_for_test(db.clone());
+    service.deployer = Arc::new(mock_deployer_serving_on_port(app_port));
+    configure_test_service_for_http_readiness(&service).await?;
+
+    service
+        .rollback_to_deployment(project.id, target_deployment.id)
+        .await?;
+
+    assert_eq!(
+        requests.lock().unwrap().clone(),
+        Vec::<String>::new(),
+        "health.type: process must not be HTTP-probed"
+    );
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_teardown_deployment() -> Result<(), Box<dyn std::error::Error>> {
     let test_db = TestDatabase::with_migrations().await?;
@@ -4571,132 +5291,6 @@ async fn test_get_container_env_variables() -> Result<(), Box<dyn std::error::Er
 }
 
 #[tokio::test]
-async fn test_stop_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
-    let test_db = TestDatabase::with_migrations().await?;
-    let db = test_db.connection_arc();
-
-    // Setup
-    let (project, environment, deployment, _container) = setup_test_deployment(&db).await?;
-
-    // Create second container
-    let now = Utc::now();
-    let container2 = deployment_containers::ActiveModel {
-        deployment_id: Set(deployment.id),
-        container_id: Set("container-789".to_string()),
-        container_name: Set("test-container-3".to_string()),
-        container_port: Set(Some(9090)),
-        image_name: Set(Some("redis:latest".to_string())),
-        status: Set(Some("running".to_string())),
-        created_at: Set(now),
-        deployed_at: Set(now),
-        ..Default::default()
-    };
-    container2.insert(db.as_ref()).await?;
-
-    let deployment_service = create_deployment_service_for_test(db.clone());
-
-    // Test: Stop all containers
-    deployment_service
-        .stop_all_containers(project.id, environment.id)
-        .await?;
-
-    // Verify: Both containers should be stopped
-    let containers = deployment_containers::Entity::find()
-        .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
-        .all(db.as_ref())
-        .await?;
-
-    for container in containers {
-        assert_eq!(container.status, Some("stopped".to_string()));
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_start_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
-    let test_db = TestDatabase::with_migrations().await?;
-    let db = test_db.connection_arc();
-
-    // Setup
-    let (project, environment, deployment, container1) = setup_test_deployment(&db).await?;
-
-    // Set all containers to stopped
-    let mut active_container: deployment_containers::ActiveModel = container1.into();
-    active_container.status = Set(Some("stopped".to_string()));
-    active_container.update(db.as_ref()).await?;
-
-    let deployment_service = create_deployment_service_for_test(db.clone());
-
-    // Test: Start all containers
-    deployment_service
-        .start_all_containers(project.id, environment.id)
-        .await?;
-
-    // Verify: All containers should be running
-    let containers = deployment_containers::Entity::find()
-        .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
-        .all(db.as_ref())
-        .await?;
-
-    for container in containers {
-        assert_eq!(container.status, Some("running".to_string()));
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn test_restart_all_containers_success() -> Result<(), Box<dyn std::error::Error>> {
-    let test_db = TestDatabase::with_migrations().await?;
-    let db = test_db.connection_arc();
-
-    // Setup (this creates 1 container)
-    let (project, environment, deployment, _container) = setup_test_deployment(&db).await?;
-
-    // Create multiple additional containers (3 more, total 4)
-    let now = Utc::now();
-    for i in 1..=3 {
-        let container = deployment_containers::ActiveModel {
-            deployment_id: Set(deployment.id),
-            container_id: Set(format!("container-{}", i * 100)),
-            container_name: Set(format!("test-container-{}", i)),
-            container_port: Set(Some(8000 + i)),
-            image_name: Set(Some("nginx:latest".to_string())),
-            status: Set(Some("running".to_string())),
-            created_at: Set(now),
-            deployed_at: Set(now),
-            ..Default::default()
-        };
-        container.insert(db.as_ref()).await?;
-    }
-
-    let deployment_service = create_deployment_service_for_test(db.clone());
-
-    // Test: Restart all containers
-    deployment_service
-        .restart_all_containers(project.id, environment.id)
-        .await?;
-
-    // Verify: All containers should still be running (1 from setup + 3 created = 4 total)
-    let containers = deployment_containers::Entity::find()
-        .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
-        .all(db.as_ref())
-        .await?;
-
-    assert_eq!(
-        containers.len(),
-        4,
-        "Should have 4 containers (1 from setup + 3 created)"
-    );
-    for container in containers {
-        assert_eq!(container.status, Some("running".to_string()));
-    }
-
-    Ok(())
-}
-
-#[tokio::test]
 async fn test_container_operations_wrong_environment() -> Result<(), Box<dyn std::error::Error>> {
     let test_db = TestDatabase::with_migrations().await?;
     let db = test_db.connection_arc();
@@ -5365,6 +5959,129 @@ async fn test_failure_report_preview_stops_at_failed_job_and_redacts_secrets(
         !preview.redacted_log.contains("super-secret-value"),
         "known secret value must be redacted from the trace"
     );
+
+    Ok(())
+}
+
+/// A key rotated since the deployment ran leaves its envelope undecryptable.
+/// The log, which still holds the secret value, must stay out of the preview
+/// and of anything sent, not go out with only the pattern-based redaction.
+#[tokio::test]
+#[serial_test::serial(temps_telemetry_env)]
+async fn test_failure_report_withholds_the_log_when_secrets_cannot_be_decrypted(
+) -> Result<(), Box<dyn std::error::Error>> {
+    if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+        && !tokio::process::Command::new("docker")
+            .arg("info")
+            .output()
+            .await
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    {
+        eprintln!("Docker unavailable; skipping undecryptable failure-report test");
+        return Ok(());
+    }
+    let test_db = TestDatabase::with_migrations().await?;
+    let db = test_db.connection_arc();
+    let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+    let secret = "super-secret-value";
+    let rotated_away =
+        EncryptionService::new("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210")?;
+    let mut job_config = serde_json::Map::new();
+    crate::services::sensitive_envelope::write_sealed(
+        &mut job_config,
+        &rotated_away,
+        "secrets",
+        &std::collections::HashMap::from([("DB_PASSWORD".to_string(), secret.to_string())]),
+    )?;
+
+    let log_dir = tempfile::tempdir()?;
+    let log_id = format!("{}-build_image", uuid::Uuid::new_v4().simple());
+    tokio::fs::write(
+        log_dir.path().join(format!("{log_id}.log")),
+        format!("connecting with password {secret}\n"),
+    )
+    .await?;
+    let job = temps_entities::deployment_jobs::ActiveModel {
+        deployment_id: Set(deployment.id),
+        job_id: Set("build_image".to_string()),
+        job_type: Set("build_imageJob".to_string()),
+        name: Set("Build Image".to_string()),
+        log_id: Set(log_id),
+        status: Set(temps_entities::types::JobStatus::Failure),
+        error_message: Set(Some(format!("login failed for {secret}"))),
+        job_config: Set(Some(serde_json::Value::Object(job_config))),
+        execution_order: Set(Some(0)),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await?;
+
+    // Reporting on, and pointed at a closed port: if the refusal below ever
+    // regresses, the test fails on the send error instead of reaching a server.
+    std::env::remove_var("TEMPS_TELEMETRY");
+    std::env::set_var(
+        "TEMPS_FAILURE_REPORT_ENDPOINT",
+        "http://127.0.0.1:9/v1/deploy-failure-reports",
+    );
+    let failure_service = crate::services::FailureReportService::new(
+        Arc::new(create_deployment_service_for_test(db.clone())),
+        Arc::new(temps_deployment_logs::LogService::new(
+            log_dir.path().to_path_buf(),
+        )),
+        create_test_encryption_service(),
+    );
+    std::env::remove_var("TEMPS_FAILURE_REPORT_ENDPOINT");
+    let failure_service = failure_service?;
+
+    let preview = failure_service
+        .build_preview(deployment.project_id, deployment.id, &job.job_id)
+        .await?;
+
+    assert!(
+        !preview.redacted_log.contains(secret),
+        "the log must not be shown without exact-match redaction: {}",
+        preview.redacted_log
+    );
+    assert!(
+        preview.redacted_log.contains("Log withheld")
+            && preview
+                .redacted_log
+                .contains(&format!("deployment {}", deployment.id)),
+        "the preview must say why the log is missing: {}",
+        preview.redacted_log
+    );
+    assert_eq!(preview.error_message, None);
+    assert!(
+        !preview.github_issue_title.contains(secret),
+        "{}",
+        preview.github_issue_title
+    );
+    assert!(
+        !preview.github_issue_body.contains(secret),
+        "{}",
+        preview.github_issue_body
+    );
+
+    let refused = failure_service
+        .send_report(
+            deployment.project_id,
+            deployment.id,
+            &job.job_id,
+            &format!("connecting with password {secret}\n"),
+        )
+        .await
+        .expect_err("a report that cannot be checked for secrets must not be sent");
+    assert!(
+        matches!(
+            &refused,
+            crate::services::FailureReportError::SecretsUnavailable { deployment_id, .. }
+                if *deployment_id == deployment.id
+        ),
+        "{refused:?}"
+    );
+    assert!(!refused.to_string().contains(secret), "{refused}");
 
     Ok(())
 }

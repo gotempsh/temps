@@ -47,6 +47,8 @@ temps-core = { path = "../temps-core", optional = true }
 # Policy-aware answers for restricted workloads (ADR-055 §9).
 temps-workload-netpol = { path = "../temps-workload-netpol" }
 arc-swap = { workspace = true }
+# Per-process id of the query observer (ADR-095).
+uuid = { workspace = true }
 
 # Error handling & logging
 thiserror = { workspace = true }

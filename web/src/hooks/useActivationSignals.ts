@@ -14,18 +14,18 @@ import {
   listDnsProvidersOptions,
   listUsersOptions,
   getAiProviderStatusOptions,
-  listApiKeysOptions,
+  getAiHarnessStatusOptions,
   getPreviewDomainStatusOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
-import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { harnessStatusOf } from '@/lib/ai-onboarding'
 import { hasCompletedDeployment } from '@/lib/first-deploy'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 export interface ActivationSignals {
-  /** Dedicated active admin key has authenticated an external AI harness */
+  /** An external AI harness authenticated (see `GET /api-keys/ai-harness/status`) */
   aiHarnessConfigured: boolean
   /** Active provider can power Temps' built-in chat and AI features */
   aiProviderConfigured: boolean
@@ -151,14 +151,16 @@ export function useActivationSignals(): ActivationSignals {
       retry: false,
     })
 
-  const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
-    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
-    retry: false,
-    // Shares its cache entry with the AI-harness setup banner, and each
-    // observer's `meta` replaces the other's: both must opt out. Roles without
-    // API-key access are refused here, which is not a failure of the page.
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
-  })
+  const { data: aiHarnessStatus, isLoading: aiHarnessStatusLoading } = useQuery(
+    {
+      ...getAiHarnessStatusOptions(),
+      retry: false,
+      // Shares its cache entry with the AI-harness setup banner, and each
+      // observer's `meta` replaces the other's: both must opt out. Roles without
+      // API-key access are refused here, which is not a failure of the page.
+      meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    }
+  )
 
   // TEMP: pretend nothing is set up yet, for building the first-run
   // experience. See lib/devSimulate.ts. Placed after all hooks so hook order
@@ -198,11 +200,10 @@ export function useActivationSignals(): ActivationSignals {
     !previewStatusLoading &&
     !usersLoading &&
     !aiProviderStatusLoading &&
-    !apiKeysLoading
+    !aiHarnessStatusLoading
 
   const aiProviderConfigured = aiProviderStatus?.configured === true
-  const aiHarnessConfigured =
-    getAiHarnessStatus(apiKeysData?.api_keys) === 'connected'
+  const aiHarnessConfigured = harnessStatusOf(aiHarnessStatus) === 'connected'
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0

@@ -5,13 +5,14 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_entities::{feature_flag_environments, feature_flags};
 use utoipa::ToSchema;
 
-use crate::eval::{FlagSnapshot, FlagValueType};
-use crate::services::FlagService;
+use crate::eval::{AttributeValue, FlagRule, FlagSnapshot, FlagValueType, FlagVariant};
+use crate::services::{parse_rules, parse_variants, FlagService};
 
 pub struct FlagsAppState {
     pub flag_service: Arc<FlagService>,
@@ -94,6 +95,13 @@ pub struct CreateFlagRequest {
     /// explicitly opted in, because targeting rules can encode business logic.
     #[serde(default)]
     pub client_visible: bool,
+    /// Named values targeting rules may serve. Each must match `value_type`.
+    #[serde(default)]
+    pub variants: Vec<FlagVariant>,
+    /// Share of subjects (`0..=1`) whose browser records a `flag_exposure`
+    /// event when it reads the flag. Defaults to 0: exposure is opt-in.
+    #[serde(default)]
+    pub exposure_sample_rate: f64,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -106,6 +114,40 @@ pub struct UpdateFlagRequest {
     pub description: Option<Option<String>>,
     #[serde(default)]
     pub client_visible: Option<bool>,
+    /// Replaces the variant list. A variant still served by a rule cannot be
+    /// removed.
+    #[serde(default)]
+    pub variants: Option<Vec<FlagVariant>>,
+    #[serde(default)]
+    pub exposure_sample_rate: Option<f64>,
+    /// The flag's `updated_at` as last read. When sent, the update is refused
+    /// with 409 if the flag changed since.
+    #[serde(default)]
+    pub expected_updated_at: Option<String>,
+}
+
+/// Replace the ordered targeting rules of a flag in one environment.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct SetFlagRulesRequest {
+    /// First match wins. An empty list removes all targeting.
+    pub rules: Vec<FlagRule>,
+    /// The environment row's `updated_at` as last read, or absent when the
+    /// flag had no row for this environment. A 409 means someone else changed
+    /// the rules in between: reload and apply the change again.
+    #[serde(default)]
+    pub expected_updated_at: Option<String>,
+}
+
+/// Evaluate one flag as an app in an environment would.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct EvaluateFlagRequest {
+    pub environment_id: i32,
+    /// Bucketing subject. Required for rules with a rollout or a split to
+    /// apply.
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub attributes: std::collections::HashMap<String, AttributeValue>,
 }
 
 #[derive(Debug, Clone, Deserialize, ToSchema)]
@@ -129,14 +171,31 @@ pub struct FlagEnvironmentResponse {
     pub environment_id: i32,
     pub enabled: bool,
     pub value: Option<serde_json::Value>,
+    /// Ordered targeting rules; first match wins.
+    pub rules: Vec<FlagRule>,
+    /// `false` when the stored rules could not be decoded. The flag then
+    /// serves its default with reason `ERROR` until they are replaced.
+    pub rules_valid: bool,
+    /// Send back as `expected_updated_at` when replacing the rules.
+    pub updated_at: String,
+}
+
+/// ISO 8601 with a `Z` suffix and the stored precision, so a revision sent
+/// back as `expected_updated_at` compares equal.
+pub(crate) fn iso(timestamp: DateTime<Utc>) -> String {
+    timestamp.to_rfc3339_opts(SecondsFormat::AutoSi, true)
 }
 
 impl From<feature_flag_environments::Model> for FlagEnvironmentResponse {
     fn from(model: feature_flag_environments::Model) -> Self {
+        let parsed = parse_rules(&model);
         Self {
             environment_id: model.environment_id,
             enabled: model.enabled,
             value: model.value,
+            rules_valid: parsed.is_some(),
+            rules: parsed.unwrap_or_default(),
+            updated_at: iso(model.updated_at),
         }
     }
 }
@@ -149,11 +208,16 @@ pub struct FlagResponse {
     pub default_value: serde_json::Value,
     pub description: Option<String>,
     pub client_visible: bool,
+    /// Named values targeting rules may serve.
+    pub variants: Vec<FlagVariant>,
+    /// Share of subjects whose browser records exposure events. 0 = off.
+    pub exposure_sample_rate: f64,
     pub archived_at: Option<String>,
     /// When an app last actually evaluated this flag. `None` means never seen,
     /// which is a real answer rather than missing data.
     pub last_evaluated_at: Option<String>,
     pub created_at: String,
+    /// Send back as `expected_updated_at` to make an update conditional.
     pub updated_at: String,
     /// Per-environment overrides. Empty means the flag inherits its default
     /// everywhere.
@@ -165,17 +229,20 @@ impl FlagResponse {
         flag: feature_flags::Model,
         environments: Vec<feature_flag_environments::Model>,
     ) -> Self {
+        let variants = parse_variants(&flag);
         Self {
             id: flag.id,
+            variants,
+            exposure_sample_rate: flag.exposure_sample_rate,
             key: flag.key,
             value_type: flag.value_type,
             default_value: flag.default_value,
             description: flag.description,
             client_visible: flag.client_visible,
-            archived_at: flag.archived_at.map(|t| t.to_rfc3339()),
-            last_evaluated_at: flag.last_evaluated_at.map(|t| t.to_rfc3339()),
-            created_at: flag.created_at.to_rfc3339(),
-            updated_at: flag.updated_at.to_rfc3339(),
+            archived_at: flag.archived_at.map(iso),
+            last_evaluated_at: flag.last_evaluated_at.map(iso),
+            created_at: iso(flag.created_at),
+            updated_at: iso(flag.updated_at),
             environments: environments.into_iter().map(Into::into).collect(),
         }
     }
@@ -228,6 +295,18 @@ pub struct ArchiveFlagResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn timestamps_use_the_z_suffix_and_keep_their_precision() {
+        use chrono::TimeZone;
+        let timestamp = Utc
+            .timestamp_opt(1_763_640_000, 123_456_000)
+            .single()
+            .expect("a valid timestamp");
+        assert_eq!(iso(timestamp), "2025-11-20T12:00:00.123456Z");
+        let parsed = DateTime::parse_from_rfc3339(&iso(timestamp)).expect("parses back");
+        assert_eq!(parsed.with_timezone(&Utc), timestamp);
+    }
 
     // The tri-state distinction (absent vs explicit null vs value) is the
     // mechanism that has silently regressed in this codebase before: serde's

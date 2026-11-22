@@ -29,6 +29,7 @@ async-trait = { workspace = true }
 sea-orm = { workspace = true }
 
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 temps-database = { path = "../temps-database" }
 
 [lints]

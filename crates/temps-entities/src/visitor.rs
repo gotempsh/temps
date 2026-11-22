@@ -35,6 +35,17 @@ pub struct Model {
     pub first_utm_medium: Option<String>,
     /// UTM campaign parameter from the first visit
     pub first_utm_campaign: Option<String>,
+    // Identity set by `identify` (ADR 109 D4)
+    /// The app's own id for the person
+    pub user_id: Option<String>,
+    /// Who set `user_id`: the page (a claim) or the app's backend (vouched)
+    pub identity_source: Option<super::visitor_identity_source::VisitorIdentitySource>,
+    /// When `user_id` or its source last changed
+    pub identified_at: Option<DBDateTime>,
+    /// For each `custom_data` key `identify` wrote, who wrote it:
+    /// `{"plan": "server", "theme": "browser"}`
+    #[sea_orm(column_type = "JsonBinary", nullable)]
+    pub trait_sources: Option<serde_json::Value>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

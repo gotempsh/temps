@@ -80,7 +80,10 @@ struct RecordingAudit {
 
 #[async_trait]
 impl AuditLogger for RecordingAudit {
-    async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+    async fn create_audit_log(
+        &self,
+        operation: &dyn AuditOperation,
+    ) -> temps_core::AuditResult<()> {
         self.operations
             .lock()
             .unwrap()
@@ -212,11 +215,9 @@ async fn test_setup_dns_inactive_provider_rejects_without_dns_or_audit_touch() {
     use temps_domains::tls::models::AcmeOrder;
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping inactive-provider router test: {error}");
             return;
         }
@@ -345,11 +346,9 @@ async fn test_setup_dns_normalized_zone_ambiguity_returns_conflict() {
     use temps_domains::tls::models::AcmeOrder;
     use temps_entities::{dns_managed_domains, dns_providers};
 
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error)
-            if temps_database::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
-        {
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) => {
             eprintln!("Docker unavailable; skipping setup-DNS ambiguity test: {error}");
             return;
         }

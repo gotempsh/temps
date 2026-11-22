@@ -392,7 +392,12 @@ impl PostgresAllocator {
         let mut used: Vec<Ipv4Net> = Vec::with_capacity(allocated.len());
         let mut reassigned = Vec::with_capacity(allocated.len());
         for node in allocated {
-            let avoid = AvoidSets::for_node(node.id, &members, control_plane_underlay);
+            let avoid = AvoidSets::for_node(
+                node.id,
+                &members,
+                control_plane_underlay,
+                &cfg.docker_network_name,
+            );
             let (chosen, fit) = pick_tiered(
                 requested_pool
                     .subnets(requested_prefix_len)
@@ -502,7 +507,7 @@ impl PostgresAllocator {
             raw: raw.to_owned(),
             reason: error.to_string(),
         })?;
-        let own = occupied_of(node);
+        let own = occupied_of(node, &cfg.docker_network_name);
         let Some(collision) = occupied::first_overlap(&allocated, &own) else {
             return Ok(None);
         };
@@ -547,7 +552,12 @@ impl PostgresAllocator {
             .control_plane_underlay_address
             .as_deref()
             .and_then(|raw| raw.parse::<IpAddr>().ok());
-        let avoid = AvoidSets::for_node(node_id, &members, control_plane_underlay);
+        let avoid = AvoidSets::for_node(
+            node_id,
+            &members,
+            control_plane_underlay,
+            &cfg.docker_network_name,
+        );
         let subnets = current
             .compute_pool_cidr
             .subnets(current.subnet_prefix_len)
@@ -689,7 +699,7 @@ impl PostgresAllocator {
             }
             // Every node routes to the control plane's subnet, so it avoids
             // their occupied ranges too, highest first.
-            let avoid = AvoidSets::for_control_plane(&members);
+            let avoid = AvoidSets::for_control_plane(&members, &cfg.docker_network_name);
             let (cidr, fit) = pick_tiered(highest_first(pool, prefix_len), &used, &avoid).ok_or(
                 AllocatorError::PoolExhausted {
                     pool,
@@ -1012,7 +1022,12 @@ impl ComputeNetworkAllocator for PostgresAllocator {
             .control_plane_underlay_address
             .as_deref()
             .and_then(|raw| raw.parse::<IpAddr>().ok());
-        let avoid = AvoidSets::for_node(node_id, &members, control_plane_underlay);
+        let avoid = AvoidSets::for_node(
+            node_id,
+            &members,
+            control_plane_underlay,
+            &cfg.docker_network_name,
+        );
 
         // 4. The lowest free subnet that overlaps no member's occupied
         //    ranges or address; failing that, the best available.
@@ -1194,16 +1209,39 @@ fn validate_private_underlay(node_id: i32, address: IpAddr) -> Result<(), Alloca
 /// A node's reported occupied ranges. A malformed column (hand-edited, or
 /// from a future agent) is ignored rather than blocking allocation: the node
 /// still preflights every route itself.
-pub fn occupied_of(node: &nodes::Model) -> Vec<OccupiedRange> {
+pub fn occupied_of(node: &nodes::Model, cluster_overlay: &str) -> Vec<OccupiedRange> {
     let Some(raw) = node.occupied_ranges.as_ref() else {
         return Vec::new();
     };
     match serde_json::from_value::<Vec<OccupiedRange>>(raw.clone()) {
-        Ok(ranges) => ranges,
+        Ok(ranges) => {
+            let own = node
+                .overlay_network_name
+                .as_deref()
+                .unwrap_or(cluster_overlay);
+            ranges
+                .into_iter()
+                .filter(|range| !is_own_overlay(range, own))
+                .collect()
+        }
         Err(error) => {
             warn!(node_id = node.id, %error, "ignoring malformed nodes.occupied_ranges");
             Vec::new()
         }
+    }
+}
+
+/// Whether `range` is the node's own overlay (ADR 062): a route on its
+/// `br-<name>`/`vxlan-<name>` device, or its `<name>` Docker network. An
+/// agent that reported one (one that predates ADR 062, after a failed
+/// bootstrap) must not get its allocation moved off its own bridge.
+fn is_own_overlay(range: &OccupiedRange, overlay: &str) -> bool {
+    match range.source {
+        occupied::OccupiedSource::Route => {
+            range.name.strip_prefix("br-") == Some(overlay)
+                || range.name.strip_prefix("vxlan-") == Some(overlay)
+        }
+        occupied::OccupiedSource::Docker => range.name == overlay,
     }
 }
 
@@ -1305,7 +1343,9 @@ fn validate_pool_against_cluster(
                 }
             }
         }
-        if let Some(range) = occupied::first_overlap(&pool, &occupied_of(node)) {
+        if let Some(range) =
+            occupied::first_overlap(&pool, &occupied_of(node, &cfg.docker_network_name))
+        {
             return Err(AllocatorError::PoolOverlapsOccupied {
                 pool,
                 member: format!("node '{}'", node.name),
@@ -1328,10 +1368,17 @@ pub(crate) struct AvoidSets {
 }
 
 impl AvoidSets {
-    fn for_node(node_id: i32, members: &[nodes::Model], control_plane: Option<IpAddr>) -> Self {
+    fn for_node(
+        node_id: i32,
+        members: &[nodes::Model],
+        control_plane: Option<IpAddr>,
+        cluster_overlay: &str,
+    ) -> Self {
         let mut sets = Self::default();
         for member in members {
-            let ranges = occupied_of(member).into_iter().map(|range| range.cidr);
+            let ranges = occupied_of(member, cluster_overlay)
+                .into_iter()
+                .map(|range| range.cidr);
             if member.id == node_id {
                 sets.own.extend(ranges);
             } else {
@@ -1354,8 +1401,8 @@ impl AvoidSets {
     }
 
     /// For the control plane: every node's occupied ranges and address.
-    fn for_control_plane(members: &[nodes::Model]) -> Self {
-        Self::for_node(0, members, None)
+    fn for_control_plane(members: &[nodes::Model], cluster_overlay: &str) -> Self {
+        Self::for_node(0, members, None, cluster_overlay)
     }
 }
 
@@ -1613,6 +1660,25 @@ mod tests {
             pick_tiered(pool.subnets(24).unwrap(), &[], &avoid).map(|(_, fit)| fit),
             Some(Fit::OverlapsOwn)
         );
+    }
+
+    #[test]
+    fn a_nodes_own_overlay_is_not_an_occupied_range() {
+        // ADR 062: an agent that reported its own half-built `br-temps1`
+        // must not have its allocation moved off it.
+        let cidr: Ipv4Net = "10.202.5.0/24".parse().unwrap();
+        let own = |range: OccupiedRange| is_own_overlay(&range, "temps1");
+        assert!(own(OccupiedRange::route(cidr, "br-temps1")));
+        assert!(own(OccupiedRange::route(cidr, "vxlan-temps1")));
+        assert!(own(OccupiedRange::docker(cidr, "temps1")));
+        // Another overlay's devices and network still count.
+        assert!(!own(OccupiedRange::route(cidr, "br-temps0")));
+        assert!(!own(OccupiedRange::route(cidr, "vxlan-temps0")));
+        assert!(!own(OccupiedRange::docker(cidr, "temps0")));
+        // A route device named like the network is not the bridge.
+        assert!(!own(OccupiedRange::route(cidr, "temps1")));
+        assert!(!own(OccupiedRange::docker(cidr, "br-temps1")));
+        assert!(!own(OccupiedRange::route(cidr, "br-temps10")));
     }
 
     #[test]

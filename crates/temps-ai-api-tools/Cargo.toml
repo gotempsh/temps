@@ -12,8 +12,11 @@ repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+regex = { workspace = true }
+arc-swap = { workspace = true }
+uuid = { workspace = true }
 # Internal crates
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 
 # Async runtime
@@ -30,8 +33,10 @@ tracing = { workspace = true }
 
 # HTTP framework
 axum = { workspace = true }
+matchit = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
+http-body-util = { workspace = true }
 
 # API documentation
 utoipa = { workspace = true }

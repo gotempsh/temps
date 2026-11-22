@@ -19,11 +19,13 @@
 pub mod logging;
 pub mod mounts;
 pub mod restart;
+pub mod sandbox_user;
 pub mod stats;
 pub mod supervisor;
 pub mod workload_log;
 
 pub use restart::SpawnRestartPolicy;
+pub use sandbox_user::SandboxUser;
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -80,7 +82,7 @@ pub const PTY_PORT: u32 = 5000;
 pub const PTY_AGENT_BIN: &str = "/sbin/temps-pty-agent";
 
 /// Control socket of the guest's PTY agent. Same path as the Docker sandboxes
-/// (`temps_ai_agents::sandbox::PTY_AGENT_SOCKET`; a test there keeps the two in
+/// (`temps_sandbox_providers::PTY_AGENT_SOCKET`; a test there keeps the two in
 /// step) so a terminal behaves identically on every backend.
 pub const PTY_AGENT_SOCKET: &str = "/run/temps-pty/agent.sock";
 
@@ -194,7 +196,30 @@ pub enum Request {
         #[serde(default)]
         pid: Option<u32>,
     },
+    /// Whether the sandbox user named on the kernel command line
+    /// ([`sandbox_user::SANDBOX_USER_BOOT_ARG`]) was prepared at boot. The
+    /// host asks once the agent answers a ping, and fails the create when
+    /// it could not be.
+    SandboxUser,
     Shutdown,
+}
+
+/// What [`Request::SandboxUser`] found.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum SandboxUserStatus {
+    /// The agent is still preparing the user (the first boot of a rootfs
+    /// hands the converter's files back to root, which walks the whole
+    /// filesystem). The host asks again until it is settled.
+    Preparing,
+    /// The kernel command line named no sandbox user: everything runs as
+    /// root, as in a workload VM.
+    NotRequested,
+    /// The user exists, owns its home and the workspace, and the terminal
+    /// agent runs as it.
+    Ready { user: SandboxUser },
+    /// The user could not be prepared; nothing runs as it.
+    Failed { reason: String },
 }
 
 /// Resource ceilings a spawned process runs under, set with `setrlimit`
@@ -291,6 +316,8 @@ pub enum Response {
     },
     /// What [`Request::ReadStats`] sampled.
     Stats(stats::GuestStats),
+    /// What [`Request::SandboxUser`] found.
+    SandboxUser(SandboxUserStatus),
     Err {
         message: String,
     },

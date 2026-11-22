@@ -5,7 +5,6 @@ mod alerts;
 mod backup;
 mod capability;
 mod notifier;
-mod reconcile;
 mod restore;
 mod restore_cancel;
 mod restore_reconcile;
@@ -18,23 +17,23 @@ pub use alerts::{sweep_backup_alerts, SweepStats, OVERDUE_GRACE};
 pub use backup::{
     BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
     BackupScheduleAccessScope, BackupService, BackupTriggerParams, BackupWithAccessScope,
-    ChildBackupEntry, EnqueuedJob, RecoverySetPublication, RetentionCleanupFailure,
-    RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse,
-    ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList,
-    ServiceBackupEntry, ServiceProjectScope, TriggerSource,
+    ChildBackupEntry, EnqueuedJob, InternalArchiveReconcile, RecoverySetPublication,
+    RetentionCleanupFailure, RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry,
+    ScheduleRunListResponse, ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary,
+    ScheduleRunSummaryList, ServiceBackupEntry, ServiceProjectScope, TriggerSource,
+    NO_ARCHIVE_DESTINATION_COMMAND,
 };
 pub use capability::{BackupCapabilityError, ExternalServiceBackupCapability};
 pub use notifier::BackupNotificationAdapter;
-pub use reconcile::reconcile_orphan_backups;
 pub use restore::{
-    BackupProducerServices, BackupSelector, PlanSourceBackup, PlanTarget, RestoreError,
-    RestoreOriginBinding, RestorePlan, RestoreRequestMode, RestoreRunSourceBackup, RestoreRunView,
-    RestoreService, RestoreServiceIdentity,
+    BackupProducerServices, BackupSelector, ManagerWorkerRestoreResume, PlanSourceBackup,
+    PlanTarget, RestoreError, RestoreOriginBinding, RestorePlan, RestoreRequestMode,
+    RestoreRunSourceBackup, RestoreRunView, RestoreService, RestoreServiceIdentity,
 };
 pub use restore_cancel::{cancellable_phases, run_is_destructive, RestoreCancellations};
 pub use restore_reconcile::{
     active_restore_run_ids, reconcile_interrupted_restores, FenceTarget, ManagerRestoreFence,
-    RestoreHelperFence, RestoreReconcileReport, INTERRUPTED_STATUS,
+    RestoreHelperFence, RestoreReconcileReport, WorkerRestoreResume, INTERRUPTED_STATUS,
 };
 pub use s3_lifecycle::{ReconcileOutcome, S3LifecycleService};
 pub use s3_probe::S3ProbeFailureKind;

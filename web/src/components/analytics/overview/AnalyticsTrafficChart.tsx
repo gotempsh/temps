@@ -8,9 +8,11 @@ import type { ChartDateRange } from '@/lib/chart-range-selection'
 import {
   analyticsTimeline,
   formatAnalyticsTick,
+  hourInProgress,
   type AnalyticsTimelineRow,
 } from '@/lib/analytics-timeline'
 export type AnalyticsMetric = 'events' | 'sessions' | 'visitors'
+
 export function AnalyticsTrafficChart({
   data,
   startDate,
@@ -134,6 +136,7 @@ export function AnalyticsTrafficChart({
           selectionKey="timestamp"
           selectedRange={selectedRange}
           onRangeSelect={onZoom}
+          lastPointPartial={hourInProgress(chartData)}
         />
       )}
     </DataSection>

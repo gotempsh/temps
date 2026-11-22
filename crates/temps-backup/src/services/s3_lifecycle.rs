@@ -841,7 +841,7 @@ mod tests {
     async fn sources_in_scope_excludes_unscheduled_operator_buckets() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(d) => d,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");
@@ -868,6 +868,7 @@ mod tests {
                 managed_by_cloud: Set(managed_by_cloud),
                 lifecycle_reconcile_failed_at: Set(None),
                 lifecycle_reconcile_generation: Set(0),
+                worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
                 created_at: Set(now),
                 updated_at: Set(now),
                 backing_service_id: Set(None),
@@ -966,7 +967,7 @@ mod tests {
     async fn sources_in_scope_includes_source_with_a_pending_reconcile_retry() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(d) => d,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");
@@ -993,6 +994,7 @@ mod tests {
             managed_by_cloud: Set(false),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }
@@ -1029,6 +1031,7 @@ mod tests {
             id: Set(source.id),
             lifecycle_reconcile_failed_at: Set(Some(now)),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             ..Default::default()
         }
         .update(db.as_ref())
@@ -1069,7 +1072,7 @@ mod tests {
     async fn a_stale_reconcile_attempt_cannot_clobber_a_newer_attempts_failure() {
         use sea_orm::{ActiveModelTrait, ActiveValue::Set};
 
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(d) => d,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");
@@ -1096,6 +1099,7 @@ mod tests {
             managed_by_cloud: Set(true),
             lifecycle_reconcile_failed_at: Set(None),
             lifecycle_reconcile_generation: Set(0),
+            worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
             created_at: Set(now),
             updated_at: Set(now),
         }

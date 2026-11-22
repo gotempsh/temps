@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use std::sync::Arc;
+use temps_core::crypto::constant_time_eq;
 
 use axum::{
     extract::{rejection::QueryRejection, Extension, Path, Query, State},
@@ -105,6 +106,22 @@ fn cookie_header_value(cookie: &Cookie<'_>) -> Result<HeaderValue, String> {
         .map_err(|error| format!("failed to build login binding cookie: {error}"))
 }
 
+/// The forced password-change cookie an SSO sign-in hands the browser.
+///
+/// Built through [`crate::auth_cookies::builder`] so it is issued under the
+/// name `change_required_password` reads for the same request: on HTTPS that
+/// reader accepts only the host-only name, so a cookie built here under the
+/// bare name would never be read back.
+fn required_password_change_cookie(encrypted_token: String, secure: bool) -> Cookie<'static> {
+    crate::auth_cookies::builder(
+        crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+        encrypted_token,
+        secure,
+    )
+    .max_age(cookie::time::Duration::minutes(15))
+    .build()
+}
+
 /// `Set-Cookie` that ties the login attempt `state` to the browser receiving it.
 fn login_binding_cookie(
     crypto: &CookieCrypto,
@@ -139,10 +156,6 @@ fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, 
 fn insert_no_store_no_referrer(headers: &mut HeaderMap) {
     headers.insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     headers.insert(REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// True when the request carries the cookie that was set when the login
@@ -685,13 +698,8 @@ async fn complete_oidc_login(
                 ),
             }
         })?;
-        let password_change_cookie = Cookie::build(("password_change_session", encrypted_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::minutes(15))
-            .same_site(cookie::SameSite::Strict)
-            .secure(metadata.is_secure)
-            .build();
+        let password_change_cookie =
+            required_password_change_cookie(encrypted_token, metadata.is_secure);
         let cookie_header = password_change_cookie
             .to_string()
             .parse()
@@ -755,13 +763,18 @@ async fn complete_oidc_login(
                 })?;
 
         let mut headers = HeaderMap::new();
-        let mfa_cookie = Cookie::build(("mfa_session", encrypted_token))
-            .http_only(true)
-            .path("/")
-            .max_age(cookie::time::Duration::minutes(5))
-            .same_site(cookie::SameSite::Strict)
-            .secure(metadata.is_secure)
-            .build();
+        // Through the shared builder, so this challenge is issued under the
+        // same name the password flow uses and the one `verify_mfa` reads.
+        // Issuing the unprefixed name here while that reader preferred the
+        // host-only one let a stale password-flow challenge shadow a fresh
+        // SSO one for its whole five-minute life.
+        let mfa_cookie = crate::auth_cookies::builder(
+            crate::auth_cookies::MFA_SESSION,
+            encrypted_token,
+            metadata.is_secure,
+        )
+        .max_age(cookie::time::Duration::minutes(5))
+        .build();
         let cookie_header =
             mfa_cookie
                 .to_string()
@@ -1337,6 +1350,42 @@ mod login_binding_tests {
         }
     }
 
+    /// The SSO branch that forces a password change must issue the cookie
+    /// under the name `change_required_password` reads back for the same
+    /// request. On HTTPS that reader accepts only the host-only name, so a
+    /// bare `password_change_session` left the user with "Password Change
+    /// Session Required" right after being sent to change it.
+    #[test]
+    fn the_password_change_cookie_is_read_back_by_the_password_change_handler() {
+        for secure in [true, false] {
+            let cookie = required_password_change_cookie("sealed-token".to_string(), secure);
+            let text = cookie.to_string();
+            let mut headers = HeaderMap::new();
+            headers.insert(COOKIE, text.split(';').next().unwrap().parse().unwrap());
+
+            assert_eq!(
+                crate::auth_cookies::read(
+                    &headers,
+                    crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+                    secure
+                )
+                .as_deref(),
+                Some("sealed-token"),
+                "secure={secure}: {text}"
+            );
+            assert_eq!(
+                cookie.max_age(),
+                Some(cookie::time::Duration::minutes(15)),
+                "{text}"
+            );
+            assert_eq!(cookie.same_site(), Some(cookie::SameSite::Strict), "{text}");
+            assert_eq!(cookie.http_only(), Some(true), "{text}");
+            assert_eq!(cookie.secure(), Some(secure), "{text}");
+            assert_eq!(cookie.path(), Some("/"), "{text}");
+            assert_eq!(cookie.domain(), None, "{text}");
+        }
+    }
+
     fn crypto() -> CookieCrypto {
         CookieCrypto::new("0123456789abcdef0123456789abcdef").unwrap()
     }
@@ -1586,14 +1635,6 @@ mod login_binding_tests {
         assert!(plain.starts_with("oidc_login_"), "{plain}");
         assert_ne!(plain, login_binding_cookie_name("state-one", true));
     }
-
-    #[test]
-    fn constant_time_eq_matches_equality() {
-        assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
-        assert!(!constant_time_eq(b"abc", b"abcd"));
-        assert!(constant_time_eq(b"", b""));
-    }
 }
 
 /// The binding wired into the real handlers: the start redirect, and the
@@ -1612,8 +1653,8 @@ mod login_binding_http_tests {
         AuthUrl, EmptyAdditionalProviderMetadata, IssuerUrl, JsonWebKeySetUrl, ResponseTypes,
     };
     use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{oidc_login_states, oidc_providers};
+    use temps_test_utils::TestDatabase;
     use tower::ServiceExt;
 
     struct Fixture {
@@ -1626,9 +1667,7 @@ mod login_binding_http_tests {
         match TestDatabase::with_migrations().await {
             Ok(db) => Some(db),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping test: {error}");
                 None

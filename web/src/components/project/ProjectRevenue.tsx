@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { PageHeader } from '@/components/layout/PageContainer'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
   revenueCreateIntegrationMutation,
@@ -10,9 +11,13 @@ import {
   revenueListIntegrationsQueryKey,
   revenueListProvidersOptions,
   revenueMetricsCustomersOptions,
+  revenueMetricsCustomersQueryKey,
   revenueMetricsMrrOptions,
+  revenueMetricsMrrQueryKey,
   revenueMetricsSummaryOptions,
+  revenueMetricsSummaryQueryKey,
   revenueRecentEventsOptions,
+  revenueRecentEventsQueryKey,
   revenueRotateTokenMutation,
   revenueUpdateConfigMutation,
   revenueUpdateSecretMutation,
@@ -114,8 +119,9 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
     ])
   }, [project.slug, setBreadcrumbs])
 
+  const projectPath = { project_id: project.id }
   const integrationsQuery = useQuery({
-    ...revenueListIntegrationsOptions({ path: { project_id: project.id } }),
+    ...revenueListIntegrationsOptions({ path: projectPath }),
   })
 
   const integrations = useMemo(
@@ -163,6 +169,16 @@ export function ProjectRevenue({ project }: ProjectRevenueProps) {
         actions={
           hasIntegrations && (
             <div className="flex flex-wrap items-center gap-2">
+              <RefreshButton
+                queryKeys={[
+                  revenueMetricsSummaryQueryKey({ path: projectPath }),
+                  revenueMetricsMrrQueryKey({ path: projectPath }),
+                  revenueMetricsCustomersQueryKey({ path: projectPath }),
+                  revenueRecentEventsQueryKey({ path: projectPath }),
+                  // The providers' last event and status, shown below.
+                  revenueListIntegrationsQueryKey({ path: projectPath }),
+                ]}
+              />
               <DropdownMenu>
                 <DropdownMenuTrigger asChild>
                   <Button variant="outline" size="sm">

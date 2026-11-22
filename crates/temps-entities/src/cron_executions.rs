@@ -29,6 +29,9 @@ pub struct Model {
     pub finished_at: Option<DBDateTime>,
     /// The last lines of the run's output, bounded.
     pub output_tail: Option<String>,
+    /// The workflow run a `workflow` cron started. No foreign key: runs
+    /// expire by retention while the history stays.
+    pub workflow_run_id: Option<Uuid>,
 }
 
 /// `cron_executions.state` values for `job` runs.

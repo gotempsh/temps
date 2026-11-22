@@ -11,7 +11,7 @@ import {
   useSearchParams,
 } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { MessageSquare, RefreshCw } from 'lucide-react'
+import { MessageSquare } from 'lucide-react'
 import {
   Button,
   Callout,
@@ -32,9 +32,14 @@ import type { FeedbackView, ProjectResponse } from '@/api/client'
 import { deleteProjectFeedback, updateProjectFeedback } from '@/api/client'
 import {
   getProjectFeedbackOptions,
+  getProjectFeedbackQueryKey,
   listProjectFeedbackOptions,
+  listProjectFeedbackQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { CodeBlock } from '@/components/ui/code-block'
+import { FeedbackAttachments } from '@/components/error-tracking/EventAttachments'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ScrollRegion } from '@/components/ui/scroll-region'
 import { readFailureServerDetail } from '@/lib/read-failure'
@@ -79,15 +84,13 @@ function FeedbackList({ project }: { project: ProjectResponse }) {
       title="Feedback"
       description="User reports sent from your application, linked to errors and browser recordings."
       actions={
-        <Button
-          variant="outline"
-          busy={query.isFetching}
-          busyLabel="Refreshing…"
-          onClick={() => void query.refetch()}
-        >
-          <RefreshCw className="size-4" />
-          Refresh
-        </Button>
+        <RefreshButton
+          queryKeys={[
+            queryKeyPrefix(listProjectFeedbackQueryKey, {
+              path: { project_id: project.id },
+            }),
+          ]}
+        />
       }
       toolbar={
         <div className="space-y-3">
@@ -252,6 +255,7 @@ function FeedbackRecord({ project }: { project: ProjectResponse }) {
         }
         actions={
           <>
+            <RefreshButton queryKeys={[getProjectFeedbackQueryKey({ path })]} />
             <Button
               variant="outline"
               busy={triage.isPending}
@@ -345,6 +349,10 @@ function FeedbackRecord({ project }: { project: ProjectResponse }) {
                 </p>
               )}
             </section>
+            <FeedbackAttachments
+              projectId={project.id}
+              feedbackId={report.id}
+            />
             <details>
               <summary className="cursor-pointer text-sm font-medium">
                 SDK context
@@ -366,7 +374,7 @@ function FeedbackRecord({ project }: { project: ProjectResponse }) {
         onOpenChange={setDeleting}
         resourceType="feedback report"
         resourceName={`#${report.id}`}
-        consequences="This permanently deletes this report and its contact information. Its associated error and replay remain available."
+        consequences="This permanently deletes this report, its contact information and its attachments. Its associated error and replay remain available."
         requireTypedName
         confirmLabel="Delete feedback"
         isPending={remove.isPending}

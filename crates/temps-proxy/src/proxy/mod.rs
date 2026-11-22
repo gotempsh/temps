@@ -22,15 +22,15 @@
 
 use crate::handler::preview_wall::{
     build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
-    generate_preview_bridge_html, generate_preview_form_html_labeled, sanitize_next,
+    generate_preview_bridge_html, generate_preview_form_with_identity, sanitize_next,
     PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_gateway_peer, preview_request_group_key, verify_argon2,
-    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
+    preview_cookie_needs_refresh, preview_request_group_key, verify_argon2, PreviewAuthLimiter,
+    PreviewAuthOutcome, PreviewHost, PreviewRequest, SandboxLookupCache,
 };
 use crate::service::acme_challenge_cache::AcmeChallengeCache;
 use crate::service::cert_host_cache::CertHostCache;
@@ -68,6 +68,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
+use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
 use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
 use temps_database::DbConnection;
 use temps_entities::{deployments, environments, projects};
@@ -78,6 +79,7 @@ mod acme;
 mod edge_rules;
 mod markdown;
 mod policy;
+mod request_filter;
 mod security_headers;
 mod static_serving;
 mod timeouts;
@@ -202,22 +204,32 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
-fn https_redirect_response(redirect_url: &str, request_id: &str) -> Result<ResponseHeader> {
+fn https_redirect_response(
+    redirect_url: &str,
+    request_id: &str,
+    expose: bool,
+) -> Result<ResponseHeader> {
     let mut response = ResponseHeader::build(301, None)?;
     response.insert_header("Location", redirect_url)?;
     response.insert_header("Content-Length", "0")?;
     response.insert_header("X-Request-ID", request_id)?;
-    response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
-    response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    if expose {
+        response.insert_header("X-Temps-Proxy-Https-Redirect", "1")?;
+        response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+    }
     Ok(response)
 }
 
 /// A custom domain's "Redirect to" answer, marked as the proxy's own so a
 /// reachability check of a redirecting domain can tell Temps answered it.
-fn domain_redirect_response(status_code: u16, location: &str) -> Result<ResponseHeader> {
+fn domain_redirect_response(
+    status_code: u16,
+    location: &str,
+    expose: bool,
+) -> Result<ResponseHeader> {
     let mut response = ResponseHeader::build(status_code, None)?;
     response.insert_header(header::LOCATION, location)?;
-    mark_served_by_proxy(&mut response)?;
+    mark_served_by_proxy(&mut response, expose)?;
     Ok(response)
 }
 
@@ -354,6 +366,7 @@ pub struct ProxyContext {
     pub upstream_host: Option<String>,
     pub container_id: Option<String>,
     pub container_name: Option<String>,
+    pub replica_in_flight: Option<temps_routes::replica_policy::InFlightGuard>,
     pub tls_fingerprint: Option<String>,
     pub tls_version: Option<String>,
     pub tls_cipher: Option<String>,
@@ -400,9 +413,9 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
-    /// The previewed sandbox runs on a worker node: `upstream_peer` sends the
-    /// request to this process's worker preview relay instead of the gateway.
-    pub preview_on_worker: bool,
+    /// For a local preview, the gateway port from the same settings snapshot as
+    /// its token. A worker preview uses the worker relay.
+    pub preview_gateway_port: Option<u16>,
     /// The admin gate denied this request, so `upstream_peer` must send it to
     /// the listener that serves only the console's public routes (ADR-051)
     /// instead of resolving a peer. A non-allowlisted client can therefore
@@ -521,9 +534,13 @@ pub struct LoadBalancer {
     cert_host_cache: Arc<CertHostCache>,
     disable_https_redirect: bool,
     trust_loopback_forwarded_ip: Arc<AtomicBool>,
+    expose_platform_identity: Arc<AtomicBool>,
     /// The header a trusted loopback proxy sends the visitor's JA4 in
     /// (ADR 066, D4). Refreshed from the platform settings; read lock-free.
     loopback_ja4_header: Arc<arc_swap::ArcSwapOption<axum::http::HeaderName>>,
+    /// The loopback listener the control plane's own tunnel connectors
+    /// forward to (ADR-107 D3). `None` outside `temps serve`.
+    tunnel_origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
     on_demand_manager: Option<Arc<OnDemandManager>>,
     /// On-demand HTTP-01 TLS cert manager (ADR-018). When set, the port-80
     /// `request_filter` reads its in-process state cache (NO DB hit) to serve a
@@ -695,6 +712,10 @@ const SHIELD_HTTPS_REQUIRED_PAGE: &str = r#"<!DOCTYPE html>
 "#;
 
 /// Entity tags of the solver files, from their content.
+static NEUTRAL_SOLVER_JS_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(temps_shield::assets::NEUTRAL_SOLVER_JS.as_bytes()));
+static NEUTRAL_SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| content_etag(&temps_shield::assets::NEUTRAL_SOLVER_WASM));
 static SOLVER_JS_ETAG: std::sync::LazyLock<String> =
     std::sync::LazyLock::new(|| content_etag(temps_shield::assets::SOLVER_JS.as_bytes()));
 static SOLVER_WASM_ETAG: std::sync::LazyLock<String> =
@@ -807,7 +828,9 @@ impl LoadBalancer {
             cert_host_cache,
             disable_https_redirect,
             trust_loopback_forwarded_ip: Arc::new(AtomicBool::new(false)),
+            expose_platform_identity: Arc::new(AtomicBool::new(false)),
             loopback_ja4_header: Arc::new(arc_swap::ArcSwapOption::empty()),
+            tunnel_origin: None,
             on_demand_manager: None,
             on_demand_cert_manager: None,
             route_table: None,
@@ -829,82 +852,6 @@ impl LoadBalancer {
     pub fn with_gate(mut self, gate: Arc<crate::handler::gate::ProxyGate>) -> Self {
         self.gate = Some(gate);
         self
-    }
-
-    /// Run the signed-in gate for this request. `Some(true)` when the gate
-    /// answered it; `None` when the host has no gate or the visitor is
-    /// admitted (identity headers set, gate cookies removed).
-    async fn enforce_gate(
-        &self,
-        session: &mut PingoraSession,
-        ctx: &mut ProxyContext,
-    ) -> Result<Option<bool>> {
-        let Some(gate) = self.gate.as_ref() else {
-            return Ok(None);
-        };
-        let hostname = crate::handler::gate::gate_hostname(&ctx.host);
-        let Some(policy) = gate.policy_for(&hostname) else {
-            return Ok(None);
-        };
-        ctx.gated_host = true;
-        // ACME HTTP-01 first, as on the agent: a signed-in address must still
-        // get and renew its certificate, and Let's Encrypt never signs in.
-        // Only a challenge stored for this host is answered; any other path
-        // under the prefix meets the gate, so the prefix is no way past it.
-        if ctx.path.starts_with(ACME_HTTP01_PREFIX) {
-            if let Some(key_authorization) = self
-                .handle_acme_http_challenge(&ctx.host, &ctx.path)
-                .await?
-            {
-                let body = Bytes::from(key_authorization);
-                let mut resp = ResponseHeader::build(200, None)?;
-                resp.insert_header("Content-Type", "text/plain")?;
-                resp.insert_header("Cache-Control", "no-cache")?;
-                resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                resp.insert_header("Content-Length", body.len().to_string())?;
-                session.write_response_header(Box::new(resp), false).await?;
-                session.write_response_body(Some(body), true).await?;
-                ctx.routing_status = "acme_challenge".to_string();
-                return Ok(Some(true));
-            }
-        }
-        // An operator who turned the HTTPS redirect off terminates TLS in
-        // front of this listener; sending the visitor to HTTPS again would
-        // loop. Either way the gate runs: this only picks the redirect.
-        let secure = self.is_https_request(session) || self.disable_https_redirect;
-        let outcome = {
-            let header = session.req_header();
-            let request = temps_core::gate::GateRequest {
-                hostname: &hostname,
-                method: &header.method,
-                path: header.uri.path(),
-                query: header.uri.query(),
-                headers: &header.headers,
-                secure,
-                // Tunnels end at a worker's tunnel origin, never here.
-                via_tunnel: false,
-            };
-            gate.evaluate(&policy, &request, temps_core::gate::unix_now())
-                .await
-        };
-        match outcome {
-            crate::handler::gate::GateOutcome::Admit(claims) => {
-                crate::handler::gate::admit(session.req_header_mut(), &claims)?;
-                ctx.gate_identity = Some(claims);
-                Ok(None)
-            }
-            crate::handler::gate::GateOutcome::Respond(answer, routing_status) => {
-                let (response, body) = crate::handler::gate::render(&answer, &ctx.request_id)?;
-                session
-                    .write_response_header(Box::new(response), body.is_none())
-                    .await?;
-                if let Some(body) = body {
-                    session.write_response_body(Some(body), true).await?;
-                }
-                ctx.routing_status = routing_status.to_string();
-                Ok(Some(true))
-            }
-        }
     }
 
     /// Wire the in-process console's startup state so console-bound requests
@@ -1013,9 +960,66 @@ impl LoadBalancer {
         self
     }
 
+    /// Wire the refreshed instance-wide response privacy setting.
+    pub fn with_expose_platform_identity(mut self, enabled: Arc<AtomicBool>) -> Self {
+        self.expose_platform_identity = enabled;
+        self
+    }
+
+    fn expose_platform_identity(&self) -> bool {
+        self.expose_platform_identity.load(Ordering::Relaxed)
+    }
+
+    fn authenticated_probe(&self, session: &PingoraSession) -> bool {
+        let headers = &session.req_header().headers;
+        let Some(token) = headers
+            .get(temps_core::probe_auth::HEADER)
+            .and_then(|v| v.to_str().ok())
+        else {
+            return false;
+        };
+        // Authenticate against the same host routing uses, including HTTP/2
+        // :authority without Host. Invalid routing authorities fail closed.
+        let Ok(authority) = self.request_authority(session) else {
+            return false;
+        };
+        temps_core::probe_auth::verify(
+            &self.config_service.get_server_config().encryption_key,
+            &authority.host,
+            token,
+            temps_core::probe_auth::now(),
+        )
+    }
+
+    fn expose_probe_markers(&self, session: &PingoraSession) -> bool {
+        self.expose_platform_identity() || self.authenticated_probe(session)
+    }
+
+    fn protect_probe_response(
+        &self,
+        session: &PingoraSession,
+        response: &mut ResponseHeader,
+    ) -> Result<()> {
+        response.append_header("Vary", temps_core::probe_auth::HEADER)?;
+        if self.authenticated_probe(session) {
+            response.insert_header("Cache-Control", "private, no-store")?;
+        }
+        Ok(())
+    }
+
     /// Enable forwarded client IPs only for an explicitly configured local proxy.
     pub fn with_trust_loopback_forwarded_ip(mut self, enabled: Arc<AtomicBool>) -> Self {
         self.trust_loopback_forwarded_ip = enabled;
+        self
+    }
+
+    /// Treat requests on the control plane's tunnel origin as having come
+    /// through its tunnel (ADR-107 D3).
+    pub fn with_tunnel_origin(
+        mut self,
+        origin: Option<Arc<temps_core::tunnel_origin::ControlPlaneTunnelOrigin>>,
+    ) -> Self {
+        self.tunnel_origin = origin;
         self
     }
 
@@ -1163,6 +1167,15 @@ impl LoadBalancer {
             ConsolePhase::Starting | ConsolePhase::Running => return None,
         };
 
+        let body = if !self.expose_platform_identity() {
+            match format {
+                crate::console_unavailable::ResponseFormat::Html => Bytes::from_static(b"<!doctype html><title>Service unavailable</title><h1>Service unavailable</h1><p>Please retry shortly.</p>"),
+                crate::console_unavailable::ResponseFormat::Json => Bytes::from_static(b"{\"type\":\"about:blank\",\"title\":\"Service unavailable\",\"status\":503}"),
+            }
+        } else {
+            body
+        };
+
         // The cause was logged once, at ERROR, when startup failed; one line
         // per request here would only repeat it.
         debug!(
@@ -1178,7 +1191,9 @@ impl LoadBalancer {
         let error_code = 503;
         let written = async {
             let mut header = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-            header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            if self.expose_platform_identity() {
+                header.insert_header(header::SERVER, &SERVER_NAME[..])?;
+            }
             header.insert_header(header::CACHE_CONTROL, "no-store")?;
             header.insert_header(header::CONTENT_TYPE, format.content_type())?;
             header.insert_header(header::CONTENT_LENGTH, body.len().to_string())?;
@@ -1522,7 +1537,39 @@ impl LoadBalancer {
         // Trusting the header let a client on the plain-HTTP listener spoof
         // `https`, influencing Secure-cookie attributes and the proto we forward
         // upstream.
-        self.is_tls_connection(session)
+        //
+        // The one exception is decided by the listener, never by a header:
+        // the control plane's tunnel origin on loopback, which only the
+        // tunnel's connector reaches, after the provider's edge terminated
+        // the visitor's HTTPS (ADR-107 D3, ADR-070).
+        self.is_tls_connection(session) || self.tunnel_visitor_on_https(session)
+    }
+
+    /// Whether a request on the control plane's tunnel origin came from a
+    /// visitor who reached the provider's edge over HTTPS (ADR-107 D3).
+    ///
+    /// The listener decides that the request is a tunnel's; the provider's
+    /// `X-Forwarded-Proto` can only *downgrade* it: a hostname whose edge
+    /// policy lets plain HTTP through (`AllowHttp`, `AllowAll`) forwards
+    /// `http`, and that visitor must still get the app's HTTPS redirect and
+    /// no `Secure` cookies. A missing or other value keeps HTTPS, so a
+    /// connector that does not send it never loops on our own redirect, and a
+    /// forged value can only cause a redirect, never skip one. Off the tunnel
+    /// origin the header is never read (SEC-12).
+    pub(crate) fn tunnel_visitor_on_https(&self, session: &PingoraSession) -> bool {
+        self.via_tunnel_origin(session) && !edge_forwarded_plain_http(session.req_header())
+    }
+
+    /// Whether this request came in on the control plane's tunnel origin
+    /// (ADR-107 D3). Two atomic loads; no lock.
+    pub(crate) fn via_tunnel_origin(&self, session: &PingoraSession) -> bool {
+        let Some(origin) = self.tunnel_origin.as_deref() else {
+            return false;
+        };
+        session
+            .server_addr()
+            .and_then(|address| address.as_inet())
+            .is_some_and(|local| origin.is_origin(*local))
     }
 
     /// Check if the connection is a TLS connection by checking for SSL digest
@@ -1539,10 +1586,12 @@ impl LoadBalancer {
     /// Allowed, in order:
     /// 1. ACME HTTP-01 challenges for the hostname, so ownership can be proven
     ///    and the certificate renewed.
-    /// 2. `GET`/`HEAD` of `/` and `/summary.json` while the page is published
-    ///    and the hostname verified: an HTTPS upgrade on plain HTTP, otherwise
-    ///    a rewrite to the page's slug route, pinned to the public-only
-    ///    listener by `upstream_peer`.
+    /// 2. The paths and methods of `StatusHostPath` (`GET`/`HEAD` of `/`
+    ///    and `/summary.json`; the subscribe post and the confirm and
+    ///    unsubscribe links of ADR 108 D2) while the page is published and the
+    ///    hostname verified: an HTTPS upgrade on plain HTTP, otherwise a
+    ///    rewrite to the page's slug route, pinned to the public-only listener
+    ///    by `upstream_peer`.
     ///
     /// Everything else gets the status-page 404, byte-identical to the
     /// console's, whatever the reason.
@@ -1552,7 +1601,9 @@ impl LoadBalancer {
         ctx: &mut ProxyContext,
         route: temps_routes::StatusPageHostRoute,
     ) -> Result<bool> {
-        use temps_core::public_status_page::{StatusHostPath, STATUS_HOST_HEADER};
+        use temps_core::public_status_page::{
+            is_well_formed_access_cookie, StatusHostPath, STATUS_ACCESS_COOKIE, STATUS_HOST_HEADER,
+        };
 
         let host = temps_routes::normalize_route_hostname(&ctx.host).into_owned();
         ctx.routing_status = "status_page_host".to_string();
@@ -1576,7 +1627,9 @@ impl LoadBalancer {
         }
 
         let view = StatusHostPath::parse(&ctx.path);
-        let method_allowed = matches!(ctx.method.as_str(), "GET" | "HEAD");
+        let method_allowed = view
+            .as_ref()
+            .is_some_and(|view| view.allows_method(ctx.method.as_str()));
         let (Some(view), true, Some(slug)) = (view, method_allowed, route.slug) else {
             return self
                 .write_status_page_not_found(session, ctx, ctx.path == "/summary.json")
@@ -1587,7 +1640,11 @@ impl LoadBalancer {
         // must name the same hostname: a connection made for one status page
         // cannot be steered to another with a forged Host header. The console
         // re-checks the hostname-to-page binding (`STATUS_HOST_HEADER`) too.
+        // A tunnel's visitor reached the provider's edge over HTTPS and the
+        // connector forwards in plain HTTP on loopback (ADR-107 D3): no SNI
+        // to compare, and nothing to upgrade.
         let is_tls = self.is_tls_connection(session);
+        let is_https = is_tls || self.tunnel_visitor_on_https(session);
         if is_tls {
             let sni = Self::tls_sni(session);
             if sni
@@ -1606,11 +1663,16 @@ impl LoadBalancer {
                 );
                 return self.write_misdirected(session, ctx).await;
             }
-        } else if !self.disable_https_redirect {
+        } else if !is_https && !self.disable_https_redirect {
             // A verified hostname always has its certificate: upgrade.
             let location = format!("https://{host}{}", ctx.path);
-            let resp = https_redirect_response(&location, &ctx.request_id)?;
+            let mut resp = https_redirect_response(
+                &location,
+                &ctx.request_id,
+                self.expose_probe_markers(session),
+            )?;
             ctx.routing_status = "status_page_host_https_redirect".to_string();
+            self.protect_probe_response(session, &mut resp)?;
             session.write_response_header(Box::new(resp), true).await?;
             return Ok(true);
         }
@@ -1632,8 +1694,17 @@ impl LoadBalancer {
         let header = session.req_header_mut();
         header.set_raw_path(target.as_bytes())?;
         // Credentials and caller-chosen forwarding headers never reach the
-        // public listener from a custom hostname.
+        // public listener from a custom hostname. The one exception is a
+        // well-formed status page access cookie (ADR 108 D2): it only proves
+        // the visitor typed this page's password, and the console checks its
+        // signature against this page.
+        let access_cookie = find_request_cookie(header, STATUS_ACCESS_COOKIE, |value| {
+            is_well_formed_access_cookie(value).then(|| value.to_string())
+        });
         header.remove_header("cookie");
+        if let Some(value) = access_cookie {
+            header.insert_header("cookie", format!("{STATUS_ACCESS_COOKIE}={value}"))?;
+        }
         header.remove_header("authorization");
         header.remove_header("x-forwarded-host");
         strip_untrusted_client_ip_headers(header, self.loopback_ja4_header.load().as_deref());
@@ -1642,7 +1713,7 @@ impl LoadBalancer {
         } else {
             header.remove_header("x-forwarded-for");
         }
-        header.insert_header("X-Forwarded-Proto", if is_tls { "https" } else { "http" })?;
+        header.insert_header("X-Forwarded-Proto", if is_https { "https" } else { "http" })?;
         header.insert_header("Host", host.as_str())?;
         header.insert_header(STATUS_HOST_HEADER, host.as_str())?;
 
@@ -1839,9 +1910,18 @@ impl LoadBalancer {
             duration.as_millis(),
             ctx.ip_address.clone().unwrap_or_default()
         );
-        upstream_response
-            .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;
-        if let Some(pending_ms) = ctx.upstream_write_pending_time_ms {
+        if !self.expose_platform_identity() {
+            return Ok(());
+        }
+        if !upstream_response.headers.contains_key("X-Response-Time") {
+            upstream_response
+                .insert_header("X-Response-Time", format!("{}ms", duration.as_millis()))?;
+        }
+        if let Some(pending_ms) = ctx.upstream_write_pending_time_ms.filter(|_| {
+            !upstream_response
+                .headers
+                .contains_key("X-Upstream-Write-Pending")
+        }) {
             upstream_response
                 .insert_header("X-Upstream-Write-Pending", format!("{}ms", pending_ms))?;
         }
@@ -1868,9 +1948,9 @@ impl LoadBalancer {
             return Ok(false);
         }
         let now = temps_shield::unix_now();
-        // The clearance cookie is `__Host-` and `Secure`: only a TLS
-        // connection can receive one.
-        let tls = ctx.tls_fingerprint.is_some() || self.is_tls_connection(session);
+        // The clearance cookie is `__Host-` and `Secure`: only an HTTPS
+        // visitor can receive one, which a tunnel's visitor is (ADR-107 D3).
+        let tls = ctx.tls_fingerprint.is_some() || self.is_https_request(session);
         let (decision, netwatch_line) = {
             let header = session.req_header();
             let text = |name: &str| header.headers.get(name).and_then(|v| v.to_str().ok());
@@ -1981,10 +2061,11 @@ impl LoadBalancer {
             } => (
                 StatusCode::FORBIDDEN,
                 "text/html; charset=utf-8",
-                Bytes::from(crate::shield::challenge_page(
+                Bytes::from(temps_shield::assets::challenge_page_with_identity(
                     &token,
                     difficulty,
                     ctx.ip_address.as_deref().unwrap_or("unknown"),
+                    !self.expose_platform_identity(),
                 )),
                 "shield_challenge",
             ),
@@ -2012,7 +2093,10 @@ impl LoadBalancer {
         response.insert_header("Content-Length", body.len().to_string())?;
         response.insert_header("Cache-Control", "no-store")?;
         response.insert_header("X-Request-ID", &ctx.request_id)?;
-        if let Some(verdict) = ctx.shield_header {
+        if let Some(verdict) = ctx
+            .shield_header
+            .filter(|_| self.expose_platform_identity())
+        {
             response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -2198,11 +2282,23 @@ impl LoadBalancer {
     ) -> Result<bool> {
         use temps_shield::assets;
         let (content_type, content, etag): (_, &'static [u8], &str) =
-            if ctx.path == assets::SOLVER_JS_PATH {
+            if ctx.path == assets::NEUTRAL_SOLVER_JS_PATH {
+                (
+                    "application/javascript; charset=utf-8",
+                    assets::NEUTRAL_SOLVER_JS.as_bytes(),
+                    &NEUTRAL_SOLVER_JS_ETAG,
+                )
+            } else if ctx.path == assets::SOLVER_JS_PATH {
                 (
                     "application/javascript; charset=utf-8",
                     assets::SOLVER_JS.as_bytes(),
                     &SOLVER_JS_ETAG,
+                )
+            } else if ctx.path == assets::NEUTRAL_SOLVER_WASM_PATH {
+                (
+                    "application/wasm",
+                    &assets::NEUTRAL_SOLVER_WASM,
+                    &NEUTRAL_SOLVER_WASM_ETAG,
                 )
             } else if ctx.path == assets::SOLVER_WASM_PATH {
                 ("application/wasm", assets::SOLVER_WASM, &SOLVER_WASM_ETAG)
@@ -2325,9 +2421,11 @@ fn resolve_session_client_ip(
 
     crate::bunny_ips::BUNNY_TRUST.ensure_refresh_started();
 
-    if let Some(client_ip) =
-        crate::client_ip::resolve_loopback_client_ip(peer, headers, trust_loopback_forwarded_ip)
-    {
+    if let Some(client_ip) = temps_core::trusted_proxies::resolve_trusted_proxy_ip(
+        peer,
+        headers,
+        trust_loopback_forwarded_ip,
+    ) {
         return Some(client_ip.to_string());
     }
 
@@ -2379,6 +2477,26 @@ fn resolve_client_fingerprint(
     loopback_ja4_header: Option<&axum::http::HeaderName>,
     direct: Option<temps_shield::ja4::Ja4>,
 ) -> temps_shield::ja4::ClientFingerprint {
+    resolve_client_fingerprint_with_proxy_trust(
+        peer,
+        headers,
+        trust_loopback_forwarded_ip,
+        loopback_ja4_header,
+        direct,
+        temps_core::trusted_proxies::is_trusted_proxy_peer,
+    )
+}
+
+/// Keep fingerprint policy testable with a local trust snapshot, rather than
+/// writing the process-wide settings that other requests and tests consume.
+fn resolve_client_fingerprint_with_proxy_trust(
+    peer: Option<std::net::IpAddr>,
+    headers: &axum::http::HeaderMap,
+    trust_loopback_forwarded_ip: bool,
+    loopback_ja4_header: Option<&axum::http::HeaderName>,
+    direct: Option<temps_shield::ja4::Ja4>,
+    configured_proxy: impl Fn(std::net::IpAddr) -> bool,
+) -> temps_shield::ja4::ClientFingerprint {
     use temps_shield::ja4::{ClientFingerprint, Ja4, Ja4Source};
 
     let forwarded = |name: &axum::http::HeaderName| {
@@ -2404,6 +2522,10 @@ fn resolve_client_fingerprint(
         Some(peer) if crate::bunny_ips::BUNNY_TRUST.is_bunny(peer) => {
             (forwarded(&CDN_JA4), Ja4Source::Bunny)
         }
+        Some(peer) if configured_proxy(peer) => {
+            // A configured proxy's TLS fingerprint is not the visitor's.
+            (None, Ja4Source::Local)
+        }
         Some(_) | None => (direct, Ja4Source::Direct),
     };
     ClientFingerprint { ja4, source }
@@ -2420,7 +2542,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Result<bool> {
         // `None` when the proxy could not determine the address: an
         // allow-list then refuses the request rather than guess.
@@ -2440,7 +2562,7 @@ impl LoadBalancer {
                 .await;
         }
         if ctx.path == PREVIEW_LOGOUT_PATH && ctx.method == "POST" {
-            let secure = self.is_tls_connection(session);
+            let secure = self.is_https_request(session);
             let set_cookie =
                 build_logout_cookie_sandbox(&preview_host.hex, &settings.preview_domain, secure);
             let mut response = ResponseHeader::build(303, None)?;
@@ -2527,7 +2649,14 @@ impl LoadBalancer {
                     port = host.port,
                     "preview-auth: allowed"
                 );
-                ctx.preview_on_worker = on_worker;
+                if !on_worker {
+                    if !settings.preview_gateway.enabled {
+                        ctx.routing_status = "preview_disabled".to_string();
+                        session.respond_error(503).await?;
+                        return Ok(true);
+                    }
+                    ctx.preview_gateway_port = Some(settings.preview_gateway.effective_host_port());
+                }
                 ctx.preview_route = Some(host);
                 ctx.routing_status = "preview".to_string();
 
@@ -2556,7 +2685,7 @@ impl LoadBalancer {
                 // settings row (reloaded on NOTIFY, so a rotated secret is
                 // picked up without a restart), never from a per-request
                 // environment read.
-                if ctx.preview_on_worker {
+                if on_worker {
                     if let Some(relay) = temps_core::sandbox_preview_relay::worker_preview_relay() {
                         session
                             .req_header_mut()
@@ -2639,7 +2768,13 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    crate::preview_auth::ip_denied_message(&host.hex, client_ip),
+                    if !self.expose_platform_identity() {
+                        crate::branded_404::neutralize_access_response(
+                            crate::preview_auth::ip_denied_message(&host.hex, client_ip),
+                        )
+                    } else {
+                        crate::preview_auth::ip_denied_message(&host.hex, client_ip)
+                    },
                     "preview_ip_denied",
                 )
                 .await
@@ -2653,7 +2788,13 @@ impl LoadBalancer {
                     session,
                     ctx,
                     StatusCode::FORBIDDEN,
-                    crate::preview_auth::password_missing_message(&host.hex),
+                    if !self.expose_platform_identity() {
+                        crate::branded_404::neutralize_access_response(
+                            crate::preview_auth::password_missing_message(&host.hex),
+                        )
+                    } else {
+                        crate::preview_auth::password_missing_message(&host.hex)
+                    },
                     "preview_password_missing",
                 )
                 .await
@@ -2677,7 +2818,12 @@ impl LoadBalancer {
                         session,
                         ctx,
                         StatusCode::UNAUTHORIZED,
-                        crate::preview_auth::temps_login_required_message(&host.hex),
+                        if !self.expose_platform_identity() {
+                            "Sign in to open this preview. Open it in a browser to continue.\n"
+                                .to_string()
+                        } else {
+                            crate::preview_auth::temps_login_required_message(&host.hex)
+                        },
                         "preview_temps_login_required",
                     )
                     .await;
@@ -2736,7 +2882,11 @@ impl LoadBalancer {
                             session,
                             ctx,
                             StatusCode::FORBIDDEN,
-                            crate::preview_auth::temps_login_unconfigured_message(&host.hex),
+                            if !self.expose_platform_identity() {
+                                "Sign-in is unavailable. Contact the administrator.\n".to_string()
+                            } else {
+                                crate::preview_auth::temps_login_unconfigured_message(&host.hex)
+                            },
                             "preview_temps_login_unconfigured",
                         )
                         .await
@@ -2754,7 +2904,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: &PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<bool> {
         let hex = &preview_host.hex;
@@ -2768,7 +2918,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if !self.expose_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -2796,12 +2952,13 @@ impl LoadBalancer {
         let html = if has_session_grant {
             generate_preview_bridge_html(&label, &next)
         } else {
-            generate_preview_form_html_labeled(
+            generate_preview_form_with_identity(
                 &label,
                 preview_host.port,
                 &next,
                 false,
                 settings.external_url.as_deref(),
+                !self.expose_platform_identity(),
             )
         };
         let mut response = ResponseHeader::build(StatusCode::OK, None)?;
@@ -2831,7 +2988,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         preview_host: &PreviewHost,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
         client_ip: Option<std::net::IpAddr>,
     ) -> Result<bool> {
         let hex = preview_host.hex.as_str();
@@ -2846,7 +3003,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if !self.expose_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -2946,12 +3109,13 @@ impl LoadBalancer {
             self.preview_auth_limiter.record_failure(limiter_ip, hex);
             debug!(sandbox = %hex, "preview-auth: sandbox login failed (bad password)");
             let label = format!("sandbox sbx_{}", hex);
-            let html = generate_preview_form_html_labeled(
+            let html = generate_preview_form_with_identity(
                 &label,
                 preview_host.port,
                 &next,
                 true,
                 settings.external_url.as_deref(),
+                !self.expose_platform_identity(),
             );
             let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
             response.insert_header("Content-Type", "text/html; charset=utf-8")?;
@@ -3017,7 +3181,7 @@ impl LoadBalancer {
                 hex,
                 &cookie_value,
                 &settings.preview_domain,
-                self.is_tls_connection(session),
+                self.is_https_request(session),
             ))
         };
 
@@ -3036,7 +3200,7 @@ impl LoadBalancer {
         // an unpartitioned host-only cookie and a parent-domain cookie
         // alongside the fresh CHIPS cookie, sometimes emitting them in
         // separate Cookie header fields.
-        if should_refresh_cookie && self.is_tls_connection(session) {
+        if should_refresh_cookie && self.is_https_request(session) {
             let unpartitioned_cookie = build_logout_cookie_sandbox_unpartitioned(hex);
             response.append_header("Set-Cookie", &unpartitioned_cookie)?;
             let legacy_cookie = build_logout_cookie_sandbox(hex, &settings.preview_domain, false);
@@ -3081,7 +3245,13 @@ impl LoadBalancer {
                 session,
                 ctx,
                 StatusCode::FORBIDDEN,
-                crate::preview_auth::ip_denied_message(hex, client_ip),
+                if !self.expose_platform_identity() {
+                    crate::branded_404::neutralize_access_response(
+                        crate::preview_auth::ip_denied_message(hex, client_ip),
+                    )
+                } else {
+                    crate::preview_auth::ip_denied_message(hex, client_ip)
+                },
                 "preview_ip_denied",
             )
             .await;
@@ -3091,7 +3261,7 @@ impl LoadBalancer {
             return write_preview_redirect(session, ctx, &next, "preview_login_not_required").await;
         }
 
-        let secure = self.is_tls_connection(session);
+        let secure = self.is_https_request(session);
         let snapshot = self
             .route_table
             .as_ref()
@@ -3227,6 +3397,19 @@ fn parse_public_authority(raw_authority: &str) -> Option<PublicAuthority> {
         forwarded_host,
         port,
     })
+}
+
+/// Whether the tunnel provider's edge says the visitor used plain HTTP: the
+/// first `X-Forwarded-Proto` value is `http` (any case). Read only for a
+/// request on the control plane's tunnel origin (see
+/// `LoadBalancer::tunnel_visitor_on_https`).
+fn edge_forwarded_plain_http(request: &RequestHeader) -> bool {
+    request
+        .headers
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|scheme| scheme.trim().eq_ignore_ascii_case("http"))
 }
 
 /// Strip every client-controlled IP/forwarding header from the request that
@@ -3507,6 +3690,7 @@ impl ProxyHttp for LoadBalancer {
 
     fn new_ctx(&self) -> Self::CTX {
         ProxyContext {
+            replica_in_flight: None,
             response_modified: false,
             response_compressed: false,
             upstream_response_headers: None,
@@ -3555,7 +3739,7 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
-            preview_on_worker: false,
+            preview_gateway_port: None,
             path_route: None,
             gated_host: false,
             gate_identity: None,
@@ -3602,7 +3786,9 @@ impl ProxyHttp for LoadBalancer {
 
         // The solver files bypass IP access control: the challenge page needs them.
         let is_wasm_request = path == temps_shield::assets::SOLVER_JS_PATH
-            || path == temps_shield::assets::SOLVER_WASM_PATH;
+            || path == temps_shield::assets::SOLVER_WASM_PATH
+            || path == temps_shield::assets::NEUTRAL_SOLVER_JS_PATH
+            || path == temps_shield::assets::NEUTRAL_SOLVER_WASM_PATH;
 
         // Check if IP is blocked - this happens at infrastructure level before any processing
         // WASM routes bypass this check since they're needed for challenge solving
@@ -3770,1934 +3956,10 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
-        // Set the started_at time here
-        ctx.start_time = Instant::now();
-
-        // Add the request ID to the request headers
-        session
-            .req_header_mut()
-            .insert_header("X-Request-ID", &ctx.request_id)?;
-
-        ctx.host = match self.get_host_header(session) {
-            Ok(host) => host,
-            Err(error) => return self.answer_invalid_host(session, ctx, &error).await,
-        };
-        ctx.method = session.req_header().method.to_string();
-        ctx.path = session.req_header().uri.path().to_string();
-        ctx.query_string = session.req_header().uri.query().map(|q| q.to_string());
-        ctx.user_agent = session
-            .req_header()
-            .headers
-            .get("user-agent")
-            .map(|h| h.to_str().unwrap_or_default().to_string())
-            .unwrap_or_default();
-
-        // Extract client IP address early (needed for Shield)
-        if let Some(client_ip) = resolve_session_client_ip(
-            session,
-            self.trust_loopback_forwarded_ip.load(Ordering::Relaxed),
-        ) {
-            ctx.ip_address = Some(client_ip);
-        }
-
-        // SECURITY: Strip any inbound X-Temps-Demo-Mode header. Demo mode
-        // has been removed; clients sending this header should never have it
-        // honored by downstream auth middleware.
-        let _ = session.req_header_mut().remove_header("X-Temps-Demo-Mode");
-
-        // SECURITY: only the signed-in gate tells an app who is signed in
-        // (ADR 065 D8); a client's own identity headers never get through.
-        crate::handler::gate::strip_client_identity(session.req_header_mut());
-
-        // SECURITY: only the status-host branch below may tag a request with
-        // the custom hostname it was served for (#1412).
-        let _ = session
-            .req_header_mut()
-            .remove_header(temps_core::public_status_page::STATUS_HOST_HEADER);
-
-        // A status page's custom hostname (#1412) is answered here and only
-        // here: before previews, wake-on-request, project routing, the admin
-        // gate and the console fall-through, so no path or header can steer it
-        // anywhere but the page it is attached to.
-        if let Some(status_route) = self.upstream_resolver.status_page_host(&ctx.host) {
-            return self
-                .handle_status_page_host(session, ctx, status_route)
-                .await;
-        }
-        // A TLS connection negotiated for a status hostname may only ever
-        // carry requests for that hostname: a different Host must not use it
-        // to reach the console or an application.
-        if let Some(sni) = Self::tls_sni(session) {
-            if self.upstream_resolver.status_page_host(&sni).is_some() {
-                return self.write_misdirected(session, ctx).await;
-            }
-        }
-
-        // Sandbox preview gateway: requests to `ws-<sid>-<port>.<preview_domain>`
-        // are checked against the sandbox's preview allow-list, then its
-        // access mode: a Temps login (the default), a password form, or
-        // public. On success we mark the request as a preview route so
-        // `upstream_peer` forwards it to the local gateway or worker relay;
-        // otherwise `handle_preview_request` answers it.
-        //
-        // HTTP Basic auth is NOT supported — see `preview_auth.rs` for
-        // rationale.
-        //
-        // The public ingress hostname (ADR-051) is never a preview, whatever
-        // it looks like: it is reserved for the platform's callback routes,
-        // and treating a `ws-` shaped one as a sandbox would answer provider
-        // callbacks with a login redirect or a 404. The settings API refuses
-        // such a hostname; this keeps the guarantee if one is stored anyway.
-        if let Ok(settings) = self.config_service.get_settings().await {
-            if let Some(preview_host) =
-                preview_host_for_request(&ctx.host, &settings.preview_domain, || {
-                    self.upstream_resolver.is_public_ingress_host(&ctx.host)
-                })
-            {
-                if self
-                    .handle_preview_request(session, ctx, preview_host, &settings)
-                    .await?
-                {
-                    return Ok(true);
-                }
-            }
-        }
-
-        // Signed-in addresses (ADR 065 D8): the gate answers before anything
-        // can reach the app, including waking a sleeping environment.
-        if let Some(handled) = self.enforce_gate(session, ctx).await? {
-            return Ok(handled);
-        }
-
-        // On-demand: check if this host maps to a sleeping environment.
-        // Sleeping environments are excluded from the route table, so we must
-        // check before project context resolution. Wake the environment inline
-        // and hold the request until the container is ready and routes are reloaded.
-        if let Some(ref on_demand) = self.on_demand_manager {
-            let host_without_port = ctx.host.split(':').next().unwrap_or(&ctx.host);
-            // An awake route always wins over a sleeping wildcard. Without
-            // this check, `api.example.com` could wake an environment behind
-            // `*.example.com` even when the exact host belongs to another
-            // active project. Both lookups are in-memory.
-            if let Some(sleeping_info) =
-                should_lookup_sleeping_environment(self.route_table.as_deref(), host_without_port)
-                    .then(|| on_demand.get_sleeping_environment(host_without_port))
-                    .flatten()
-            {
-                info!(
-                    environment_id = sleeping_info.environment_id,
-                    host = %ctx.host,
-                    "Request hit sleeping environment, waking inline"
-                );
-
-                let env_id = sleeping_info.environment_id;
-                let wake_timeout = sleeping_info.wake_timeout_seconds;
-
-                // Reserve a wake slot before parking this request. The wake path
-                // can hold the request for several seconds; cap how many requests
-                // may be parked here at once so an unauthenticated client that
-                // knows a sleeping hostname can't pin proxy worker tasks. Held for
-                // the duration of the wake + re-resolve via this guard.
-                let _wake_slot = match on_demand.try_acquire_wake_slot() {
-                    Some(permit) => permit,
-                    None => {
-                        warn!(
-                            environment_id = env_id,
-                            host = %ctx.host,
-                            "Wake path at capacity; returning retryable 503 without parking"
-                        );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                        response.insert_header("Retry-After", "2")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "application/json")?;
-                        // Body carries no environment_id: it has no authorization
-                        // significance and the client keys retries off Retry-After,
-                        // not the id. This response goes to an unauthenticated
-                        // client (a sleeping env has no auth context yet).
-                        let body_bytes = Bytes::from_static(
-                            br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                        );
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body_bytes), true).await?;
-                        ctx.routing_status = "wake_throttled".to_string();
-                        return Ok(true);
-                    }
-                };
-
-                // Block until the environment is fully awake (containers healthy)
-                match on_demand.wake_environment(env_id, wake_timeout).await {
-                    Ok(()) => {
-                        info!(
-                            environment_id = env_id,
-                            "Environment woke up, waiting for route reload"
-                        );
-
-                        // The woken environment was excluded from the route table
-                        // while sleeping, so we must wait for the in-process
-                        // reload (driven by Job::ForceRouteReload in do_wake)
-                        // before the request can resolve. wait_for_route_reload
-                        // is lost-wakeup-safe, but we still re-resolve in a
-                        // bounded loop afterwards so a route that lands a few
-                        // milliseconds late (or a missed signal) still serves THIS
-                        // first request instead of falling back to the console.
-                        let reload_timeout = std::time::Duration::from_secs(10);
-                        let reloaded = on_demand.wait_for_route_reload(reload_timeout).await;
-                        if !reloaded {
-                            warn!(
-                                environment_id = env_id,
-                                "Route reload not observed within timeout after wake; \
-                                 re-resolving route directly"
-                            );
-                        }
-
-                        // Bounded re-resolve loop: poll resolve_context until the
-                        // just-woken host is routable, or we exhaust the budget.
-                        // We only need to CONFIRM the route is live here — the
-                        // canonical resolve below does the actual context setup,
-                        // attack-mode checks, and activity recording.
-                        let resolve_deadline =
-                            std::time::Instant::now() + std::time::Duration::from_secs(5);
-                        // A context for a host without a live upstream (its
-                        // containers not running yet) is not routable: keep
-                        // polling rather than failing the first request.
-                        let mut routable = self
-                            .project_context_resolver
-                            .resolve_context(&ctx.host)
-                            .await
-                            .is_some_and(|context| !context.upstream_unavailable);
-                        while !routable && std::time::Instant::now() < resolve_deadline {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            routable = self
-                                .project_context_resolver
-                                .resolve_context(&ctx.host)
-                                .await
-                                .is_some_and(|context| !context.upstream_unavailable);
-                        }
-
-                        if routable {
-                            info!(
-                                environment_id = env_id,
-                                "Route resolved after wake, serving first request"
-                            );
-                            // Fall through to normal request handling (the
-                            // canonical resolve below now succeeds).
-                        } else {
-                            // Containers are awake but the route still isn't
-                            // resolvable. Do NOT fall through — that would route
-                            // the app's own domain to the console and serve a
-                            // confusing error. Return an explicit, retryable 503
-                            // so the client retries instead.
-                            error!(
-                                environment_id = env_id,
-                                host = %ctx.host,
-                                "Environment woke but route did not become resolvable; \
-                                 returning retryable wake_pending"
-                            );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "2")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-
-                            // No environment_id in the body — see the wake_throttled
-                            // response above. Detail stays server-side in the log line.
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                            );
-
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-
-                            ctx.routing_status = "wake_pending".to_string();
-                            return Ok(true);
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            environment_id = env_id,
-                            error = %e,
-                            "Failed to wake environment"
-                        );
-
-                        // Wake failed — return 503 with Retry-After
-                        let mut response =
-                            ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                        response.insert_header("Retry-After", "5")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "application/json")?;
-
-                        // Static body: do not interpolate the OnDemandError Display
-                        // string (it can carry container/deployment context) or the
-                        // environment_id into a response served to an unauthenticated
-                        // client. The detailed error is logged server-side above.
-                        let body_bytes = Bytes::from_static(
-                            br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
-                        );
-
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session.write_response_body(Some(body_bytes), true).await?;
-
-                        ctx.routing_status = "wake_failed".to_string();
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-
-        // Path routes (ADR 050): `frontend: /api -> backend` serves this
-        // path from another service of the project. In-memory lookup only.
-        //
-        // The password form rendered for a path-routed target posts to the
-        // reserved `/_temps/password-verify`, which never matches a path
-        // route; `resolve_request_path_route` matches it by the routed path
-        // the form carries, so the password is checked (and the cookie
-        // issued) for the target environment the form was rendered for,
-        // never the host's own. The Temps-login exchange callback is matched
-        // the same way, by the `next` path its sign-in started from, so the
-        // grant is traded (and the cookie scoped) for the routed target.
-        // Client input only selects among the prefixes this host already
-        // serves.
-        if ctx.preview_route.is_none() {
-            ctx.path_route = crate::handler::password_wall::resolve_request_path_route(
-                &ctx.method,
-                &ctx.path,
-                ctx.query_string.as_deref(),
-                |path| {
-                    self.project_context_resolver
-                        .match_path_route(&ctx.host, path)
-                },
-            );
-        }
-
-        // Path-route wake-on-demand: if the target service is sleeping
-        // (scale-to-zero), wake it inline before resolving the route, using the
-        // same mechanism as host-level wake-on-demand.
-        if let Some(sleeping_env_id) = ctx
-            .path_route
-            .as_ref()
-            .and_then(|r| (r.target.is_none()).then_some(r.sleeping_environment_id))
-            .flatten()
-        {
-            if let Some(ref on_demand) = self.on_demand_manager {
-                if let Some(sleeping_info) =
-                    on_demand.get_sleeping_environment_by_id(sleeping_env_id)
-                {
-                    let wake_timeout = sleeping_info.wake_timeout_seconds;
-                    info!(
-                        environment_id = sleeping_env_id,
-                        host = %ctx.host,
-                        prefix = %ctx.path_route.as_ref().map(|r| r.prefix.as_str()).unwrap_or(""),
-                        "Path-route target is sleeping, waking inline"
-                    );
-                    let _wake_slot = match on_demand.try_acquire_wake_slot() {
-                        Some(permit) => permit,
-                        None => {
-                            warn!(
-                                environment_id = sleeping_env_id,
-                                host = %ctx.host,
-                                "Wake path at capacity for path-route target; returning retryable 503"
-                            );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "2")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                            );
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-                            ctx.routing_status = "wake_throttled".to_string();
-                            return Ok(true);
-                        }
-                    };
-                    match on_demand
-                        .wake_environment(sleeping_env_id, wake_timeout)
-                        .await
-                    {
-                        Ok(()) => {
-                            info!(
-                                environment_id = sleeping_env_id,
-                                "Path-route target woke up, waiting for route reload"
-                            );
-                            let reload_timeout = std::time::Duration::from_secs(10);
-                            let reloaded = on_demand.wait_for_route_reload(reload_timeout).await;
-                            if !reloaded {
-                                warn!(
-                                    environment_id = sleeping_env_id,
-                                    "Route reload not observed within timeout after path-route wake"
-                                );
-                            }
-                            // Re-resolve the path route after the target is awake.
-                            let resolve_deadline =
-                                std::time::Instant::now() + std::time::Duration::from_secs(5);
-                            let rematch = |ctx: &ProxyContext| {
-                                crate::handler::password_wall::resolve_request_path_route(
-                                    &ctx.method,
-                                    &ctx.path,
-                                    ctx.query_string.as_deref(),
-                                    |path| {
-                                        self.project_context_resolver
-                                            .match_path_route(&ctx.host, path)
-                                    },
-                                )
-                            };
-                            ctx.path_route = rematch(ctx);
-                            while ctx.path_route.as_ref().is_none_or(|r| r.target.is_none())
-                                && std::time::Instant::now() < resolve_deadline
-                            {
-                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                                ctx.path_route = rematch(ctx);
-                            }
-                            if ctx.path_route.as_ref().is_none_or(|r| r.target.is_none()) {
-                                error!(
-                                    environment_id = sleeping_env_id,
-                                    host = %ctx.host,
-                                    "Path-route target woke but route did not resolve; returning retryable 503"
-                                );
-                                let mut response =
-                                    ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                                response.insert_header("Retry-After", "2")?;
-                                response.insert_header("Cache-Control", "no-store")?;
-                                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                                response.insert_header("Content-Type", "application/json")?;
-                                let body_bytes = Bytes::from_static(
-                                    br#"{"status":"wake_pending","message":"Environment is starting, please retry"}"#,
-                                );
-                                session
-                                    .write_response_header(Box::new(response), false)
-                                    .await?;
-                                session.write_response_body(Some(body_bytes), true).await?;
-                                ctx.routing_status = "wake_pending".to_string();
-                                return Ok(true);
-                            }
-                            // Fall through: ctx.path_route now has a live target.
-                        }
-                        Err(e) => {
-                            error!(
-                                environment_id = sleeping_env_id,
-                                error = %e,
-                                "Failed to wake path-route target environment"
-                            );
-                            let mut response =
-                                ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                            response.insert_header("Retry-After", "5")?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "application/json")?;
-                            let body_bytes = Bytes::from_static(
-                                br#"{"status":"wake_failed","message":"Failed to start environment, please retry"}"#,
-                            );
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body_bytes), true).await?;
-                            ctx.routing_status = "wake_failed".to_string();
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Some(path_route) = ctx.path_route.as_ref() {
-            if path_route.target.is_none() {
-                // Never let the host's own service (or another environment)
-                // answer in the target's place: that hides the problem
-                // behind the frontend's index.html. The body carries only
-                // the requested prefix; the service name goes to the log.
-                warn!(
-                    host = %ctx.host,
-                    prefix = %path_route.prefix,
-                    target_service = %path_route.target_service,
-                    "path route target has no running deployment in this environment"
-                );
-                let body = Bytes::from(
-                    serde_json::json!({
-                        "status": "path_route_unavailable",
-                        "message": format!(
-                            "The service that serves {} is not deployed in this environment",
-                            path_route.prefix
-                        ),
-                    })
-                    .to_string(),
-                );
-                let mut response = ResponseHeader::build(StatusCode::BAD_GATEWAY, None)?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                response.insert_header("Content-Type", "application/json")?;
-                response.insert_header("Content-Length", body.len().to_string())?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session.write_response_body(Some(body), true).await?;
-                ctx.routing_status = "path_route_unavailable".to_string();
-                return Ok(true);
-            }
-        }
-
-        // Resolve project context early to set routing status for all requests
-        let path_target_context = ctx
-            .path_route
-            .as_ref()
-            .and_then(|route| route.target.as_ref())
-            .and_then(|target| {
-                Some(ProjectContext {
-                    project: target.project.clone()?,
-                    environment: target.environment.clone()?,
-                    deployment: target.deployment.clone()?,
-                    // A target is only attached once it has a live backend.
-                    upstream_unavailable: false,
-                })
-            });
-        let project_context = match path_target_context {
-            Some(context) => Some(context),
-            None => {
-                self.project_context_resolver
-                    .resolve_context(&ctx.host)
-                    .await
-            }
-        };
-
-        if let Some(project_ctx) = &project_context {
-            ctx.project = Some(project_ctx.project.clone());
-            ctx.environment = Some(project_ctx.environment.clone());
-            ctx.deployment = Some(project_ctx.deployment.clone());
-            ctx.routing_status = "routed".to_string();
-
-            // Record activity for on-demand idle tracking. A request that
-            // will be answered 503 (no live upstream) is not activity: it must
-            // not keep an environment with dead containers from idling to
-            // sleep, after which the next request wakes it cleanly.
-            if let Some(ref on_demand) = self.on_demand_manager {
-                if !project_ctx.upstream_unavailable {
-                    on_demand.record_activity(project_ctx.environment.id);
-                }
-            }
-
-            // Per-project/environment concurrent-connection cap (issue #646): a slow
-            // or malicious upstream must not be able to exhaust the proxy's own
-            // connection budget now that request timeouts are opt-in (PR #642). Keyed
-            // on environment id (the actual upstream-instance granularity); global
-            // default and the project/environment DeploymentConfig override are
-            // resolved the same way as the timeout settings above.
-            // One TTL-cached settings read serves both the connection cap and
-            // the rate limits below (an in-memory read, not a DB round-trip).
-            let (connection_limits, instance_rate_limiting) = self
-                .config_service
-                .get_settings()
-                .await
-                .map(|settings| (settings.connection_limits, settings.rate_limiting))
-                .unwrap_or_default();
-            let project_config = project_ctx
-                .project
-                .deployment_config
-                .clone()
-                .unwrap_or_default();
-            let effective_config = project_ctx
-                .environment
-                .get_effective_deployment_config(&project_config);
-            let connection_limit = effective_config
-                .max_concurrent_connections
-                .map(|v| v.max(0) as u32)
-                .unwrap_or(connection_limits.default_max_concurrent_connections);
-
-            match self
-                .connection_limiter
-                .try_acquire(project_ctx.environment.id, connection_limit)
-            {
-                Some(permit) => ctx.connection_permit = Some(permit),
-                None => {
-                    warn!(
-                        environment_id = project_ctx.environment.id,
-                        project_id = project_ctx.project.id,
-                        limit = connection_limit,
-                        "Environment at concurrent-connection capacity; rejecting request"
-                    );
-                    let mut response =
-                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                    response.insert_header("Retry-After", "1")?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "application/json")?;
-                    // Generic body/message: this must not be distinguishable from the
-                    // proxy's other 503 responses (e.g. no upstream route found), or
-                    // an unauthenticated caller could use it as an oracle to confirm
-                    // that a given hostname routes to a real project/environment.
-                    let body_bytes = Bytes::from_static(
-                        br#"{"status":"service_unavailable","message":"Service temporarily unavailable, please retry"}"#,
-                    );
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session.write_response_body(Some(body_bytes), true).await?;
-                    ctx.routing_status = "connection_limit_exceeded".to_string();
-                    return Ok(true);
-                }
-            }
-
-            // Per-project/environment IP restriction. Synchronous,
-            // lock-free — see temps_core::ProjectIpGate's contract. Denial
-            // is a generic 403 with no detail: an unauthenticated caller
-            // must not be able to distinguish "this project doesn't exist"
-            // from "this project is restricted and you're not on the
-            // allowlist" by response shape.
-            //
-            // `ctx.ip_address` can fail to resolve to a parseable `IpAddr`
-            // (non-INET socket, missing/garbled forwarded-for value —
-            // resolve_session_client_ip falls back to the literal
-            // "unknown"). We must not silently skip enforcement in that
-            // case: fail closed (deny) when this project/environment
-            // actually has an active restriction policy, since an
-            // unresolvable IP under an active policy is exactly what an
-            // attacker (or a misconfigured proxy) would produce. When there
-            // is no policy at all for this project/environment — the common
-            // case — an unresolvable IP must NOT deny, matching today's
-            // behavior; this feature is opt-in and most traffic has nothing
-            // to do with it.
-            let parsed_ip = ctx
-                .ip_address
-                .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                .map(normalize_client_ip);
-            let decision = evaluate_request_policy(
-                self.request_policy_gate.as_ref(),
-                session.req_header(),
-                &ctx.host,
-                project_ctx.project.id,
-                project_ctx.environment.id,
-                parsed_ip,
-            );
-            let ip_restricted = legacy_ip_gate_denies(
-                decision,
-                self.project_ip_gate.as_ref(),
-                project_ctx.project.id,
-                project_ctx.environment.id,
-                parsed_ip,
-            );
-            if let temps_core::RequestPolicyDecision::Unavailable { reason } = decision {
-                warn!(
-                    project_id = project_ctx.project.id,
-                    environment_id = project_ctx.environment.id,
-                    reason,
-                    "Project policy unavailable; denying request"
-                );
-                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session
-                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
-                    .await?;
-                ctx.routing_status = "request_policy_unavailable".to_string();
-                return Ok(true);
-            }
-            if let temps_core::RequestPolicyDecision::Deny {
-                reason,
-                rule_id,
-                revision,
-            } = decision
-            {
-                warn!(
-                    project_id = project_ctx.project.id,
-                    environment_id = project_ctx.environment.id,
-                    reason,
-                    rule_id,
-                    revision,
-                    "Request denied by project policy"
-                );
-                let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session
-                    .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                    .await?;
-                ctx.routing_status = "request_policy_denied".to_string();
-                return Ok(true);
-            }
-
-            let password_protection = project_ctx
-                .environment
-                .deployment_config
-                .as_ref()
-                .and_then(|dc| dc.security.as_ref())
-                .and_then(|s| s.password_protection.as_ref())
-                .filter(|pp| pp.enabled);
-            // The password form's POST: with a wall, the wall always handles
-            // it (it never reaches the app), so a rule must not stop visitors
-            // from unlocking. Without one, the path is the app's.
-            let password_verify_post = password_protection.is_some()
-                && ctx.path == crate::handler::password_wall::PASSWORD_VERIFY_PATH
-                && ctx.method == "POST";
-
-            // Project edge rules (ADR-089): after the operator's IP gate,
-            // before rate limits, Shield and the password wall, none of which
-            // an `allow` rule skips. ACME, Temps' own challenge endpoints and
-            // the password form are never subject to them.
-            if !password_verify_post
-                && self
-                    .enforce_edge_rules(
-                        session,
-                        ctx,
-                        project_ctx.project.id,
-                        project_ctx.environment.id,
-                        parsed_ip,
-                    )
-                    .await?
-            {
-                return Ok(true);
-            }
-
-            // The access decision (ADR-055 §11): the legacy chain, or the
-            // environment's compiled ingress endpoint, as its
-            // `ingress_mode` says. Either way it is one `AccessOutcome`,
-            // answered below by the same responses.
-            let access_outcome = self
-                .decide_environment_access(
-                    project_ctx,
-                    AccessRequest {
-                        request: session.req_header(),
-                        host: &ctx.host,
-                        path: &ctx.path,
-                        tls_fingerprint: ctx.tls_fingerprint.as_deref(),
-                        policy_decision: decision,
-                        ip_restricted,
-                        client_ip: parsed_ip,
-                        rate_limit: crate::rate_limiter::resolve_policy(
-                            &instance_rate_limiting,
-                            effective_config.security.as_ref(),
-                            project_ctx.environment.id,
-                        ),
-                        password: password_protection.map(|pp| crate::ingress::PasswordFacts {
-                            verify_post: ctx.path
-                                == crate::handler::password_wall::PASSWORD_VERIFY_PATH
-                                && ctx.method == "POST",
-                            cookie_valid: find_request_cookie(
-                                session.req_header(),
-                                crate::handler::password_wall::PASSWORD_COOKIE_NAME,
-                                |value| {
-                                    crate::handler::password_wall::validate_cookie(
-                                        value,
-                                        project_ctx.environment.id,
-                                        &pp.password_hash,
-                                    )
-                                    .then_some(true)
-                                },
-                            )
-                            .unwrap_or(false),
-                        }),
-                    },
-                )
-                .await;
-
-            match access_outcome {
-                crate::ingress::AccessOutcome::Allow
-                | crate::ingress::AccessOutcome::PasswordWall => {}
-                crate::ingress::AccessOutcome::IpForbidden
-                | crate::ingress::AccessOutcome::Forbidden => {
-                    // Counted for every denial; logged through a
-                    // process-wide limiter so a scan against a locked
-                    // project cannot flood the log (the counter keeps
-                    // the true rate).
-                    self.proxy_metrics.record_ip_access_denied();
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    if let Some(suppressed) = IP_DENY_LOG_LIMITER.admit(now_secs) {
-                        warn!(
-                            environment_id = project_ctx.environment.id,
-                            project_id = project_ctx.project.id,
-                            ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                            outcome = access_outcome.label(),
-                            suppressed_since_last_log = suppressed,
-                            "Request denied by project IP restriction"
-                        );
-                    }
-                    // A generic 403 with no detail: an unauthenticated
-                    // caller must not be able to tell "this project is
-                    // restricted" from "this project does not exist".
-                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                        .await?;
-                    ctx.routing_status =
-                        if access_outcome == crate::ingress::AccessOutcome::IpForbidden {
-                            "project_ip_restricted"
-                        } else {
-                            "ingress_forbidden"
-                        }
-                        .to_string();
-                    return Ok(true);
-                }
-                crate::ingress::AccessOutcome::Blacklisted => {
-                    self.proxy_metrics.record_rate_limited();
-                    warn!(
-                        project_id = project_ctx.project.id,
-                        environment_id = project_ctx.environment.id,
-                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                        "Request denied by rate-limit blacklist"
-                    );
-                    // Same generic 403 as the IP restriction above.
-                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                        .await?;
-                    ctx.routing_status = "rate_limit_blacklisted".to_string();
-                    return Ok(true);
-                }
-                crate::ingress::AccessOutcome::TooManyRequests {
-                    window,
-                    retry_after_secs,
-                } => {
-                    self.proxy_metrics.record_rate_limited();
-                    debug!(
-                        project_id = project_ctx.project.id,
-                        environment_id = project_ctx.environment.id,
-                        ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
-                        window = window.as_str(),
-                        "Request rejected by rate limit"
-                    );
-                    let mut response = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                    response.insert_header("Retry-After", retry_after_secs.to_string())?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from_static(b"Too Many Requests\n")), true)
-                        .await?;
-                    ctx.routing_status = "rate_limited".to_string();
-                    return Ok(true);
-                }
-                crate::ingress::AccessOutcome::Unavailable => {
-                    // Logged (rate-limited, with the reason) where it was decided.
-                    let mut response =
-                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(
-                            Some(Bytes::from_static(
-                                b"Service unavailable: this environment's access policy is not available\n",
-                            )),
-                            true,
-                        )
-                        .await?;
-                    ctx.routing_status = "ingress_endpoint_unavailable".to_string();
-                    return Ok(true);
-                }
-                crate::ingress::AccessOutcome::LoginRequired
-                    if ctx.path == crate::ingress::GRANT_EXCHANGE_PATH =>
-                {
-                    let secure = self.is_https_request(session);
-                    // A path-routed target (resolved from the exchange's
-                    // `next`) gets a cookie scoped to its prefix.
-                    let exchange = self.exchange_ingress_grant(
-                        project_ctx.environment.id,
-                        &ctx.host,
-                        ctx.query_string.as_deref(),
-                        secure,
-                        ctx.path_route.as_ref().map(|route| route.prefix.as_str()),
-                    );
-                    // The query holds the grant: keep it out of the proxy
-                    // log, which outlives the grant and is readable by
-                    // project members.
-                    ctx.query_string = None;
-                    let mut response = match exchange {
-                        Ok(exchange) => {
-                            info!(
-                                project_id = project_ctx.project.id,
-                                environment_id = project_ctx.environment.id,
-                                grant_id = exchange.grant_id,
-                                user_id = exchange.user_id,
-                                "Temps login grant exchanged for an ingress session"
-                            );
-                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
-                            response.insert_header("Location", exchange.location)?;
-                            response.insert_header("Set-Cookie", exchange.set_cookie)?;
-                            response
-                        }
-                        Err(error) => {
-                            warn!(
-                                project_id = project_ctx.project.id,
-                                environment_id = project_ctx.environment.id,
-                                error = %error,
-                                "Refused a Temps login grant exchange"
-                            );
-                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
-                        }
-                    };
-                    let refused = response.status != StatusCode::SEE_OTHER;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("Referrer-Policy", "no-referrer")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    let body: &'static [u8] = if refused {
-                        b"This sign-in link is invalid or has expired. Reload the page to sign in again.\n"
-                    } else {
-                        b"Signed in.\n"
-                    };
-                    session
-                        .write_response_body(Some(Bytes::from_static(body)), true)
-                        .await?;
-                    ctx.routing_status = if refused {
-                        "ingress_grant_refused"
-                    } else {
-                        "ingress_grant_exchanged"
-                    }
-                    .to_string();
-                    return Ok(true);
-                }
-                // An edge rule challenge runs before this decision, so its
-                // solver and verification must work before sign-in; Shield
-                // answers them below.
-                crate::ingress::AccessOutcome::LoginRequired
-                    if crate::ingress::answered_before_login(&ctx.path) => {}
-                crate::ingress::AccessOutcome::LoginRequired => {
-                    let external_url = self
-                        .config_service
-                        .get_settings()
-                        .await
-                        .ok()
-                        .and_then(|settings| settings.external_url);
-                    let next = match ctx.query_string.as_deref() {
-                        Some(qs) if !qs.is_empty() => format!("{}?{}", ctx.path, qs),
-                        _ => ctx.path.clone(),
-                    };
-                    let scheme = if self.is_https_request(session) {
-                        crate::ingress::LoginScheme::Https
-                    } else {
-                        crate::ingress::LoginScheme::Http
-                    };
-                    let now_secs = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let port = self
-                        .request_authority(session)
-                        .ok()
-                        .and_then(|authority| authority.port);
-                    let location = external_url.as_deref().and_then(|base| {
-                        crate::ingress::login_redirect_url(
-                            base,
-                            self.crypto.ingress_grant_master_key(),
-                            temps_workload_ingress::ProductRef {
-                                kind: temps_workload_ingress::ProductKind::Environment,
-                                id: i64::from(project_ctx.environment.id),
-                            },
-                            crate::ingress::LoginSite {
-                                scheme,
-                                host: &ctx.host,
-                                port,
-                            },
-                            &next,
-                            now_secs,
-                        )
-                    });
-                    let mut response = match location {
-                        Some(location) => {
-                            let mut response = ResponseHeader::build(StatusCode::SEE_OTHER, None)?;
-                            response.insert_header("Location", location)?;
-                            response
-                        }
-                        None => {
-                            warn!(
-                                project_id = project_ctx.project.id,
-                                environment_id = project_ctx.environment.id,
-                                "Environment requires a Temps login but the instance has no valid external URL to send the visitor to"
-                            );
-                            ResponseHeader::build(StatusCode::FORBIDDEN, None)?
-                        }
-                    };
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("Referrer-Policy", "no-referrer")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(
-                            Some(Bytes::from_static(b"Sign in to Temps to open this page.\n")),
-                            true,
-                        )
-                        .await?;
-                    ctx.routing_status = "ingress_login_required".to_string();
-                    return Ok(true);
-                }
-                // Bot challenges are Shield's (ADR 066), which runs right
-                // after this decision; the access decision defers to it.
-                crate::ingress::AccessOutcome::HttpsRequired
-                | crate::ingress::AccessOutcome::CaptchaChallenge => {}
-            }
-
-            // ADR 066 (I4): Shield, after the operator's IP gate and the
-            // rate limits, so an operator deny rule or a spent rate budget
-            // answers first and is not a Shield decision (D1). The verify
-            // POST and the solver the page loads are answered here, whichever
-            // environment this host or path resolved to: the clearance is for
-            // the environment in the signed token, and a page served just
-            // before Shield was turned off can still finish. Neither they nor
-            // ACME HTTP-01 are ever challenged (D7).
-            if ctx.path == crate::shield::VERIFY_PATH {
-                return self
-                    .answer_challenge_verify(
-                        session,
-                        ctx,
-                        &project_ctx.project,
-                        &project_ctx.environment,
-                        parsed_ip,
-                    )
-                    .await;
-            }
-            if self.serve_solver_asset(session, ctx).await? {
-                return Ok(true);
-            }
-            // Only a challenge stored for this host skips Shield; any other
-            // path under the ACME prefix is decided like the rest.
-            if self.answer_stored_acme_challenge(session, ctx).await? {
-                return Ok(true);
-            }
-            if self
-                .enforce_shield(
-                    session,
-                    ctx,
-                    &project_ctx.project,
-                    &project_ctx.environment,
-                    parsed_ip,
-                )
-                .await?
-            {
-                return Ok(true);
-            }
-
-            // Password wall: the outcome says the wall decides this request
-            // (no valid cookie, or the wall's own verify POST).
-            if access_outcome == crate::ingress::AccessOutcome::PasswordWall
-                && password_protection.is_none()
-            {
-                // The compiled endpoint asked for a wall this environment no
-                // longer has (a reload in flight): refuse rather than guess.
-                let mut response = ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
-                response.insert_header("Retry-After", "1")?;
-                response.insert_header("Cache-Control", "no-store")?;
-                response.insert_header("X-Request-ID", &ctx.request_id)?;
-                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                session
-                    .write_response_header(Box::new(response), false)
-                    .await?;
-                session
-                    .write_response_body(Some(Bytes::from_static(b"Service unavailable\n")), true)
-                    .await?;
-                ctx.routing_status = "ingress_endpoint_unavailable".to_string();
-                return Ok(true);
-            }
-            if let Some(pp) = password_protection
-                .filter(|_| access_outcome == crate::ingress::AccessOutcome::PasswordWall)
-            {
-                let password_hash = pp.password_hash.clone();
-                let env_id = project_ctx.environment.id;
-                let project_name = &project_ctx.project.name;
-                let environment_name = &project_ctx.environment.name;
-                // Check if this is the password verify POST endpoint
-                if ctx.path == crate::handler::password_wall::PASSWORD_VERIFY_PATH
-                    && ctx.method == "POST"
-                {
-                    // Read the POST body to get the password
-                    let body = session.read_request_body().await.map_err(|e| {
-                        error!("Failed to read password verify body: {}", e);
-                        e
-                    })?;
-
-                    let body_str = body
-                        .as_ref()
-                        .map(|b| String::from_utf8_lossy(b).to_string())
-                        .unwrap_or_default();
-
-                    // Parse form data (application/x-www-form-urlencoded)
-                    let params: Vec<(String, String)> =
-                        url::form_urlencoded::parse(body_str.as_bytes())
-                            .into_owned()
-                            .collect();
-
-                    let password = params
-                        .iter()
-                        .find(|(k, _)| k == "password")
-                        .map(|(_, v)| v.as_str())
-                        .unwrap_or("");
-
-                    // The destination is client input: reduce it to a
-                    // same-origin path before it becomes a Location header.
-                    let redirect = crate::handler::password_wall::sanitize_redirect_path(
-                        params
-                            .iter()
-                            .find(|(k, _)| k == "redirect")
-                            .map(|(_, v)| v.as_str())
-                            .unwrap_or("/"),
-                    );
-
-                    // Guesses are limited per (client IP, environment) with
-                    // the same sliding window as the sandbox preview login,
-                    // so the wall cannot be brute-forced. The attempt is
-                    // taken atomically before the password is checked, so a
-                    // concurrent burst cannot outrun the count. An unparsable
-                    // client address shares one bucket rather than escaping
-                    // the limit.
-                    let client_ip = ctx
-                        .ip_address
-                        .as_deref()
-                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-                    if !self
-                        .preview_auth_limiter
-                        .try_admit_password_wall(client_ip, env_id)
-                    {
-                        warn!(
-                            environment_id = env_id,
-                            client_ip = %client_ip,
-                            "password-wall: verify POST rate limited"
-                        );
-                        let mut resp = ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                        resp.insert_header("Retry-After", "60")?;
-                        resp.insert_header("Cache-Control", "no-store")?;
-                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                        resp.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        resp.insert_header("Referrer-Policy", "no-referrer")?;
-                        resp.insert_header("X-Frame-Options", "DENY")?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(
-                                    b"Too many failed attempts. Try again in a minute.\n",
-                                )),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "password_rate_limited".to_string();
-                        return Ok(true);
-                    }
-
-                    if crate::handler::password_wall::verify_password(password, &password_hash) {
-                        // Password correct — set cookie and redirect
-                        self.preview_auth_limiter
-                            .clear_password_wall(client_ip, env_id);
-                        let host = ctx.host.clone();
-                        let set_cookie =
-                            crate::handler::password_wall::build_set_cookie_header_for_path(
-                                env_id,
-                                &password_hash,
-                                &host,
-                                // A path-routed target is unlocked under
-                                // its prefix only, so its cookie coexists
-                                // with the host's own `Path=/` one.
-                                ctx.path_route
-                                    .as_ref()
-                                    .map_or("/", |route| route.prefix.as_str()),
-                            );
-
-                        let mut resp = ResponseHeader::build(303, None)?;
-                        resp.insert_header("Location", redirect)?;
-                        resp.insert_header("Set-Cookie", &set_cookie)?;
-                        resp.insert_header("Cache-Control", "no-store")?;
-                        resp.insert_header("Referrer-Policy", "no-referrer")?;
-                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
-                        session.write_response_header(Box::new(resp), true).await?;
-                        ctx.routing_status = "password_verified".to_string();
-                        return Ok(true);
-                    } else {
-                        // Wrong password — the attempt is already counted;
-                        // show the form again with an error
-                        let html =
-                            crate::handler::password_wall::generate_password_form_html_for_route(
-                                redirect,
-                                true,
-                                project_name,
-                                environment_name,
-                                // Behind a path route the form posts back
-                                // the routed path, so the next attempt
-                                // resolves to this environment again.
-                                crate::handler::password_wall::routed_form_path(
-                                    ctx.path_route.is_some(),
-                                    &ctx.path,
-                                    ctx.query_string.as_deref(),
-                                )
-                                .as_deref(),
-                            );
-                        let html_bytes = Bytes::from(html);
-
-                        let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
-                        resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                        resp.insert_header("Cache-Control", "no-store")?;
-                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                        // A credential prompt must not be framed or leak its URL.
-                        resp.insert_header("Referrer-Policy", "no-referrer")?;
-                        resp.insert_header("X-Frame-Options", "DENY")?;
-
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session.write_response_body(Some(html_bytes), true).await?;
-                        ctx.routing_status = "password_wrong".to_string();
-                        return Ok(true);
-                    }
-                }
-
-                // Check for valid password cookie. Several cookies may carry
-                // this name: the host's own environment (`Path=/`) and a
-                // path-routed target's (`Path=<prefix>`) coexist, and the
-                // browser sends both on a routed path. Each is bound to its
-                // environment id and password hash, so any one that
-                // validates for THIS environment unlocks it.
-                let has_valid_cookie = find_request_cookie(
-                    session.req_header(),
-                    crate::handler::password_wall::PASSWORD_COOKIE_NAME,
-                    |value| {
-                        crate::handler::password_wall::validate_cookie(
-                            value,
-                            env_id,
-                            &password_hash,
-                        )
-                        .then_some(true)
-                    },
-                )
-                .unwrap_or(false);
-
-                if !has_valid_cookie {
-                    // No valid cookie — show password form
-                    let current_path = if let Some(ref qs) = ctx.query_string {
-                        if qs.is_empty() {
-                            ctx.path.clone()
-                        } else {
-                            format!("{}?{}", ctx.path, qs)
-                        }
-                    } else {
-                        ctx.path.clone()
-                    };
-
-                    let html = crate::handler::password_wall::generate_password_form_html_for_route(
-                        &current_path,
-                        false,
-                        project_name,
-                        environment_name,
-                        // Behind a path route the form posts back the routed
-                        // path, so the verify request resolves to this
-                        // (target) environment, not the host's own.
-                        crate::handler::password_wall::routed_form_path(
-                            ctx.path_route.is_some(),
-                            &ctx.path,
-                            ctx.query_string.as_deref(),
-                        )
-                        .as_deref(),
-                    );
-                    let html_bytes = Bytes::from(html);
-
-                    let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
-                    resp.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                    resp.insert_header("Cache-Control", "no-store")?;
-                    resp.insert_header("X-Request-ID", &ctx.request_id)?;
-                    // A credential prompt must not be framed or leak its URL.
-                    resp.insert_header("Referrer-Policy", "no-referrer")?;
-                    resp.insert_header("X-Frame-Options", "DENY")?;
-
-                    session.write_response_header(Box::new(resp), false).await?;
-                    session.write_response_body(Some(html_bytes), true).await?;
-                    ctx.routing_status = "password_wall".to_string();
-                    return Ok(true);
-                }
-            }
-        } else {
-            ctx.routing_status = "no_project".to_string();
-        }
-
-        // The challenge solver, for hosts without a project (project hosts
-        // were answered with Shield above).
-        if self.serve_solver_asset(session, ctx).await? {
-            return Ok(true);
-        }
-
-        // Handle ACME HTTP-01 challenges BEFORE redirects
-        // This ensures domains configured as redirects can still complete certificate provisioning
-        if let Some(key_authorization) = self
-            .handle_acme_http_challenge(&ctx.host, &ctx.path)
-            .await?
-        {
-            debug!(
-                "Serving ACME HTTP-01 challenge response for {}{} (request_id={}) - before redirect check",
-                ctx.host, ctx.path, ctx.request_id
-            );
-
-            let key_auth_bytes = Bytes::from(key_authorization.clone());
-            let content_length = key_auth_bytes.len();
-
-            let mut resp = ResponseHeader::build(200, None)?;
-            resp.insert_header("Content-Type", "text/plain")?;
-            resp.insert_header("Cache-Control", "no-cache")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            resp.insert_header("Content-Length", content_length.to_string())?;
-            resp.insert_header("Connection", "close")?;
-
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(key_auth_bytes), true)
-                .await?;
-
-            info!(
-                "ACME challenge completed (redirect domain): {} {} - 200 OK - {}ms",
-                ctx.method,
-                ctx.path,
-                ctx.start_time.elapsed().as_millis()
-            );
-
-            ctx.routing_status = "acme_challenge".to_string();
-            return Ok(true);
-        }
-
-        // On-demand HTTP-01 TLS UX (ADR-018 §5). Only engaged when the manager
-        // is wired (on-demand TLS enabled) — otherwise zero overhead, no extra
-        // settings fetch. MUST come after ACME challenge handling so a challenge
-        // can always complete, and before the HTTPS redirect so a host whose
-        // cert is still provisioning gets the 503 instead of a redirect to a
-        // non-existent cert.
-        // Gate on the cheap, in-memory checks FIRST so the common case (HTTPS
-        // traffic, and HTTP hosts with no on-demand cert state) costs nothing.
-        // `get_settings()` is TTL-cached (no Postgres round-trip), but the lazy
-        // fetch is still kept inside `handle_on_demand_http` so it only runs for
-        // the rare ephemeral `redirect_to_env` branch rather than for every
-        // plain-HTTP request.
-        if self.on_demand_cert_manager.is_some()
-            && !self.is_tls_connection(session)
-            && self.handle_on_demand_http(session, ctx).await?
-        {
-            return Ok(true);
-        }
-
-        // HTTP to HTTPS redirect for non-TLS connections.
-        // This MUST come after ACME challenge handling to allow Let's Encrypt
-        // HTTP-01 validation. `should_redirect_to_https` additionally exempts the
-        // whole `/.well-known/acme-challenge/` prefix, so a validation request
-        // that did NOT match a stored token (renewal in flight, token written to
-        // a sibling domain row, wildcard parent) still falls through to normal
-        // routing instead of being 301'd to a certificate that has expired or
-        // does not exist yet.
-        //
-        // By default the redirect is per-domain: we only redirect when the
-        // requesting host actually has an active TLS certificate in the database
-        // (exact match or wildcard parent). This means HTTP-only installs
-        // (sslip.io quick/local modes, no cert provisioned) never get redirected,
-        // while hosts that have gone through SSL provisioning get automatic HTTPS
-        // enforcement.
-        //
-        // The environment resolved above can override that default in either
-        // direction (`force_https`): `Some(true)` for sites whose TLS is
-        // terminated by an upstream CDN — no local cert exists, so the default
-        // heuristic would leave plain HTTP serving a full 200 alongside HTTPS —
-        // and `Some(false)` for environments that must stay reachable over HTTP.
-        // Reading it off `ctx.environment` costs nothing extra: the environment
-        // was already resolved and cloned into the context earlier in this
-        // filter, so there is no additional lookup on the hot path.
-        //
-        // `disable_https_redirect` is a global escape hatch (set by the service
-        // unit in local/testing mode) that bypasses the check entirely and
-        // outranks the per-environment override.
-        // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
-        // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
-        let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
-        // An unresolved Host falls through to the console upstream. The console
-        // has its own operator-set override rather than inheriting a project's,
-        // and it is consulted only when no environment matched — `get_settings`
-        // is TTL-cached, so this costs nothing on the project hot path.
-        //
-        // On a settings read failure this yields `None` (inherit the per-host
-        // certificate heuristic), not `Some(true)`: guessing "redirect" here
-        // would turn a transient database blip into a console that 301s to a
-        // certificate it may not have.
-        let console_force_https = if ctx.environment.is_none() {
-            match self.config_service.get_settings().await {
-                Ok(settings) => {
-                    let request_host = ctx
-                        .host
-                        .split(':')
-                        .next()
-                        .unwrap_or(&ctx.host)
-                        .trim_end_matches('.')
-                        .to_ascii_lowercase();
-                    if settings.console_hostname().as_deref() == Some(request_host.as_str()) {
-                        settings.console_force_https
-                    } else {
-                        None
-                    }
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "Failed to read app settings; falling back to the per-host certificate heuristic for HTTPS policy"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
-        // Exactly one of these can be set: `console_force_https` is only
-        // computed when no environment resolved.
-        let force_https = env_force_https.or(console_force_https);
-        let production_https = if should_apply_production_https_default(
-            self.disable_https_redirect,
-            self.is_tls_connection(session),
-            &ctx.path,
-            force_https,
-            ctx.environment.is_some(),
-        ) {
-            match self.config_service.get_url_scheme().await {
-                Ok(scheme) => scheme != "http",
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        "Failed to read external URL scheme; enforcing HTTPS"
-                    );
-                    true
-                }
-            }
-        } else {
-            false
-        };
-        let needs_redirect = should_redirect_to_https(
-            self.disable_https_redirect,
-            self.is_tls_connection(session),
-            &ctx.path,
-            force_https,
-            // Lock-free ArcSwap snapshot read, and only reached when the
-            // environment has no explicit override.
-            || {
-                inherited_https_policy(
-                    production_https,
-                    self.cert_host_cache.has_cert_for_host(&ctx.host),
-                )
-            },
-        );
-        if needs_redirect {
-            // Build the HTTPS redirect URL preserving path and query string
-            let redirect_url = if let Some(query) = &ctx.query_string {
-                format!(
-                    "https://{}{}{}",
-                    ctx.host,
-                    ctx.path,
-                    if query.is_empty() {
-                        String::new()
-                    } else {
-                        format!("?{}", query)
-                    }
-                )
-            } else {
-                format!("https://{}{}", ctx.host, ctx.path)
-            };
-
-            debug!(
-                request_id = %ctx.request_id,
-                host = %ctx.host,
-                path = %ctx.path,
-                redirect_url = %redirect_url,
-                "Redirecting HTTP to HTTPS"
-            );
-
-            // Use 301 Permanent Redirect for HTTP→HTTPS
-            let resp = https_redirect_response(&redirect_url, &ctx.request_id)?;
-            // Managed monitors use this marker to distinguish the proxy's
-            // pre-upstream protocol upgrade from an application's own 3xx.
-            // It carries no trust decision by itself: monitors still require
-            // a same-host HTTPS target and pin the follow-up to the configured
-            // local TLS listener.
-            ctx.routing_status = "http_to_https_redirect".to_string();
-
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
-        }
-
-        // Check if this host should redirect
-        if let Some((redirect_target, status_code)) = self
-            .project_context_resolver
-            .get_redirect_info(&ctx.host)
-            .await
-        {
-            let redirect_url =
-                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            debug!(
-                request_id = %ctx.request_id,
-                host = %ctx.host,
-                redirect_url = %redirect_url,
-                status_code = status_code,
-                "Redirecting request"
-            );
-
-            // Build redirect response
-            let mut resp = ResponseHeader::build(status_code, None)?;
-            resp.insert_header("Location", &redirect_url)?;
-            resp.insert_header("Content-Length", "0")?;
-            resp.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
-
-            // Add CORS headers for redirect responses
-            resp.insert_header("Access-Control-Allow-Origin", "*")?;
-
-            // Update context for logging
-            ctx.routing_status = "redirected".to_string();
-
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true); // Skip proxying
-        }
-
-        // RFC 7239 Forwarded, X-Real-IP, and CF-Connecting-IP are all
-        // client-controlled at this trust boundary (any direct client can
-        // set them, bypassing Bunny/Cloudflare entirely). We emit a
-        // complete trusted X-Forwarded-* set below from the already-
-        // resolved `ctx.ip_address`, so do not let a tenant app read a raw,
-        // possibly-spoofed client-supplied header instead.
-        strip_untrusted_client_ip_headers(
-            session.req_header_mut(),
-            self.loopback_ja4_header.load().as_deref(),
-        );
-
-        // Browsers split cookies across several fields over HTTP/2; the
-        // upstream must receive them as one `Cookie` header or it keeps only
-        // the first (see `coalesce_cookie_headers`).
-        coalesce_cookie_headers(session.req_header_mut());
-
-        // Capture request headers
-        let request_headers: HashMap<String, String> = session
-            .req_header()
-            .headers
-            .iter()
-            .filter_map(|(k, v)| v.to_str().ok().map(|val| (k.to_string(), val.to_string())))
-            .collect();
-        ctx.request_headers = Some(request_headers);
-
-        debug!(
-            request_id = %ctx.request_id,
-            method = %ctx.method,
-            host = %ctx.host,
-            path = %ctx.path,
-            user_agent = %ctx.user_agent,
-            "Incoming request"
-        );
-
-        // Store encrypted cookie values for later processing
-        // Use project-scoped cookie names if project context is available
-        let project_id = ctx.project.as_ref().map(|p| p.id);
-        let visitor_cookie_name = get_visitor_cookie_name(project_id);
-        let session_cookie_name = get_session_cookie_name(project_id);
-
-        ctx.request_visitor_cookie =
-            find_request_cookie(session.req_header(), &visitor_cookie_name, |value| {
-                Some(value.to_string())
-            });
-
-        ctx.request_session_cookie =
-            find_request_cookie(session.req_header(), &session_cookie_name, |value| {
-                Some(value.to_string())
-            });
-
-        // Get IP from the connection
-        // Add X-Forwarded-For header with client IP (already extracted in request_filter)
-        if let Some(ref ip) = ctx.ip_address {
-            session
-                .req_header_mut()
-                .insert_header("X-Forwarded-For", ip.as_str())?;
-        }
-
-        // Overwrite the complete public authority forwarded upstream. Apps
-        // such as Keycloak trust this set when constructing absolute URLs.
-        // Forwarding only the scheme loses non-default ports and produces
-        // redirects to port 80/443 instead of the Temps proxy.
-        let is_https = self.is_https_request(session);
-        let proto = if is_https { "https" } else { "http" };
-        let public_authority = self.request_authority(session)?;
-        let forwarded_port = public_authority
-            .port
-            .unwrap_or(if is_https { 443 } else { 80 });
-        // The same parsed authority controls routing and reaches the upstream.
-        // Never pass the raw client Host after making a routing decision.
-        session
-            .req_header_mut()
-            .insert_header("Host", public_authority.forwarded_host.clone())?;
-        session
-            .req_header_mut()
-            .insert_header("X-Forwarded-Proto", proto)?;
-        session
-            .req_header_mut()
-            .insert_header("X-Forwarded-Host", public_authority.forwarded_host)?;
-        session
-            .req_header_mut()
-            .insert_header("X-Forwarded-Port", forwarded_port.to_string())?;
-
-        ctx.referrer = session
-            .req_header()
-            .headers
-            .get("referer")
-            .map(|h| h.to_str().unwrap_or_default().to_string());
-
-        // Handle ACME HTTP-01 challenges
-        if let Some(key_authorization) = self
-            .handle_acme_http_challenge(&ctx.host, &ctx.path)
-            .await?
-        {
-            debug!(
-                "Serving ACME HTTP-01 challenge response for {}{} (request_id={})",
-                ctx.host, ctx.path, ctx.request_id
-            );
-
-            let key_auth_bytes = Bytes::from(key_authorization.clone());
-            let content_length = key_auth_bytes.len();
-
-            let mut resp = ResponseHeader::build(200, None)?;
-            resp.insert_header("Content-Type", "text/plain")?;
-            resp.insert_header("Cache-Control", "no-cache")?;
-            resp.insert_header("X-Request-ID", &ctx.request_id)?;
-            resp.insert_header("Content-Length", content_length.to_string())?;
-            resp.insert_header("Connection", "close")?;
-
-            session.write_response_header(Box::new(resp), false).await?;
-            session
-                .write_response_body(Some(key_auth_bytes), true)
-                .await?;
-
-            // Log this ACME challenge response for debugging
-            info!(
-                "ACME challenge completed: {} {} - 200 OK - {}ms",
-                ctx.method,
-                ctx.path,
-                ctx.start_time.elapsed().as_millis()
-            );
-
-            // Update routing status for potential logging
-            ctx.routing_status = "acme_challenge".to_string();
-
-            return Ok(true);
-        }
-
-        // Check for redirects or static file serving
-        if let Some((redirect_target, status_code)) = self
-            .project_context_resolver
-            .get_redirect_info(&ctx.host)
-            .await
-        {
-            let location =
-                domain_redirect_location(&redirect_target, &ctx.path, ctx.query_string.as_deref());
-            let resp = domain_redirect_response(status_code, &location)?;
-            session.write_response_header(Box::new(resp), true).await?;
-            return Ok(true);
-        }
-
-        // Check if this is a static deployment using route table. A path
-        // route serves from its target instead: its files if the target is
-        // static, the upstream otherwise.
-        let static_dir = match ctx.path_route.as_ref() {
-            Some(route) => route
-                .target
-                .as_ref()
-                .and_then(|target| target.static_dir())
-                .map(str::to_string),
-            None => {
-                self.project_context_resolver
-                    .get_static_path(&ctx.host)
-                    .await
-            }
-        };
-        if let Some(static_dir) = static_dir {
-            debug!(
-                "Static deployment detected for {}: {}",
-                ctx.host, static_dir
-            );
-
-            // IMPORTANT: Skip static file serving for /api/_temps/* paths
-            // These must ALWAYS be proxied to the console address (admin API)
-            if !ctx.path.starts_with("/api/_temps/") {
-                let served = self.serve_static_target(session, ctx, &static_dir).await;
-                match served {
-                    Ok(StaticFileServeOutcome::Served) => {
-                        debug!("Served static file: {}", ctx.path);
-                        ctx.routing_status = "static_file".to_string();
-                        self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
-                        return Ok(true);
-                    }
-                    Ok(StaticFileServeOutcome::ServedNotFoundPage) => {
-                        debug!(
-                            request_path = %bounded_log_value(&ctx.path),
-                            stored_static_dir = %bounded_log_value(&static_dir),
-                            "Static file request answered with the deployment's 404 page"
-                        );
-                        ctx.routing_status = "static_file_not_found_page".to_string();
-                        self.log_static_request(
-                            ctx,
-                            404,
-                            "static_file_not_found_page",
-                            &static_dir,
-                            Some("Static file not found".to_string()),
-                            None,
-                        );
-                        return Ok(true);
-                    }
-                    Ok(StaticFileServeOutcome::Redirected) => {
-                        debug!(
-                            request_path = %bounded_log_value(&ctx.path),
-                            "Static file request redirected to its slashless page"
-                        );
-                        ctx.routing_status = "static_file_redirect".to_string();
-                        self.log_static_request(
-                            ctx,
-                            308,
-                            "static_file_redirect",
-                            &static_dir,
-                            None,
-                            None,
-                        );
-                        return Ok(true);
-                    }
-                    Ok(StaticFileServeOutcome::NotFound) => {
-                        debug!(
-                            request_path = %bounded_log_value(&ctx.path),
-                            stored_static_dir = %bounded_log_value(&static_dir),
-                            "Static file request returned the uniform not-found response"
-                        );
-                        let contract = static_not_found_contract(&ctx.method);
-                        let mut resp = ResponseHeader::build(contract.status, None)?;
-                        resp.insert_header(header::CONTENT_TYPE, contract.content_type)?;
-                        resp.insert_header(
-                            header::CONTENT_LENGTH,
-                            contract.content_length.to_string(),
-                        )?;
-                        resp.insert_header(header::CACHE_CONTROL, contract.cache_control)?;
-                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
-
-                        self.ensure_static_visitor_session(session, ctx, contract.content_type)
-                            .await;
-                        self.set_tracking_cookies(session, &mut resp, ctx).await?;
-                        session.write_response_header(Box::new(resp), false).await?;
-                        if contract.send_body {
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(STATIC_NOT_FOUND_BODY)),
-                                    true,
-                                )
-                                .await?;
-                        } else {
-                            session.write_response_body(None, true).await?;
-                        }
-
-                        self.log_static_request(
-                            ctx,
-                            404,
-                            "static_file_not_found",
-                            &static_dir,
-                            Some("Static file not found".to_string()),
-                            Some(contract.content_length as i64),
-                        );
-                        return Ok(true);
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            // If we reach here and path starts with /api/_temps/,
-            // fall through to normal proxying logic (will be proxied to console)
-        }
-
-        // Serve persisted static assets via deployment-prefixed URLs.
-        // /_temps/assets/{deployment_slug}/path → DB lookup → CAS blob
-        if ctx.path.starts_with("/_temps/assets/") {
-            let after_prefix = &ctx.path["/_temps/assets/".len()..];
-            if let Some(slash_pos) = after_prefix.find('/') {
-                let deployment_slug = &after_prefix[..slash_pos];
-                let asset_path = after_prefix[slash_pos + 1..].to_string();
-                let mut legacy_source = None;
-                let mut legacy_current_slug = None;
-                let mut asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
-                    let context = deployment.context_vars.as_ref();
-                    let source_slug = context
-                        .and_then(|value| value.get("source_deployment_slug"))
-                        .and_then(serde_json::Value::as_str);
-                    let source_deployment_id = context
-                        .and_then(|value| value.get("source_deployment_id"))
-                        .and_then(serde_json::Value::as_i64)
-                        .and_then(|value| i32::try_from(value).ok());
-                    if source_slug.is_none() {
-                        legacy_source = source_deployment_id;
-                        legacy_current_slug = Some(deployment.slug.clone());
-                    }
-                    deployment_asset_scope(
-                        &deployment.slug,
-                        deployment.environment_id,
-                        deployment.id,
-                        source_slug,
-                        context
-                            .and_then(|value| value.get("source_environment_id"))
-                            .and_then(serde_json::Value::as_i64)
-                            .and_then(|value| i32::try_from(value).ok()),
-                        source_deployment_id,
-                        deployment_slug,
-                    )
-                });
-                if let (Some(project_id), Some(source_deployment_id)) = (
-                    ctx.project.as_ref().map(|project| project.id),
-                    legacy_source,
-                ) {
-                    if let Some(origin) = self
-                        .static_asset_lookup
-                        .resolve_legacy_asset_origin(project_id, source_deployment_id)
-                        .await
-                    {
-                        asset_scope = legacy_deployment_asset_scope(
-                            legacy_current_slug.as_deref().unwrap_or_default(),
-                            &origin,
-                            deployment_slug,
-                        );
-                    }
-                }
-                if Self::is_cacheable_static_asset(&asset_path) {
-                    if let Some(asset_scope) = asset_scope {
-                        if let Ok(true) = self
-                            .serve_asset_from_store(session, ctx, &asset_path, Some(asset_scope))
-                            .await
-                        {
-                            ctx.routing_status = "prefixed_asset".to_string();
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Fallback: serve immutable static assets from file store.
-        // For container deployments where the upstream didn't have the asset,
-        // check the path-keyed file store (stale-chunk fallback).
-        if Self::is_cacheable_static_asset(&ctx.path)
-            && ctx.path_route.is_none()
-            && !self
-                .project_context_resolver
-                .is_static_deployment(&ctx.host)
-                .await
-        {
-            let url_path = ctx.path.trim_start_matches('/').to_string();
-            if let Ok(true) = self
-                .serve_asset_from_store(session, ctx, &url_path, None)
-                .await
-            {
-                ctx.routing_status = "stale_chunk_fallback".to_string();
-                return Ok(true);
-            }
-        }
-
-        // Admin gate: when a non-noop gate is wired and the request is
-        // about to fall back to the console (no deployed app for this host,
-        // not a public ingest path under /api/_temps/*, not a preview),
-        // require the (IP, Host) tuple to pass the gate. If it doesn't, the
-        // management surface must stay invisible from non-admin hosts.
-        //
-        // The public ingress hostname (ADR-051) is not gated at all: the
-        // resolver pins it to the public-only listener for every client, so
-        // there is no management surface behind it to protect.
-        if let Some(gate) = self
-            .admin_gate
-            .as_ref()
-            .filter(|_| !self.is_public_ingress_request(&ctx.host))
-        {
-            let config = gate.current();
-            if Self::should_consult_admin_gate(&config, &ctx.path, ctx.preview_route.is_some()) {
-                let host_has_route = self.upstream_resolver.has_route_for_host(&ctx.host).await;
-                if !host_has_route {
-                    let client_ip = ctx
-                        .ip_address
-                        .as_deref()
-                        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-                        .unwrap_or_else(|| std::net::IpAddr::from([127, 0, 0, 1]));
-                    match Self::console_fall_through(
-                        &config,
-                        client_ip,
-                        &ctx.host,
-                        self.upstream_resolver.console_ingress_address().is_some(),
-                    ) {
-                        ConsoleFallThrough::Console => {}
-                        // A denied client is still a legitimate caller of the
-                        // public routes: a mail client fetching a tracking
-                        // pixel, a git provider delivering a push. Hand it to
-                        // the listener that mounts those and nothing else.
-                        // That listener answers everything that is not a
-                        // public route with a 404, so the console stays as
-                        // invisible as when the proxy answered itself.
-                        ConsoleFallThrough::PublicSurfaceOnly => {
-                            debug!(
-                                host = %ctx.host,
-                                client_ip = %client_ip,
-                                path = %ctx.path,
-                                "admin gate denied request; serving the public-only surface"
-                            );
-                            ctx.public_surface_only = true;
-                        }
-                        ConsoleFallThrough::NotFound => {
-                            warn!(
-                                host = %ctx.host,
-                                client_ip = %client_ip,
-                                path = %ctx.path,
-                                "admin gate denied request to non-admin host"
-                            );
-                            let mut response = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            response.insert_header("Content-Type", "text/html; charset=utf-8")?;
-                            let body =
-                                Bytes::from(crate::branded_404::render(&ctx.host, &ctx.request_id));
-                            response.insert_header("Content-Length", body.len().to_string())?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session.write_response_body(Some(body), true).await?;
-                            ctx.routing_status = "admin_gate_denied".to_string();
-                            return Ok(true);
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(false)
+        Ok(matches!(
+            self.run_request_stages(session, ctx).await?,
+            request_filter::Flow::Answered
+        ))
     }
 
     async fn upstream_response_filter(
@@ -5730,11 +3992,14 @@ impl ProxyHttp for LoadBalancer {
 
         debug!("Upstream response filter headers: {:?}", upstream_response);
 
+        self.protect_probe_response(session, upstream_response)?;
         strip_proxy_owned_response_headers(upstream_response);
         if ctx.gated_host {
             crate::handler::gate::strip_gate_from_app_response(upstream_response)?;
         }
-        upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+        if self.expose_probe_markers(session) {
+            upstream_response.insert_header("X-Temps-Proxy-Probe-Capable", "1")?;
+        }
 
         // First upstream header = backend latency (connect + upstream time).
         if ctx.upstream_response_time_ms.is_none() {
@@ -5786,8 +4051,14 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Add X-Served-By header with the container name that handled this request
-        if let Some(name) = &ctx.container_name {
-            upstream_response.insert_header("X-Served-By", name).ok();
+        if let Some(name) = ctx
+            .container_name
+            .as_ref()
+            .filter(|_| self.expose_platform_identity())
+        {
+            if !upstream_response.headers.contains_key("X-Served-By") {
+                upstream_response.insert_header("X-Served-By", name).ok();
+            }
         }
 
         // Confirm or cancel Markdown conversion now that we know the upstream status and
@@ -5869,7 +4140,10 @@ impl ProxyHttp for LoadBalancer {
         // `X-Temps-Shield` says what Shield did (ADR 066, D11): only Shield
         // sets it, and only when it acted.
         let _ = upstream_response.remove_header(temps_shield::RESPONSE_HEADER);
-        if let Some(verdict) = ctx.shield_header {
+        if let Some(verdict) = ctx
+            .shield_header
+            .filter(|_| self.expose_platform_identity())
+        {
             upstream_response.insert_header(
                 temps_shield::RESPONSE_HEADER,
                 temps_shield::response_header_value(verdict, &ctx.request_id),
@@ -6018,6 +4292,34 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        upstream_request.remove_header(temps_core::probe_auth::HEADER);
+        // A 304 merges into the client's old 200 and retains omitted proxy
+        // diagnostics. Request a full representation while hiding identity;
+        // leave app response validators and write preconditions untouched.
+        // This deliberately trades conditional GET/HEAD bandwidth for privacy.
+        // Console APIs (including flag snapshots) depend on conditional reads.
+        // Exempt only their resolved listener, never a client-selected path:
+        // an app's /api routes still need the privacy refresh.
+        let console_bound = ctx.upstream_host.as_deref().is_some_and(|peer| {
+            !peer.is_empty()
+                && peer
+                    == control_plane_address(
+                        peer,
+                        self.upstream_resolver.console_address(),
+                        self.upstream_resolver.console_ingress_address(),
+                    )
+        });
+        if !self.expose_platform_identity()
+            && !console_bound
+            && matches!(
+                upstream_request.method,
+                axum::http::Method::GET | axum::http::Method::HEAD
+            )
+        {
+            upstream_request.remove_header("If-None-Match");
+            upstream_request.remove_header("If-Modified-Since");
+        }
+
         // ADR 065 D8: no app receives the gate's cookies, admitted or not,
         // gated host or not. A cookie left from before an address stopped
         // being signed-in is still a token.
@@ -6106,7 +4408,9 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let gateway_peer = if ctx.preview_on_worker {
+            let gateway_peer = if let Some(port) = ctx.preview_gateway_port {
+                format!("127.0.0.1:{port}")
+            } else {
                 // A sandbox on a worker is reached through the relay the
                 // sandbox plugin runs in the console process; a proxy
                 // running on its own has none.
@@ -6118,8 +4422,6 @@ impl ProxyHttp for LoadBalancer {
                     ));
                 };
                 relay.address.to_string()
-            } else {
-                preview_gateway_peer()
             };
             let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_request_group_key(host, &ctx.request_id);
@@ -6162,6 +4464,7 @@ impl ProxyHttp for LoadBalancer {
         };
         let selection = if let Some(ingress_address) = public_surface_address {
             PeerSelection {
+                in_flight: None,
                 peer: Box::new(HttpPeer::new(ingress_address, false, String::new())),
                 container_id: None,
                 container_name: None,
@@ -6175,16 +4478,9 @@ impl ProxyHttp for LoadBalancer {
                     "path route target is static and has no upstream",
                 ));
             }
-            let backend = target.select_backend_avoiding(&ctx.failed_upstreams);
-            PeerSelection {
-                peer: Box::new(HttpPeer::new(
-                    backend.address.as_str(),
-                    false,
-                    String::new(),
-                )),
-                container_id: backend.container_id,
-                container_name: backend.container_name,
-            }
+            crate::services::peer_for_selection(
+                target.select_backend_avoiding(&ctx.failed_upstreams),
+            )?
         } else {
             // Use the upstream resolver trait
             // Pass SNI hostname for TLS-based routing
@@ -6199,6 +4495,7 @@ impl ProxyHttp for LoadBalancer {
                 .await?
         };
 
+        ctx.replica_in_flight = selection.in_flight;
         let mut peer = selection.peer;
 
         // The console failed to start: nothing is listening on its address
@@ -6309,6 +4606,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
         mut e: Box<Error>,
     ) -> Box<Error> {
+        ctx.replica_in_flight.take();
         // Retry on connection failure — handles stale pooled connections where
         // the upstream closed the keep-alive connection before we sent the
         // request (TCP RST / "Connection reset by peer"), and a replica that's
@@ -6425,8 +4723,13 @@ impl ProxyHttp for LoadBalancer {
             }
         };
 
-        if let Err(e) = header.insert_header(header::SERVER, &SERVER_NAME[..]) {
-            error!("Failed to insert SERVER header: {:?}", e);
+        if self.expose_platform_identity() {
+            if let Err(e) = header.insert_header(header::SERVER, &SERVER_NAME[..]) {
+                error!("Failed to insert SERVER header: {:?}", e);
+            }
+        }
+        if let Err(e) = header.insert_header("X-Request-ID", &ctx.request_id) {
+            error!(error = %e, "Failed to insert request ID in proxy error response");
         }
         if let Err(e) = header.insert_header(header::DATE, "Sun, 06 Nov 1994 08:49:37 GMT") {
             error!("Failed to insert DATE header: {:?}", e);
@@ -6446,7 +4749,7 @@ impl ProxyHttp for LoadBalancer {
             };
         }
 
-        let page = unavailable_page(ctx.preview_route.is_some());
+        let page = unavailable_page(ctx.preview_route.is_some() && self.expose_platform_identity());
         if let Err(e) = session
             .write_response_body(Some(Bytes::from(page)), true)
             .await

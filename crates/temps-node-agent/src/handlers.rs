@@ -257,6 +257,11 @@ mod exec_admission_tests {
 /// Shared state for all agent handlers.
 pub struct AgentState {
     pub container_deployer: Arc<dyn ContainerDeployer>,
+    /// The database engines this node runs (`temps-providers`, passed in by
+    /// the binary that starts the agent).
+    pub service_runtime: Arc<dyn temps_service_protocol::NodeServiceRuntime>,
+    /// Compiles plugins on this node for a control plane without Docker.
+    pub plugin_builder: Arc<dyn crate::plugin_build_handler::PluginContainerBuilder>,
     pub image_builder: Arc<dyn ImageBuilder>,
     /// Direct Docker client for service operations (create/exec/backup).
     /// None if Docker is not available (shouldn't happen on a real agent).
@@ -395,6 +400,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         | temps_deployer::DeployerError::NetworkError(_)
         | temps_deployer::DeployerError::ResourceAllocationFailed(_)
         | temps_deployer::DeployerError::SecretMountFailed { .. }
+        | temps_deployer::DeployerError::ImageRemoval { .. }
+        | temps_deployer::DeployerError::ImageInventory { .. }
         | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // DockerUnavailable is returned when the control-plane node has no
         // Docker daemon; the caller should direct traffic to a worker node.
@@ -416,6 +423,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         get_container_info,
         list_containers,
         image_exists,
+        remove_images,
+        list_owned_images,
         import_image,
         pull_image,
         crate::build_handler::build_image,
@@ -432,8 +441,29 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::service_handlers::service_status,
         crate::service_handlers::service_exec,
         crate::service_handlers::runtime_env,
+        crate::service_handlers::runtime_env_preview,
         crate::service_handlers::revoke_s3_access,
         crate::service_handlers::health_probe,
+        crate::service_observe_handlers::service_runtime,
+        crate::service_observe_handlers::wal_health,
+        crate::service_data_handlers::data_backup,
+        crate::service_data_handlers::data_restore,
+        crate::service_data_handlers::postgres_walg_backup,
+        crate::service_data_handlers::postgres_walg_backup_outcome,
+        crate::service_data_handlers::postgres_cluster_walg_backup,
+        crate::service_data_handlers::postgres_walg_restore,
+        crate::service_data_handlers::worker_restore_outcome,
+        crate::service_data_handlers::postgres_walg_archive,
+        crate::service_data_handlers::postgres_walg_credentials,
+        crate::service_data_handlers::mongodb_backup,
+        crate::service_data_handlers::mongodb_restore,
+        crate::service_data_handlers::redis_walg_backup,
+        crate::service_data_handlers::redis_rdb_backup,
+        crate::service_data_handlers::redis_restore,
+        crate::service_mariadb_handlers::mariadb_physical_backup,
+        crate::service_mariadb_handlers::mariadb_dump_backup,
+        crate::service_mariadb_handlers::mariadb_restore,
+        crate::service_mariadb_handlers::mariadb_binlog_archive,
         crate::service_handlers::list_services,
         crate::service_handlers::backup_service,
         crate::service_handlers::restore_service,
@@ -454,6 +484,10 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::sandbox_handlers::resize_sandbox_disk,
         crate::sandbox_handlers::set_sandbox_egress_policy,
         crate::sandbox_handlers::sandbox_image_identity,
+        crate::sandbox_handlers::prepare_sandbox_image,
+        crate::sandbox_handlers::sandbox_image_prepare_status,
+        crate::sandbox_handlers::remove_sandbox_image,
+        crate::sandbox_handlers::service_access::command,
         crate::sandbox_handlers::check_sandbox_agent_runtime,
         crate::sandbox_handlers::recover_sandbox_agent_harness,
         crate::sandbox_handlers::open_sandbox_byte_channel,
@@ -473,8 +507,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentResponse<NodeHealthReport>,
         AgentResponse<crate::ServiceCreateResponse>,
         AgentResponse<crate::ServiceExecResponse>,
-        AgentResponse<temps_providers::remote_service_client::RemoteRuntimeEnvResponse>,
-        AgentResponse<temps_providers::remote_service_client::RemoteHealthProbeResponse>,
+        AgentResponse<temps_service_protocol::RemoteRuntimeEnvResponse>,
+        AgentResponse<temps_service_protocol::RemoteHealthProbeResponse>,
         AgentResponse<crate::ServiceStatus>,
         AgentResponse<Vec<crate::ServiceStatus>>,
         AgentResponse<crate::ServiceBackupResponse>,
@@ -483,6 +517,8 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         AgentExecRequest,
         AgentExecResponse,
         PullImageRequest,
+        temps_deployer::remote::RemoveImagesRequest,
+        temps_deployer::remote::ListOwnedImagesRequest,
         PullImageResponse,
         RegistryCredentials,
         NodeHealthReport,
@@ -501,10 +537,54 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::ServicePortMapping,
         crate::ServiceExecRequest,
         crate::ServiceExecResponse,
-        temps_providers::remote_service_client::RemoteRuntimeEnvRequest,
-        temps_providers::remote_service_client::RemoteRuntimeEnvResponse,
-        temps_providers::remote_service_client::RemoteHealthProbeRequest,
-        temps_providers::remote_service_client::RemoteHealthProbeResponse,
+        temps_service_protocol::RemoteRuntimeEnvRequest,
+        temps_service_protocol::RemoteRuntimeEnvResponse,
+        temps_service_protocol::RemoteHealthProbeRequest,
+        temps_service_protocol::RemoteHealthProbeResponse,
+        temps_service_protocol::ServiceContainerRuntime,
+        temps_service_protocol::RemoteWalHealthRequest,
+        temps_service_protocol::RemoteWalHealthResponse,
+        temps_service_protocol::RemoteServiceBackupRequest,
+        temps_service_protocol::RemoteServiceBackupResponse,
+        temps_service_protocol::RemoteServiceRestoreRequest,
+        temps_service_protocol::RemoteServiceRestoreResponse,
+        temps_service_protocol::PostgresWalgBackupRequest,
+        temps_service_protocol::PostgresClusterWalgBackupRequest,
+        temps_service_protocol::PostgresWalgBackupOutcomeRequest,
+        temps_service_protocol::PostgresWalgBackupProgress,
+        temps_service_protocol::PostgresWalgBackupResult,
+        temps_service_protocol::PostgresWalgRestoreRequest,
+        temps_service_protocol::PostgresWalgArchiveRequest,
+        temps_service_protocol::PostgresWalgArchiveResult,
+        temps_service_protocol::PostgresWalgCredentialsRequest,
+        temps_service_protocol::PostgresWalgCredentialsResult,
+        temps_service_protocol::PostgresWalgRestoreResult,
+        temps_service_protocol::WorkerRestoreEngine,
+        temps_service_protocol::WorkerRestoreOutcomeRequest,
+        temps_service_protocol::WorkerRestoreResult,
+        temps_service_protocol::WorkerRestoreProgress,
+        temps_service_protocol::MongodbBackupRequest,
+        temps_service_protocol::MongodbBackupMode,
+        temps_service_protocol::MongodbBackupResult,
+        temps_service_protocol::MongodbRestoreRequest,
+        temps_service_protocol::MongodbRestoreResult,
+        temps_service_protocol::RedisWalgBackupRequest,
+        temps_service_protocol::RedisWalgBackupResult,
+        temps_service_protocol::RedisRdbBackupRequest,
+        temps_service_protocol::RedisRdbBackupResult,
+        temps_service_protocol::RedisRestoreRequest,
+        temps_service_protocol::RedisRestoreResult,
+        temps_service_protocol::MariadbBinlogCoordinate,
+        temps_service_protocol::MariadbPhysicalBackupRequest,
+        temps_service_protocol::MariadbPhysicalBackupResult,
+        temps_service_protocol::MariadbDumpBackupRequest,
+        temps_service_protocol::MariadbDumpBackupResult,
+        temps_service_protocol::MariadbRestoreRequest,
+        temps_service_protocol::MariadbRestoreResult,
+        temps_service_protocol::MariadbBinlogArchiveRequest,
+        temps_service_protocol::MariadbBinlogArchiveResult,
+        temps_service_protocol::RecoveryTarget,
+        temps_service_protocol::WorkerS3Destination,
         temps_deployer::image_scan::ImageScanRequest,
         temps_deployer::image_scan::ImageScanReport,
         temps_deployer::image_scan::ImageScanFinding,
@@ -514,37 +594,43 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         crate::ServiceRestoreRequest,
         crate::S3CredentialsPayload,
         crate::ServiceStatus,
-        temps_ai_agents::sandbox::SandboxHandle,
-        temps_ai_agents::sandbox::SandboxBackend,
-        temps_ai_agents::sandbox::KillSignal,
-        temps_ai_agents::sandbox::remote::RemoteCreateRequest,
-        temps_ai_agents::sandbox::remote::RemoteHandleRequest,
-        temps_ai_agents::sandbox::remote::RemoteDestroyRequest,
-        temps_ai_agents::sandbox::remote::RemoteExecRequest,
-        temps_ai_agents::sandbox::remote::RemoteExecResponse,
-        temps_ai_agents::sandbox::remote::RemoteExecFrame,
-        temps_ai_agents::sandbox::remote::RemoteReadFileRequest,
-        temps_ai_agents::sandbox::remote::RemoteFileContents,
-        temps_ai_agents::sandbox::remote::RemoteWriteFileRequest,
-        temps_ai_agents::sandbox::remote::RemoteWriteDirectoryRequest,
-        temps_ai_agents::sandbox::remote::RemoteKillRequest,
-        temps_ai_agents::sandbox::remote::RemoteRecoverRequest,
-        temps_ai_agents::sandbox::remote::RemoteReleaseOrphanedRequest,
-        temps_ai_agents::sandbox::remote::RemoteStatusRequest,
-        temps_ai_agents::sandbox::remote::RemoteAliveResponse,
-        temps_ai_agents::sandbox::remote::RemoteStatusResponse,
-        temps_ai_agents::sandbox::remote::RemoteOkResponse,
-        temps_ai_agents::sandbox::remote::RemoteErrorBody,
-        temps_ai_agents::sandbox::remote::RemoteResizeDiskRequest,
-        temps_ai_agents::sandbox::remote::RemoteEgressPolicyRequest,
-        temps_ai_agents::sandbox::SandboxEgressPolicy,
-        temps_ai_agents::sandbox::EgressRule,
-        temps_ai_agents::sandbox::EgressMode,
-        temps_ai_agents::sandbox::remote::RemoteImageIdentityResponse,
-        temps_ai_agents::sandbox::remote::RemoteRuntimeCompatibility,
-        temps_ai_agents::sandbox::remote::RemoteRecoverHarnessRequest,
-        temps_ai_agents::sandbox::remote::RemoteByteChannel,
-        temps_ai_agents::sandbox::remote::RemoteByteChannelError,
+        temps_sandbox_providers::SandboxHandle,
+        temps_sandbox_providers::SandboxBackend,
+        temps_sandbox_providers::KillSignal,
+        temps_sandbox_providers::remote::RemoteCreateRequest,
+        temps_sandbox_providers::remote::RemoteHandleRequest,
+        temps_sandbox_providers::remote::RemoteDestroyRequest,
+        temps_sandbox_providers::remote::RemoteExecRequest,
+        temps_sandbox_providers::remote::RemoteExecResponse,
+        temps_sandbox_providers::remote::RemoteExecFrame,
+        temps_sandbox_providers::remote::RemoteReadFileRequest,
+        temps_sandbox_providers::remote::RemoteFileContents,
+        temps_sandbox_providers::remote::RemoteWriteFileRequest,
+        temps_sandbox_providers::remote::RemoteWriteDirectoryRequest,
+        temps_sandbox_providers::remote::RemoteKillRequest,
+        temps_sandbox_providers::remote::RemoteRecoverRequest,
+        temps_sandbox_providers::remote::RemoteReleaseOrphanedRequest,
+        temps_sandbox_providers::remote::RemoteStatusRequest,
+        temps_sandbox_providers::remote::RemoteAliveResponse,
+        temps_sandbox_providers::remote::RemoteStatusResponse,
+        temps_sandbox_providers::remote::RemoteOkResponse,
+        temps_sandbox_providers::remote::RemoteErrorBody,
+        temps_sandbox_providers::remote::RemoteResizeDiskRequest,
+        temps_sandbox_providers::remote::RemoteEgressPolicyRequest,
+        temps_sandbox_providers::SandboxEgressPolicy,
+        temps_sandbox_providers::EgressRule,
+        temps_sandbox_providers::EgressMode,
+        temps_sandbox_providers::remote::RemoteImageIdentityResponse,
+        temps_sandbox_providers::remote::RemoteImagePrepareRequest,
+        temps_sandbox_providers::remote::RemoteImageRemoveRequest,
+        temps_sandbox_providers::remote::RemoteImageRemoveResponse,
+        temps_sandbox_providers::ImagePrepareStatus,
+        temps_sandbox_providers::ImagePrepareState,
+        temps_sandbox_providers::ImageRemoval,
+        temps_sandbox_providers::remote::RemoteRuntimeCompatibility,
+        temps_sandbox_providers::remote::RemoteRecoverHarnessRequest,
+        temps_sandbox_providers::remote::RemoteByteChannel,
+        temps_sandbox_providers::remote::RemoteByteChannelError,
         temps_deployer::compose_protocol::ComposeGenerationRequest,
         temps_deployer::compose_protocol::ComposeStackRequest,
         temps_deployer::compose_protocol::ComposePruneRequest,
@@ -654,6 +740,10 @@ pub async fn deploy_container(
     }
 }
 
+/// Longest grace period a stop request may ask for (1 hour), matching the
+/// largest stop timeout a project can be configured with.
+const MAX_STOP_GRACE_SECONDS: u64 = 3600;
+
 /// Stop a running container
 #[utoipa::path(
     tag = "Containers",
@@ -662,9 +752,11 @@ pub async fn deploy_container(
     params(
         ("id" = String, Path, description = "Container ID or name")
     ),
+    request_body(content = Option<temps_deployer::StopContainerRequest>, description = "Optional grace period; an empty body stops with the default 10 s"),
     responses(
         (status = 200, description = "Container stopped", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container does not exist on this node"),
         (status = 500, description = "Stop failed")
     ),
     security(("bearer_auth" = []))
@@ -672,9 +764,25 @@ pub async fn deploy_container(
 pub async fn stop_container(
     State(state): State<Arc<AgentState>>,
     Path(container_id): Path<String>,
+    body: Option<Json<temps_deployer::StopContainerRequest>>,
 ) -> impl IntoResponse {
-    tracing::info!(container_id = %container_id, "Stopping container");
-    match state.container_deployer.stop_container(&container_id).await {
+    let grace_seconds = body.and_then(|Json(request)| request.grace_seconds);
+    tracing::info!(container_id = %container_id, ?grace_seconds, "Stopping container");
+    let stopped = match grace_seconds {
+        // The control plane validated the project's stop timeout; bound it
+        // again so a hand-made request cannot hold the agent for days.
+        Some(seconds) => {
+            state
+                .container_deployer
+                .stop_container_with_grace(
+                    &container_id,
+                    std::time::Duration::from_secs(seconds.clamp(1, MAX_STOP_GRACE_SECONDS)),
+                )
+                .await
+        }
+        None => state.container_deployer.stop_container(&container_id).await,
+    };
+    match stopped {
         Ok(()) => {
             tracing::info!(container_id = %container_id, "Container stopped");
             AgentResponse::ok("stopped".to_string()).into_response()
@@ -682,7 +790,7 @@ pub async fn stop_container(
         Err(e) => {
             tracing::error!(container_id = %container_id, "Stop failed: {}", e);
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                container_error_status(&e),
                 format!("Stop failed for container {}: {}", container_id, e),
             )
             .into_response()
@@ -791,6 +899,181 @@ mod container_error_tests {
             "container no longer exists".to_string(),
         );
         assert_eq!(container_error_status(&error), StatusCode::NOT_FOUND);
+    }
+
+    /// The control plane treats a 404 as "this container is gone, so it is not
+    /// running". Any other failure must stay a 500, so that a stop that did
+    /// not happen can never read that way.
+    async fn stop_answer(agent_status_line: &'static str) -> StatusCode {
+        use axum::extract::{Path, State};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // The deployer behind this agent, answering like a Docker runtime that
+        // does not have the container (or is failing).
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock runtime");
+        let address = listener.local_addr().expect("mock runtime address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"scripted failure"}"#;
+            let response = format!(
+                "HTTP/1.1 {agent_status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .expect("create deployer"),
+        );
+        let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
+            container_deployer: runtime.clone(),
+            image_builder: runtime,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+
+        let response = stop_container(State(state), Path("some-container".to_string()), None)
+            .await
+            .into_response();
+        server.await.expect("mock runtime task");
+        response.status()
+    }
+
+    /// The stop request this agent forwards to its runtime for `body`.
+    async fn forwarded_stop(body: Option<temps_deployer::StopContainerRequest>) -> String {
+        use axum::extract::{Path, State};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock runtime");
+        let address = listener.local_addr().expect("mock runtime address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 2048];
+            // Read the head, then the (small, fixed-length) JSON body.
+            loop {
+                let text = String::from_utf8_lossy(&request).to_string();
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length: ")
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+                let read = stream.read(&mut buffer).await.expect("read request");
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let body = r#"{"success":true,"data":"stopped","error":null}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+            String::from_utf8_lossy(&request).to_string()
+        });
+        let runtime = Arc::new(
+            temps_deployer::remote::RemoteNodeDeployer::new(
+                format!("http://{address}"),
+                "unused".into(),
+                "no-io".into(),
+            )
+            .expect("create deployer"),
+        );
+        let state = Arc::new(AgentState {
+            service_runtime: crate::test_engines::service_runtime(),
+            plugin_builder: crate::test_engines::plugin_builder(),
+            container_deployer: runtime.clone(),
+            image_builder: runtime,
+            docker: None,
+            overlay_bridge_address: Default::default(),
+            overlay_peers: Default::default(),
+            platform: Default::default(),
+            host_bind_address: Arc::new(std::sync::RwLock::new("127.0.0.1".into())),
+        });
+
+        let response = stop_container(
+            State(state),
+            Path("old-replica".to_string()),
+            body.map(Json),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        server.await.expect("mock runtime task")
+    }
+
+    /// #1806: the control plane's grace period is the one the container gets.
+    #[tokio::test]
+    async fn a_stop_with_a_grace_period_applies_it() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(90),
+        }))
+        .await;
+        assert!(forwarded.contains(r#"{"grace_seconds":90}"#), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn a_stop_grace_period_is_bounded_to_an_hour() {
+        let forwarded = forwarded_stop(Some(temps_deployer::StopContainerRequest {
+            grace_seconds: Some(u64::MAX),
+        }))
+        .await;
+        assert!(
+            forwarded.contains(r#"{"grace_seconds":3600}"#),
+            "{forwarded}"
+        );
+    }
+
+    /// An older control plane sends no grace period: the default stop.
+    #[tokio::test]
+    async fn a_stop_without_a_grace_period_uses_the_default_stop() {
+        let forwarded = forwarded_stop(None).await;
+        assert!(!forwarded.contains("grace_seconds"), "{forwarded}");
+    }
+
+    #[tokio::test]
+    async fn stopping_a_missing_container_answers_not_found() {
+        assert_eq!(stop_answer("404 Not Found").await, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_failed_stop_answers_internal_server_error() {
+        assert_eq!(
+            stop_answer("500 Internal Server Error").await,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 
     #[test]
@@ -1830,6 +2113,145 @@ pub async fn image_exists(
     }
 }
 
+/// Remove images from this node's daemon, each only if no container here,
+/// running or stopped, was created from it.
+///
+/// The control plane calls this when a project is deleted, for the images
+/// its builds recorded. Judged by image ID against every container on this
+/// daemon, and never forced, so an image something still uses stays. One
+/// outcome per image, in request order; at most
+/// [`temps_deployer::MAX_IMAGE_REMOVAL_BATCH`] images per call.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/remove",
+    request_body = temps_deployer::remote::RemoveImagesRequest,
+    responses(
+        (status = 200, description = "One outcome per image, in request order: removed, absent, in_use, replaced, refused or failed"),
+        (status = 400, description = "More images than one call accepts"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 503, description = "Docker unavailable on this node"),
+        (status = 500, description = "The node's runtime could not remove images; nothing was removed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn remove_images(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_deployer::remote::RemoveImagesRequest>,
+) -> impl IntoResponse {
+    if request.images.len() > temps_deployer::MAX_IMAGE_REMOVAL_BATCH {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Refusing to remove {} images in one call; at most {} are accepted",
+                request.images.len(),
+                temps_deployer::MAX_IMAGE_REMOVAL_BATCH
+            ),
+        )
+        .into_response();
+    }
+    match state
+        .container_deployer
+        .remove_unused_images(&request.images)
+        .await
+    {
+        Ok(outcomes) => {
+            let removed = outcomes.iter().filter(|o| o.status.is_removed()).count();
+            let kept = outcomes.iter().filter(|o| o.status.is_kept()).count();
+            let failed = outcomes.iter().filter(|o| o.status.is_failed()).count();
+            tracing::info!(
+                requested = request.images.len(),
+                removed,
+                kept,
+                failed,
+                "Removed unused images on request of the control plane"
+            );
+            AgentResponse::ok(outcomes).into_response()
+        }
+        Err(error) => {
+            tracing::error!(
+                requested = request.images.len(),
+                %error,
+                "Could not remove images on request of the control plane"
+            );
+            error_response(container_error_status(&error), error.to_string()).into_response()
+        }
+    }
+}
+
+/// Whether `owner` is a plausible image ownership label value: the
+/// control plane sends `<uuid>.<uuid>`.
+fn is_valid_image_owner(owner: &str) -> bool {
+    !owner.is_empty()
+        && owner.len() <= 128
+        && owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+}
+
+/// The images on this node's daemon that one Temps install built for one
+/// of its projects, so its control plane can sweep a project it deleted.
+///
+/// Lists only images labelled with that install's ownership ID and that
+/// project's ID, oldest first
+/// and bounded by [`temps_deployer::MAX_LABELLED_IMAGES`], keeping only
+/// their `sh.temps.image.*` labels, each with a container created from it if
+/// any. Removal goes through `POST /agent/images/remove`, which checks again.
+#[utoipa::path(
+    tag = "Images",
+    post,
+    path = "/agent/images/owned",
+    request_body = temps_deployer::remote::ListOwnedImagesRequest,
+    responses(
+        (status = 200, description = "This install's images on the node, oldest first, with any container using each"),
+        (status = 400, description = "The owner is not a valid image ownership ID, or the project ID is not positive"),
+        (status = 401, description = "Unauthorized — invalid or missing bearer token"),
+        (status = 503, description = "Docker unavailable on this node"),
+        (status = 500, description = "The node's images could not be listed")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_owned_images(
+    State(state): State<Arc<AgentState>>,
+    Json(request): Json<temps_deployer::remote::ListOwnedImagesRequest>,
+) -> impl IntoResponse {
+    if !is_valid_image_owner(&request.owner) {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "The image owner must be 1-128 ASCII letters, digits, '-', '.' or '_'".to_string(),
+        )
+        .into_response();
+    }
+    if request.project_id <= 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "The project ID must be positive, got {}",
+                request.project_id
+            ),
+        )
+        .into_response();
+    }
+    match state
+        .container_deployer
+        .list_owned_images(&request.owner, request.project_id, request.after.as_ref())
+        .await
+    {
+        Ok(listing) => {
+            tracing::debug!(
+                listed = listing.images.len(),
+                unlisted = listing.unlisted,
+                "Listed this install's images on request of the control plane"
+            );
+            AgentResponse::ok(listing).into_response()
+        }
+        Err(error) => {
+            tracing::error!(%error, "Could not list images on request of the control plane");
+            error_response(container_error_status(&error), error.to_string()).into_response()
+        }
+    }
+}
+
 fn image_upload_stream(
     body: Body,
     received_bytes: Arc<AtomicU64>,
@@ -2142,37 +2564,46 @@ pub async fn pull_image(
         }
     };
 
-    // 3. Fast-path: if the image is already present, skip the pull entirely.
-    match docker.inspect_image(&request.image).await {
-        Ok(info) => {
-            let image_id = info.id.unwrap_or_default();
-            let digest = info
-                .repo_digests
-                .as_ref()
-                .and_then(|d| d.first())
-                .and_then(|s| s.rsplit('@').next())
-                .map(String::from);
-            tracing::info!(
-                image = %request.image,
-                image_id = %image_id,
-                "Image already present locally; skipping pull"
-            );
-            return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
-        }
-        Err(bollard::errors::Error::DockerResponseServerError {
-            status_code: 404, ..
-        }) => {
-            // Not present — proceed to pull.
-        }
-        Err(e) => {
-            // An unexpected inspect error is non-fatal: fall through and let
-            // the pull attempt surface a cleaner error if the daemon is really
-            // broken.
-            tracing::warn!(
-                image = %request.image,
-                "Pre-pull image inspect failed ({}); proceeding with pull attempt",
-                e
-            );
+    // 3. Fast-path: if the image is already present, skip the pull entirely,
+    //    unless the control plane asked to replace a cached copy it found to
+    //    be for another architecture.
+    if request.replace_cached {
+        tracing::info!(
+            image = %request.image,
+            "Replacing the cached image; pulling it again"
+        );
+    } else {
+        match docker.inspect_image(&request.image).await {
+            Ok(info) => {
+                let image_id = info.id.unwrap_or_default();
+                let digest = info
+                    .repo_digests
+                    .as_ref()
+                    .and_then(|d| d.first())
+                    .and_then(|s| s.rsplit('@').next())
+                    .map(String::from);
+                tracing::info!(
+                    image = %request.image,
+                    image_id = %image_id,
+                    "Image already present locally; skipping pull"
+                );
+                return AgentResponse::ok(PullImageResponse { image_id, digest }).into_response();
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Not present — proceed to pull.
+            }
+            Err(e) => {
+                // An unexpected inspect error is non-fatal: fall through and let
+                // the pull attempt surface a cleaner error if the daemon is really
+                // broken.
+                tracing::warn!(
+                    image = %request.image,
+                    "Pre-pull image inspect failed ({}); proceeding with pull attempt",
+                    e
+                );
+            }
         }
     }
 
@@ -2280,7 +2711,21 @@ pub async fn pull_image(
         }
     };
 
-    // 6. Inspect to confirm the image landed and obtain its ID and digest.
+    // 6. A replacing pull that failed leaves the cached copy it was meant to
+    //    replace, which the inspect below would report as pulled. Report the
+    //    failure instead, so the control plane can fall back to another way
+    //    of delivering the image.
+    if pull_replacement_failed(request.replace_cached, &stream_errors) {
+        let (status, message) = pull_failure(&request.image, &stream_errors);
+        tracing::error!(
+            image = %request.image,
+            reason = %message,
+            "Replacing pull failed; the cached image was left in place"
+        );
+        return error_response(status, message).into_response();
+    }
+
+    // 7. Inspect to confirm the image landed and obtain its ID and digest.
     match docker.inspect_image(&request.image).await {
         Ok(info) => {
             let image_id = info.id.unwrap_or_default();
@@ -2298,48 +2743,7 @@ pub async fn pull_image(
             AgentResponse::ok(PullImageResponse { image_id, digest }).into_response()
         }
         Err(_) => {
-            // The image is not present after the pull. Classify the failure
-            // from stream errors so the caller can distinguish auth problems
-            // from "no such image" from network issues. Credentials are never
-            // included in these messages — we only surface what the daemon
-            // told us, which is limited to the HTTP status/body from the
-            // registry.
-            let combined = stream_errors.join("; ");
-
-            let (status, message) = if stream_errors.is_empty() {
-                (
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "Failed to pull image '{}': pull stream ended without confirming a downloaded image",
-                        request.image
-                    ),
-                )
-            } else {
-                match classify_pull_error(&combined) {
-                    PullErrorKind::Auth => (
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "Registry authentication failed for '{}': check credentials (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::NotFound => (
-                        StatusCode::NOT_FOUND,
-                        format!(
-                            "Image '{}' was not found in the registry (registry said: {})",
-                            request.image, combined
-                        ),
-                    ),
-                    PullErrorKind::Network => (
-                        StatusCode::BAD_GATEWAY,
-                        format!(
-                            "Network or registry error pulling '{}': {}",
-                            request.image, combined
-                        ),
-                    ),
-                }
-            };
-
+            let (status, message) = pull_failure(&request.image, &stream_errors);
             tracing::error!(
                 image = %request.image,
                 reason = %message,
@@ -2347,6 +2751,46 @@ pub async fn pull_image(
             );
             error_response(status, message).into_response()
         }
+    }
+}
+
+/// Whether a pull asked to replace a cached image failed. Without a pull that
+/// replaced it, the image found afterwards is the cached copy itself.
+fn pull_replacement_failed(replace_cached: bool, stream_errors: &[String]) -> bool {
+    replace_cached && !stream_errors.is_empty()
+}
+
+/// The status and message for a pull that did not deliver its image.
+///
+/// Classified from the daemon's stream errors so the caller can tell auth
+/// problems from "no such image" from network issues. Credentials are never
+/// included: only what the daemon reported, which is limited to the
+/// registry's HTTP status and body.
+fn pull_failure(image: &str, stream_errors: &[String]) -> (StatusCode, String) {
+    if stream_errors.is_empty() {
+        return (
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "Failed to pull image '{image}': pull stream ended without confirming a downloaded image"
+            ),
+        );
+    }
+    let combined = stream_errors.join("; ");
+    match classify_pull_error(&combined) {
+        PullErrorKind::Auth => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "Registry authentication failed for '{image}': check credentials (registry said: {combined})"
+            ),
+        ),
+        PullErrorKind::NotFound => (
+            StatusCode::NOT_FOUND,
+            format!("Image '{image}' was not found in the registry (registry said: {combined})"),
+        ),
+        PullErrorKind::Network => (
+            StatusCode::BAD_GATEWAY,
+            format!("Network or registry error pulling '{image}': {combined}"),
+        ),
     }
 }
 
@@ -2652,6 +3096,7 @@ mod pull_image_tests {
         let req = PullImageRequest {
             image: "ghcr.io/org/app:v1.0".to_string(),
             credentials: None,
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2669,6 +3114,7 @@ mod pull_image_tests {
                 identity_token: None,
                 server_address: Some("private.registry.io".to_string()),
             }),
+            replace_cached: false,
         };
         let json = serde_json::to_string(&req).expect("serialize");
         let parsed: PullImageRequest = serde_json::from_str(&json).expect("deserialize");
@@ -2676,6 +3122,37 @@ mod pull_image_tests {
         assert_eq!(creds.username.as_deref(), Some("alice"));
         // Verify the password field round-trips (serde still sees it).
         assert_eq!(creds.password.as_deref(), Some("hunter2"));
+    }
+
+    /// A failed replacing pull leaves the cached copy in place; it must be
+    /// reported as the failure it is, not as the cached image "pulled".
+    #[test]
+    fn a_replacing_pull_with_errors_is_a_failure_even_though_the_image_remains() {
+        let errors = vec!["no matching manifest for linux/amd64 in the manifest list".to_string()];
+        assert!(pull_replacement_failed(true, &errors));
+        // An ordinary pull only runs when the image was absent, so an image
+        // present afterwards is the one it pulled.
+        assert!(!pull_replacement_failed(false, &errors));
+        assert!(!pull_replacement_failed(true, &[]));
+
+        let (status, message) = pull_failure("ghcr.io/org/app:v1.0", &errors);
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(message.contains("ghcr.io/org/app:v1.0"), "{message}");
+        assert!(message.contains("no matching manifest"), "{message}");
+    }
+
+    /// A control plane that predates `replace_cached` sends no such field:
+    /// the cached image keeps being used, as before.
+    #[test]
+    fn pull_image_request_without_replace_cached_uses_the_cached_image() {
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0"}"#).expect("deserialize");
+        assert!(!parsed.replace_cached);
+
+        let parsed: PullImageRequest =
+            serde_json::from_str(r#"{"image":"ghcr.io/org/app:v1.0","replace_cached":true}"#)
+                .expect("deserialize");
+        assert!(parsed.replace_cached);
     }
 
     #[test]
@@ -2808,6 +3285,9 @@ mod openapi_response_tests {
             "sandboxes~1resize-disk",
             "sandboxes~1egress-policy",
             "sandboxes~1image-identity",
+            "sandboxes~1image-prepare",
+            "sandboxes~1image-prepare-status",
+            "sandboxes~1image-remove",
             "sandboxes~1agent-runtime-check",
             "sandboxes~1recover-agent-harness",
         ] {

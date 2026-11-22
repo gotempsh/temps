@@ -687,6 +687,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let commit = manager
@@ -736,6 +737,7 @@ mod tests {
             ),
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
 
         let error = manager
@@ -789,6 +791,7 @@ mod tests {
                 ),
                 Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
                 create_test_config_service(db),
+                Arc::new(temps_core::NoopAuditLogger),
             );
 
             let error = manager
@@ -880,6 +883,7 @@ mod tests {
             encryption_service,
             Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
             create_test_config_service(db),
+            Arc::new(temps_core::NoopAuditLogger),
         );
         manager.providers_cache.write().await.insert(
             7,

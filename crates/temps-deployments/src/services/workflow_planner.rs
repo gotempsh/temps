@@ -8,9 +8,10 @@
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
 use serde_json;
 use std::sync::Arc;
-use temps_core::{canonical_managed_service_type, EncryptionService, SecretsManagerResolver};
+use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
+use temps_presets::templates::canonical_managed_service_type;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -1223,7 +1224,7 @@ impl WorkflowPlanner {
     /// substituting something that cannot be right.
     async fn resolve_control_plane_private_address(
         &self,
-        settings: &temps_core::AppSettings,
+        settings: &temps_config::AppSettings,
     ) -> Option<String> {
         if let Some(addr) = settings.multi_node.private_address.as_deref() {
             return Some(addr.to_string());
@@ -2278,6 +2279,17 @@ impl WorkflowPlanner {
         // NOT required for deployment completion - if they fail, deployment still succeeds
         if has_git_info || is_uploaded_source {
             jobs.push(JobDefinition {
+                job_id: "deployment_workflows".into(),
+                job_type: "DeploymentWorkflowsJob".into(),
+                name: "Start Deployment Workflows".into(),
+                description: Some(
+                    "Start deploymentWorkflows from .temps.yaml; retries reuse run IDs".into(),
+                ),
+                dependencies: vec!["mark_deployment_complete".into()],
+                job_config: Some(serde_json::json!({"download_job_id":source_job_id})),
+                required_for_completion: false,
+            });
+            jobs.push(JobDefinition {
                 job_id: "configure_crons".to_string(),
                 job_type: "ConfigureCronsJob".to_string(),
                 name: "Configure Cron Jobs".to_string(),
@@ -3031,8 +3043,8 @@ mod tests {
 
     use temps_config::{ConfigService, ServerConfig};
     use temps_core::EncryptionService;
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+    use temps_test_utils::TestDatabase;
 
     // ── Cross-node linking of external services ────────────────────────
     //
@@ -3366,9 +3378,7 @@ mod tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Docker unavailable; skipping startup snapshot test: {error}");
                 return Ok(());
@@ -4067,6 +4077,13 @@ mod tests {
             assert_eq!(alerts.job_type, "ConfigureMetricAlertsJob");
             assert_reads_temps_yaml_from(alerts, "prepare_source_bundle");
 
+            let workflows = planned_job(&jobs, "deployment_workflows")
+                .expect("deployment workflows must be planned");
+            assert_reads_temps_yaml_from(workflows, "prepare_source_bundle");
+            assert_eq!(
+                workflows.job_config.as_ref().unwrap()["_required_for_completion"],
+                false
+            );
             // Agent definitions are synced from a git repository only.
             assert!(planned_job(&jobs, "configure_agents").is_none());
         }
@@ -4103,7 +4120,11 @@ mod tests {
             .await?;
 
         assert!(planned_job(&jobs, "prepare_source_bundle").is_none());
-        for id in ["configure_crons", "configure_metric_alerts"] {
+        for id in [
+            "configure_crons",
+            "configure_metric_alerts",
+            "deployment_workflows",
+        ] {
             let job = planned_job(&jobs, id).unwrap_or_else(|| panic!("{id} must be planned"));
             assert_reads_temps_yaml_from(job, "download_repo");
         }

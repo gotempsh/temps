@@ -21,6 +21,9 @@ Temps includes feature flags scoped to a project and overridable per environment
     - Typed values: boolean, string, number, JSON
     - A default value per flag, overridable per environment
     - A one-action kill switch per environment
+    - Targeting rules: serve a value by user attribute, country, browser…
+    - Percentage rollouts and multi-variant splits, sticky per user
+    - Browser reads from your own origin, and OpenFeature (OFREP) for any language
     - Synchronous, in-memory reads in your app — no network call per check
     - Zero-config SDK: credentials are already injected into your deployment
     - Full audit trail of who changed what, and what it was before
@@ -117,11 +120,13 @@ const { value, reason } = flags.getDetails('checkout.v2', {}, false)
 
 | `reason.kind` | Meaning |
 | --- | --- |
+| `RULE_MATCH` | Targeting rule `reason.index` (0-based) matched |
+| `PERCENTAGE_ROLLOUT` | Rule `reason.index` matched and the user's bucket put them in its rollout or split |
 | `ENVIRONMENT_VALUE` | A value is set for this environment |
 | `DEFAULT` | Nothing set here; the flag default was served |
 | `DISABLED` | The kill switch is on; the default was served |
 | `FLAG_NOT_FOUND` | No such flag (or it is archived); your fallback was served |
-| `ERROR` | The stored value didn't match the flag's type; the default was served |
+| `ERROR` | A stored value or rule could not be used; the default was served |
 
 ---
 
@@ -157,8 +162,154 @@ Resolution order, exactly as your app sees it:
 
 1. Flag missing or archived → your fallback
 2. Kill switch on → the flag default
-3. A value set for this environment → that value
-4. Otherwise → the flag default
+3. The first [targeting rule](#targeting-rules) that matches → what it serves
+4. A value set for this environment → that value
+5. Otherwise → the flag default
+
+---
+
+## Targeting rules
+
+A rule serves a different value to the users who match it. Rules are set per environment and checked top to bottom; **the first one that matches decides**. A user who matches no rule gets the environment value.
+
+In the dashboard open the flag, then **Add rules** under an environment. Each rule has:
+
+- **Conditions**, all of which must hold: an attribute, an operator and a value, e.g. `plan` *is one of* `pro, team`. A rule with no conditions applies to everyone.
+- **Rollout** (optional): only this percentage of the matching users get the rule; the others fall through to the next rule.
+- **Serve**: a value, a [variant](#variants), or a split across variants.
+
+| Operator | Matches when the attribute… |
+| --- | --- |
+| `eq`, `neq` | equals / does not equal the value. `5` and `"5"` are equal; `true` and `"true"` are not |
+| `in`, `not_in` | is / is not one of a list (at most 100 values) |
+| `contains`, `not_contains` | contains / does not contain a substring |
+| `matches` | matches a regular expression over the whole value |
+| `gt`, `gte`, `lt`, `lte` | compares as a number |
+| `exists`, `not_exists` | is set / is not set |
+
+An attribute the caller did not send matches nothing except `not_exists`, so a rule never targets a user by accident because information was missing.
+
+Your server passes attributes with each read:
+
+```js
+const tier = flags.get(
+  'search.ranking',
+  { key: user.id, attributes: { plan: user.plan, country: user.country } },
+  'classic'
+)
+```
+
+From the CLI, rules are JSON, which makes them easy to review and copy between environments:
+
+```bash
+temps flags rules list checkout.v2 -e production --json > rules.json
+temps flags rules set checkout.v2 @rules.json -e preview
+temps flags evaluate checkout.v2 -e production --subject user_1001 --attr plan=pro
+```
+
+```json
+[
+  {
+    "description": "Internal users",
+    "conditions": [{ "attribute": "email", "operator": "matches", "value": ".*@example\\.com" }],
+    "serve": { "kind": "value", "value": true }
+  },
+  {
+    "description": "10% of pro accounts",
+    "conditions": [{ "attribute": "plan", "operator": "eq", "value": "pro" }],
+    "rollout_percentage": 10,
+    "serve": { "kind": "value", "value": true }
+  }
+]
+```
+
+Saving rules replaces the whole list. The console and CLI send the revision they read, and Temps refuses the save with **409** if someone else changed the rules in between, rather than silently overwriting their change.
+
+Use **Test this flag** in the flag's panel (or `temps flags evaluate`) to see what a given user would get, and why, before you ship a rule.
+
+### Percentage rollouts are sticky
+
+A user's bucket is a hash of the flag key, the flag's salt and the **subject key**: the `key` you pass (usually a user id) or, in a browser, the Temps visitor cookie. The same user always lands on the same side, on every server, in every SDK. Raising a rollout from 10% to 20% keeps the first 10% in.
+
+A partial rollout or split **needs a subject**. Without one the rule is skipped, so an anonymous request is never assigned at random.
+
+**Reshuffle** (in the flag's panel, or `temps flags reshuffle`) draws new buckets for every rollout and split of the flag. Never reshuffle a flag that a running experiment depends on.
+
+---
+
+## Variants
+
+Variants are named values declared on the flag, e.g. `control` and `test`. A rule can serve one, or **split** matching users across several by weight:
+
+```json
+{
+  "conditions": [],
+  "serve": {
+    "kind": "split",
+    "split": [
+      { "variant": "control", "weight": 50 },
+      { "variant": "test", "weight": 50 }
+    ]
+  }
+}
+```
+
+Weights are whole numbers adding up to 100. The served variant is reported with the value (`variant` in the evaluation), so analytics and experiments can tell the arms apart. A variant cannot be removed while a rule still serves it.
+
+```bash
+temps flags update checkout.v2 --variants '[{"key":"control","value":false},{"key":"test","value":true}]'
+```
+
+---
+
+## Reading flags in the browser
+
+A flag marked **Expose to browsers** can be read by your front end from your own site. Temps evaluates it on the server, for the visitor making the request, and sends only the result: the browser never sees rules, salts or server-only flags.
+
+With React:
+
+```tsx
+import { TempsAnalyticsProvider, useFlag, useFlagVariant } from '@temps-sdk/react-analytics'
+
+function Checkout() {
+  // `false` until flags arrive, then the served value.
+  const useV2 = useFlag('checkout.v2', false)
+  const arm = useFlagVariant('pricing.page') // 'control' | 'test' | null
+  return useV2 ? <CheckoutV2 /> : <CheckoutV1 />
+}
+```
+
+Without React, `analytics.flags.get('checkout.v2', false)` from `@temps-sdk/analytics-core` does the same.
+
+- **Nothing is fetched until you read a flag**, so pages that never use flags pay nothing.
+- Requests go to `POST /api/_temps/flags` on **your own domain**, the same path as Temps analytics: no CORS, no key, no ad-blocker list.
+- To target a signed-in user rather than the anonymous visitor, pass `flags={{ key: user.id, attributes: { plan: user.plan } }}` to the provider, or call `flags.reload({ key: user.id })` after sign-in. When the subject or attributes change, values fetched for the previous ones are dropped at once, so after a sign-out nothing targeted at the previous user is served while the new request runs, or if it fails. A refresh with the same context keeps the last values until the new ones arrive.
+- To avoid a flash of the wrong variant, render flags on the server and pass them as `flags={{ bootstrap: { 'checkout.v2': true } }}`.
+
+Temps fills in these attributes from the request, so rules can use them without your app sending anything: `environment`, `host`, `country` (when GeoIP is configured), `browser`, `os`, `device_type`, `visitor_id`, `session_id`. Attributes your app sends override them.
+
+The endpoint is rate limited per site (30,000 requests a minute) and per client address (600 a minute). Over the limit it answers **429** and the SDK keeps serving the last values it had.
+
+---
+
+## Exposure events
+
+For an experiment you need to know who actually **saw** each variant, not just who was assigned one. Set **Record exposures** on the flag (or `temps flags update <key> --exposure-rate 10`) to the share of visitors to record.
+
+The first time a recorded visitor's page reads the flag, the browser sends one `flag_exposure` analytics event with `flag_key`, `variant` and `reason`. It shows up in Events and can be used in funnels like any other event. It is **off by default**, and sampled per visitor (the same visitors are always recorded), so a busy flag does not flood your analytics.
+
+---
+
+## OpenFeature (OFREP)
+
+Temps speaks the [OpenFeature Remote Evaluation Protocol](https://openfeature.dev/specification/appendix-c), so any OpenFeature SDK with an OFREP provider (Go, Java, Python, .NET, JavaScript…) can read Temps flags:
+
+| Endpoint | Used by | Authentication |
+| --- | --- | --- |
+| `/api/_temps/ofrep/v1/evaluate/flags[/{key}]` on your site's domain | Browser and mobile OpenFeature SDKs | None: same scope and limits as the browser endpoint, browser-visible flags only |
+| `/api/ofrep/v1/evaluate/flags[/{key}]` on the Temps API | Server SDKs | The deployment's `TEMPS_API_TOKEN`; every flag of its environment |
+
+The OpenFeature `targetingKey` is the subject key, and every other context field is an attribute. Bulk evaluation returns an `ETag`, so polling providers get `304 Not Modified` while nothing changed.
 
 ---
 
@@ -219,7 +370,7 @@ bunx @temps-sdk/cli flags restore checkout.v2
 ## Security
 
 - **Flags are not secrets.** Values are stored unencrypted. Use secret environment variables for credentials.
-- **Flags are server-only by default.** `client_visible` is off unless you turn it on.
+- **Flags are server-only by default.** `client_visible` is off unless you turn it on. Browsers only ever receive the evaluated value of browser-visible flags, never rules, other users' targeting, or server-only flags.
 - **Deployment tokens are read-only.** The `TEMPS_API_TOKEN` baked into your container can read the flag snapshot but can never change a flag — a compromised app cannot flip production.
 - **Changes are audited.** Every mutation records who, when, and the old and new value. A flag change is a production change with no deployment behind it, so the audit log is the only record.
 
@@ -231,8 +382,13 @@ bunx @temps-sdk/cli flags restore checkout.v2
 temps flags list [--environment <name>] [--include-archived] [--page <n>] [--json]
 temps flags get <key>
 temps flags create <key> --type <bool|string|number|json> --default <value>
-temps flags update <key> [--default <value>] [--description <text>]
+temps flags update <key> [--default <value>] [--description <text>] [--variants <json|@file>] [--exposure-rate <percent>]
 temps flags set <key> <value> --environment <name>
+temps flags rules list <key> --environment <name> [--json]
+temps flags rules set <key> <json|@file|-> --environment <name>
+temps flags rules clear <key> --environment <name>
+temps flags evaluate <key> --environment <name> [--subject <key>] [--attr name=value ...]
+temps flags reshuffle <key> [--yes]
 temps flags clear <key> --environment <name>
 temps flags disable <key> --environment <name>
 temps flags enable <key> --environment <name>
@@ -243,10 +399,10 @@ temps flags archive <key>
 
 ## Limitations
 
-Phase 1 covers per-environment values and kill switches. Not yet available:
+Not yet available:
 
-- Targeting rules (serve a value based on user attributes)
-- Percentage rollouts
-- Reading flags directly from a browser
+- Reusable segments and cohorts in rules (each rule lists its own conditions)
+- Exposure events from server-side SDKs (only browsers record them today)
 - Flag-change correlation with analytics and error tracking
 - Per-environment usage (today "last evaluated" is per flag, across all environments)
+- Instant propagation across separate console and proxy processes: a change is live at once on a single-binary install, and in a split topology within 5 seconds plus the time one cache refresh takes

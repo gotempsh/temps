@@ -12,172 +12,15 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::audit::{AuditContext, AuditOperation};
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_entities::project_agents;
 
 use crate::error::AgentError;
 use crate::handlers::AppState;
 use crate::services::config_service::UpsertAgentRequest;
-
-impl From<AgentError> for Problem {
-    fn from(error: AgentError) -> Self {
-        match error {
-            AgentError::ConfigNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Autopilot Config Not Found")
-                .with_detail(error.to_string()),
-            AgentError::AgentNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Agent Not Found")
-                .with_detail(error.to_string()),
-            AgentError::RunNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Autopilot Run Not Found")
-                .with_detail(error.to_string()),
-            AgentError::ProjectNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Project Not Found")
-                .with_detail(error.to_string()),
-            AgentError::BudgetExceeded { .. } => problemdetails::new(StatusCode::PAYMENT_REQUIRED)
-                .with_title("Daily Budget Exceeded")
-                .with_detail(error.to_string()),
-            AgentError::CooldownActive { .. } => problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
-                .with_title("Cooldown Active")
-                .with_detail(error.to_string()),
-            AgentError::AiCliNotInstalled { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_title("AI CLI Not Installed")
-                    .with_detail(error.to_string())
-            }
-            AgentError::AiCliFailed { .. } | AgentError::AiCliReportedError { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("AI CLI Failed")
-                    .with_detail(error.to_string())
-            }
-            AgentError::AiCliTimeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                .with_title("AI CLI Timeout")
-                .with_detail(error.to_string()),
-            AgentError::GitError { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Git Error")
-                .with_detail(error.to_string()),
-            AgentError::EncryptionError { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Encryption Error")
-                    .with_detail(error.to_string())
-            }
-            AgentError::Validation { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Validation Error")
-                .with_detail(error.to_string()),
-            // 400 like every other rejected request-body field, and like the
-            // sibling error-group checks in the trigger and workflow
-            // handlers. Its message never says whether the group exists in
-            // another project.
-            AgentError::InvalidErrorGroup { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid Error Group")
-                .with_detail(error.to_string()),
-            AgentError::ImmutableSandboxImageRebuild { .. } => {
-                problemdetails::new(StatusCode::BAD_REQUEST)
-                    .with_title("Immutable Sandbox Image")
-                    .with_detail(error.to_string())
-            }
-            AgentError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail(error.to_string()),
-            AgentError::Io(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail(error.to_string()),
-            AgentError::SandboxCreationFailed { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Sandbox Creation Failed")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxNotFound { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Sandbox Not Found")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxNotRunning { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_title("Sandbox Not Running")
-                .with_detail(error.to_string()),
-            AgentError::SandboxExecFailed { .. } => {
-                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Sandbox Exec Failed")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxTerminalTimeout { .. } => {
-                problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
-                    .with_title("Terminal Attach Timed Out")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SnapshotSizeLimitExceeded { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_title("Snapshot Storage Limit Exceeded")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxProviderUnavailable { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Sandbox Provider Unavailable")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxNodeUnavailable { .. } => {
-                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
-                    .with_title("Sandbox Node Unavailable")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SandboxUnsupportedOnNode { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_type("https://temps.sh/probs/sandbox-unsupported-on-worker-node")
-                    .with_title("Not Available For Sandboxes On Worker Nodes")
-                    .with_detail(error.to_string())
-            }
-            // ADR 063: a control plane that runs no workloads. Not the
-            // worker-node-required problem: adding a worker does not make an
-            // agent run or an application workspace possible here yet.
-            AgentError::NoLocalSandboxHost { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_type(crate::error::NO_LOCAL_SANDBOX_HOST_TYPE)
-                .with_title(crate::error::NO_LOCAL_SANDBOX_HOST_TITLE)
-                .with_detail(error.to_string())
-                .with_value("error_code", crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE),
-            AgentError::SandboxConflictOnNode { .. } => problemdetails::new(StatusCode::CONFLICT)
-                .with_type("https://temps.sh/probs/sandbox-node-conflict")
-                .with_title("Sandbox Conflict On Worker Node")
-                .with_detail(error.to_string()),
-            AgentError::SandboxEgressPolicyUnsupported { .. } => {
-                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
-                    .with_title("Egress Policy Not Supported By This Backend")
-                    .with_detail(error.to_string())
-            }
-            AgentError::SecretNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Secret Not Found")
-                .with_detail(error.to_string()),
-            AgentError::SkillDefinitionNotFound { .. } => {
-                problemdetails::new(StatusCode::NOT_FOUND)
-                    .with_title("Skill Definition Not Found")
-                    .with_detail(error.to_string())
-            }
-            AgentError::McpDefinitionNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("MCP Definition Not Found")
-                .with_detail(error.to_string()),
-            AgentError::McpConfigFieldNotFound { .. } => problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("MCP Config Field Not Found")
-                .with_detail(error.to_string()),
-            AgentError::SkillDefinitionAlreadyExists { .. } => {
-                problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("Skill Already Exists")
-                    .with_detail(error.to_string())
-            }
-            AgentError::McpDefinitionAlreadyExists { .. } => {
-                problemdetails::new(StatusCode::CONFLICT)
-                    .with_title("MCP Server Already Exists")
-                    .with_detail(error.to_string())
-            }
-            AgentError::DockerSocketWriteRequiresAdmin { .. } => {
-                problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Host Docker Access Write Requires An Admin")
-                    .with_detail(error.to_string())
-            }
-        }
-    }
-}
 
 // ── Audit structs ─────────────────────────────────────────────────────────────
 
@@ -217,9 +60,8 @@ impl AuditOperation for AgentCreatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -236,9 +78,8 @@ impl AuditOperation for AgentUpdatedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -255,9 +96,8 @@ impl AuditOperation for AgentDeletedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> temps_core::anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| temps_core::anyhow::anyhow!("Failed to serialize audit: {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -307,8 +147,13 @@ pub struct AgentConfigResponse {
     /// Only set when `on: { webhook: true }` is configured.
     /// Usage: `POST {webhook_url}` with header `X-Webhook-Token: {webhook_token}`
     pub webhook_url: Option<String>,
-    /// Secret token for the `X-Webhook-Token` header. Shown once when created,
-    /// masked with `***` prefix in subsequent reads.
+    /// Secret token for the `X-Webhook-Token` header.
+    ///
+    /// Returned in full exactly once, by the request that mints it (creating
+    /// an agent with the webhook trigger on, or turning that trigger on).
+    /// Every later read is `***`: the row holds only a digest, so the token
+    /// cannot be shown again. Turn the webhook trigger off and on to mint a
+    /// replacement.
     pub webhook_token: Option<String>,
     pub created_at: String,
     pub updated_at: String,
@@ -350,17 +195,25 @@ impl From<project_agents::Model> for AgentConfigResponse {
                 .webhook_id
                 .as_ref()
                 .map(|id| format!("/api/agents/webhook/{}", id)),
-            webhook_token: model.webhook_token.as_ref().map(|t| {
-                // Mask the token: show first 8 chars + ***
-                if t.len() > 8 {
-                    format!("{}***", &t[..8])
-                } else {
-                    "***".to_string()
-                }
-            }),
+            // What the row holds is a digest, not the token, so there is
+            // nothing to reveal a prefix of. `***` says "set, not shown".
+            webhook_token: model.webhook_token.as_ref().map(|_| "***".to_string()),
             created_at: model.created_at.to_rfc3339(),
             updated_at: model.updated_at.to_rfc3339(),
         }
+    }
+}
+
+impl AgentConfigResponse {
+    /// Carry the webhook token this request minted, in full, this once.
+    ///
+    /// `Cache-Control: no-store` goes on the response that uses this; see
+    /// the handlers.
+    fn with_minted_webhook_token(mut self, minted: Option<String>) -> Self {
+        if let Some(token) = minted {
+            self.webhook_token = Some(token);
+        }
+        self
     }
 }
 
@@ -553,11 +406,12 @@ pub async fn create_agent(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
-    let agent = app_state
+    let minted = app_state
         .config_service
         .create_agent(project_id, request)
         .await
         .map_err(Problem::from)?;
+    let agent = minted.agent;
 
     let audit = AgentCreatedAudit {
         context: AuditContext {
@@ -578,7 +432,15 @@ pub async fn create_agent(
         );
     }
 
-    Ok((StatusCode::CREATED, Json(AgentConfigResponse::from(agent))))
+    // The webhook token is in this body in full and nowhere else, so keep
+    // it out of every cache between here and the caller.
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
 }
 
 #[utoipa::path(
@@ -651,11 +513,12 @@ pub async fn update_agent(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
 
-    let agent = app_state
+    let minted = app_state
         .config_service
         .update_agent(project_id, &slug, request)
         .await
         .map_err(Problem::from)?;
+    let agent = minted.agent;
 
     let audit = AgentUpdatedAudit {
         context: AuditContext {
@@ -676,7 +539,14 @@ pub async fn update_agent(
         );
     }
 
-    Ok(Json(AgentConfigResponse::from(agent)))
+    // Turning the webhook trigger on mints a token; same contract as
+    // creation -- in full once, never cached.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
 }
 
 #[utoipa::path(
@@ -736,36 +606,6 @@ pub async fn delete_agent(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn immutable_image_rebuild_error_is_a_client_error() {
-        let problem = Problem::from(AgentError::ImmutableSandboxImageRebuild {
-            image: "registry.example.test/sandbox@sha256:abc".into(),
-        });
-        let response = axum::response::IntoResponse::into_response(problem);
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[test]
-    fn no_local_sandbox_host_is_a_typed_conflict_naming_the_workaround() {
-        let problem = Problem::from(AgentError::NoLocalSandboxHost {
-            operation: "An AI agent run".into(),
-        });
-        assert_eq!(problem.status_code, StatusCode::CONFLICT);
-        let body = serde_json::to_value(&problem.body).unwrap();
-        assert_eq!(body["type"], crate::error::NO_LOCAL_SANDBOX_HOST_TYPE);
-        assert_eq!(
-            body["error_code"],
-            crate::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
-        );
-        let detail = body["detail"].as_str().unwrap();
-        assert!(
-            detail.starts_with("An AI agent run needs a sandbox"),
-            "{detail}"
-        );
-        assert!(detail.contains("worker nodes"), "{detail}");
-        assert!(detail.contains("/settings/nodes"), "{detail}");
-    }
 
     #[test]
     fn legacy_inline_mcp_response_masks_url_env_and_headers() {

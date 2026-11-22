@@ -7,11 +7,14 @@
 //! to the source map storage for error symbolication. This runs as a post-deployment
 //! job so it does not block the deployment pipeline.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_deployer::ImageBuilder;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_error_tracking::services::{SourceMapService, MAX_SOURCE_MAP_BYTES};

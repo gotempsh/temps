@@ -493,13 +493,15 @@ jobs:
         if: ${{ !cancelled() && steps.auth.outcome == 'success' }}
         env:
           API_KEY: ${{ steps.auth.outputs.api_key }}
+          # A fork PR's branch exists only in the fork, so deploy from there.
+          SOURCE_REPOSITORY: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
 
-          REPO_URL="https://github.com/${{ github.repository }}.git"
-          REPO_OWNER="${{ github.repository_owner }}"
-          REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
+          REPO_URL="https://github.com/$SOURCE_REPOSITORY.git"
+          REPO_OWNER="${SOURCE_REPOSITORY%%/*}"
+          REPO_NAME="${SOURCE_REPOSITORY#*/}"
           BRANCH="$SOURCE_BRANCH"
 
           # Define example apps: name|directory|preset

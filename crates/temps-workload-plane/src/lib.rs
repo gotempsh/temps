@@ -55,8 +55,8 @@ pub use env::{EnvSource, NoEnvSource};
 pub use error::{AdmissionError, PlaneError};
 pub use node::{Placed, Placement as AttemptPlacement, StreamNodeDriver, STREAM_DRIVER};
 pub use plane::{
-    ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, PlaneSlot, ReconcilerHandle,
-    RetireOnDrop, VolumeApplied, WorkloadPlane, WorkloadView,
+    isolation_of_instances, ApplyRequest, Finalizer, NodeDriver, Owner, PlaneConfig, PlaneSlot,
+    ReconcilerHandle, RetireOnDrop, VolumeApplied, WorkloadPlane, WorkloadView,
 };
 pub use scale::{driver_fits, Awake, STALE_WAKE_SECS};
 pub use scheduler::{

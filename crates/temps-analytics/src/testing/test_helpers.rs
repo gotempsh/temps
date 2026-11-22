@@ -21,7 +21,7 @@ pub struct AnalyticsTestHelper {
     pub service: AnalyticsService,
     pub db: Arc<DatabaseConnection>,
     #[allow(dead_code)] // held so the test database lives as long as the helper
-    test_database: temps_database::test_utils::TestDatabase,
+    test_database: temps_test_utils::TestDatabase,
 }
 
 #[cfg(test)]
@@ -34,7 +34,7 @@ impl AnalyticsTestHelper {
 
     /// Create a new test helper with specified test name
     pub async fn new_with_name(_test_name: &str) -> anyhow::Result<Self> {
-        let test_database = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let test_database = temps_test_utils::TestDatabase::with_migrations().await?;
         let db = test_database.db.clone();
         let cookie_crypto =
             Arc::new(temps_core::CookieCrypto::new("test_key_32_bytes_long_for_tests").unwrap());

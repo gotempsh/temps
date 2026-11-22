@@ -21,6 +21,71 @@ use super::{ai_read_allowlist, ai_read_safe_posts, ai_write_allowlist};
 /// Operations withheld from the assistant, grouped by the reason they are.
 pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
+        "vault configuration is managed by instance administrators; general sessions have a separate human confirmation path",
+        &[
+            "create_access_bundle", "create_access_vault_general",
+            "update_access_bundle_general", "update_access_vault_general",
+            "delete_access_vault_general", "delete_access_bundle_general", "delete_access_service_general",
+            "create_access_service_general", "update_access_service_general",
+            "create_access_session", "create_access_vault", "get_access_session", "get_access_vault",
+            "list_access_bundles", "list_access_sessions", "list_access_vaults", "revoke_access_session", "update_access_bundle", "update_access_vault",
+        ],
+    ),
+    (
+        "live sandbox service grants require direct operator consent; assistants cannot approve their own access",
+        &["approve_service_grant"],
+    ),
+    (
+        "pre-integration service access is console/API-only; credentials and fresh grant consent are managed directly until runtime enforcement is available",
+        &[
+            "access_capability",
+            "create_access_service",
+            "list_service_grants",
+            "request_service_grant",
+            "revoke_service_grant",
+            "update_access_service",
+        ],
+    ),
+    (
+        "installing a native executable requires the operator to select the file and explicitly trust its digest",
+        &["install_local_file"],
+    ),
+    (
+        "plugin AI consent is inspected in the operator console; assistant discovery already lists declared tools and disabled access",
+        &["get_plugin_ai_tools"],
+    ),
+    (
+        "granting plugin AI access is an operator decision behind step-up; the assistant must not enable its own tools",
+        &["put_plugin_ai_tools"],
+    ),
+    (
+        "durable workflow configuration, credentials, grants and development sessions remain operator-console operations",
+        &[
+            "update_workflow_settings",
+            "issue_workflow_credential",
+            "revoke_workflow_credential",
+            "shred_workflow_project_key",
+            "open_workflow_dev","configure_workflow_dev","close_workflow_dev","poll_workflow_dev","respond_workflow_dev",
+            "create_workflow_grant",
+            "revoke_workflow_grant",
+            "app_start_granted_workflow",
+            "app_send_granted_event",
+        ],
+    ),
+    (
+        "the workflow executor and app protocol (ADR-106): called by the SDK inside a deployment with an invocation token or the environment's workflow credential, never by a user or the assistant",
+        &[
+            "get_invocation_key",
+            "get_run_journal",
+            "record_run_step",
+            "heartbeat_run",
+            "report_run_outcome",
+            "app_start_workflow_run",
+            "app_get_workflow_run",
+            "app_send_workflow_event",
+        ],
+    ),
+    (
         "revokes every visitor's gate session for an address; a security action the user takes themselves, behind step-up",
         &["sign_everyone_out_of_address"],
     ),
@@ -41,6 +106,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "decide_reachability_conflict",
             "resume_reachability_run",
             "undo_reachability_run",
+            // Recreates a managed database's container to apply new
+            // healthcheck timings; it restarts briefly, and the console
+            // confirms first.
+            "apply_service_healthcheck",
             "blob_disable",
             "cancel_data_import",
             "cancel_pg_upgrade",
@@ -72,6 +141,11 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "kv_disable",
             "plan_restore",
             "promote_cluster_member",
+            // Drops the asset versions the proxy keeps for pages still open
+            // on an older deployment, which then fail to load their scripts;
+            // the console asks before purging.
+            "purge_asset_cache",
+            "purge_environment_asset_cache",
             "purge_project_logs",
             "put_environment_ip_access",
             "put_project_ip_access",
@@ -98,6 +172,43 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "status page subscriber addresses are personal data; the page owner lists, exports and deletes them in the console",
+        &[
+            "delete_status_page_subscriber",
+            "export_status_page_subscribers",
+            "list_status_page_subscribers",
+        ],
+    ),
+    (
+        "switches mail to the public on or off for a status page and chooses its sender; a human decides",
+        &["update_status_page_subscriptions"],
+    ),
+    (
+        "a maintenance window silences its monitors' outage alerts and is announced to the page's subscribers, feed and webhooks; a human decides",
+        &[
+            "cancel_status_page_maintenance",
+            "create_status_page_maintenance",
+            "update_status_page_maintenance",
+        ],
+    ),
+    (
+        "status page webhooks post page events to an external URL that can carry the receiver's credential, and creating one returns its signing secret; managed in the console or CLI",
+        &[
+            "create_status_page_webhook",
+            "delete_status_page_webhook",
+            "list_status_page_webhooks",
+            "update_status_page_webhook",
+        ],
+    ),
+    (
+        "takes a credential: the status page password",
+        &["set_status_page_password"],
+    ),
+    (
+        "a monitor of a target outside Temps takes request headers and a body that can carry the target's credentials; created and edited in the console or CLI",
+        &["create_target_monitor", "update_target_monitor"],
+    ),
+    (
         "removes monitoring silently, so a human must do it (same rule as delete_alert)",
         &[
             "ExternalServiceMetricsDeleteAlertRule",
@@ -109,6 +220,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
     (
         "cluster topology and node enrollment; operator only",
         &[
+            // Moves every node's overlay to a new VXLAN network ID, pausing
+            // cross-node traffic until each has rebuilt; behind step-up.
+            "ClusterNetworkIdChange",
             "ClusterNetworkUpdate",
             "NodePairingCancel",
             "NodePairingCreate",
@@ -190,6 +304,9 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "createProjectSecret",
             "create_api_key",
             "create_deployment_token",
+            // Log ingest keys (ADR 108 D1): creation returns the key in
+            // plaintext once; revoking one cuts off a collector.
+            "create_log_ingest_key",
             "create_oidc_provider",
             "create_oidc_role_mapping",
             // Returns a Shield bypass token in plaintext.
@@ -205,6 +322,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "delete_user",
             "disable_mfa",
             "get_admin_gate",
+            "list_log_ingest_keys",
             "list_users",
             "login",
             "logout",
@@ -216,6 +334,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "reset_user_mfa",
             "reset_user_password",
             "restore_user",
+            "revoke_log_ingest_key",
             "revoke_shield_token",
             "rotate_api_key",
             "rotate_deployment_token",
@@ -264,6 +383,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "fail_ci_build",
             "finalize_project_release",
             "get_ci_build_context",
+            "evaluate_public_flags",
             "get_public_status_page_json",
             "ingest_logs",
             "ingest_logs_by_path",
@@ -275,11 +395,29 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "ingest_traces",
             "ingest_traces_by_path",
             "init_session_replay",
+            "ofrep_public_bulk",
+            "ofrep_public_single",
+            "ofrep_server_bulk",
+            "ofrep_server_single",
+            "public_surveys",
             "list_analytics_ingest_keys",
+            "record_browser_identify",
             "record_event_metrics",
             "record_speed_metrics",
+            "reset_browser_identity",
             "revoke_analytics_ingest_key",
             "rotate_analytics_ingest_key",
+            // Status page subscription links and form (ADR 108 D2): used
+            // by visitors and their mail clients.
+            "status_page_confirm",
+            "status_page_confirm_form",
+            "status_page_subscribe",
+            "status_page_unsubscribe",
+            "status_page_unsubscribe_form",
+            // The Atom feed and the password form (ADR 108 D2): used by
+            // feed readers and visitors; unlocking takes the page password.
+            "get_public_status_page_feed",
+            "unlock_public_status_page",
             "track_click",
             "track_open",
             "update_analytics_ingest_key",
@@ -287,6 +425,14 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "upload_artifact_chunk",
             "upload_release_file",
         ],
+    ),
+    (
+        "free text typed by the project's visitors (open-text survey answers); read in the console, not passed through the chat",
+        &["list_survey_responses"],
+    ),
+    (
+        "reassigns every user's rollout and split bucket for a flag, which silently invalidates a running experiment; an operator decision made in the console or CLI",
+        &["reshuffle_flag"],
     ),
     (
         "changes who can access the platform; a prompt injection could escalate privilege",
@@ -332,6 +478,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_data_import",
             "get_data_import_availability",
             "get_event_entries",
+            // Raw property values of visitors' events, e.g. the URLs they clicked.
+            "get_event_properties",
             "get_ingest_errors",
             "get_log_context",
             "get_preview_gateway_logs",
@@ -386,6 +534,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "upload_static_bundle",
             "upload_user_conversation_attachment",
         ],
+    ),
+    (
+        "the temps_watch tool binds watch access to the current chat; the assistant cannot select a different conversation through the API",
+        &["list_chat_plugin_watches", "change_chat_plugin_watch"],
     ),
     (
         "the assistant's own chat machinery; it must not drive or approve itself",
@@ -486,27 +638,24 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "untyped config: a credential inside it is invisible to the secret-slot layer and would be typed into the chat; the assistant uses the typed create_*_provider / update_*_provider operations, whose credentials are SecretString",
+        &["create_notification_provider", "update_notification_provider"],
+    ),
+    (
+        "replaces a Git connection's token by id without binding the connection to the caller, unlike the repository operations; it stays in the console until the service scopes it",
+        &["update_connection_token"],
+    ),
+    (
         "payload carries a credential; it must be entered in the console until sealed secret input exists",
         &[
             "blob_enable",
-            "check_access_provider",
             "createHttpCheck",
-            "create_access_provider",
             "create_agent",
-            "create_bitbucket_provider",
-            "create_delivery_profile",
-            "create_dns_provider",
-            "create_email_provider",
-            "create_generic_provider",
             "create_git_provider",
-            "create_gitea_pat_provider",
-            "create_github_pat_provider",
-            "create_gitlab_pat_provider",
             "create_global_mcp",
             "create_mcp",
             "create_plan",
             "create_provider_key",
-            "create_webhook",
             "discover_workloads",
             "execute_import",
             "import_external_service",
@@ -519,17 +668,12 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "test_provider_key_inline",
             "updateHttpCheck",
             "update_agent",
-            "update_connection_token",
-            "update_email_provider",
-            "update_git_provider_credentials",
             "update_global_mcp",
             "update_mcp",
             "update_project_deployment_config",
-            "update_provider",
             "update_provider_key",
             "update_service",
             "update_settings",
-            "update_webhook",
         ],
     ),
     (
@@ -576,6 +720,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "pulling the multi-gigabyte sandbox image onto hosts, and whether each host keeps it pulled, are administrator decisions about disk and bandwidth made in the console",
+        &["prepare_sandbox_images", "update_host_image_preparation"],
+    ),
+    (
         "the node platform's own platform lifecycle and trust root; operator only",
         &[
             "check_for_update",
@@ -589,6 +737,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "rotate_cluster_ca",
             "start_update",
         ],
+    ),
+    (
+        "per-placement host capacity and effective limits are read by the sandbox creation and settings forms",
+        &["get_sandbox_resource_defaults"],
     ),
     (
         "served by the dedicated sandbox tools",
@@ -651,7 +803,6 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "get_or_create_dsn",
             "get_provider_key",
             "get_resolved_environment_variable_value",
-            "get_s3_credentials",
             "get_service_environment_variable",
             "get_settings",
             "issue_runtime_credentials",
@@ -682,6 +833,10 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
+        "starts a browser flow: the state it issues is a credential for the setup flow, so it must not pass through the assistant",
+        &["start_github_manifest_flow"],
+    ),
+    (
         "static bundles and image archives need an upload the assistant cannot perform",
         &[
             "deploy_from_image_upload",
@@ -695,6 +850,8 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         "personal data written or ingested on behalf of end users, not an operator action",
         &[
             "enrich_visitor",
+            "identify_visitor",
+            "identify_visitor_for_token",
             "record_console_event",
             "record_flag_exposure",
             "revenue_import_invoices_csv",
@@ -737,7 +894,7 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
         ],
     ),
     (
-        "edge rules decide who reaches the app and are live within seconds; agents change them through the MCP tools, which only propose and leave enforcing to a human",
+        "edge rules decide who reaches the app and can contain secret match values; manage them in the console or REST API until the shared CLI has a redacted representation",
         &[
             "create_edge_rule",
             "delete_edge_rule",
@@ -834,6 +991,43 @@ pub(super) const EXCLUDED: &[(&str, &[&str])] = &[
             "update_runtime_health",
             "update_status_page",
             "verify_status_page_domain",
+        ],
+    ),
+    (
+        "error triage writes (ADR 111, D1: bulk status changes, merge, unmerge and split, inbound filters, assignment, comments and saved searches) are made by a person in the console or CLI; the assistant reads their results and proposes single-group changes through update_error_group",
+        &[
+            "bulkUpdateErrorGroups",
+            "mergeErrorGroups",
+            "unmergeErrorGroup",
+            "splitErrorGroup",
+            "createErrorInboundFilter",
+            "updateErrorInboundFilter",
+            "deleteErrorInboundFilter",
+            "set_error_group_assignee",
+            "create_error_group_comment",
+            "update_error_group_comment",
+            "delete_error_group_comment",
+            "create_error_saved_search",
+            "update_error_saved_search",
+            "delete_error_saved_search",
+        ],
+    ),
+    (
+        "the bytes of an error or feedback attachment (ADR 111, D4) can hold anything an SDK captured (screenshots, logs, request dumps) and are served for a person to open; deleting one and setting the attachment quota are made in the console or CLI",
+        &[
+            "get_error_attachment_content",
+            "delete_error_attachment",
+            "set_error_attachment_quota",
+        ],
+    ),
+    (
+        "opening, linking and unlinking an error group's issue (ADR 111, D5) writes to the project's GitHub or GitLab repository or to the group's record, and refreshing reads every linked issue from the provider with the project's credentials; replacing the ownership rules decides who new errors are assigned to. A person does these in the console or CLI",
+        &[
+            "create_error_group_issue",
+            "link_error_group_issue",
+            "unlink_error_group_issue",
+            "refresh_error_group_issues",
+            "replace_error_ownership_rules",
         ],
     ),
 ];

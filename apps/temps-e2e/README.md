@@ -759,8 +759,9 @@ container, which no deploy response exposes.
 7. confirm `has_events` is now `true`
 
 **Real gap found and fixed** (see `chore(sdk): regenerate @temps-sdk/api`):
-`packages/api/openapi.json` — the source for the SDK this entire suite
-depends on — had drifted to 590 of the live server's 674 paths. The whole
+the spec copy that then fed the SDK this entire suite depends on (since
+removed; `packages/api` now generates from `apps/temps-cli/openapi.json`) had
+drifted to 590 of the live server's 674 paths. The whole
 `temps-analytics` query surface used by this scenario
 (`getEventEntries`/`checkAnalyticsHasEvents`/`getVisitorJourney`/etc.) was
 unreachable from any TypeScript consumer until the SDK was regenerated from

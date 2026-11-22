@@ -193,14 +193,45 @@ pub fn mesh_listen_plan(listen_address: &str, mtls: bool, mesh: Option<Ipv4Addr>
     }
 }
 
+/// On a Mac worker (ADR 090) the mesh address lives in the Docker app's VM,
+/// where this process cannot bind: the mesh sidecar listens there and
+/// forwards to the main listener, so the address is covered rather than
+/// bound. TLS is end to end through that forwarder.
+pub fn forwarded_by_vm(plan: MeshListen, mac_worker: bool) -> MeshListen {
+    match plan {
+        MeshListen::Bind(address) if mac_worker => MeshListen::Covered(address),
+        other => other,
+    }
+}
+
 /// Keep the agent API served on the mesh address as it comes, changes and
 /// goes. Runs for the agent's lifetime; only spawned for an mTLS agent.
 pub fn spawn(
     router: Router,
     tls: Arc<rustls::ServerConfig>,
     listen_address: String,
+    mesh: watch::Receiver<MeshAddress>,
+    serving: SharedMeshListener,
+) -> tokio::task::JoinHandle<()> {
+    spawn_listener(
+        router,
+        tls,
+        listen_address,
+        mesh,
+        serving,
+        cfg!(target_os = "macos"),
+    )
+}
+
+/// [`spawn`], with whether the mesh address is forwarded by a Docker app's
+/// VM (a Mac worker) as an input, so the bind path is tested on every OS.
+fn spawn_listener(
+    router: Router,
+    tls: Arc<rustls::ServerConfig>,
+    listen_address: String,
     mut mesh: watch::Receiver<MeshAddress>,
     serving: SharedMeshListener,
+    mac_worker: bool,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // `None` until the mesh address is known: nothing is reported then.
@@ -213,7 +244,9 @@ pub fn spawn(
                 MeshAddress::Off => Some(None),
                 MeshAddress::At(address) => Some(Some(address)),
             };
-            let desired = address.map(|address| mesh_listen_plan(&listen_address, true, address));
+            let desired = address.map(|address| {
+                forwarded_by_vm(mesh_listen_plan(&listen_address, true, address), mac_worker)
+            });
             if let Some(desired) = desired.filter(|desired| applied != Some(*desired) || retry) {
                 if let Some(task) = listener.take() {
                     task.abort();
@@ -297,6 +330,19 @@ pub fn spawn(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mac_worker_reports_the_mesh_address_as_covered_by_its_sidecar() {
+        let mesh: Ipv4Addr = "10.210.0.4".parse().unwrap();
+        let plan = mesh_listen_plan("127.0.0.1:3100", true, Some(mesh));
+        assert_eq!(plan, MeshListen::Bind("10.210.0.4:3100".parse().unwrap()));
+        assert_eq!(
+            forwarded_by_vm(plan, true),
+            MeshListen::Covered("10.210.0.4:3100".parse().unwrap())
+        );
+        assert_eq!(forwarded_by_vm(plan, false), plan);
+        assert_eq!(forwarded_by_vm(MeshListen::Off, true), MeshListen::Off);
+    }
 
     fn mesh() -> Option<Ipv4Addr> {
         Some("10.201.0.5".parse().unwrap())
@@ -412,12 +458,13 @@ mod tests {
         let serving: SharedMeshListener = Arc::default();
         // The main listener is on another address, so the mesh address gets a
         // listener of its own; loopback stands in for the mesh address.
-        let task = spawn(
+        let task = spawn_listener(
             Router::new(),
             mtls_server_config(dir.path()),
             format!("192.0.2.1:{port}"),
             receiver,
             serving.clone(),
+            false,
         );
         let on_mesh: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
 

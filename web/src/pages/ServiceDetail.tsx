@@ -10,11 +10,12 @@ import {
   deleteServiceMutation,
   getClusterHealthQueryKey,
   getProjectsOptions,
-  listS3SourcesOptions,
   getServiceOptions,
+  getServiceQueryKey,
   getServicePreviewEnvironmentVariablesMaskedOptions,
   linkServiceToProjectMutation,
   listServiceProjectsOptions,
+  listServiceProjectsQueryKey,
   startServiceMutation,
   stopServiceMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -31,7 +32,8 @@ import { ClusterHealthPanel } from '@/components/storage/ClusterHealthPanel'
 import { MonitoringCard } from '@/components/storage/MonitoringCard'
 import { EditServiceDialog } from '@/components/storage/EditServiceDialog'
 import { ServiceResourcesPanel } from '@/components/storage/ServiceResourcesPanel'
-import { ServiceWorkloadModeCard } from '@/components/storage/ServiceWorkloadModeCard'
+import { ServiceTlsCard } from '@/components/storage/ServiceTlsCard'
+import { ServiceHealthcheckCard } from '@/components/storage/ServiceHealthcheckCard'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import { MajorUpgradeDialog } from '@/components/storage/MajorUpgradeDialog'
 import {
@@ -39,6 +41,7 @@ import {
   ServiceHealthCard,
 } from '@/components/storage/ServiceHealthCard'
 import { WalHealthPanel } from '@/components/storage/WalHealthPanel'
+import { backupDestinationsOptions } from '@/components/storage/backup-destinations-query'
 import { TriggerBackupDialog } from '@/components/storage/TriggerBackupDialog'
 import {
   ScheduleBackupsAction,
@@ -90,6 +93,7 @@ import {
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EnvVariablesDisplay } from '@/components/ui/env-variables-display'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ServiceReadinessPanel } from '@/components/storage/ServiceReadinessPanel'
@@ -161,6 +165,7 @@ import { isVerifiedNotFound } from '@/lib/read-failure'
 import { toast } from 'sonner'
 import { toastRedeployAfterLinkChange } from '@/lib/service-link-redeploy'
 import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 /**
  * Pick the role label to render for a cluster member.
@@ -262,6 +267,7 @@ export function ServiceDetail() {
     isLoading,
     error: queryError,
     refetch,
+    isFetching: isFetchingService,
   } = useQuery({
     ...getServiceOptions({
       path: { id: parseInt(id!) },
@@ -369,7 +375,7 @@ export function ServiceDetail() {
   // Backup destinations decide whether the Backups card can offer to back
   // this database up or must onboard a destination first.
   const backupSourcesQuery = useQuery({
-    ...listS3SourcesOptions(),
+    ...backupDestinationsOptions(),
     retry: false,
   })
   const backupSources = backupSourcesQuery.data ?? []
@@ -451,9 +457,7 @@ export function ServiceDetail() {
   const serviceLoaded = !!service
   useEffect(() => {
     if (!serviceLoaded || location.hash !== `#${SERVICE_BACKUPS_ANCHOR}`) return
-    document
-      .getElementById(SERVICE_BACKUPS_ANCHOR)
-      ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    scrollToElementId(SERVICE_BACKUPS_ANCHOR, { behavior: 'smooth' })
   }, [serviceLoaded, location.hash])
 
   // Notify when cluster creation or a readiness-gated start settles
@@ -689,7 +693,9 @@ export function ServiceDetail() {
     )
   }
 
-  if (queryError || !service) {
+  // A failed refresh keeps the loaded page (and its open dialogs); only a
+  // service that never loaded is replaced by the error.
+  if (!service) {
     return (
       <PageState
         variant="failed"
@@ -778,6 +784,18 @@ export function ServiceDetail() {
         facts={facts}
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getServiceQueryKey({ path: { id: service.service.id } }),
+                listServiceProjectsQueryKey({
+                  path: { id: service.service.id },
+                }),
+                ['pg-upgrades', id],
+                externalServiceBackupsQueryKey(service.service.id),
+                // The header badge and the health strip.
+                ['service-health', service.service.id],
+              ]}
+            />
             {/*
               Linked projects: collapsed into a header chip so the body of the
               page can stay focused on Health + Configuration. Click to see the
@@ -1022,6 +1040,19 @@ export function ServiceDetail() {
         main={
           <>
             {error ? <Callout tone="error">{error}</Callout> : null}
+            {queryError ? (
+              <Callout tone="error" title="Couldn't refresh service">
+                Showing the last loaded service.{' '}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void refetch()}
+                  disabled={isFetchingService}
+                >
+                  Retry service
+                </Button>
+              </Callout>
+            ) : null}
 
             <ActiveRestoreBanner serviceId={service.service.id} />
 
@@ -1062,7 +1093,13 @@ export function ServiceDetail() {
               <WalHealthPanel
                 serviceId={parseInt(id!)}
                 serviceType={service.service.service_type}
-                onUpgrade={() => setIsUpgradeDialogOpen(true)}
+                // A service on a worker node cannot change its image here
+                // (the server refuses it), so it gets no upgrade action.
+                onUpgrade={
+                  service.service.node_id
+                    ? undefined
+                    : () => setIsUpgradeDialogOpen(true)
+                }
                 onBackup={() => setIsBackupDialogOpen(true)}
                 isImported={!!service.current_parameters?.container_name}
               />
@@ -1077,6 +1114,7 @@ export function ServiceDetail() {
                 }
                 metricsEnabled={service.service.metrics_enabled ?? false}
                 onMonitoringChange={() => refetch()}
+                cluster={service.service.topology === 'cluster'}
               />
             )}
 
@@ -1317,15 +1355,21 @@ export function ServiceDetail() {
               serviceName={service.service.name}
             />
 
-            {/*
-              How the database's container is built (ADR-055 workload plane)
-              and the recreate from its workload spec. Instance-admin only;
-              other roles see what it is and who can change it.
-            */}
-            <ServiceWorkloadModeCard
+            {/* The container's Docker healthcheck and its overrides */}
+            <ServiceHealthcheckCard
               serviceId={service.service.id}
               serviceName={service.service.name}
+              serviceStatus={service.service.status}
             />
+
+            {/* Server TLS for managed PostgreSQL (ADR-093) */}
+            {service.service.service_type === 'postgres' && (
+              <ServiceTlsCard
+                serviceId={service.service.id}
+                serviceName={service.service.name}
+                serviceStatus={service.service.status}
+              />
+            )}
 
             {/* Backups Section */}
             <Card id={SERVICE_BACKUPS_ANCHOR} className="scroll-mt-20">

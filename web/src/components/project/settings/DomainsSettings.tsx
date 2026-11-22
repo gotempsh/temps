@@ -10,6 +10,10 @@ import {
 import {
   deleteCustomDomainMutation,
   listCustomDomainsForProjectOptions,
+  listCustomDomainsForProjectQueryKey,
+  getEnvironmentReachabilityQueryKey,
+  listIngressHostnamesQueryKey,
+  listReachabilityRunsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
@@ -19,6 +23,8 @@ import {
   CollapsibleContent,
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import { DomainDeliveryBindings } from '@/components/domains/DomainDeliveryBindings'
 import { DomainDeliverySetup } from '@/components/domains/DomainDeliverySetup'
@@ -128,10 +134,24 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         title="Domains"
         description="Custom domains for this service. Each one points at an environment and can redirect."
         actions={
-          <Button onClick={() => setIsAddDialogOpen(true)}>
-            Add domain
-            <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-          </Button>
+          <>
+            <RefreshButton
+              queryKeys={[
+                listCustomDomainsForProjectQueryKey({
+                  path: { project_id: project.id },
+                }),
+                queryKeyPrefix(listIngressHostnamesQueryKey),
+                queryKeyPrefix(getEnvironmentReachabilityQueryKey),
+                queryKeyPrefix(listReachabilityRunsQueryKey),
+                // The managed-delivery rows under DNS and CDN, not its form.
+                ['delivery-bindings', project.id],
+              ]}
+            />
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              Add domain
+              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+            </Button>
+          </>
         }
       />
 
@@ -155,6 +175,9 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             >
               <div className="min-w-0">
                 <p className="break-all font-medium">{domain.domain}</p>
+                {domain.status === 'hostname_conflict' && (
+                  <p className="text-sm text-destructive">{domain.message}</p>
+                )}
                 {domain.environment && (
                   <p className="text-sm text-muted-foreground">
                     Environment: {domain.environment.slug}

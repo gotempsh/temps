@@ -27,7 +27,6 @@ import {
   SortableTableHead,
   type SortDirection,
 } from '@/components/ui/sortable-table-head'
-import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowLeft, ChevronRight, Search } from 'lucide-react'
 import * as React from 'react'
@@ -47,6 +46,7 @@ import {
   type DimensionSortKey,
   dimensionRowHref,
 } from './DimensionList-shared'
+import { useWindowQuery } from '@/hooks/useWindowQuery'
 
 /**
  * Maximum rows fetched from the backend. The property-breakdown and
@@ -95,7 +95,7 @@ export function DimensionList({
   const getRowHref = (value: string): string | undefined =>
     dimensionRowHref(project.slug, dimension, value, searchParams)
 
-  const breakdownQuery = useQuery({
+  const breakdownQuery = useWindowQuery({
     ...getPropertyBreakdownOptions({
       path: { project_id: project.id },
       query: {
@@ -111,7 +111,7 @@ export function DimensionList({
       !!startDate && !!endDate && !!config.groupBy && !config.useEventsCount,
   })
 
-  const eventsQuery = useQuery({
+  const eventsQuery = useWindowQuery({
     ...getEventsCountOptions({
       path: { project_id: project.id },
       query: {
@@ -128,6 +128,10 @@ export function DimensionList({
     ? eventsQuery.isLoading
     : breakdownQuery.isLoading
   const error = config.useEventsCount ? eventsQuery.error : breakdownQuery.error
+  // The previous window's rows while a moved one loads: not for the AI.
+  const isPreviousWindow = config.useEventsCount
+    ? eventsQuery.isPlaceholderData
+    : breakdownQuery.isPlaceholderData
 
   const rows: Row[] = React.useMemo(() => {
     if (config.useEventsCount) {
@@ -202,7 +206,7 @@ export function DimensionList({
   )
 
   const aiContext = React.useMemo<AiInsightContext | undefined>(() => {
-    if (rows.length === 0) return undefined
+    if (rows.length === 0 || isPreviousWindow) return undefined
     return {
       surface: config.title.toLowerCase(),
       rangeStart: startDate?.toISOString(),
@@ -214,7 +218,7 @@ export function DimensionList({
           .map((row) => ({ name: row.value, visitors: row.count })),
       },
     }
-  }, [rows, config.title, config.plural, startDate, endDate])
+  }, [rows, isPreviousWindow, config.title, config.plural, startDate, endDate])
 
   return (
     <div className="flex flex-col gap-4 sm:gap-6">
@@ -223,6 +227,7 @@ export function DimensionList({
           insights={insights}
           isLoading={isLoading}
           aiContext={aiContext}
+          aiPending={isPreviousWindow}
           project={{ id: project.id, slug: project.slug, name: project.name }}
         />
       )}

@@ -33,6 +33,7 @@ pub mod facet_service;
 pub mod health_service;
 pub mod metric_alert_evaluator;
 pub mod metric_alert_service;
+pub mod operation_trends;
 pub mod otel_service;
 /// Per-project telemetry write mode, its gate and its interval ledger
 /// (ADR-041 §1, §7, §8).
@@ -84,7 +85,8 @@ pub use facet_service::{
 };
 pub use health_service::HealthComputeService;
 pub use metric_alert_evaluator::MetricAlertEvaluator;
-pub use metric_alert_service::MetricAlertService;
+pub use metric_alert_service::{AlertSeriesSource, MetricAlertService};
+pub use operation_trends::OperationTrendService;
 pub use otel_service::OtelService;
 pub use telemetry_write_mode::{
     resolve_window, CloudLinkSnapshot, CloudWriteSuspension, LocalSpanStoreRequirement,

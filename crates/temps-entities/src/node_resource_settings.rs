@@ -11,7 +11,7 @@
 //! existing `nodes::Model` construction untouched.
 //!
 //! The control plane (node 0) is not a row; its values are stored with its
-//! other node-0 settings (`temps_core::AppSettings::control_plane_resources`).
+//! other node-0 settings (`temps_config::AppSettings::control_plane_resources`).
 
 use sea_orm::entity::prelude::*;
 use sea_orm::{DeriveActiveEnum, EnumIter, FromJsonQueryResult};

@@ -229,9 +229,9 @@ pub(crate) fn url_has_embedded_credentials(url: &str) -> bool {
 /// and the network stack. Until credentialed clones move to a host-owned
 /// staging helper, allow them only in the versioned images built by Temps.
 pub(super) fn sandbox_image_is_trusted_for_credentials(
-    handle: &temps_ai_agents::sandbox::SandboxHandle,
+    handle: &temps_sandbox_providers::SandboxHandle,
 ) -> bool {
-    handle.backend == temps_ai_agents::sandbox::SandboxBackend::Docker
+    handle.backend == temps_sandbox_providers::SandboxBackend::Docker
         && handle.image.starts_with("ghcr.io/gotempsh/temps-sandbox-")
 }
 
@@ -598,7 +598,7 @@ impl SandboxService {
     #[allow(clippy::too_many_arguments)]
     async fn run_git_clone(
         &self,
-        handle: &temps_ai_agents::sandbox::SandboxHandle,
+        handle: &temps_sandbox_providers::SandboxHandle,
         internal_id: i32,
         work_dir: &str,
         target_dir: &str,
@@ -616,7 +616,7 @@ impl SandboxService {
         self.ensure_source_target_as_sandbox_user(handle, internal_id, target_dir)
             .await?;
         let private_root = match handle.backend {
-            temps_ai_agents::sandbox::SandboxBackend::Local => "/tmp",
+            temps_sandbox_providers::SandboxBackend::Local => "/tmp",
             // Docker mounts /run/secrets as tmpfs. Credential material must
             // never enter the writable layer where a concurrent `commit`
             // snapshot could retain it.
@@ -756,7 +756,7 @@ TEMPS_ASKPASS_EOF\n\
 
     async fn ensure_source_target_as_sandbox_user(
         &self,
-        handle: &temps_ai_agents::sandbox::SandboxHandle,
+        handle: &temps_sandbox_providers::SandboxHandle,
         internal_id: i32,
         target_dir: &str,
     ) -> Result<(), SandboxError> {
@@ -794,7 +794,7 @@ TEMPS_ASKPASS_EOF\n\
 
     async fn exec_seed_script_as_root(
         &self,
-        handle: &temps_ai_agents::sandbox::SandboxHandle,
+        handle: &temps_sandbox_providers::SandboxHandle,
         internal_id: i32,
         script: String,
     ) -> Result<(), SandboxError> {
@@ -808,7 +808,7 @@ TEMPS_ASKPASS_EOF\n\
     /// provider's exec impl is expected to honor this).
     async fn exec_seed_script_with_env_as_root(
         &self,
-        handle: &temps_ai_agents::sandbox::SandboxHandle,
+        handle: &temps_sandbox_providers::SandboxHandle,
         internal_id: i32,
         script: String,
         mut env_map: HashMap<String, String>,
@@ -941,14 +941,14 @@ fn source_target_restore_script() -> &'static str {
 }
 
 pub(super) fn source_import_staging_dir(
-    backend: temps_ai_agents::sandbox::SandboxBackend,
+    backend: temps_sandbox_providers::SandboxBackend,
     internal_id: i32,
 ) -> String {
     let private_root = match backend {
-        temps_ai_agents::sandbox::SandboxBackend::Local => "/tmp",
-        temps_ai_agents::sandbox::SandboxBackend::Docker => "/run/temps-source-import",
-        temps_ai_agents::sandbox::SandboxBackend::Firecracker
-        | temps_ai_agents::sandbox::SandboxBackend::Microsandbox => "/root",
+        temps_sandbox_providers::SandboxBackend::Local => "/tmp",
+        temps_sandbox_providers::SandboxBackend::Docker => "/run/temps-source-import",
+        temps_sandbox_providers::SandboxBackend::Firecracker
+        | temps_sandbox_providers::SandboxBackend::Microsandbox => "/root",
     };
     format!("{private_root}/.temps-source-import-{internal_id}")
 }

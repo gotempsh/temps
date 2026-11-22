@@ -351,8 +351,9 @@ mod https_redirect_tests {
 
     #[test]
     fn proxy_https_redirect_response_has_monitor_marker() {
-        let response = https_redirect_response("https://app.example.test/health", "request-1")
-            .expect("build HTTPS redirect response");
+        let response =
+            https_redirect_response("https://app.example.test/health", "request-1", true)
+                .expect("build HTTPS redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
             response
@@ -379,7 +380,7 @@ mod https_redirect_tests {
 
     #[test]
     fn domain_redirect_says_temps_answered() {
-        let response = domain_redirect_response(301, "https://example.test/pricing")
+        let response = domain_redirect_response(301, "https://example.test/pricing", true)
             .expect("build domain redirect response");
         assert_eq!(response.status.as_u16(), 301);
         assert_eq!(
@@ -396,6 +397,18 @@ mod https_redirect_tests {
                 .and_then(|value| value.to_str().ok()),
             Some("1")
         );
+    }
+
+    #[test]
+    fn domain_redirect_hides_markers_without_changing_redirect() {
+        let response =
+            domain_redirect_response(302, "https://example.test/pricing", false).unwrap();
+        assert_eq!(response.status.as_u16(), 302);
+        assert_eq!(
+            response.headers.get("location").unwrap(),
+            "https://example.test/pricing"
+        );
+        assert!(!response.headers.contains_key("x-temps-proxy-probe-capable"));
     }
 
     #[test]
@@ -784,6 +797,7 @@ mod admin_gate_tests {
                 _sni: Option<&str>,
             ) -> pingora_core::Result<PeerSelection> {
                 Ok(PeerSelection {
+                    in_flight: None,
                     peer: Box::new(HttpPeer::new("127.0.0.1:1".to_string(), false, "".into())),
                     container_id: None,
                     container_name: None,
@@ -1467,8 +1481,8 @@ mod stopped_app_tests {
     use anyhow::Result;
     use pingora::upstreams::peer::Peer;
     use std::sync::Arc;
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -1582,9 +1596,7 @@ mod stopped_app_tests {
         let test_db_mock = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping pipelining test: Docker runtime unavailable");
                 return Ok(());
@@ -1688,9 +1700,7 @@ mod stopped_app_tests {
         let test_db_mock = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping stopped-app proxy test: Docker runtime unavailable");
                 return Ok(());
@@ -1852,8 +1862,8 @@ pub(super) mod status_page_host_tests {
     use pingora_proxy::{ProxyHttp, Session};
     use std::sync::Arc;
     use temps_core::public_status_page::{NOT_FOUND_HTML, NOT_FOUND_JSON, STATUS_HOST_HEADER};
-    use temps_database::test_utils::TestDatabase;
     use temps_routes::CachedPeerTable;
+    use temps_test_utils::TestDatabase;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn create_crypto_cookie_crypto() -> Arc<temps_core::CookieCrypto> {
@@ -1902,9 +1912,7 @@ pub(super) mod status_page_host_tests {
         let test_db = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping status-page host proxy test: Docker runtime unavailable");
                 return Ok(None);
@@ -1965,7 +1973,7 @@ pub(super) mod status_page_host_tests {
         Forwarded {
             path: String,
             status_host: Option<String>,
-            cookie: bool,
+            cookie: Option<String>,
             peer: Option<String>,
         },
         /// The proxy answered itself.
@@ -1992,7 +2000,11 @@ pub(super) mod status_page_host_tests {
                 .get(STATUS_HOST_HEADER)
                 .and_then(|v| v.to_str().ok())
                 .map(str::to_string);
-            let cookie = header.headers.get("cookie").is_some();
+            let cookie = header
+                .headers
+                .get("cookie")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string);
             let peer = if ctx.status_page_host {
                 Some(
                     h.lb.upstream_peer(&mut session, &mut ctx)
@@ -2067,7 +2079,7 @@ pub(super) mod status_page_host_tests {
                 } => {
                     assert_eq!(forwarded, expected);
                     assert_eq!(status_host.as_deref(), Some(HOST));
-                    assert!(!cookie, "credentials never reach the public listener");
+                    assert_eq!(cookie, None, "credentials never reach the public listener");
                     assert_eq!(peer.as_deref(), Some(INGRESS));
                 }
                 Outcome::Answered { head, .. } => panic!("{path} must be forwarded: {head}"),
@@ -2107,6 +2119,104 @@ pub(super) mod status_page_host_tests {
             .await?,
             false,
         );
+        Ok(())
+    }
+
+    /// The subscription routes of ADR 108 D2: the subscribe form only posts,
+    /// a confirm or unsubscribe link answers GET (a button) and POST, and
+    /// nothing else reaches the console.
+    #[tokio::test]
+    async fn verified_host_forwards_only_the_status_page_access_cookie() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        let with_cookie =
+            |cookie: &str| format!("GET / HTTP/1.1\r\nHost: {HOST}\r\nCookie: {cookie}\r\n\r\n");
+        let forwarded = |outcome: Outcome| match outcome {
+            Outcome::Forwarded { cookie, .. } => cookie,
+            Outcome::Answered { head, .. } => panic!("must be forwarded: {head}"),
+        };
+        let access = "v1.7.1.1767225600.00ff";
+        assert_eq!(
+            forwarded(
+                send(
+                    &h,
+                    &with_cookie(&format!(
+                        "session=secret; temps_status_access={access}; other=1"
+                    ))
+                )
+                .await?
+            ),
+            Some(format!("temps_status_access={access}")),
+            "only the access cookie survives"
+        );
+        assert_eq!(
+            forwarded(send(&h, &with_cookie("temps_status_access=bad%20value")).await?),
+            None,
+            "a malformed access cookie is dropped"
+        );
+        assert_eq!(
+            forwarded(send(&h, &with_cookie("session=secret")).await?),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn verified_host_forwards_the_subscription_routes_with_their_methods() -> Result<()> {
+        let Some(h) = harness(Some(INGRESS), true).await? else {
+            return Ok(());
+        };
+        h.route_table
+            .insert_status_page_host_for_test(HOST, Some(SLUG));
+        let token = "c".repeat(temps_core::public_status_page::SUBSCRIPTION_TOKEN_LEN);
+        let post = |path: &str| {
+            format!(
+                "POST {path} HTTP/1.1\r\nHost: {HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 0\r\n\r\n"
+            )
+        };
+        for (request, expected) in [
+            (
+                get("/feed.atom", HOST),
+                format!("/api/status/{SLUG}/feed.atom"),
+            ),
+            (post("/subscribe"), format!("/api/status/{SLUG}/subscribe")),
+            (post("/unlock"), format!("/api/status/{SLUG}/unlock")),
+            (
+                get(&format!("/confirm/{token}"), HOST),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/confirm/{token}")),
+                format!("/api/status/{SLUG}/confirm/{token}"),
+            ),
+            (
+                post(&format!("/unsubscribe/{token}")),
+                format!("/api/status/{SLUG}/unsubscribe/{token}"),
+            ),
+        ] {
+            match send(&h, &request).await? {
+                Outcome::Forwarded {
+                    path, status_host, ..
+                } => {
+                    assert_eq!(path, expected);
+                    assert_eq!(status_host.as_deref(), Some(HOST));
+                }
+                Outcome::Answered { head, .. } => panic!("{expected} must be forwarded: {head}"),
+            }
+        }
+        for request in [
+            post("/feed.atom"),
+            get("/subscribe", HOST),
+            get("/unlock", HOST),
+            format!("DELETE /confirm/{token} HTTP/1.1\r\nHost: {HOST}\r\n\r\n"),
+            post("/confirm/not-a-token"),
+            post(&format!("/api/status/{SLUG}/subscribe")),
+        ] {
+            assert_not_found(send(&h, &request).await?, false);
+        }
         Ok(())
     }
 
@@ -2162,6 +2272,13 @@ pub(super) mod status_page_host_tests {
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
                     backends: vec![temps_routes::BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "127.0.0.1:2".to_string(),
                         container_id: None,
                         container_name: None,
@@ -2520,6 +2637,13 @@ mod shield_enforcement_tests {
             temps_routes::RouteInfo {
                 backend: temps_routes::BackendType::Upstream {
                     backends: vec![temps_routes::BackendEntry {
+                        compose_service: None,
+                        node_id: None,
+                        state: Default::default(),
+                        tier: 0,
+                        capacity: None,
+                        check_health: false,
+                        pinned: None,
                         address: "127.0.0.1:9".to_string(),
                         container_id: None,
                         container_name: None,
@@ -2623,6 +2747,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), BLOCKED, true).await?);
@@ -2654,6 +2781,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
 
         let (head, body, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, true).await?);
@@ -2698,6 +2828,9 @@ mod shield_enforcement_tests {
         let Some(s) = shielded_harness().await? else {
             return Ok(());
         };
+        s.h.lb
+            .expose_platform_identity
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         host_in(&s.h, "selective").await?;
         let (head, _, ctx) = answered(send(&s.h, page("/", None), CHALLENGED, false).await?);
         assert!(head.starts_with("HTTP/1.1 426"), "{head}");
@@ -3418,6 +3551,31 @@ mod client_fingerprint_tests {
         (fingerprint.ja4.map(|j| j.to_string()), fingerprint.source)
     }
 
+    #[test]
+    fn configured_proxy_suppresses_its_direct_tls_fingerprint() {
+        use temps_core::trusted_proxies::TrustedProxyRanges;
+        let ranges = TrustedProxyRanges::parse(&["10.123.45.6/32".into()]).unwrap();
+        for (peer, expected) in [
+            ("10.123.45.6", (None, Ja4Source::Local)),
+            ("10.123.45.7", (Some(CURL_JA4.into()), Ja4Source::Direct)),
+        ] {
+            // Header contents do not affect whether this socket peer's own
+            // TLS fingerprint must be suppressed.
+            let result = super::resolve_client_fingerprint_with_proxy_trust(
+                Some(ip(peer)),
+                &headers(&[("x-forwarded-for", "malformed")]),
+                false,
+                None,
+                Some(ja4(CURL_JA4)),
+                |address| ranges.trusts_peer(address),
+            );
+            assert_eq!(
+                (result.ja4.map(|value| value.to_string()), result.source),
+                expected
+            );
+        }
+    }
+
     /// Behind Cloudflare the TLS client is Cloudflare, so its `cf-ja4` is
     /// the visitor's and the computed one is not; a malformed header gives
     /// no JA4 rather than Cloudflare's own.
@@ -3589,4 +3747,23 @@ mod upstream_retry_tests {
         assert!(session.pipelining_enabled());
         assert_eq!(session.req_header().uri.path(), "/a");
     }
+}
+
+#[test]
+fn hidden_identity_redirect_keeps_request_id_and_local_probe_protocol() {
+    let public =
+        https_redirect_response("https://app.example.test/health", "request-1", false).unwrap();
+    assert_eq!(public.headers.get("X-Request-ID").unwrap(), "request-1");
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Probe-Capable"));
+    assert!(!public.headers.contains_key("X-Temps-Proxy-Https-Redirect"));
+    let local =
+        https_redirect_response("https://app.example.test/health", "request-1", true).unwrap();
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Probe-Capable").unwrap(),
+        "1"
+    );
+    assert_eq!(
+        local.headers.get("X-Temps-Proxy-Https-Redirect").unwrap(),
+        "1"
+    );
 }

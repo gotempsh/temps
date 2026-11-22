@@ -16,11 +16,28 @@
 
 use std::sync::OnceLock;
 
-use temps_ai_agents::sandbox::DefaultResourceLimits;
-use temps_core::AgentSandboxSettings;
+use temps_config::AgentSandboxSettings;
+use temps_sandbox_providers::DefaultResourceLimits;
 
 use crate::error::SandboxError;
 use crate::services::sandbox_service::CreateSandboxRequest;
+
+/// Ceilings for the resource limits a caller may request on create. The
+/// provider treats a request value as authoritative (the operator's
+/// `agent_sandbox` settings are only the defaults for omitted fields), so
+/// without a ceiling here any `sandboxes:write` key could ask for no process
+/// cap (`pids_limit <= 0` means "unlimited" to Docker) or for more memory than
+/// the host has. Generous enough for real workloads, finite so the host's
+/// pid table and memory stay protected from untrusted code.
+pub const MAX_SANDBOX_CPU_CORES: f64 = 16.0;
+/// Floors below which the request cannot be enforced. Docker takes CPU as
+/// integer NanoCPUs, so a tiny positive value truncates to 0, which Docker
+/// reads as "no CPU quota"; it also rejects memory limits under 6 MB.
+pub const MIN_SANDBOX_CPU_CORES: f64 = 0.01;
+pub const MIN_SANDBOX_MEMORY_MB: u64 = 6;
+pub const MAX_SANDBOX_MEMORY_MB: u64 = 32 * 1024;
+pub const MAX_SANDBOX_PIDS_LIMIT: i64 = 4096;
+pub const MAX_SANDBOX_DISK_MB: u64 = 64 * 1024;
 
 /// Memory (MB) of the machine Temps runs on: the smaller of its physical
 /// memory and the cgroup limit it runs under, if any. `None` when the OS
@@ -88,6 +105,44 @@ pub fn clamp_omitted_limits(
             }
         }
     }
+}
+
+pub(crate) fn max_cpu_limit(operator: Option<f64>, host: Option<f64>) -> f64 {
+    operator
+        .unwrap_or(MAX_SANDBOX_CPU_CORES)
+        .min(MAX_SANDBOX_CPU_CORES)
+        .min(host.unwrap_or(f64::MAX))
+}
+
+/// Check a caller-supplied CPU limit after placement, so even a value over the
+/// API ceiling reports the host's range when the host is the tighter bound.
+pub fn check_cpu_limit(
+    sandbox_id: &str,
+    requested: Option<f64>,
+    host: Option<f64>,
+    operator: Option<f64>,
+) -> Result<(), SandboxError> {
+    let Some(requested) = requested else {
+        return Ok(());
+    };
+    if let Some(host) = host {
+        if requested > host {
+            return Err(SandboxError::CpuLimit {
+                sandbox_id: sandbox_id.to_owned(),
+                requested,
+                host,
+                max: max_cpu_limit(operator, Some(host)),
+            });
+        }
+    }
+    if requested > MAX_SANDBOX_CPU_CORES {
+        return Err(SandboxError::Validation {
+            message: format!(
+                "cpu_limit/vcpus must be between {MIN_SANDBOX_CPU_CORES} and {MAX_SANDBOX_CPU_CORES}, got {requested}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 /// Refuse a request whose own `memory_limit_mb` is more than the machine the
@@ -209,6 +264,21 @@ pub fn check_user_sandbox_cap(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cpu_limit_checks_host_then_api_ceiling() {
+        let cpu = MAX_SANDBOX_CPU_CORES + 0.5;
+        assert!(matches!(
+            check_cpu_limit("sandbox", Some(cpu), Some(2.0), Some(1.5)),
+            Err(SandboxError::CpuLimit { host: 2.0, max: 1.5, requested, .. }) if requested == cpu
+        ));
+        for host in [None, Some(32.0)] {
+            assert!(matches!(
+                check_cpu_limit("sandbox", Some(cpu), host, None),
+                Err(SandboxError::Validation { .. })
+            ));
+        }
+    }
 
     fn request(cpu: Option<f64>, memory: Option<u64>, pids: Option<i64>) -> CreateSandboxRequest {
         CreateSandboxRequest {

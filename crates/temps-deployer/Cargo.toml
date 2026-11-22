@@ -13,6 +13,7 @@ homepage.workspace = true
 
 [dependencies]
 nix = { workspace = true, features = ["fs"] }
+temps-docker-util = { path = "../temps-docker-util" }
 temps-runtime-health = { path = "../temps-runtime-health" }
 # ADR-055 phase 1: containers are created through the Docker driver.
 temps-workload = { path = "../temps-workload" }
@@ -24,6 +25,9 @@ bytes = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
+hyper-util = { version = "0.1", features = ["tokio"] }
+tonic = { version = "0.14", default-features = false, features = ["transport"] }
+tower = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -64,6 +68,7 @@ shlex = { workspace = true }
 
 [dev-dependencies]
 temps-test-containers = { path = "../temps-test-containers" }
+temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
 # ADR-055 golden captures of the container-create request.
@@ -78,7 +83,6 @@ serial_test = { workspace = true }
 # real labelled containers on a real Docker network, asserted through the real
 # route table. All skip gracefully when Docker is unavailable.
 testcontainers = { workspace = true }
-temps-database = { path = "../temps-database" }
 temps-routes = { path = "../temps-routes" }
 
 [lints]

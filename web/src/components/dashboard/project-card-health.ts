@@ -49,6 +49,8 @@ export interface ProjectHealthInput {
 export interface ProjectMonitorHealthInput {
   /** `operational` | `degraded` | `down` | `not_deployed` | `no_address` | `no_monitors` */
   status: string
+  runtime_status?: string | null
+  runtime_reason?: string | null
 }
 
 export interface ProjectHealthIndicatorOptions {
@@ -92,6 +94,29 @@ function measuredDetail(
 function monitorIndicator(
   monitor: ProjectMonitorHealthInput
 ): ProjectHealthIndicator | null {
+  if (monitor.status === 'no_address' && monitor.runtime_status != null) {
+    if (monitor.runtime_status === 'healthy')
+      return {
+        tone: 'healthy',
+        label: 'Healthy',
+        detail:
+          'The worker reports fresh, passing container health checks. Public reachability is separate.',
+      }
+    if (monitor.runtime_status === 'unhealthy')
+      return {
+        tone: 'down',
+        label: 'Unhealthy',
+        detail:
+          monitor.runtime_reason ||
+          'The worker reports a failing container health check.',
+      }
+    return {
+      tone: 'idle',
+      label: 'Health unknown',
+      detail:
+        'No fresh supported worker health observation is available. Check the worker connection and runtime monitoring in Monitors.',
+    }
+  }
   switch (monitor.status) {
     case 'operational':
       return {

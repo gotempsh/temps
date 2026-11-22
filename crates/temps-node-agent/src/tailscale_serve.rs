@@ -1059,6 +1059,8 @@ mod tests {
                 environment_id: Some(1),
                 gate: None,
                 shield: None,
+                allowed_callers: Vec::new(),
+                allowed_sandboxes: Vec::new(),
             }),
             addrs: Vec::new(),
             principals: None,

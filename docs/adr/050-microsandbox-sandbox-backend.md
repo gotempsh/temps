@@ -63,7 +63,7 @@ All SDK state lives under a Temps-owned home, never the user's `~/.microsandbox`
 ```
 <data_dir>/microsandbox/      0700
   config.json                 Temps-owned SDK config (absent = SDK defaults)
-  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.8)
+  bin/msb, lib/libkrunfw.*    pinned runtime pair (v0.7.11)
   db/ sandboxes/ cache/ …     SDK-managed
 ```
 
@@ -211,7 +211,7 @@ Terminals run the same `temps-pty-agent` as the Docker and Firecracker backends 
 ### Negative
 
 - +76 crates in the agents graph, including a second ORM stack (sea-orm 2 / sqlx 0.9 + SQLite) that the SDK uses only for its own bookkeeping. Compile time and binary size grow.
-- A pre-1.0 dependency (`=0.7.8`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
+- A pre-1.0 dependency (`=0.7.11`) whose crate version, runtime binary and `libkrunfw` ABI move in lockstep. Upgrades are deliberate: bump the pin, `MICROSANDBOX_VERSION`, and re-run setup.
 - libkrun's shared guest/VMM security context means this backend is weaker than Firecracker against VMM-escape attacks. Mitigated by positioning and the confinement in §6, but not eliminated.
 - Two microVM backends double the microVM test matrix.
 
@@ -255,5 +255,5 @@ E2E tests (`TEMPS_DATA_DIR=<dir with runtime> cargo test --lib -p temps-agents s
 - ADR-036: Persistent Workspace Sandboxes
 - ADR-037: Sandbox Snapshots
 - ADR-048: Multi-Node Sandboxes
-- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.8)
+- microsandbox: https://github.com/superradcompany/microsandbox (SDK crate `microsandbox` 0.7.11)
 - libkrun: https://github.com/containers/libkrun (security model section)

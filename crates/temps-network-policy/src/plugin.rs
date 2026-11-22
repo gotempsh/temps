@@ -16,6 +16,8 @@ use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::handlers::{router, NetworkPolicyApiDoc, NetworkPolicyAppState};
+use crate::internal_access::handlers::router as internal_access_router;
+use crate::internal_access::{InternalAccessApiDoc, InternalAccessAppState, InternalAccessService};
 use crate::service::NetworkPolicyService;
 use crate::source::spawn_control_plane_enforcer;
 
@@ -58,7 +60,8 @@ impl TempsPlugin for NetworkPolicyPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<DatabaseConnection>();
-            context.register_service(Arc::new(NetworkPolicyService::new(db)));
+            context.register_service(Arc::new(NetworkPolicyService::new(db.clone())));
+            context.register_service(Arc::new(InternalAccessService::new(db)));
             debug!("network-policy: services registered");
             Ok(())
         })
@@ -98,15 +101,27 @@ impl TempsPlugin for NetworkPolicyPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let audit = context.require_service::<dyn temps_core::AuditLogger>();
         let state = Arc::new(NetworkPolicyAppState {
             service: context.require_service::<NetworkPolicyService>(),
-            audit: context.require_service::<dyn temps_core::AuditLogger>(),
+            audit: audit.clone(),
         });
-        Some(PluginRoutes::new(router(state)))
+        let internal_access = Arc::new(InternalAccessAppState {
+            service: context.require_service::<InternalAccessService>(),
+            audit,
+            // Optional by design: without a team plugin every authorised
+            // user may access every project.
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+        Some(PluginRoutes::new(
+            router(state).merge(internal_access_router(internal_access)),
+        ))
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(<NetworkPolicyApiDoc as OpenApiTrait>::openapi())
+        let mut schema = <NetworkPolicyApiDoc as OpenApiTrait>::openapi();
+        schema.merge(<InternalAccessApiDoc as OpenApiTrait>::openapi());
+        Some(schema)
     }
 }
 

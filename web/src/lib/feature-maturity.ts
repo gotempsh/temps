@@ -21,6 +21,7 @@ export function featureKeyForPath(pathname: string): string | undefined {
 
   if (projectRoute.startsWith('analytics/replays')) return 'session-replay'
   if (projectRoute.startsWith('analytics/funnels')) return 'funnels'
+  if (projectRoute.startsWith('analytics/surveys')) return 'surveys'
   if (projectRoute.startsWith('analytics')) return 'web-analytics'
   if (projectRoute.startsWith('errors')) return 'error-tracking'
   if (
@@ -32,7 +33,6 @@ export function featureKeyForPath(pathname: string): string | undefined {
   }
   if (projectRoute.startsWith('speed')) return 'performance-monitoring'
   if (projectRoute.startsWith('revenue')) return 'revenue-tracking'
-  if (projectRoute.startsWith('agents')) return 'ai-agents-workflows'
   if (projectRoute.startsWith('ai-gateway')) return 'ai-gateway'
   if (projectRoute.includes('database-browser')) return 'database-browser'
 
@@ -44,8 +44,6 @@ export function featureKeyForPath(pathname: string): string | undefined {
   if (pathname.startsWith('/settings/plugins')) return 'plugin-system'
   if (pathname.startsWith('/ai-gateway')) return 'ai-gateway'
   if (pathname.startsWith('/chat')) return 'ai-chat'
-  if (pathname.startsWith('/ai-workflows')) return 'ai-agents-workflows'
-  if (pathname.startsWith('/agent-sandbox')) return 'agent-execution-sandbox'
   if (pathname.startsWith('/revenue')) return 'revenue-tracking'
   if (pathname.startsWith('/status-pages')) return 'status-pages'
   if (pathname.startsWith('/screenshots')) return 'screenshots'

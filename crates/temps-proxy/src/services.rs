@@ -207,7 +207,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
         // Try the in-memory route table across all three lookup strategies
         // (TLS/SNI, HTTP host, legacy). Returns the matched peer, if any.
         let sni_or_host = sni_hostname.unwrap_or(host);
-        let lookup = |label: &str| -> Option<PeerSelection> {
+        let lookup = |label: &str| -> Option<Result<PeerSelection, Box<Error>>> {
             // 1. TLS/SNI-based routing
             if let Some(route_info) = self.route_table.get_route_by_sni(sni_or_host) {
                 let selection = route_info.select_backend_avoiding(avoid);
@@ -215,15 +215,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     "{}: found TLS route via SNI/Host {} -> {}",
                     label, sni_or_host, selection.address
                 );
-                return Some(PeerSelection {
-                    peer: Box::new(HttpPeer::new(
-                        selection.address.clone(),
-                        false,
-                        "".to_string(),
-                    )),
-                    container_id: selection.container_id,
-                    container_name: selection.container_name,
-                });
+                return Some(peer_for_selection(selection));
             }
 
             // 2. HTTP Host-based routing (HTTP routes)
@@ -235,15 +227,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     "{}: found HTTP route for {} -> {} (project_id: {:?}, env_id: {:?})",
                     label, host, selection.address, project_id, env_id
                 );
-                return Some(PeerSelection {
-                    peer: Box::new(HttpPeer::new(
-                        selection.address.clone(),
-                        false,
-                        "".to_string(),
-                    )),
-                    container_id: selection.container_id,
-                    container_name: selection.container_name,
-                });
+                return Some(peer_for_selection(selection));
             }
 
             // 3. Legacy: the old get_route method for backwards compatibility
@@ -255,22 +239,14 @@ impl UpstreamResolver for UpstreamResolverImpl {
                     "{}: found legacy route for {} -> {} (project_id: {:?}, env_id: {:?})",
                     label, host, selection.address, project_id, env_id
                 );
-                return Some(PeerSelection {
-                    peer: Box::new(HttpPeer::new(
-                        selection.address.clone(),
-                        false,
-                        "".to_string(),
-                    )),
-                    container_id: selection.container_id,
-                    container_name: selection.container_name,
-                });
+                return Some(peer_for_selection(selection));
             }
 
             None
         };
 
         if let Some(selection) = lookup("route lookup") {
-            return Ok(selection);
+            return selection;
         }
 
         // No route matched. If the table has never loaded — i.e. the proxy just
@@ -285,7 +261,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             );
             self.route_table.wait_until_loaded(FIRST_LOAD_WAIT).await;
             if let Some(selection) = lookup("route lookup (after first load)") {
-                return Ok(selection);
+                return selection;
             }
         }
 
@@ -328,6 +304,8 @@ impl UpstreamResolver for UpstreamResolverImpl {
             if let Some(address) = self.server_config.internal_dns_sync_address.as_ref() {
                 debug!(%address, "Routing authenticated DNS sync request to proxy service");
                 return Ok(PeerSelection {
+                    in_flight: None,
+
                     peer: Box::new(HttpPeer::new(address.clone(), false, "".to_string())),
                     container_id: None,
                     container_name: None,
@@ -347,6 +325,7 @@ impl UpstreamResolver for UpstreamResolverImpl {
             "".to_string(),
         ));
         Ok(PeerSelection {
+            in_flight: None,
             peer,
             container_id: None,
             container_name: None,
@@ -406,9 +385,29 @@ impl UpstreamResolver for UpstreamResolverImpl {
     }
 }
 
+/// The peer for a route's selected backend, or a 502 when the backend must
+/// not be dialled: a custom route upstream whose name currently has no
+/// allowed address. The peer is built from `selection.address`, which for such
+/// an upstream is the checked IP address, so no lookup happens here.
+pub(crate) fn peer_for_selection(
+    selection: temps_routes::BackendSelection,
+) -> Result<PeerSelection, Box<Error>> {
+    if let Some(reason) = selection.refused {
+        warn!("Refusing a request to a custom route upstream: {}", reason);
+        return Err(Error::explain(ErrorType::HTTPStatus(502), reason).into_up());
+    }
+    Ok(PeerSelection {
+        in_flight: selection.in_flight,
+        peer: Box::new(HttpPeer::new(selection.address, false, String::new())),
+        container_id: selection.container_id,
+        container_name: selection.container_name,
+    })
+}
+
 /// A plain-HTTP peer for one of the console's loopback listeners.
 fn console_peer(address: &str) -> PeerSelection {
     PeerSelection {
+        in_flight: None,
         peer: Box::new(HttpPeer::new(address.to_string(), false, "".to_string())),
         container_id: None,
         container_name: None,
@@ -517,6 +516,13 @@ mod public_ingress_tests {
         temps_routes::RouteInfo {
             backend: temps_routes::BackendType::Upstream {
                 backends: vec![temps_routes::BackendEntry {
+                    compose_service: None,
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
+                    pinned: None,
                     address: address.into(),
                     container_id: None,
                     container_name: None,
@@ -822,9 +828,17 @@ mod dns_sync_tests {
         RouteInfo {
             backend: BackendType::Upstream {
                 backends: vec![BackendEntry {
+                    compose_service: None,
+                    pinned: None,
                     address: "127.0.0.1:18080".into(),
                     container_id: Some("application-container".into()),
                     container_name: None,
+
+                    node_id: None,
+                    state: Default::default(),
+                    tier: 0,
+                    capacity: None,
+                    check_health: false,
                 }],
                 round_robin_counter: Arc::new(AtomicUsize::new(0)),
             },
@@ -1032,7 +1046,7 @@ mod unavailable_host_tests {
     use pingora_core::upstreams::peer::Peer;
     use pingora_core::ErrorSource;
     use sea_orm::{ActiveModelTrait, Set};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     const CONSOLE: &str = "127.0.0.1:18085";
     const STOPPED_HOST: &str = "stopped-app.example.com";
@@ -1051,9 +1065,7 @@ mod unavailable_host_tests {
         let database = match TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping unavailable-host resolver test: Docker runtime unavailable");
                 return None;
@@ -1180,5 +1192,60 @@ mod unavailable_host_tests {
             .resolve_context("unknown.example.com")
             .await
             .is_none());
+    }
+}
+
+#[cfg(test)]
+mod peer_for_selection_tests {
+    use super::*;
+    use pingora_core::upstreams::peer::Peer;
+
+    fn selection(address: &str, refused: Option<&str>) -> temps_routes::BackendSelection {
+        temps_routes::BackendSelection {
+            in_flight: None,
+            address: address.to_string(),
+            container_id: None,
+            container_name: None,
+            refused: refused.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_refused_backend_fails_the_request_without_a_peer() {
+        let error = match peer_for_selection(selection(
+            "upstream.example.net:443",
+            Some("upstream upstream.example.net:443 is not served: resolves to 127.0.0.1"),
+        )) {
+            Ok(_) => panic!("a refused backend must not produce a peer"),
+            Err(error) => error,
+        };
+        assert_eq!(error.etype(), &ErrorType::HTTPStatus(502));
+    }
+
+    #[test]
+    fn peer_selection_retains_the_reservation_and_releases_it_on_refusal() {
+        use std::sync::atomic::Ordering;
+        use temps_routes::replica_policy::{InFlightGuard, ReplicaState};
+        let state = Arc::new(ReplicaState::default());
+        let mut backend = selection("127.0.0.1:8080", None);
+        backend.in_flight = Some(InFlightGuard::acquire(state.clone()));
+        let peer = peer_for_selection(backend).expect("allowed peer");
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 1);
+        drop(peer);
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 0);
+
+        let mut backend = selection("upstream.example.net:80", Some("upstream refused"));
+        backend.in_flight = Some(InFlightGuard::acquire(state.clone()));
+        assert!(peer_for_selection(backend).is_err());
+        assert_eq!(state.in_flight.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn an_allowed_backend_is_dialled_at_the_selected_address() {
+        let peer = match peer_for_selection(selection("8.8.8.8:443", None)) {
+            Ok(peer) => peer,
+            Err(error) => panic!("allowed backend: {error}"),
+        };
+        assert_eq!(peer.peer.address().to_string(), "8.8.8.8:443");
     }
 }

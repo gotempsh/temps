@@ -13,6 +13,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { getAutofixCapabilityOptions } from '@/api/client/@tanstack/react-query.gen'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import type {
   AutofixCapabilityResponse,
   AutofixSettingsResponse,
@@ -26,7 +27,7 @@ const originalConfig = client.getConfig()
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
 })
 
 const PROJECT = 7

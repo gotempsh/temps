@@ -25,6 +25,9 @@ pub struct Model {
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
     pub service_id: Option<i32>,
+    /// Immutable resource confinement; absent on legacy account-wide keys.
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

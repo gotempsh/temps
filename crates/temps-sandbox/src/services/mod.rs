@@ -6,9 +6,11 @@
 
 pub mod agent_run_bridge;
 pub mod create_policy;
+pub mod creation_progress;
 pub mod exec;
 pub mod expiration_sweeper;
 pub mod fs;
+pub mod image_preparation;
 pub mod job_tracker;
 pub mod placement;
 pub mod preview_access;

@@ -14,7 +14,7 @@ import {
   useSearchParams,
 } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { CalendarCheck, Clock3, RefreshCw } from 'lucide-react'
+import { CalendarCheck, Clock3 } from 'lucide-react'
 import {
   Button,
   Callout,
@@ -50,11 +50,16 @@ import {
 } from '@/api/client'
 import {
   getCronMonitorOptions,
+  getCronMonitorQueryKey,
   getNotificationDeliveryCoverageOptions,
   getEnvironmentsOptions,
   listCronMonitorsOptions,
+  listCronMonitorsQueryKey,
   listCronMonitorRunsOptions,
+  listCronMonitorRunsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { CodeBlock } from '@/components/ui/code-block'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { readFailureServerDetail } from '@/lib/read-failure'
@@ -202,15 +207,13 @@ function CronList({ project }: { project: ProjectResponse }) {
         actions={
           rows.length > 0 ? (
             <>
-              <Button
-                variant="outline"
-                busy={query.isFetching}
-                busyLabel="Refreshing…"
-                onClick={() => void query.refetch()}
-              >
-                <RefreshCw className="size-4" />
-                Refresh
-              </Button>
+              <RefreshButton
+                queryKeys={[
+                  queryKeyPrefix(listCronMonitorsQueryKey, {
+                    path: { project_id: project.id },
+                  }),
+                ]}
+              />
               <Button asChild>
                 <Link to={`${basePath(project)}/new`}>Create monitor</Link>
               </Button>
@@ -387,6 +390,12 @@ function CronRecord({ project }: { project: ProjectResponse }) {
         }
         actions={
           <>
+            <RefreshButton
+              queryKeys={[
+                getCronMonitorQueryKey({ path }),
+                queryKeyPrefix(listCronMonitorRunsQueryKey, { path }),
+              ]}
+            />
             <Button asChild variant="outline">
               <Link to={`${basePath(project)}/${id}/edit`}>
                 Edit configuration

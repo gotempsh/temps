@@ -40,6 +40,8 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useLocation } from 'react-router'
 import { toast } from 'sonner'
 import { PageHeader } from '@/components/layout/PageContainer'
+import { LocalScreenshotNote } from '@/components/settings/LocalScreenshotNote'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 type SettingsFormData = Pick<
   PlatformSettings,
@@ -203,9 +205,7 @@ export function Settings() {
   const settingsLoaded = Boolean(settings)
   useEffect(() => {
     if (!settingsLoaded || location.hash !== '#public-ingress') return
-    document
-      .getElementById('public-ingress')
-      ?.scrollIntoView({ block: 'center' })
+    scrollToElementId('public-ingress', { block: 'center' })
   }, [settingsLoaded, location.hash])
 
   const onSubmit = async (data: SettingsFormData) => {
@@ -593,6 +593,8 @@ export function Settings() {
                       </SelectContent>
                     </Select>
                   </div>
+
+                  {screenshots.provider === 'local' && <LocalScreenshotNote />}
 
                   {screenshots.provider === 'external' && (
                     <div className="space-y-2">

@@ -101,9 +101,8 @@ impl AuditOperation for GateAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -365,7 +364,7 @@ mod tests {
     struct NoAudit;
     #[async_trait::async_trait]
     impl AuditLogger for NoAudit {
-        async fn create_audit_log(&self, _: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(&self, _: &dyn AuditOperation) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

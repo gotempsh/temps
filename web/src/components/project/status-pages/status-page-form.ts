@@ -22,6 +22,27 @@ export const MAX_INCIDENT_PUBLIC_TITLE_CHARS = 200
 export const MAX_PAGE_URL_CHARS = 2048
 export const DEFAULT_ACCENT_COLOR = '#4f46e5'
 
+/** Console URL of a status page. Pages are platform-level, not per project. */
+export function statusPageUrl(id: number): string {
+  return `/status-pages/${id}`
+}
+
+/** Console URL of the create page, opening its picker on `projectId` if given. */
+export function newStatusPageUrl(projectId?: number): string {
+  return projectId === undefined
+    ? '/status-pages/new'
+    : `/status-pages/new?project=${projectId}`
+}
+
+/** The `?project=` of the create page, ignored unless it is a real project id. */
+export function parseInitialProjectId(
+  value: string | null
+): number | undefined {
+  if (!value || !/^[1-9]\d*$/.test(value)) return undefined
+  const id = Number(value)
+  return Number.isSafeInteger(id) ? id : undefined
+}
+
 export const INCIDENT_SEVERITIES = ['minor', 'major', 'critical'] as const
 
 export const INCIDENT_STATUSES = [

@@ -1,15 +1,24 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
+import { cleanup, render, waitFor } from '@testing-library/react'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
 import type { DeploymentWithoutResolver } from '@/api/client'
 import {
   ClusterDnsCoverageRows,
   ClusterDnsStaleAlert,
+  ClusterDnsStaleBanner,
 } from './ClusterDnsCoverage'
 import { staleBannerMessage } from '@/lib/cluster-dns-coverage'
+import { collectRouteQueryFailures } from '@/lib/route-query-failures'
+import { installBrowserWindow } from '@/test/dom'
+import { jsonResponse, mockApi } from '@/test/fetch-mock'
+
+installBrowserWindow()
+afterEach(cleanup)
 
 const entry: DeploymentWithoutResolver = {
   deployment_id: 41,
@@ -59,5 +68,33 @@ describe('staleBannerMessage', () => {
     expect(staleBannerMessage(['staging', 'production'])).toContain(
       'Redeploy them to fix this.'
     )
+  })
+})
+
+describe('ClusterDnsStaleBanner for a role that cannot read the status', () => {
+  test('renders nothing and is not reported as a failure of the page', async () => {
+    const api = mockApi({
+      'GET /cluster/dns/status': () =>
+        jsonResponse(
+          { title: 'Access denied', detail: 'settings:read required' },
+          403
+        ),
+    })
+    const client = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    })
+    const view = render(
+      <QueryClientProvider client={client}>
+        <MemoryRouter>
+          <ClusterDnsStaleBanner projectId={7} />
+        </MemoryRouter>
+      </QueryClientProvider>
+    )
+    await waitFor(() =>
+      expect(client.getQueryCache().findAll()[0]?.state.status).toBe('error')
+    )
+    expect(view.container.innerHTML).toBe('')
+    expect(collectRouteQueryFailures(client)).toEqual([])
+    api.restore()
   })
 })

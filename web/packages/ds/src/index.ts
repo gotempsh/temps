@@ -102,7 +102,8 @@ export {
 export { SettingsGroup } from './settings-group'
 export { SaveRow, saveRowClassName } from './save-row'
 
-export { RecordLink } from './record-link'
+export { RecordLink, RecordListItem, RecordRow } from './record-link'
+export { followsRecordLink } from './lib/follows-record-link'
 
 export {
   Tabs,

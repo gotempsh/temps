@@ -26,7 +26,7 @@ All use `TEMPS_` prefix:
 
 | Variable | Default | Required |
 |---|---|---|
-| `TEMPS_DATABASE_URL` | -- | Yes |
+| `TEMPS_DATABASE_URL` | -- | No. `serve`, `proxy` and `setup` need a database URL from this, `--database-url`, `TEMPS_DATABASE_URL_FILE` or the `temps_database_url` credential; admin commands also fall back to the installed service's URL |
 | `TEMPS_ADDRESS` | `127.0.0.1:3000` | No |
 | `TEMPS_TLS_ADDRESS` | -- | No |
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |

@@ -13,7 +13,13 @@ import {
   CommandPaletteSuggestions,
   indexedMainNavItems,
   projectNavItems,
+  projectNavItemsFor,
 } from './CommandPalette'
+import { INTERNAL_ACCESS_SECTION_ID } from '@/components/project/settings/internal-access'
+import {
+  platformSettingNavigationItems,
+  settingsPageNavigationItems,
+} from '@/lib/command-navigation-catalog'
 import { NAV_FUSE_OPTIONS } from './nav-search'
 
 describe('CommandPaletteSuggestions', () => {
@@ -38,11 +44,41 @@ describe('CommandPaletteSuggestions', () => {
 })
 
 describe('navigation search', () => {
+  test('branding searches open the platform response privacy setting', () => {
+    const fuse = new Fuse(
+      [...settingsPageNavigationItems, ...platformSettingNavigationItems],
+      NAV_FUSE_OPTIONS
+    )
+    for (const query of ['branding', 'response privacy', 'fingerprinting']) {
+      const [first] = fuse.search(query)
+      expect(first?.item.url).toBe(
+        '/settings/security#setting-response-branding'
+      )
+    }
+    expect(
+      projectNavItems.some((item) =>
+        item.url.includes('setting-response-branding')
+      )
+    ).toBe(false)
+  })
+
   test('typing "Cluster DNS" finds the Cluster DNS card first', () => {
     const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
     const [first] = fuse.search('Cluster DNS')
     expect(first?.item.title).toBe('Cluster DNS')
     expect(first?.item.url).toBe(CLUSTER_DNS_URL)
+  })
+
+  test('the setup checklist stays reachable after its sidebar card is hidden', () => {
+    const fuse = new Fuse(indexedMainNavItems, NAV_FUSE_OPTIONS)
+    for (const query of [
+      'Finish setting up',
+      'platform setup',
+      'setup checklist',
+    ]) {
+      const [first] = fuse.search(query)
+      expect(first?.item.url).toBe('/setup')
+    }
   })
 
   test('the card is also found by what it does', () => {
@@ -70,6 +106,21 @@ describe('project pages in the palette', () => {
         url: tab.url,
         icon: tab.icon,
       })
+    }
+  })
+
+  test('a project finds its Internal access card by name and by temps.local', () => {
+    const items = projectNavItemsFor({ source_type: 'git', preset: 'nextjs' })
+    const fuse = new Fuse(items, NAV_FUSE_OPTIONS)
+    for (const query of ['internal access', 'temps.local']) {
+      const [first] = fuse.search(query)
+      expect({ query, title: first?.item.title, url: first?.item.url }).toEqual(
+        {
+          query,
+          title: 'Internal access',
+          url: `settings/security#${INTERNAL_ACCESS_SECTION_ID}`,
+        }
+      )
     }
   })
 })

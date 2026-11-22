@@ -13,9 +13,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub name: String,
+    #[serde(skip_serializing)]
     pub token_hash: String,
     /// Encrypted plaintext token (AES-256-GCM via EncryptionService)
     /// Used by control plane to authenticate with the agent for remote deployments
+    #[serde(skip_serializing)]
     pub token_encrypted: Option<String>,
     /// Agent API address, e.g. "https://203.0.113.50:3100"
     pub address: String,
@@ -146,6 +148,9 @@ pub struct Model {
     /// (`network_config.docker_network_name`), ADR 059. Set when the node
     /// joined on a host that already had a network of the cluster's name.
     pub overlay_network_name: Option<String>,
+    /// The VXLAN network ID this node's agent reports it follows (ADR 062).
+    /// `None`: never reported, an agent older than per-cluster network IDs.
+    pub overlay_vxlan_vni: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }
@@ -270,6 +275,21 @@ impl Model {
         )
     }
 
+    /// How values may be sent to this node's agent: sealed to its key, or
+    /// refused when it has none or is only reachable over plain `http://`.
+    pub fn request_sealing(&self) -> temps_core::sealed_request::NodeSealing {
+        temps_core::sealed_request::NodeSealing::for_agent(
+            &self.agent_endpoint().dial_url,
+            self.edge_public_key.as_deref(),
+        )
+    }
+
+    /// A Mac worker (ADR 090): it reports so in its heartbeat. It goes
+    /// offline while the Mac sleeps and reconnects on its own.
+    pub fn is_mac_worker(&self) -> bool {
+        temps_core::node_address::capacity_is_mac_worker(&self.capacity)
+    }
+
     /// Deployment ids this node last reported running without its cluster
     /// resolver; empty when it has not reported or the value is malformed.
     pub fn deployments_without_resolver(&self) -> Vec<i64> {
@@ -353,9 +373,23 @@ mod tests {
             overlay_ready_cidr: None,
             overlay_remediation: None,
             overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: now,
             updated_at: now,
         }
+    }
+
+    #[test]
+    fn serializing_a_node_leaves_out_its_token_columns() {
+        let mut model = node("10.0.0.5", None);
+        model.token_hash = "stored-token-hash".into();
+        model.token_encrypted = Some("stored-token-ciphertext".into());
+
+        let json = serde_json::to_string(&model).expect("serializes");
+
+        assert!(!json.contains("stored-token-hash"), "{json}");
+        assert!(!json.contains("stored-token-ciphertext"), "{json}");
+        assert!(json.contains("worker-1"), "{json}");
     }
 
     #[test]

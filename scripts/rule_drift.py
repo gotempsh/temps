@@ -185,7 +185,9 @@ def matching_brace(masked: str, open_index: int) -> int:
     return len(masked) - 1
 
 
-_CFG_TEST = re.compile(r"^(\s*)#\[cfg\(test\)\]\s*$")
+# Helpers shared between crates' tests sit behind a `test-support` feature that
+# only dev-dependencies turn on, so they are test code too.
+_CFG_TEST = re.compile(r'^(\s*)#\[cfg\((?:test|any\(test, feature = "test-support"\))\)\]\s*$')
 _OUT_OF_LINE_MOD = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;")
 
 
@@ -321,7 +323,7 @@ def _out_of_line_test_files(crate_dir: Path) -> set[Path]:
             text = path.read_text(encoding="utf-8")
         except (OSError, UnicodeDecodeError):
             continue
-        if "#[cfg(test)]" not in text:
+        if "#[cfg(test)]" not in text and 'feature = "test-support"' not in text:
             continue
         _, modules = strip_test_items(text)
         if not modules:

@@ -27,7 +27,6 @@
 //! (default: `false`).  `GET /mcp/tools` returns `404` when the flag is off,
 //! signalling the wizard that MCP is not yet configured on this instance.
 
-pub mod access;
 pub mod audit;
 pub mod error;
 pub mod handlers;
@@ -35,7 +34,7 @@ pub mod plugin;
 pub mod proposal;
 pub mod protocol;
 pub mod registry;
-pub mod tools;
+mod virtual_cli;
 
 use std::sync::Arc;
 
@@ -44,9 +43,6 @@ use axum::{
     Router,
 };
 use temps_config::ConfigService;
-use temps_core::project_access::ProjectAccessChecker;
-use temps_deployments::DeploymentService;
-use temps_projects::ProjectService;
 
 pub use plugin::McpServerPlugin;
 
@@ -54,24 +50,12 @@ use proposal::ProposalStore;
 
 /// Shared state injected into every MCP handler.
 pub struct McpHandlerState {
-    pub project_service: Arc<ProjectService>,
-    pub deployment_service: Arc<DeploymentService>,
+    pub(crate) virtual_cli: std::sync::OnceLock<Arc<virtual_cli::VirtualCli>>,
     pub config_service: Arc<ConfigService>,
     /// In-memory store for propose-then-confirm tokens.
     pub proposals: Arc<ProposalStore>,
-    /// Audit sink for MCP-executed write actions (e.g. `confirm_action` ->
-    /// `trigger_deployment`). CLAUDE.md requires audit logging on every write.
+    /// Audit sink for confirmed virtual CLI writes.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
-    /// Optional project-scoped access checker.  `None` on instances without
-    /// RBAC/team-based access configured — the absence means "allow all",
-    /// matching the OSS default.  Retrieved via `get_service` (not
-    /// `require_service`) because this dependency is legitimately optional.
-    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
-    /// Project edge rules (ADR-089). Set when plugins initialise: the proxy
-    /// plugin that provides it registers after this one. Initialisation fails
-    /// if it is missing, so it is always set once requests are served.
-    pub edge_rule_service:
-        std::sync::OnceLock<Arc<temps_proxy::service::edge_rule_service::EdgeRuleService>>,
 }
 
 /// The two sub-routers returned by [`build_mcp_routers`].

@@ -14,7 +14,7 @@ homepage.workspace = true
 # Guest-side agent for Firecracker sandboxes (ADR-029 §5). The binary runs
 # as PID 1 inside the microVM and serves exec/fs RPCs over vsock; the lib
 # target exposes the wire protocol types so the host-side provider in
-# `temps-ai-agents` speaks the same schema. Keep dependencies minimal and pure
+# `temps-sandbox-providers` speaks the same schema. Keep dependencies minimal and pure
 # Rust — this must build as a fully static musl binary that runs on any
 # guest image (glibc, musl, distroless).
 

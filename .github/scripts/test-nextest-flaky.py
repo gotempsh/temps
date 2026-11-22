@@ -10,6 +10,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import re
 import tempfile
 import tomllib
 import unittest
@@ -141,6 +142,25 @@ class NextestFlakyTests(unittest.TestCase):
         self.assertEqual(ci["retries"]["count"], 2)
         self.assertEqual(ci["junit"]["path"], "junit.xml")
         self.assertEqual(config["test-groups"][flaky.GROUP], {"max-threads": 1})
+
+    def test_every_user_of_the_shared_sandbox_image_runs_one_at_a_time(self) -> None:
+        config = tomllib.loads((REPO_ROOT / ".config/nextest.toml").read_text(encoding="utf-8"))
+        self.assertEqual(config["test-groups"]["sandbox-image"], {"max-threads": 1})
+        overrides = config["profile"]["default"]["overrides"]
+        group = next(o for o in overrides if o.get("test-group") == "sandbox-image")
+        # 20 minutes: a cold image build plus the test.
+        self.assertEqual(group["slow-timeout"], {"period": "120s", "terminate-after": 10})
+        # The first match wins per setting: `apply` appends below this one.
+        self.assertLess(overrides.index(group), len(overrides) - 1)
+
+        source = (REPO_ROOT / "crates/temps-sandbox-providers/src/docker/tests.rs").read_text(encoding="utf-8")
+        users = {
+            name
+            for name, body in re.findall(r"^#\[tokio::test\]\nasync fn (\w+)\(\) \{\n(.*?)^\}", source, re.M | re.S)
+            if "sandbox_image_is_ready(" in body or "ensure_image" in body
+        }
+        self.assertIn("test_pull_fallback_on_missing_hub_image", users)
+        self.assertEqual(set(re.findall(r"test\(=docker::tests::(\w+)\)", group["filter"])), users)
 
 
 if __name__ == "__main__":

@@ -3,8 +3,8 @@
 
 use chrono::Utc;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Order, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ActiveValue::NotSet, ColumnTrait, DatabaseConnection, EntityTrait, Order,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
@@ -13,23 +13,10 @@ use temps_entities::{agent_run_logs, agent_runs};
 
 use crate::error::AgentError;
 
-/// Non-terminal run statuses: a run in one of these states is in-flight.
-/// Used for concurrency counting and restart recovery.
-pub const ACTIVE_RUN_STATUSES: &[&str] = &[
-    "pending",
-    "cloning",
-    "analyzing",
-    "fixing",
-    "pushing",
-    "creating_pr",
-    "deploying",
-];
+pub use temps_agent_core::run_status::{ACTIVE_RUN_STATUSES, TERMINAL_RUN_STATUSES};
 
-/// Terminal run statuses: once a run reaches one of these it never
-/// transitions again. Consumers outside this crate (e.g. the sandbox
-/// plugin's orphaned agent-run sandbox cleanup) rely on this to decide
-/// when resources attributed to a run can safely be released.
-pub const TERMINAL_RUN_STATUSES: &[&str] = &["completed", "failed", "no_fix", "cancelled"];
+/// The status of a run the user cancelled. Nothing moves a run out of it.
+const CANCELLED_STATUS: &str = "cancelled";
 
 /// Fields that can be updated when changing a run's status.
 #[derive(Default)]
@@ -356,12 +343,29 @@ impl AgentRunService {
         self.forget_secret_values(run_id);
     }
 
+    /// Write `fields` to the run. A cancelled run stays cancelled: its status,
+    /// phase, error and completion time are not overwritten, including by a
+    /// cancel that lands between the read and the write here.
+    ///
+    /// A step moving the run on to another active status gets
+    /// [`AgentError::RunCancelled`], so the run stops at that step. A late
+    /// finish (a terminal status) succeeds and returns the cancelled row, with
+    /// what the finished work produced (tokens, cost, output) still recorded:
+    /// that spend happened.
     pub async fn update_status(
         &self,
         run_id: i32,
         fields: UpdateRunFields,
     ) -> Result<agent_runs::Model, AgentError> {
         let run = self.get_run(run_id).await?;
+        let was_cancelled = run.status == CANCELLED_STATUS;
+        let moves_run_on = fields
+            .status
+            .as_deref()
+            .is_some_and(|status| !TERMINAL_RUN_STATUSES.contains(&status));
+        if was_cancelled && moves_run_on {
+            return Err(AgentError::RunCancelled { run_id });
+        }
         let mut active: agent_runs::ActiveModel = run.into();
         let mut fields = fields;
         if let Some(values) = self.secret_values_for(run_id) {
@@ -447,12 +451,31 @@ impl AgentRunService {
             active.workspace_volume = Set(Some(workspace_volume));
         }
 
-        let model = active
+        if !was_cancelled {
+            let updated = agent_runs::Entity::update_many()
+                .set(active.clone())
+                .filter(agent_runs::Column::Id.eq(run_id))
+                .filter(agent_runs::Column::Status.ne(CANCELLED_STATUS))
+                .exec_with_returning(self.db.as_ref())
+                .await
+                .map_err(AgentError::Database)?;
+            if let Some(model) = updated.into_iter().next() {
+                return Ok(model);
+            }
+            // Cancelled after the read above.
+            if moves_run_on {
+                return Err(AgentError::RunCancelled { run_id });
+            }
+        }
+
+        active.status = NotSet;
+        active.phase = NotSet;
+        active.error_message = NotSet;
+        active.completed_at = NotSet;
+        active
             .update(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)?;
-
-        Ok(model)
+            .map_err(AgentError::Database)
     }
 
     pub async fn list_runs(
@@ -722,28 +745,39 @@ impl AgentRunService {
         Ok(count)
     }
 
-    /// Cancel an active run by setting status to "cancelled".
+    /// Record that an active run is cancelled, unless it reached a terminal
+    /// status first. This only writes the row: the run's next status write
+    /// stops it (see [`Self::update_status`]), and
+    /// [`AgentExecutor::cancel_run`](crate::services::executor::AgentExecutor::cancel_run)
+    /// also stops its sandbox, so call that to cancel a running run.
     pub async fn cancel_run(&self, run_id: i32) -> Result<agent_runs::Model, AgentError> {
         let run = self.get_run(run_id).await?;
+        let already_terminal = |status: &str| AgentError::Validation {
+            message: format!("Run {run_id} is already in terminal state '{status}'"),
+        };
 
         if TERMINAL_RUN_STATUSES.contains(&run.status.as_str()) {
-            return Err(AgentError::Validation {
-                message: format!(
-                    "Run {} is already in terminal state '{}'",
-                    run_id, run.status
-                ),
-            });
+            return Err(already_terminal(&run.status));
         }
 
-        let mut active: agent_runs::ActiveModel = run.into();
-        active.status = Set("cancelled".to_string());
-        active.error_message = Set(Some("Cancelled by user".to_string()));
-        active.completed_at = Set(Some(chrono::Utc::now()));
-
-        active
-            .update(self.db.as_ref())
+        let updated = agent_runs::Entity::update_many()
+            .set(agent_runs::ActiveModel {
+                status: Set(CANCELLED_STATUS.to_string()),
+                error_message: Set(Some("Cancelled by user".to_string())),
+                completed_at: Set(Some(chrono::Utc::now())),
+                ..Default::default()
+            })
+            .filter(agent_runs::Column::Id.eq(run_id))
+            .filter(agent_runs::Column::Status.is_not_in(TERMINAL_RUN_STATUSES.iter().copied()))
+            .exec_with_returning(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?;
+
+        match updated.into_iter().next() {
+            Some(model) => Ok(model),
+            // The run finished after the read above; its outcome stands.
+            None => Err(already_terminal(&self.get_run(run_id).await?.status)),
+        }
     }
 
     /// Count runs in active (non-terminal) states for a project.
@@ -867,6 +901,239 @@ mod tests {
             status: status.to_string(),
             ..make_run(id, project_id)
         }
+    }
+
+    fn finished_fields() -> UpdateRunFields {
+        UpdateRunFields {
+            status: Some("completed".to_string()),
+            phase: Some("completed".to_string()),
+            error_message: Some("late".to_string()),
+            completed_at: Some(Utc::now()),
+            tokens_input: Some(7),
+            ..Default::default()
+        }
+    }
+
+    /// The SQL the service sent, one statement per entry.
+    fn statements(db: DatabaseConnection) -> Vec<String> {
+        db.into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| statement.sql.clone())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_late_finish_keeps_the_cancelled_outcome_and_records_the_spend() {
+        let cancelled = make_run_with_status(1, 42, "cancelled");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![cancelled.clone()]]) // get_run
+                .append_query_results(vec![vec![cancelled]]) // UPDATE
+                .into_connection(),
+        );
+        let svc = AgentRunService::new(db.clone());
+
+        let run = svc
+            .update_status(1, finished_fields())
+            .await
+            .expect("a late finish is not an error");
+        drop(svc);
+
+        assert_eq!(run.status, "cancelled");
+        let db = Arc::into_inner(db).expect("only reference");
+        let log = statements(db);
+        let update = log.last().expect("an UPDATE was sent");
+        assert!(update.starts_with("UPDATE"), "{update}");
+        assert!(update.contains("\"tokens_input\" ="), "{update}");
+        for outcome in ["status", "phase", "error_message", "completed_at"] {
+            assert!(
+                !update.contains(&format!("\"{outcome}\" =")),
+                "a late finish wrote {outcome}: {update}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancel_landing_during_a_finish_is_not_overwritten() {
+        let cancelled = make_run_with_status(1, 42, "cancelled");
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_run_with_status(1, 42, "fixing")]]) // get_run
+                // The guarded write matches nothing: the row is cancelled now.
+                .append_query_results(vec![Vec::<agent_runs::Model>::new()])
+                .append_query_results(vec![vec![cancelled]]) // the outcome-free write
+                .into_connection(),
+        );
+        let svc = AgentRunService::new(db.clone());
+
+        let run = svc
+            .update_status(1, finished_fields())
+            .await
+            .expect("a late finish is not an error");
+        drop(svc);
+
+        assert_eq!(run.status, "cancelled");
+        let db = Arc::into_inner(db).expect("only reference");
+        let log = statements(db);
+        assert!(
+            log[1].contains("\"status\" <> $"),
+            "the finishing write must be conditional on the status: {}",
+            log[1]
+        );
+        assert!(!log[2].contains("\"status\" ="), "{}", log[2]);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_cannot_move_to_another_active_status() {
+        for status in ["analyzing", "pushing", "fix_ready"] {
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_run_with_status(3, 42, "cancelled")]])
+                .into_connection();
+            let svc = AgentRunService::new(Arc::new(db));
+
+            let result = svc
+                .update_status(
+                    3,
+                    UpdateRunFields {
+                        status: Some(status.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            assert!(
+                matches!(result, Err(AgentError::RunCancelled { run_id: 3 })),
+                "{status}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_step_that_loses_the_race_with_a_cancel_stops_the_run() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run_with_status(3, 42, "cloning")]])
+            .append_query_results(vec![Vec::<agent_runs::Model>::new()])
+            .into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+
+        let result = svc
+            .update_status(
+                3,
+                UpdateRunFields {
+                    status: Some("analyzing".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(AgentError::RunCancelled { run_id: 3 })
+        ));
+    }
+
+    #[tokio::test]
+    async fn cancel_keeps_the_outcome_of_a_run_that_finished_first() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run_with_status(4, 42, "fixing")]])
+            .append_query_results(vec![Vec::<agent_runs::Model>::new()]) // guarded write
+            .append_query_results(vec![vec![make_run_with_status(4, 42, "completed")]])
+            .into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+
+        let error = svc.cancel_run(4).await.expect_err("already finished");
+
+        assert!(
+            matches!(&error, AgentError::Validation { message } if message.contains("completed")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_refuses_a_run_that_already_finished() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_run_with_status(5, 42, "failed")]])
+            .into_connection();
+        let svc = AgentRunService::new(Arc::new(db));
+
+        let error = svc.cancel_run(5).await.expect_err("already finished");
+
+        assert!(
+            matches!(&error, AgentError::Validation { message } if message.contains("failed")),
+            "{error}"
+        );
+    }
+
+    /// The same guard against PostgreSQL: the mock tests above cannot run the
+    /// `WHERE` clause they assert on.
+    #[tokio::test]
+    async fn a_cancelled_run_stays_cancelled_in_the_database() {
+        use sea_orm::ActiveModelTrait as _;
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(database) => database,
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Docker not available, skipping: {error}");
+                return;
+            }
+            Err(error) => panic!("failed to start the test database: {error}"),
+        };
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("cancel-guard".to_string()),
+            slug: Set("cancel-guard".to_string()),
+            repo_name: Set("cancel-guard".to_string()),
+            repo_owner: Set("owner".to_string()),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("insert project");
+        let run = agent_runs::ActiveModel {
+            project_id: Set(project.id),
+            trigger_type: Set("manual".to_string()),
+            status: Set("fixing".to_string()),
+            source: Set("committed".to_string()),
+            ..Default::default()
+        }
+        .insert(test_db.connection())
+        .await
+        .expect("insert run");
+        let svc = AgentRunService::new(test_db.connection_arc());
+
+        let cancelled = svc.cancel_run(run.id).await.expect("cancel");
+        assert_eq!(cancelled.status, "cancelled");
+
+        let after_finish = svc
+            .update_status(run.id, finished_fields())
+            .await
+            .expect("a late finish is not an error");
+        assert_eq!(after_finish.status, "cancelled");
+        assert_eq!(
+            after_finish.error_message.as_deref(),
+            Some("Cancelled by user")
+        );
+        assert_eq!(after_finish.completed_at, cancelled.completed_at);
+        assert_eq!(after_finish.phase, None);
+        assert_eq!(after_finish.tokens_input, 7);
+
+        svc.record_run_failure(run.id, "late failure".to_string(), "late failure")
+            .await;
+        let after_failure = svc.get_run(run.id).await.expect("load");
+        assert_eq!(after_failure.status, "cancelled");
+        assert_eq!(
+            after_failure.error_message.as_deref(),
+            Some("Cancelled by user")
+        );
+
+        let error = svc.cancel_run(run.id).await.expect_err("already cancelled");
+        assert!(matches!(error, AgentError::Validation { .. }), "{error}");
     }
 
     #[tokio::test]

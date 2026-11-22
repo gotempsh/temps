@@ -57,6 +57,19 @@ pub enum ResolverError {
     #[error("Invalid record type {value:?} in record for {fqdn}")]
     InvalidRecordType { fqdn: String, value: String },
 
+    #[error("Invalid DNS name {name:?}: {reason}")]
+    InvalidQueryName { name: String, reason: String },
+
+    #[error("Record type {value:?} cannot be tested; supported: {supported}")]
+    UnsupportedQueryType { value: String, supported: String },
+
+    #[error("Test resolution of {name} against {server} failed: {reason}")]
+    TestQueryFailed {
+        name: String,
+        server: String,
+        reason: String,
+    },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }

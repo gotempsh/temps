@@ -3,6 +3,8 @@
 
 import { PageHeader } from '@temps-sdk/ds'
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 
 import { ACTIVATION_SECTION_ANCHOR } from '@/components/observe/CloudTelemetryActivationSection'
@@ -38,8 +40,11 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   getCurrentBulkActivationJobOptions,
   getIngestErrorsOptions,
+  getIngestErrorsQueryKey,
   getPipelineHistoryOptions,
+  getPipelineHistoryQueryKey,
   getPipelineStatsOptions,
+  getPipelineStatsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   BulkActivationJobResponse,
@@ -65,6 +70,7 @@ import {
 } from 'lucide-react'
 import { type MouseEvent, useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
+import { scrollElementToTop } from '@/lib/scroll-to-element'
 
 // ---------------------------------------------------------------------------
 // Trend chart
@@ -540,7 +546,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
   const target = document.getElementById(ACTIVATION_SECTION_ANCHOR)
   if (!target) return
   event.preventDefault()
-  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+  scrollElementToTop(target, { behavior: 'smooth' })
 }
 
 /**
@@ -551,7 +557,7 @@ function scrollToActivation(event: MouseEvent<HTMLAnchorElement>) {
  * not have to scroll past four charts to discover that an activation is moving
  * them to Cloud right now.
  */
-function ActivationJumpLink({
+export function ActivationJumpLink({
   job,
 }: {
   job: BulkActivationJobResponse | null | undefined
@@ -674,6 +680,15 @@ export function OtelPipelineStatusPage() {
             metrics store every {sampleIntervalSeconds}&nbsp;s and can trigger
             alarms.
           </>
+        }
+        actions={
+          <RefreshButton
+            queryKeys={[
+              queryKeyPrefix(getPipelineStatsQueryKey),
+              queryKeyPrefix(getPipelineHistoryQueryKey),
+              queryKeyPrefix(getIngestErrorsQueryKey),
+            ]}
+          />
         }
       />
 

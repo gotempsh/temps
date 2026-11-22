@@ -3,7 +3,7 @@
 
 import { getProjectsOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useIsMobile } from '@/components/hooks/use-mobile'
-import { ProjectAvatar } from '@/components/project/ProjectAvatar'
+import { ServiceIcon } from '@/components/project/ServiceIcon'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import {
@@ -87,11 +87,7 @@ function ProjectChoices({
                 onClick={() => onChoose(project)}
                 className="flex w-full items-center gap-2 rounded-md px-2 py-2 text-left hover:bg-accent"
               >
-                <ProjectAvatar
-                  name={project.name}
-                  className="size-6 rounded-md"
-                  fallbackClassName="rounded-md bg-primary/10 text-xs text-primary"
-                />
+                <ServiceIcon service={project} size="sm" />
                 <span className="min-w-0 flex-1">
                   <span className="block truncate text-sm font-medium">
                     {project.name}

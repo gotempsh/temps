@@ -20,7 +20,7 @@
 //!   `permission_guard!` runs, against the real acting user, and its audit
 //!   log is written where every other write is logged.
 //! - **No new credential.** Identity arrives as an actor token the platform
-//!   itself minted (see [`temps_core::external_plugin::actor`]), not as an
+//!   itself minted (see [`crate::actor`]), not as an
 //!   API key the plugin holds.
 //!
 //! ## Why this injects `AuthContext` rather than replaying a session
@@ -38,6 +38,7 @@
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use crate::actor::{verify_plugin_actor_token, ActorPrincipal};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum::Router;
@@ -46,12 +47,11 @@ use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_auth::context::AuthContext;
 use temps_auth::permissions::{Permission, Role};
 use temps_auth::UserService;
-use temps_core::external_plugin::actor::{verify_plugin_actor_token, ActorPrincipal};
-use temps_core::external_plugin::channel::{
+use temps_core::CookieCrypto;
+use temps_plugin_protocol::channel::{
     ApiCall, ApiCallResult, CallBody, ChannelError, ChannelErrorCode, JsonBody, MultipartPart,
     PartContent, VerifiedPluginApiCaller, MAX_CALL_BODY_BYTES,
 };
-use temps_core::CookieCrypto;
 use tower::ServiceExt;
 use tracing::{debug, warn};
 
@@ -287,7 +287,9 @@ impl RouterHostApi {
                     permissions,
                     key.name,
                     key.id,
-                ))
+                ).with_api_key_scope(temps_auth::context::ApiKeyScope::from_ids(key.project_id, key.environment_id)
+                    .map_err(|error| ChannelError::new(ChannelErrorCode::Unauthenticated,
+                        format!("API key {key_id} has an invalid resource scope for plugin '{plugin}': {error}")))?))
             }
         }
     }
@@ -513,11 +515,11 @@ impl HostApiBridge for RouterHostApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::actor::{encode_plugin_actor_token, PLUGIN_ACTOR_TOKEN_TTL};
     use chrono::{Duration as ChronoDuration, Utc};
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_auth::context::AuthSource;
-    use temps_core::external_plugin::actor::{encode_plugin_actor_token, PLUGIN_ACTOR_TOKEN_TTL};
-    use temps_core::external_plugin::channel::{ActorToken, BinaryPayload, HttpMethod};
+    use temps_plugin_protocol::channel::{ActorToken, BinaryPayload, HttpMethod};
 
     const TEST_PLUGIN: &str = "security-test-plugin";
 
@@ -568,6 +570,8 @@ mod tests {
     fn api_key(expires_at: Option<chrono::DateTime<Utc>>) -> temps_entities::api_keys::Model {
         let now = Utc::now();
         temps_entities::api_keys::Model {
+            project_id: None,
+            environment_id: None,
             id: 9,
             name: "restricted-plugin-key".to_string(),
             key_hash: "hash".to_string(),

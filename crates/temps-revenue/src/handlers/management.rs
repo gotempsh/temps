@@ -18,7 +18,7 @@ use axum::{
 };
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, project_access_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::secret_string::SecretString;
@@ -413,7 +413,7 @@ fn analytics_error_to_problem(err: AnalyticsError) -> Problem {
 /// Project-scoped revenue endpoints keep their `ProjectsRead` +
 /// `project_access_guard!` gate and are unaffected.
 fn require_instance_admin_for_global_revenue(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     operation: &str,
 ) -> Result<(), Problem> {
     if auth.is_instance_admin() {
@@ -1310,7 +1310,7 @@ pub fn configure_management_routes() -> Router<Arc<ManagementState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_auth::{AuthContext, Role};
+    use temps_authz::{AuthContext, Role};
     use temps_entities::users;
 
     fn test_user(id: i32) -> users::Model {
@@ -1348,7 +1348,7 @@ mod tests {
         let auth = AuthContext::new_session(test_user(2), Role::User);
         // The user role holds ProjectsRead, which is exactly why the old
         // guard alone let it read install-wide financials.
-        assert!(auth.has_permission(&temps_auth::Permission::ProjectsRead));
+        assert!(auth.has_permission(&temps_authz::Permission::ProjectsRead));
         let problem = require_instance_admin_for_global_revenue(&auth, "global MRR")
             .expect_err("a regular user must not read install-wide revenue");
         assert_eq!(problem.status_code, StatusCode::FORBIDDEN);

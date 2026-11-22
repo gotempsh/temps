@@ -1010,7 +1010,7 @@ fn summarize_decision(decision: &Decision, names: &HashMap<i32, String>) -> Stri
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     pub(crate) async fn database() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

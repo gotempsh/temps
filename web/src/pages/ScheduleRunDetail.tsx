@@ -34,6 +34,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -58,7 +59,7 @@ import {
   listScheduleRunJobsOptions,
 } from '@/lib/schedule-runs'
 import { formatBytes } from '@/lib/utils'
-import { PageState } from '@temps-sdk/ds'
+import { Callout, PageState } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
@@ -67,7 +68,6 @@ import {
   DatabaseBackup,
   Loader2,
   MoreHorizontal,
-  RefreshCw,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
@@ -139,8 +139,9 @@ export function ScheduleRunDetail() {
     data: jobs,
     isPending: isJobsPending,
     isError: isJobsError,
-    isFetching: isJobsFetching,
     error: jobsError,
+    refetch: refetchJobs,
+    isFetching: isFetchingJobs,
   } = useQuery({
     ...jobsQueryOptions,
     // Auto-refresh every 5s while any child is still pending/running. The
@@ -355,6 +356,7 @@ export function ScheduleRunDetail() {
           </div>
 
           <div className="flex items-center gap-2 sm:shrink-0">
+            <RefreshButton queryKeys={[jobsQueryOptions.queryKey]} />
             {/* Cancel run — only when at least one child is still live.
                 Refreshing while cancelling is fine, the mutation invalidates
                 the jobs query on success. */}
@@ -376,32 +378,6 @@ export function ScheduleRunDetail() {
                 <span className="max-sm:sr-only">Cancel run</span>
               </Button>
             )}
-
-            <Tooltip>
-              <TooltipTrigger asChild>
-                <Button
-                  variant="outline"
-                  size="icon"
-                  className="shrink-0"
-                  onClick={() => {
-                    void queryClient.invalidateQueries({
-                      queryKey: jobsQueryOptions.queryKey,
-                    })
-                  }}
-                  disabled={isJobsFetching}
-                  aria-label="Refresh run"
-                >
-                  <RefreshCw
-                    className={`h-4 w-4 ${isJobsFetching ? 'animate-spin' : ''}`}
-                  />
-                </Button>
-              </TooltipTrigger>
-              <TooltipContent side="bottom">
-                {aggregateState === 'running' || aggregateState === 'pending'
-                  ? 'Refresh (auto-refreshing every 5s)'
-                  : 'Refresh'}
-              </TooltipContent>
-            </Tooltip>
           </div>
         </div>
 
@@ -426,7 +402,7 @@ export function ScheduleRunDetail() {
                       <Skeleton key={i} className="h-10 w-full" />
                     ))}
                   </div>
-                ) : isJobsError ? (
+                ) : isJobsError && !jobs ? (
                   <div className="px-4 pb-6 text-base text-destructive sm:px-6 sm:text-sm">
                     Failed to load jobs:{' '}
                     {jobsError instanceof Error
@@ -440,6 +416,22 @@ export function ScheduleRunDetail() {
                   </div>
                 ) : (
                   <div className="overflow-x-auto">
+                    {isJobsError ? (
+                      // A failed refresh keeps the loaded jobs.
+                      <div className="px-4 pb-4 sm:px-6">
+                        <Callout tone="error" title="Couldn't refresh jobs">
+                          Showing the last loaded jobs.{' '}
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => void refetchJobs()}
+                            disabled={isFetchingJobs}
+                          >
+                            Retry jobs
+                          </Button>
+                        </Callout>
+                      </div>
+                    ) : null}
                     <Table className="min-w-[560px]">
                       <TableHeader>
                         <TableRow>

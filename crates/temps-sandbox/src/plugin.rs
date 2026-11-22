@@ -17,12 +17,12 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use temps_ai_agents::sandbox::SandboxProvider;
 use temps_config::ConfigService;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_git::GitProviderManager;
+use temps_sandbox_providers::SandboxProvider;
 use tracing::{debug, info, warn};
 use utoipa::OpenApi;
 
@@ -33,7 +33,7 @@ use crate::services::placement::{NodeProbe, ResolverNodeProbe};
 use crate::services::registry::{SandboxNodeLookup, StandaloneSandboxRegistry};
 use crate::services::sandbox_service::SandboxService;
 use crate::services::snapshot_service::SnapshotService;
-use temps_ai_agents::sandbox::node_routing::DbRemoteNodeResolver;
+use temps_sandbox_providers::node_routing::DbRemoteNodeResolver;
 
 pub struct SandboxPlugin;
 
@@ -135,8 +135,11 @@ impl TempsPlugin for SandboxPlugin {
             // SnapshotService (ADR-037): wired with the same provider and
             // registry the sandbox service uses. Created first so it can be
             // injected into SandboxService for the destroy→nullify path.
-            let snapshot_service =
-                Arc::new(SnapshotService::new(db.clone(), registry.clone(), provider));
+            let snapshot_service = Arc::new(SnapshotService::new(
+                db.clone(),
+                registry.clone(),
+                provider.clone(),
+            ));
             context.register_service(snapshot_service.clone());
 
             // ADR 063: on a control plane that runs no workloads, sandboxes
@@ -163,6 +166,19 @@ impl TempsPlugin for SandboxPlugin {
             let network_reconciler: Arc<dyn temps_core::ApplicationDataNetworkReconciler> =
                 service.clone();
             context.register_service(network_reconciler);
+
+            // Pre-pulling the default sandbox image on the hosts that run
+            // sandboxes, under the policy stored per host. Through the same
+            // provider every create goes through, so a create joins a pull
+            // this service started instead of starting a second one.
+            let image_preparation = Arc::new(
+                crate::services::image_preparation::ImagePreparationService::new(
+                    db.clone(),
+                    provider,
+                    service.clone(),
+                ),
+            );
+            context.register_service(image_preparation);
             context.register_service(service);
 
             debug!("Sandbox plugin services registered");
@@ -204,7 +220,7 @@ impl TempsPlugin for SandboxPlugin {
             // them down. Say so while the operator is looking at the logs, in
             // the background: it shells out to `systemctl`.
             {
-                use temps_ai_agents::sandbox::SandboxBackend;
+                use temps_sandbox_providers::SandboxBackend;
                 let provider = registry.provider();
                 if provider.supports_backend(SandboxBackend::Firecracker)
                     || provider.supports_backend(SandboxBackend::Microsandbox)
@@ -217,8 +233,7 @@ impl TempsPlugin for SandboxPlugin {
             // so agent runs (autofixer, workflow agents) create first-class
             // `sandboxes` rows instead of untracked containers.
             match (
-                context
-                    .get_service::<temps_ai_agents::services::sandbox_registry::SandboxRegistry>(),
+                context.get_service::<temps_sandbox_providers::sandbox_registry::SandboxRegistry>(),
                 sandbox_service.clone(),
             ) {
                 (Some(agent_registry), Some(service)) => {
@@ -375,6 +390,15 @@ impl TempsPlugin for SandboxPlugin {
                 sweeper.run().await;
             });
 
+            // Keep the hosts an operator asked to keep prepared on the
+            // current default image: re-pull after an upgrade changes it and
+            // remove the image it replaced. Only hosts with the policy on.
+            if let Some(image_preparation) =
+                context.get_service::<crate::services::image_preparation::ImagePreparationService>()
+            {
+                tokio::spawn(image_preparation.run_reconciler());
+            }
+
             // Preview URLs of sandboxes on worker nodes: the proxy hands them
             // to this relay, which reaches the sandbox through its worker.
             let relay = Arc::new(
@@ -422,12 +446,18 @@ impl TempsPlugin for SandboxPlugin {
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
+        // Registered next to `SandboxService`, so present whenever it is:
+        // its absence is a wiring bug, reported at startup.
+        let image_preparation = context
+            .require_service::<crate::services::image_preparation::ImagePreparationService>();
+
         let app_state = Arc::new(SandboxAppState {
             sandbox_service,
             snapshot_service,
             project_access_checker,
             audit_service,
             sensitive_action_authorizer,
+            image_preparation,
         });
         let router = configure_routes()
             .route_layer(axum::middleware::from_fn_with_state(

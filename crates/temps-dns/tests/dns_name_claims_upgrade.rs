@@ -25,10 +25,10 @@ use sea_orm::{
     DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Statement,
 };
 use sea_orm_migration::{MigrationTrait, SchemaManager};
-use temps_database::test_utils::TestDatabase;
 use temps_dns::services::{DnsRegistry, DnsRegistryError, EndpointDraft, OwnerKind, RecordType};
 use temps_entities::{deployments, environments, projects, service_endpoints};
 use temps_migrations::DnsNameClaimsMigration;
+use temps_test_utils::TestDatabase;
 
 async fn database() -> Option<TestDatabase> {
     match TestDatabase::with_migrations().await {

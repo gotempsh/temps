@@ -997,12 +997,11 @@ impl DockerImporter {
                 mounts
                     .iter()
                     .map(|mount| {
-                        use bollard::models::MountPointTypeEnum;
                         use temps_import_types::VolumeType;
-                        let volume_type = match &mount.typ {
-                            Some(MountPointTypeEnum::BIND) => VolumeType::Bind,
-                            Some(MountPointTypeEnum::VOLUME) => VolumeType::Volume,
-                            Some(MountPointTypeEnum::TMPFS) => VolumeType::Tmpfs,
+                        let volume_type = match mount.typ.as_deref() {
+                            Some("bind") => VolumeType::Bind,
+                            Some("volume") => VolumeType::Volume,
+                            Some("tmpfs") => VolumeType::Tmpfs,
                             _ => VolumeType::Volume, // Default to volume
                         };
                         VolumeMount {
@@ -1694,7 +1693,7 @@ mod tests {
     /// Create a test database connection with migrations
     async fn create_test_database() -> std::sync::Arc<sea_orm::DatabaseConnection> {
         // Use TestDatabase from temps_database for integration tests
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(test_db) => test_db.db.clone(),
             Err(_) => {
                 // Fallback to disconnected database for environments without Docker

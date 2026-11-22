@@ -53,7 +53,7 @@ pub fn build_http_client_for_test(ca_pem: &[u8]) -> Result<Box<dyn HttpClient>, 
 /// We pin `ring` here to match the workspace and call this before constructing
 /// any client config. `install_default` returns `Err` if a provider is already
 /// installed; that is fine — we ignore it (idempotent), mirroring the lazy
-/// install pattern in `temps-query-postgres` and `temps-cli`.
+/// install pattern in `temps-providers-postgres` and `temps-cli`.
 fn ensure_crypto_provider_installed() {
     let _ = rustls::crypto::ring::default_provider().install_default();
 }
@@ -353,9 +353,9 @@ fn letsencrypt_mode_env_value() -> Option<String> {
 /// was honoured, so it is normalised to `staging` to keep that behaviour.
 pub fn plan_letsencrypt_mode_env_migration(
     env_value: Option<&str>,
-    stored: &temps_core::LetsEncryptSettings,
-) -> temps_core::EnvSettingMigration<String> {
-    temps_core::decide_env_setting_migration(
+    stored: &temps_config::LetsEncryptSettings,
+) -> temps_config::EnvSettingMigration<String> {
+    temps_config::decide_env_setting_migration(
         env_value,
         &stored.environment,
         &LETSENCRYPT_PRODUCTION.to_string(),
@@ -429,7 +429,7 @@ pub(crate) async fn migrate_letsencrypt_mode(
             config_service
                 .mark_env_migrations_handled(&[LETSENCRYPT_MODE_ENV])
                 .await;
-            temps_core::record_env_setting_persisted(
+            temps_config::record_env_setting_persisted(
                 Some(audit),
                 LETSENCRYPT_MODE_ENV,
                 LETSENCRYPT_ENVIRONMENT_SETTING,
@@ -1427,8 +1427,8 @@ mod tests {
 
     #[test]
     fn letsencrypt_mode_is_persisted_only_over_the_default() {
-        use temps_core::EnvSettingMigration;
-        let default = temps_core::LetsEncryptSettings::default();
+        use temps_config::EnvSettingMigration;
+        let default = temps_config::LetsEncryptSettings::default();
         assert_eq!(
             plan_letsencrypt_mode_env_migration(Some("staging"), &default),
             EnvSettingMigration::Persist("staging".to_string())
@@ -1447,7 +1447,7 @@ mod tests {
             EnvSettingMigration::EnvUnset
         );
 
-        let staging = temps_core::LetsEncryptSettings {
+        let staging = temps_config::LetsEncryptSettings {
             environment: "staging".to_string(),
             ..Default::default()
         };
@@ -1536,8 +1536,8 @@ mod tests {
     #[tokio::test]
     async fn letsencrypt_mode_shim_persists_the_setting_and_its_audit_row_together() {
         use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
         use temps_entities::{audit_logs, settings};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,

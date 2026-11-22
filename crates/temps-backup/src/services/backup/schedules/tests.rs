@@ -49,6 +49,11 @@ fn target_all_expansion_excludes_destination_backing_service() {
             workload_mode: Default::default(),
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -229,7 +234,7 @@ async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
         return;
     }
 
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
     use testcontainers::runners::AsyncRunner;
 
     let s3_container = crate::test_rustfs::rustfs_container_request()
@@ -310,6 +315,8 @@ async fn disable_and_enable_schedule_reconcile_s3_lifecycle_rules() {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
+            use_tls: None,
         })
         .await
         .expect("Failed to create S3 source");
@@ -939,7 +946,7 @@ async fn integration_create_weekly_specific_schedule_without_control_plane() {
     }
     use chrono::{Datelike, Weekday};
     use sea_orm::ActiveValue::Set;
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(database) => database,
@@ -1115,7 +1122,7 @@ async fn integration_attach_list_detach_round_trip() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,
@@ -1143,6 +1150,7 @@ async fn integration_attach_list_detach_round_trip() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),
@@ -1203,6 +1211,11 @@ async fn integration_attach_list_detach_round_trip() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: Set(None),
         log_ingest_kib_per_sec: Set(None),
+        healthcheck_interval_secs: Set(None),
+        healthcheck_start_interval_secs: Set(None),
+        healthcheck_start_period_secs: Set(None),
+        healthcheck_timeout_secs: Set(None),
+        healthcheck_retries: Set(None),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     };
@@ -1308,7 +1321,7 @@ async fn integration_flip_to_all_clears_membership() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,
@@ -1337,6 +1350,7 @@ async fn integration_flip_to_all_clears_membership() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),
@@ -1394,6 +1408,11 @@ async fn integration_flip_to_all_clears_membership() {
         workload_mode: Default::default(),
         log_ingest_lines_per_sec: Set(None),
         log_ingest_kib_per_sec: Set(None),
+        healthcheck_interval_secs: Set(None),
+        healthcheck_start_interval_secs: Set(None),
+        healthcheck_start_period_secs: Set(None),
+        healthcheck_timeout_secs: Set(None),
+        healthcheck_retries: Set(None),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
     }
@@ -1547,6 +1566,7 @@ async fn create_rejects_empty_fan_out() {
                 managed_by_cloud: false,
                 lifecycle_reconcile_failed_at: None,
                 lifecycle_reconcile_generation: 0,
+                worker_credentials: "scoped".to_string(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
                 backing_service_id: None,
@@ -1661,7 +1681,7 @@ async fn reconcile_default_schedules_provisions_mariadb_once() {
     }
     use sea_orm::ActiveValue::Set;
     use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     let test_db = match TestDatabase::with_migrations().await {
         Ok(d) => d,
@@ -1689,6 +1709,7 @@ async fn reconcile_default_schedules_provisions_mariadb_once() {
         managed_by_cloud: Set(false),
         lifecycle_reconcile_failed_at: Set(None),
         lifecycle_reconcile_generation: Set(0),
+        worker_credentials: sea_orm::ActiveValue::Set("scoped".to_string()),
         created_at: Set(chrono::Utc::now()),
         updated_at: Set(chrono::Utc::now()),
         backing_service_id: Set(None),

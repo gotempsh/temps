@@ -28,13 +28,14 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::str::FromStr;
+use temps_config::deployment_config::EnvironmentDeploymentConfigExt;
 
 use ipnetwork::IpNetwork;
 use sea_orm::{
     ColumnTrait, Condition, DatabaseConnection, DbErr, EntityTrait, JoinType, QueryFilter,
     QueryOrder, QuerySelect, RelationTrait,
 };
-use temps_core::RateLimitSettings;
+use temps_config::RateLimitSettings;
 use temps_entities::ingress_mode::{IngressMode, SandboxPreviewAccess};
 use temps_entities::{
     environments, ingress_access_policies, ingress_endpoints, ingress_login_grants,
@@ -820,6 +821,7 @@ mod tests {
             cloud_telemetry_attribute_allowlist: Vec::new(),
             cloud_telemetry_write_mode: Default::default(),
             cloud_analytics_write_mode: Default::default(),
+            analytics_identity_mode: Default::default(),
             instantiation_token: None,
             log_ingest_lines_per_sec: None,
             log_ingest_kib_per_sec: None,
@@ -1072,13 +1074,11 @@ mod tests {
     #[tokio::test]
     async fn revocations_cover_revoked_grants_and_grants_of_deleted_users() {
         use sea_orm::{ActiveModelTrait, Set};
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
                 if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
-                    && temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    && temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping: {error}");
                 return;

@@ -32,6 +32,13 @@ use tracing::{info, warn};
 
 use crate::netpol_guard::BootGuard;
 
+/// Whether this host has a boot guard: on Linux a systemd unit loads it
+/// before Docker. A Mac worker (ADR 090) has no such unit and no `nft` on the
+/// Mac itself, so its agent neither writes nor lifts one.
+fn boot_guard_supported() -> bool {
+    cfg!(target_os = "linux")
+}
+
 /// File name, in the agent data directory, of the last policy the control
 /// plane sent.
 pub const POLICY_CACHE_FILE: &str = "netpol-last-policy.json";
@@ -287,11 +294,15 @@ pub fn spawn_worker_enforcer(
         Arc::from(choose_executor(docker.clone(), daemon_is_local)),
         Arc::from(choose_port_resolver(docker.clone(), daemon_is_local)),
         Arc::new(DockerInstanceSource::new(node.clone(), docker.clone())),
-        Arc::new(
-            AgentPolicySource::new(http, control_plane_url, node_id, token, backend)
-                .with_cache(data_dir.join(POLICY_CACHE_FILE))
-                .with_boot_guard(BootGuard::new(data_dir, docker.clone())),
-        ),
+        Arc::new({
+            let source = AgentPolicySource::new(http, control_plane_url, node_id, token, backend)
+                .with_cache(data_dir.join(POLICY_CACHE_FILE));
+            if boot_guard_supported() {
+                source.with_boot_guard(BootGuard::new(data_dir, docker.clone()))
+            } else {
+                source
+            }
+        }),
         dns,
         Arc::new(ArcSwap::from_pointee(EgressTable::default())),
     );
@@ -316,6 +327,16 @@ pub fn spawn_worker_enforcer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_linux_keeps_a_boot_guard() {
+        assert_eq!(boot_guard_supported(), cfg!(target_os = "linux"));
+        #[cfg(target_os = "macos")]
+        assert!(
+            !boot_guard_supported(),
+            "a Mac worker has no boot-time loader"
+        );
+    }
 
     #[test]
     fn the_policy_url_never_doubles_slashes() {

@@ -53,7 +53,7 @@ fn build_walg_env(
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
-    if creds.force_path_style {
+    if creds.uses_path_style() {
         env.push("export AWS_S3_FORCE_PATH_STYLE='true'".to_string());
     }
     Ok(env)
@@ -66,6 +66,24 @@ fn build_walg_env(
 // OOM kills, plus live CPU/memory usage. Cluster services return a list
 // of members; standalone services return a single entry with role="standalone".
 // ---------------------------------------------------------------------------
+
+/// The worker node data member `member` of cluster `service_id` runs on,
+/// refusing one on the control plane: its backup takes this server's Docker.
+fn cluster_member_node(
+    service_id: i32,
+    member: &ServiceMemberInfo,
+) -> Result<i32, ExternalServiceError> {
+    member
+        .node_id
+        .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+            service_id,
+            reason: format!(
+                "member '{}' (ordinal {}) of cluster service {service_id} runs on the control \
+                 plane; its backup uses this server's Docker, not a worker's",
+                member.container_name, member.ordinal
+            ),
+        })
+}
 
 impl ExternalServiceManager {
     /// Run a WAL-G basebackup against a Postgres HA cluster.
@@ -468,14 +486,6 @@ impl ExternalServiceManager {
                 })?;
             Ok((result.exit_code, result.stdout, result.stderr))
         } else {
-            // Local path — augment exec_in_local_container with env
-            // support. Until we extend that helper, fall back to a
-            // bollard call here.
-            use bollard::exec::{CreateExecOptions, StartExecOptions};
-            use futures::StreamExt;
-
-            let docker = self.require_docker()?;
-            let cmd_refs: Vec<&str> = cmd.iter().map(|s| s.as_str()).collect();
             let env_strings: Vec<String> =
                 env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             let env_refs: Option<Vec<&str>> = if env_strings.is_empty() {
@@ -483,73 +493,86 @@ impl ExternalServiceManager {
             } else {
                 Some(env_strings.iter().map(|s| s.as_str()).collect())
             };
-
-            let exec = docker
-                .create_exec(
-                    &member.container_name,
-                    CreateExecOptions {
-                        cmd: Some(cmd_refs),
-                        env: env_refs,
-                        user,
-                        attach_stdout: Some(true),
-                        attach_stderr: Some(true),
-                        ..Default::default()
-                    },
-                )
+            self.exec_in_local_container_with_env(&member.container_name, &cmd, user, env_refs)
                 .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!(
-                        "Failed to create exec in '{}': {}",
-                        member.container_name, e
-                    ),
-                })?;
-
-            let output = docker
-                .start_exec(
-                    &exec.id,
-                    Some(StartExecOptions {
-                        detach: false,
-                        ..Default::default()
-                    }),
-                )
-                .await
-                .map_err(|e| ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!("Failed to start exec in '{}': {}", member.container_name, e),
-                })?;
-
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-                while let Some(chunk) = output.next().await {
-                    match chunk {
-                        Ok(bollard::container::LogOutput::StdOut { message }) => {
-                            stdout.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(bollard::container::LogOutput::StdErr { message }) => {
-                            stderr.push_str(&String::from_utf8_lossy(&message));
-                        }
-                        Ok(other) => stdout.push_str(&other.to_string()),
-                        Err(e) => {
-                            return Err(ExternalServiceError::DockerError {
-                                id: 0,
-                                reason: format!("Exec stream error: {}", e),
-                            });
-                        }
-                    }
-                }
-            }
-
-            let inspect = docker.inspect_exec(&exec.id).await.map_err(|e| {
-                ExternalServiceError::DockerError {
-                    id: 0,
-                    reason: format!("Failed to inspect exec result: {}", e),
-                }
-            })?;
-            let exit_code = inspect.exit_code.unwrap_or(-1);
-            Ok((exit_code, stdout, stderr))
         }
+    }
+
+    /// Take a WAL-G base backup of PostgreSQL HA cluster `service_id` from
+    /// `primary`, a data member on a worker node, with the cluster engine run
+    /// by that node's agent: only that node's Docker reaches the member's
+    /// container. The login is the service's stored one; the destination's
+    /// credentials and the login travel sealed.
+    pub async fn walg_backup_worker_postgres_cluster(
+        &self,
+        service_id: i32,
+        primary: &ServiceMemberInfo,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupResult, ExternalServiceError> {
+        let node_id = cluster_member_node(service_id, primary)?;
+        let request = self
+            .cluster_walg_backup_request(service_id, primary, destination, bucket_path, backup_uuid)
+            .await?;
+        self.get_remote_client(node_id)
+            .await?
+            .postgres_cluster_walg_backup(&request)
+            .await
+    }
+
+    /// The request [`Self::walg_backup_worker_postgres_cluster`] sends for
+    /// `primary`.
+    async fn cluster_walg_backup_request(
+        &self,
+        service_id: i32,
+        primary: &ServiceMemberInfo,
+        destination: crate::remote_service_client::WorkerS3Destination,
+        bucket_path: String,
+        backup_uuid: String,
+    ) -> Result<crate::remote_service_client::PostgresClusterWalgBackupRequest, ExternalServiceError>
+    {
+        let service = self.get_service(service_id).await?;
+        let parameters =
+            serde_json::Value::Object(self.parameters_of(&service)?.into_iter().collect());
+        let login =
+            crate::externalsvc::postgres_walg_backup::PostgresLogin::from_parameters(&parameters);
+        Ok(
+            crate::remote_service_client::PostgresClusterWalgBackupRequest {
+                service_id,
+                service: service.name,
+                ordinal: primary.ordinal,
+                pg_port: primary.port.unwrap_or(5432),
+                username: login.username,
+                password: login.password,
+                database: login.database,
+                destination,
+                bucket_path,
+                backup_uuid,
+            },
+        )
+    }
+
+    /// Where the WAL-G base backup of cluster `service_id` started under
+    /// `backup_uuid` on node `node_id` (its primary's) is, for a backup whose
+    /// request went unanswered while the node's backup ran on.
+    pub async fn walg_backup_outcome_worker_postgres_cluster(
+        &self,
+        service_id: i32,
+        node_id: i32,
+        backup_uuid: &str,
+    ) -> Result<crate::remote_service_client::PostgresWalgBackupProgress, ExternalServiceError>
+    {
+        let service = self.get_service(service_id).await?;
+        self.get_remote_client(node_id)
+            .await?
+            .postgres_walg_backup_outcome(
+                &crate::remote_service_client::PostgresWalgBackupOutcomeRequest {
+                    service: service.name,
+                    backup_uuid: backup_uuid.to_string(),
+                },
+            )
+            .await
     }
 
     /// Restore a Postgres HA cluster from a WAL-G backup.
@@ -1024,6 +1047,254 @@ echo "[restore] Pre-seed complete"
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn worker_destination() -> crate::remote_service_client::WorkerS3Destination {
+        crate::remote_service_client::WorkerS3Destination {
+            bucket: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some("s3.example.test".to_string()),
+            force_path_style: true,
+            access_key_id: "scoped-key".to_string(),
+            secret_access_key: "scoped-secret".to_string(),
+            session_token: Some("scoped-session".to_string()),
+        }
+    }
+
+    /// The primary of a cluster runs on a worker: its backup is sent to that
+    /// worker, naming the member by ordinal with its own port, and carrying
+    /// the service's stored login. The control plane's Docker, where the
+    /// reported backups exec'd, has no such container.
+    #[tokio::test]
+    async fn a_worker_primarys_backup_request_names_the_member_and_its_port() {
+        let mut service = crate::services::test_support::encrypted_service_model(
+            9,
+            serde_json::json!({"username": "app", "password": "db-pw", "db_name": "appdb"}),
+        );
+        service.name = "orders-ha".to_string();
+        service.topology = "cluster".to_string();
+        let manager = crate::services::test_support::control_plane_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([vec![service]])
+                .into_connection(),
+        ));
+        let mut primary = crate::services::test_support::service_member_info(
+            3,
+            "postgres-orders-ha-3",
+            "replica",
+            "running",
+        );
+        primary.node_id = Some(10);
+        primary.port = Some(6013);
+
+        let request = manager
+            .cluster_walg_backup_request(
+                9,
+                &primary,
+                worker_destination(),
+                "base".to_string(),
+                "u-1".to_string(),
+            )
+            .await
+            .expect("the request is built from the stored service");
+        assert_eq!(request.service, "orders-ha");
+        assert_eq!(request.ordinal, 3);
+        assert_eq!(request.pg_port, 6013);
+        assert_eq!(request.username, "app");
+        assert_eq!(request.password, "db-pw");
+        assert_eq!(request.database, "appdb");
+        assert_eq!(request.bucket_path, "base");
+        assert_eq!(request.backup_uuid, "u-1");
+        assert_eq!(cluster_member_node(9, &primary).ok(), Some(10));
+    }
+
+    /// A primary on the control plane is never sent to an agent: its backup
+    /// runs on this server's Docker.
+    #[tokio::test]
+    async fn a_control_plane_primary_is_never_sent_to_a_worker() {
+        let primary = crate::services::test_support::service_member_info(
+            1,
+            "postgres-orders-ha-1",
+            "replica",
+            "running",
+        );
+        let Err(ExternalServiceError::ParameterValidationFailed { reason, .. }) =
+            cluster_member_node(9, &primary)
+        else {
+            panic!("a member on the control plane has no worker node");
+        };
+        assert!(reason.contains("runs on the control plane"), "{reason}");
+
+        let manager = crate::services::test_support::control_plane_manager_with_db(Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        ));
+        let error = manager
+            .walg_backup_worker_postgres_cluster(
+                9,
+                &primary,
+                worker_destination(),
+                String::new(),
+                "u-1".to_string(),
+            )
+            .await
+            .expect_err("refused before any query or agent call");
+        assert!(
+            matches!(
+                error,
+                ExternalServiceError::ParameterValidationFailed { .. }
+            ),
+            "{error}"
+        );
+    }
+
+    /// `exec_in_local_container` and the local path of `exec_in_member_with_env`
+    /// are one function: env reaches the command, the streams stay apart and
+    /// the output is not capped.
+    #[tokio::test]
+    async fn local_cluster_exec_keeps_streams_apart_and_passes_env() {
+        use bollard::query_parameters::{
+            CreateContainerOptionsBuilder, RemoveContainerOptions, StartContainerOptions,
+        };
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+        temps_docker_util::pull_image(&docker, temps_docker_util::PullSpec::new("busybox:1.36"))
+            .await
+            .expect("pull the test image");
+        let name = format!("temps-cluster-exec-test-{}", uuid::Uuid::new_v4().simple());
+        docker
+            .create_container(
+                Some(CreateContainerOptionsBuilder::new().name(&name).build()),
+                bollard::models::ContainerCreateBody {
+                    image: Some("busybox:1.36".to_string()),
+                    cmd: Some(vec!["sleep".to_string(), "300".to_string()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create the test container");
+        if let Err(error) = docker
+            .start_container(&name, None::<StartContainerOptions>)
+            .await
+        {
+            // The panic ends the test before its own cleanup can run.
+            let _ = docker
+                .remove_container(
+                    &name,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        v: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            panic!("start the test container {name}: {error}");
+        }
+
+        let db =
+            std::sync::Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let enc = std::sync::Arc::new(
+            temps_core::EncryptionService::new(&"0".repeat(64)).expect("encryption key"),
+        );
+        let dns = std::sync::Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+        let manager = crate::services::ExternalServiceManager::new(
+            db,
+            enc,
+            std::sync::Arc::new(docker.clone()),
+            dns,
+        );
+
+        let sh = |script: &str| vec!["sh".to_string(), "-c".to_string(), script.to_string()];
+        let plain = manager
+            .exec_in_local_container(
+                &name,
+                &sh(
+                    "i=0; while [ $i -lt 10000 ]; do echo 0123456789; i=$((i+1)); done; \
+                     echo err >&2; exit 8",
+                ),
+                None,
+            )
+            .await;
+        let with_env = manager
+            .exec_in_local_container_with_env(
+                &name,
+                &sh("echo \"$CLUSTER_VALUE\"; id -u"),
+                Some("nobody"),
+                Some(vec!["CLUSTER_VALUE=from-env"]),
+            )
+            .await;
+        let member = ServiceMemberInfo {
+            id: 1,
+            role: "data".to_string(),
+            node_id: None,
+            container_name: name.clone(),
+            hostname: None,
+            port: None,
+            status: "running".to_string(),
+            ordinal: 0,
+            compute_ip: None,
+            provisioning_step: None,
+            provisioning_error: None,
+            live_state: None,
+        };
+        let through_member = manager
+            .exec_in_member_with_env(
+                &member,
+                sh("echo \"$MEMBER_VALUE\""),
+                None,
+                std::collections::HashMap::from([(
+                    "MEMBER_VALUE".to_string(),
+                    "member-env".to_string(),
+                )]),
+            )
+            .await;
+        let missing = manager
+            .exec_in_local_container(
+                "temps-cluster-exec-test-no-such-container",
+                &sh("true"),
+                None,
+            )
+            .await;
+        let _ = docker
+            .remove_container(
+                &name,
+                Some(RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let (exit_code, stdout, stderr) = plain.expect("exec");
+        assert_eq!(exit_code, 8);
+        assert_eq!(stdout.len(), 10_000 * 11);
+        assert_eq!(stderr, "err\n");
+
+        let (exit_code, stdout, _) = with_env.expect("exec");
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "from-env\n65534\n");
+
+        let (exit_code, stdout, _) = through_member.expect("exec");
+        assert_eq!(exit_code, 0);
+        assert_eq!(stdout, "member-env\n");
+
+        match missing {
+            Err(ExternalServiceError::DockerError { reason, .. }) => assert!(
+                reason.starts_with(
+                    "Failed to create exec in 'temps-cluster-exec-test-no-such-container': "
+                ),
+                "{reason}"
+            ),
+            other => panic!("expected a DockerError, got {other:?}"),
+        }
+    }
 
     fn test_s3_credentials() -> crate::S3Credentials {
         crate::S3Credentials {

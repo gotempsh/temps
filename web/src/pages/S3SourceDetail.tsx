@@ -3,14 +3,18 @@
 
 'use client'
 
+import { describePathStyleReason } from '@/lib/s3-endpoint'
 import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
   getBackupOptions,
   getS3SourceOptions,
+  getS3SourceQueryKey,
   listBackupSchedulesOptions,
+  listBackupSchedulesQueryKey,
   listSourceBackupsOptions,
+  listSourceBackupsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   BackupScheduleResponse,
@@ -33,6 +37,8 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -49,6 +55,7 @@ import {
   testS3SourceConnection,
 } from '@/lib/s3-sources'
 import { runScheduleNow } from '@/lib/schedule-runs'
+import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
 import { cn, isPitrCapableFormat } from '@/lib/utils'
 import {
   iconForServiceType,
@@ -117,6 +124,28 @@ function formatTimeoutSecs(secs: number): string {
   if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`
   if (hours > 0) return `${hours}h`
   return `${minutes}m`
+}
+
+function WorkerCredentialsFact({ source }: { source: S3SourceResponse }) {
+  const presentation = workerCredentialsPresentation(
+    source.worker_credentials,
+    source.managed_by_cloud
+  )
+  return (
+    <div className="min-w-0">
+      <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+        Worker node credentials
+      </dt>
+      <dd className="space-y-1 text-base sm:text-sm">
+        <Badge variant={presentation.warning ? 'warning-subtle' : 'secondary'}>
+          {presentation.label}
+        </Badge>
+        <p className="text-sm text-muted-foreground">
+          {presentation.description}
+        </p>
+      </dd>
+    </div>
+  )
 }
 
 function sourceFacts(source: S3SourceResponse): DetailFact[] {
@@ -472,6 +501,13 @@ export function S3SourceDetail() {
       title={source.name}
       actions={
         <>
+          <RefreshButton
+            queryKeys={[
+              getS3SourceQueryKey({ path: { id: sourceId! } }),
+              listSourceBackupsQueryKey({ path: { id: sourceId! } }),
+              queryKeyPrefix(listBackupSchedulesQueryKey),
+            ]}
+          />
           {backAction}
           <Button
             variant="outline"
@@ -985,7 +1021,7 @@ export function S3SourceDetail() {
                     Endpoint URL
                   </dt>
                   <dd className="break-all text-base sm:text-sm">
-                    {source.endpoint}
+                    {source.effective_endpoint ?? source.endpoint}
                   </dd>
                 </div>
               )}
@@ -993,14 +1029,24 @@ export function S3SourceDetail() {
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                   Force path style
                 </dt>
-                <dd className="text-base sm:text-sm">
+                <dd className="space-y-1 text-base sm:text-sm">
                   <Badge
-                    variant={source.force_path_style ? 'default' : 'secondary'}
+                    variant={
+                      source.effective_force_path_style
+                        ? 'default'
+                        : 'secondary'
+                    }
                   >
-                    {source.force_path_style ? 'Enabled' : 'Disabled'}
+                    {source.effective_force_path_style ? 'Enabled' : 'Disabled'}
                   </Badge>
+                  {source.path_style_reason !== 'configured' && (
+                    <p className="text-xs text-muted-foreground">
+                      {describePathStyleReason(source.path_style_reason)}
+                    </p>
+                  )}
                 </dd>
               </div>
+              <WorkerCredentialsFact source={source} />
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
                   Access key ID

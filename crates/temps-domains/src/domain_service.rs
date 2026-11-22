@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use anyhow::Result;
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, TransactionTrait,
@@ -189,6 +189,18 @@ pub enum DomainServiceError {
     #[error("Internal error: {0}")]
     Internal(String),
 
+    /// On-demand issuance for `hostname` was not attempted: an earlier
+    /// failure's backoff, stored on the domain row (possibly by another
+    /// process sharing the database), runs until `backoff_until`. Nothing was
+    /// sent to the CA and the failure streak did not grow.
+    #[error(
+        "On-demand TLS for {hostname} is backing off after earlier failures until {backoff_until}"
+    )]
+    OnDemandBackoffActive {
+        hostname: String,
+        backoff_until: DateTime<Utc>,
+    },
+
     /// On-demand HTTP-01 issuance for `hostname` hit a Let's Encrypt rate limit
     /// (`urn:ietf:params:acme:error:rateLimited`). `retry_after` carries the LE
     /// `Retry-After` window when the ACME problem document exposed one, else
@@ -205,12 +217,17 @@ pub enum DomainServiceError {
     /// reason. `category` is the coarse `error_category` written to the
     /// `on_demand_cert_attempts` audit row (`dns_failure`, `acme_order_expired`,
     /// `challenge_mismatch`, `timeout`, or `internal`); `error_chain` is the full
-    /// `source()` chain of the underlying error.
+    /// `source()` chain of the underlying error. `backoff_until` is the retry
+    /// deadline `provision_on_demand` persisted on the `domains` row, so the
+    /// proxy's negative cache waits exactly as long as the ladder says; `None`
+    /// when no backoff was armed (the failure happened before one could be
+    /// stored).
     #[error("On-demand TLS issuance failed for {hostname} ({category}): {error_chain}")]
     OnDemandIssuanceFailed {
         hostname: String,
         category: String,
         error_chain: String,
+        backoff_until: Option<DateTime<Utc>>,
     },
 
     /// `begin_on_demand_issuing` found that the domain already has an `active`
@@ -218,6 +235,53 @@ pub enum DomainServiceError {
     /// no-op success — no ACME request should be sent.
     #[error("Certificate already active for {0}: skipping on-demand re-issuance")]
     CertificateAlreadyActive(String),
+
+    /// DNS-01 through a provider was asked for `domain`, but no active DNS
+    /// provider in Temps manages a verified zone for it with automatic DNS.
+    #[error(
+        "No DNS provider in Temps manages a verified zone for {domain} with automatic DNS on, \
+         so Temps cannot publish its DNS-01 challenge"
+    )]
+    Dns01NoProvider { domain: String },
+
+    /// The zone's DNS provider could not be reached or did not create every
+    /// DNS-01 challenge record for `domain`.
+    #[error(
+        "DNS provider {provider} could not publish the DNS-01 challenge for {domain}: {detail}"
+    )]
+    Dns01Provider {
+        domain: String,
+        provider: String,
+        detail: String,
+    },
+
+    /// The challenge record was published but public resolvers did not see
+    /// it in time; Let's Encrypt was not asked to validate, so the order is
+    /// not spent.
+    #[error(
+        "The DNS-01 challenge record {record} for {domain} was published, but public resolvers \
+         did not see it within {waited_secs}s. Let's Encrypt was not asked to validate it yet; \
+         try again in a few minutes"
+    )]
+    Dns01NotVisible {
+        domain: String,
+        record: String,
+        waited_secs: u64,
+    },
+
+    /// Saving or reading the record of which DNS-01 challenge records were
+    /// published for `domain` failed. When `records_may_have_changed`, the
+    /// provider may hold records Temps can no longer name exactly.
+    #[error(
+        "The record of DNS-01 challenge records published for {domain} could not be saved or \
+         read{}: {detail}",
+        if *records_may_have_changed { " after the provider may have changed them" } else { "" }
+    )]
+    Dns01Receipt {
+        domain: String,
+        records_may_have_changed: bool,
+        detail: String,
+    },
 }
 
 /// Fixed telemetry label for a certificate's verification method. The column is
@@ -239,6 +303,10 @@ pub(crate) const ORDER_STATUS_INVALID: &str = "invalid";
 /// Prefix of the `error_chain` written by the DNS preflight, so the failure
 /// path can tell "never reached the CA" apart from a real ACME failure.
 const DNS_PREFLIGHT_MARKER: &str = "DNS preflight: ";
+
+/// A quiet gap, in hours, after which a host's failure streak starts over.
+/// Twice the 24h cap, so a host retried at the cap keeps its place.
+const ON_DEMAND_STREAK_GAP_HOURS: i64 = 48;
 
 /// The one-level wildcard that would cover `host` (`app.example.com` ->
 /// `*.example.com`). Mirrors the proxy certificate loader's `wildcard_for` so
@@ -666,7 +734,7 @@ impl DomainService {
         // Request challenge from Let's Encrypt
         let provisioning_result = match self
             .cert_provider
-            .provision(domain_name, challenge_type, user_email)
+            .provision(domain_name, challenge_type.clone(), user_email)
             .await
         {
             Ok(result) => result,
@@ -687,6 +755,11 @@ impl DomainService {
                 let mut domain_active: domains::ActiveModel = domain.clone().into();
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some("challenge_request".to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
+                        .as_str()
+                        .to_string(),
+                ));
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
                         "Failed to persist challenge-request failure for domain {}: {}",
@@ -795,6 +868,7 @@ impl DomainService {
                 // fresh challenge instructions.
                 domain_active.last_error = Set(None);
                 domain_active.last_error_type = Set(None);
+                domain_active.failure_cause = Set(None);
 
                 match challenge_data.challenge_type {
                     ChallengeType::Http01 => {
@@ -885,8 +959,7 @@ impl DomainService {
                 domain_active.certificate = Set(Some(cert_data.certificate_pem.clone()));
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(cert_data.expiration_time));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
                 // As in `complete_challenge`: the certificate came from an ACME
                 // order for this challenge type, so the renewal job can renew
                 // it the same way.
@@ -1144,8 +1217,7 @@ impl DomainService {
                 domain_active.private_key = Set(Some(encrypted_private_key));
                 domain_active.expiration_time = Set(Some(certificate.expiration_time));
                 domain_active.last_renewed = Set(Some(Utc::now()));
-                domain_active.last_error = Set(None);
-                domain_active.last_error_type = Set(None);
+                domain_active.clear_certificate_failure();
                 // Record the challenge that was actually validated. A row
                 // created as `manual` (e.g. by `temps setup`) and issued here
                 // would otherwise stay `manual`, which the renewal job never
@@ -1290,6 +1362,11 @@ impl DomainService {
                 domain_active.status = Set(fallback_status.to_string());
                 domain_active.last_error = Set(Some(e.to_string()));
                 domain_active.last_error_type = Set(Some(error_type.to_string()));
+                domain_active.failure_cause = Set(Some(
+                    crate::failure_cause::classify_for(&e.to_string(), &challenge_type)
+                        .as_str()
+                        .to_string(),
+                ));
 
                 if let Err(update_err) = domain_active.update(self.db.as_ref()).await {
                     error!(
@@ -1521,9 +1598,11 @@ impl DomainService {
             // leave a stale "error" surfaced to operators for a healthy domain.
             domain_active.last_error = Set(None);
             domain_active.last_error_type = Set(None);
+            domain_active.failure_cause = Set(None);
         } else {
             domain_active.last_error = Set(Some("Order cancelled by user".to_string()));
             domain_active.last_error_type = Set(Some("cancelled".to_string()));
+            domain_active.failure_cause = Set(None);
         }
 
         let updated_domain = domain_active.update(self.db.as_ref()).await?;
@@ -1622,6 +1701,7 @@ impl DomainService {
                 hostname: hostname.to_string(),
                 category: "internal".to_string(),
                 error_chain: "no ACME contact email configured for on-demand issuance".to_string(),
+                backoff_until: None,
             };
             self.record_on_demand_outcome(hostname, false, false, None, Some(&err), started)
                 .await;
@@ -1655,6 +1735,15 @@ impl DomainService {
                 // The domain already has a valid active cert — nothing to do.
                 // The cert loader serves it regardless of this function being called.
                 return Ok(());
+            }
+            Err(e @ DomainServiceError::OnDemandBackoffActive { .. }) => {
+                // No attempt was made, so no audit row: the caller gets the
+                // stored deadline and holds the host until then.
+                debug!(
+                    hostname = %hostname,
+                    "on-demand TLS: stored backoff still running, not contacting the CA"
+                );
+                return Err(e);
             }
             Err(e) => {
                 self.record_on_demand_outcome(hostname, false, false, None, Some(&e), started)
@@ -1692,16 +1781,20 @@ impl DomainService {
                 // before recording the audit row and returning.
                 let (category, retry_after) = Self::categorize_on_demand_error(&e);
                 let error_chain = error_chain_string(&e);
-                if let Err(persist_err) = self
+                let backoff_until = match self
                     .mark_on_demand_failed(hostname, &error_chain, &category, retry_after)
                     .await
                 {
-                    error!(
-                        hostname = %hostname,
-                        "on-demand TLS: failed to persist failure state: {}",
-                        persist_err
-                    );
-                }
+                    Ok(until) => Some(until),
+                    Err(persist_err) => {
+                        error!(
+                            hostname = %hostname,
+                            "on-demand TLS: failed to persist failure state: {}",
+                            persist_err
+                        );
+                        None
+                    }
+                };
                 let duration_ms = Self::elapsed_ms(started);
                 warn!(
                     hostname = %hostname,
@@ -1709,6 +1802,7 @@ impl DomainService {
                     outcome = "failed",
                     error_category = %category,
                     error_chain = %error_chain,
+                    backoff_until = ?backoff_until,
                     duration_ms,
                     "on-demand TLS: issuance failed"
                 );
@@ -1725,8 +1819,47 @@ impl DomainService {
                     started,
                 )
                 .await;
-                Err(e)
+                Err(Self::with_backoff_deadline(
+                    hostname,
+                    e,
+                    category,
+                    error_chain,
+                    backoff_until,
+                ))
             }
+        }
+    }
+
+    /// The error `provision_on_demand` returns for a failed attempt: it carries
+    /// the backoff deadline just persisted, whatever went wrong. The proxy's
+    /// negative cache is what actually holds a host back (`provision_on_demand`
+    /// itself does not consult the stored backoff), so without the deadline it
+    /// fell back to a fixed 5 minutes and the persisted ladder never applied.
+    fn with_backoff_deadline(
+        hostname: &str,
+        err: DomainServiceError,
+        category: String,
+        error_chain: String,
+        backoff_until: Option<DateTime<Utc>>,
+    ) -> DomainServiceError {
+        match err {
+            DomainServiceError::OnDemandRateLimited {
+                hostname,
+                detail,
+                retry_after,
+            } => DomainServiceError::OnDemandRateLimited {
+                hostname,
+                detail,
+                // The CA's own window when it gave one; otherwise the deadline
+                // the failure path derived for it (now + 1h).
+                retry_after: retry_after.or(backoff_until),
+            },
+            _ => DomainServiceError::OnDemandIssuanceFailed {
+                hostname: hostname.to_string(),
+                category,
+                error_chain,
+                backoff_until,
+            },
         }
     }
 
@@ -1750,6 +1883,7 @@ impl DomainService {
             hostname: hostname.to_string(),
             category: "dns_failure".to_string(),
             error_chain: format!("{DNS_PREFLIGHT_MARKER}{reason}"),
+            backoff_until: None,
         };
 
         let lookup = tokio::time::timeout(
@@ -1881,12 +2015,26 @@ impl DomainService {
                         hostname.to_string(),
                     ));
                 }
+                // Each proxy only caches the deadline it was handed, so one
+                // whose cache expired can arrive while a later deadline,
+                // stored by another process's failure, still runs. Honour the
+                // stored one: clearing it here would reach the CA early.
+                if let Some(backoff_until) = existing
+                    .on_demand_backoff_until
+                    .filter(|until| *until > Utc::now())
+                {
+                    return Err(DomainServiceError::OnDemandBackoffActive {
+                        hostname: hostname.to_string(),
+                        backoff_until,
+                    });
+                }
                 let mut active: domains::ActiveModel = existing.into();
                 active.status = Set("on_demand_issuing".to_string());
                 active.verification_method = Set("http-01".to_string());
                 active.on_demand_backoff_until = Set(None);
                 active.last_error = Set(None);
                 active.last_error_type = Set(None);
+                active.failure_cause = Set(None);
                 let updated = active.update(self.db.as_ref()).await?;
                 Ok(updated)
             }
@@ -1971,56 +2119,90 @@ impl DomainService {
     /// `on_demand_failed`, the full error chain, an `on_demand` error type, and
     /// an exponential `on_demand_backoff_until` (ADR §4 Layer 2). For a rate
     /// limit, `retry_after` (when present) overrides the exponential delay.
+    /// Returns the deadline as stored.
+    ///
+    /// The rung comes from the failure streak on the same row, and this one
+    /// update writes the deadline and the grown streak together, so nothing
+    /// that can fail separately (the audit row, a history read) can lower the
+    /// next rung or leave the row without its failure state. The row is read
+    /// `FOR UPDATE` in the same transaction: two processes sharing the
+    /// database (a standalone proxy beside the server) that fail the same host
+    /// at once take turns, so neither increment is lost.
     async fn mark_on_demand_failed(
         &self,
         hostname: &str,
         error_chain: &str,
         category: &str,
         retry_after: Option<DateTime<Utc>>,
-    ) -> Result<(), DomainServiceError> {
+    ) -> Result<DateTime<Utc>, DomainServiceError> {
+        use sea_orm::QuerySelect;
+        let txn = self.db.begin().await?;
         let domain = domains::Entity::find()
             .filter(domains::Column::Domain.eq(hostname))
-            .one(self.db.as_ref())
+            .lock_exclusive()
+            .one(&txn)
             .await?
             .ok_or_else(|| DomainServiceError::NotFound(hostname.to_string()))?;
 
-        let backoff_until = match retry_after {
-            Some(ts) => ts,
-            None => {
-                let prev = domain.on_demand_backoff_until;
-                Utc::now() + Self::next_backoff_delay(prev, domain.updated_at)
-            }
-        };
+        // PostgreSQL keeps timestamps to the microsecond; truncate first so the
+        // deadline handed to the proxy is exactly the one stored.
+        let now = Utc::now().trunc_subsecs(6);
+        let previous = Self::previous_failures(
+            domain.on_demand_failure_streak,
+            domain.on_demand_last_failure_at,
+            now,
+        );
+        let backoff_until = retry_after
+            .unwrap_or_else(|| now + Self::backoff_delay(previous))
+            .trunc_subsecs(6);
 
         let mut active: domains::ActiveModel = domain.into();
         active.status = Set("on_demand_failed".to_string());
         active.last_error = Set(Some(error_chain.to_string()));
         active.last_error_type = Set(Some(category.to_string()));
+        active.failure_cause = Set(Some(
+            crate::failure_cause::classify(error_chain)
+                .as_str()
+                .to_string(),
+        ));
         active.on_demand_backoff_until = Set(Some(backoff_until));
-        active.update(self.db.as_ref()).await?;
-        Ok(())
+        active.on_demand_failure_streak = Set(previous.saturating_add(1));
+        active.on_demand_last_failure_at = Set(Some(now));
+        let updated = active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(updated.on_demand_backoff_until.unwrap_or(backoff_until))
     }
 
-    /// Compute the next exponential backoff delay: 5m → 15m → 1h → 4h → 24h
-    /// (capped). The previous step is inferred from the gap between the last
-    /// `on_demand_backoff_until` and the row's `updated_at` (the time that
-    /// backoff was set); a missing/short gap restarts at 5m.
-    fn next_backoff_delay(
-        prev_backoff_until: Option<DateTime<Utc>>,
-        prev_set_at: DateTime<Utc>,
-    ) -> Duration {
-        const LADDER_MINS: [i64; 5] = [5, 15, 60, 240, 1440];
-        let prev_delay_mins = prev_backoff_until
-            .map(|until| (until - prev_set_at).num_minutes())
-            .unwrap_or(0);
+    /// How many failures in a row `hostname` had before this one, from the
+    /// streak stored on its row.
+    ///
+    /// The ladder used to be inferred from `on_demand_backoff_until` and the
+    /// row's `updated_at`, but each attempt clears the first and rewrites the
+    /// second before it runs, so every failure restarted at 5 minutes. The
+    /// streak is only written by a failure and reset by an issued or imported
+    /// certificate ([`domains::ActiveModel::clear_certificate_failure`]).
+    ///
+    /// A streak whose last failure is older than [`ON_DEMAND_STREAK_GAP_HOURS`]
+    /// starts over: a host nobody requested for two days begins at 5 minutes.
+    fn previous_failures(
+        streak: i32,
+        last_failure_at: Option<DateTime<Utc>>,
+        now: DateTime<Utc>,
+    ) -> i32 {
+        match last_failure_at {
+            Some(at) if now - at <= Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) => streak.max(0),
+            _ => 0,
+        }
+    }
 
-        // Find the next rung strictly greater than the previous delay; cap at 24h.
-        let next = LADDER_MINS
-            .iter()
-            .copied()
-            .find(|&m| m > prev_delay_mins)
-            .unwrap_or(1440);
-        Duration::minutes(next)
+    /// Backoff for an attempt that follows `previous_failures` failures in a
+    /// row: 5m → 15m → 1h → 4h → 24h, capped at 24h.
+    fn backoff_delay(previous_failures: i32) -> Duration {
+        const LADDER_MINS: [i64; 5] = [5, 15, 60, 240, 1440];
+        let rung = usize::try_from(previous_failures)
+            .unwrap_or(0)
+            .min(LADDER_MINS.len() - 1);
+        Duration::minutes(LADDER_MINS[rung])
     }
 
     /// Map a `DomainServiceError` from the on-demand flow to a coarse
@@ -2035,7 +2217,15 @@ impl DomainService {
             return ("rate_limited".to_string(), Some(deadline));
         }
 
-        let chain = error_chain_string(err).to_lowercase();
+        let chain = error_chain_string(err);
+        // The CA's problem type, when the error carries one, is exact. The
+        // keyword fallback below misread HTTP-01 failures: their text always
+        // contains `/.well-known/acme-challenge/`, and a hostname may contain
+        // "dns".
+        if let Some(cause) = crate::failure_cause::classify_problem(&chain) {
+            return (cause.legacy_category().to_string(), None);
+        }
+        let chain = chain.to_lowercase();
         let category = if chain.contains("ratelimited") || chain.contains("rate limit") {
             "rate_limited"
         } else if chain.contains("dns") {
@@ -2343,6 +2533,8 @@ fn parse_retry_after(detail: &str) -> Option<DateTime<Utc>> {
     }
     None
 }
+
+mod dns01;
 
 #[cfg(test)]
 mod tests {
@@ -2929,15 +3121,25 @@ mod tests {
     ) -> Option<(
         DomainService,
         Arc<DatabaseConnection>,
-        temps_database::test_utils::TestDatabase,
+        temps_test_utils::TestDatabase,
     )> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping on-demand TLS test: {e}");
                 return None;
             }
         };
+        let service = on_demand_service_on(test_db.db.clone(), mode);
+        let db = test_db.db.clone();
+        // Return the TestDatabase guard so the caller keeps it alive for the whole
+        // test; its Drop reaps the dedicated schema afterwards.
+        Some((service, db, test_db))
+    }
+
+    /// A service with the given provider behaviour over an existing database,
+    /// so a test can fail and then succeed against the same rows.
+    fn on_demand_service_on(db: Arc<DatabaseConnection>, mode: OnDemandMockMode) -> DomainService {
         let encryption_service = Arc::new(
             EncryptionService::new(
                 "0000000000000000000000000000000000000000000000000000000000000000",
@@ -2945,19 +3147,29 @@ mod tests {
             .unwrap(),
         );
         let repository = Arc::new(crate::tls::repository::DefaultCertificateRepository::new(
-            test_db.db.clone(),
+            db.clone(),
             encryption_service.clone(),
         ));
-        let service = DomainService::new(
-            test_db.db.clone(),
+        DomainService::new(
+            db,
             Arc::new(OnDemandMockProvider { mode }),
             repository,
             encryption_service,
-        );
-        let db = test_db.db.clone();
-        // Return the TestDatabase guard so the caller keeps it alive for the whole
-        // test; its Drop reaps the dedicated schema afterwards.
-        Some((service, db, test_db))
+        )
+    }
+
+    /// Move the stored backoff deadline of `hostname` into the past, as if the
+    /// wait had elapsed, so the next attempt may run.
+    async fn expire_on_demand_backoff(db: &DatabaseConnection, hostname: &str) {
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db)
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let mut active: domains::ActiveModel = row.into();
+        active.on_demand_backoff_until = Set(Some(Utc::now() - Duration::seconds(1)));
+        active.update(db).await.unwrap();
     }
 
     #[tokio::test]
@@ -3062,6 +3274,291 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("incorrect key authorization"));
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_repeated_failures_climb_the_ladder() {
+        // Regression: each attempt cleared `on_demand_backoff_until` before it
+        // ran, so every failure restarted at 5 minutes and a host with port 80
+        // closed was retried ~12 times an hour, past the CA's failed-validation
+        // limit. The returned error also carried no deadline, so the proxy's
+        // negative cache fell back to 5 minutes regardless.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "closed-port.1-2-3-4.sslip.io";
+
+        let mut rungs = Vec::new();
+        for _ in 0..6 {
+            let err = service
+                .provision_on_demand(hostname, "ops@example.com")
+                .await
+                .expect_err("issuance keeps failing");
+            let DomainServiceError::OnDemandIssuanceFailed {
+                backoff_until: Some(returned),
+                ..
+            } = err
+            else {
+                panic!("a failed attempt must return its backoff deadline, got {err:?}");
+            };
+            let stored = domains::Entity::find()
+                .filter(domains::Column::Domain.eq(hostname))
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .expect("domains row exists")
+                .on_demand_backoff_until
+                .expect("failure arms the backoff");
+            assert_eq!(
+                returned, stored,
+                "the proxy must wait as long as the row says"
+            );
+            assert_eq!(
+                returned.timestamp_subsec_nanos() % 1_000,
+                0,
+                "the deadline carries no precision the database drops"
+            );
+            // Round to the nearest minute: the deadline was set a moment ago.
+            rungs.push((stored - Utc::now() + Duration::seconds(30)).num_minutes());
+            // The audit log is observability only: losing its rows (a failed
+            // insert) must not lower the next rung.
+            on_demand_cert_attempts::Entity::delete_many()
+                .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+            expire_on_demand_backoff(db.as_ref(), hostname).await;
+        }
+        assert_eq!(rungs, vec![5, 15, 60, 240, 1440, 1440]);
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 6);
+        assert!(row.on_demand_last_failure_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_honours_a_stored_backoff() {
+        // Regression: starting an attempt cleared the stored deadline without
+        // looking at it, so a proxy whose own cache had expired reached the
+        // CA while a later deadline stored by another process still ran.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "held.1-2-3-4.sslip.io";
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+        // Another process's failure stored a longer deadline meanwhile.
+        let held_until = (Utc::now() + Duration::hours(24)).trunc_subsecs(6);
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let streak = row.on_demand_failure_streak;
+        let mut active: domains::ActiveModel = row.into();
+        active.on_demand_backoff_until = Set(Some(held_until));
+        active.update(db.as_ref()).await.unwrap();
+        let attempts_before = on_demand_cert_attempts::Entity::find()
+            .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("a running backoff refuses the attempt");
+        assert!(
+            matches!(
+                &err,
+                DomainServiceError::OnDemandBackoffActive { backoff_until, .. }
+                    if *backoff_until == held_until
+            ),
+            "the refusal carries the stored deadline, got {err:?}"
+        );
+
+        let after = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(after.on_demand_backoff_until, Some(held_until));
+        assert_eq!(after.on_demand_failure_streak, streak, "no new failure");
+        assert_eq!(after.status, "on_demand_failed");
+        let attempts_after = on_demand_cert_attempts::Entity::find()
+            .filter(on_demand_cert_attempts::Column::Hostname.eq(hostname))
+            .count(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(attempts_after, attempts_before, "no attempt was recorded");
+
+        // Once the deadline passes the next attempt runs again.
+        expire_on_demand_backoff(db.as_ref(), hostname).await;
+        let err = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect_err("issuance still fails");
+        assert!(
+            matches!(err, DomainServiceError::OnDemandIssuanceFailed { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_on_demand_failures_each_count_once() {
+        // Two processes sharing the database (a standalone proxy beside the
+        // server) can fail the same host at once. Each failure must grow the
+        // streak; a read-then-write without a row lock loses increments.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "raced.1-2-3-4.sslip.io";
+        service.begin_on_demand_issuing(hostname).await.unwrap();
+        let service = Arc::new(service);
+
+        let failures: Vec<_> = (0..8)
+            .map(|_| {
+                let service = service.clone();
+                tokio::spawn(async move {
+                    service
+                        .mark_on_demand_failed(hostname, "connection refused", "timeout", None)
+                        .await
+                })
+            })
+            .collect();
+        for failure in failures {
+            failure.await.unwrap().unwrap();
+        }
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.on_demand_failure_streak, 8);
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_success_resets_the_ladder() {
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "challenge failed: incorrect key authorization".to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "flaky.1-2-3-4.sslip.io";
+        for _ in 0..3 {
+            let _ = service
+                .provision_on_demand(hostname, "ops@example.com")
+                .await;
+            expire_on_demand_backoff(db.as_ref(), hostname).await;
+        }
+        let failing = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(failing.on_demand_failure_streak, 3);
+
+        // A certificate is issued: the streak ends with it.
+        on_demand_service_on(db.clone(), OnDemandMockMode::ImmediateCert)
+            .provision_on_demand(hostname, "ops@example.com")
+            .await
+            .expect("issuance succeeds");
+        let issued = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(issued.status, "active");
+        assert_eq!(issued.on_demand_failure_streak, 0);
+        assert!(issued.on_demand_last_failure_at.is_none());
+        assert!(issued.on_demand_backoff_until.is_none());
+
+        // The certificate goes away (removed by an operator); the next failure
+        // starts the ladder from the bottom.
+        let mut cleared: domains::ActiveModel = issued.into();
+        cleared.status = Set("pending".to_string());
+        cleared.certificate = Set(None);
+        cleared.private_key = Set(None);
+        cleared.update(db.as_ref()).await.unwrap();
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        let mins = (row.on_demand_backoff_until.unwrap() - Utc::now() + Duration::seconds(30))
+            .num_minutes();
+        assert_eq!(
+            mins, 5,
+            "the first failure after a success starts at 5 minutes"
+        );
+        assert_eq!(row.on_demand_failure_streak, 1);
+    }
+
+    #[tokio::test]
+    async fn test_provision_on_demand_failure_records_the_typed_cause() {
+        // A closed port 80, in the shape the provider reports the CA's
+        // problem. The hostname contains "dns": that must not decide.
+        let Some((service, db, _guard)) = on_demand_service(OnDemandMockMode::Fail(
+            "Order validation failed after 2 attempt(s): [mydns.1-2-3-4.sslip.io Http01] \
+             urn:ietf:params:acme:error:connection: 203.0.113.10: Fetching \
+             http://mydns.1-2-3-4.sslip.io/.well-known/acme-challenge/abc: Connection refused"
+                .to_string(),
+        ))
+        .await
+        else {
+            return;
+        };
+        let hostname = "mydns.1-2-3-4.sslip.io";
+        let _ = service
+            .provision_on_demand(hostname, "ops@example.com")
+            .await;
+
+        let row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(hostname))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("domains row exists");
+        assert_eq!(row.failure_cause.as_deref(), Some("unreachable"));
+        assert_eq!(row.last_error_type.as_deref(), Some("challenge_mismatch"));
+        let attempt = service
+            .latest_on_demand_attempt(hostname)
+            .await
+            .unwrap()
+            .expect("the failure is audited");
+        assert_eq!(
+            attempt.error_category.as_deref(),
+            Some("challenge_mismatch")
+        );
     }
 
     #[tokio::test]
@@ -3494,9 +3991,9 @@ mod tests {
         DomainService,
         Arc<dyn CertificateRepository>,
         Arc<DatabaseConnection>,
-        temps_database::test_utils::TestDatabase,
+        temps_test_utils::TestDatabase,
     )> {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping DNS-01 retry test: {e}");
@@ -3710,6 +4207,31 @@ mod tests {
         assert_eq!(kept.order_url, url);
         assert_eq!(kept.status, "valid");
         assert_eq!(cleanup_receipt_of(&kept), Some(receipt));
+    }
+
+    #[tokio::test]
+    async fn test_dns_01_proof_the_ca_cannot_verify_records_a_txt_record_mismatch() {
+        // Regression: the CA reports an unverified DNS-01 proof as
+        // `unauthorized`, the same type as an HTTP-01 response from the wrong
+        // server, and the cause read "upstream answered" for a domain that
+        // never served anything.
+        let provider = ScriptedProvider::new(CompletionMode::Invalidate);
+        let Some((service, _repository, db, _guard)) = scripted_service(provider).await else {
+            return;
+        };
+        let name = "txt.example.com";
+        service.create_domain(name, "dns-01").await.unwrap();
+        service
+            .request_challenge(name, "ops@example.com")
+            .await
+            .unwrap();
+        service
+            .complete_challenge(name, "ops@example.com")
+            .await
+            .expect_err("an invalidated challenge must fail");
+
+        let failed = domain_row(&db, name).await;
+        assert_eq!(failed.failure_cause.as_deref(), Some("dns_record_mismatch"));
     }
 
     #[tokio::test]
@@ -3995,42 +4517,46 @@ mod tests {
     // ---- Pure unit tests (no DB) for the on-demand helpers ----
 
     #[test]
-    fn test_next_backoff_delay_climbs_the_ladder() {
-        let set_at = Utc::now();
-        // No previous backoff → first rung (5m).
+    fn test_backoff_delay_climbs_the_ladder_and_caps_at_24h() {
+        let mins: Vec<i64> = (0..7)
+            .map(|n| DomainService::backoff_delay(n).num_minutes())
+            .collect();
+        assert_eq!(mins, vec![5, 15, 60, 240, 1440, 1440, 1440]);
+    }
+
+    #[test]
+    fn test_previous_failures_keeps_a_recent_streak() {
+        let now = Utc::now();
+        assert_eq!(DomainService::previous_failures(0, None, now), 0);
         assert_eq!(
-            DomainService::next_backoff_delay(None, set_at).num_minutes(),
-            5
+            DomainService::previous_failures(3, Some(now - Duration::minutes(20)), now),
+            3
         );
-        // Previous was 5m → 15m.
+    }
+
+    #[test]
+    fn test_previous_failures_keeps_a_streak_retried_at_the_cap() {
+        // The 24h rung retries a day later: still one streak.
+        let now = Utc::now();
+        let last = Some(now - Duration::hours(24) - Duration::minutes(5));
+        assert_eq!(DomainService::previous_failures(5, last, now), 5);
+    }
+
+    #[test]
+    fn test_previous_failures_restarts_after_a_long_quiet_gap() {
+        let now = Utc::now();
+        let stale = Some(now - Duration::hours(ON_DEMAND_STREAK_GAP_HOURS) - Duration::minutes(1));
+        assert_eq!(DomainService::previous_failures(4, stale, now), 0);
+    }
+
+    #[test]
+    fn test_previous_failures_without_a_failure_time_is_zero() {
+        // A streak with no time (a row written before the column existed, or
+        // edited by hand) starts over rather than guessing.
+        assert_eq!(DomainService::previous_failures(4, None, Utc::now()), 0);
         assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(5)), set_at)
-                .num_minutes(),
-            15
-        );
-        // Previous was 15m → 1h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(15)), set_at)
-                .num_minutes(),
-            60
-        );
-        // Previous was 1h → 4h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(60)), set_at)
-                .num_minutes(),
-            240
-        );
-        // Previous was 4h → 24h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(240)), set_at)
-                .num_minutes(),
-            1440
-        );
-        // Previous was 24h → stays capped at 24h.
-        assert_eq!(
-            DomainService::next_backoff_delay(Some(set_at + Duration::minutes(1440)), set_at)
-                .num_minutes(),
-            1440
+            DomainService::previous_failures(-1, Some(Utc::now()), Utc::now()),
+            0
         );
     }
 
@@ -4061,6 +4587,20 @@ mod tests {
                 "challenge_mismatch",
             ),
             ("connection reset by peer", "internal"),
+            // With the CA's problem type the type decides, not words in the
+            // hostname or the token path.
+            (
+                "[mydns.example.com Http01] urn:ietf:params:acme:error:connection: Fetching http://mydns.example.com/.well-known/acme-challenge/x: Connection refused",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:connection: Timeout during connect (likely firewall problem)",
+                "challenge_mismatch",
+            ),
+            (
+                "[app.example.com Http01] urn:ietf:params:acme:error:dns: DNS problem: NXDOMAIN looking up A for app.example.com",
+                "dns_failure",
+            ),
         ];
         for (msg, expected) in cases {
             let err =
@@ -4102,7 +4642,7 @@ mod tests {
     #[tokio::test]
     async fn test_domain_validation() {
         // Create a test database
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let encryption_service = Arc::new(
@@ -4162,6 +4702,9 @@ mod tests {
             is_wildcard: false,
             verification_method: "http-01".to_string(),
             on_demand_backoff_until: None,
+            on_demand_failure_streak: 0,
+            on_demand_last_failure_at: None,
+            failure_cause: None,
             created_at: now,
             updated_at: now,
         }
@@ -4525,7 +5068,7 @@ mod tests {
         };
 
         // ── 0b. Guard: skip gracefully when the test database is not available ─
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Test database not available, skipping Pebble E2E test: {e}");
@@ -5080,7 +5623,7 @@ mod tests {
         // ── 5. Build LetsEncryptProvider pointed at Pebble ────────────────────
         // We only need a CertificateRepository for ACME account persistence; back
         // it with a Docker Postgres test schema (skip gracefully if unavailable).
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!(
@@ -5578,7 +6121,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_certificate_issued_for_a_deleted_row_leaves_no_stored_copy() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Database not available, skipping certificate storage test: {e}");

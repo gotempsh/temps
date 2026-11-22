@@ -165,6 +165,8 @@ async fn local_workspace_archive_intersects_root_and_specific_rules() {
 #[test]
 fn buildkit_arguments_extend_user_arguments() {
     let request = BuildRequest {
+        labels: Default::default(),
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: "test".into(),
         context_path: PathBuf::new(),
@@ -186,6 +188,36 @@ fn buildkit_arguments_extend_user_arguments() {
     assert_eq!(args["OVERRIDE"], "builder");
     assert_eq!(args["BUILDKIT_INLINE_CACHE"], "1");
     assert_eq!(docker_build_args(&request, false), request.build_args);
+}
+
+#[test]
+fn built_images_carry_the_requested_labels_and_cannot_drop_built_by() {
+    let mut request = BuildRequest {
+        cache_from: Vec::new(),
+        image_name: "app-1:latest".to_string(),
+        context_path: PathBuf::from("/tmp"),
+        dockerfile_path: None,
+        build_args: HashMap::new(),
+        build_args_buildkit: HashMap::new(),
+        platform: None,
+        log_path: PathBuf::from("/tmp/build.log"),
+        labels: HashMap::new(),
+        build_secrets: Default::default(),
+    };
+    request
+        .labels
+        .insert("sh.temps.image.project_id".to_string(), "7".to_string());
+    request
+        .labels
+        .insert("built-by".to_string(), "someone-else".to_string());
+
+    let labels = image_labels(&request);
+
+    assert_eq!(
+        labels.get("sh.temps.image.project_id").map(String::as_str),
+        Some("7")
+    );
+    assert_eq!(labels.get("built-by").map(String::as_str), Some("temps"));
 }
 
 #[test]
@@ -379,6 +411,8 @@ CMD ["cat", "/hello.txt"]
     match create_test_docker_runtime().await {
         Ok(runtime) => {
             let request = BuildRequest {
+                labels: Default::default(),
+                build_secrets: Default::default(),
                 cache_from: Vec::new(),
                 image_name: "docker-test:latest".to_string(),
                 context_path,
@@ -624,6 +658,8 @@ async fn buildkit_build_stage_sees_root_owned_context() {
     let runtime = DockerRuntime::new(Arc::new(docker.clone()), true, network.clone());
     let log_dir = TempDir::new().unwrap();
     let request = BuildRequest {
+        labels: Default::default(),
+        build_secrets: Default::default(),
         cache_from: Vec::new(),
         image_name: image.clone(),
         context_path: checkout.path().to_path_buf(),
@@ -766,4 +802,281 @@ fn image_archive_client_leaves_the_shared_client_timeout_alone() {
 
     assert_eq!(archive_client.timeout(), IMAGE_ARCHIVE_CLIENT_TIMEOUT);
     assert_eq!(docker.timeout(), Duration::from_secs(120));
+}
+
+/// A daemon that answers an image inspect with `inspect` and an image list
+/// with `list`, as JSON.
+async fn image_store_daemon(inspect: serde_json::Value, list: serde_json::Value) -> Docker {
+    image_store_daemon_with_registry(inspect, list, None).await
+}
+
+/// [`image_store_daemon`] that also answers a registry distribution inspect
+/// with `distribution`, or refuses it with a 500 when `None`.
+async fn image_store_daemon_with_registry(
+    inspect: serde_json::Value,
+    list: serde_json::Value,
+    distribution: Option<serde_json::Value>,
+) -> Docker {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let inspect = inspect.to_string();
+    let list = list.to_string();
+    let distribution = distribution.map(|body| body.to_string());
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let (inspect, list, distribution) =
+                (inspect.clone(), list.clone(), distribution.clone());
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buffer).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(read) => request.extend_from_slice(&buffer[..read]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&request).to_string();
+                let path = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let (status, body) = if path.contains("/distribution/") {
+                    match distribution {
+                        Some(body) => ("200 OK", body),
+                        None => (
+                            "500 Internal Server Error",
+                            r#"{"message":"registry unreachable"}"#.to_string(),
+                        ),
+                    }
+                } else if path.contains("/images/json") {
+                    ("200 OK", list)
+                } else {
+                    ("200 OK", inspect)
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    Docker::connect_with_http(
+        &format!("http://{address}"),
+        5,
+        bollard::API_DEFAULT_VERSION,
+    )
+    .unwrap()
+}
+
+fn manifest(
+    os: &str,
+    arch: &str,
+    variant: Option<&str>,
+    kind: &str,
+    available: bool,
+) -> serde_json::Value {
+    let mut platform = serde_json::json!({"os": os, "architecture": arch});
+    if let Some(variant) = variant {
+        platform["variant"] = serde_json::json!(variant);
+    }
+    serde_json::json!({
+        "ID": format!("sha256:{arch}{}", variant.unwrap_or_default()),
+        "Descriptor": {"mediaType": "application/vnd.oci.image.manifest.v1+json", "digest": "sha256:00", "size": 1},
+        "Available": available,
+        "Size": {"Total": 1, "Content": 1},
+        "Kind": kind,
+        "ImageData": {"Platform": platform, "Containers": [], "Size": {"Unpacked": 1}},
+    })
+}
+
+fn summary(id: &str, manifests: Option<Vec<serde_json::Value>>) -> serde_json::Value {
+    let mut summary = serde_json::json!({
+        "Id": id, "ParentId": "", "RepoTags": ["app:1"], "RepoDigests": [],
+        "Created": 0, "Size": 1, "SharedSize": -1, "Labels": {}, "Containers": -1,
+    });
+    if let Some(manifests) = manifests {
+        summary["Manifests"] = serde_json::json!(manifests);
+    }
+    summary
+}
+
+const INSPECTED_ID: &str = "sha256:1111";
+
+fn inspected_amd64() -> serde_json::Value {
+    serde_json::json!({"Id": INSPECTED_ID, "Architecture": "amd64", "Os": "linux", "RepoTags": ["app:1"]})
+}
+
+/// #1789: a multi-arch image with every architecture pulled locally is
+/// schedulable on each of them, not only on the daemon's own.
+#[tokio::test]
+async fn image_platforms_lists_every_locally_available_architecture() {
+    let docker = image_store_daemon(
+        inspected_amd64(),
+        serde_json::json!([summary(
+            INSPECTED_ID,
+            Some(vec![
+                manifest("linux", "amd64", None, "image", true),
+                manifest("linux", "arm64", Some("v8"), "image", true),
+                // Pulled for amd64 and arm64 only: listed, not runnable here.
+                manifest("linux", "arm", Some("v7"), "image", false),
+                // Build provenance is not a platform.
+                manifest("unknown", "unknown", None, "attestation", true),
+            ]),
+        )]),
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let platforms = runtime.image_platforms("app:1").await.unwrap();
+
+    assert_eq!(platforms.len(), 2, "{platforms:?}");
+    for node in ["linux/amd64", "linux/arm64"] {
+        assert!(
+            platforms
+                .iter()
+                .any(|platform| crate::platform::platforms_match(platform, node)),
+            "a {node} node must be eligible: {platforms:?}"
+        );
+    }
+    assert!(
+        !platforms
+            .iter()
+            .any(|platform| crate::platform::platforms_match(platform, "linux/arm/v7")),
+        "an architecture whose content is not local is not runnable: {platforms:?}"
+    );
+}
+
+/// The classic image store lists no manifests: one platform, as before.
+#[tokio::test]
+async fn image_platforms_falls_back_to_the_inspected_platform() {
+    for list in [
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        serde_json::json!([summary(INSPECTED_ID, Some(vec![]))]),
+        // A summary for some other image under the same reference is not this one.
+        serde_json::json!([summary(
+            "sha256:other",
+            Some(vec![manifest("linux", "arm64", None, "image", true)]),
+        )]),
+        serde_json::json!([]),
+    ] {
+        let docker = image_store_daemon(inspected_amd64(), list.clone()).await;
+        let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+        assert_eq!(
+            runtime.image_platforms("app:1").await.unwrap(),
+            ["linux/amd64"],
+            "{list}"
+        );
+    }
+}
+
+/// A registry index as `GET /distribution/{name}/json` reports it.
+fn distribution(platforms: &[(&str, &str, Option<&str>)]) -> serde_json::Value {
+    serde_json::json!({
+        "Descriptor": {
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "digest": "sha256:00",
+            "size": 1,
+        },
+        "Platforms": platforms
+            .iter()
+            .map(|(os, architecture, variant)| {
+                let mut platform = serde_json::json!({"os": os, "architecture": architecture});
+                if let Some(variant) = variant {
+                    platform["variant"] = serde_json::json!(variant);
+                }
+                platform
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// #1892: the containerd image store keeps a pulled tag's whole index, so
+/// the architectures this daemon did not download are still offered — and
+/// read without a registry round-trip (the registry here is unreachable).
+#[tokio::test]
+async fn registry_image_platforms_reads_the_pulled_index() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(
+            INSPECTED_ID,
+            Some(vec![
+                manifest("linux", "amd64", None, "image", true),
+                // Listed by the index, never downloaded on this amd64 host.
+                manifest("linux", "arm64", None, "image", false),
+                manifest("unknown", "unknown", None, "attestation", false),
+            ]),
+        )]),
+        None,
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    assert_eq!(
+        runtime
+            .registry_image_platforms("app:1", None)
+            .await
+            .unwrap(),
+        ["linux/amd64", "linux/arm64"]
+    );
+    // What this daemon can run itself is unchanged.
+    assert_eq!(
+        runtime.image_platforms("app:1").await.unwrap(),
+        ["linux/amd64"]
+    );
+}
+
+/// The classic image store keeps no index: the registry is asked, and the
+/// attestations it lists as `unknown/unknown` are not platforms.
+#[tokio::test]
+async fn registry_image_platforms_asks_the_registry_without_a_local_index() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        Some(distribution(&[
+            ("linux", "amd64", None),
+            ("linux", "arm64", Some("v8")),
+            ("unknown", "unknown", None),
+            ("unknown", "unknown", None),
+        ])),
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let platforms = runtime
+        .registry_image_platforms("registry.example.com/team/app:1", None)
+        .await
+        .unwrap();
+
+    assert_eq!(platforms.len(), 2, "{platforms:?}");
+    for node in ["linux/amd64", "linux/arm64"] {
+        assert!(
+            platforms
+                .iter()
+                .any(|platform| crate::platform::platforms_match(platform, node)),
+            "a {node} node must be eligible: {platforms:?}"
+        );
+    }
+}
+
+/// An unreachable registry is an error naming the image, which the deploy
+/// job answers by falling back to the platforms held locally.
+#[tokio::test]
+async fn registry_image_platforms_reports_an_unreachable_registry() {
+    let docker = image_store_daemon_with_registry(
+        inspected_amd64(),
+        serde_json::json!([summary(INSPECTED_ID, None)]),
+        None,
+    )
+    .await;
+    let runtime = DockerRuntime::new(Arc::new(docker), false, "temps-test-network".to_string());
+
+    let error = runtime
+        .registry_image_platforms("registry.example.com/team/app:1", None)
+        .await
+        .expect_err("no index locally and none from the registry");
+    let message = error.to_string();
+    assert!(
+        message.contains("registry.example.com/team/app:1"),
+        "{message}"
+    );
 }

@@ -206,6 +206,26 @@ ORDER BY esb.id ASC
         backup_type: &str,
         created_by: i32,
     ) -> Result<temps_entities::external_service_backups::Model, BackupError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .backup_external_service_inner(service, s3_source_id, backup_type, created_by)
+            .await;
+        self.telemetry.report(crate::telemetry::operation_outcome(
+            false,
+            &service.service_type,
+            started.elapsed(),
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        ));
+        result
+    }
+
+    async fn backup_external_service_inner(
+        &self,
+        service: &temps_entities::external_services::Model,
+        s3_source_id: i32,
+        backup_type: &str,
+        created_by: i32,
+    ) -> Result<temps_entities::external_service_backups::Model, BackupError> {
         info!("Starting external service backup process");
         let service_id = service.id;
 
@@ -253,7 +273,7 @@ ORDER BY esb.id ASC
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
             bucket_path: s3_source.bucket_path.clone(),
-            force_path_style: s3_source.force_path_style.unwrap_or(true),
+            force_path_style: s3_source.effective_path_style(true).force_path_style,
         };
 
         // Generate unique backup ID

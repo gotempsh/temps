@@ -56,6 +56,7 @@ pub mod migrations;
 pub mod read_limits;
 
 use migrations::WriteTable;
+use temps_core::escape::escape_like;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -932,10 +933,15 @@ struct ChSpanStatsRow {
     p99_duration_ms: f64,
     /// Unix milliseconds (toUnixTimestamp64Milli)
     last_seen_ms: i64,
+    /// Spans at or under the Apdex threshold (0 when none was asked for).
+    satisfied_count: u64,
+    /// Spans over the threshold and at or under four times it.
+    tolerating_count: u64,
 }
 
-impl From<ChSpanStatsRow> for SpanStats {
-    fn from(r: ChSpanStatsRow) -> Self {
+impl ChSpanStatsRow {
+    fn into_stats(self, apdex_threshold_ms: Option<f64>) -> SpanStats {
+        let r = self;
         use chrono::TimeZone;
         let last_seen = chrono::Utc
             .timestamp_millis_opt(r.last_seen_ms)
@@ -961,6 +967,11 @@ impl From<ChSpanStatsRow> for SpanStats {
                 p99_ms: r.p99_duration_ms,
             },
             last_seen,
+            apdex_threshold_ms.map(|threshold_ms| crate::types::ApdexCounts {
+                threshold_ms,
+                satisfied: r.satisfied_count as i64,
+                tolerating: r.tolerating_count as i64,
+            }),
         )
     }
 }
@@ -1030,10 +1041,7 @@ fn build_ch_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<ChBind>) 
     }
     if let Some(ref pattern) = query.name_pattern {
         where_parts.push("spans.name ILIKE ?".to_owned());
-        binds.push(ChBind::Str(format!(
-            "%{}%",
-            escape_like_pattern(pattern.as_str())
-        )));
+        binds.push(ChBind::Str(format!("%{}%", escape_like(pattern.as_str()))));
     }
     if let Some(kind) = query.kind {
         where_parts.push("spans.kind = ?".to_owned());
@@ -1121,34 +1129,6 @@ struct ChGenAiSummaryRow {
 struct ChSpanEventsRow {
     span_id: String,
     events: String, // JSON string
-}
-
-// ── LIKE pattern helpers ────────────────────────────────────────────────────
-
-/// Escape LIKE/ILIKE metacharacters in a user-supplied substring pattern.
-///
-/// ClickHouse LIKE uses backslash as the default escape character (no explicit
-/// `ESCAPE` clause required). We must escape:
-///
-/// - `\` → `\\`   (backslash itself, before the other replacements)
-/// - `%` → `\%`   (wildcard: any sequence of chars)
-/// - `_` → `\_`   (wildcard: exactly one char)
-///
-/// The caller then wraps the result with `%{escaped}%` to perform a
-/// case-insensitive substring search via ILIKE.
-///
-/// ## Verification
-///
-/// Confirmed against live ClickHouse 26.2: `'hello%world' LIKE '%\%%'`
-/// returns 1, `'helloXworld' LIKE '%\%%'` returns 0. The backslash is the
-/// default escape character; no `ESCAPE` clause is needed.
-pub(crate) fn escape_like_pattern(pattern: &str) -> String {
-    // Order matters: escape backslash first so the subsequent replacements
-    // don't double-escape the backslashes we just introduced.
-    pattern
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_")
 }
 
 // ── Metric bucket-interval translation ──────────────────────────────────────
@@ -1589,6 +1569,176 @@ impl ClickHouseOtelStorage {
     }
 }
 
+impl ClickHouseOtelStorage {
+    /// A trace's spans by start time; with `limit`, only the first `limit`.
+    async fn read_trace(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        limit: Option<usize>,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        // Simple point-lookup — the ORDER BY (project_id, trace_id, span_id)
+        // primary index makes this a sequential read of one contiguous block.
+        #[derive(::clickhouse::Row, Deserialize, Debug)]
+        struct ChRawSpanRow {
+            project_id: i32,
+            deployment_id: Option<i32>,
+            service_name: String,
+            service_version: String,
+            deployment_environment: String,
+            trace_id: String,
+            span_id: String,
+            parent_span_id: String,
+            name: String,
+            kind: String,
+            start_time_ms: i64,
+            end_time_ms: i64,
+            duration_ms: f64,
+            status_code: String,
+            status_message: String,
+            attributes: String,
+            events: String,
+        }
+
+        let sql = "SELECT project_id, deployment_id, service_name, service_version, \
+                   deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+                   toUnixTimestamp64Milli(start_time) AS start_time_ms, \
+                   toUnixTimestamp64Milli(end_time) AS end_time_ms, \
+                   duration_ms, status_code, status_message, attributes, events \
+                   FROM spans FINAL \
+                   WHERE project_id = ? AND trace_id = ? \
+                   ORDER BY start_time ASC";
+        let sql = match limit {
+            Some(_) => format!("{sql} LIMIT ?"),
+            None => sql.to_string(),
+        };
+
+        let mut query = self.read.query(&sql).bind(project_id).bind(trace_id);
+        if let Some(limit) = limit {
+            query = query.bind(limit as u64);
+        }
+        let rows = query
+            .fetch_all::<ChRawSpanRow>()
+            .await
+            .map_err(|e| ch_query_err("get_trace", e))?;
+
+        let spans: Vec<SpanRecord> = rows
+            .into_iter()
+            .map(|r| {
+                use chrono::TimeZone;
+                let start_time = chrono::Utc
+                    .timestamp_millis_opt(r.start_time_ms)
+                    .single()
+                    .unwrap_or_default();
+                let end_time = chrono::Utc
+                    .timestamp_millis_opt(r.end_time_ms)
+                    .single()
+                    .unwrap_or_default();
+                let attributes: std::collections::BTreeMap<String, String> =
+                    serde_json::from_str(&r.attributes).unwrap_or_default();
+                let events: Vec<SpanEvent> = serde_json::from_str(&r.events).unwrap_or_default();
+                let resource = crate::types::ResourceInfo {
+                    service_name: r.service_name,
+                    service_version: if r.service_version.is_empty() {
+                        None
+                    } else {
+                        Some(r.service_version)
+                    },
+                    deployment_environment: if r.deployment_environment.is_empty() {
+                        None
+                    } else {
+                        Some(r.deployment_environment)
+                    },
+                    attributes: std::collections::BTreeMap::new(),
+                };
+                SpanRecord {
+                    ingest_identity: None,
+                    project_id: r.project_id,
+                    deployment_id: r.deployment_id,
+                    resource,
+                    trace_id: r.trace_id,
+                    span_id: r.span_id,
+                    parent_span_id: if r.parent_span_id.is_empty() {
+                        None
+                    } else {
+                        Some(r.parent_span_id)
+                    },
+                    name: r.name,
+                    kind: str_to_span_kind(&r.kind),
+                    start_time,
+                    end_time,
+                    duration_ms: r.duration_ms,
+                    status_code: str_to_span_status(&r.status_code),
+                    status_message: r.status_message,
+                    attributes,
+                    events,
+                }
+            })
+            .collect();
+
+        debug!(
+            project_id,
+            trace_id,
+            count = spans.len(),
+            "ClickHouseOtelStorage: get_trace"
+        );
+        Ok(spans)
+    }
+}
+
+impl ClickHouseOtelStorage {
+    /// `AND ...` predicates for a span query's attribute filters, with their
+    /// string binds in placeholder order. Faceted keys read their slot
+    /// column; the rest extract from the JSON attributes.
+    fn span_attribute_filters(&self, query: &TraceQuery) -> (String, Vec<String>) {
+        let mut sql = String::new();
+        let mut binds: Vec<String> = Vec::new();
+        if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap read).
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
+            for (key, value) in attrs {
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column + bloom index.
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    sql.push_str(&format!(" AND {column} = ?"));
+                    binds.push(value.clone());
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
+                    binds.push(key.clone());
+                    binds.push(value.clone());
+                }
+            }
+        }
+        if let Some(ref wanted) = query.attribute_path {
+            let facet_slot = self
+                .facet_cache
+                .as_ref()
+                .and_then(|c| c.load().get(wanted.key.as_str()).copied());
+            let column = match facet_slot {
+                Some(slot) => crate::services::facet_service::facet_column_name(slot),
+                None => "JSONExtractString(attributes, ?)".to_string(),
+            };
+            let [query_prefix, fragment_prefix] = wanted.suffixed();
+            sql.push_str(&format!(
+                " AND ({column} = ? OR startsWith({column}, ?) OR startsWith({column}, ?))"
+            ));
+            for value in [wanted.path.clone(), query_prefix, fragment_prefix] {
+                if facet_slot.is_none() {
+                    binds.push(wanted.key.clone());
+                }
+                binds.push(value);
+            }
+        }
+        (sql, binds)
+    }
+}
+
 #[async_trait]
 impl OtelStorage for ClickHouseOtelStorage {
     async fn global_trace_stream(
@@ -1744,31 +1894,12 @@ impl OtelStorage for ClickHouseOtelStorage {
         // In Phase 1 we use the denormalized deployment_environment column
         // for the common case; environment_id is not resolvable in CH without
         // a separate Postgres lookup, so we skip that filter here.
-        if let Some(ref attrs) = query.attributes {
-            // Load the facet cache once for this query (lock-free ArcSwap read).
-            let facet_snapshot = self
-                .facet_cache
-                .as_ref()
-                .map(|c| c.load_full())
-                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
-
-            for (key, value) in attrs {
-                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
-                    // Faceted key: use the pre-populated slot column + bloom index.
-                    let column = crate::services::facet_service::facet_column_name(slot);
-                    where_sql.push_str(&format!(" AND {column} = ?"));
-                    binds.push(Bv::Str(value.clone()));
-                } else {
-                    // Unfaceted key: fall back to JSON extraction.
-                    where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
-                    binds.push(Bv::Str(key.clone()));
-                    binds.push(Bv::Str(value.clone()));
-                }
-            }
-        }
+        let (attribute_sql, attribute_binds) = self.span_attribute_filters(&query);
+        where_sql.push_str(&attribute_sql);
+        binds.extend(attribute_binds.into_iter().map(Bv::Str));
         if let Some(ref pattern) = query.name_pattern {
             where_sql.push_str(" AND name ILIKE ?");
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
         if query.root_only {
             // Root spans use the '' sentinel for parent_span_id in the CH
@@ -2106,7 +2237,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -2347,7 +2478,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         if let Some(ref pattern) = query.name_pattern {
             where_parts.push("name ILIKE ?".to_owned());
-            binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+            binds.push(Bv::Str(format!("%{}%", escape_like(pattern))));
         }
 
         let where_sql = where_parts.join(" AND ");
@@ -2431,108 +2562,16 @@ impl OtelStorage for ClickHouseOtelStorage {
 
     /// Fetch all spans of a single trace, ordered by start_time ASC.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
-        // Simple point-lookup — the ORDER BY (project_id, trace_id, span_id)
-        // primary index makes this a sequential read of one contiguous block.
-        #[derive(::clickhouse::Row, Deserialize, Debug)]
-        struct ChRawSpanRow {
-            project_id: i32,
-            deployment_id: Option<i32>,
-            service_name: String,
-            service_version: String,
-            deployment_environment: String,
-            trace_id: String,
-            span_id: String,
-            parent_span_id: String,
-            name: String,
-            kind: String,
-            start_time_ms: i64,
-            end_time_ms: i64,
-            duration_ms: f64,
-            status_code: String,
-            status_message: String,
-            attributes: String,
-            events: String,
-        }
+        self.read_trace(project_id, trace_id, None).await
+    }
 
-        let sql = "SELECT project_id, deployment_id, service_name, service_version, \
-                   deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
-                   toUnixTimestamp64Milli(start_time) AS start_time_ms, \
-                   toUnixTimestamp64Milli(end_time) AS end_time_ms, \
-                   duration_ms, status_code, status_message, attributes, events \
-                   FROM spans FINAL \
-                   WHERE project_id = ? AND trace_id = ? \
-                   ORDER BY start_time ASC";
-
-        let rows = self
-            .read
-            .query(sql)
-            .bind(project_id)
-            .bind(trace_id)
-            .fetch_all::<ChRawSpanRow>()
-            .await
-            .map_err(|e| ch_query_err("get_trace", e))?;
-
-        let spans: Vec<SpanRecord> = rows
-            .into_iter()
-            .map(|r| {
-                use chrono::TimeZone;
-                let start_time = chrono::Utc
-                    .timestamp_millis_opt(r.start_time_ms)
-                    .single()
-                    .unwrap_or_default();
-                let end_time = chrono::Utc
-                    .timestamp_millis_opt(r.end_time_ms)
-                    .single()
-                    .unwrap_or_default();
-                let attributes: std::collections::BTreeMap<String, String> =
-                    serde_json::from_str(&r.attributes).unwrap_or_default();
-                let events: Vec<SpanEvent> = serde_json::from_str(&r.events).unwrap_or_default();
-                let resource = crate::types::ResourceInfo {
-                    service_name: r.service_name,
-                    service_version: if r.service_version.is_empty() {
-                        None
-                    } else {
-                        Some(r.service_version)
-                    },
-                    deployment_environment: if r.deployment_environment.is_empty() {
-                        None
-                    } else {
-                        Some(r.deployment_environment)
-                    },
-                    attributes: std::collections::BTreeMap::new(),
-                };
-                SpanRecord {
-                    ingest_identity: None,
-                    project_id: r.project_id,
-                    deployment_id: r.deployment_id,
-                    resource,
-                    trace_id: r.trace_id,
-                    span_id: r.span_id,
-                    parent_span_id: if r.parent_span_id.is_empty() {
-                        None
-                    } else {
-                        Some(r.parent_span_id)
-                    },
-                    name: r.name,
-                    kind: str_to_span_kind(&r.kind),
-                    start_time,
-                    end_time,
-                    duration_ms: r.duration_ms,
-                    status_code: str_to_span_status(&r.status_code),
-                    status_message: r.status_message,
-                    attributes,
-                    events,
-                }
-            })
-            .collect();
-
-        debug!(
-            project_id,
-            trace_id,
-            count = spans.len(),
-            "ClickHouseOtelStorage: get_trace"
-        );
-        Ok(spans)
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        self.read_trace(project_id, trace_id, Some(max_spans)).await
     }
 
     /// Per-operation latency statistics, aggregated over the queried window.
@@ -2597,7 +2636,11 @@ impl OtelStorage for ClickHouseOtelStorage {
                 toFloat64(quantileTDigest(0.50)(duration_ms)) AS p50_duration_ms,
                 toFloat64(quantileTDigest(0.95)(duration_ms)) AS p95_duration_ms,
                 toFloat64(quantileTDigest(0.99)(duration_ms)) AS p99_duration_ms,
-                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms
+                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms,
+                -- Apdex counts, in the same pass: satisfied at or under T,
+                -- tolerating up to 4T (ADR 111, D2).
+                countIf(duration_ms <= ?) AS satisfied_count,
+                countIf(duration_ms > ? AND duration_ms <= ?) AS tolerating_count
             FROM spans
             WHERE {where_sql}
             GROUP BY project_id, service_name, name
@@ -2606,7 +2649,16 @@ impl OtelStorage for ClickHouseOtelStorage {
             LIMIT ? OFFSET ?"#
         );
 
-        let mut q = bind_all(self.read.query(&sql), binds);
+        // The SELECT placeholders come before the WHERE ones in the text, so
+        // they are bound first.
+        let threshold = query.apdex_threshold_ms.unwrap_or(0.0);
+        let q = self
+            .read
+            .query(&sql)
+            .bind(threshold)
+            .bind(threshold)
+            .bind(threshold * 4.0);
+        let mut q = bind_all(q, binds);
         q = q
             .bind(query.min_count as i64)
             .bind(limit as i64)
@@ -2617,7 +2669,10 @@ impl OtelStorage for ClickHouseOtelStorage {
             .await
             .map_err(|e| ch_query_err("query_span_stats", e))?;
 
-        Ok(rows.into_iter().map(SpanStats::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| row.into_stats(query.apdex_threshold_ms))
+            .collect())
     }
 
     async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
@@ -4256,26 +4311,26 @@ mod tests {
         assert_eq!(str_to_span_status("BOGUS"), SpanStatusCode::Unset);
     }
 
-    // ── escape_like_pattern tests ─────────────────────────────────────────
+    // ── escape_like tests ─────────────────────────────────────────
 
     #[test]
     fn escape_plain_pattern_unchanged() {
-        assert_eq!(escape_like_pattern("hello"), "hello");
-        assert_eq!(escape_like_pattern("GET /api/v1"), "GET /api/v1");
+        assert_eq!(escape_like("hello"), "hello");
+        assert_eq!(escape_like("GET /api/v1"), "GET /api/v1");
     }
 
     #[test]
     fn escape_percent_metachar() {
         // A literal '%' in the user pattern must become '\%' so it does not
         // act as a wildcard in the LIKE expression.
-        assert_eq!(escape_like_pattern("%"), "\\%");
-        assert_eq!(escape_like_pattern("50%"), "50\\%");
+        assert_eq!(escape_like("%"), "\\%");
+        assert_eq!(escape_like("50%"), "50\\%");
     }
 
     #[test]
     fn escape_underscore_metachar() {
-        assert_eq!(escape_like_pattern("_id"), "\\_id");
-        assert_eq!(escape_like_pattern("user_name"), "user\\_name");
+        assert_eq!(escape_like("_id"), "\\_id");
+        assert_eq!(escape_like("user_name"), "user\\_name");
     }
 
     #[test]
@@ -4283,18 +4338,18 @@ mod tests {
         // A literal backslash must become '\\' and must be processed before
         // the other replacements so that introduced backslashes are not
         // double-escaped.
-        assert_eq!(escape_like_pattern("\\"), "\\\\");
+        assert_eq!(escape_like("\\"), "\\\\");
         // A pattern with both a backslash and a %:
         //   input:  `\%`  (backslash then percent)
         //   want:   `\\\%` (escaped backslash, then escaped percent)
-        assert_eq!(escape_like_pattern("\\%"), "\\\\\\%");
+        assert_eq!(escape_like("\\%"), "\\\\\\%");
     }
 
     #[test]
     fn wrapped_escaped_pattern_is_correct() {
         // Full round-trip: user types "50%" → ILIKE pattern "%50\%%"
         let pattern = "50%";
-        let wrapped = format!("%{}%", escape_like_pattern(pattern));
+        let wrapped = format!("%{}%", escape_like(pattern));
         assert_eq!(wrapped, "%50\\%%");
     }
 

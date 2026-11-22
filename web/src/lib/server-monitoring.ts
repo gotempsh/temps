@@ -198,9 +198,11 @@ export type DiskProjection =
 export function projectDisk(
   points: MetricDataPoint[] | undefined,
   totalBytes: number | null | undefined,
-  criticalPercent = DISK_THRESHOLDS.poor
+  criticalPercent = DISK_THRESHOLDS.poor,
+  singleNode = true
 ): DiskProjection | null {
-  if (!totalBytes || !(totalBytes > 0)) return null
+  // Summed history changes when nodes join or stop reporting; it is not disk growth.
+  if (!singleNode || !totalBytes || !(totalBytes > 0)) return null
   const samples = samplesOf(points).filter(
     (p) => !Number.isNaN(Date.parse(p.time))
   )

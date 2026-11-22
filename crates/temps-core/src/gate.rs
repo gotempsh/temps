@@ -16,6 +16,7 @@
 //! padding. The signature is Ed25519 over `temps-gate-v1.<claims>` by the
 //! control plane's gate key; the public half travels in the route snapshot.
 
+use crate::crypto::constant_time_eq;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, Method};
@@ -963,14 +964,6 @@ pub fn check_callback(
         verifier: found.verifier,
         return_to: found.return_to,
     })
-}
-
-/// Compare two byte strings without an early exit.
-pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// A listener asks the control plane to exchange a sign-in code.

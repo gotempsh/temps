@@ -15,8 +15,13 @@
 )]
 pub use sea_orm_migration::prelude::*;
 
-// Module removed for initial build
+mod general_vault_backfill;
+pub use general_vault_backfill::backfill_legacy_vault_links;
+mod vault_audit_backfill;
+pub use vault_audit_backfill::{backfill_vault_audit_attribution, VaultAuditBackfillSummary};
 mod migration;
+#[cfg(test)]
+mod migration_order;
 // Re-export for convenience
 // Re-export removed
 pub use migration::m20260805_000001_index_normalized_managed_domains::Migration as NormalizedManagedDomainIndexMigration;
@@ -26,6 +31,11 @@ pub use migration::m20260916_000001_reconcile_otel_trace_summaries::{
     trace_summary_rebuild_delta_sql, trace_summary_rebuild_initial_sql,
 };
 pub use migration::m20261107_000003_unique_custom_domain_hostname::Migration as UniqueCustomDomainHostnameMigration;
+pub use migration::m20261112_000001_seed_postgres_wal_archiving_alert_rules::Migration as SeedPostgresWalArchivingAlertRulesMigration;
+pub use migration::m20261113_000009_legacy_standalone_vault_coverage::Migration as LegacyStandaloneVaultCoverageMigration;
+pub use migration::m20261113_000010_legacy_vault_revocation_fence::Migration as LegacyVaultRevocationFenceMigration;
+pub use migration::m20261113_000011_vault_membership_fence::Migration as VaultMembershipFenceMigration;
+pub use migration::m20261120_000105_error_group_assignees::Migration as ErrorGroupAssigneesMigration;
 pub use migration::Migrator;
 
 pub use migration::m20261022_000001_dns_name_claims::{
@@ -82,9 +92,17 @@ pub use migration::m20261024_000001_drop_sandbox_driver_mode::{
 /// crate's purger must cover exactly these.
 pub use migration::m20261105_000001_project_data_purges::PURGED_TABLES as PROJECT_DATA_PURGED_TABLES;
 
+/// Parents the telemetry tables hold no foreign keys to once
+/// `temps_schema`'s post-migration step has dropped them.
+pub use migration::m20261105_000001_project_data_purges::DETACHED_PARENTS as PROJECT_DATA_DETACHED_PARENTS;
+
 /// Foreign key columns under `projects` without a leading index, and the name
 /// of the index built for each. Built concurrently after boot by
-/// `temps_database::run_post_migration_indexes`, not inside the migration.
+/// `temps_schema::run_post_migration_indexes`, not inside the migration.
 pub use migration::m20261105_000001_project_data_purges::{
     fk_index_name as project_fk_index_name, FK_INDEXES as PROJECT_FK_INDEXES,
+};
+
+pub use migration::m20261113_000002_general_access_vaults::{
+    GENERAL_VAULT_CONSUMER_INDEXES, GENERAL_VAULT_MIGRATION,
 };

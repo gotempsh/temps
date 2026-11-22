@@ -63,6 +63,26 @@ impl BackupService {
         backup_type: &str,
         created_by: i32,
     ) -> Result<Backup, BackupError> {
+        let started = std::time::Instant::now();
+        let result = self
+            .create_backup_inner(schedule_id, s3_source_id, backup_type, created_by)
+            .await;
+        self.telemetry.report(crate::telemetry::operation_outcome(
+            false,
+            "control_plane",
+            started.elapsed(),
+            result.as_ref().map(|_| ()).map_err(ToString::to_string),
+        ));
+        result
+    }
+
+    async fn create_backup_inner(
+        &self,
+        schedule_id: Option<i32>,
+        s3_source_id: i32,
+        backup_type: &str,
+        created_by: i32,
+    ) -> Result<Backup, BackupError> {
         info!("Starting backup process");
 
         // Get S3 source configuration
@@ -335,9 +355,7 @@ impl BackupService {
 
     /// Pulls the specified PostgreSQL Docker image
     pub(super) async fn pull_postgres_image(&self, image_tag: &str) -> Result<()> {
-        use bollard::query_parameters::CreateImageOptionsBuilder;
         use bollard::Docker;
-        use futures::stream::StreamExt as FuturesStreamExt;
 
         info!("Pulling Docker image: {}", image_tag);
 
@@ -351,25 +369,23 @@ impl BackupService {
             (image_tag, "latest")
         };
 
-        let options = CreateImageOptionsBuilder::new()
-            .from_image(image)
-            .tag(tag)
-            .build();
-
-        let mut stream = docker.create_image(Some(options), None, None);
-
-        while let Some(result) = FuturesStreamExt::next(&mut stream).await {
-            match result {
-                Ok(info) => {
-                    if let Some(status) = info.status {
-                        debug!("Docker pull: {}", status);
-                    }
+        temps_docker_util::pull_image_with_progress(
+            &docker,
+            temps_docker_util::PullSpec::new(image).tag(Some(tag)),
+            |info| {
+                if let Some(status) = &info.status {
+                    debug!("Docker pull: {}", status);
                 }
-                Err(e) => {
-                    anyhow::bail!("Failed to pull Docker image {}: {}", image_tag, e);
-                }
-            }
-        }
+            },
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to pull Docker image {}: {}",
+                image_tag,
+                e.cause_text()
+            )
+        })?;
 
         info!("Successfully pulled Docker image: {}", image_tag);
         Ok(())
@@ -725,7 +741,7 @@ mod tests {
             return;
         }
 
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         use testcontainers::runners::AsyncRunner;
 
         // Start RustFS (S3-compatible) container
@@ -837,6 +853,8 @@ mod tests {
             force_path_style: Some(true),
             is_default: None,
             backing_service_id: None,
+            worker_credentials: None,
+            use_tls: None,
         };
 
         let s3_source = backup_service

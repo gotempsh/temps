@@ -14,15 +14,6 @@ const member = {
   resource_limits: { shm_mb: 64 },
 }
 
-const workload = {
-  service_id: 23,
-  service_name: 'redis-example',
-  service_type: 'redis',
-  mode: 'legacy',
-  node_id: null,
-  support: { supported: true },
-}
-
 async function mockService(page: Page, width: number) {
   await page.setViewportSize({ width, height: 1000 })
   await page.route('**/api/**', async (route) => {
@@ -84,24 +75,16 @@ async function mockService(page: Page, width: number) {
         last_checked_at: new Date().toISOString(),
         recent_checks: [],
       }
-    else if (path === '/external-services/23/workload-mode') body = workload
-    else if (path === '/external-services/23/workload-mode/pending-changes')
+    // The API still serves the workload mode to operators; the page must not
+    // ask for it. Answered here so a regression renders the card, not a crash.
+    else if (path === '/external-services/23/workload-mode')
       body = {
-        ...workload,
-        container_found: true,
-        container_name: 'redis-example',
-        computed_at: new Date().toISOString(),
-        changes: [
-          {
-            field: 'labels',
-            current: 'none',
-            after_recreate: Array.from(
-              { length: 6 },
-              (_, index) => `sh.temps.example-label-${index}=value`
-            ).join(', '),
-          },
-          { field: 'init', current: 'false', after_recreate: 'true' },
-        ],
+        service_id: 23,
+        service_name: 'redis-example',
+        service_type: 'redis',
+        mode: 'legacy',
+        node_id: null,
+        support: { supported: true },
       }
     else if (path === '/external-services/23/query/explorer-support')
       body = {
@@ -187,6 +170,22 @@ test('the way back to the list is the breadcrumb, not a second arrow in the head
   )
 })
 
+test('the page does not offer the internal workload mode', async ({ page }) => {
+  const workloadRequests: string[] = []
+  page.on('request', (request) => {
+    const path = new URL(request.url()).pathname
+    if (path.includes('/workload-mode')) workloadRequests.push(path)
+  })
+  await openServicePage(page, 1400)
+
+  await expect(page.getByText('Workload Plane')).toHaveCount(0)
+  for (const mode of ['Legacy', 'Shadow', 'Enforce'])
+    await expect(
+      page.getByRole('button', { name: new RegExp(`^${mode}`) })
+    ).toHaveCount(0)
+  expect(workloadRequests).toEqual([])
+})
+
 test('beside a sidebar, the service page drops to one column so nothing is squeezed', async ({
   page,
 }) => {
@@ -251,38 +250,6 @@ for (const width of [1153, 1400, 1700, 390]) {
     // Squeezed into six columns these were about 70px, clipping their labels.
     const box = await tile.boundingBox()
     expect(box!.width).toBeGreaterThanOrEqual(120)
-  })
-
-  test(`at ${width}px the workload modes stack and the changes fit`, async ({
-    page,
-  }) => {
-    await openServicePage(page, width)
-    const modes = await Promise.all(
-      ['Legacy', 'Shadow', 'Enforce'].map((name) =>
-        page.getByRole('button', { name: new RegExp(`^${name}`) }).boundingBox()
-      )
-    )
-    for (const [above, below] of [
-      [modes[0], modes[1]],
-      [modes[1], modes[2]],
-    ]) {
-      expect(below!.y).toBeGreaterThanOrEqual(above!.y + above!.height)
-      expect(below!.x).toBe(above!.x)
-    }
-
-    // A short value keeps its one word, a long list wraps in its own space.
-    const changes = page.locator('li', { hasText: 'After recreate' })
-    await expect(changes).toHaveCount(2)
-    const value = changes.last().getByText('false', { exact: true })
-    const { height, lineHeight } = await value.evaluate((element) => ({
-      height: element.getBoundingClientRect().height,
-      lineHeight: parseFloat(getComputedStyle(element).lineHeight),
-    }))
-    expect(height).toBeLessThanOrEqual(lineHeight + 1)
-    const overflowing = await changes
-      .first()
-      .evaluate((item) => item.scrollWidth > item.clientWidth)
-    expect(overflowing).toBe(false)
   })
 }
 

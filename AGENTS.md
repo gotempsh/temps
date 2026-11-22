@@ -48,6 +48,12 @@ cleanup, resource limits, migrations) and a pre-PR checklist.
 - **Use `Option<T>` for a required dependency.** Use `Arc<T>` and fail at startup if it is missing.
 - **Use `get_service` for a required plugin dependency.** Use `require_service`, which fails fast with a clear error.
 - **Add runtime configuration as an environment variable** ([next section](#configuration-is-a-column-not-an-environment-variable)).
+- **Add a third-party library (Rust crate, npm package, Python package) unless it is needed and this project cannot reasonably implement the functionality itself.**
+  - *Prefer, in order*: the standard library, a dependency already in the workspace (`[workspace.dependencies]` in the root `Cargo.toml`, an existing `package.json` entry), then code written here.
+  - *Data that drives billing, limits, security or policy* (price tables, allowlists, rate cards) lives in this repository, where every change is reviewed, never in an external package (`crates/temps-ai-gateway/src/services/pricing/mod.rs`).
+  - *A library that is needed* must be established and maintained (real usage history, not a brand-new or single-maintainer package), under a licence `deny.toml` already allows, with few transitive dependencies and no network access at build time. Declare a Rust crate once in `[workspace.dependencies]` with a deliberate version and use it with `{ workspace = true }`.
+  - *A library the contributor maintains* meets the same bar, and the PR discloses that they maintain it.
+  - *The PR description justifies it*: what it does, why an in-repo implementation is not feasible, the alternatives considered, its maintainers, age and usage, licence, and the transitive dependencies it adds.
 - **Hand-edit `CHANGELOG.md`.** [git-cliff](https://git-cliff.org) generates it from commit subjects at release time (concurrent edits used to conflict constantly); preview with `scripts/changelog.sh --unreleased`.
 - **Pass `--no-verify`** unless the user explicitly asks. If a hook is broken, fix the hook.
 - **Mutate Docker resources you did not create.** A host may already run a live Temps instance or operator-owned resources: never stop, remove, prune, rebuild or retag existing containers, images, volumes or networks. Tests create uniquely named resources and clean up only their own.
@@ -204,9 +210,9 @@ status and body, and the Problem Details shape of errors. Real patterns:
 - service tests on Sea-ORM `MockDatabase`: `crates/temps-flags/src/services/flag_service.rs`;
 - handler guard tests: `mod tests` in `crates/temps-flags/src/handlers/handler.rs`;
   401s and audit assertions through the router with `oneshot`:
-  `crates/temps-deployments/src/handlers/wireguard_mesh.rs`;
+  `crates/temps-nodes/src/handlers/wireguard_mesh.rs`;
 - trait-based mocks or `mockall` for external services; `TestDatabase`
-  (`crates/temps-database/src/test_utils.rs`) for real-database tests, one
+  (`crates/temps-test-utils/src/lib.rs`) for real-database tests, one
   isolated schema per test, cleaned up on drop;
 - Docker tests check `docker.ping()` and return early with a message when Docker
   is unavailable.
@@ -298,6 +304,22 @@ regenerate with `bun run scripts/generate-docs.ts --output docs/CLI.md` and
 
 ## Build, lint and CI
 
+### Minimize CI runner allocations
+
+- Add related checks as steps in an existing compatible job; reuse its checkout,
+  dependency installation and caches instead of adding a job per check or SDK.
+- Each job and matrix entry allocates a runner. Reusable workflows do not remove
+  that cost. Keep workflows and matrices small, avoid duplicate validation across
+  workflows, and cancel superseded PR runs where safe.
+- Create a separate job only for a concrete need: a different OS or architecture,
+  permission or secret isolation, resource requirements, or a measured improvement
+  in feedback time that justifies the extra runner cost. State that reason in the
+  workflow or PR. Keep publication permissions isolated from untrusted PR checks.
+- Preserve required checks and test coverage when consolidating jobs; update
+  coverage mappings and coordinate required-status changes rather than silently
+  removing validation.
+
+
 ```bash
 cargo check --lib -p <crate>                 # after every change
 cargo test --lib -p <crate> [test_name] [-- --nocapture]
@@ -326,6 +348,11 @@ FORCE_WEB_BUILD=1 cargo build                # debug build with the web UI
   fixing violations, lower it with `python3 scripts/rule_drift.py
   --update-baseline` and commit the baseline; `--list <metric>` shows where the
   rest are.
+- **Test coverage**: `scripts/ci_test_coverage.py` fails the required
+  **Formatting** job when a test binary is selected by no group in
+  `rust-tests.yml` and not listed, with its reason, in
+  `scripts/ci-test-coverage-allowlist.toml`. A new test binary or crate goes in a
+  group. `--measure` reports per test from a `cargo nextest list` file.
 - **Generated docs** are checked in CI: `python3 scripts/crate_map.py --check`
   (crate map and Cargo descriptions) and `python3 scripts/adr_index.py --check`
   (unique ADR numbers and the index).

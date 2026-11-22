@@ -64,6 +64,22 @@ pub enum CronServiceError {
     #[error("No active deployment found for environment {env_id}")]
     NoActiveDeployment { env_id: i32 },
 
+    /// A stored HTTP cron whose path would not stay on the app's own address.
+    /// The row is kept but never run; the repository's `.temps.yaml` has to be
+    /// fixed and redeployed.
+    #[error(
+        "Cron {cron_id} was not run: its path '{path}' is not accepted ({reason}); fix the \
+         `path` in .temps.yaml and redeploy"
+    )]
+    InvalidCronPath {
+        cron_id: i32,
+        path: String,
+        reason: String,
+    },
+
+    #[error("Could not build the HTTP client for cron requests: {reason}")]
+    HttpClient { reason: String },
+
     #[error("HTTP request failed: {0}")]
     HttpError(#[from] reqwest::Error),
 
@@ -114,7 +130,10 @@ const ALARM_DELIVERY_TIMEOUT: Duration = Duration::from_secs(60);
 /// Database-backed cron configuration service
 pub struct DatabaseCronConfigService {
     db: Arc<DatabaseConnection>,
-    http_client: Arc<reqwest::Client>,
+    /// Never follows a redirect: a cron request goes to the app's own
+    /// container and carries the project's deployment token, and the app (the
+    /// repository's code) chooses what it answers with.
+    http_client: reqwest::Client,
     queue: Arc<dyn temps_core::JobQueue>,
     deployment_token_service: Arc<DeploymentTokenService>,
     /// Raises an alarm (and its notifications) when an invocation fails.
@@ -127,6 +146,11 @@ pub struct DatabaseCronConfigService {
     /// every plugin has registered. Unset means `job` crons are recorded
     /// as failed with that reason; `http` crons never use it.
     plane: OnceLock<Arc<WorkloadPlane>>,
+    /// Starts the runs of `workflow` crons (ADR-106 §9). Late-bound: set
+    /// from `initialize_plugin_services` when the workflows plugin is
+    /// loaded. Unset means `workflow` crons are recorded as failed with
+    /// that reason.
+    workflows: OnceLock<Arc<dyn temps_core::WorkflowControl>>,
 }
 
 /// Where a `job` cron's run comes from: the environment's current
@@ -145,15 +169,29 @@ impl DatabaseCronConfigService {
         db: Arc<DbConnection>,
         queue: Arc<dyn temps_core::JobQueue>,
         deployment_token_service: Arc<DeploymentTokenService>,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, CronServiceError> {
+        // A 3xx answer is recorded as the cron's result. Following it would
+        // send the request, and the deployment token, wherever the app points.
+        let http_client = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|error| CronServiceError::HttpClient {
+                reason: error.to_string(),
+            })?;
+        Ok(Self {
             db,
-            http_client: Arc::new(reqwest::Client::new()),
+            http_client,
             queue,
             deployment_token_service,
             alarm_service: OnceLock::new(),
             plane: OnceLock::new(),
-        }
+            workflows: OnceLock::new(),
+        })
+    }
+
+    /// Wire in the workflows engine that `workflow` crons start runs on.
+    pub fn set_workflow_control(&self, control: Arc<dyn temps_core::WorkflowControl>) {
+        let _ = self.workflows.set(control);
     }
 
     /// Wire in the workload plane that runs `job` crons.
@@ -460,19 +498,37 @@ impl DatabaseCronConfigService {
         }
 
         // First verify the cron exists and belongs to the project/environment
-        self.get_cron_by_id(project_id, env_id, cron_id).await?;
+        let cron = self.get_cron_by_id(project_id, env_id, cron_id).await?;
 
         let query = cron_executions::Entity::find()
             .filter(cron_executions::Column::CronId.eq(cron_id))
             .order_by_desc(cron_executions::Column::ExecutedAt);
 
         let paginator = query.paginate(self.db.as_ref(), per_page.max(1) as u64);
-        let executions = paginator
+        let mut executions = paginator
             .fetch_page(temps_core::config::page_index(page.max(1) as u64))
             .await
             .map_err(|e| {
                 CronConfigError::DatabaseError(format!("Failed to fetch executions: {}", e))
             })?;
+
+        // A workflow cron's runs finish on their own: settle the page's
+        // finished ones, so the history never shows a done run as running.
+        // Best effort: on failure the rows stay as they are.
+        if let Some(control) = self.workflows.get() {
+            if cron.mode == crons::MODE_WORKFLOW {
+                if let Err(error) = super::cron_workflows::settle_workflow_executions(
+                    self.db.as_ref(),
+                    control.as_ref(),
+                    &cron,
+                    &mut executions,
+                )
+                .await
+                {
+                    warn!(cron_id, %error, "could not settle the finished runs of a workflow cron");
+                }
+            }
+        }
 
         Ok(executions)
     }
@@ -648,6 +704,35 @@ impl DatabaseCronConfigService {
         let should_run = due_at <= now;
 
         if should_run {
+            if cron.mode == crons::MODE_WORKFLOW {
+                // Only the scheduler holding this exact due occurrence may
+                // dispatch it. A concurrent scheduler or a reconfiguration
+                // must not repeat `replace` against newer workflow runs.
+                let claimed = crons::Entity::update_many()
+                    .col_expr(
+                        crons::Column::NextRun,
+                        Expr::value(upcoming.unwrap_or_else(Self::retired_sentinel)),
+                    )
+                    .filter(crons::Column::Id.eq(cron.id))
+                    .filter(crons::Column::NextRun.eq(due_at))
+                    .filter(crons::Column::UpdatedAt.eq(cron.updated_at))
+                    .filter(crons::Column::DeletedAt.is_null())
+                    .exec(self.db.as_ref())
+                    .await?;
+                if claimed.rows_affected == 0 {
+                    return Ok(());
+                }
+                return super::cron_workflows::dispatch_workflow(
+                    self.db.as_ref(),
+                    self.workflows.get(),
+                    cron,
+                    due_at,
+                    now,
+                )
+                .await
+                .map_err(CronServiceError::from);
+            }
+
             // Advance the due time *before* executing. A failed execution
             // returns early below, and leaving `next_run` in the past would
             // then replay the same minute on every sweep.
@@ -665,13 +750,23 @@ impl DatabaseCronConfigService {
                 return self.dispatch_job(cron, due_at, now).await;
             }
 
-            // Execute the cron
+            // Execute the cron. The address is resolved once, so the URL that
+            // is recorded is the URL that was called.
+            let base_url = self.get_deployment_url(cron).await?;
             let start_time = std::time::Instant::now();
-            let result = self.execute_cron(cron).await;
+            let (result, url) = match Self::cron_request_url(cron, &base_url) {
+                Ok(target) => {
+                    let url = target.to_string();
+                    (self.execute_cron(cron, &url).await, url)
+                }
+                Err(refusal) => {
+                    // The path no longer passes. Nothing is sent; the row stays
+                    // so the failure is visible next to the cron.
+                    error!("{refusal}");
+                    (Err(refusal), base_url)
+                }
+            };
             let execution_time = start_time.elapsed().as_millis() as i32;
-
-            // Get the deployment URL for recording the execution
-            let url = format!("{}{}", self.get_deployment_url(cron).await?, cron.path);
 
             // Record the execution with appropriate status and error message
             let (status_code, error_message, headers) = match &result {
@@ -1125,11 +1220,27 @@ impl DatabaseCronConfigService {
         Ok(url)
     }
 
+    /// The URL an HTTP cron calls: `cron.path` on the app's address `base`.
+    ///
+    /// Crons stored before paths were validated may carry one that would move
+    /// the request to another host. Those are refused here, on every run, not
+    /// only when `.temps.yaml` is read.
+    fn cron_request_url(cron: &crons::Model, base: &str) -> Result<url::Url, CronServiceError> {
+        temps_core::request_path::url_for_request_path(base, &cron.path).map_err(|error| {
+            CronServiceError::InvalidCronPath {
+                cron_id: cron.id,
+                path: cron.path.escape_debug().to_string(),
+                reason: error.to_string(),
+            }
+        })
+    }
+
     async fn execute_cron(
         &self,
         cron: &crons::Model,
+        url: &str,
     ) -> Result<reqwest::Response, CronServiceError> {
-        let url = format!("{}{}", self.get_deployment_url(cron).await?, cron.path);
+        let url = url.to_string();
         debug!("Executing cron {} at {}", cron.id, url);
 
         let mut request = self.http_client.get(&url).header("X-Cron-Job", "true");
@@ -1246,8 +1357,8 @@ mod tests {
             "leap-second wait must stay within one minute, got {wait:?}"
         );
     }
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
 
     // Mock queue for tests
     struct MockQueue;
@@ -1347,6 +1458,7 @@ mod tests {
             Arc::new(MockQueue),
             create_test_deployment_token_service(db.clone()),
         )
+        .expect("cron service")
     }
 
     #[tokio::test]
@@ -1723,9 +1835,11 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/cleanup".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1759,10 +1873,12 @@ mod tests {
 
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Use standard 5-field cron (the format users actually write in .temps.yaml)
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/daily".to_string(),
             schedule: "0 0 * * *".to_string(),
             job: None,
@@ -1797,10 +1913,12 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Create initial cron
         let configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1811,6 +1929,7 @@ mod tests {
 
         // Update with different schedule
         let updated_configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task".to_string(),
             schedule: "0 */5 * * * *".to_string(),
             job: None,
@@ -1843,16 +1962,19 @@ mod tests {
         // Create test project and environment
         let (project, environment) = create_test_project_and_environment(db.as_ref()).await?;
 
-        let service = DatabaseCronConfigService::new(db.clone(), queue, token_service);
+        let service =
+            DatabaseCronConfigService::new(db.clone(), queue, token_service).expect("cron service");
 
         // Create two crons
         let configs = vec![
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task1".to_string(),
                 schedule: "0 0 * * * *".to_string(),
                 job: None,
             },
             CronConfig {
+                workflow: None,
                 path: "/api/cron/task2".to_string(),
                 schedule: "0 0 * * * *".to_string(),
                 job: None,
@@ -1864,6 +1986,7 @@ mod tests {
 
         // Update with only one cron (task2 removed)
         let updated_configs = vec![CronConfig {
+            workflow: None,
             path: "/api/cron/task1".to_string(),
             schedule: "0 0 * * * *".to_string(),
             job: None,
@@ -1988,6 +2111,8 @@ mod tests {
             retry_limit: 0,
             timeout_seconds: None,
             ttl_seconds_after_finished: None,
+            workflow_name: None,
+            workflow_input: None,
         }
     }
 
@@ -2181,10 +2306,22 @@ mod tests {
         temps_entities::environments::Model,
         crons::Model,
     ) {
+        let port = failing_endpoint().await;
+        cron_fixture_on_port(db, port).await
+    }
+
+    /// Like [`failing_cron_fixture`], with the deployment on `port`.
+    async fn cron_fixture_on_port(
+        db: &Arc<DatabaseConnection>,
+        port: u16,
+    ) -> (
+        temps_entities::projects::Model,
+        temps_entities::environments::Model,
+        crons::Model,
+    ) {
         let (project, environment) = create_test_project_and_environment(db.as_ref())
             .await
             .expect("fixtures");
-        let port = failing_endpoint().await;
 
         let deployment = deployments::ActiveModel {
             project_id: Set(project.id),
@@ -2256,7 +2393,8 @@ mod tests {
             db.clone(),
             queue.clone(),
             create_test_deployment_token_service(db.clone()),
-        );
+        )
+        .expect("cron service");
         service.set_alarm_service(Arc::new(AlarmService::new(
             db.clone(),
             Arc::new(NoopNotificationService),
@@ -2300,6 +2438,134 @@ mod tests {
         );
     }
 
+    /// Answer every connection with `response` and count the connections.
+    async fn counting_endpoint(response: String) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test endpoint");
+        let port = listener.local_addr().expect("local addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let mut buffer = [0u8; 2048];
+                let _ = socket.read(&mut buffer).await;
+                let _ = socket.write_all(response.as_bytes()).await;
+            }
+        });
+        (port, hits)
+    }
+
+    /// The app answering with a redirect is recorded as the result. The
+    /// request, and the deployment token it carries, is not sent on.
+    #[tokio::test]
+    async fn a_redirect_from_the_app_is_recorded_and_not_followed() {
+        use std::sync::atomic::Ordering;
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (other_port, other_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (app_port, app_hits) = counting_endpoint(format!(
+            "HTTP/1.1 302 Found\r\nlocation: http://127.0.0.1:{other_port}/elsewhere\r\n\
+             content-length: 0\r\nconnection: close\r\n\r\n"
+        ))
+        .await;
+        let (_project, _environment, cron) = cron_fixture_on_port(&db, app_port).await;
+        let service = cron_service(&db);
+
+        let result = service.process_cron(&cron, Utc::now()).await;
+        assert!(
+            matches!(
+                result,
+                Err(CronServiceError::ExecutionFailed { status: 302, .. })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(app_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target must not be contacted"
+        );
+
+        let latest = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("execution recorded");
+        assert_eq!(latest.status_code, 302);
+    }
+
+    /// A cron stored with a path that would leave the app's address (rows
+    /// from before paths were checked) is not run, and no request is made.
+    #[tokio::test]
+    async fn a_stored_cron_path_that_names_another_host_is_not_run() {
+        use std::sync::atomic::Ordering;
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let (other_port, other_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (app_port, app_hits) = counting_endpoint(
+            "HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n".to_string(),
+        )
+        .await;
+        let (_project, _environment, cron) = cron_fixture_on_port(&db, app_port).await;
+        let bad_path = format!("@127.0.0.1:{other_port}/internal");
+        let cron = crons::ActiveModel {
+            path: Set(bad_path.clone()),
+            ..cron.into()
+        }
+        .update(db.as_ref())
+        .await
+        .expect("cron path update");
+        let service = cron_service(&db);
+
+        let result = service.process_cron(&cron, Utc::now()).await;
+        assert!(
+            matches!(
+                &result,
+                Err(CronServiceError::InvalidCronPath { cron_id, .. }) if *cron_id == cron.id
+            ),
+            "{result:?}"
+        );
+        assert_eq!(
+            app_hits.load(Ordering::SeqCst),
+            0,
+            "nothing sent to the app"
+        );
+        assert_eq!(
+            other_hits.load(Ordering::SeqCst),
+            0,
+            "nothing sent elsewhere"
+        );
+
+        let latest = cron_executions::Entity::find()
+            .filter(cron_executions::Column::CronId.eq(cron.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("the refusal is recorded next to the cron");
+        assert!(
+            !latest.url.contains("/internal"),
+            "the recorded URL is the app's address, not the refused path: {}",
+            latest.url
+        );
+    }
+
     /// A notification provider that never answers must not hold up the
     /// scheduler: the alarm is raised off the scheduler's awaited work.
     #[tokio::test]
@@ -2315,7 +2581,8 @@ mod tests {
             db.clone(),
             queue.clone(),
             create_test_deployment_token_service(db.clone()),
-        );
+        )
+        .expect("cron service");
         service.set_alarm_service(Arc::new(AlarmService::new(
             db.clone(),
             Arc::new(StalledNotificationService),
@@ -2339,10 +2606,66 @@ mod tests {
         assert_eq!(wait_for_cron_alarms(db.as_ref(), project.id).await.len(), 1);
     }
 
+    #[tokio::test]
+    async fn workflow_occurrence_is_claimed_once_across_schedulers() {
+        if !temps_test_utils::docker_available().await
+            && !temps_test_utils::external_database_configured()
+        {
+            eprintln!("skipping: Docker and external test database unavailable");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let (project, environment) = create_test_project_and_environment(db.as_ref())
+            .await
+            .unwrap();
+        let service = cron_service(&db);
+        let fake = Arc::new(super::super::cron_workflows::fake::FakeWorkflowControl::default());
+        service.set_workflow_control(fake.clone());
+        let config = CronConfig::from_repo(&temps_core::CronJobConfig {
+            workflow: Some("digest".into()),
+            schedule: "* * * * *".into(),
+            concurrency_policy: Some(CronConcurrencyPolicy::Replace),
+            ..Default::default()
+        })
+        .unwrap();
+        service
+            .configure_crons(project.id, environment.id, vec![config])
+            .await
+            .unwrap();
+        let row = service
+            .get_environment_crons(project.id, environment.id)
+            .await
+            .unwrap()
+            .remove(0);
+        let now = Utc::now();
+        let mut update: crons::ActiveModel = row.into();
+        update.next_run = Set(Some(now - chrono::Duration::seconds(1)));
+        let row = update.update(db.as_ref()).await.unwrap();
+        let (first, second) = tokio::join!(
+            service.process_cron(&row, now),
+            service.process_cron(&row, now)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(fake.runs.lock().unwrap().len(), 1);
+        assert!(fake.cancelled.lock().unwrap().is_empty());
+        let executions = service
+            .get_cron_executions(project.id, environment.id, row.id, 1, 20)
+            .await
+            .unwrap();
+        assert_eq!(executions.len(), 1);
+        assert_eq!(
+            executions[0].state.as_deref(),
+            Some(cron_executions::STATE_RUNNING)
+        );
+    }
+
     // ---- job crons (ADR-055 §14) ----
 
     fn job_config(retry_limit: u32, policy: CronConcurrencyPolicy) -> CronConfig {
         CronConfig {
+            workflow: None,
             path: "job:nightly-report".to_string(),
             schedule: "0 3 * * *".to_string(),
             job: Some(crate::jobs::configure_crons::JobCronConfig {
@@ -2368,6 +2691,7 @@ mod tests {
             .expect("fixtures");
         let service = cron_service(&db);
         let http = CronConfig {
+            workflow: None,
             path: "/api/cron/cleanup".to_string(),
             schedule: "0 0 * * *".to_string(),
             job: None,
@@ -2492,7 +2816,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }

@@ -3,7 +3,8 @@
 
 'use client'
 
-import { getPreferences, updatePreferences } from '@/api/client/sdk.gen'
+import { getPreferences } from '@/api/client/sdk.gen'
+import { savePreferences } from './save-preferences'
 import { NotificationPreferencesResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { SettingsGroup } from '@temps-sdk/ds'
@@ -31,7 +32,6 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useQuery } from '@tanstack/react-query'
 import { useForm, useWatch } from 'react-hook-form'
 import { Link, useNavigate, useParams } from 'react-router'
-import { toast } from 'sonner'
 import {
   backupAlertsSchema,
   domainAlertsSchema,
@@ -58,7 +58,8 @@ import { withReturnTo } from '@/lib/safe-return-to'
 import { notificationPreferencesUpdate } from './notification-preferences-payload'
 
 interface AlertComponentProps<T> {
-  onSave: (data: T) => Promise<void>
+  /** Resolves `true` once the server saved the change. */
+  onSave: (data: T) => Promise<boolean>
   defaultValues?: Partial<T>
 }
 
@@ -80,122 +81,133 @@ function ProjectAlerts({
   })
 
   const handleSubmit = async (data: ProjectAlertsFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
           <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="deploymentFailures"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Deployment failures</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="buildErrors"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Build errors</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="runtimeErrors.enabled"
-              render={({ field }) => (
-                <FormItem className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <FormLabel>Runtime errors</FormLabel>
+            <div className="space-y-4">
+              <FormField
+                control={form.control}
+                name="deploymentFailures"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Deployment failures</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
-                  </div>
+                  </FormItem>
+                )}
+              />
 
-                  {field.value && (
-                    <div className="grid gap-4 pl-6">
-                      <FormField
-                        control={form.control}
-                        name="runtimeErrors.errorThreshold"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Error Threshold (per minute)</FormLabel>
-                            <FormControl>
-                              <NumberInput
-                                inputMode="numeric"
-                                name={field.name}
-                                ref={field.ref}
-                                onBlur={field.onBlur}
-                                value={field.value}
-                                onValueChange={(value) =>
-                                  field.onChange(value ?? Number.NaN)
-                                }
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
+              <FormField
+                control={form.control}
+                name="buildErrors"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Build errors</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
                       />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
 
-                      <FormField
-                        control={form.control}
-                        name="runtimeErrors.windowMinutes"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Time Window (minutes)</FormLabel>
-                            <FormControl>
-                              <NumberInput
-                                inputMode="numeric"
-                                name={field.name}
-                                ref={field.ref}
-                                onBlur={field.onBlur}
-                                value={field.value}
-                                onValueChange={(value) =>
-                                  field.onChange(value ?? Number.NaN)
-                                }
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
+              <FormField
+                control={form.control}
+                name="runtimeErrors.enabled"
+                render={({ field }) => (
+                  <FormItem className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <FormLabel>Runtime errors</FormLabel>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
                     </div>
-                  )}
-                </FormItem>
-              )}
-            />
-          </div>
-        </div>
 
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save service alerts
-          </Button>
-        </div>
+                    {field.value && (
+                      <div className="grid gap-4 pl-6">
+                        <FormField
+                          control={form.control}
+                          name="runtimeErrors.errorThreshold"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                Error Threshold (per minute)
+                              </FormLabel>
+                              <FormControl>
+                                <NumberInput
+                                  inputMode="numeric"
+                                  name={field.name}
+                                  ref={field.ref}
+                                  onBlur={field.onBlur}
+                                  value={field.value}
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtimeErrors.windowMinutes"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Time Window (minutes)</FormLabel>
+                              <FormControl>
+                                <NumberInput
+                                  inputMode="numeric"
+                                  name={field.name}
+                                  ref={field.ref}
+                                  onBlur={field.onBlur}
+                                  value={field.value}
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    )}
+                  </FormItem>
+                )}
+              />
+            </div>
+          </div>
+
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save service alerts
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -219,99 +231,108 @@ function DomainAlerts({
   })
 
   const handleSubmit = async (data: DomainAlertsFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
           <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="sslExpirationWarning.enabled"
-              render={({ field }) => (
-                <FormItem className="space-y-4">
-                  <div className="flex items-center justify-between">
-                    <FormLabel>SSL certificate expiration</FormLabel>
+            <div className="space-y-4">
+              <FormField
+                control={form.control}
+                name="sslExpirationWarning.enabled"
+                render={({ field }) => (
+                  <FormItem className="space-y-4">
+                    <div className="flex items-center justify-between">
+                      <FormLabel>SSL certificate expiration</FormLabel>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
+                    </div>
+
+                    {field.value && (
+                      <div className="grid gap-2 pl-6">
+                        <FormField
+                          control={form.control}
+                          name="sslExpirationWarning.daysBeforeExpiration"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Days before expiration</FormLabel>
+                              <FormControl>
+                                <NumberInput
+                                  inputMode="numeric"
+                                  name={field.name}
+                                  ref={field.ref}
+                                  onBlur={field.onBlur}
+                                  value={field.value}
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
+                                  }
+                                />
+                              </FormControl>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    )}
+                  </FormItem>
+                )}
+              />
+
+              <FormField
+                control={form.control}
+                name="domainExpirationWarning"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Domain expiration warning</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
-                  </div>
+                  </FormItem>
+                )}
+              />
 
-                  {field.value && (
-                    <div className="grid gap-2 pl-6">
-                      <FormField
-                        control={form.control}
-                        name="sslExpirationWarning.daysBeforeExpiration"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Days before expiration</FormLabel>
-                            <FormControl>
-                              <NumberInput
-                                inputMode="numeric"
-                                name={field.name}
-                                ref={field.ref}
-                                onBlur={field.onBlur}
-                                value={field.value}
-                                onValueChange={(value) =>
-                                  field.onChange(value ?? Number.NaN)
-                                }
-                              />
-                            </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
+              <FormField
+                control={form.control}
+                name="dnsConfigurationChanges"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>DNS configuration changes</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
                       />
-                    </div>
-                  )}
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="domainExpirationWarning"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Domain expiration warning</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="dnsConfigurationChanges"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>DNS configuration changes</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </div>
           </div>
-        </div>
 
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save domain alerts
-          </Button>
-        </div>
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save domain alerts
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -332,90 +353,99 @@ function BackupAlerts({
   })
 
   const handleSubmit = async (data: BackupAlertsFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
           <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="backupSuccess"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <div>
-                    <FormLabel>Backup success</FormLabel>
-                    <FormDescription>
-                      Get notified when backups complete successfully
-                    </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="backupFailure"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Backup failures</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+            <div className="space-y-4">
+              <FormField
+                control={form.control}
+                name="backupSuccess"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <div>
+                      <FormLabel>Backup success</FormLabel>
+                      <FormDescription>
+                        Get notified when backups complete successfully
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="backupFailure"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Backup failures</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
 
-            <FormField
-              control={form.control}
-              name="s3ConnectionIssues"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>S3 connection issues</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+              <FormField
+                control={form.control}
+                name="s3ConnectionIssues"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>S3 connection issues</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
 
-            <FormField
-              control={form.control}
-              name="retentionViolations"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Retention policy violations</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+              <FormField
+                control={form.control}
+                name="retentionViolations"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Retention policy violations</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </div>
           </div>
-        </div>
 
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save backup alerts
-          </Button>
-        </div>
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save backup alerts
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -434,54 +464,63 @@ function RouteAlerts({
   })
 
   const handleSubmit = async (data: RouteAlertsFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
           <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="routeDowntime"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Route downtime</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+            <div className="space-y-4">
+              <FormField
+                control={form.control}
+                name="routeDowntime"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Route downtime</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
 
-            <FormField
-              control={form.control}
-              name="loadBalancerIssues"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Load balancer issues</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+              <FormField
+                control={form.control}
+                name="loadBalancerIssues"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Load balancer issues</FormLabel>
+                    <FormControl>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </div>
           </div>
-        </div>
 
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save route alerts
-          </Button>
-        </div>
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save route alerts
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -509,118 +548,127 @@ function NotificationSettings({
   })
 
   const handleSubmit = async (data: NotificationSettingsFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
           <div className="space-y-4">
-            <FormField
-              control={form.control}
-              name="email"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <FormLabel>Email notifications</FormLabel>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="slack.enabled"
-              render={({ field }) => (
-                <FormItem className="space-y-2">
-                  <div className="flex items-center justify-between">
-                    <FormLabel>Slack notifications</FormLabel>
+            <div className="space-y-4">
+              <FormField
+                control={form.control}
+                name="email"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <FormLabel>Email notifications</FormLabel>
                     <FormControl>
                       <Switch
                         checked={field.value}
                         onCheckedChange={field.onChange}
                       />
                     </FormControl>
-                  </div>
+                  </FormItem>
+                )}
+              />
 
-                  <FormDescription>
-                    Slack messages are delivered by a Slack notification
-                    provider, which applies to all projects.{' '}
-                    <Link
-                      to={SLACK_PROVIDER_SETUP_HREF}
-                      className="font-medium text-foreground underline underline-offset-4"
-                    >
-                      Add a Slack provider
-                    </Link>
-                  </FormDescription>
-                </FormItem>
-              )}
-            />
+              <FormField
+                control={form.control}
+                name="slack.enabled"
+                render={({ field }) => (
+                  <FormItem className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <FormLabel>Slack notifications</FormLabel>
+                      <FormControl>
+                        <Switch
+                          checked={field.value}
+                          onCheckedChange={field.onChange}
+                        />
+                      </FormControl>
+                    </div>
 
-            <FormField
-              control={form.control}
-              name="batchNotifications"
-              render={({ field }) => (
-                <FormItem className="flex items-center justify-between">
-                  <div>
-                    <FormLabel>Batch similar notifications</FormLabel>
                     <FormDescription>
-                      Group similar alerts to reduce noise
+                      Slack messages are delivered by a Slack notification
+                      provider, which applies to all projects.{' '}
+                      <Link
+                        to={SLACK_PROVIDER_SETUP_HREF}
+                        className="font-medium text-foreground underline underline-offset-4"
+                      >
+                        Add a Slack provider
+                      </Link>
                     </FormDescription>
-                  </div>
-                  <FormControl>
-                    <Switch
-                      checked={field.value}
-                      onCheckedChange={field.onChange}
-                    />
-                  </FormControl>
-                </FormItem>
-              )}
-            />
+                  </FormItem>
+                )}
+              />
 
-            <FormField
-              control={form.control}
-              name="minimumSeverity"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>Minimum alert severity</FormLabel>
-                  <Select
-                    onValueChange={field.onChange}
-                    defaultValue={field.value}
-                  >
+              <FormField
+                control={form.control}
+                name="batchNotifications"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between">
+                    <div>
+                      <FormLabel>Batch similar notifications</FormLabel>
+                      <FormDescription>
+                        Group similar alerts to reduce noise
+                      </FormDescription>
+                    </div>
                     <FormControl>
-                      <SelectTrigger>
-                        <SelectValue placeholder="Select minimum severity" />
-                      </SelectTrigger>
+                      <Switch
+                        checked={field.value}
+                        onCheckedChange={field.onChange}
+                      />
                     </FormControl>
-                    <SelectContent>
-                      <SelectItem value="critical">Critical Only</SelectItem>
-                      <SelectItem value="warning">
-                        Warning & critical
-                      </SelectItem>
-                      <SelectItem value="info">All Notifications</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormDescription>
-                    Only receive alerts at or above this severity level
-                  </FormDescription>
-                </FormItem>
-              )}
-            />
-          </div>
-        </div>
+                  </FormItem>
+                )}
+              />
 
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save preferences
-          </Button>
-        </div>
+              <FormField
+                control={form.control}
+                name="minimumSeverity"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Minimum alert severity</FormLabel>
+                    <Select
+                      onValueChange={field.onChange}
+                      defaultValue={field.value}
+                    >
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue placeholder="Select minimum severity" />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="critical">Critical Only</SelectItem>
+                        <SelectItem value="warning">
+                          Warning & critical
+                        </SelectItem>
+                        <SelectItem value="info">All Notifications</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>
+                      Only receive alerts at or above this severity level
+                    </FormDescription>
+                  </FormItem>
+                )}
+              />
+            </div>
+          </div>
+
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save preferences
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -647,8 +695,9 @@ function WeeklyDigest({
   })
 
   const handleSubmit = async (data: WeeklyDigestFormData) => {
-    await onSave(data)
-    form.reset(data)
+    // The form is disabled while the save runs, so nothing typed since the
+    // submit can be lost; a refused save keeps the edits unsaved (dirty).
+    if (await onSave(data)) form.reset(data)
   }
 
   const digestEnabled = useWatch({
@@ -658,193 +707,201 @@ function WeeklyDigest({
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <div className="space-y-4">
-          <p className="text-sm text-muted-foreground">
-            Receive a comprehensive weekly summary of your services&apos;
-            activity, performance, and health metrics
-          </p>
+      <form onSubmit={form.handleSubmit(handleSubmit)}>
+        <fieldset
+          disabled={form.formState.isSubmitting}
+          className="min-w-0 space-y-6"
+        >
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Receive a comprehensive weekly summary of your services&apos;
+              activity, performance, and health metrics
+            </p>
 
-          <FormField
-            control={form.control}
-            name="weeklyDigestEnabled"
-            render={({ field }) => (
-              <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
-                <div className="space-y-0.5">
-                  <FormLabel className="text-base">
-                    Enable weekly digest
-                  </FormLabel>
+            <FormField
+              control={form.control}
+              name="weeklyDigestEnabled"
+              render={({ field }) => (
+                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-4">
+                  <div className="space-y-0.5">
+                    <FormLabel className="text-base">
+                      Enable weekly digest
+                    </FormLabel>
+                    <FormDescription>
+                      Get a weekly email with service insights and metrics
+                    </FormDescription>
+                  </div>
+                  <FormControl>
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                    />
+                  </FormControl>
+                </FormItem>
+              )}
+            />
+
+            {digestEnabled && (
+              <div className="space-y-4 pl-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <FormField
+                    control={form.control}
+                    name="digestSendDay"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Send day</FormLabel>
+                        <Select
+                          onValueChange={field.onChange}
+                          value={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select day" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            <SelectItem value="monday">Monday</SelectItem>
+                            <SelectItem value="friday">Friday</SelectItem>
+                            <SelectItem value="sunday">Sunday</SelectItem>
+                          </SelectContent>
+                        </Select>
+                        <FormDescription>
+                          Day of the week to send the digest
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="digestSendTime"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Send Time (24-hour format)</FormLabel>
+                        <FormControl>
+                          <Input {...field} type="time" placeholder="09:00" />
+                        </FormControl>
+                        <FormDescription>
+                          Time of day to send the digest
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+
+                <div className="space-y-3">
+                  <FormLabel className="text-base">Digest sections</FormLabel>
                   <FormDescription>
-                    Get a weekly email with service insights and metrics
+                    Choose which sections to include in your weekly digest
                   </FormDescription>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <FormField
+                      control={form.control}
+                      name="digestSections.performance"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                          <FormLabel className="font-normal">
+                            Performance metrics
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="digestSections.deployments"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                          <FormLabel className="font-normal">
+                            Deployment activity
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="digestSections.errors"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                          <FormLabel className="font-normal">
+                            Error summary
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="digestSections.funnels"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                          <FormLabel className="font-normal">
+                            Funnel analytics
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+
+                    <FormField
+                      control={form.control}
+                      name="digestSections.projects"
+                      render={({ field }) => (
+                        <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                          <FormLabel className="font-normal">
+                            Service updates
+                          </FormLabel>
+                          <FormControl>
+                            <Switch
+                              checked={field.value}
+                              onCheckedChange={field.onChange}
+                            />
+                          </FormControl>
+                        </FormItem>
+                      )}
+                    />
+                  </div>
                 </div>
-                <FormControl>
-                  <Switch
-                    checked={field.value}
-                    onCheckedChange={field.onChange}
-                  />
-                </FormControl>
-              </FormItem>
+              </div>
             )}
-          />
+          </div>
 
-          {digestEnabled && (
-            <div className="space-y-4 pl-4">
-              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <FormField
-                  control={form.control}
-                  name="digestSendDay"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Send day</FormLabel>
-                      <Select
-                        onValueChange={field.onChange}
-                        value={field.value}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select day" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          <SelectItem value="monday">Monday</SelectItem>
-                          <SelectItem value="friday">Friday</SelectItem>
-                          <SelectItem value="sunday">Sunday</SelectItem>
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>
-                        Day of the week to send the digest
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-
-                <FormField
-                  control={form.control}
-                  name="digestSendTime"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Send Time (24-hour format)</FormLabel>
-                      <FormControl>
-                        <Input {...field} type="time" placeholder="09:00" />
-                      </FormControl>
-                      <FormDescription>
-                        Time of day to send the digest
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
-
-              <div className="space-y-3">
-                <FormLabel className="text-base">Digest sections</FormLabel>
-                <FormDescription>
-                  Choose which sections to include in your weekly digest
-                </FormDescription>
-
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  <FormField
-                    control={form.control}
-                    name="digestSections.performance"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Performance metrics
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="digestSections.deployments"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Deployment activity
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="digestSections.errors"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Error summary
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="digestSections.funnels"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Funnel analytics
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-
-                  <FormField
-                    control={form.control}
-                    name="digestSections.projects"
-                    render={({ field }) => (
-                      <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
-                        <FormLabel className="font-normal">
-                          Service updates
-                        </FormLabel>
-                        <FormControl>
-                          <Switch
-                            checked={field.value}
-                            onCheckedChange={field.onChange}
-                          />
-                        </FormControl>
-                      </FormItem>
-                    )}
-                  />
-                </div>
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="flex justify-end">
-          <Button disabled={!form.formState.isDirty} type="submit">
-            Save digest
-          </Button>
-        </div>
+          <div className="flex justify-end">
+            <Button
+              disabled={!form.formState.isDirty || form.formState.isSubmitting}
+              type="submit"
+            >
+              Save digest
+            </Button>
+          </div>
+        </fieldset>
       </form>
     </Form>
   )
@@ -868,7 +925,7 @@ export function MonitoringSettings() {
   }
 
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
     const updatedPreferences: NotificationPreferencesResponse = {
       ...preferences,
@@ -879,22 +936,20 @@ export function MonitoringSettings() {
       error_time_window: data.runtimeErrors.windowMinutes,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    return savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving service alert settings...',
         success: 'Service alert settings saved successfully',
-        error: 'Failed to save service alert settings',
+        subject: 'service alert settings',
       }
     )
   }
 
   const handleDomainSave = async (data: DomainAlertsFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
     const updatedPreferences: NotificationPreferencesResponse = {
       ...preferences,
@@ -905,22 +960,20 @@ export function MonitoringSettings() {
       dns_changes_enabled: data.dnsConfigurationChanges,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    return savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving domain alert settings...',
         success: 'Domain alert settings saved successfully',
-        error: 'Failed to save domain alert settings',
+        subject: 'domain alert settings',
       }
     )
   }
 
   const handleBackupSave = async (data: BackupAlertsFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
     const updatedPreferences: NotificationPreferencesResponse = {
       ...preferences,
@@ -930,22 +983,20 @@ export function MonitoringSettings() {
       backup_successes_enabled: data.backupSuccess,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    return savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving backup alert settings...',
         success: 'Backup alert settings saved successfully',
-        error: 'Failed to save backup alert settings',
+        subject: 'backup alert settings',
       }
     )
   }
 
   const handleRouteSave = async (data: RouteAlertsFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
     const updatedPreferences: NotificationPreferencesResponse = {
       ...preferences,
@@ -953,37 +1004,30 @@ export function MonitoringSettings() {
       load_balancer_issues_enabled: data.loadBalancerIssues,
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    return savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving route alert settings...',
         success: 'Route alert settings saved successfully',
-        error: 'Failed to save route alert settings',
+        subject: 'route alert settings',
       }
     )
   }
 
   const handleNotificationSave = async (data: NotificationSettingsFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
-    await toast.promise(
-      updatePreferences({
-        body: notificationPreferencesUpdate(preferences, data),
-      }),
-      {
-        loading: 'Saving delivery preferences...',
-        success: 'Delivery preferences saved',
-        error: 'Failed to save delivery preferences',
-      }
-    )
+    return savePreferences(notificationPreferencesUpdate(preferences, data), {
+      loading: 'Saving delivery preferences...',
+      success: 'Delivery preferences saved',
+      subject: 'delivery preferences',
+    })
   }
 
   const handleDigestSave = async (data: WeeklyDigestFormData) => {
-    if (!preferences) return
+    if (!preferences) return false
 
     const updatedPreferences: NotificationPreferencesResponse = {
       ...preferences,
@@ -999,16 +1043,14 @@ export function MonitoringSettings() {
       },
     }
 
-    await toast.promise(
-      updatePreferences({
-        body: {
-          preferences: updatedPreferences,
-        },
-      }),
+    return savePreferences(
+      {
+        preferences: updatedPreferences,
+      },
       {
         loading: 'Saving weekly digest settings...',
         success: 'Weekly digest settings saved successfully',
-        error: 'Failed to save weekly digest settings',
+        subject: 'weekly digest settings',
       }
     )
   }

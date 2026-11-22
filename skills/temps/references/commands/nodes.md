@@ -76,6 +76,8 @@ Mesh hub: a member that relays between members that cannot reach each other (two
 
 Make <member> the hub: control-plane, or a node name. Pairs that never connect move onto it within a few minutes. The hub can read the traffic it relays: pick your own machine
 
+**Usage:** `nodes mesh hub set <member> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -134,6 +136,8 @@ Start pairing the node at --address. Prints the one command to run on it; the co
 #### `nodes pair cancel`
 
 Cancel a pending pairing: its command stops working and its address is released
+
+**Usage:** `nodes pair cancel <id> [options]`
 
 **Options:**
 
@@ -195,6 +199,8 @@ Read the SSH host key of the server at --host, to verify it before `nodes ssh ad
 
 Show one enrollment: its progress and the log with the server output
 
+**Usage:** `nodes ssh show <id> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -214,6 +220,8 @@ What the scheduler keeps for the OS and Temps on a node, and whether a placement
 
 Show a node's reservation and resource policy (node id; 0 or "control-plane" for the control plane)
 
+**Usage:** `nodes resources show <node> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -223,6 +231,8 @@ Show a node's reservation and resource policy (node id; 0 or "control-plane" for
 #### `nodes resources set`
 
 Change a node's resource policy or reservation. Giving only one of --reserve-cpu and --reserve-memory keeps the node's current value for the other
+
+**Usage:** `nodes resources set <node> [options]`
 
 **Options:**
 

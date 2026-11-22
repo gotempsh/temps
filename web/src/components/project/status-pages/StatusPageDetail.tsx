@@ -40,6 +40,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   Boxes,
+  CalendarClock,
   CheckCircle2,
   Circle,
   ExternalLink,
@@ -47,6 +48,7 @@ import {
   EyeOff,
   Globe,
   Home,
+  Mail,
   MoreVertical,
   Palette,
   RefreshCw,
@@ -61,10 +63,15 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { StatusPageProjects, StatusPageStateBadge } from './ProjectStatusPages'
 import { StatusPageComponentsEditor } from './StatusPageComponentsEditor'
+import { useComponentAddition } from './use-adding-component'
 import { StatusPageDomains } from './StatusPageDomains'
 import { PublicLinkSection } from './StatusPagePublicLink'
 import { StatusPageAppearanceForm } from './StatusPageAppearanceForm'
 import { StatusPageIncidents } from './StatusPageIncidents'
+import { StatusPageSubscribers } from './StatusPageSubscribers'
+import { StatusPageMaintenance } from './StatusPageMaintenance'
+import { StatusPageFeedCard, StatusPageWebhooks } from './StatusPageWebhooks'
+import { StatusPagePassword } from './StatusPagePassword'
 import { StatusPagePreview } from './StatusPagePreview'
 import {
   formDefaults,
@@ -79,6 +86,8 @@ const DETAIL_TABS = [
   'components',
   'appearance',
   'incidents',
+  'maintenance',
+  'subscribers',
   'domains',
 ] as const
 type DetailTab = (typeof DETAIL_TABS)[number]
@@ -260,7 +269,12 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
     },
   })
 
+  const addition = useComponentAddition()
+  const adding = addition.adding
+
   const onSubmit = (values: StatusPageFormValues) => {
+    // A service still being added is not in `values` yet.
+    if (adding) return
     update.mutate({
       path: { status_page_id: page.id },
       body: { monitors: toSelection(values.components) },
@@ -293,6 +307,7 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
                 <FormItem>
                   <StatusPageComponentsEditor
                     value={field.value}
+                    addition={addition}
                     onChange={field.onChange}
                     errors={form.formState.errors.components}
                     initialProjectId={page.projects[0]?.id}
@@ -308,8 +323,12 @@ function StatusPageForm({ page }: { page: StatusPageResponse }) {
           </section>
 
           <div className="flex justify-end">
-            <Button type="submit" disabled={update.isPending}>
-              {update.isPending ? 'Saving...' : 'Save changes'}
+            <Button type="submit" disabled={update.isPending || adding}>
+              {update.isPending
+                ? 'Saving...'
+                : adding
+                  ? 'Adding service…'
+                  : 'Save changes'}
             </Button>
           </div>
         </fieldset>
@@ -518,6 +537,12 @@ export function StatusPageDetail() {
           <TabsTrigger value="incidents" icon={Siren}>
             Incidents
           </TabsTrigger>
+          <TabsTrigger value="maintenance" icon={CalendarClock}>
+            Maintenance
+          </TabsTrigger>
+          <TabsTrigger value="subscribers" icon={Mail}>
+            Notifications
+          </TabsTrigger>
           <TabsTrigger value="domains" icon={Globe}>
             Domains
           </TabsTrigger>
@@ -530,6 +555,7 @@ export function StatusPageDetail() {
             publishing={publish.isPending}
           />
           <PublicLinkSection page={page} />
+          <StatusPagePassword page={page} />
           <StatusPagePreview page={page} />
         </TabsContent>
         <TabsContent value="components" className="pt-4">
@@ -542,6 +568,14 @@ export function StatusPageDetail() {
           {/* Keyed by page: switching pages must never show (and let you
               act on) the previous page's incidents or page number. */}
           <StatusPageIncidents key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="maintenance" className="pt-4">
+          <StatusPageMaintenance key={page.id} page={page} />
+        </TabsContent>
+        <TabsContent value="subscribers" className="space-y-6 pt-4">
+          <StatusPageSubscribers key={page.id} page={page} />
+          <StatusPageWebhooks key={`webhooks-${page.id}`} page={page} />
+          <StatusPageFeedCard page={page} />
         </TabsContent>
         <TabsContent value="domains" className="pt-4">
           <StatusPageDomains page={page} />

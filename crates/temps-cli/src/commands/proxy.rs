@@ -172,7 +172,7 @@ pub struct ProxyCommand {
 
     /// Database connection URL. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    pub database_url: String,
+    pub database_url: Option<String>,
 
     /// Data directory for storing configuration and runtime files
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -279,6 +279,13 @@ impl ProxyCommand {
             );
         }
 
+        // Only this process's own sources, as for `temps serve`.
+        let database_url = crate::database_url_source::resolve_database_url(
+            self.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
+
         let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
         if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
             warn!(
@@ -291,7 +298,7 @@ impl ProxyCommand {
 
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
-            self.database_url.clone(),
+            database_url.clone(),
             self.tls_address.clone(),
             self.console_address.clone(),
         )?);
@@ -312,7 +319,7 @@ impl ProxyCommand {
         debug!("Initializing database connection...");
         // Create tokio runtime for database connection since we need async for this
         let rt = tokio::runtime::Runtime::new()?;
-        let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
+        let db = rt.block_on(temps_schema::establish_connection(&database_url))?;
 
         // Services are now available for use
         debug!("Cookie crypto and encryption services initialized");
@@ -381,7 +388,7 @@ impl ProxyCommand {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(temps_config::ServerConfig::new(
                 address.clone(),
-                self.database_url.clone(),
+                config.database_url.clone(),
                 tls_address.clone(),
                 Some(console_address.clone()),
             )?),
@@ -424,7 +431,7 @@ impl ProxyCommand {
                             );
                         }
                     }
-                    Ok::<Option<temps_core::AppSettings>, anyhow::Error>(Some(settings))
+                    Ok::<Option<temps_config::AppSettings>, anyhow::Error>(Some(settings))
                 }
                 Err(e) => {
                     warn!("Failed to fetch settings: {}, using defaults (preview_domain 'localhost', on-demand TLS disabled)", e);
@@ -461,6 +468,9 @@ impl ProxyCommand {
             Arc::new(std::sync::RwLock::new(None)),
             None,
             config_service.clone(),
+            // ADR-104: split mode is not served. The console process deploys
+            // the containers and never points them at this resolver.
+            None,
         );
 
         info!(
@@ -536,10 +546,13 @@ impl ProxyCommand {
             console_startup: None,
             // The console process samples the host (`temps serve --role=console`).
             host_metrics: false,
+            // The console is another process and runs no connector here
+            // (ADR-107 D2), so nothing is bound for a tunnel.
+            tunnel_origin: None,
         };
         let listener = Arc::new(temps_routes::RouteTableListener::new(
             route_table.clone(),
-            self.database_url.clone(),
+            config.database_url.clone(),
             queue.clone(),
         ));
 
@@ -634,7 +647,7 @@ impl ProxyCommand {
         // Keep the listener alive on the stack so its Drop doesn't abort the background task
         info!("Starting project change listener...");
         let project_listener = temps_routes::ProjectChangeListener::new(
-            self.database_url.clone(),
+            config.database_url.clone(),
             route_table.clone(),
             queue.clone(),
         );
@@ -692,7 +705,7 @@ impl ProxyCommand {
                 // duration of the blocking Pingora server below, which is what
                 // keeps the task alive (same pattern as the route listeners).
                 let service = Arc::new(service);
-                let database_url = self.database_url.clone();
+                let database_url = config.database_url.clone();
                 rt.block_on(async { service.start_settings_listener(database_url) });
                 Some(handle)
             }

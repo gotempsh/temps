@@ -106,9 +106,11 @@ export function ImageRetentionCard({
           <CardHeader>
             <CardTitle>Image retention</CardTitle>
             <CardDescription>
-              How long built images are kept before the nightly cleanup removes
-              them. Rolling back or promoting a deployment needs its image, so
-              this is the rollback window.
+              How long built and registry-pulled images are kept before the
+              nightly cleanup removes them. Rolling back or promoting a
+              deployment needs its image, so for built images this is the
+              rollback window; a removed registry image is pulled again on
+              rollback. Uploaded images are never removed.
             </CardDescription>
           </CardHeader>
           <CardContent>

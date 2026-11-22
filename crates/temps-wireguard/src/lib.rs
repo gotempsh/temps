@@ -11,6 +11,7 @@
 mod link;
 pub mod mesh;
 pub mod pairing;
+pub mod vm;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use serde::{Deserialize, Serialize};

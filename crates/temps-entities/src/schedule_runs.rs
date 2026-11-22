@@ -32,7 +32,7 @@ pub struct Model {
     pub started_at: DBDateTime,
     /// When all child backups reached a terminal state. `NULL` while any
     /// child is still `"pending"` or `"running"`. Written by the
-    /// `mark_schedule_run_finished_if_done` helper in `temps-backup-core`.
+    /// `mark_schedule_run_finished_if_done` helper in `temps-backup`.
     pub finished_at: Option<DBDateTime>,
     pub created_at: DBDateTime,
 }

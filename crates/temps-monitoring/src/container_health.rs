@@ -922,7 +922,7 @@ impl ContainerHealthMonitor {
                 let intentional = exit_is_intentional(container, info);
                 self.persist_exit_info(container, info, intentional).await;
 
-                // A user-initiated stop (`stop_container`/`stop_all_containers`)
+                // A user-initiated stop (`stop_container`)
                 // and a failed deployment retained for log inspection are both
                 // stopped on purpose — an exit there is expected, not a crash.
                 if intentional {
@@ -1467,7 +1467,7 @@ impl ContainerHealthMonitor {
             // CPU usage relative to the CPU the container may use — its limit
             // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
-            // against — see `container_default_seeds()` in the evaluator.
+            // against — see `container_default_seeds()` in temps-alarms.
             make_point(
                 "container.cpu_utilization_percent",
                 stats.cpu_utilization_percent(),
@@ -2015,6 +2015,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
         }
     }
 
@@ -3243,7 +3245,7 @@ mod tests {
     // forever.
 
     struct ExitFixture {
-        _database: temps_database::test_utils::TestDatabase,
+        _database: temps_test_utils::TestDatabase,
         db: Arc<sea_orm::DatabaseConnection>,
         environment_id: i32,
     }
@@ -3254,12 +3256,10 @@ mod tests {
             environments, preset::Preset, projects, upstream_config::UpstreamList,
         };
 
-        let database = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => database,
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 eprintln!("Skipping container exit alarm test: Docker runtime unavailable");
                 return None;

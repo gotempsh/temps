@@ -14,8 +14,7 @@ homepage.workspace = true
 [dependencies]
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
-temps-auth = { path = "../temps-auth" }
-anyhow = { workspace = true }
+temps-authz = { path = "../temps-authz" }
 axum = { workspace = true }
 url = { workspace = true }
 utoipa = { workspace = true }

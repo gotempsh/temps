@@ -11,10 +11,9 @@ import {
   KeyRound,
   LockKeyhole,
   Plug,
-  PlugZap,
-  Puzzle,
   Rocket,
   Settings2,
+  Vault,
   Webhook,
   Workflow,
 } from 'lucide-react'
@@ -35,14 +34,13 @@ import { BuildDeploySettings } from './BuildDeploySettings'
 import { SecretsSettings } from './SecretsSettings'
 import { DeploymentTokensSettings } from './DeploymentTokensSettings'
 import { WebhooksSettings } from './WebhooksSettings'
-import { SkillsSettings } from './SkillsSettings'
-import { McpServersSettings } from './McpServersSettings'
 import {
   HostDockerAccessAlert,
   HostDockerAccessOnboarding,
   useHostDockerAccess,
 } from '@/components/project/HostDockerAccessAlert'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
+import { ProjectVaultAccess } from '@/components/service-access/ProjectVaultAccess'
 import { Link } from 'react-router'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
@@ -65,8 +63,7 @@ const descriptions: Record<CombinedSettingsPage, string> = {
   'deployment-tokens': '',
   automation:
     'Jobs the AI does on its own. Every run is a chat you can open and continue.',
-  integrations:
-    'Webhooks, skills, MCP servers and extensions for this service.',
+  integrations: 'Webhooks, vaults and extensions for this service.',
 }
 
 type Section = {
@@ -83,6 +80,12 @@ type Section = {
    * action on the right), so the page adds no title of its own.
    */
   ownsPageHeader?: boolean
+  /**
+   * The content is a record list or operational panel, not a form, so it
+   * spans the page under its heading instead of sitting in the settings
+   * column.
+   */
+  fullWidth?: boolean
 }
 
 /**
@@ -256,19 +259,13 @@ export function CombinedProjectSettings({
           content: <WebhooksSettings project={project} />,
         },
         {
-          id: 'skills',
-          title: 'Skills',
+          id: 'vaults',
+          title: 'Vaults',
           description:
-            'Instructions the AI loads when it works on this service.',
-          icon: Puzzle,
-          content: <SkillsSettings project={project} />,
-        },
-        {
-          id: 'mcp-servers',
-          title: 'MCP servers',
-          description: 'Extra tools the AI can call for this service.',
-          icon: PlugZap,
-          content: <McpServersSettings project={project} />,
+            'Shared services that sandboxes and AI chats in this service can request access to.',
+          icon: Vault,
+          content: <ProjectVaultAccess projectId={project.id} />,
+          fullWidth: true,
         },
         {
           id: 'extensions',
@@ -293,6 +290,7 @@ export function CombinedProjectSettings({
         />
       )}
       {banner}
+      {intro}
       {single ? (
         <section
           id={settingsSectionDomId(sections[0].id)}
@@ -303,13 +301,13 @@ export function CombinedProjectSettings({
         </section>
       ) : (
         <div className="min-w-0 divide-y [&>section]:py-8 [&>section:first-child]:pt-0">
-          {intro}
           {sections.map((section) => (
             <SettingsBlock
               key={`${page}-${section.id}`}
               id={settingsSectionDomId(section.id)}
               title={section.title}
               description={section.description}
+              fullWidth={section.fullWidth}
             >
               {section.content}
             </SettingsBlock>
@@ -324,17 +322,20 @@ export function CombinedProjectSettings({
  * One always-open group of settings, laid out like `SettingsGroup`: what it
  * is on the left, the settings on the right. The content is marked as being
  * on a settings surface, so cards and sections inside it render flat instead
- * of as a box in a box.
+ * of as a box in a box. A `fullWidth` group (a record list, not a form) puts
+ * its heading above and spans the page instead.
  */
-function SettingsBlock({
+export function SettingsBlock({
   id,
   title,
   description,
+  fullWidth = false,
   children,
 }: {
   id: string
   title: string
   description?: string
+  fullWidth?: boolean
   children: ReactNode
 }) {
   const headingId = `${id}-heading`
@@ -342,7 +343,11 @@ function SettingsBlock({
     <section
       id={id}
       aria-labelledby={headingId}
-      className="grid min-w-0 scroll-mt-4 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10"
+      className={
+        fullWidth
+          ? 'min-w-0 scroll-mt-4 space-y-5'
+          : 'grid min-w-0 scroll-mt-4 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10'
+      }
     >
       <div className="min-w-0">
         <h2 id={headingId} className="text-base font-semibold">

@@ -35,6 +35,24 @@
 /// operation_id without duplicating the list — see `ai_tool_allowlist_tests`
 /// in the console (`temps-cli`), which checks it against the real API.
 pub const AI_READ_ALLOWLIST: &[&str] = &[
+    "get_vault_eligibility",
+    "sandbox_access_vaults",
+    "project_access_vaults",
+    "general_access_capability",
+    // Static provider metadata only; no saved credentials or configuration.
+    "service_catalog",
+    "list_access_services_general",
+    "get_access_service_general",
+    "list_access_vaults_general",
+    "get_access_vault_general",
+    "list_access_bundles_general",
+    "list_access_sessions_general",
+    "get_access_session_general",
+    "list_vault_links",
+    // Vault metadata is masked; grants never return upstream credentials.
+    "list_access_services",
+    "get_access_service",
+    "list_sandbox_services",
     // ── OpenTelemetry: metrics / traces / logs / health ──
     "query_metrics",
     "list_metric_names",
@@ -99,6 +117,35 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "has_error_groups",
     "list_error_events",
     "list_error_groups",
+    // Issue workflow (ADR 111, D1): a group's fingerprints, its comments
+    // and activity, the project's inbound filter rules, the caller's saved
+    // searches, and the members a group can be assigned to (names and
+    // emails, the same as `list_team_members`). No secrets.
+    "listErrorGroupFingerprints",
+    "list_error_group_activity",
+    "listErrorInboundFilters",
+    "list_error_saved_searches",
+    "get_error_saved_search",
+    "search_error_group_assignees",
+    // Performance and release health (ADR 111, D2 and D3): aggregates of
+    // spans and sessions, and span descriptions of the same class as
+    // `get_trace`.
+    "get_performance_issue_status",
+    "get_operation_trend",
+    "get_operation_breakdown",
+    "get_deployment_regressions",
+    "get_page_backend",
+    "list_release_health",
+    "get_release_health_series",
+    // Attachments (ADR 111, D4): file names, types and sizes, and the
+    // project's attachment usage. Not the files themselves.
+    "list_error_event_attachments",
+    "list_feedback_attachments",
+    "get_error_attachment_usage",
+    "get_error_source_control",
+    "list_error_group_issues",
+    "get_error_group_suspect_commits",
+    "list_error_ownership_rules",
     "list_alert_rules",
     "get_alert_rule",
     // ── Metric alert rules (OTel) — the rules themselves, so the AI can
@@ -138,6 +185,17 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // stay out: those return plaintext.
     "get_service",
     "get_service_by_slug",
+    // Server TLS of a managed database: mode, whether each container or
+    // data node serves it, and the certificate's public details. The CA
+    // download is the public certificate clients verify against; no
+    // private key is ever returned.
+    "get_service_tls",
+    "get_managed_ca_certificate",
+    // Docker healthcheck timings of a managed service's container and the
+    // instance default: whole seconds and counts, nothing sensitive. Lets
+    // the assistant explain why a container is checked as often as it is.
+    "get_service_healthcheck",
+    "get_healthcheck_defaults",
     // ── Agentic follow-up reads: what a change did, and what to do next ──
     "list_container_history",
     "tail_deployment_job_logs",
@@ -255,6 +313,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_funnel_metrics",
     "list_funnels",
     "get_unique_events",
+    // Conversion goals (ADR 109 D2): definitions the user wrote and
+    // aggregate counts per goal or per dimension value.
+    // Visitor identity mode (ADR 109 D3): persistent or cookieless.
+    "get_analytics_identity_settings",
+    "list_analytics_goals",
+    "get_analytics_goal",
+    "get_analytics_goal_stats",
+    "get_analytics_goal_breakdown",
     // Traffic exclusion settings, the project's own rules (referrer
     // domains, IPs/CIDR ranges, ASNs, countries the user chose to
     // exclude) and per-reason counts. No secrets; IPs here are ones the
@@ -294,6 +360,10 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // ── Auth / API keys / OIDC (masked keys/secrets only) ──
     "list_api_keys",
     "get_api_key",
+    // Whether the caller's external AI harness has connected: status, the
+    // connecting key's id, name, prefix and timestamps. No secret or hash,
+    // the same masking class as `get_api_key`.
+    "get_ai_harness_status",
     "list_public_providers",
     "list_oidc_providers",
     "list_oidc_provider_users",
@@ -410,6 +480,11 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // project_access_guard — same three-layer check the list endpoint uses.
     "get_project",
     "get_project_by_slug",
+    // Where each telemetry signal is sent and how it authenticates: public
+    // URLs, header templates such as `Bearer $TEMPS_API_KEY`, and whether an
+    // analytics key or DSN exists. It never returns a credential value, and
+    // runs the same three guards as `get_project`.
+    "get_project_ingest_setup",
     // ── External services: masked env vars only ──
     // `get_service` / `get_service_by_slug` are intentionally NOT included.
     // `get_service` calls `get_service_details`, which runs
@@ -530,6 +605,23 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     // Dashboard config (queries, panel layout) — no secrets. Gated OtelRead.
     "get_dashboard",
     "list_dashboards",
+    // ── Saved log searches (ADR 108 D1) ──
+    // A named query over the project's logs and its counts per bucket; no
+    // secrets. Gated LogsRead plus project access.
+    "list_saved_searches",
+    "get_saved_search",
+    "saved_search_series",
+    // Status page subscription settings (ADR 108 D2): whether mail can go
+    // out, what is missing and subscriber counts. No addresses, no secrets.
+    "get_status_page_subscriptions",
+    // Maintenance windows (titles, times, monitors; shown on the public
+    // page anyway), whether a page has a password (a flag, never the hash)
+    // and the locations a target check would run from (node names and
+    // regions). ADR 108 D2 and D5. No secrets.
+    "list_status_page_maintenances",
+    "get_status_page_maintenance",
+    "get_status_page_password",
+    "get_monitor_probe_locations",
     // ── Platform info + update status ──
     // OS type, architecture, and supported platform strings — no secrets.
     "get_platform_info",
@@ -619,6 +711,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_flag",
     "get_flag_snapshot",
     "list_flags",
+    // ── Surveys ──
+    // Definitions and aggregate results (counts, averages, NPS): no
+    // credentials and no free text. The individual responses
+    // (`list_survey_responses`) are withheld: open-text answers are typed by
+    // the project's visitors.
+    "list_surveys",
+    "get_survey",
+    "get_survey_results",
     // ── Project presets + templates ──
     // Built-in and community preset catalogue — no secrets.
     "list_presets",
@@ -723,6 +823,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_sandboxes",
     // Sandbox event list — lifecycle events (created, started, stopped).
     "list_events",
+    // A sandbox create's ordered steps (status, timings, image download
+    // bytes, the failed step's reason) and each host's sandbox image state:
+    // what the assistant needs to answer "why is my sandbox slow to start".
+    // Image references, host names and error reasons; no credential.
+    "get_sandbox_creation",
+    "get_sandbox_creation_by_sandbox",
+    "get_sandbox_image_preparation",
     // ── Coverage audit: reads added after a DTO review (masked or no secrets) ──
     // Projects and deployments
     "get_cloudflare_project_capability",
@@ -788,6 +895,13 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_email_domain_projects",
     // Cluster and platform
     "cluster_dns_status",
+    // Internal DNS observability (ADR-095), SettingsRead: each node's
+    // resolver health, the records it serves, the query log and traffic.
+    // Names, addresses and counts only, no credential.
+    "list_dns_resolvers",
+    "list_dns_records",
+    "list_dns_queries",
+    "dns_traffic",
     "NodeCapabilityGet",
     "NodeDockerDiskUsageGet",
     "admin_list_nodes",
@@ -818,6 +932,17 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "admin_get_node_resources",
     "admin_list_environment_volumes",
     "get_effective_policy",
+    // Which projects may call a project's internal addresses (ADR 101):
+    // project and environment ids, names and a description, no credential.
+    // ProjectsRead on the project, narrowed to it.
+    "list_internal_access_grants",
+    // Which sandboxes may call a project's internal addresses (ADR 105):
+    // sandbox ids, labels and a description, no credential. ProjectsRead on
+    // the project, narrowed to it.
+    "list_internal_access_sandbox_grants",
+    // The internal hostnames and `curl` lines one of the caller's own
+    // sandboxes may use (ADR 105), no credential; scoped to that user.
+    "list_sandbox_internal_addresses",
     "get_ingress_settings",
     "get_rule",
     "get_workload_mode",
@@ -825,6 +950,23 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "list_node_modes",
     "list_rules",
     "node_state_status",
+    // Durable workflows (ADR-106): status, runs and journals with every
+    // payload masked, settings, and whether a credential exists (its prefix,
+    // never the token). Decrypting a payload is `reveal_workflow_payload`,
+    // which is withheld.
+    "get_workflows_overview",
+    "list_workflow_runs",
+    "list_all_workflow_runs",
+    // Each workflow once per environment, by name, version and run counts;
+    // only projects the caller may read, and no payload.
+    "list_workflow_definitions",
+    "list_workflow_project_keys",
+    "list_workflow_grants",
+    "get_workflow_run",
+    "diagnose_workflow_run",
+    "list_workflow_steps",
+    "get_workflow_settings",
+    "get_workflow_credential",
 ];
 
 /// [`AI_READ_ALLOWLIST`] as owned strings, the shape [`crate::InternalApiCaller`] takes.
@@ -846,6 +988,39 @@ pub fn ai_read_allowlist() -> Vec<String> {
 /// site) so tests can assert it stays disjoint from `ai_read_safe_posts()`,
 /// which is the one rule holding up the read-only-POST mechanism.
 pub const AI_WRITE_ALLOWLIST: &[&str] = &[
+    "create_vault_link",
+    "delete_vault_link",
+    // A bundle only defines a service selection and lifetime; saving it grants
+    // nothing. It still needs explicit human confirmation like the link and the
+    // session, because the model picks the services and lifetime on the card.
+    "create_access_bundle_general",
+    "create_access_session_general",
+    "revoke_access_session_general",
+    // Same scoped user authorization as the console, through the existing
+    // assistant write policy. This does not let the agent change that policy.
+    "request_sandbox_service",
+    "approve_sandbox_service",
+    "revoke_sandbox_service",
+    // ── Internal access (ADR 101, ADR 105 D8) ──
+    // Let one of the user's sandboxes call a project's *.temps.local
+    // addresses: what a sandbox's 403 "add sandbox … as a caller" asks for.
+    // Safe to propose: the handler holds the user to projects:write on the
+    // project and to owning that sandbox, and audits the grant as them. It
+    // widens network reach, so it is in HUMAN_CONSENT_OPERATIONS: only the
+    // owner's confirmation of that exact card in the console runs it, never
+    // a permission mode or an MCP confirm_action, so a prompt-injected agent
+    // in the sandbox cannot grant itself access.
+    "create_internal_access_sandbox_grant",
+    // Stop a sandbox calling a project. It only narrows reach; a DELETE is
+    // never approved automatically, so the user still confirms it.
+    "delete_internal_access_sandbox_grant",
+    // Let another project call this one's internal addresses. Same guards as
+    // the console (projects:write on the project being called, and being
+    // able to see the caller), and the same human-only consent as the
+    // sandbox grant above.
+    "create_internal_access_grant",
+    // Stop another project calling this one; confirmed like any DELETE.
+    "delete_internal_access_grant",
     // ── Deployment lifecycle (reversible / safe) ──
     // Redeploy the project from its configured branch —
     // what a "redeploy main" request maps to
@@ -909,6 +1084,10 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // only (`update_ingress_connector`). Those stay in the console.
     "set_ingress_hostname_choice",
     "sync_ingress_connector",
+    // Retries DNS setup for one failed hostname on the tunnel that already
+    // carries it: a narrower `sync_ingress_connector`. It takes no
+    // credential, withdraws nothing, and refuses when the route has moved.
+    "retry_ingress_hostname_dns",
     "create_ingress_connector",
     // ── Managed external services (databases, caches, etc.) —
     //    provisioning a new container and linking an existing
@@ -947,18 +1126,36 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // (`update_connection_token`, `create_*_pat_provider`) stay out.
     "commit_repository_files",
     "open_repository_pull_request",
+    // Connect a Git host with a personal access token, or replace a
+    // provider's credentials. Every token, password, app secret and private
+    // key is a `SecretString`, so the model passes `secret_ref:` handles from
+    // `request_secret`. The handlers need `git_providers:create` /
+    // `git_providers:write` like the console, refuse private and metadata
+    // addresses as `base_url`, test the token, and audit which credential was
+    // set (never its value). `update_connection_token` stays out: it does not
+    // bind the connection to the caller.
+    "create_github_pat_provider",
+    "create_gitlab_pat_provider",
+    "create_gitea_pat_provider",
+    "create_bitbucket_provider",
+    "create_generic_provider",
+    "update_git_provider_credentials",
     // ── Getting started: backups ──
     // Schedules reference an S3 source by id. Registering or editing a
     // source takes the bucket secret key, so these three are proposable only
     // because `secret_key` is a `SecretString` flagged `x-temps-secret`: the
     // model passes a `secret_ref:` handle from `request_secret`, never the
-    // key, and the caller substitutes it server-side at confirm time. Git
-    // provider tokens (`create_*_pat_provider`, `create_generic_provider`)
-    // are not converted yet and stay out.
+    // key, and the caller substitutes it server-side at confirm time.
     "create_s3_source",
     "update_s3_source",
     // Checks a candidate bucket before it is saved; the same secret_key rules.
     "test_s3_connection_preview",
+    // Which permissions a Cloudflare token has, before it is saved anywhere.
+    // It writes nothing, but it takes the token, and a `secret_ref:` handle is
+    // only resolved for a confirmed write: as a read-only POST the assistant
+    // could never pass one, and it used to tell users the operation did not
+    // exist. Same shape as `test_s3_connection_preview`.
+    "check_cloudflare_token",
     "create_backup_schedule",
     "update_backup_schedule",
     "enable_backup_schedule",
@@ -978,6 +1175,9 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "stop_service",
     "update_service_resources",
     "trigger_service_health_check",
+    // Turning a managed database's server TLS on or off. Takes only the
+    // mode, no credential; like a resize it restarts a standalone database.
+    "update_service_tls",
     "add_cluster_member",
     "unlink_service_from_project",
     // Removing a service is the only way to clean up a cluster that failed
@@ -991,6 +1191,11 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_environment_subdomain",
     // ── Backups: run and manage, never create the destination ──
     "run_external_service_backup",
+    // Writes, reads back and deletes one probe object in the archive bucket
+    // with the service's own WAL-G settings; it takes no credential and
+    // changes no configuration, but it does touch the bucket, so it is a
+    // confirmed write rather than a safe read.
+    "test_wal_archive_target",
     "cancel_backup",
     "cancel_schedule_run",
     "detach_schedule_service",
@@ -1030,6 +1235,14 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_flag",
     "update_flag",
     "set_flag_environment",
+    // Replaces one environment's targeting rules; compare-and-set on the
+    // flag's revision, like the console.
+    "set_flag_rules",
+    // Launching a survey puts a question in front of the project's visitors,
+    // so each change is a confirmed write.
+    "create_survey",
+    "update_survey",
+    "delete_survey",
     "restore_flag",
     "archive_flag",
     "create_alert_rule",
@@ -1063,12 +1276,15 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "create_alert",
     "update_alert",
     // ── Global notification control plane ──
-    // Provider payloads may contain credentials. `temps_write` encrypts
-    // executable parameters at rest and redacts both the approval card and
-    // result returned to the model. DELETE operations remain explicit even
-    // in Auto mode through `platform_request_is_destructive`.
-    "create_notification_provider",
-    "update_notification_provider",
+    // Every credential here is a `SecretString` (`webhook_url`, `password`,
+    // `api_token`, `bot_token`, each webhook header value), so the model passes a
+    // `secret_ref:` handle from `request_secret` and never the value. The
+    // generic `create_notification_provider` / `update_notification_provider`
+    // take an untyped `config` the secret-slot layer cannot see into, so a
+    // credential there would be typed into the chat: they stay in the console
+    // (every provider type has a typed operation below). DELETE operations
+    // remain explicit even in Auto mode through
+    // `platform_request_is_destructive`.
     "delete_notification_provider",
     "create_slack_provider",
     "update_slack_provider",
@@ -1078,6 +1294,8 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_webhook_provider",
     "create_cloudflare_provider",
     "update_cloudflare_provider",
+    "create_telegram_provider",
+    "update_telegram_provider",
     "test_notification_provider",
     "create_notification_route",
     "update_notification_route",
@@ -1109,10 +1327,32 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "NodeMetricsCreateAlertRule",
     "NodeMetricsUpdateAlertRule",
     "update_service_log_ingestion",
+    // Healthcheck timings: validated integers, nothing running changes until
+    // the container is recreated. Recreating it now (`apply_service_healthcheck`)
+    // restarts the database and stays out.
+    "update_service_healthcheck",
+    "update_healthcheck_defaults",
     "kv_enable",
     "kv_update",
     "blob_update",
     // Domains, DNS and email
+    // Register a DNS provider (Cloudflare, Bunny, Route53, DigitalOcean, GCP,
+    // Azure, Namecheap) or rotate its credentials. Every credential under
+    // `credentials` is a `SecretString`, so the model passes `secret_ref:`
+    // handles from `request_secret` and never sees the token; the handler
+    // tests the credentials before saving, needs `dns_providers:write` like
+    // the console and audits who did it (and that the assistant did) without
+    // the secret. Deleting a provider stays in the console.
+    "create_dns_provider",
+    "update_provider",
+    // Edge and CDN credentials, same rules: a Cloudflare Access token
+    // (checked, then sealed; `dns_providers:write`) and a Bunny delivery
+    // profile's API key (checked against its Pull Zone, then encrypted;
+    // `dns_providers:write` and `dns_automation:write`). Both are
+    // `SecretString`, neither is ever returned, both handlers audit.
+    "check_access_provider",
+    "create_access_provider",
+    "create_delivery_profile",
     "add_managed_domain",
     "update_managed_domain",
     "verify_managed_domain",
@@ -1122,6 +1362,12 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "import_managed_record",
     "remove_managed_record",
     "remove_managed_domain",
+    // Transactional email providers (SES, Scaleway, SMTP): every credential
+    // is a `SecretString` taken through a secret slot; the handlers need
+    // `email_providers:create` / `email_providers:write`, mask credentials in
+    // responses and audit the write.
+    "create_email_provider",
+    "update_email_provider",
     "create_email_domain",
     "import_email_domain",
     "setup_dns",
@@ -1139,17 +1385,35 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     "update_preferences",
     "delete_preferences",
     "retry_delivery",
+    // Project webhooks. The optional signing `secret` is a `SecretString`
+    // taken through a secret slot; responses only say `has_secret`. The
+    // handlers need webhooks permissions plus project access, and audit.
+    "create_webhook",
+    "update_webhook",
     "delete_webhook",
     // Observability and analytics
     "create_dashboard",
     "update_dashboard",
     "delete_dashboard",
+    // Saved log searches: a name and a filter, no credential. Deleting one
+    // that an alert rule uses is refused by the service.
+    "create_saved_search",
+    "update_saved_search",
+    "delete_saved_search",
     "create_facet",
     "delete_facet",
     "retry_facet_backfill",
     "create_funnel",
     "update_funnel",
     "delete_funnel",
+    // Switching visitor identity changes how new visits are counted; history
+    // already recorded stays as it is (ADR 109 D3).
+    "update_analytics_identity_settings",
+    // Deleting a conversion goal deletes no events; defining it again
+    // brings its history back.
+    "create_analytics_goal",
+    "update_analytics_goal",
+    "delete_analytics_goal",
     "update_project_cloud_telemetry",
     // Which traffic analytics counts: reversible (a rule is deleted, a
     // switch flipped back) and takes no credential.
@@ -1211,6 +1475,15 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // Revenue configuration
     "revenue_update_config",
     "revenue_delete_integration",
+    // All mutations use the existing propose/confirm path and router authorization.
+    // Starts additionally require a stable idempotency key in the API caller.
+    "start_workflow_run",
+    "send_workflow_event",
+    "delete_workflow_run",
+    "reveal_workflow_payload",
+    "cancel_workflow_run",
+    "retry_workflow_run",
+    "resume_workflow_run",
 ];
 
 /// [`AI_WRITE_ALLOWLIST`] as owned strings, the shape [`crate::InternalApiCaller`] takes.
@@ -1246,6 +1519,10 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // fired?" *before* proposing it, so a suggested alert arrives with
     // evidence attached instead of a guessed threshold.
     "preview_alert",
+    // Explains what one subject would get from a flag in one environment, and
+    // why. FlagsRead; evaluates in memory and stores nothing (no
+    // exposure is recorded). A POST only because it takes a context body.
+    "evaluate_flag",
     // ── Coverage audit: POSTs that write nothing (search, preview, quote) ──
     // Read-only POST: log search and facets
     "search_logs",
@@ -1260,10 +1537,10 @@ pub const AI_READ_SAFE_POSTS: &[&str] = &[
     // Read-only POST: *Make it reachable* plans change nothing; a plan is
     // only kept for `apply`, which stays with the operator.
     "plan_environment_reachability",
-    // Read-only POST: which permissions a Cloudflare token has. Nothing is
-    // created or stored; the token is a `SecretString`, so the assistant
-    // passes it through a secret slot.
-    "check_cloudflare_token",
+    // Read-only POST: one test lookup of a *.temps.local name from one
+    // node's resolver (ADR-095), SettingsRead. It stores nothing; the body
+    // is a POST only because it names the node, the name and the type.
+    "resolve_dns_name",
 ];
 
 /// [`AI_READ_SAFE_POSTS`] as owned strings, the shape [`crate::InternalApiCaller`] takes.
@@ -1274,6 +1551,24 @@ pub fn ai_read_safe_posts() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workflow_mutations_and_reveals_require_confirmation() {
+        for operation in [
+            "start_workflow_run",
+            "send_workflow_event",
+            "cancel_workflow_run",
+            "retry_workflow_run",
+            "resume_workflow_run",
+            "delete_workflow_run",
+            "reveal_workflow_payload",
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_SAFE_POSTS.contains(&operation));
+        }
+        assert!(AI_READ_ALLOWLIST.contains(&"diagnose_workflow_run"));
+    }
 
     #[test]
     fn certificate_policy_reads_and_writes_have_separate_permissions() {
@@ -1346,8 +1641,6 @@ mod tests {
         }
         for operation in [
             "update_connection_token",
-            "create_github_pat_provider",
-            "create_gitlab_pat_provider",
             "create_git_provider",
             "delete_connection",
         ] {
@@ -1361,7 +1654,8 @@ mod tests {
     /// The assistant must be able to take a user from nothing to a deployed
     /// project and scheduled backups. An operation whose payload carries a stored
     /// credential is proposable only once that field is a flagged `SecretString`
-    /// (the S3 source operations); the rest still go through the console forms.
+    /// (S3 sources, Git personal access tokens); the rest still go through the
+    /// console forms.
     #[test]
     fn getting_started_operations_are_proposable_but_unconverted_credential_forms_are_not() {
         let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
@@ -1391,8 +1685,14 @@ mod tests {
             "update_git_provider_credentials",
         ] {
             assert!(
+                writes.contains(operation),
+                "`{operation}` takes its token through a secret slot and must be proposable"
+            );
+        }
+        for operation in ["create_git_provider", "create_gitlab_oauth_provider"] {
+            assert!(
                 !writes.contains(operation),
-                "`{operation}` carries a secret and must stay out of the assistant's write tool"
+                "`{operation}` carries an unflagged secret or a browser flow and must stay out"
             );
         }
         // Both return `S3SourceResponse`, which masks the access key id and the
@@ -1421,6 +1721,7 @@ mod tests {
             "start_service",
             "stop_service",
             "update_service_resources",
+            "update_service_tls",
             "add_cluster_member",
             "retry_cluster",
             "delete_service",
@@ -1435,7 +1736,13 @@ mod tests {
                 "operating flow cannot stage `{operation}`"
             );
         }
-        for operation in ["get_service", "get_service_by_slug", "get_access_info"] {
+        for operation in [
+            "get_service",
+            "get_service_by_slug",
+            "get_access_info",
+            "get_service_tls",
+            "get_managed_ca_certificate",
+        ] {
             assert!(
                 reads.contains(operation),
                 "operating flow cannot read `{operation}`"
@@ -1446,7 +1753,6 @@ mod tests {
             "update_project_deployment_config",
             "createHttpCheck",
             "updateHttpCheck",
-            "create_webhook",
             "create_api_key",
             "create_deployment_token",
             "createProjectSecret",
@@ -1482,6 +1788,60 @@ mod tests {
         }
     }
 
+    /// The operations that create a credential-bearing provider or replace its
+    /// key are proposable, and the token checks that take a credential are
+    /// writes: a `secret_ref:` handle is only resolved for a confirmed write, so
+    /// as a read-only POST one could never be passed. The untyped notification
+    /// operations, whose `config` hides its credentials, are not proposable.
+    #[test]
+    fn credential_providers_are_proposable_through_secret_slots() {
+        let writes: std::collections::HashSet<String> = ai_write_allowlist().into_iter().collect();
+        let safe: std::collections::HashSet<String> = ai_read_safe_posts().into_iter().collect();
+        for operation in [
+            "create_dns_provider",
+            "update_provider",
+            "test_provider_connection",
+            "check_cloudflare_token",
+            "check_access_provider",
+            "create_access_provider",
+            "create_delivery_profile",
+            "create_email_provider",
+            "update_email_provider",
+            "create_webhook",
+            "update_webhook",
+            "create_slack_provider",
+            "update_slack_provider",
+            "create_webhook_provider",
+            "update_webhook_provider",
+            "create_telegram_provider",
+            "update_telegram_provider",
+            "create_s3_source",
+            "update_s3_source",
+        ] {
+            assert!(
+                writes.contains(operation),
+                "`{operation}` must be proposable"
+            );
+            assert!(
+                !safe.contains(operation),
+                "`{operation}` takes a credential"
+            );
+        }
+        for operation in [
+            "create_notification_provider",
+            "update_notification_provider",
+            "delete_dns_provider",
+            "create_oidc_provider",
+            "create_provider_key",
+            "save_ai_provider_credential",
+            "set_ci_builder",
+            "blob_enable",
+            "NodeSshEnrollmentCreate",
+        ] {
+            assert!(!writes.contains(operation), "`{operation}` must stay out");
+        }
+    }
+
     /// The AI read allowlist must never contain duplicate entries — a repeat
     /// is dead weight in the model's tool catalogue and a signal something
     /// was pasted twice while merging.
@@ -1493,6 +1853,60 @@ mod tests {
             assert!(
                 seen.insert(entry.as_str()),
                 "duplicate allowlist entry: {entry}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_service_tests {
+    use super::*;
+    #[test]
+    fn chat_can_discover_and_manage_scoped_sandbox_access() {
+        for operation in [
+            "service_catalog",
+            "list_access_services",
+            "get_access_service",
+            "list_sandbox_services",
+        ] {
+            assert!(AI_READ_ALLOWLIST.contains(&operation));
+        }
+        for operation in [
+            "request_sandbox_service",
+            "approve_sandbox_service",
+            "revoke_sandbox_service",
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation));
+            assert!(!AI_READ_ALLOWLIST.contains(&operation));
+        }
+        assert!(!AI_WRITE_ALLOWLIST.contains(&"confirm_pending_action"));
+    }
+
+    #[test]
+    fn chat_can_propose_internal_access_and_only_a_person_grants_it() {
+        for operation in [
+            "list_internal_access_grants",
+            "list_internal_access_sandbox_grants",
+            "list_sandbox_internal_addresses",
+        ] {
+            assert!(AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+        }
+        for (operation, needs_consent) in [
+            ("create_internal_access_sandbox_grant", true),
+            ("create_internal_access_grant", true),
+            ("delete_internal_access_sandbox_grant", false),
+            ("delete_internal_access_grant", false),
+        ] {
+            assert!(AI_WRITE_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(!AI_READ_ALLOWLIST.contains(&operation), "{operation}");
+            assert!(
+                !ai_read_safe_posts().iter().any(|safe| safe == operation),
+                "{operation}"
+            );
+            assert_eq!(
+                temps_core::ai_tool_call::requires_human_consent(operation),
+                needs_consent,
+                "{operation}"
             );
         }
     }

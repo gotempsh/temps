@@ -3,6 +3,8 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  PLATFORM_SETTINGS_INDEX,
+  pluginAiToolSetting,
   PROJECT_SETTINGS_INDEX,
   projectHasSetting,
   projectSettingUrl,
@@ -37,10 +39,28 @@ function combinedPage(page: string): CombinedSettingsPage | undefined {
     : undefined
 }
 
-describe('PROJECT_SETTINGS_INDEX', () => {
+const ALL_SETTINGS = [
+  ...PROJECT_SETTINGS_INDEX,
+  ...PLATFORM_SETTINGS_INDEX,
+  pluginAiToolSetting('reports'),
+]
+
+describe('settings indexes', () => {
+  test('trusted proxies can be found by operator vocabulary and deep-linked', () => {
+    const entry = PLATFORM_SETTINGS_INDEX.find((entry) =>
+      entry.keywords.includes('trusted proxy')
+    )
+    expect(entry).toBeDefined()
+    expect(entry?.keywords).toContain('CIDR')
+    expect(entry?.keywords).toContain('load balancer')
+    expect(entry && projectSettingUrl(entry)).toBe(
+      '/settings/security#setting-trusted-proxy-cidrs'
+    )
+  })
+
   test('every anchor is rendered by some component', async () => {
     const sources = await componentSources()
-    const missing = PROJECT_SETTINGS_INDEX.filter(({ anchor, page }) => {
+    const missing = ALL_SETTINGS.filter(({ anchor, page }) => {
       // A combined settings page renders its sections' ids itself.
       const combined = combinedPage(page)
       if (combined && anchor.startsWith(settingsSectionDomId(''))) {
@@ -77,8 +97,8 @@ describe('PROJECT_SETTINGS_INDEX', () => {
   })
 
   test('anchors and titles are unique', () => {
-    const anchors = PROJECT_SETTINGS_INDEX.map((entry) => entry.anchor)
-    const titles = PROJECT_SETTINGS_INDEX.map((entry) => entry.title)
+    const anchors = ALL_SETTINGS.map((entry) => entry.anchor)
+    const titles = ALL_SETTINGS.map((entry) => entry.title)
     expect(new Set(anchors).size).toBe(anchors.length)
     expect(new Set(titles).size).toBe(titles.length)
   })
@@ -150,4 +170,14 @@ describe('projectHasSetting', () => {
       'Container startup',
     ])
   })
+})
+
+test('plugin AI tools have a searchable direct link for each installation', () => {
+  const entry = pluginAiToolSetting('reports')
+  expect(projectSettingUrl(entry)).toBe(
+    '/plugins/reports#setting-plugin-ai-tools'
+  )
+  expect(entry.keywords).toContain('plugin AI access')
+  expect(entry.keywords).toContain('AI tools')
+  expect(entry.keywords).toContain('reports')
 })

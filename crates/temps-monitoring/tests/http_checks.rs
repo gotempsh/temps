@@ -7,11 +7,11 @@
     reason = "integration-test helpers: panicking is how a test fails"
 )]
 use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
 use temps_migrations::{
     CredentialCatalogMigration, DetectionRetryMigration, EnvCheckHistoryMigration,
     HttpChecksMigration, MigrationTrait, SchemaManager, SecretChecksAndHistoryMigration,
 };
+use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
 /// Mirrors the columns of the real `secrets` table that checks and history rely on.
 const SECRETS_TABLE: &str = "CREATE TABLE secrets(id INTEGER PRIMARY KEY,project_id INTEGER NOT NULL DEFAULT 1 REFERENCES projects(id) ON DELETE CASCADE,environment_id INTEGER,key TEXT NOT NULL DEFAULT 'TLS_CERT',value TEXT NOT NULL DEFAULT 'initial-ciphertext',include_in_preview BOOLEAN NOT NULL DEFAULT FALSE,created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW());";
@@ -27,7 +27,7 @@ async fn http_check_migration_claims_and_cascade_work_on_postgres() {
         Err(error) => panic!("Could not create isolated test database: {error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'GITHUB_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1),(2);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'GITHUB_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW(),secret_suggestion_dismissed_at TIMESTAMPTZ); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1),(2);").await.unwrap();
     db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
@@ -164,7 +164,7 @@ async fn automatic_checks_follow_variable_creation_rotation_and_issuer_changes()
         Err(error) => panic!("{error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW(),secret_suggestion_dismissed_at TIMESTAMPTZ); INSERT INTO projects VALUES(1);").await.unwrap();
     db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
@@ -364,7 +364,7 @@ async fn secret_history_and_check_constraints_follow_secret_changes() {
         Err(error) => panic!("Could not create isolated test database: {error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'API_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT DEFAULT 'API_TOKEN',value TEXT DEFAULT 'initial',is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW(),secret_suggestion_dismissed_at TIMESTAMPTZ); INSERT INTO projects VALUES(1); INSERT INTO env_vars(id) VALUES(1);").await.unwrap();
     db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     db.execute_unprepared("INSERT INTO secrets(id,key) VALUES(1,'EXISTING_CERT')")
         .await
@@ -611,7 +611,7 @@ async fn automatic_checks_follow_secret_values_and_certificates() {
         Err(error) => panic!("{error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW(),secret_suggestion_dismissed_at TIMESTAMPTZ); INSERT INTO projects VALUES(1);").await.unwrap();
     db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();
@@ -839,7 +839,7 @@ async fn env_vars_and_secrets_get_the_same_checks_and_results() {
         Err(error) => panic!("{error}"),
     };
     let db = database.connection();
-    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW()); INSERT INTO projects VALUES(1);").await.unwrap();
+    db.execute_unprepared("CREATE TABLE projects(id INTEGER PRIMARY KEY); CREATE TABLE env_vars(id INTEGER PRIMARY KEY,project_id INTEGER DEFAULT 1,key TEXT,value TEXT,is_encrypted BOOLEAN DEFAULT FALSE,is_secret BOOLEAN DEFAULT TRUE,include_in_preview BOOLEAN DEFAULT FALSE,environment_id INTEGER,created_at TIMESTAMPTZ DEFAULT NOW(),updated_at TIMESTAMPTZ DEFAULT NOW(),secret_suggestion_dismissed_at TIMESTAMPTZ); INSERT INTO projects VALUES(1);").await.unwrap();
     db.execute_unprepared(SECRETS_TABLE).await.unwrap();
     let schema = SchemaManager::new(db);
     HttpChecksMigration.up(&schema).await.unwrap();

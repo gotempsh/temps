@@ -14,7 +14,13 @@
 //! Traffic reaches the node's edge through an [`EdgeHandoff`]: process and
 //! container drivers forward to the loopback tunnel origin listener, which
 //! trusts the provider's client-address header from loopback only.
+//!
+//! On a worker the supervisor binds that listener itself. The control plane
+//! runs the same supervisor in-process for connectors placed on node 0
+//! ([`ConnectorSupervisor::for_external_origin`], ADR-107 D2): its proxy
+//! already listens on the tunnel origin, so the supervisor binds nothing.
 
+pub mod child;
 pub mod process;
 pub mod sync;
 pub mod wire;
@@ -123,10 +129,19 @@ struct Running {
     status: Arc<Mutex<ConnectorStatus>>,
 }
 
+/// Who serves the loopback tunnel origin the connectors forward to.
+enum Origin {
+    /// This supervisor binds it and serves the agent's routes there.
+    Own(SharedRouteStore),
+    /// Something else in this process already serves it: the control
+    /// plane's proxy, which checks the port before handing specs over.
+    External,
+}
+
 pub struct ConnectorSupervisor {
     drivers: Vec<Arc<dyn ConnectorDriver>>,
     data_dir: PathBuf,
-    store: SharedRouteStore,
+    origin: Origin,
     shutdown: Arc<Notify>,
     running: tokio::sync::Mutex<HashMap<i32, Running>>,
     /// Connectors held back because their tunnel origin could not bind,
@@ -144,16 +159,34 @@ impl ConnectorSupervisor {
         Self::with_drivers(drivers, data_dir, store, shutdown)
     }
 
+    /// A supervisor whose connectors forward to a tunnel origin something
+    /// else in this process already serves (the control plane's proxy,
+    /// ADR-107 D2). Same drivers, trusted artifacts, secret handling,
+    /// readiness and restart backoff as on a worker; it binds no listener.
+    pub fn for_external_origin(data_dir: PathBuf) -> Arc<Self> {
+        let drivers: Vec<Arc<dyn ConnectorDriver>> = vec![Arc::new(process::ProcessDriver::new())];
+        Self::build(drivers, data_dir, Origin::External, Arc::new(Notify::new()))
+    }
+
     fn with_drivers(
         drivers: Vec<Arc<dyn ConnectorDriver>>,
         data_dir: PathBuf,
         store: SharedRouteStore,
         shutdown: Arc<Notify>,
     ) -> Arc<Self> {
+        Self::build(drivers, data_dir, Origin::Own(store), shutdown)
+    }
+
+    fn build(
+        drivers: Vec<Arc<dyn ConnectorDriver>>,
+        data_dir: PathBuf,
+        origin: Origin,
+        shutdown: Arc<Notify>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             drivers,
             data_dir,
-            store,
+            origin,
             shutdown,
             running: tokio::sync::Mutex::new(HashMap::new()),
             blocked: Mutex::new(HashMap::new()),
@@ -276,6 +309,10 @@ impl ConnectorSupervisor {
     /// up to date: they can change without the connector's revision, which
     /// only restarts the connector process.
     async fn ensure_listener(&self, spec: &NodeConnectorSpec) -> std::io::Result<()> {
+        let store = match &self.origin {
+            Origin::Own(store) => store,
+            Origin::External => return Ok(()),
+        };
         let headers = crate::internal_proxy::TunnelOriginHeaders::new(
             spec.client_address_header.as_deref(),
             spec.client_ja4.as_ref().map(|forwarded| {
@@ -297,7 +334,7 @@ impl ConnectorSupervisor {
         let headers = Arc::new(arc_swap::ArcSwap::from_pointee(headers));
         crate::internal_proxy::spawn_tunnel_origin(
             addr,
-            self.store.clone(),
+            store.clone(),
             self.shutdown.clone(),
             Arc::clone(&headers),
         )
@@ -534,6 +571,50 @@ mod tests {
         supervisor.apply(Vec::new()).await;
         assert!(supervisor.statuses().await.is_empty());
         shutdown.notify_waiters();
+    }
+
+    /// ADR-107 D2: on the control plane the proxy owns the tunnel origin.
+    /// A port something else listens on is not a reason to hold the
+    /// connector, and the supervisor binds nothing of its own.
+    #[tokio::test]
+    async fn an_external_origin_supervisor_binds_nothing_and_runs_the_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = ConnectorSupervisor::build(
+            Vec::new(),
+            dir.path().to_path_buf(),
+            Origin::External,
+            Arc::new(Notify::new()),
+        );
+        // The proxy's listener, standing in for pingora's tunnel origin.
+        let proxy = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = proxy.local_addr().unwrap().port();
+
+        supervisor.apply(vec![spec(7, port)]).await;
+        assert!(supervisor.blocked.lock().is_empty());
+        assert!(supervisor.listeners.lock().await.is_empty());
+        assert!(supervisor.running.lock().await.contains_key(&7));
+        let statuses = supervisor.statuses().await;
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].connector_id, 7);
+
+        supervisor.apply(Vec::new()).await;
+        assert!(supervisor.statuses().await.is_empty());
+        drop(proxy);
+    }
+
+    /// The control plane's supervisor offers the same process driver, with
+    /// the same compiled-in artifact pins, as a worker's.
+    #[test]
+    fn the_external_origin_supervisor_uses_the_process_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let supervisor = ConnectorSupervisor::for_external_origin(dir.path().to_path_buf());
+        let kinds: Vec<String> = supervisor
+            .drivers
+            .iter()
+            .map(|d| d.kind().label())
+            .collect();
+        assert_eq!(kinds, vec!["process".to_string()]);
+        assert!(matches!(supervisor.origin, Origin::External));
     }
 
     #[tokio::test]

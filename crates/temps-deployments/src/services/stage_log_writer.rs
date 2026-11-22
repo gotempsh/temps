@@ -3,9 +3,10 @@
 
 //! Stage-specific log writer that writes to deployment stage log files
 
+use crate::workflow::LogWriter;
+use crate::workflow::WorkflowError;
 use async_trait::async_trait;
 use std::sync::Arc;
-use temps_core::{LogWriter, WorkflowError};
 use temps_deployment_logs::{LogLevel, LogService};
 
 /// Log writer implementation for deployment stages

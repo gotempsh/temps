@@ -3,6 +3,7 @@
 
 import { type SearchableSelectOption } from '@/components/ui/searchable-select'
 
+import { VAULT_AUDIT_OPERATIONS } from '@/lib/vault-audit'
 import { PERMISSION_DENIED_FILTER } from '@/lib/audit-operation-filters'
 
 export type OperationGroup = {
@@ -11,6 +12,7 @@ export type OperationGroup = {
 }
 
 export const OPERATION_GROUPS: OperationGroup[] = [
+  { label: 'Vault', operations: [...VAULT_AUDIT_OPERATIONS] },
   {
     label: 'Plugins',
     operations: [
@@ -151,6 +153,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
         label: 'Deployment config updated',
       },
       { value: 'ENVIRONMENT_DELETED', label: 'Environment deleted' },
+      {
+        value: 'PREVIEW_ENVIRONMENT_RETIRED',
+        label: 'Preview environment retired',
+      },
       {
         value: 'ENVIRONMENT_SETTINGS_UPDATED',
         label: 'Environment settings updated',

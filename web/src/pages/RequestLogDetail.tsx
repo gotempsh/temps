@@ -1,7 +1,11 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useParams, useNavigate, useSearchParams } from 'react-router'
+import { useParams, useSearchParams } from 'react-router'
+import {
+  useListBack,
+  type ListReturnState,
+} from '@/components/table/list-navigation'
 import { useQuery } from '@tanstack/react-query'
 import {
   getProxyLogByIdOptions,
@@ -35,6 +39,7 @@ import { ProjectResponse } from '@/api/client'
 
 interface RequestLogDetailProps {
   project: ProjectResponse
+  listState?: ListReturnState | null
 }
 
 // Tone from the HTTP status class — the Detail template's single verdict.
@@ -84,9 +89,9 @@ function RequestLogDetailSkeleton({
 
 export default function RequestLogDetail({
   project: projectResponse,
+  listState,
 }: RequestLogDetailProps) {
   const { logId } = useParams<{ logId: string }>()
-  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   // Row timestamp forwarded by the list; bounds the backend's hypertable
   // lookup. Absent on bare deep-links, which fall back to a wider scan.
@@ -123,9 +128,10 @@ export default function RequestLogDetail({
     refetch,
   } = isLegacyNumericId ? byId : byRequestId
 
-  const handleBack = () => {
-    navigate(`/projects/${projectResponse.slug}/request-logs`)
-  }
+  const handleBack = useListBack(
+    `/projects/${projectResponse.slug}/request-logs`,
+    listState
+  )
 
   const backAction = (
     <Button onClick={handleBack} variant="ghost" size="sm">
@@ -150,11 +156,10 @@ export default function RequestLogDetail({
             : 'No log data is available for this request.'
         }
         action={
-          error ? (
-            <Button onClick={() => void refetch()}>Retry</Button>
-          ) : (
-            backAction
-          )
+          <div className="flex flex-wrap items-center gap-2">
+            {error && <Button onClick={() => void refetch()}>Retry</Button>}
+            {backAction}
+          </div>
         }
       />
     )

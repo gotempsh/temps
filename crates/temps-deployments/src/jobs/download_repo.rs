@@ -6,11 +6,14 @@
 //! Downloads repository source code using git provider manager
 
 use crate::services::deployment_commit::{is_unresolved_commit, record_checked_out_commit};
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
-use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_database::DbConnection;
 use temps_deployment_logs::{LogLevel, LogService};
 use temps_git::GitProviderManagerTrait;
@@ -1998,6 +2001,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: now,
             updated_at: now,
         }

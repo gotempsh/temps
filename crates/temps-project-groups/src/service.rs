@@ -1631,7 +1631,7 @@ mod tests {
     // -----------------------------------------------------------------
 
     use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-    use temps_database::test_utils::TestDatabase;
+    use temps_test_utils::TestDatabase;
 
     async fn try_test_db() -> Option<TestDatabase> {
         match TestDatabase::with_migrations().await {

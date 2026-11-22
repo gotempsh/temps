@@ -27,18 +27,17 @@ use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
     require_sensitive_action,
 };
-use temps_core::{
-    AppSettings, AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction,
-};
+use temps_config::AppSettings;
+use temps_core::{AuditContext, PublicHostnameStrategy, RequestMetadata, SensitiveAction};
 use tracing::{debug, error, info, warn};
 use utoipa::OpenApi;
 
 use crate::handlers::failure_report::*;
 use crate::handlers::types::{
-    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
-    ContainerHistoryListResponse, ContainerHistoryQuery, ContainerInfoResponse,
-    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ActivityDay, ActivityGraphQuery, ActivityGraphResponse, AssetCachePurgeResponse,
+    ContainerActionResponse, ContainerDetailResponse, ContainerEnvironmentVariableValueResponse,
+    ContainerHistoryEntry, ContainerHistoryListResponse, ContainerHistoryQuery,
+    ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
@@ -227,9 +226,12 @@ async fn deployment_response_with_service_urls(
         get_container_metrics_history,
         stream_container_metrics,
         get_activity_graph,
-        list_managed_environment_variables
+        list_managed_environment_variables,
+        purge_asset_cache,
+        purge_environment_asset_cache
     ),
     components(schemas(
+        AssetCachePurgeResponse,
         DeploymentListResponse,
         DeploymentResponse,
         crate::services::DeploymentFailureInfo,
@@ -499,6 +501,16 @@ impl From<crate::services::services::DeploymentError> for Problem {
             DeploymentError::DeploymentStateConflict { .. } => {
                 problemdetails::new(StatusCode::CONFLICT)
                     .with_title("Deployment State Conflict")
+                    .with_detail(err.to_string())
+            }
+            DeploymentError::MicroVmReplicaCannotBePaused { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Deployment Cannot Be Paused")
+                    .with_detail(err.to_string())
+            }
+            DeploymentError::DeploymentPauseIncomplete { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Deployment Pause Incomplete")
                     .with_detail(err.to_string())
             }
             DeploymentError::PipelineError(msg) => {
@@ -802,35 +814,97 @@ pub async fn rollback_to_deployment(
         .ensure_project_hosted_locally(project_id)
         .await?;
 
-    let deployment = state
-        .deployment_service
-        // ADR 045: a project that holds host Docker access may only be
-        // deployed — in any direction — by an instance admin.
-        .rollback_to_deployment_as(
+    // ADR 045: a project that holds host Docker access may only be
+    // deployed — in any direction — by an instance admin.
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
+    };
+
+    // A rollback waits for the new container's health check inside the
+    // request. Run it detached so a client disconnect (a CLI timeout, a closed
+    // tab) cannot drop it half-way and leave the deployment `running` forever
+    // with its container behind (#1802).
+    let task_state = state.clone();
+    let deployment = run_detached("rollback", project_id, deployment_id, async move {
+        let deployment = task_state
+            .deployment_service
+            .rollback_to_deployment_as(project_id, deployment_id, caller)
+            .await
+            .map_err(|error| {
+                warn!(
+                    project_id,
+                    deployment_id,
+                    %error,
+                    "Rollback failed"
+                );
+                Problem::from(error)
+            })?;
+
+        let audit = DeploymentRollbackAudit {
+            context: audit_context,
             project_id,
             deployment_id,
-            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
-                auth.is_instance_admin(),
-            ),
-        )
-        .await?;
-
-    let audit = DeploymentRollbackAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        project_id,
-        deployment_id,
-    };
-    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!(
+                project_id,
+                deployment_id, "Failed to create rollback audit log: {}", e
+            );
+        }
+        Ok(deployment)
+    })
+    .await?;
 
     Ok(Json(DeploymentResponse::from_service_deployment(
         deployment,
     )))
+}
+
+/// Run a lifecycle operation (rollback, promotion) on its own task and await it.
+///
+/// Axum drops the handler future when the client disconnects. These operations
+/// start a container and wait for its health check before they record the
+/// outcome, so being dropped half-way leaves a deployment `running` with no
+/// job driving it and a container nobody owns. A spawned task is not cancelled
+/// when its `JoinHandle` is dropped: the operation runs to completion (or fails
+/// and cleans up) whether or not anyone is still waiting for the answer. The
+/// task logs its own failure, because after a disconnect nobody else will.
+async fn run_detached<T, F>(
+    operation: &'static str,
+    project_id: i32,
+    deployment_id: i32,
+    work: F,
+) -> Result<T, Problem>
+where
+    T: Send + 'static,
+    F: std::future::Future<Output = Result<T, Problem>> + Send + 'static,
+{
+    match tokio::spawn(work).await {
+        Ok(result) => result,
+        Err(join_error) => {
+            error!(
+                project_id,
+                deployment_id,
+                operation,
+                %join_error,
+                "Deployment lifecycle task did not finish"
+            );
+            Err(temps_core::error_builder::internal_server_error()
+                .title("Deployment operation failed")
+                // The panic payload is internal; it is in the log above, not
+                // in the response.
+                .detail(format!(
+                    "The {operation} of deployment {deployment_id} in project {project_id} \
+                     stopped unexpectedly; the server log has the cause"
+                ))
+                .build())
+        }
+    }
 }
 
 /// Promote a deployment to another environment
@@ -876,31 +950,50 @@ pub async fn promote_deployment(
         deployment_id, request.target_environment_id, project_id
     );
 
-    let deployment = state
-        .deployment_service
-        .promote_deployment_as(
-            project_id,
-            deployment_id,
-            request.target_environment_id,
-            temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
-                auth.is_instance_admin(),
-            ),
-        )
-        .await?;
-
-    let audit = DeploymentPromotedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        project_id,
-        source_deployment_id: deployment_id,
-        target_environment_id: request.target_environment_id,
+    let caller = temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
+        auth.is_instance_admin(),
+    );
+    let audit_context = AuditContext {
+        user_id: auth.user_id(),
+        ip_address: Some(metadata.ip_address.clone()),
+        user_agent: metadata.user_agent.clone(),
     };
-    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
+    let target_environment_id = request.target_environment_id;
+
+    // Same as rollback: the promotion health-checks the new container inside
+    // the request, so it must not be dropped when the client goes away.
+    let task_state = state.clone();
+    let deployment = run_detached("promotion", project_id, deployment_id, async move {
+        let deployment = task_state
+            .deployment_service
+            .promote_deployment_as(project_id, deployment_id, target_environment_id, caller)
+            .await
+            .map_err(|error| {
+                warn!(
+                    project_id,
+                    deployment_id,
+                    target_environment_id,
+                    %error,
+                    "Promotion failed"
+                );
+                Problem::from(error)
+            })?;
+
+        let audit = DeploymentPromotedAudit {
+            context: audit_context,
+            project_id,
+            source_deployment_id: deployment_id,
+            target_environment_id,
+        };
+        if let Err(e) = task_state.audit_service.create_audit_log(&audit).await {
+            error!(
+                project_id,
+                deployment_id, "Failed to create promotion audit log: {}", e
+            );
+        }
+        Ok(deployment)
+    })
+    .await?;
 
     Ok(Json(DeploymentResponse::from_service_deployment(
         deployment,
@@ -1419,6 +1512,41 @@ async fn send_close_error(socket: &mut WebSocket, reason: &str) -> Result<(), ax
     send_log_stream_close(socket, 1011, reason).await
 }
 
+// Setup includes placement lookup, TLS client construction and the worker
+// request. Keep the upgraded connection alive throughout, not only once Docker
+// starts producing logs. Dropping this future cancels setup on disconnect.
+async fn prepare_log_stream<T>(
+    socket: &mut WebSocket,
+    setup: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    tokio::pin!(setup);
+    let deadline = tokio::time::sleep(std::time::Duration::from_secs(90));
+    tokio::pin!(deadline);
+    let mut ping = tokio::time::interval(std::time::Duration::from_secs(15));
+    ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = &mut deadline => {
+                let _ = send_close_error(socket, "container log setup timed out").await;
+                return None;
+            }
+            _ = ping.tick() => {
+                if socket.send(Message::Ping(Vec::new().into())).await.is_err() {
+                    return None;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return None,
+                    _ => {}
+                }
+            }
+            result = &mut setup => return Some(result),
+        }
+    }
+}
+
 async fn handle_container_logs_socket(
     mut socket: WebSocket,
     state: Arc<AppState>,
@@ -1430,22 +1558,22 @@ async fn handle_container_logs_socket(
     );
 
     // Get the log stream from the deployment service
-    let log_stream = match state
-        .deployment_service
-        .get_container_logs_by_id(
-            params.project_id,
-            params.environment_id,
-            params.container_id.clone(),
-            crate::services::services::ContainerLogParams {
-                start_date: params.start_date,
-                end_date: params.end_date,
-                tail: params.tail,
-                timestamps: params.timestamps,
-                follow: params.follow,
-            },
-        )
-        .await
-    {
+    let setup = state.deployment_service.get_container_logs_by_id(
+        params.project_id,
+        params.environment_id,
+        params.container_id.clone(),
+        crate::services::services::ContainerLogParams {
+            start_date: params.start_date,
+            end_date: params.end_date,
+            tail: params.tail,
+            timestamps: params.timestamps,
+            follow: params.follow,
+        },
+    );
+    let Some(result) = prepare_log_stream(&mut socket, setup).await else {
+        return;
+    };
+    let log_stream = match result {
         Ok(stream) => stream,
         Err(e) => {
             error!(
@@ -1462,14 +1590,6 @@ async fn handle_container_logs_socket(
             {
                 error!("Failed to send error message over WebSocket: {}", e);
             }
-            // Close with an explicit normal-closure code (not `socket.close()`,
-            // which sends a bare Close frame with no code). The frontend only
-            // treats `event.code === 1000` as "don't reconnect" -- a codeless
-            // close reads as abnormal, and combined with the client resetting
-            // its retry counter on every successful re-open, that produced an
-            // infinite reconnect loop for containers whose `container_id` no
-            // longer resolves in Docker (e.g. long-lived rows pointing at a
-            // container Docker has since removed).
             let _ = send_close_error(&mut socket, "container logs unavailable").await;
             return;
         }
@@ -1495,6 +1615,12 @@ async fn handle_container_logs_socket(
                 if let Err(e) = socket.send(Message::Ping(Vec::new().into())).await {
                     debug!("WebSocket ping failed (client likely gone): {}", e);
                     break;
+                }
+            }
+            incoming = socket.recv() => {
+                match incoming {
+                    None | Some(Err(_)) | Some(Ok(Message::Close(_))) => return,
+                    _ => {}
                 }
             }
             maybe_line = log_stream.next() => {
@@ -2941,9 +3067,10 @@ pub async fn get_activity_graph(
     path = "/projects/{project_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Asset cache purged"),
+        (status = 200, description = "Asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID")
@@ -2964,7 +3091,7 @@ pub async fn purge_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 /// Purge cached static assets for a specific environment.
@@ -2973,9 +3100,10 @@ pub async fn purge_asset_cache(
     path = "/projects/{project_id}/environments/{environment_id}/asset-cache",
     tag = "Deployments",
     responses(
-        (status = 200, description = "Environment asset cache purged"),
+        (status = 200, description = "Environment asset cache purged", body = AssetCachePurgeResponse),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 500, description = "Internal server error")
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID"),
@@ -2997,11 +3125,32 @@ pub async fn purge_environment_asset_cache(
         .await
         .map_err(Problem::from)?;
 
-    Ok(Json(serde_json::json!({ "deleted": deleted })))
+    Ok(Json(AssetCachePurgeResponse { deleted }))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
+
+    /// #1795: the purge endpoints are in the OpenAPI document, so the console
+    /// calls them through the generated client and sees a refusal.
+    #[test]
+    fn asset_cache_purge_endpoints_are_documented() {
+        use utoipa::OpenApi;
+        let doc = super::DeploymentsApiDoc::openapi();
+        for path in [
+            "/projects/{project_id}/asset-cache",
+            "/projects/{project_id}/environments/{environment_id}/asset-cache",
+        ] {
+            let item = doc
+                .paths
+                .paths
+                .get(path)
+                .unwrap_or_else(|| panic!("{path} is documented"));
+            assert!(item.delete.is_some(), "{path} documents DELETE");
+        }
+        let schemas = doc.components.expect("components").schemas;
+        assert!(schemas.contains_key("AssetCachePurgeResponse"));
+    }
 
     mod lifecycle_conflict_tests {
         use crate::services::services::DeploymentError;
@@ -3041,7 +3190,7 @@ mod tests {
         use super::super::*;
         use axum::body::{to_bytes, Body};
         use axum::http::Request;
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
         use tower::ServiceExt;
 
         #[tokio::test]
@@ -3173,9 +3322,9 @@ mod tests {
     use std::sync::Arc;
     use temps_config::ConfigService;
     use temps_core::ProjectAccessChecker;
-    use temps_database::test_utils::TestDatabase;
     use temps_deployment_logs::{DockerLogService, LogService};
     use temps_entities::upstream_config::UpstreamList;
+    use temps_test_utils::TestDatabase;
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
@@ -3564,7 +3713,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3575,9 +3724,12 @@ mod tests {
     impl temps_core::AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::AuditOperation,
-        ) -> Result<(), anyhow::Error> {
-            Err(anyhow::anyhow!("audit database unavailable"))
+            operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit database unavailable",
+            ))
         }
     }
 
@@ -3643,6 +3795,14 @@ mod tests {
             .await
             .expect_err("credential reveal must fail if audit persistence fails");
 
+        assert_eq!(
+            problem.body["title"],
+            "Container environment variable could not be revealed"
+        );
+        assert_eq!(
+            problem.body["detail"],
+            "The audit record for this reveal could not be written"
+        );
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
@@ -4993,7 +5153,7 @@ mod tests {
     // =============================================================================
 
     /// Helper to create test app state for HTTP tests
-    async fn create_test_app_state_for_http(
+    pub(crate) async fn create_test_app_state_for_http(
         db: Arc<sea_orm::DatabaseConnection>,
         temp_dir: std::path::PathBuf,
     ) -> Arc<AppState> {
@@ -5057,7 +5217,8 @@ mod tests {
                 db.clone(),
                 queue_service.clone(),
                 deployment_token_service,
-            ),
+            )
+            .expect("cron service"),
         );
 
         let remote_deployment_service =
@@ -5167,16 +5328,6 @@ mod tests {
             ),
             db.clone(),
         ));
-        let enrollment_token_service =
-            Arc::new(temps_config::EnrollmentTokenService::new(db.clone()));
-        let node_pairing_admin = Arc::new(
-            crate::services::node_pairing_admin::NodePairingAdminService::new(
-                db.clone(),
-                config_service.clone(),
-                encryption_service.clone(),
-                enrollment_token_service.clone(),
-            ),
-        );
 
         let external_deployment_manager =
             Arc::new(crate::services::ExternalDeploymentManager::new());
@@ -5202,12 +5353,6 @@ mod tests {
             image_builder: Arc::new(MockImageBuilder) as Arc<dyn temps_deployer::ImageBuilder>,
             audit_service: Arc::new(MockAuditLogger) as Arc<dyn temps_core::AuditLogger>,
             node_service: Arc::new(crate::services::NodeService::new(db.clone())),
-            node_public_ingress_service: Arc::new(
-                crate::services::node_public_ingress::NodePublicIngressService::new(
-                    db.clone(),
-                    Arc::new(crate::services::NodeService::new(db.clone())),
-                ),
-            ),
             node_scheduler: Arc::new(crate::services::NodeScheduler::new(Arc::new(
                 crate::services::NodeService::new(db.clone()),
             ))),
@@ -5217,23 +5362,12 @@ mod tests {
                 bollard::Docker::connect_with_local_defaults()
                     .unwrap_or_else(|_| bollard::Docker::connect_with_defaults().unwrap()),
             ))),
-            docker_disk_usage: Arc::new(crate::services::DockerDiskUsageService::local()),
-            resolver_coverage: Arc::new(crate::services::ResolverCoverageService::new(
-                db.clone(),
-                Arc::new(temps_core::DockerHandle::disabled(
-                    "test",
-                    "no daemon in tests",
-                )),
-                None,
-            )),
             deployment_gate: None,
             project_access_checker: None,
             hostname_resolver: Arc::new(temps_core::StandardHostnameResolver)
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
-            enrollment_token_service,
-            node_pairing_admin,
             sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
@@ -6821,5 +6955,123 @@ mod tests {
 
         println!("✅ DELETE /projects/{{project_id}}/environments/{{env_id}}/teardown test passed");
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// #1802: the client giving up (its request future dropped) must not stop
+    /// the rollback it started.
+    #[tokio::test]
+    async fn detached_lifecycle_work_finishes_after_the_request_is_dropped() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let request = tokio::spawn(super::run_detached("rollback", 1, 2, async move {
+            let _ = started_tx.send(());
+            // Stands in for the health-check wait.
+            let _ = release_rx.await;
+            let _ = done_tx.send(());
+            Ok::<_, Problem>(())
+        }));
+
+        started_rx.await.expect("the work starts");
+        // The client disconnects: axum drops the handler future.
+        request.abort();
+        let _ = request.await;
+
+        release_tx.send(()).expect("the work is still running");
+        tokio::time::timeout(std::time::Duration::from_secs(5), done_rx)
+            .await
+            .expect("the detached work finishes")
+            .expect("the detached work reports completion");
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_work_returns_its_own_error() {
+        let result = super::run_detached("rollback", 1, 2, async {
+            Err::<(), _>(
+                temps_core::error_builder::bad_request()
+                    .detail("Cannot rollback to deployment in 'failed' state")
+                    .build(),
+            )
+        })
+        .await;
+        let problem = result.expect_err("the work's error is returned");
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn detached_lifecycle_work_that_panics_is_a_500_naming_the_deployment() {
+        let result = super::run_detached("rollback", 7, 42, async {
+            if true {
+                panic!("boom");
+            }
+            Ok::<(), Problem>(())
+        })
+        .await;
+        let problem = result.expect_err("a panicked task is an error");
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&problem.body).expect("problem serializes");
+        assert!(body.contains("deployment 42 in project 7"), "{body}");
+        assert!(
+            !body.contains("boom") && !body.contains("panicked"),
+            "the panic payload must stay out of the response: {body}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod log_setup_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cold_log_setup_pings_before_upstream_is_ready_and_cancels_on_close() {
+        use axum::{routing::get, Router};
+        use futures::{SinkExt, StreamExt};
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let cancelled = Arc::new(AtomicBool::new(false));
+        struct Cancelled(Arc<AtomicBool>);
+        impl Drop for Cancelled {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let flag = cancelled.clone();
+        let app = Router::new().route(
+            "/",
+            get(move |ws: WebSocketUpgrade| async move {
+                ws.on_upgrade(move |mut socket| async move {
+                    let guard = Cancelled(flag);
+                    let setup = async move {
+                        let _guard = guard;
+                        std::future::pending::<()>().await;
+                    };
+                    prepare_log_stream(&mut socket, setup).await;
+                })
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let (mut client, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/"))
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(1), client.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(first.is_ping(), "cold setup must send a frame immediately");
+        client
+            .send(tokio_tungstenite::tungstenite::Message::Close(None))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while !cancelled.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        server.abort();
     }
 }

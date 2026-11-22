@@ -160,7 +160,7 @@ mod tests {
 
     #[tokio::test]
     async fn native_release_queries_bound_work_keep_pagination_and_scope() {
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(_) => {
                 eprintln!("Skipping native database test: Docker-backed TestDatabase unavailable");

@@ -132,12 +132,14 @@ const SEGMENT_MAX_LINES: usize = 1024;
 /// a head buffer O(#segments) instead of O(#lines).
 const SEGMENT_MAX_BYTES: usize = 256 * 1024;
 
-/// Backoff schedule for storage/manifest retries inside [`ChunkWriterService::seal`].
-const RETRY_DELAYS: [Duration; 3] = [
-    Duration::from_millis(250),
-    Duration::from_secs(1),
-    Duration::from_secs(4),
-];
+/// Backoff for storage/manifest retries inside [`ChunkWriterService::seal`]
+/// (ADR-046): four attempts, waiting 250 ms, 1 s and 4 s between them.
+fn seal_retry() -> RetryConfig {
+    RetryConfig::new(4)
+        .with_base_delay(Duration::from_millis(250))
+        .with_backoff_factor(4)
+        .with_max_delay(Duration::from_secs(4))
+}
 
 // ── Manifest dependency (testable) ─────────────────────────────────────────
 
@@ -269,6 +271,23 @@ struct HeadBuffer {
     /// cancellation of an outer `write_line` task can never leave
     /// `sealing = Some(...)` permanently stuck.
     sealing_notify: Arc<tokio::sync::Notify>,
+    /// Changes whenever this buffer's lines move between "only here" and
+    /// "also in the line index": when a seal starts and when its chunk has
+    /// been indexed. A count that reads the heads and then the index
+    /// compares it afterwards to tell whether a seal crossed the two reads
+    /// ([`HeadSource::seal_epoch`]). Drawn from [`next_seal_epoch`], so a
+    /// buffer recreated after its stream closed never repeats an old value.
+    seal_epoch: u64,
+    /// `true` once the in-flight seal's chunk is in the line index, while
+    /// its lines are still visible here as `sealing`.
+    sealing_indexed: bool,
+}
+
+/// Process-wide source of [`HeadBuffer::seal_epoch`] values.
+static NEXT_SEAL_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_seal_epoch() -> u64 {
+    NEXT_SEAL_EPOCH.fetch_add(1, Ordering::Relaxed)
 }
 
 /// The writer's own thin wrapper around [`crate::chunk::wal::StreamWal`] so a
@@ -293,6 +312,8 @@ impl HeadBuffer {
             wal: wal.map(|stream| WalHandle { stream }),
             recovered_generation: None,
             sealing_notify: Arc::new(tokio::sync::Notify::new()),
+            seal_epoch: next_seal_epoch(),
+            sealing_indexed: false,
         }
     }
 
@@ -366,9 +387,15 @@ impl HeadBuffer {
         if segments.is_empty() {
             return None;
         }
+        let indexed_segments = match &self.sealing {
+            Some(sealing) if self.sealing_indexed => sealing.len(),
+            _ => 0,
+        };
         Some(HeadSnapshot {
             identity: self.identity.clone(),
             segments,
+            indexed_segments,
+            seal_epoch: self.seal_epoch,
         })
     }
 
@@ -1068,6 +1095,29 @@ impl ChunkWriterService {
         Ok(())
     }
 
+    /// Seal and drop every stream whose id starts with `prefix`, the way
+    /// [`Self::remove_container`] does for one. Returns how many were
+    /// removed. Used when a log ingest key is revoked: its
+    /// `ingest-<key id>-<service>` streams would otherwise keep a head
+    /// buffer and a WAL file open for the life of the process.
+    pub async fn remove_streams_with_prefix(
+        self: &Arc<Self>,
+        prefix: &str,
+    ) -> Result<usize, LogAggregatorError> {
+        let ids: Vec<String> = {
+            let buffers = self.buffers.lock().await;
+            buffers
+                .keys()
+                .filter(|id| id.starts_with(prefix))
+                .cloned()
+                .collect()
+        };
+        for id in &ids {
+            self.remove_container(id).await?;
+        }
+        Ok(ids.len())
+    }
+
     /// Seal then drop a container's buffer and WAL file (call when a
     /// container stops).
     ///
@@ -1138,6 +1188,7 @@ impl ChunkWriterService {
             if let Some(buffer) = buffers.get_mut(container_id) {
                 buffer.sealing = None;
                 buffer.sealing_stats = None;
+                buffer.sealing_indexed = false;
                 Some(buffer.sealing_notify.clone())
             } else {
                 None
@@ -1234,6 +1285,8 @@ impl ChunkWriterService {
                     buffer.bytes = 0;
                     buffer.opened_at = Instant::now();
                     buffer.sealing = Some(sealing_segments.clone());
+                    buffer.sealing_indexed = false;
+                    buffer.seal_epoch = next_seal_epoch();
                     buffer.sealing_stats = Some(buffer.stats);
                     buffer.stats = BufferStats::default();
                     break (buffer.identity.clone(), sealing_segments, generation);
@@ -1342,6 +1395,14 @@ impl ChunkWriterService {
         .await
         {
             Ok(IndexOutcome::Indexed) => {
+                // The sealing lines are now in the index as well as here.
+                {
+                    let mut buffers = self.buffers.lock().await;
+                    if let Some(buffer) = buffers.get_mut(container_id) {
+                        buffer.sealing_indexed = true;
+                        buffer.seal_epoch = next_seal_epoch();
+                    }
+                }
                 if let Err(e) = manifests.mark_indexed(seq).await {
                     warn!(seq, error = %e, "could not mark chunk as indexed; reindexer will redo it");
                 }
@@ -1384,6 +1445,7 @@ impl ChunkWriterService {
             if let Some(buffer) = buffers.get_mut(container_id) {
                 buffer.sealing = None;
                 buffer.sealing_stats = None;
+                buffer.sealing_indexed = false;
                 Some(buffer.sealing_notify.clone())
             } else {
                 None
@@ -1415,6 +1477,11 @@ impl HeadSource for ChunkWriterService {
     async fn snapshot(&self, container_id: &str) -> Option<HeadSnapshot> {
         let buffers = self.buffers.lock().await;
         buffers.get(container_id)?.build_snapshot()
+    }
+
+    async fn seal_epoch(&self, container_id: &str) -> Option<u64> {
+        let buffers = self.buffers.lock().await;
+        buffers.get(container_id).map(|buffer| buffer.seal_epoch)
     }
 }
 
@@ -1468,47 +1535,29 @@ fn build_chunk_meta(
     }
 }
 
-/// Retry `f` up to `RETRY_DELAYS.len()` additional times (so
-/// `1 + RETRY_DELAYS.len()` attempts total) with the ADR-046 backoff
-/// schedule, returning the last error if every attempt fails.
-pub(crate) async fn retry_with_backoff<T, E, F, Fut>(mut f: F) -> Result<T, E>
+/// Retry `f` on any error with the seal path's backoff ([`seal_retry`]),
+/// returning the last error if every attempt fails.
+pub(crate) async fn retry_with_backoff<T, E, F, Fut>(f: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Display,
 {
-    let mut attempt = 0usize;
-    loop {
-        match f().await {
-            Ok(v) => return Ok(v),
-            Err(e) => {
-                if attempt >= RETRY_DELAYS.len() {
-                    return Err(e);
-                }
-                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
-                attempt += 1;
-            }
-        }
-    }
+    seal_retry().retry(f).await
 }
 
-async fn retry_log_operation_with_backoff<T, F, Fut>(mut f: F) -> Result<T, LogAggregatorError>
+/// Retry `f` with the seal path's backoff while it fails with a
+/// [`RetryClass::Transient`] error; any other error is returned at once.
+async fn retry_log_operation_with_backoff<T, F, Fut>(f: F) -> Result<T, LogAggregatorError>
 where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, LogAggregatorError>>,
 {
-    let mut attempt = 0usize;
-    loop {
-        match f().await {
-            Ok(value) => return Ok(value),
-            Err(error) => {
-                if error.retry_class() != RetryClass::Transient || attempt >= RETRY_DELAYS.len() {
-                    return Err(error);
-                }
-                tokio::time::sleep(RETRY_DELAYS[attempt]).await;
-                attempt += 1;
-            }
-        }
-    }
+    seal_retry()
+        .retry_if(f, |error: &LogAggregatorError| {
+            error.retry_class() == RetryClass::Transient
+        })
+        .await
 }
 
 #[cfg(test)]
@@ -1519,6 +1568,75 @@ mod tests {
     use crate::types::{LogLevel, LogStream};
     use chrono::Utc;
     use tokio::sync::Mutex as StdAsyncMutex;
+
+    fn transient_error() -> LogAggregatorError {
+        LogAggregatorError::Io(std::io::Error::other("storage connection reset"))
+    }
+
+    fn permanent_error() -> LogAggregatorError {
+        LogAggregatorError::Io(std::io::Error::from(std::io::ErrorKind::NotFound))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_retries_transient_errors_on_the_adr_046_schedule() {
+        let calls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let result: Result<(), _> = retry_log_operation_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(transient_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+        // 250 ms + 1 s + 4 s between the four attempts.
+        assert_eq!(started.elapsed(), Duration::from_millis(5250));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_succeeds_once_a_transient_error_clears() {
+        let calls = AtomicUsize::new(0);
+        let result = retry_log_operation_with_backoff(|| {
+            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt < 2 {
+                    Err(transient_error())
+                } else {
+                    Ok(attempt)
+                }
+            }
+        })
+        .await;
+
+        assert_eq!(result.unwrap(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn seal_retry_does_not_retry_permanent_errors() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_log_operation_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retry_with_backoff_retries_every_error() {
+        let calls = AtomicUsize::new(0);
+        let result: Result<(), _> = retry_with_backoff(|| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async { Err(permanent_error()) }
+        })
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
+    }
 
     async fn seed_background_wal(root: &std::path::Path) {
         let wal_dir = WalDir::open(root.to_path_buf()).await.unwrap();
@@ -1579,6 +1697,13 @@ mod tests {
             crate::services::IngestLimits::UNLIMITED,
         ));
         context.register_service(ingest_budget.clone());
+        let ingest_keys = Arc::new(crate::ingest::LogIngestKeyService::new(db.clone()));
+        context.register_service(ingest_keys.clone());
+        context.register_service(Arc::new(crate::ingest::LogIngestService::new(
+            ingest_keys,
+            Arc::new(writer.clone()),
+            ingest_budget.clone(),
+        )));
         context.register_service(Arc::new(crate::services::CollectorService::new(
             docker,
             writer.clone(),
@@ -2261,6 +2386,88 @@ mod tests {
         .await
         .unwrap();
         (writer, sink, tmp)
+    }
+
+    /// A line index that holds every `index_chunk` until released, so a
+    /// test can look at a head while its seal is being indexed.
+    #[derive(Default)]
+    struct GatedIndex {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl LineIndexSink for GatedIndex {
+        async fn index_chunk(
+            &self,
+            _seq: i64,
+            _labels: &ChunkLabels,
+            _segments: &[Arc<Vec<LogLine>>],
+        ) -> Result<crate::index::IndexOutcome, LogAggregatorError> {
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(crate::index::IndexOutcome::Indexed)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_seal_moves_the_heads_seal_epoch_when_it_starts_and_when_indexed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage: Arc<dyn LogStorage> =
+            Arc::new(FilesystemStorage::new(tmp.path().join("objects")).unwrap());
+        let index = Arc::new(GatedIndex::default());
+        let writer = ChunkWriterService::open_with_index(
+            storage,
+            Arc::new(VecSink::default()) as Arc<dyn ManifestSink>,
+            Some(tmp.path().join("wal")),
+            None,
+            index.clone(),
+        )
+        .await
+        .unwrap();
+        writer
+            .write_line(make_line("epoch-c", LogLevel::Info, "one"))
+            .await
+            .unwrap();
+        let before = writer.seal_epoch("epoch-c").await.expect("a head");
+
+        let flushing = tokio::spawn({
+            let writer = writer.clone();
+            async move { writer.flush_all().await }
+        });
+        index.entered.notified().await;
+        let sealing = writer.seal_epoch("epoch-c").await.expect("still a head");
+        assert_ne!(sealing, before, "starting a seal moves the epoch");
+        let snapshot = writer.snapshot("epoch-c").await.expect("sealing lines");
+        assert_eq!(snapshot.len(), 1, "sealing lines stay readable");
+        assert_eq!(snapshot.indexed_segments, 0, "not in the index yet");
+        assert_eq!(snapshot.seal_epoch, sealing);
+
+        index.release.notify_one();
+        flushing.await.unwrap();
+        assert_ne!(
+            writer.seal_epoch("epoch-c").await,
+            Some(sealing),
+            "indexing the chunk moves the epoch again"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_marks_sealing_segments_already_in_the_index() {
+        let line = make_line("idx-c", LogLevel::Info, "sealed");
+        let mut buffer = HeadBuffer::new(identity_from_line(&line), None);
+        buffer.sealing = Some(vec![Arc::new(vec![line.clone()])]);
+        buffer.segments = vec![Arc::new(vec![line.clone()])];
+        let snapshot = buffer.build_snapshot().expect("lines");
+        assert_eq!(snapshot.indexed_segments, 0);
+
+        buffer.sealing_indexed = true;
+        let snapshot = buffer.build_snapshot().expect("lines");
+        assert_eq!(snapshot.segments.len(), 2);
+        assert_eq!(
+            snapshot.indexed_segments, 1,
+            "the sealing segment comes first"
+        );
     }
 
     async fn generation_paths(root: &std::path::Path) -> Vec<std::path::PathBuf> {

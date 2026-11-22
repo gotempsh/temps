@@ -36,6 +36,11 @@ pub struct Model {
     /// most one connector has it on.
     #[serde(default)]
     pub environment_hosts: bool,
+    /// Name environment hosts `<label>-<host_suffix>.<domain>` instead of
+    /// `<label>.<domain>`, so a tunnel on a zone keeps them one level deep
+    /// (which Cloudflare's free certificate covers). `None`: no suffix.
+    #[serde(default)]
+    pub host_suffix: Option<String>,
     /// `pending`, `ready`, `error`, or `deleting` while it is being removed
     /// (ADR 064 D4): sync and reconcile skip it, and it is never reverted.
     pub status: String,

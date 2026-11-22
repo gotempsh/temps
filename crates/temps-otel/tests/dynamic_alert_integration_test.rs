@@ -30,16 +30,16 @@ use axum::http::{HeaderMap, StatusCode};
 use chrono::Utc;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 
-use temps_auth::{AuthContext, RequireAuth, Role};
+use temps_alarms::{AlarmService, AlarmStatus};
+use temps_authz::{AuthContext, RequireAuth, Role};
 use temps_core::RequestMetadata;
-use temps_monitoring::{AlarmService, AlarmStatus};
 use temps_otel::detectors::{Comparator, DetectionConfig, StaticParams};
 use temps_otel::handlers::metric_alert_handler::{delete_alert, MetricAlertScopeParams};
 use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
 use temps_otel::services::{
-    CrossProjectTraceService, MetricAlertEvaluator, MetricAlertService, MetricDashboardService,
-    OtelService,
+    AlertSeriesSource, CrossProjectTraceService, MetricAlertEvaluator, MetricAlertService,
+    MetricDashboardService, OtelService,
 };
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
@@ -114,7 +114,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
     async fn create_audit_log(
         &self,
         _operation: &dyn temps_core::AuditOperation,
-    ) -> anyhow::Result<()> {
+    ) -> temps_core::AuditResult<()> {
         Ok(())
     }
 }
@@ -123,7 +123,7 @@ impl temps_core::AuditLogger for NoOpAuditLogger {
 /// cleanup on drop), the evaluator under test, the alert service for rule CRUD,
 /// the storage for seeding metrics, and the project the rows are scoped to.
 struct EvaluatorTestCtx {
-    _db: temps_database::test_utils::TestDatabase,
+    _db: temps_test_utils::TestDatabase,
     db: Arc<sea_orm::DatabaseConnection>,
     evaluator: Arc<MetricAlertEvaluator>,
     alert_service: Arc<MetricAlertService>,
@@ -142,15 +142,24 @@ struct EvaluatorTestCtx {
 /// service, so the DB cooldown key can't tell series apart — the evaluator's
 /// per-series state machine guarantees exactly-once firing instead.
 async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
-    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    setup_evaluator_with(Arc::new(NoOpJobQueue)).await
+}
+
+/// [`setup_evaluator`] with the job queue the alarm services send to, so a
+/// test can act at the moment an alarm fires.
+async fn setup_evaluator_with(queue: Arc<dyn temps_core::JobQueue>) -> Option<EvaluatorTestCtx> {
+    // Skip only when there is no container runtime. A database that starts
+    // but fails to migrate is a real failure, not a reason to skip.
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(e) => {
+        Err(e) if temps_test_utils::is_container_runtime_unavailable(&e.to_string()) => {
             println!(
                 "Docker/TestDatabase not available, skipping dynamic alert test: {}",
                 e
             );
             return None;
         }
+        Err(e) => panic!("the test database started but could not be set up: {e}"),
     };
 
     let db = test_db.db.clone();
@@ -203,7 +212,6 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
 
     let notify: Arc<dyn temps_core::notifications::NotificationService> =
         Arc::new(NoOpNotificationService);
-    let queue: Arc<dyn temps_core::JobQueue> = Arc::new(NoOpJobQueue);
     let alarm_service = Arc::new(AlarmService::new(db.clone(), notify.clone(), queue.clone()));
     let alarm_service_dynamic = Arc::new(
         AlarmService::new(db.clone(), notify, queue).with_cooldown(chrono::Duration::zero()),
@@ -215,6 +223,8 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         alarm_service,
         alarm_service_dynamic,
         db.clone(),
+        None,
+        // No log series source: these tests exercise metric rules only.
         None,
     ));
 
@@ -324,6 +334,7 @@ async fn test_dynamic_alert_fires_then_resolves_per_series() {
             true,                       // dynamic_alerts
             20,                         // max_series
             5,                          // grouped_notification_threshold
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create dynamic rule");
@@ -388,6 +399,7 @@ async fn test_dynamic_alert_fires_then_resolves_per_series() {
             None,
             None,
             Some(static_gt(500.0)),
+            None,
             None,
             None,
             None,
@@ -463,6 +475,7 @@ async fn test_dynamic_alert_cardinality_cap_limits_alarms() {
             true,
             2, // max_series — below the 3 seeded series
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create capped rule");
@@ -534,6 +547,7 @@ async fn test_grouped_non_dynamic_fires_single_aggregate_alarm() {
             false,                      // ...but NOT dynamic: collapse to max
             20,
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create collapse rule");
@@ -662,6 +676,7 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
             true,
             20,
             5,
+            AlertSeriesSource::Metric,
         )
         .await
         .expect("create victim rule");
@@ -699,6 +714,10 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         facet_cache,
     ));
     let app_state = OtelAppState {
+        operation_trends: Arc::new(temps_otel::services::OperationTrendService::new(
+            ctx.db.clone(),
+            ctx.storage.clone(),
+        )),
         otel_service: ctx.otel_service.clone(),
         metrics_store: None,
         metrics_write_tx: None,
@@ -793,5 +812,855 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
     assert!(
         legit_result.is_ok(),
         "the rule's real owner must still be able to delete it: {legit_result:?}"
+    );
+}
+
+// ── Log alerts (ADR 108 D1) ─────────────────────────────────────────────
+
+/// A log-line counter that returns whatever count the test sets, so the
+/// evaluator's log path runs against the real `alarms` table without a log
+/// store behind it.
+struct FixedLogCount(std::sync::atomic::AtomicU64);
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for FixedLogCount {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: self.0.load(std::sync::atomic::Ordering::Relaxed),
+            saturated: false,
+            query_fingerprint: 1,
+        })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(1)
+    }
+}
+
+async fn seed_saved_search(db: &sea_orm::DatabaseConnection, project_id: i32, name: &str) -> i32 {
+    temps_entities::log_saved_searches::ActiveModel {
+        project_id: Set(project_id),
+        name: Set(name.to_string()),
+        description: Set(None),
+        query: Set(serde_json::json!({ "text": "payment failed" })),
+        time_range: Set("1h".to_string()),
+        pinned: Set(false),
+        created_by: Set(None),
+        ..Default::default()
+    }
+    .insert(db)
+    .await
+    .expect("seed saved search")
+    .id
+}
+
+/// The whole point of D1's first piece: a count of matching lines over a
+/// window fires through the same alarm log a metric rule uses, and resolves
+/// when the count falls back.
+#[tokio::test]
+async fn test_log_alert_fires_on_a_line_count_and_resolves() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+
+    let rule = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Payment failures".to_string(),
+            String::new(),
+            "count".to_string(),
+            static_gt(20.0),
+            300,
+            1,
+            "critical".to_string(),
+            true,
+            vec![],
+            vec![],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id },
+        )
+        .await
+        .expect("create log rule");
+    assert_eq!(rule.source, "logs");
+    assert_eq!(rule.saved_search_id, Some(saved_search_id));
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2");
+
+    let firing = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(firing.len(), 1, "one log alarm fires: {firing:?}");
+    let alarm = &firing[0];
+    assert_eq!(alarm.status, AlarmStatus::Firing.as_str());
+    assert_eq!(alarm.title, "Log alert: Payment failures");
+    let message = alarm.message.as_deref().unwrap_or_default();
+    assert!(
+        message.contains("42 log lines matched"),
+        "the message says what was counted: {message}"
+    );
+    let metadata = alarm.metadata.as_ref().expect("metadata recorded");
+    assert_eq!(
+        metadata["saved_search_id"],
+        serde_json::json!(saved_search_id)
+    );
+    assert_eq!(metadata["source"], serde_json::json!("log_alert"));
+
+    counter.0.store(3, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3");
+    let resolved = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the alarm resolves once the count is back under the threshold"
+    );
+}
+
+/// A rule may only count a saved search of its own project.
+#[tokio::test]
+async fn test_log_alert_refuses_another_projects_saved_search() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let other_project = temps_entities::projects::ActiveModel {
+        name: Set("Other project".into()),
+        repo_name: Set("other-repo".into()),
+        repo_owner: Set("test-org".into()),
+        directory: Set("/".into()),
+        main_branch: Set("main".into()),
+        preset: Set(temps_entities::preset::Preset::Dockerfile),
+        slug: Set("log-alert-other-project".into()),
+        ..Default::default()
+    }
+    .insert(ctx.db.as_ref())
+    .await
+    .expect("insert other project");
+    let foreign = seed_saved_search(&ctx.db, other_project.id, "Not yours").await;
+
+    let error = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Borrowed search".to_string(),
+            String::new(),
+            "count".to_string(),
+            static_gt(20.0),
+            300,
+            60,
+            "warning".to_string(),
+            true,
+            vec![],
+            vec![],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs {
+                saved_search_id: foreign,
+            },
+        )
+        .await
+        .expect_err("a foreign saved search is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("Saved log search {foreign} not found in project")),
+        "unexpected: {message}"
+    );
+}
+
+// ── Edits that land while a tick is running (ADR 108 D1) ────────────────
+
+/// A log counter that edits its rule while counting, the way a PATCH can
+/// land while the evaluator waits for the log store.
+struct EditingLogCount {
+    count: std::sync::atomic::AtomicU64,
+    edit: tokio::sync::Mutex<Option<(Arc<MetricAlertService>, i32, i32)>>,
+}
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for EditingLogCount {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        if let Some((service, project_id, rule_id)) = self.edit.lock().await.take() {
+            service
+                .update(
+                    project_id,
+                    rule_id,
+                    None,
+                    None,
+                    None,
+                    Some(static_gt(100.0)),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("raise the threshold mid-tick");
+        }
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: self.count.load(std::sync::atomic::Ordering::Relaxed),
+            saturated: false,
+            query_fingerprint: 1,
+        })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(1)
+    }
+}
+
+async fn create_log_rule(ctx: &EvaluatorTestCtx, saved_search_id: i32) -> i32 {
+    ctx.alert_service
+        .create(
+            ctx.project_id,
+            "Payment failures".to_string(),
+            String::new(),
+            "count".to_string(),
+            static_gt(20.0),
+            300,
+            1,
+            "critical".to_string(),
+            true,
+            vec![],
+            vec![],
+            false,
+            20,
+            5,
+            AlertSeriesSource::Logs { saved_search_id },
+        )
+        .await
+        .expect("create log rule")
+        .id
+}
+
+/// A threshold raised while a tick counts must not let that tick fire with
+/// the old threshold: 42 lines breach "> 20" but not "> 100".
+#[tokio::test]
+async fn test_a_threshold_raised_mid_tick_does_not_fire_the_old_verdict() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(EditingLogCount {
+        count: std::sync::atomic::AtomicU64::new(42),
+        edit: tokio::sync::Mutex::new(None),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 1 arms the breach");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    *counter.edit.lock().await = Some((ctx.alert_service.clone(), ctx.project_id, rule_id));
+    ctx.evaluator.run_cycle().await.expect("cycle 2");
+
+    assert!(
+        alarms_for(&ctx.db, ctx.project_id).await.is_empty(),
+        "no alarm for a threshold the rule no longer has"
+    );
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_ne!(rule.last_state, "firing", "the stale verdict is not stored");
+    assert!(rule.config_revision > 0, "the edit bumped the revision");
+
+    // Under the new threshold 42 lines are fine.
+    ctx.evaluator.run_cycle().await.expect("cycle 3");
+    assert!(alarms_for(&ctx.db, ctx.project_id).await.is_empty());
+}
+
+/// A recovery read before an edit must not resolve the alarm: the edit
+/// discards that tick's "ok", so resolving would leave the rule firing with
+/// no alarm behind it. The next tick, under the new configuration, resolves.
+#[tokio::test]
+async fn test_a_recovery_read_before_an_edit_does_not_resolve_the_alarm() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(EditingLogCount {
+        count: std::sync::atomic::AtomicU64::new(42),
+        edit: tokio::sync::Mutex::new(None),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+
+    // The count falls back, and the rule is edited while it is counted.
+    counter.count.store(5, std::sync::atomic::Ordering::Relaxed);
+    *counter.edit.lock().await = Some((ctx.alert_service.clone(), ctx.project_id, rule_id));
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, stale recovery");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Firing.as_str(),
+        "a discarded recovery leaves the alarm open"
+    );
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "firing", "state and alarm agree");
+
+    ctx.evaluator.run_cycle().await.expect("cycle 4 resolves");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms[0].status, AlarmStatus::Resolved.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok");
+}
+
+/// A resolve that fails (the database refuses the write) is retried on the
+/// next cycle, although the rule has already recorded "ok" and stopped
+/// tracking the alarm.
+#[tokio::test]
+async fn test_a_failed_resolve_is_retried_next_cycle() {
+    use sea_orm::ConnectionTrait;
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    assert_eq!(alarms_for(&ctx.db, ctx.project_id).await.len(), 1);
+
+    // Resolving is refused while this constraint exists. This test's schema
+    // is its own, so nothing else sees it.
+    ctx.db
+        .execute_unprepared(
+            "ALTER TABLE alarms ADD CONSTRAINT test_refuse_resolve \
+             CHECK (status <> 'resolved') NOT VALID",
+        )
+        .await
+        .expect("add constraint");
+    counter.0.store(5, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, resolve fails");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok", "the rule itself has recovered");
+
+    ctx.db
+        .execute_unprepared("ALTER TABLE alarms DROP CONSTRAINT test_refuse_resolve")
+        .await
+        .expect("drop constraint");
+    ctx.evaluator.run_cycle().await.expect("cycle 4 retries");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the failed resolve was retried"
+    );
+}
+
+/// A state write that fails after the alarm opened leaves "ok" stored behind
+/// an open alarm. The evaluator still treats the rule as firing, so the
+/// recovery that follows resolves the alarm instead of leaving it open.
+#[tokio::test]
+async fn test_an_alarm_whose_state_write_failed_is_still_resolved() {
+    use sea_orm::ConnectionTrait;
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(FixedLogCount(std::sync::atomic::AtomicU64::new(42)));
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    // Storing "firing" is refused while this constraint exists. This test's
+    // schema is its own, so nothing else sees it.
+    ctx.db
+        .execute_unprepared(
+            "ALTER TABLE metric_alert_rules ADD CONSTRAINT test_refuse_firing \
+             CHECK (last_state <> 'firing') NOT VALID",
+        )
+        .await
+        .expect("add constraint");
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 2 fires, its state write fails");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0].status, AlarmStatus::Firing.as_str());
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok", "the failed write left the old state");
+    ctx.db
+        .execute_unprepared("ALTER TABLE metric_alert_rules DROP CONSTRAINT test_refuse_firing")
+        .await
+        .expect("drop constraint");
+
+    counter.0.store(5, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3 recovers");
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the recovery resolves the alarm the failed write left open"
+    );
+    let rule = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(rule.last_state, "ok");
+}
+
+/// A counter whose saved search is edited while it counts: the sample
+/// carries the fingerprint it counted, the search now has another.
+struct QueryEditedWhileCounting {
+    count: std::sync::atomic::AtomicU64,
+    counted: std::sync::atomic::AtomicU64,
+    current: std::sync::atomic::AtomicU64,
+}
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for QueryEditedWhileCounting {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: self.count.load(std::sync::atomic::Ordering::Relaxed),
+            saturated: false,
+            query_fingerprint: self.counted.load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(self.current.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A count taken under the old query must not fire once the query has
+/// changed; the new query has to hold for `for_duration` itself.
+#[tokio::test]
+async fn test_a_query_edited_while_counting_does_not_fire_the_old_count() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(QueryEditedWhileCounting {
+        count: std::sync::atomic::AtomicU64::new(42),
+        counted: std::sync::atomic::AtomicU64::new(1),
+        current: std::sync::atomic::AtomicU64::new(1),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    counter
+        .current
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 2, stale count");
+    assert!(
+        alarms_for(&ctx.db, ctx.project_id).await.is_empty(),
+        "the old query's count does not fire"
+    );
+
+    // Counting the new query restarts the breach.
+    counter
+        .counted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 3 arms anew");
+    assert!(alarms_for(&ctx.db, ctx.project_id).await.is_empty());
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 4 fires");
+    assert_eq!(alarms_for(&ctx.db, ctx.project_id).await.len(), 1);
+}
+
+/// A recovery counted under the old query must not resolve the alarm: the
+/// new query has not been counted yet.
+#[tokio::test]
+async fn test_a_query_edited_while_counting_does_not_resolve_on_the_old_count() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(QueryEditedWhileCounting {
+        count: std::sync::atomic::AtomicU64::new(42),
+        counted: std::sync::atomic::AtomicU64::new(1),
+        current: std::sync::atomic::AtomicU64::new(1),
+    });
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator.run_cycle().await.expect("cycle 1 arms");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 2 fires");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Firing.as_str()
+    );
+
+    counter.count.store(5, std::sync::atomic::Ordering::Relaxed);
+    counter
+        .current
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 3, stale recovery");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Firing.as_str(),
+        "the old query's recovery does not resolve"
+    );
+
+    counter
+        .counted
+        .store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 4 resolves");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await[0].status,
+        AlarmStatus::Resolved.as_str()
+    );
+}
+
+/// A log counter whose saved-search query fingerprint the test controls.
+struct FingerprintedLogCount(std::sync::atomic::AtomicU64);
+
+#[async_trait::async_trait]
+impl temps_core::log_series::LogSeriesSource for FingerprintedLogCount {
+    async fn count_matching(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+        _start: chrono::DateTime<Utc>,
+        _end: chrono::DateTime<Utc>,
+    ) -> Result<temps_core::log_series::LogSeriesSample, temps_core::log_series::LogSeriesError>
+    {
+        Ok(temps_core::log_series::LogSeriesSample {
+            count: 42,
+            saturated: false,
+            query_fingerprint: self.0.load(std::sync::atomic::Ordering::Relaxed),
+        })
+    }
+
+    async fn current_query_fingerprint(
+        &self,
+        _project_id: i32,
+        _saved_search_id: i32,
+    ) -> Result<u64, temps_core::log_series::LogSeriesError> {
+        Ok(self.0.load(std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// Editing the saved search's query restarts the rule's breach: the new
+/// predicate has to hold for `for_duration` itself before it fires.
+#[tokio::test]
+async fn test_editing_the_saved_search_query_restarts_the_breach() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    create_log_rule(&ctx, saved_search_id).await;
+    let counter = Arc::new(FingerprintedLogCount(std::sync::atomic::AtomicU64::new(1)));
+    ctx.evaluator.set_log_series(counter.clone());
+
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 1 arms the breach");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    counter.0.store(2, std::sync::atomic::Ordering::Relaxed);
+    ctx.evaluator.run_cycle().await.expect("cycle 2");
+    assert!(
+        alarms_for(&ctx.db, ctx.project_id).await.is_empty(),
+        "the old query's breach does not count for the new one"
+    );
+
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator.run_cycle().await.expect("cycle 3");
+    assert_eq!(
+        alarms_for(&ctx.db, ctx.project_id).await.len(),
+        1,
+        "the new query fires once it has held for for_duration"
+    );
+}
+
+/// Switches its rule to a saved search, as the update handler does
+/// (update, then resolve every alarm of the old series), the moment the
+/// evaluator fires the rule's first alarm.
+#[derive(Default)]
+struct SwitchOnFire {
+    target: std::sync::OnceLock<SwitchTarget>,
+    done: std::sync::atomic::AtomicBool,
+}
+
+struct SwitchTarget {
+    service: Arc<MetricAlertService>,
+    evaluator: Arc<MetricAlertEvaluator>,
+    project_id: i32,
+    rule_id: i32,
+    saved_search_id: i32,
+}
+
+#[async_trait::async_trait]
+impl temps_core::JobQueue for SwitchOnFire {
+    async fn send(&self, job: temps_core::jobs::Job) -> Result<(), temps_core::jobs::QueueError> {
+        if !matches!(job, temps_core::jobs::Job::AlarmFired(_)) {
+            return Ok(());
+        }
+        let Some(SwitchTarget {
+            service,
+            evaluator,
+            project_id,
+            rule_id,
+            saved_search_id,
+        }) = self.target.get()
+        else {
+            return Ok(());
+        };
+        if self.done.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Ok(());
+        }
+        service
+            .update(
+                *project_id,
+                *rule_id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(vec![]),
+                Some(vec![]),
+                Some(false),
+                None,
+                None,
+                Some(AlertSeriesSource::Logs {
+                    saved_search_id: *saved_search_id,
+                }),
+            )
+            .await
+            .expect("switch the rule to logs mid-tick");
+        evaluator.resolve_all_for_rule(*rule_id, *project_id).await;
+        Ok(())
+    }
+    fn subscribe(&self) -> Box<dyn temps_core::jobs::JobReceiver> {
+        Box::new(NoOpJobReceiver)
+    }
+}
+
+/// A per-series tick that read the rule before it was switched to logs must
+/// not leave its alarms open or overwrite the state the switch reset:
+/// nothing would ever evaluate those series again.
+#[tokio::test]
+async fn test_a_per_series_tick_does_not_survive_a_switch_to_logs() {
+    let queue = Arc::new(SwitchOnFire::default());
+    let Some(ctx) = setup_evaluator_with(queue.clone()).await else {
+        return;
+    };
+    let metric = "http.request.latency";
+    ctx.storage
+        .store_metrics(vec![method_gauge(ctx.project_id, metric, "GET", 100.0)])
+        .await
+        .expect("seed metrics");
+    let rule = ctx
+        .alert_service
+        .create(
+            ctx.project_id,
+            "Per-series latency".to_string(),
+            metric.to_string(),
+            "avg".to_string(),
+            static_gt(50.0),
+            120,
+            1,
+            "warning".to_string(),
+            true,
+            vec![],
+            vec!["method".to_string()],
+            true,
+            20,
+            5,
+            AlertSeriesSource::Metric,
+        )
+        .await
+        .expect("create dynamic rule");
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let _ = queue.target.set(SwitchTarget {
+        service: ctx.alert_service.clone(),
+        evaluator: ctx.evaluator.clone(),
+        project_id: ctx.project_id,
+        rule_id: rule.id,
+        saved_search_id,
+    });
+
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 1 arms the breach");
+    tokio::time::sleep(BREACH_PERSIST_WAIT).await;
+    ctx.evaluator
+        .run_cycle()
+        .await
+        .expect("cycle 2 fires, then sees the switch");
+
+    let alarms = alarms_for(&ctx.db, ctx.project_id).await;
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert_eq!(
+        alarms[0].status,
+        AlarmStatus::Resolved.as_str(),
+        "the old series' alarm does not stay open"
+    );
+    let after = ctx
+        .alert_service
+        .get(ctx.project_id, rule.id)
+        .await
+        .expect("rule");
+    assert_eq!(after.source, "logs");
+    assert_eq!(after.last_state, "ok", "the reset state is kept");
+    assert_eq!(
+        after.series_states,
+        serde_json::json!({}),
+        "{:?}",
+        after.series_states
+    );
+    assert!(ctx.evaluator.firing_series_for(rule.id).await.is_empty());
+}
+
+/// The revision moves with edits that change a verdict and with nothing
+/// else, so renaming a rule or the evaluator's own state writes never make
+/// an in-flight tick look stale.
+#[tokio::test]
+async fn test_only_verdict_changing_edits_bump_the_revision() {
+    let Some(ctx) = setup_evaluator().await else {
+        return;
+    };
+    let saved_search_id = seed_saved_search(&ctx.db, ctx.project_id, "Payment failures").await;
+    let rule_id = create_log_rule(&ctx, saved_search_id).await;
+    let update = |name: Option<String>, detector: Option<DetectionConfig>| {
+        ctx.alert_service.update(
+            ctx.project_id,
+            rule_id,
+            name,
+            None,
+            None,
+            detector,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    };
+
+    let renamed = update(Some("Checkout failures".to_string()), None)
+        .await
+        .expect("rename")
+        .model;
+    assert_eq!(renamed.config_revision, 0, "a rename changes no verdict");
+    assert!(ctx
+        .alert_service
+        .persist_evaluation_if_current(&renamed, "ok", Some(3.0), Utc::now())
+        .await
+        .expect("state write"));
+    let evaluated = ctx
+        .alert_service
+        .get(ctx.project_id, rule_id)
+        .await
+        .expect("rule");
+    assert_eq!(evaluated.config_revision, 0, "a state write is not an edit");
+
+    let raised = update(None, Some(static_gt(100.0)))
+        .await
+        .expect("raise threshold")
+        .model;
+    assert_eq!(raised.config_revision, 1);
+    assert!(
+        !ctx.alert_service
+            .persist_evaluation_if_current(&evaluated, "firing", Some(42.0), Utc::now())
+            .await
+            .expect("stale write"),
+        "a verdict read before the edit is refused"
     );
 }

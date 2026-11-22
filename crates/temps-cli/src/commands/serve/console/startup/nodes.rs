@@ -91,10 +91,10 @@ pub(super) fn start_node_control(
                                 "Node health check: failed to read failover settings, using default: {}",
                                 e
                             );
-                            temps_core::MultiNodeSettings::default().node_failover_after_secs
+                            temps_config::MultiNodeSettings::default().node_failover_after_secs
                         }
                     },
-                    None => temps_core::MultiNodeSettings::default().node_failover_after_secs,
+                    None => temps_config::MultiNodeSettings::default().node_failover_after_secs,
                 };
                 let offline_ids =
                     check_node_health(&health_node_service, health_db.as_ref(), watching_since)

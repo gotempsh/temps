@@ -35,6 +35,7 @@ import { Button, buttonVariants } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { problemDetail } from '@/lib/api-problem'
+import { suffixedHost } from '@/lib/tunnel-host-suffix'
 import { cn } from '@/lib/utils'
 
 function HostState({ host }: { host: EnvironmentHostView }) {
@@ -109,9 +110,7 @@ export function TunnelEnvironmentHostsView({
               ? `Tunnel ${data.enabled_elsewhere} already does this. Only one tunnel can.`
               : data.preview_domain_usable && data.enabled
                 ? 'The preview domain is usable, so new environments get no tunnel address; existing ones keep theirs.'
-                : 'Apps become reachable without a wildcard domain: each environment is published as <environment>.' +
-                  data.domain +
-                  '.'}
+                : `Apps become reachable without a wildcard domain: each environment is published as ${suffixedHost('<environment>', data.host_suffix, data.domain)}.`}
           </p>
         </div>
         <Button
@@ -121,7 +120,9 @@ export function TunnelEnvironmentHostsView({
           disabled={pending || blocked}
           onClick={() => setAsking(!data.enabled)}
         >
-          {data.enabled ? 'Stop publishing environments' : 'Publish environments'}
+          {data.enabled
+            ? 'Stop publishing environments'
+            : 'Publish environments'}
         </Button>
       </div>
       {data.enabled && <HostList hosts={data.hosts} />}

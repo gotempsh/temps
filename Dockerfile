@@ -148,7 +148,9 @@ COPY crates/temps-cli/GeoLite2-ASN.mmdb /GeoLite2-ASN.mmdb
 FROM ${TEMPS_ARTIFACTS} AS artifacts
 
 # Stage 3: Runtime
-FROM alpine:3.22
+# Alpine 3.23 is the first release with PostgreSQL 18 client packages; see the
+# postgresql18-client note below.
+FROM alpine:3.23
 
 # `apk add` only installs the packages listed below -- it does not touch
 # packages already present in the base image (busybox, musl, ssl_client),
@@ -162,13 +164,21 @@ RUN apk update && apk upgrade --no-cache
 # git is how plugin installs fetch their source from GitHub. libstdc++ and
 # libgcc are what a Bun-compiled musl plugin binary links against; without
 # them an installed plugin dies at load.
+# postgresql18-client: without a local Docker daemon the control-plane backup
+# runs this image's own pg_dump and pg_dumpall, and refuses when they are
+# older than the database's major version (ADR-100). Name the major
+# explicitly (the unversioned postgresql-client is 17 on Alpine 3.22) and fail
+# the build if the tools report another one.
+ARG PG_CLIENT_MAJOR=18
 RUN apk add --no-cache \
     ca-certificates \
     git \
     libgcc \
     libssl3 \
     libstdc++ \
-    postgresql-client
+    "postgresql${PG_CLIENT_MAJOR}-client" && \
+    pg_dump --version | grep -Eq "^pg_dump \(PostgreSQL\) ${PG_CLIENT_MAJOR}\." && \
+    pg_dumpall --version | grep -Eq "^pg_dumpall \(PostgreSQL\) ${PG_CLIENT_MAJOR}\."
 
 # Create app user
 RUN addgroup -g 1001 -S appgroup && \

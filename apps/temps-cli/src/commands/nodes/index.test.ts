@@ -8,6 +8,7 @@ import {
   describeConnection,
   describePairing,
   hubTargetFor,
+  indentCommand,
   joinCommand,
   linksNeedingAttention,
   meshDoctorFindings,
@@ -133,6 +134,20 @@ function makeMesh(overrides: Partial<WireguardMeshStatusResponse> = {}): Wiregua
     ...overrides,
   }
 }
+
+describe('indentCommand', () => {
+  test('indents every line of a multi-line server command and keeps its leading space', () => {
+    const command =
+      " (set -o pipefail; curl -fsSL https://temps.sh/install.sh | sudo -H bash -s -- v1.2.3) && \\\n" +
+      "printf '%s\\n' 'tpair1.x' | sudo -H /root/.temps/bin/temps join --pair - && \\\n" +
+      'sudo -H /root/.temps/bin/temps agent service install'
+    const lines = indentCommand(command, '    ').split('\n')
+    expect(lines).toHaveLength(3)
+    expect(lines[0]).toStartWith('     (set -o pipefail;')
+    expect(lines[1]).toStartWith("    printf '%s")
+    expect(lines[2]).toBe('    sudo -H /root/.temps/bin/temps agent service install')
+  })
+})
 
 describe('joinCommand', () => {
   test('points a node at the configured external URL', () => {

@@ -24,6 +24,7 @@ import {
   updateGitSettingsMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { BuildConfigurationCard } from './BuildConfigurationCard'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
 import { DockerfileRuntimeSettings } from './DockerfileRuntimeSettings'
@@ -95,18 +96,17 @@ import {
 import { composeValidationWarning } from '@/lib/compose-check'
 import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
+import { useRefreshPublicPresets } from '@/hooks/useRefreshPublicPresets'
+import { withoutLegacySandboxGrants } from '@/lib/build-configuration-form'
 import {
+  detectedPresetsFromPublic,
   normalizePresetPath,
   presetConfigForSelection,
   presetSelectionKey,
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
-import { problemDetail } from '@/lib/api-problem'
-import {
-  isRepositoryRootDirectory,
-  rootDirectoryHelp,
-} from '@/lib/project-directory'
+import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -125,7 +125,6 @@ import {
   Database,
   EyeOff,
   FileIcon,
-  FolderIcon,
   GitBranchIcon,
   Info,
   Loader2,
@@ -139,7 +138,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { useTheme } from 'next-themes'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
-import FrameworkIcon from '../FrameworkIcon'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { FrameworkSelector } from '../FrameworkSelector'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -310,17 +308,19 @@ function GitSettingsInline({
     enabled: !!repositoryData?.id,
   })
   // Preset detection — public repos
+  const publicPresetRequest = {
+    path: {
+      provider: publicProvider,
+      owner: project?.repo_owner || '',
+      repo: project?.repo_name || '',
+    },
+    query: { base_url: publicRepository?.instanceUrl },
+  }
   const publicPresetQuery = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: publicProvider,
-        owner: project?.repo_owner || '',
-        repo: project?.repo_name || '',
-      },
-      query: { base_url: publicRepository?.instanceUrl },
-    }),
+    ...detectPublicPresetsOptions(publicPresetRequest),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
+  const refreshPublicPresets = useRefreshPublicPresets(publicPresetRequest)
   const publicRepositoryQuery = useQuery({
     ...getPublicRepositoryOptions({
       path: {
@@ -339,22 +339,16 @@ function GitSettingsInline({
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const effectivePresetData = presetQuery.data || publicPresetData
-  const effectivePresetLoading =
-    presetQuery.isLoading ||
-    publicPresetQuery.isLoading ||
-    publicPresetQuery.isFetching
+  const isDetectingPresets =
+    presetQuery.isLoading || publicPresetQuery.isLoading
+  const isRefreshingPresets =
+    presetQuery.isFetching ||
+    publicPresetQuery.isFetching ||
+    refreshPublicPresets.isPending
 
   // ---------------- Save helpers ----------------
   // The API expects a full update; build it from current project state plus overrides.
@@ -378,11 +372,11 @@ function GitSettingsInline({
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
-    if (selectedPreset === 'docker-compose' && selectedPresetConfig) {
-      selectedPresetConfig = {
-        ...selectedPresetConfig,
-        unsandboxedServices: [],
-      }
+    if (selectedPresetConfig) {
+      selectedPresetConfig = withoutLegacySandboxGrants(
+        selectedPreset,
+        selectedPresetConfig
+      )
     }
     if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
@@ -431,15 +425,7 @@ function GitSettingsInline({
   }
 
   // ---------------- Inline editors ----------------
-  const [editing, setEditing] = useState<
-    | null
-    | 'branch'
-    | 'framework'
-    | 'directory'
-    | 'dockerfile'
-    | 'buildContext'
-    | 'composePath'
-  >(null)
+  const [editing, setEditing] = useState<null | 'branch'>(null)
   const close = () => setEditing(null)
 
   // Tracks the branch-refresh button separately from `isLoadingBranches`
@@ -463,49 +449,6 @@ function GitSettingsInline({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setBranchDraft(project.main_branch || '')
   }, [project.main_branch])
-
-  // Directory editor
-  const [directoryDraft, setDirectoryDraft] = useState('')
-  // The server refuses a root directory the repository does not have on the
-  // configured branch, naming what is there instead; keep that next to the
-  // field rather than only in a toast that disappears.
-  const [directoryError, setDirectoryError] = useState<string | null>(null)
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setDirectoryDraft(project.directory || './')
-  }, [project.directory])
-
-  // Dockerfile path editor
-  const [dockerfileDraft, setDockerfileDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setDockerfileDraft(
-      (project?.preset_config as any)?.dockerfilePath || 'Dockerfile'
-    )
-  }, [project?.preset_config])
-
-  // Dockerfile build context editor (overrides the root directory as the
-  // `docker build` context -- only needed when it must differ from where
-  // the Dockerfile itself is discovered, e.g. a monorepo build that needs
-  // sibling package sources outside the Dockerfile's own directory)
-  const [buildContextDraft, setBuildContextDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setBuildContextDraft((project?.preset_config as any)?.buildContext || '')
-  }, [project?.preset_config])
-
-  // Compose path editor
-  const [composePathDraft, setComposePathDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setComposePathDraft(
-      (project?.preset_config as any)?.composePath || 'docker-compose.yml'
-    )
-  }, [project?.preset_config])
 
   const presetName = (project.preset || '').toString()
   const isDockerfilePreset = presetName === 'dockerfile'
@@ -882,26 +825,13 @@ function GitSettingsInline({
         </Card>
       )}
 
-      {/* ----------------- Build configuration card ----------------- */}
-      {(sections.showBuildConfiguration || sections.showGitAutomation) && (
-        <Card
-          id={
-            sections.showGitAutomation
-              ? 'setting-production-branch'
-              : 'setting-build-configuration'
-          }
-          className="scroll-mt-4"
-        >
+      {/* ----------------- Production branch card ----------------- */}
+      {sections.showGitAutomation && (
+        <Card id="setting-production-branch" className="scroll-mt-4">
           <CardHeader>
-            <CardTitle className="text-base">
-              {sections.showGitAutomation
-                ? 'Production branch'
-                : 'Build configuration'}
-            </CardTitle>
+            <CardTitle className="text-base">Production branch</CardTitle>
             <CardDescription>
-              {sections.showGitAutomation
-                ? 'The branch production deploys from, and whether a push deploys it.'
-                : 'Framework, source directory, and runtime-specific build settings.'}
+              The branch production deploys from, and whether a push deploys it.
             </CardDescription>
           </CardHeader>
           <CardContent className="p-0">
@@ -1097,353 +1027,30 @@ function GitSettingsInline({
                   onInstall={handleReinstallGithubWebhook}
                 />
               )}
-
-              {sections.showBuildConfiguration && (
-                <>
-                  {/* Framework row */}
-                  <InlineRow
-                    id="setting-framework"
-                    label="Framework"
-                    editing={editing === 'framework'}
-                    onStartEdit={() => setEditing('framework')}
-                    onCancel={close}
-                    hideSaveButtons
-                    display={
-                      <div className="flex items-center gap-2 min-w-0">
-                        <FrameworkIcon
-                          preset={project.preset as any}
-                          className="size-5 shrink-0"
-                        />
-                        <span className="text-sm truncate">
-                          {project.preset}
-                        </span>
-                      </div>
-                    }
-                    editor={
-                      <div className="flex-1">
-                        <FrameworkSelector
-                          presetData={effectivePresetData as any}
-                          isLoading={effectivePresetLoading}
-                          error={presetQuery.error}
-                          selectedPreset={(() => {
-                            const dir = project.directory || './'
-                            const norm =
-                              dir === '.' || dir === './'
-                                ? 'root'
-                                : dir.startsWith('./')
-                                  ? dir.slice(2)
-                                  : dir
-                            return `${project.preset}::${norm}`
-                          })()}
-                          onSelectPreset={async (value) => {
-                            const { preset: slug, directory: dir } =
-                              splitPresetSelection(value)
-                            await saveGitField({ preset: slug, directory: dir })
-                            toast.success('Framework updated')
-                            close()
-                          }}
-                        />
-                      </div>
-                    }
-                  />
-
-                  {/* Directory row */}
-                  <InlineRow
-                    id="setting-root-directory"
-                    label="Root directory"
-                    editing={editing === 'directory'}
-                    onStartEdit={() => {
-                      setDirectoryDraft(project.directory || './')
-                      setDirectoryError(null)
-                      setEditing('directory')
-                    }}
-                    onCancel={() => {
-                      setDirectoryError(null)
-                      close()
-                    }}
-                    onSave={async () => {
-                      const next = directoryDraft || './'
-                      if (next === project.directory) {
-                        close()
-                        return
-                      }
-                      try {
-                        await saveGitField({ directory: next })
-                      } catch (error) {
-                        setDirectoryError(
-                          problemDetail(
-                            error,
-                            'The root directory could not be saved.'
-                          )
-                        )
-                        return
-                      }
-                      setDirectoryError(null)
-                      toast.success('Root directory updated')
-                      close()
-                    }}
-                    isPending={updateGitSettings.isPending}
-                    display={
-                      <div className="flex items-center gap-2 min-w-0">
-                        <FolderIcon className="size-4 text-muted-foreground shrink-0" />
-                        <span className="font-mono text-sm truncate">
-                          {project.directory || './'}
-                        </span>
-                      </div>
-                    }
-                    editor={
-                      <div className="flex-1 min-w-0 space-y-1">
-                        <Input
-                          value={directoryDraft}
-                          onChange={(e) => {
-                            setDirectoryDraft(e.target.value)
-                            setDirectoryError(null)
-                          }}
-                          placeholder="./"
-                          className="font-mono text-sm"
-                          aria-invalid={directoryError ? true : undefined}
-                          aria-describedby="root-directory-help"
-                          autoFocus
-                        />
-                        <p
-                          id="root-directory-help"
-                          role={directoryError ? 'alert' : undefined}
-                          className={cn(
-                            'text-xs',
-                            directoryError
-                              ? 'text-destructive'
-                              : 'text-muted-foreground'
-                          )}
-                        >
-                          {rootDirectoryHelp(
-                            directoryError,
-                            isLocalSource,
-                            project.main_branch
-                          )}
-                        </p>
-                      </div>
-                    }
-                  />
-                  <li
-                    className={cn(
-                      'px-6 py-4',
-                      isRepositoryRootDirectory(
-                        editing === 'directory'
-                          ? directoryDraft
-                          : project.directory
-                      ) && 'hidden'
-                    )}
-                  >
-                    <div className="flex items-start gap-4">
-                      <div className="w-32 shrink-0" aria-hidden="true" />
-                      <div className="flex min-w-0 items-start gap-2">
-                        <Checkbox
-                          id="pull-only-root-directory"
-                          checked={!!project.pull_only_root_directory}
-                          disabled={updateGitSettings.isPending}
-                          onCheckedChange={async (checked) => {
-                            await saveGitField({
-                              pull_only_root_directory: checked === true,
-                              ...(editing === 'directory'
-                                ? { directory: directoryDraft || './' }
-                                : {}),
-                            })
-                            if (editing === 'directory') {
-                              close()
-                            }
-                            toast.success(
-                              checked === true
-                                ? 'Deploy will pull only the root directory'
-                                : 'Deploy will pull the full repository'
-                            )
-                          }}
-                        />
-                        <div className="space-y-1">
-                          <label
-                            htmlFor="pull-only-root-directory"
-                            className="text-sm leading-none cursor-pointer"
-                          >
-                            Pull only the root directory
-                          </label>
-                          <p className="text-xs text-muted-foreground">
-                            Clone only this subdirectory instead of the whole
-                            repository.
-                          </p>
-                        </div>
-                      </div>
-                    </div>
-                  </li>
-
-                  {/* Dockerfile path — only when dockerfile preset */}
-                  {isDockerfilePreset && (
-                    <InlineRow
-                      id="setting-dockerfile-path"
-                      label="Dockerfile path"
-                      editing={editing === 'dockerfile'}
-                      onStartEdit={() => {
-                        setDockerfileDraft(
-                          (project?.preset_config as any)?.dockerfilePath ||
-                            'Dockerfile'
-                        )
-                        setEditing('dockerfile')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = dockerfileDraft || 'Dockerfile'
-                        if (next === (cfg.dockerfilePath || 'Dockerfile')) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'dockerfile',
-                            dockerfilePath: next,
-                          },
-                        })
-                        toast.success('Dockerfile path updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.dockerfilePath ||
-                              'Dockerfile'}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={dockerfileDraft}
-                          onChange={(e) => setDockerfileDraft(e.target.value)}
-                          placeholder="Dockerfile"
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-
-                  {/* Build context — only when dockerfile preset. Overrides the
-                docker build context (defaults to root directory above) for
-                monorepos where the Dockerfile needs sibling package sources
-                outside its own directory. */}
-                  {isDockerfilePreset && (
-                    <InlineRow
-                      id="setting-build-context"
-                      label="Build context"
-                      editing={editing === 'buildContext'}
-                      onStartEdit={() => {
-                        setBuildContextDraft(
-                          (project?.preset_config as any)?.buildContext || ''
-                        )
-                        setEditing('buildContext')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = buildContextDraft.trim()
-                        if (next === (cfg.buildContext || '')) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'dockerfile',
-                            buildContext: next || undefined,
-                          },
-                        })
-                        toast.success('Build context updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FolderIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.buildContext || (
-                              <span className="text-muted-foreground italic">
-                                same as root directory
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={buildContextDraft}
-                          onChange={(e) => setBuildContextDraft(e.target.value)}
-                          placeholder={project.directory || './'}
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-
-                  {/* Compose path — only when compose preset */}
-                  {isComposePreset && (
-                    <InlineRow
-                      id="setting-compose-file"
-                      label="Compose file"
-                      editing={editing === 'composePath'}
-                      onStartEdit={() => {
-                        setComposePathDraft(
-                          (project?.preset_config as any)?.composePath ||
-                            'docker-compose.yml'
-                        )
-                        setEditing('composePath')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = composePathDraft || 'docker-compose.yml'
-                        if (
-                          next === (cfg.composePath || 'docker-compose.yml')
-                        ) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'docker-compose',
-                            composePath: next,
-                          },
-                        })
-                        toast.success('Compose path updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.composePath ||
-                              'docker-compose.yml'}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={composePathDraft}
-                          onChange={(e) => setComposePathDraft(e.target.value)}
-                          placeholder="docker-compose.yml"
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-                </>
-              )}
             </ul>
           </CardContent>
         </Card>
+      )}
+
+      {sections.showBuildConfiguration && (
+        <BuildConfigurationCard
+          project={project}
+          saving={
+            updateGitSettings.isPending || updateProjectSettings.isPending
+          }
+          onSave={saveGitField}
+          detectedPresets={effectivePresetData?.presets}
+          isDetecting={isDetectingPresets}
+          isRefreshingDetection={isRefreshingPresets}
+          detectionError={presetQuery.error ?? publicPresetQuery.error}
+          onRefreshDetection={
+            isUploadedSource
+              ? undefined
+              : isPublicRepo
+                ? () => refreshPublicPresets.mutate()
+                : () => void presetQuery.refetch()
+          }
+        />
       )}
 
       {sections.showBuildConfiguration && isDockerfilePreset && (
@@ -2914,15 +2521,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const detectedPresetData =

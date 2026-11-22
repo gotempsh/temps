@@ -27,7 +27,7 @@ use axum::middleware::{self, Next};
 use axum::response::Response;
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use temps_auth::permission_guard;
+use temps_authz::permission_guard;
 use temps_core::problemdetails::Problem;
 use temps_metrics::proxy::{ProxyMetrics, RequestDestination};
 use temps_metrics::worker_report::WORKER_METRICS_VERSION;

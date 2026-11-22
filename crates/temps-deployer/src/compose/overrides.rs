@@ -489,10 +489,7 @@ impl ComposeExecutor {
             let mut service_map = Mapping::new();
             service_map.insert(
                 Value::String("networks".to_string()),
-                Value::Sequence(vec![
-                    Value::String("default".to_string()),
-                    Value::String(network_name.to_string()),
-                ]),
+                Self::service_networks_override(&parsed, service, network_name),
             );
             services_map.insert(Value::String(service.clone()), Value::Mapping(service_map));
         }
@@ -508,6 +505,53 @@ impl ComposeExecutor {
         );
 
         yaml_serde::to_string(&Value::Mapping(root)).unwrap_or_default()
+    }
+
+    /// One service's `networks:` entry for the generated network override:
+    /// the project default network and the shared Temps network.
+    ///
+    /// When the compose model carries DNS aliases on the default network —
+    /// which is how [`ComposeExecutor::normalize_for_policy`] keeps a
+    /// `container_name` resolvable — they are repeated here. Compose merges a
+    /// per-service `networks:` across `-f` files, and this override is the
+    /// last file, so an entry that named `default` with no settings could
+    /// drop the aliases the model declares. Repeating them means the alias
+    /// survives whichever side of that merge wins. The shared Temps network
+    /// never carries an alias: it is reachable from every other project.
+    fn service_networks_override(parsed: &Value, service: &str, network_name: &str) -> Value {
+        let aliases: Vec<Value> = parsed
+            .get("services")
+            .and_then(|services| services.get(service))
+            .and_then(|service| service.get("networks"))
+            .and_then(|networks| networks.get("default"))
+            .and_then(|default| default.get("aliases"))
+            .and_then(Value::as_sequence)
+            .map(|aliases| {
+                aliases
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|alias| Value::String(alias.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if aliases.is_empty() {
+            return Value::Sequence(vec![
+                Value::String("default".to_string()),
+                Value::String(network_name.to_string()),
+            ]);
+        }
+        let mut default = Mapping::new();
+        default.insert(
+            Value::String("aliases".to_string()),
+            Value::Sequence(aliases),
+        );
+        let mut networks = Mapping::new();
+        networks.insert(
+            Value::String("default".to_string()),
+            Value::Mapping(default),
+        );
+        networks.insert(Value::String(network_name.to_string()), Value::Null);
+        Value::Mapping(networks)
     }
 
     /// Minimal Linux capabilities official image entrypoints commonly need to
@@ -535,6 +579,7 @@ impl ComposeExecutor {
             .find(|service| relaxed_capability_services.contains(service))
         {
             return Err(ComposeError::SecurityPolicyViolation {
+                check: None,
                 service: service.clone(),
                 field: "sandbox".to_string(),
                 reason:

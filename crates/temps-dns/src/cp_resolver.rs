@@ -19,7 +19,8 @@ use std::time::Duration;
 
 use sea_orm::DatabaseConnection;
 use temps_entities::service_endpoints;
-use temps_node_dns::{DnsPolicySlot, ResolverConfig, ResolverHandle, ZoneRecord};
+use temps_node_dns::observe::DnsObserver;
+use temps_node_dns::{DnsPolicySlot, ResolverConfig, ResolverHandle, ResolverView, ZoneRecord};
 use tracing::{info, warn};
 
 use crate::services::DnsRegistry;
@@ -50,6 +51,20 @@ impl Drop for ControlPlaneResolver {
 impl ControlPlaneResolver {
     pub fn gateway(&self) -> IpAddr {
         self.gateway
+    }
+
+    /// The running resolver, for its DNS report (ADR-095).
+    pub fn view(&self) -> Option<ResolverView> {
+        self.handle.as_ref().map(ResolverHandle::view)
+    }
+
+    /// Whether the resolver's tasks and the zone feeder are alive.
+    pub fn tasks_alive(&self) -> bool {
+        !self.feeder.is_finished()
+            && self
+                .handle
+                .as_ref()
+                .is_some_and(|handle| handle.status().tasks_alive)
     }
 
     pub async fn shutdown(mut self) {
@@ -90,18 +105,21 @@ fn to_zone_record(m: service_endpoints::Model) -> ZoneRecord {
 ///
 /// `policy` is node 0's network policy view, kept current by its enforcer;
 /// with it, restricted workloads only resolve the names their rules allow.
+/// `observer` counts and logs what the resolver answers (ADR-095); pass the
+/// same one to every restart.
 pub async fn start_control_plane_resolver(
     db: Arc<DatabaseConnection>,
     bridge_gateway: IpAddr,
     snapshot_dir: PathBuf,
     policy: Option<DnsPolicySlot>,
+    observer: Option<Arc<DnsObserver>>,
 ) -> Option<ControlPlaneResolver> {
     // node_id 0 is conventional for the control plane; the DB-direct feeder
     // ignores it (it serves the full zone, not a per-node slice). `new_local_feed`
     // binds ONLY the bridge gateway (not 127.0.0.53, which systemd-resolved owns)
     // and disables the HTTP sync loop.
     let config = ResolverConfig::new_local_feed(0, bridge_gateway, snapshot_dir);
-    start_resolver(db, config, policy).await
+    start_resolver(db, config, policy, observer).await
 }
 
 /// Configurable entrypoint used by integration tests and alternate proxy
@@ -111,17 +129,18 @@ pub async fn start_control_plane_resolver_with_config(
     db: Arc<DatabaseConnection>,
     config: ResolverConfig,
 ) -> Option<ControlPlaneResolver> {
-    start_resolver(db, config, None).await
+    start_resolver(db, config, None, None).await
 }
 
 async fn start_resolver(
     db: Arc<DatabaseConnection>,
     config: ResolverConfig,
     policy: Option<DnsPolicySlot>,
+    observer: Option<Arc<DnsObserver>>,
 ) -> Option<ControlPlaneResolver> {
     let listen_address = *config.listen_addrs.first()?;
     let bridge_gateway = listen_address.ip();
-    let handle = match ResolverHandle::start_with_policy(config, policy).await {
+    let handle = match ResolverHandle::start_observed(config, policy, observer).await {
         Ok(h) => h,
         Err(e) => {
             warn!(
@@ -238,7 +257,8 @@ mod tests {
         config.upstream_resolvers.clear();
 
         let slot = temps_node_dns::open_dns_policy_slot();
-        let resolver = start_resolver(db, config, Some(slot.clone()))
+        let observer = DnsObserver::spawn();
+        let resolver = start_resolver(db, config, Some(slot.clone()), Some(observer.clone()))
             .await
             .expect("resolver starts");
         // The mock database has no rows, so the feeder never replaces this.
@@ -269,6 +289,21 @@ mod tests {
 
         let open = client.lookup_ip("api.production.temps.local.").await;
         assert!(open.is_ok(), "an open source resolves the name: {open:?}");
+        // The observer it was given counts the answer as an internal name
+        // (ADR-095), just after the response is sent.
+        let mut counted = observer.snapshot(None, None).counters;
+        for _ in 0..50 {
+            if counted.internal.noerror >= 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            counted = observer.snapshot(None, None).counters;
+        }
+        assert!(
+            counted.internal.noerror >= 1,
+            "the A answer is counted: {counted:?}"
+        );
+        assert_eq!(counted.external.total(), 0, "nothing was forwarded");
 
         // The client asks from 127.0.0.1: make that a restricted workload
         // with no rules, so it may resolve nothing.
