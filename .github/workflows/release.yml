@@ -340,7 +340,9 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
         with:
-          node-version: '24'
+          # Exact, not '24': a cached older Node 24 on the runner can bundle an
+          # npm without `npm stage` (11.16.0+). 24.22.3 bundles npm 11.19.1.
+          node-version: '24.22.3'
           package-manager-cache: false
       - name: Check immutable package tags before any uploads
         run: python3 scripts/sdk_release.py check-tags --tag "$RELEASE_TAG"
@@ -350,7 +352,10 @@ jobs:
           for kind in npm pypi crate; do
             python3 scripts/sdk_release.py check --tag "$RELEASE_TAG" --kind "$kind"
           done
-      - name: Publish npm artifacts with trusted publishing
+      # Staged, never published directly: each version becomes installable
+      # only when a maintainer approves it with 2FA on npm. Approve them, then
+      # rerun this job to verify them and create the package tags.
+      - name: Stage npm artifacts for maintainer approval (trusted publishing)
         if: contains(fromJSON(needs.validate-release-ref.outputs.sdk_kinds), 'npm')
         run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind npm
       - name: Check whether Python uploads remain
@@ -379,7 +384,7 @@ jobs:
         env:
           CARGO_REGISTRIES_CRATES_IO_TOKEN: ${{ steps.crates-auth.outputs.token }}
         run: python3 scripts/sdk_release.py publish --tag "$RELEASE_TAG" --kind crate
-      - name: Create immutable package tags after registry verification
+      - name: Create immutable package tags once every registry shows the release
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/sdk_release.py publish-tags --tag "$RELEASE_TAG"

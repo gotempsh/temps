@@ -1153,7 +1153,9 @@ state before the release.
 `release.yml` plans in its existing validation job and tests/packages in its
 existing web-assets job. A single isolated `publish-sdks` job waits for the test
 gate and GitHub Release, uploads to npm/PyPI/crates.io, verifies registry hashes,
-and creates immutable package tags. Go uses the required subdirectory tag
+and creates immutable package tags. npm versions are **staged**, not published
+(see [Approving staged npm versions](#approving-staged-npm-versions)), so the
+tags wait for a maintainer's approval and a rerun. Go uses the required subdirectory tag
 `sdks/go/workflows/v<version>`; other packages use `sdk/<catalog-key>/v<version>`.
 The tags point to the tested release commit and are never moved. They are output,
 not workflow triggers. This works for the existing tag-targeted dispatch path
@@ -1165,6 +1167,42 @@ and retry rules. Rust packaging batches selected crates so unpublished sibling
 dependencies can be verified together. No registry credentials are given to
 these build/check jobs. The only extra release runner isolates publication
 permissions (`id-token: write`, package-tag `contents: write`) from builds.
+
+### Approving staged npm versions
+
+The npm trusted publishers allow only `npm stage publish`, so the workflow never
+makes an npm version installable by itself: a maintainer approves each one with
+2FA. A stolen workflow token can at most stage a version nobody approves. Staging
+needs npm 11.16.0 or later; the job pins a Node whose bundled npm has it and
+checks the version before any upload.
+
+On a tag that selects npm packages, `publish-sdks` stages each one with its
+channel's dist-tag (`beta` or `latest`), publishes PyPI and crates.io as before,
+then fails at **Create immutable package tags** with the list of npm versions
+still waiting. That failure is expected. Then:
+
+1. Approve the staged versions in the order the job lists them (dependencies
+   first, such as `analytics-core` before `react-analytics`), on npmjs.com or
+   from a terminal logged in to an account with publish rights:
+
+   ```sh
+   npm stage list @temps-sdk/analytics-core   # find the stage id
+   npm stage approve <stage-id>               # asks for 2FA
+   ```
+
+   `npm stage reject <stage-id>` discards a version that should not ship.
+2. Rerun the job. It finds the approved versions public with the tested bytes,
+   skips every upload and creates the package tags:
+
+   ```sh
+   RUN=$(gh run list --workflow release.yml --branch "$TAG" --limit 1 --json databaseId --jq '.[0].databaseId')
+   gh run rerun "$RUN" --failed
+   ```
+
+Rerunning before approving is harmless but fails again: npm refuses to stage a
+version that is already staged, and the job names it. One refusal does not stop
+the others from being staged. Approve or reject staged versions before the next
+release, since an unapproved version still holds its number.
 
 ### Dry runs and recovery
 
@@ -1193,8 +1231,8 @@ partial upload: artifacts carry the release SHA, plan and file hashes, and the
 publisher accepts only identical existing registry bytes. A partial PyPI upload
 sends only missing files. Auth failures, timeouts and registry errors never mean
 "version absent"; transient metadata reads retry with a bounded delay. Registry
-visibility is checked after upload, and a timeout fails the job for reconciliation
-on rerun. A conflicting/yanked version requires a new version and release commit.
+visibility is checked after upload (npm: after approval, when the job is rerun),
+and a timeout fails the job for reconciliation on rerun. A conflicting/yanked version requires a new version and release commit.
 An existing npm channel ahead of a new upload is rejected rather than downgraded.
 
 Publication is serialized across server releases. GitHub concurrency can replace
@@ -1278,7 +1316,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
    package, open **Settings → Trusted publishing** on npmjs.com (or **Settings →
    Trusted Publishing** on crates.io), choose GitHub Actions and enter owner
    `gotempsh`, repository `temps`, workflow `release.yml` and environment
-   `sdk-beta` (and a separate entry for `sdk-stable`). npmjs.com accepts several
+   `sdk-beta` (and a separate entry for `sdk-stable`). On npm, leave **Allow npm
+   publish** and **Allow npm dist-tag** unticked: `npm stage publish` is always
+   allowed, and the workflow uses only that. npmjs.com accepts several
    publishers per package, but `npm trust github` only manages one; with a
    single entry, leave the environment empty rather than picking one channel.
    An npm configuration expires unless it publishes within 2 days. Add a
@@ -1289,8 +1329,9 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
    crates.io allow trusted publishing only on a package that already exists, so
    each needs one token-based upload. Publish the release run's own tested
    artifacts, never a local build, so the registry bytes match what
-   `publish-sdks` verifies. On the first tag that selects them, `publish-sdks`
-   stops at the first package without a publisher. That failure is expected.
+   `publish-sdks` verifies. On the first tag that selects them, npm refuses to
+   stage each package without a publisher (the others are still staged) and
+   crates.io stops at the first crate without one. That failure is expected.
    Then:
 
    ```sh
@@ -1314,9 +1355,10 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
    ```
 
    Only packages in that tag's selection have artifacts, so publish each one with
-   the first tag that selects it. Then configure their trusted publishers (step 4)
-   and resume the release, which skips the byte-identical uploads and creates the
-   package tags:
+   the first tag that selects it. Then configure their trusted publishers (step 4),
+   approve the npm versions the run staged ([Approving staged npm
+   versions](#approving-staged-npm-versions)), and resume the release, which
+   skips the byte-identical uploads and creates the package tags:
 
    ```sh
    gh run rerun "$RUN" --failed
