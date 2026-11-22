@@ -215,7 +215,11 @@ describe('canRedeploySameSource', () => {
         { kind: 'docker_image' }
       )
     ).toBe(true)
-    expect(canRedeploySameSource(deployment(), { kind: 'git' })).toBe(true)
+    expect(
+      canRedeploySameSource(deployment({ commit_hash: 'abc1234' }), {
+        kind: 'git',
+      })
+    ).toBe(true)
     expect(
       canRedeploySameSource(deployment(), {
         kind: 'static_files',
@@ -224,7 +228,7 @@ describe('canRedeploySameSource', () => {
     ).toBe(true)
   })
 
-  test('an uploaded image archive, a missing bundle and unsupported sources cannot', () => {
+  test('an uploaded image archive, a missing bundle or commit and unsupported sources cannot', () => {
     expect(
       canRedeploySameSource(
         deployment({ metadata: { uploadedImageId: 'uploaded-image-9' } }),
@@ -234,6 +238,10 @@ describe('canRedeploySameSource', () => {
     expect(canRedeploySameSource(deployment(), { kind: 'static_files' })).toBe(
       false
     )
+    // Without a stored commit, a redeploy would build the branch head.
+    expect(
+      canRedeploySameSource(deployment({ branch: 'main' }), { kind: 'git' })
+    ).toBe(false)
     expect(
       canRedeploySameSource(deployment(), {
         kind: 'unsupported',

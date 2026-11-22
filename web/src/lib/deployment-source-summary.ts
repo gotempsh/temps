@@ -76,8 +76,10 @@ export function deploymentRedeployPlan(
 
 /**
  * Whether the deployment's own source can be redeployed as it is, with no
- * input: a Git revision, a registry image reference or a stored static
- * bundle. An image uploaded as an archive has no reference to pull again.
+ * input: a stored Git commit, a registry image reference or a stored static
+ * bundle. A Git deployment without a commit would build whatever the branch
+ * head is by then, and an image uploaded as an archive has no reference to
+ * pull again.
  */
 export function canRedeploySameSource(
   deployment: DeploymentResponse,
@@ -85,7 +87,7 @@ export function canRedeploySameSource(
 ): boolean {
   switch (plan.kind) {
     case 'git':
-      return true
+      return Boolean(deployment.commit_hash?.trim())
     case 'docker_image':
       return Boolean(deployment.metadata?.externalImageRef?.trim())
     case 'static_files':
