@@ -51,6 +51,9 @@ Configure an AI client to connect to this Temps instance over MCP. Clients: clau
 | `-k, --api-key <key>` | Use this API key instead of creating or prompting for one | - | No |
 | `-u, --url <url>` | Target this Temps instance directly (e.g. copied from the Settings UI), without needing a saved CLI context or changing the active one. Defaults to the current context/login when omitted. | - | No |
 | `-y, --yes` | Skip prompts and confirmation (uses defaults; requires --api-key or an existing login) | - | No |
+| `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
+| `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `mcp remove`
 

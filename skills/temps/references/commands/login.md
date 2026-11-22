@@ -17,3 +17,6 @@ Authenticate with a Temps server. Opens the browser for interactive logins; use 
 | `-k, --api-key <key>` | Use a pre-minted API key (Settings → API Keys) instead of opening the browser. Required for headless / CI. | - | No |
 | `--context <name>` | Save the credentials under this context name (defaults to URL host) | - | No |
 | `--debug` | Print every request/response (URL, status, headers, raw body) to stderr. Also enabled via TEMPS_DEBUG=1. | - | No |
+| `--api-key-file <path>` | Read the API key from a file (- reads stdin) instead of --api-key | - | No |
+| `--api-key-stdin` | Read the API key from stdin instead of --api-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |

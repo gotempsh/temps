@@ -74,15 +74,21 @@ bunx @temps-sdk/cli@latest --target-context staging environments list --project 
 bunx @temps-sdk/cli@latest --target-context staging environments vars list --project example --json
 ```
 
-Never put a secret value directly in an agent-generated command. If the CLI can
-prompt interactively, let the user enter it. Otherwise show a placeholder
-command for the user to run privately:
+Never put a secret value directly in an agent-generated command. Read it from
+a file or pipe it from the user's secret manager, so it never reaches shell
+history, `ps` or CI logs:
 
 ```bash
 bunx @temps-sdk/cli@latest --target-context staging environments vars set \
-  --project example \
-  --key DATABASE_URL
+  --project example DATABASE_URL --secret --value-file ./database-url.txt
+
+op read op://vault/db/url | bunx @temps-sdk/cli@latest --target-context staging \
+  environments vars set --project example DATABASE_URL --secret --value-stdin
 ```
+
+The value is sent byte-for-byte; add `--trim-trailing-newline` when the file
+ends with a newline the value should not have. If neither a file nor a pipe is
+available, omit the value and let the user type it at the prompt.
 
 Verify only the variable name and metadata. Never reveal or echo its value.
 

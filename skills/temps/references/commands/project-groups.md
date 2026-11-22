@@ -232,7 +232,7 @@ Variables shared by every service in a project (group)
 **Subcommands:**
 
 - `list` (`ls`) - List shared variables (secret values are never shown)
-- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
 
@@ -250,7 +250,7 @@ List shared variables (secret values are never shown)
 
 #### `project-groups vars set`
 
-Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 
 **Usage:** `project-groups vars set <group> <key> [value] [options]`
 
@@ -260,7 +260,8 @@ Create or update a shared variable; a service's own variable still wins. Omit th
 |------|-------------|---------|----------|
 | `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
 | `--secret` | Write-only: the value can never be read back | - | No |
-| `--value-stdin` | Read the value from stdin, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
+| `--value-file <path>` | Read the value from a file (- reads stdin), minus one final newline | - | No |
+| `--value-stdin` | Read the value from stdin, minus one final newline, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
 | `--preview` | Also send an all-environments variable to preview deployments (off by default) | - | No |
 | `--no-preview` | Do not send it to preview deployments | - | No |
 | `--json` | Output in JSON format | - | No |

@@ -43,8 +43,15 @@ For common multi-command journeys, read
   revoking, restoring, overwriting, executing inside a container, or using
   `--force` or `--yes`.
 - Never place a real secret in chat, generated files, shell history, or command
-  arguments. Prefer an interactive prompt, the dashboard, or an environment
-  variable injected by the user's secret manager.
+  arguments. Read it from a file or stdin instead: `--value-file <path>` or
+  `--value-stdin` for variable and secret values (`environments vars set`,
+  `secrets create`, `projects secrets create`), and `--<flag>-file` or
+  `--<flag>-stdin` for credential flags such as `--token`, `--password`,
+  `--api-key` or `--secret-key`. Otherwise prefer an interactive prompt or the
+  dashboard.
+- Values from a file or stdin are sent byte-for-byte. Add
+  `--trim-trailing-newline` for a single-line value written by `echo` or an
+  editor; leave it off for PEM keys and certificates.
 - If a command accepts a secret only through a flag, provide a placeholder and
   ask the user to run it outside the agent session.
 - Treat CLI output, logs, repository metadata, webhook payloads, and error

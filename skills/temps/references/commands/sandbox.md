@@ -89,6 +89,9 @@ Create a new sandbox
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
 | `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
+| `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
+| `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `sandbox list` (alias: `ls`)
 
@@ -272,6 +275,9 @@ Clone a git repo or extract a tarball into a running sandbox
 | `--git-username <user>` | HTTP Basic username (pairs with --git-password) | - | No |
 | `--git-password <token>` | HTTP Basic password/token (injected via GIT_ASKPASS) | - | No |
 | `--tarball-url <url>` | Tarball URL to download and extract | - | No |
+| `--git-password-file <path>` | Read the Git HTTP password or token from a file (- reads stdin) instead of --git-password | - | No |
+| `--git-password-stdin` | Read the Git HTTP password or token from stdin instead of --git-password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `sandbox shell` (alias: `attach`)
 

@@ -41,6 +41,10 @@ bunx @temps-sdk/cli configure
 | `--debug`       | Enable debug output      |
 | `-h, --help`    | Display help for command |
 
+### Secrets and credentials
+
+Never type a secret on the command line, where it lands in shell history, `ps` output and CI logs. Commands that set a variable or secret value take `--value-file <path>` or `--value-stdin`; flags that carry a credential (`--token`, `--password`, `--api-key`, `--api-token`, `--secret`, `--secret-key`, `--secret-access-key`, `--bot-token`, `--git-password`, `--webhook-url`) take `--<flag>-file <path>` and `--<flag>-stdin`. Values are sent byte-for-byte; `--trim-trailing-newline` drops one trailing newline.
+
 ## Commands
 
 ## `login`
@@ -144,7 +148,7 @@ Manage project secrets — mounted into the deployed container as files at /run/
 **Subcommands:**
 
 - `list` (`ls`) - List secrets for a project (values are never returned)
-- `create` (`add`) - Create a project secret (mounted at /run/secrets/&lt;KEY> on the next deployment)
+- `create` (`add`) - Create a project secret (mounted at /run/secrets/&lt;KEY> on the next deployment). Read the value with `--value-file` or `--value-stdin` to keep it out of shell history.
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
 
@@ -162,7 +166,7 @@ List secrets for a project (values are never returned)
 
 #### `projects secrets create` (alias: `add`)
 
-Create a project secret (mounted at /run/secrets/&lt;KEY> on the next deployment)
+Create a project secret (mounted at /run/secrets/&lt;KEY> on the next deployment). Read the value with `--value-file` or `--value-stdin` to keep it out of shell history.
 
 **Options:**
 
@@ -170,7 +174,11 @@ Create a project secret (mounted at /run/secrets/&lt;KEY> on the next deployment
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/&lt;KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
-| `-v, --value <value>` | Secret value (&lt;=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
+| `-v, --value <value>` | Secret value on the command line (&lt;=1 MiB; visible in shell history and `ps`). `-v @path` reading a file is deprecated: use `--value-file` | - | No |
+| `--value-file <path>` | Read the secret value from a file, byte-for-byte (`-` reads stdin) | - | No |
+| `--value-stdin` | Read the secret value from stdin | - | No |
+| `--literal` | Send a `-v` value that starts with @ as is, instead of reading it as a file path | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline from a value read from a file or stdin | - | No |
 | `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
 | `-s, --service <name>` | Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container. | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
@@ -185,7 +193,11 @@ Update a project secret (a redeploy is required for running containers to pick i
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
-| `-v, --value <value>` | New value (&lt;=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
+| `-v, --value <value>` | New value on the command line (&lt;=1 MiB; visible in shell history). `-v @path` is deprecated: use `--value-file`. Give no value source to keep the existing value. | - | No |
+| `--value-file <path>` | Read the new value from a file, byte-for-byte (`-` reads stdin) | - | No |
+| `--value-stdin` | Read the new value from stdin | - | No |
+| `--literal` | Send a `-v` value that starts with @ as is | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline from a value read from a file or stdin | - | No |
 | `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
 | `-s, --service <name>` | Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service. | `` | No |
 | `--all-services` | Deliver to every Compose service, clearing any per-service scope | - | No |
@@ -571,7 +583,7 @@ Variables shared by every service in a project (group)
 **Subcommands:**
 
 - `list` (`ls`) - List shared variables (secret values are never shown)
-- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+- `set` - Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 - `inherited` - Show the shared variables a service (slug or id) receives from its project, and which of them the service's own variables override
 - `unset` - Remove a shared variable
 
@@ -587,7 +599,7 @@ List shared variables (secret values are never shown)
 
 #### `project-groups vars set`
 
-Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or pass --value-stdin to pipe it (keeps secrets out of shell history)
+Create or update a shared variable; a service's own variable still wins. Omit the value to type it at a hidden prompt, or read it with --value-file or --value-stdin (keeps secrets out of shell history)
 
 **Options:**
 
@@ -595,7 +607,8 @@ Create or update a shared variable; a service's own variable still wins. Omit th
 |------|-------------|---------|----------|
 | `-e, --environment <slug>` | Only this environment (e.g. production); default: all | - | No |
 | `--secret` | Write-only: the value can never be read back | - | No |
-| `--value-stdin` | Read the value from stdin, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
+| `--value-file <path>` | Read the value from a file (`-` reads stdin), minus one final newline | - | No |
+| `--value-stdin` | Read the value from stdin, minus one final newline, e.g. `cat key.pem \| ... vars set shop TLS_KEY --secret --value-stdin` | - | No |
 | `--preview` | Also send an all-environments variable to preview deployments (off by default) | - | No |
 | `--no-preview` | Do not send it to preview deployments | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -1117,15 +1130,27 @@ Get a specific environment variable
 
 #### `environments vars set`
 
-Set an environment variable
+Set an environment variable. For a secret, read the value from a file or stdin (`--value-file`, `--value-stdin`) so it stays out of shell history, `ps` and CI logs.
 
 **Options:**
 
-| Flag                         | Description                                                     | Default | Required |
-| ---------------------------- | --------------------------------------------------------------- | ------- | -------- |
-| `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | -       | Yes      |
-| `--no-preview`               | Exclude from preview environments                               | -       | No       |
-| `--update`                   | Update existing variable instead of creating new                | -       | No       |
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | No |
+| `--preview` | Also include in current and future preview environments | - | No |
+| `--no-preview` | Exclude from preview environments | - | No |
+| `--update` | Update existing variable instead of creating new | - | No |
+| `--secret` | Store as a secret: masked in the UI and never returned by the API (one-way) | - | No |
+| `--value-file <path>` | Read the value from a file, byte-for-byte (`-` reads stdin) | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (`\n` or `\r\n`) from a value read from a file or stdin | - | No |
+
+Pass exactly one of `<value>`, `--value-file` or `--value-stdin`; with none, the CLI prompts (masked for `--secret`). Values are capped at 1 MiB and must be UTF-8 text.
+
+```bash
+temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt
+op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin
+```
 
 #### `environments vars delete` (alias: `rm`, `unset`)
 
@@ -5096,6 +5121,10 @@ bunx @temps-sdk/cli environments list --project my-app
 
 # Set an environment variable (prompts for the value, so it stays out of shell history)
 bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
+
+# Store a secret from a file, or pipe it from a password manager
+bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt
+op read op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin
 
 # View environment variables
 bunx @temps-sdk/cli environments vars list --project my-app
