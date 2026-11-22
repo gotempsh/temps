@@ -330,15 +330,38 @@ pub enum DeployerError {
     /// The file capabilities of `path` in container `container_id` could
     /// not be read on `location`. Diagnostic only: the deploy that asked
     /// has already failed for its own reason.
-    #[error(
-        "Cannot read the file capabilities of '{path}' in container {container_id} on {location}: {reason}"
-    )]
-    FileCapabilities {
-        container_id: String,
-        path: String,
-        location: String,
-        reason: String,
-    },
+    #[error(transparent)]
+    FileCapabilities(Box<FileCapabilitiesError>),
+}
+
+/// Why the file capabilities of a path in a container could not be read.
+/// Boxed in [`DeployerError::FileCapabilities`] to keep the error small.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "Cannot read the file capabilities of '{path}' in container {container_id} on {location}: {reason}"
+)]
+pub struct FileCapabilitiesError {
+    pub container_id: String,
+    pub path: String,
+    pub location: String,
+    pub reason: String,
+}
+
+impl DeployerError {
+    /// A [`DeployerError::FileCapabilities`] for `path` in `container_id`.
+    pub fn file_capabilities(
+        container_id: &str,
+        path: &str,
+        location: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::FileCapabilities(Box::new(FileCapabilitiesError {
+            container_id: container_id.to_string(),
+            path: path.to_string(),
+            location: location.into(),
+            reason: reason.into(),
+        }))
+    }
 }
 
 /// Why a deploy refused to replace an existing container of the same name:
@@ -1415,12 +1438,12 @@ pub trait ContainerDeployer: Send + Sync {
         container_id: &str,
         path: &str,
     ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
-        Err(DeployerError::FileCapabilities {
-            container_id: container_id.to_string(),
-            path: path.to_string(),
-            location: "this runtime".to_string(),
-            reason: "it cannot read files from containers".to_string(),
-        })
+        Err(DeployerError::file_capabilities(
+            container_id,
+            path,
+            "this runtime",
+            "it cannot read files from containers",
+        ))
     }
 
     /// Stream container logs

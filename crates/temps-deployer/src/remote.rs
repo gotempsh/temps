@@ -1648,11 +1648,13 @@ impl ContainerDeployer for RemoteNodeDeployer {
                 container_id,
             )
             .await
-            .map_err(|error| DeployerError::FileCapabilities {
-                container_id: container_id.to_string(),
-                path: path.to_string(),
-                location: format!("node {}", self.node_name),
-                reason: error.to_string(),
+            .map_err(|error| {
+                DeployerError::file_capabilities(
+                    container_id,
+                    path,
+                    format!("node {}", self.node_name),
+                    error.to_string(),
+                )
             })?;
         Ok(answer.capabilities)
     }

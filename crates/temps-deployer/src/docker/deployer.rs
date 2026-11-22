@@ -1331,11 +1331,8 @@ impl ContainerDeployer for DockerRuntime {
             parse_tar_head, resolve_link, valid_lookup_path, TarHeadError, MAX_HEAD_BYTES,
             MAX_SYMLINK_HOPS,
         };
-        let failed = |path: &str, reason: String| DeployerError::FileCapabilities {
-            container_id: container_id.to_string(),
-            path: path.to_string(),
-            location: "the local Docker daemon".to_string(),
-            reason,
+        let failed = |path: &str, reason: String| {
+            DeployerError::file_capabilities(container_id, path, "the local Docker daemon", reason)
         };
         let docker = self.require_docker()?;
         let mut current = path.to_string();

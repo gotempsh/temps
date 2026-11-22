@@ -7,6 +7,7 @@
 
 use super::image_source::{DeployImageSource, ExpectedImageIdentity};
 use super::node_image::{copy_node_built_image, NodeImageCopy};
+use crate::services::entrypoint_capability::{detect_exec_eperm, EntrypointCapabilityFailure};
 use crate::workflow::JobResult;
 use crate::workflow::WorkflowCancellationProvider;
 use crate::workflow::WorkflowContext;
@@ -1172,6 +1173,18 @@ fn container_crash_loop_message(info: &temps_deployer::ContainerInfo, restarts: 
     message
 }
 
+/// `message`, annotated with the entrypoint capability finding when there
+/// is one.
+fn annotated(finding: Option<EntrypointCapabilityFailure>, message: String) -> String {
+    match finding {
+        Some(finding) => finding.annotate(message),
+        None => message,
+    }
+}
+
+/// Bound on reading the entrypoint's file capabilities after a failure.
+const FILE_CAPABILITIES_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 /// What the readiness probe has observed so far.
 #[derive(Debug, Default)]
 struct ReadinessProbeState {
@@ -1458,21 +1471,67 @@ async fn wait_for_non_http_probe(
 }
 
 impl DeployImageJob {
+    /// Write the container's startup log excerpt to the job log and, when
+    /// the kernel refused to exec its entrypoint because the binary carries
+    /// file capabilities Temps drops, one line explaining that and both
+    /// fixes. Returns that finding so the caller annotates the failure
+    /// reason with it.
+    ///
     /// Runtime output belongs only in authorized job logs, never in the
-    /// persisted failure reason forwarded to notifications and webhooks.
-    async fn write_startup_log_excerpt(
+    /// persisted failure reason forwarded to notifications and webhooks: the
+    /// annotation carries only capability names Temps read or inferred.
+    async fn diagnose_startup_failure(
         &self,
         context: &WorkflowContext,
         deployer: &dyn ContainerDeployer,
         container_id: &str,
-    ) {
-        if let Ok(logs) = deployer.get_container_logs(container_id).await {
-            if let Some(excerpt) = log_excerpt(&logs) {
-                let _ = self
-                    .log(context, format!("Container startup log excerpt: {excerpt}"))
-                    .await;
-            }
+        exit_code: Option<i32>,
+    ) -> Option<EntrypointCapabilityFailure> {
+        let logs = deployer.get_container_logs(container_id).await.ok()?;
+        if let Some(excerpt) = log_excerpt(&logs) {
+            let _ = self
+                .log(context, format!("Container startup log excerpt: {excerpt}"))
+                .await;
         }
+        let binary = detect_exec_eperm(exit_code, &logs)?;
+        let probe = match tokio::time::timeout(
+            FILE_CAPABILITIES_PROBE_TIMEOUT,
+            deployer.file_capabilities(container_id, &binary),
+        )
+        .await
+        {
+            Ok(result) => result.map_err(|error| error.to_string()),
+            Err(_) => Err(format!(
+                "timed out after {}s",
+                FILE_CAPABILITIES_PROBE_TIMEOUT.as_secs()
+            )),
+        };
+        if let Err(reason) = &probe {
+            tracing::warn!(
+                container_id,
+                binary = %binary,
+                %reason,
+                "Could not read the entrypoint's file capabilities; inferring NET_BIND_SERVICE"
+            );
+        }
+        let failure = EntrypointCapabilityFailure::from_probe(binary, probe)?;
+        if failure.already_allowed(&self.config.allowed_capabilities) {
+            let _ = self
+                .log(
+                    context,
+                    format!(
+                        "⚠️ The image's entrypoint {} needs {}, which this project already allows, yet the runtime refused to start it. If it ran on a worker node, update that node's agent so it applies the project's container security setting.",
+                        failure.binary,
+                        failure.required.join(", ")
+                    ),
+                )
+                .await;
+            return None;
+        }
+        let _ = self
+            .log(context, format!("❌ {}", failure.log_line()))
+            .await;
+        Some(failure)
     }
 
     /// `pub(crate)`, not `pub`: the only production constructor is

@@ -238,6 +238,8 @@ async fn deployment_response_with_service_urls(
         crate::services::DeploymentFailureStage,
         crate::services::DeploymentFailureCode,
         crate::services::FailureSettingsSection,
+        crate::services::entrypoint_capability::SuggestedFix,
+        temps_workload::ContainerCapability,
         LastDeploymentResponse,
         LatestDeploymentMediaResponse,
         LatestDeploymentMediaResponseItem,
@@ -3546,6 +3548,20 @@ pub(crate) mod tests {
             .paths
             .paths
             .contains_key("/deployments/latest-media"));
+    }
+
+    #[test]
+    fn the_suggested_fix_is_published_with_the_failure() {
+        let document = serde_json::to_value(DeploymentsApiDoc::openapi()).unwrap();
+        let schemas = &document["components"]["schemas"];
+        let property = schemas["DeploymentFailureInfo"]["properties"]["suggested_fix"].to_string();
+        assert!(
+            property.contains("#/components/schemas/SuggestedFix"),
+            "{property}"
+        );
+        for name in ["SuggestedFix", "ContainerCapability"] {
+            assert!(schemas[name].is_object(), "{name} missing");
+        }
     }
 
     fn public_compose_service_url(
