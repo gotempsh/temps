@@ -17,6 +17,13 @@ pub(super) async fn start_background_services(
 ) {
     spawn_certificate_renewal_scheduler(service_context);
 
+    // Once per start: Temps' own database must not keep WAL that nothing
+    // archives (the Compose package starts it with archive_mode on).
+    let wal_db = Arc::clone(db);
+    tokio::spawn(async move {
+        temps_backup::guard_unarchived_wal(wal_db.as_ref()).await;
+    });
+
     spawn_disk_space_monitor(service_context);
 
     wire_traefik_discovery(service_context, traefik_discovery);

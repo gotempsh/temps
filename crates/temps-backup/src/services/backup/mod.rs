@@ -92,6 +92,7 @@ mod schedules;
 #[cfg(test)]
 mod test_support;
 mod types;
+mod wal_retention;
 mod walg;
 mod walg_deletion;
 
@@ -112,6 +113,9 @@ pub use types::{
     ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunOutcome,
     ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList, ServiceBackupEntry,
     TriggerSource,
+};
+pub use wal_retention::{
+    guard_unarchived_wal, stop_unarchived_wal_retention, WalRetentionError, WalRetentionOutcome,
 };
 use walg_deletion::{deletion_walg_service_identity, validated_walg_target, WalgDeletionEngine};
 
