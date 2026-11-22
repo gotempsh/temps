@@ -305,6 +305,9 @@ describe('what may be read', () => {
     expect(err.message).toBe(`Cannot read the value for DB_PASSWORD from ${directory}: it is a directory, not a file`)
   })
 
+  // The FIFO has no writer: a blocking open would hang here. The file is opened
+  // non-blocking and its descriptor is checked, so a path swapped for a FIFO
+  // after any earlier check is refused the same way.
   test('a FIFO is refused without blocking on it', async () => {
     if (process.platform === 'win32') return
     const fifo = join(await scratch(), 'fifo')
@@ -483,6 +486,16 @@ describe('commander wiring', () => {
     expect((await runCredentials(['--token-file', path], io)).opts.token).toBe(`${SECRET}\n`)
     expect(io.warnings[0]).toContain('--trim-trailing-newline')
     expect((await runCredentials(['--token-file', path, '--trim-trailing-newline'], fakeIO())).opts.token).toBe(SECRET)
+  })
+
+  test('an empty credential file, or one holding only a newline when trimming, is refused', async () => {
+    const empty = await runCredentials(['--token-file', await secretFile('')], fakeIO())
+    expect(empty.error?.message).toBe('the access token read from the file is empty')
+    expect(empty.opts).toEqual({})
+    const newline = await runCredentials(['--token-file', await secretFile('\n'), '--trim-trailing-newline'], fakeIO())
+    expect(newline.error?.message).toBe('the access token read from the file is empty after trimming the trailing newline')
+    const stdin = await runCredentials(['--token-stdin', '--trim-trailing-newline'], fakeIO({ chunks: ['\r\n'] }))
+    expect(stdin.error?.message).toBe('the access token read from stdin is empty after trimming the trailing newline')
   })
 
   test('directories are refused for credential files too', async () => {

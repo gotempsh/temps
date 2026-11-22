@@ -125,7 +125,7 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
         if (format === 'mdx') {
           escapedDesc = escapeForMdx(escapedDesc)
         }
-        md += `| \`${opt.flags}\` | ${escapedDesc} | ${defaultVal} | ${required} |\n`
+        md += `| \`${opt.flags.replace(/\|/g, '\\|')}\` | ${escapedDesc} | ${defaultVal} | ${required} |\n`
       }
       md += '\n'
     }
@@ -257,8 +257,8 @@ bunx @temps-sdk/cli@latest environments list --project my-app
 bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # Store a secret from a file, or pipe it from a password manager (never type it on the command line)
-bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt
-op read op://vault/db/password | bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-stdin
+bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read op://vault/db/password | bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # View environment variables
 bunx @temps-sdk/cli@latest environments vars list --project my-app

@@ -131,6 +131,7 @@ export async function resolveSecretFiles(
         subject: `the value for secret ${name}`,
         flags: { inline: '--secret', file: '--secret-file', stdin: '--secret-file KEY=-' },
         newlineHint: true,
+        rejectEmpty: true,
       },
       io
     )

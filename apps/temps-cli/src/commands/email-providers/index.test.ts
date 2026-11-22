@@ -90,6 +90,7 @@ describe('email-providers create credential sources', () => {
       ['email-providers', 'create', '-n', 'ses', '-t', 'ses', '-r', 'us-east-1', '--access-key-id', 'AKIAEXAMPLE', '--secret-access-key-file', path, '-y'],
       { 'POST /email-providers': { id: 1, name: 'ses', provider_type: 'ses', region: 'us-east-1', is_active: true, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' } })
     expect(run.error).toBeUndefined()
-    expect(JSON.stringify(credentialBody(run, 'POST /email-providers'))).toContain(CREDENTIAL_SENTINEL)
+    const body = credentialBody(run, 'POST /email-providers') as { ses_credentials: { secret_access_key: unknown } }
+    expect(body.ses_credentials.secret_access_key).toBe(CREDENTIAL_SENTINEL)
   })
 })

@@ -13,7 +13,8 @@
  */
 
 import type { Command } from 'commander'
-import { open, stat } from 'node:fs/promises'
+import { constants } from 'node:fs'
+import { open } from 'node:fs/promises'
 
 /**
  * Largest value accepted from any source, in bytes. Project secrets are capped
@@ -65,6 +66,12 @@ export interface ValueSourceSpec {
    * always an accident of `echo` or an editor; noise for PEM files.
    */
   newlineHint?: boolean
+  /**
+   * Refuse an empty value read from a file or stdin (after any trimming).
+   * Right for credentials: an empty token or signing secret is never meant,
+   * and some commands would quietly treat it as "none".
+   */
+  rejectEmpty?: boolean
   maxBytes?: number
 }
 
@@ -132,37 +139,43 @@ async function readValueFile(
   maxBytes: number,
   io: ValueSourceIO,
 ): Promise<string> {
-  // stat first: opening a FIFO would block until something writes to it.
-  let info
-  try {
-    info = await stat(path)
-  } catch (err) {
-    throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: ${errorCode(err)}`)
-  }
-  if (info.isDirectory()) {
-    throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: it is a directory, not a file`)
-  }
-  if (!info.isFile()) {
-    throw new ValueSourceError(
-      `Cannot read ${spec.subject} from ${display}: it is not a regular file (a pipe, socket or device). ` +
-        `To pipe the value in, use ${spec.flags.stdin}.`,
-    )
-  }
-  if (info.size > maxBytes) throw tooLarge(spec.subject, display, maxBytes)
-  if (io.platform !== 'win32' && (info.mode & 0o044) !== 0) {
-    const mode = (info.mode & 0o777).toString(8).padStart(3, '0')
-    io.warn(
-      `warning: ${display} is readable by other users (mode ${mode}); consider \`chmod 600\` on it`,
-    )
-  }
-
+  // Open without blocking, then check the opened descriptor rather than the
+  // path, so a file swapped for a FIFO after a check cannot hang the read.
+  // O_NONBLOCK does not change reads of a regular file; Windows has no FIFOs.
+  const flags = constants.O_RDONLY | (constants.O_NONBLOCK ?? 0)
   let handle
   try {
-    handle = await open(path, 'r')
+    handle = await open(path, flags)
   } catch (err) {
+    if (errorCode(err) === 'EISDIR') {
+      throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: it is a directory, not a file`)
+    }
     throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: ${errorCode(err)}`)
   }
   try {
+    let info
+    try {
+      info = await handle.stat()
+    } catch (err) {
+      throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: ${errorCode(err)}`)
+    }
+    if (info.isDirectory()) {
+      throw new ValueSourceError(`Cannot read ${spec.subject} from ${display}: it is a directory, not a file`)
+    }
+    if (!info.isFile()) {
+      throw new ValueSourceError(
+        `Cannot read ${spec.subject} from ${display}: it is not a regular file (a pipe, socket or device). ` +
+          `To pipe the value in, use ${spec.flags.stdin}.`,
+      )
+    }
+    if (info.size > maxBytes) throw tooLarge(spec.subject, display, maxBytes)
+    if (io.platform !== 'win32' && (info.mode & 0o044) !== 0) {
+      const mode = (info.mode & 0o777).toString(8).padStart(3, '0')
+      io.warn(
+        `warning: ${display} is readable by other users (mode ${mode}); consider \`chmod 600\` on it`,
+      )
+    }
+
     // Read at most one byte past the cap, in case the file grew since stat.
     const buffer = new Uint8Array(maxBytes + 1)
     let length = 0
@@ -271,7 +284,12 @@ export async function resolveValueSource(
 
   if (input.trimTrailingNewline) {
     resolved.value = trimOneTrailingNewline(resolved.value)
-  } else if (spec.newlineHint && resolved.source !== 'argument' && resolved.value.endsWith('\n')) {
+  }
+  if (spec.rejectEmpty && resolved.source !== 'argument' && resolved.value === '') {
+    const where = resolved.source === 'stdin' ? 'stdin' : 'the file'
+    throw new ValueSourceError(`${spec.subject} read from ${where} is empty${input.trimTrailingNewline ? ' after trimming the trailing newline' : ''}`)
+  }
+  if (!input.trimTrailingNewline && spec.newlineHint && resolved.source !== 'argument' && resolved.value.endsWith('\n')) {
     io.warn(
       `hint: ${spec.subject} read from ${resolved.source === 'stdin' ? 'stdin' : 'the file'} ends with a newline, ` +
         'which is kept; pass --trim-trailing-newline to drop it',
@@ -373,6 +391,7 @@ export function addCredentialSources(
             stdin: `--${credential.flag}-stdin`,
           },
           newlineHint: true,
+          rejectEmpty: true,
         },
         io(),
       )

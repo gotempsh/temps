@@ -128,3 +128,14 @@ describe('webhooks create credential sources', () => {
     expect(credentialBody(run, 'POST /projects/4/webhooks').secret).toBe(CREDENTIAL_SENTINEL)
   })
 })
+
+describe('webhooks create with an empty secret file', () => {
+  test('is refused before the webhook is created, instead of creating an unsigned one', async () => {
+    const path = await credentialFile('\n')
+    const run = await runWithApi(registerWebhooksCommands,
+      ['webhooks', 'create', '--project-id', '4', '-u', 'https://hooks.example.com/x', '-e', 'all', '--secret-file', path, '--trim-trailing-newline', '-y'],
+      {})
+    expect(run.error?.message).toBe('the webhook signing secret read from the file is empty after trimming the trailing newline')
+    expect(run.requests).toEqual([])
+  })
+})
