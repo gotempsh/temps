@@ -219,31 +219,50 @@ test('Run now is blocked while any action runs for the project, not only a repor
       },
       ...overrides,
     })
-  let status = configured({
-    in_progress: {
-      operation: 'website_analysis',
-      started_at: new Date(Date.now() - 5_000).toISOString(),
-    },
-  })
-  mockApi({
-    'GET /projects/7/environments': () => jsonResponse([environment]),
-    'GET /projects/7/environments/3/domains': () => jsonResponse([]),
-    'GET /projects/7/analytics/activity': () => jsonResponse(status),
-  })
-  renderPage()
-  const runNow = await screen.findByRole('button', { name: 'Run now' })
+  const renderWith = (status: ActivityStatus) => {
+    mockApi({
+      'GET /projects/7/environments': () => jsonResponse([environment]),
+      'GET /projects/7/environments/3/domains': () => jsonResponse([]),
+      'GET /projects/7/analytics/activity': () => jsonResponse(status),
+    })
+    renderPage()
+  }
+  const runNowDisabled = async () => {
+    const button = await screen.findByRole('button', { name: 'Run now' })
+    // Settled once the status has loaded (Run now is disabled while fetching).
+    await waitFor(() =>
+      expect(screen.queryByRole('status', { name: /loading/i })).toBeNull()
+    )
+    return (button as HTMLButtonElement).disabled
+  }
+
+  // Nothing running: Run now is available.
+  renderWith(configured())
+  await waitFor(async () => expect(await runNowDisabled()).toBe(false))
+  cleanup()
+
   // The report lease is free (`running: false`), but a website analysis is
   // in progress, so the server would refuse a report.
-  await waitFor(() => expect((runNow as HTMLButtonElement).disabled).toBe(true))
-
-  // Once nothing runs, the next status poll re-enables it.
-  status = configured()
-  await waitFor(
-    () =>
-      expect(
-        (screen.getByRole('button', { name: 'Run now' }) as HTMLButtonElement)
-          .disabled
-      ).toBe(false),
-    { timeout: 4000 }
+  renderWith(
+    configured({
+      in_progress: {
+        operation: 'website_analysis',
+        started_at: new Date(Date.now() - 5_000).toISOString(),
+      },
+    })
   )
+  await screen.findByRole('button', { name: 'Run now' })
+  await waitFor(() =>
+    expect(
+      screen
+        .getAllByRole('status')
+        .some((node) =>
+          /Website analysis is running/.test(node.textContent ?? '')
+        )
+    ).toBe(true)
+  )
+  expect(
+    (screen.getByRole('button', { name: 'Run now' }) as HTMLButtonElement)
+      .disabled
+  ).toBe(true)
 })
