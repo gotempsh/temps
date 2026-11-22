@@ -220,3 +220,49 @@ test('a provider that writes the record is named on both steps', async () => {
   expect(view.getByText('Temps adds the TXT record for you')).toBeTruthy()
   expect(view.queryByText('DNS-01 (Manual)')).toBeNull()
 })
+
+test('a domain edited while the port 80 answer is out keeps the wizard on the domain step', async () => {
+  let release = () => {}
+  const late = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const { view } = renderWizard(async (domain) => {
+    if (domain == null) await late
+    // HTTP-01 works here: the stale default would keep it.
+    return jsonResponse({ ...methods(domain), http01_available: true })
+  })
+  const input = view.getByLabelText('Domain name')
+  fireEvent.change(input, { target: { value: 'example.com' } })
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  // Validation passed; the wizard now waits on the port 80 answer.
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  fireEvent.change(input, { target: { value: '*.example.com' } })
+  release()
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(view.queryByText('How it gets HTTPS')).toBeNull()
+
+  // The next Next judges the wildcard: DNS-01 only.
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  await view.findByText('How it gets HTTPS')
+  expect(checkedMethod(view)).toEqual(['dns-01'])
+})
+
+test('Enter on the provider Retry retries instead of advancing the wizard', async () => {
+  let failures = 1
+  const { view } = renderWizard((domain) => {
+    if (domain != null && failures > 0) {
+      failures--
+      return jsonResponse({ title: 'Reachability Error', status: 500 }, 500)
+    }
+    return jsonResponse(methods(domain))
+  })
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+  const retry = await view.findByRole('button', {
+    name: 'Retry the DNS provider check',
+  })
+  fireEvent.keyDown(retry, { key: 'Enter' })
+  await new Promise((resolve) => setTimeout(resolve, 50))
+  expect(view.queryByText('Review your configuration')).toBeNull()
+  expect(view.getByText('How it gets HTTPS')).toBeTruthy()
+})

@@ -156,6 +156,9 @@ export function AddDomain() {
               retry: false,
             })
             .catch(() => undefined)
+          // Edited while waiting: this default was for another domain. Stay
+          // here; the next Next validates the new one.
+          if (form.getValues('domain') !== domain) return
           if (covering.length > 0) {
             // A tunnel carries it: no certificate to issue.
             form.setValue('challengeType', tunnelChoice(covering[0].id))
@@ -777,6 +780,11 @@ export function Dns01Writer({
           disabled={retrying}
           // Inside the option's <label>, which would otherwise name it.
           aria-label="Retry the DNS provider check"
+          // Enter and Space activate this button; the wizard's own Enter
+          // handlers must not see them and advance instead.
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') e.stopPropagation()
+          }}
           onClick={(e) => {
             e.preventDefault()
             e.stopPropagation()
