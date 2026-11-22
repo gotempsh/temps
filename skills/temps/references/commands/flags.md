@@ -84,7 +84,7 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
-| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--variants <json\|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
 | `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
 

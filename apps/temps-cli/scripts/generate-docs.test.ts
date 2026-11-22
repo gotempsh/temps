@@ -100,3 +100,14 @@ test('workload and recovery references match their CLI contracts', () => {
   registerUsersCommands(root)
   expect(generateMarkdown(extractCommandInfo(root).subcommands)).toContain('Password sign-in is blocked when require_mfa_for_admins applies')
 })
+
+test('a pipe in an option flag is escaped so it does not split the table row', () => {
+  const command = fixtureCommand().option('--consent <accept|refuse>', 'Consent choice')
+  for (const format of ['markdown', 'mdx'] as const) {
+    const row = generateMarkdown([extractCommandInfo(command)], 2, format)
+      .split('\n')
+      .find((line) => line.includes('--consent'))!
+    expect(row).toContain('`--consent <accept\\|refuse>`')
+    expect(row.replace(/\\\|/g, '').split('|')).toHaveLength(6)
+  }
+})

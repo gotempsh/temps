@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test, spyOn } from 'bun:test'
-import { formatMcpAccess, originOf, registerMcpCommands } from './index.js'
+import { codexTokenExportLine, formatMcpAccess, originOf, registerMcpCommands } from './index.js'
 
 // originOf is the comparison primitive that decides whether a credential
 // bound to one URL may be reused for another (see ensureMcpAuth /
@@ -104,4 +104,12 @@ test('MCP status describes read/write access and labels legacy group filters', (
   expect(formatMcpAccess('https://temps.example.test/mcp?groups=platform')).toBe('Read-only; legacy groups: platform')
   expect(formatMcpAccess(null)).toBe('-')
   expect(formatMcpAccess('invalid')).toBe('-')
+})
+
+test('the Codex token export shows only a key this command minted', () => {
+  const key = 's3cr3t-test-value'
+  expect(codexTokenExportLine(key, true)).toContain(`Bearer ${key}`)
+  const supplied = codexTokenExportLine(key, false)
+  expect(supplied).not.toContain(key)
+  expect(supplied).toContain('<your Temps API key>')
 })

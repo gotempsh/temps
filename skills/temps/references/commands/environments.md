@@ -91,7 +91,7 @@ Manage environment variables
 
 - `list` (`ls`) - List environment variables
 - `get` - Get a specific environment variable
-- `set` - Set an environment variable
+- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 - `delete` (`rm`, `unset`) - Delete an environment variable
 - `import` - Import environment variables from a .env file
 - `export` - Export environment variables to .env format
@@ -122,7 +122,7 @@ Get a specific environment variable
 
 #### `environments vars set`
 
-Set an environment variable
+Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 
 **Usage:** `environments vars set <key> [value] [options]`
 
@@ -135,6 +135,9 @@ Set an environment variable
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `environments vars delete` (alias: `rm`, `unset`)
 

@@ -16,6 +16,7 @@ import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/inde
 import { TOKEN_ENV_VAR as CODEX_TOKEN_ENV_VAR } from './clients/codex.js'
 import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 /**
  * The scheme+host+port a URL resolves to, for comparing whether two URLs
@@ -231,7 +232,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(disableAction)
 
-  mcp
+  const addCommand = mcp
     .command('add [client]')
     .description(
       `Configure an AI client to connect to this Temps instance over MCP. Clients: ${listClientIds().join(', ')}`,
@@ -245,6 +246,7 @@ export function registerMcpCommands(program: Command): void {
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
     .action(addAction)
+  addCredentialSources(addCommand, [{ flag: 'api-key', what: 'the API key' }])
 
   mcp.command('remove [client]').description('Remove the Temps MCP server from an AI client').action(removeAction)
 
@@ -357,6 +359,8 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         }))
 
   let apiKey = options.apiKey
+  // Whether this command minted the key: only then may it be shown, once.
+  let mintedKey = false
   if (!apiKey) {
     const wantsNewKey = options.yes
       ? false
@@ -381,6 +385,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         return data
       })
       apiKey = created.api_key
+      mintedKey = true
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
@@ -435,8 +440,20 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     warning(
       `Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`,
     )
-    info(`  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`)
+    info(codexTokenExportLine(apiKey, mintedKey))
   }
+}
+
+/**
+ * The shell line that exports Codex's bearer token. A key this command just
+ * minted is shown, exactly once, because there is no other way to get it; a
+ * key the user supplied (e.g. with --api-key-file) or one reused from a saved
+ * context is never printed, so it cannot end up in captured output or CI logs.
+ */
+export function codexTokenExportLine(apiKey: string, minted: boolean): string {
+  return minted
+    ? `  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`
+    : `  export ${CODEX_TOKEN_ENV_VAR}='Bearer <your Temps API key>'`
 }
 
 async function removeAction(clientArg: string | undefined): Promise<void> {

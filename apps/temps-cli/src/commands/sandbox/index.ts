@@ -50,6 +50,7 @@ import type {
   SandboxPlacementResponse,
   UpdateSandboxPlacementBody,
 } from '../../api/types.gen.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 // ── Types mirroring /v1/sandbox/* responses ─────────────────────────────────
 
@@ -369,7 +370,7 @@ export function registerSandboxCommands(program: Command): void {
     .command('sandbox')
     .description('Manage standalone sandboxes (/v1/sandbox API)')
 
-  sandbox
+  const createCommand = sandbox
     .command('create')
     .description('Create a new sandbox')
     .option('--image <image>', 'Docker image override (uses platform default when omitted)')
@@ -441,6 +442,7 @@ export function registerSandboxCommands(program: Command): void {
     )
     .option('--json', 'Output as JSON')
     .action(createAction)
+  addCredentialSources(createCommand, [{ flag: 'git-password', what: 'the Git HTTP password or token' }])
 
   sandbox
     .command('list')
@@ -548,7 +550,7 @@ export function registerSandboxCommands(program: Command): void {
     .description('Restart a running sandbox (preserves filesystem)')
     .action(restartAction)
 
-  sandbox
+  const cloneCommand = sandbox
     .command('clone <id>')
     .description('Clone a git repo or extract a tarball into a running sandbox')
     .option('--git-url <url>', 'Git repo URL to clone')
@@ -562,6 +564,7 @@ export function registerSandboxCommands(program: Command): void {
     .option('--git-password <token>', 'HTTP Basic password/token (injected via GIT_ASKPASS)')
     .option('--tarball-url <url>', 'Tarball URL to download and extract')
     .action(cloneAction)
+  addCredentialSources(cloneCommand, [{ flag: 'git-password', what: 'the Git HTTP password or token' }])
 
   sandbox
     .command('shell <id>')

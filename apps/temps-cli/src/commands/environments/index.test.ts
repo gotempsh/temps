@@ -5,6 +5,7 @@ import { test, expect, describe, spyOn } from 'bun:test'
 import { Command } from 'commander'
 import {
   registerEnvironmentsCommands,
+  pickEnvironments,
   resolvePreviewInclusion,
   formatEnvVarValue,
   describeForceHttps,
@@ -337,5 +338,117 @@ describe('scale routing JSON', () => {
       ['environments', 'scale', '-p', 'app', '--json'], routes)
     expect(run.error).toBeUndefined()
     expect(JSON.parse(run.stdout).load_balancing).toEqual(policy)
+  })
+})
+
+describe('vars set value sources', () => {
+  const SECRET = 's3cr3t-test-value'
+  const routes = {
+    'GET /projects/by-slug/app': { id: 4, slug: 'app' },
+    'GET /projects/4/env-vars': [makeVar({ id: 9, key: 'EXISTING', environments: [{ id: 7, name: 'production' }] as never })],
+    'GET /projects/4/environments': [{ id: 7, name: 'production', slug: 'production', is_preview: false }],
+    'POST /projects/4/env-vars': (_url: URL, body: unknown) => ({ ...makeVar(), ...(body as object), id: 10, value: '***' }),
+    'PUT /projects/4/env-vars/9': (_url: URL, body: unknown) => ({ ...makeVar(), ...(body as object), id: 9, value: '***' }),
+  }
+
+  async function fixture(contents: string | Uint8Array): Promise<string> {
+    const { mkdtemp, writeFile } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const directory = await mkdtemp(join(tmpdir(), 'temps-vars-set-'))
+    const path = join(directory, 'value.txt')
+    await writeFile(path, contents, { mode: 0o600 })
+    return path
+  }
+
+  function sentBody(run: Awaited<ReturnType<typeof runWithApi>>, request: string): Record<string, unknown> {
+    const sent = run.bodies.find(b => b.request === request)
+    expect(sent).toBeDefined()
+    return sent!.body as Record<string, unknown>
+  }
+
+  test('--secret --value-file sends the file content exactly, and never prints it', async () => {
+    const path = await fixture(`${SECRET}\r\n`)
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'DB_PASSWORD', '--secret', '--value-file', path, '-e', 'production'], routes)
+    expect(run.error).toBeUndefined()
+    const body = sentBody(run, 'POST /projects/4/env-vars')
+    expect(body).toMatchObject({ key: 'DB_PASSWORD', value: `${SECRET}\r\n`, is_secret: true, environment_ids: [7] })
+    // The trailing newline is kept, with a hint; the value itself is never echoed.
+    expect(run.stderr).toContain('--trim-trailing-newline')
+    expect(run.stdout).not.toContain(SECRET)
+    expect(run.stderr).not.toContain(SECRET)
+  })
+
+  test('--value-stdin sends the piped bytes; --trim-trailing-newline drops one newline', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'DB_PASSWORD', '--secret', '--value-stdin', '--trim-trailing-newline', '-e', 'production'],
+      routes, { stdin: `${SECRET}\n` })
+    expect(run.error).toBeUndefined()
+    expect(sentBody(run, 'POST /projects/4/env-vars').value).toBe(SECRET)
+    expect(`${run.stdout}\n${run.stderr}`).not.toContain(SECRET)
+  })
+
+  test('--update with --value-file - replaces the value of an existing variable from stdin', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'EXISTING', '--update', '--value-file', '-'],
+      routes, { stdin: 'multi\nline\nvalue' })
+    expect(run.error).toBeUndefined()
+    expect(sentBody(run, 'PUT /projects/4/env-vars/9')).toMatchObject({ key: 'EXISTING', value: 'multi\nline\nvalue', environment_ids: [7] })
+  })
+
+  test('the positional value still works, and a leading @ in it stays literal', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'HANDLE', '@team', '-e', 'production'], routes)
+    expect(run.error).toBeUndefined()
+    expect(sentBody(run, 'POST /projects/4/env-vars').value).toBe('@team')
+    expect(run.stderr).not.toContain('deprecated')
+  })
+
+  test('two sources fail before any request, naming the flags', async () => {
+    const path = await fixture(SECRET)
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'DB_PASSWORD', SECRET, '--value-file', path], routes)
+    expect(run.error?.message).toBe('Pass the value for DB_PASSWORD from only one source, got <value> and --value-file')
+    expect(run.requests).toEqual([])
+  })
+
+  test('--value-stdin on a terminal fails before any request', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'DB_PASSWORD', '--value-stdin'], routes, { stdin: 'tty' })
+    expect(run.error?.message).toContain('stdin is a terminal with nothing piped in')
+    expect(run.requests).toEqual([])
+  })
+
+  test('the environment picker reports a missing terminal with what to pass', async () => {
+    const tty = process.stdin.isTTY
+    process.stdin.isTTY = false
+    try {
+      await expect(pickEnvironments([{ name: 'production', value: 7 }], () => { throw new Error('ENXIO') }))
+        .rejects.toThrow('pass --environments <names>')
+    } finally {
+      process.stdin.isTTY = tty
+    }
+  })
+
+  test('no value and no terminal to prompt on is an error, not a hang', async () => {
+    const run = await runWithApi(registerEnvironmentsCommands,
+      ['environments', 'vars', '-p', 'app', 'set', 'DB_PASSWORD', '--secret'], routes, { stdin: '' })
+    expect(run.error?.message).toContain('Missing the value for DB_PASSWORD')
+    expect(run.requests).toEqual([])
+  })
+
+  test('the help leads with the --secret --value-file and --value-stdin examples', () => {
+    const program = new Command()
+    registerEnvironmentsCommands(program)
+    const set = program.commands.find(c => c.name() === 'environments')!
+      .commands.find(c => c.name() === 'vars')!
+      .commands.find(c => c.name() === 'set')!
+    let help = ''
+    set.configureOutput({ writeOut: (text) => { help += text } })
+    set.outputHelp()
+    expect(help).toContain('temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt')
+    expect(help).toContain('op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin')
+    expect(help.indexOf('--value-file ./db-password.txt')).toBeLessThan(help.indexOf('LOG_LEVEL'))
   })
 })

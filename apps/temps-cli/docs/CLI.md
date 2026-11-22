@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-11-20
+> Generated on: 2026-11-22
 
 ## Installation
 
@@ -251,7 +251,7 @@ Manage project secrets — mounted into the deployed container as files at /run/
 **Subcommands:**
 
 - `list` (`ls`) - List secrets for a project (values are never returned)
-- `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+- `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 - `update` - Update a project secret (a redeploy is required for running containers to pick it up)
 - `delete` (`rm`) - Delete a project secret
 
@@ -269,7 +269,7 @@ List secrets for a project (values are never returned)
 
 #### `projects secrets create` (alias: `add`)
 
-Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+Create a project secret (mounted at /run/secrets/<KEY> on the next deployment). Read the value with --value-file or --value-stdin to keep it out of shell history
 
 **Options:**
 
@@ -277,10 +277,14 @@ Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
-| `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
+| `-v, --value <value>` | Secret value on the command line (<=1 MiB; visible in shell history and `ps`). `-v @path` reading a file is deprecated: use --value-file | - | No |
 | `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
 | `-s, --service <name>` | Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container. | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
+| `--value-file <path>` | Read the secret value (<=1 MiB) from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the secret value (<=1 MiB) from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `projects secrets update`
 
@@ -292,12 +296,16 @@ Update a project secret (a redeploy is required for running containers to pick i
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
-| `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
+| `-v, --value <value>` | New value on the command line (<=1 MiB; visible in shell history). `-v @path` is deprecated: use --value-file. Give no value source to keep the existing value. | - | No |
 | `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
 | `-s, --service <name>` | Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service. | `` | No |
 | `--all-services` | Deliver to every Compose service, clearing any per-service scope | - | No |
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
+| `--value-file <path>` | Read the new secret value (<=1 MiB) from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the new secret value (<=1 MiB) from stdin, e.g. piped from a secret manager | - | No |
+| `--literal` | Send a -v value that starts with @ as is, instead of reading it as a file path (deprecated form) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `projects secrets delete <key>` (alias: `rm`)
 
@@ -1000,7 +1008,7 @@ Manage environment variables
 
 - `list` (`ls`) - List environment variables
 - `get` - Get a specific environment variable
-- `set` - Set an environment variable
+- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 - `delete` (`rm`, `unset`) - Delete an environment variable
 - `import` - Import environment variables from a .env file
 - `export` - Export environment variables to .env format
@@ -1029,7 +1037,7 @@ Get a specific environment variable
 
 #### `environments vars set <key> [value]`
 
-Set an environment variable
+Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 
 **Options:**
 
@@ -1040,6 +1048,9 @@ Set an environment variable
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
 | `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
+| `--value-file <path>` | Read the value from a file, byte-for-byte (- reads stdin). Keeps it out of shell history | - | No |
+| `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `environments vars delete <key>` (alias: `rm`, `unset`)
 
@@ -1411,6 +1422,11 @@ Add a new Git provider
 | `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
 | `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--token-file <path>` | Read the access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the access token from stdin instead of --token | - | No |
+| `--password-file <path>` | Read the Bitbucket app password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the Bitbucket app password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `providers remove` (alias: `rm`)
 
@@ -1504,6 +1520,11 @@ Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
 | `--clone-url <url>` | HTTPS clone URL (generic provider) | - | No |
 | `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--token-file <path>` | Read the access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the access token from stdin instead of --token | - | No |
+| `--password-file <path>` | Read the Bitbucket app password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the Bitbucket app password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers git repos`
 
@@ -1626,7 +1647,10 @@ Update access token for a Git connection
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Connection ID | - | Yes |
-| `-t, --token <token>` | New access token | - | Yes |
+| `-t, --token <token>` | New access token (prefer --token-file or --token-stdin, which keep it out of shell history) | - | No |
+| `--token-file <path>` | Read the new access token from a file (- reads stdin) instead of --token | - | No |
+| `--token-stdin` | Read the new access token from stdin instead of --token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `providers connections validate`
 
@@ -1775,6 +1799,9 @@ Create an S3 source
 | `--secret-key <key>` | Secret access key | - | No |
 | `--prefix <prefix>` | Bucket path/prefix | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources show`
 
@@ -1803,6 +1830,9 @@ Update an S3 source
 | `--access-key <key>` | New access key ID | - | No |
 | `--secret-key <key>` | New secret access key | - | No |
 | `--prefix <prefix>` | New bucket path/prefix | - | No |
+| `--secret-key-file <path>` | Read the S3 secret access key from a file (- reads stdin) instead of --secret-key | - | No |
+| `--secret-key-stdin` | Read the S3 secret access key from stdin instead of --secret-key | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 #### `backups sources remove` (alias: `rm`)
 
@@ -1965,6 +1995,13 @@ Add a new notification provider
 | `--chat-id <id>` | Chat ID, e.g. -1001234567890 or @channelname (for telegram) | - | No |
 | `--topic-id <id>` | Forum topic ID (for telegram, optional) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications update`
 
@@ -1994,6 +2031,13 @@ Update a notification provider
 | `--topic-id <id>` | Forum topic ID (for telegram; empty string clears it) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip confirmation prompts | - | No |
+| `--webhook-url-file <path>` | Read the Slack webhook URL from a file (- reads stdin) instead of --webhook-url | - | No |
+| `--webhook-url-stdin` | Read the Slack webhook URL from stdin instead of --webhook-url | - | No |
+| `--password-file <path>` | Read the SMTP password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the SMTP password from stdin instead of --password | - | No |
+| `--bot-token-file <path>` | Read the Telegram bot token from a file (- reads stdin) instead of --bot-token | - | No |
+| `--bot-token-stdin` | Read the Telegram bot token from stdin instead of --bot-token | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `notifications enable`
 
@@ -3159,6 +3203,9 @@ Create a new user
 | `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | No |
 | `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--password-file <path>` | Read the password from a file (- reads stdin) instead of --password | - | No |
+| `--password-stdin` | Read the password from stdin instead of --password | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `users me`
 
@@ -3518,6 +3565,9 @@ Create a new webhook for a project
 | `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
 | `-s, --secret <secret>` | Webhook secret for signature verification | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-file <path>` | Read the webhook signing secret from a file (- reads stdin) instead of --secret | - | No |
+| `--secret-stdin` | Read the webhook signing secret from stdin instead of --secret | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `webhooks show`
 
@@ -3544,6 +3594,9 @@ Update a webhook
 | `-u, --url <url>` | New webhook URL | - | No |
 | `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
 | `-s, --secret <secret>` | New webhook secret for signature verification | - | No |
+| `--secret-file <path>` | Read the webhook signing secret from a file (- reads stdin) instead of --secret | - | No |
+| `--secret-stdin` | Read the webhook signing secret from stdin instead of --secret | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `webhooks remove` (alias: `rm`)
 
@@ -3817,7 +3870,7 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
-| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--variants <json\|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
 | `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -4035,8 +4088,13 @@ View project analytics
 **Subcommands:**
 
 - `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+- `conversions` (`goals`) - Conversion goals: events or pages that count as success
+- `identity` - Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `outbound` - Show the outbound links visitors clicked (outbound_click events)
+- `downloads` - Show the files visitors downloaded (file_download events)
+- `not-found` - Show pages visitors could not find: 404s Temps answered and not_found events
 - `funnels` - Show funnel conversion metrics for all funnels
 - `performance` (`speed`) - Show real-user Web Vitals and optional dimension breakdowns
 - `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
@@ -4050,6 +4108,7 @@ View project analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 - `enrich` - Attach identity or attributes to a visitor (merges into custom_data; a null value removes a key)
+- `identify` - Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
 
 ### `analytics keys`
 
@@ -4134,6 +4193,127 @@ Revoke (deactivate) an analytics ingest key
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+### `analytics conversions` (alias: `goals`)
+
+Conversion goals: events or pages that count as success
+
+**Subcommands:**
+
+- `list` - List conversions with visitors, rate and revenue in a period
+- `create` - Define a conversion
+- `update` - Replace a conversion's definition
+- `delete` - Delete a conversion (recorded events are kept)
+- `breakdown` - Where the visitors who converted came from
+
+#### `analytics conversions list`
+
+List conversions with visitors, rate and revenue in a period
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions create`
+
+Define a conversion
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions update`
+
+Replace a conversion's definition
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-n, --name <name>` | Name shown in reports, e.g. Signup | - | No |
+| `--event <name>` | Count this event, e.g. signup | - | No |
+| `--page <path>` | Count visits to this path; * matches anything, e.g. /docs/* | - | No |
+| `--property <key=value>` | Only events whose property has this value, e.g. plan=pro | - | No |
+| `--revenue-property <key>` | Event property holding the amount, e.g. amount | - | No |
+| `--currency <code>` | ISO 4217 currency of the amount, e.g. EUR | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics conversions delete`
+
+Delete a conversion (recorded events are kept)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+
+#### `analytics conversions breakdown`
+
+Where the visitors who converted came from
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--goal-id <id>` | Conversion ID (see list) | - | Yes |
+| `--by <dimension>` | One of channel, referrer, utm_source, utm_medium, utm_campaign, page, country, device_type, browser, operating_system | `channel` | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 7d, 30d, 3m) | `30d` | No |
+| `--limit <n>` | Rows (default: 10, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identity`
+
+Whether visitors are recognised by a stored id or tracked cookieless, and who may identify them
+
+**Subcommands:**
+
+- `show` - Show the identity mode, whether browser identify is accepted, and what they change
+- `set` - Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+#### `analytics identity show`
+
+Show the identity mode, whether browser identify is accepted, and what they change
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics identity set`
+
+Switch between persistent and cookieless tracking, or accept/refuse browser identify
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | One of persistent, cookieless | - | No |
+| `--browser-identify <accept\|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
+
 ### `analytics overview` (alias: `o`)
 
 Show analytics dashboard overview
@@ -4156,6 +4336,45 @@ Show breakdown by dimension: pages, referrers, browsers, os, devices, countries,
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics outbound`
+
+Show the outbound links visitors clicked (outbound_click events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics downloads`
+
+Show the files visitors downloaded (file_download events)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics not-found`
+
+Show pages visitors could not find: 404s Temps answered and not_found events
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | No |
 | `--limit <n>` | Number of results (default: 20, max: 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -4371,6 +4590,21 @@ Attach identity or attributes to a visitor (merges into custom_data; a null valu
 | `-f, --file <path>` | Read the JSON object to merge from a file | - | No |
 | `--set <key=value>` | Set one key to a string value (repeatable; use --data for numbers, booleans, or nested values) | `` | No |
 | `--unset <key>` | Remove one top-level key (repeatable; sends null) | `` | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics identify <visitor-id>`
+
+Label a visitor with your app's user id, as your backend would (browser identify cannot replace it)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--user-id <id>` | Your app's id for this person (at most 256 characters) | - | Yes |
+| `-d, --data <json>` | Traits as a JSON object, e.g. '{"plan":"pro"}' | - | No |
+| `--set <key=value>` | Set one trait to a string value (repeatable) | `` | No |
+| `--unset <key>` | Remove one trait (repeatable; sends null) | `` | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `plugin`
