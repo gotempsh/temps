@@ -1506,7 +1506,11 @@ fn configure_on_demand_tls(
 ) {
     let zone = preview_domain.trim();
     let sslip_ip_is_public =
-        sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
+        embedded_ipv4_from_zone(zone, &app_settings.on_demand_tls.generated_hostname_suffix)
+            .or_else(|| {
+                embedded_ipv4_from_zone(zone, temps_config::DEFAULT_GENERATED_HOSTNAME_SUFFIX)
+            })
+            .is_none_or(|address| validate_ipv4(&address).is_ok());
     let can_issue = tls_mode == TlsMode::Auto
         && !zone.is_empty()
         && !is_loopback_zone(zone)
@@ -1550,26 +1554,42 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
 ///
 /// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
 /// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
-fn sslip_domain_for(ip: &str) -> anyhow::Result<String> {
+fn generated_domain_for(ip: &str, suffix: &str) -> anyhow::Result<String> {
     let address = ip.parse::<Ipv4Addr>().map_err(|error| {
         anyhow::anyhow!(
-            "Cannot generate a sslip.io domain from server IP '{ip}': {error}. \
+            "Cannot generate a hostname from server IP '{ip}': {error}. \
              Automatic domains currently require IPv4; provide --server-ip with a valid IPv4 \
              address or use an explicit --wildcard-domain."
         )
     })?;
-    Ok(format!(
-        "{}.sslip.io",
-        address.to_string().replace('.', "-")
-    ))
+    let suffix = suffix.trim_end_matches('.').to_ascii_lowercase();
+    let encoded = address.to_string().replace('.', "-");
+    if !suffix.contains('.')
+        || encoded.len() + 1 + suffix.len() > 253
+        || !suffix.split('.').all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
+    {
+        anyhow::bail!("Invalid generated hostname suffix '{suffix}' for server IP '{ip}'");
+    }
+    Ok(format!("{encoded}.{suffix}"))
 }
 
-fn sslip_ipv4_from_zone(zone: &str) -> Option<Ipv4Addr> {
+fn embedded_ipv4_from_zone(zone: &str, suffix: &str) -> Option<Ipv4Addr> {
     let encoded = zone
         .trim()
         .trim_end_matches('.')
         .to_ascii_lowercase()
-        .strip_suffix(".sslip.io")?
+        .strip_suffix(&format!(
+            ".{}",
+            suffix.trim_end_matches('.').to_ascii_lowercase()
+        ))?
         .to_string();
 
     encoded
@@ -1906,16 +1926,20 @@ impl SetupCommand {
                     }
                 }
             };
-            let sslip_domain = sslip_domain_for(&ip)?;
+            let suffix = existing_app_settings
+                .as_ref()
+                .map(|s| s.on_demand_tls.generated_hostname_suffix.as_str())
+                .unwrap_or(temps_config::DEFAULT_GENERATED_HOSTNAME_SUFFIX);
+            let sslip_domain = generated_domain_for(&ip, suffix)?;
             print_success(&format!(
-                "No --wildcard-domain given — defaulting to sslip.io: {}",
+                "No --wildcard-domain given — using the generated domain {}",
                 format!("*.{sslip_domain}").bright_cyan()
             ));
-            print_warning(
-                "The generated hostname uses the third-party sslip.io DNS service and is \
-                 intended for quick-start use. Configure your own wildcard domain for production.",
-            );
-            if sslip_ipv4_from_zone(&sslip_domain)
+            print_warning(&format!(
+                "The generated hostname uses the {suffix} DNS service and is \
+                 intended for quick-start use. Configure your own wildcard domain for production."
+            ));
+            if embedded_ipv4_from_zone(&sslip_domain, suffix)
                 .is_some_and(|address| validate_ipv4(&address).is_err())
             {
                 print_warning(
@@ -3515,6 +3539,22 @@ mod tests {
         assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
     }
 
+    #[test]
+    fn generated_domain_uses_the_stored_dns_suffix() {
+        let address = "203.0.113.10";
+        assert_eq!(
+            generated_domain_for(address, "example.com").unwrap(),
+            "203-0-113-10.example.com"
+        );
+        for suffix in ["", "https://example.com", "*.example.com", "a..example.com"] {
+            assert!(generated_domain_for(address, suffix).is_err());
+        }
+        let mut settings = AppSettings::default();
+        settings.on_demand_tls.generated_hostname_suffix = "example.com".into();
+        configure_on_demand_tls(&mut settings, "192-168-1-1.example.com", TlsMode::Auto);
+        assert!(!settings.on_demand_tls.enabled);
+    }
+
     /// Pins the dashed spelling. Reverting this to the dotted form still
     /// compiles and passes every other check, while silently making every
     /// generated app hostname on a quick-start install resolve to a third
@@ -3522,22 +3562,23 @@ mod tests {
     #[test]
     fn sslip_domain_uses_the_dashed_ip_spelling() {
         assert_eq!(
-            sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain"),
+            generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain"),
             "127-0-0-1.sslip.io"
         );
         assert_eq!(
-            sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain"),
+            generated_domain_for("203.0.113.42", "sslip.io").expect("IPv4 should produce a domain"),
             "203-0-113-42.sslip.io"
         );
         // The generated base must stay loopback-detectable, or `temps setup`
         // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
         assert!(is_loopback_zone(
-            &sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain")
+            &generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain")
         ));
         assert!(!is_loopback_zone(
-            &sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain")
+            &generated_domain_for("203.0.113.42", "sslip.io")
+                .expect("IPv4 should produce a domain")
         ));
-        assert!(sslip_domain_for("2001:db8::1")
+        assert!(generated_domain_for("2001:db8::1", "sslip.io")
             .expect_err("IPv6 should require an explicit wildcard domain")
             .to_string()
             .contains("currently require IPv4"));

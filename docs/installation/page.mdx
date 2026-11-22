@@ -650,6 +650,15 @@ These files are **automatically backed up** by Temps when you configure S3 backu
 
 ## Troubleshooting
 
+### DNS resolves but HTTPS does not connect
+
+Test from a machine outside the server's network. Some providers block connections from a VPS to its own public address. A loopback health check tells you the console process answers locally.
+
+- Direct HTTP-01 needs inbound TCP port 80 to reach the Temps proxy. HTTPS clients need inbound TCP port 443. Check the provider firewall, host firewall and any router port forwards.
+- DNS-01 lets a DNS provider validate a certificate without inbound port 80. Clients still need a route to port 443. A tunnel can publish the hostname when inbound connections are unavailable.
+- A private DNS answer can work on a LAN or VPN. For a public DNS-only record, use the server's public origin address. A proxied console hostname can resolve to the CDN's address.
+- On a generated hostname, the wildcard DNS operator controls the DNS answer. If the service cannot resolve the name, restore DNS or configure your own domain. Repeated certificate requests can exhaust the certificate authority's issuance limits. [Let’s Encrypt rate limits](https://letsencrypt.org/docs/rate-limits/)
+
 ### Database Connection Error
 
 ```bash
