@@ -29,6 +29,7 @@ on:
       - "**/Cargo.lock"
       - "web/package.json"
       - "web/bun.lock"
+      - "scripts/*advisory_ignores.py"
       - "deny.toml"
       - ".github/workflows/dependency-scan.yml"
   schedule:
@@ -49,7 +50,7 @@ jobs:
   cargo-audit:
     name: Rust Dependency Audit (cargo-audit)
     env:
-      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0381,RUSTSEC-2026-0387,RUSTSEC-2026-0459,RUSTSEC-2026-0440,RUSTSEC-2026-0543,RUSTSEC-2026-0555
+      AUDIT_IGNORE: RUSTSEC-2025-0134,RUSTSEC-2023-0071,RUSTSEC-2024-0388,RUSTSEC-2026-0253,RUSTSEC-2024-0449,RUSTSEC-2025-0141,RUSTSEC-2026-0387,RUSTSEC-2026-0440,RUSTSEC-2026-0543,RUSTSEC-2026-0555
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -88,19 +89,6 @@ jobs:
       # - RUSTSEC-2025-0134 (rustls-pemfile): used directly across several
       #   crates; migrating to rustls-pki-types' PemObject API is tracked
       #   separately, not a drop-in version bump.
-      # - RUSTSEC-2024-0436 (paste): proc-macro only (compile-time codegen,
-      #   not linked into the binary). Cargo.lock dependents:
-      #   * rav1e <- ravif <- image (default `avif` feature) <- temps-auth
-      #     (direct `image` dep, and via qrcode for MFA QR codes). This is
-      #     the only path in the default build -- temps-auth is depended on
-      #     by nearly every service crate.
-      # - RUSTSEC-2026-0173 (proc-macro-error2): proc-macro only. Paths:
-      #   * sea-orm -> sea-orm-macros -> sea-bae -> proc-macro-error2
-      #     (default build); sea-orm 1.1.20 is the pinned major, 2.0 is a
-      #     breaking migration.
-      #   * validator -> validator_derive -> proc-macro-error2, via
-      #     temps-import-types' optional `validation` feature, which no
-      #     workspace crate enables (in Cargo.lock only).
       # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core and
       #   pingora-load-balancing -> derivative (temps-proxy, temps-edge).
       #   Proc-macro only; the pinned Pingora 0.9 dependency includes it.
@@ -150,14 +138,10 @@ jobs:
       #   chrono-tz comes with it for timezone handling. Neither has a
       #   maintained drop-in replacement yet. Drop both once one exists.
       #
-      # The six below are vulnerability/unsoundness advisories (not "unmaintained"
+      # The three below are vulnerability/unsoundness advisories (not "unmaintained"
       # notices). A version bump here cannot clear any of them: either no fix is
       # released, or an upstream crate still requires the affected copy.
-      # Reachability analysis for RUSTSEC-2023-0071, RUSTSEC-2026-0235 and
-      # RUSTSEC-2026-0253 lives in the root Cargo.toml under "Dependency
-      # Overrides - Security Fixes"; for RUSTSEC-2026-0381, RUSTSEC-2026-0387
-      # and RUSTSEC-2026-0459 it is the note on the entry itself. Re-verify that analysis before
-      # removing/renewing these on advisory-db updates:
+      # See also the RSA reachability analysis under Dependency Overrides in Cargo.toml.
       # - RUSTSEC-2023-0071 (rsa, Marvin Attack). Locked paths and how each
       #   uses RSA:
       #   rsa 0.9.10:
@@ -192,78 +176,15 @@ jobs:
       #   network latency alone does not prove it unobservable. This exception
       #   requires maintainer risk review. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
-      # - RUSTSEC-2026-0235 (rkyv 0.7.46 via rust_decimal <- sea-orm):
-      #   out-of-bounds read when validating archives containing Rc/Arc.
-      #   rkyv is an OPTIONAL feature of rust_decimal that nothing in this
-      #   workspace enables -- it is in Cargo.lock (which cargo resolves over
-      #   the maximal feature set) but has zero occurrences in
-      #   `cargo tree --target all -e normal`, i.e. it is never compiled, let
-      #   alone fed an archive. No fix is reachable from here: the patch is
-      #   in 0.8.17, upstream dropped the 0.7 series, and rust_decimal 1.42.1
-      #   (latest) still declares `rkyv ^0.7.46`.
-      #   NOTE: this entry exists only because cargo-audit reads Cargo.lock
-      #   rather than what is built. Switching this gate to cargo-auditable
-      #   (`cargo audit bin` against the compiled binary) would drop it
-      #   without an exception -- see the PR that added this line.
-      # - RUSTSEC-2026-0253 (lru 0.16.4, unsound UAF in LruCache::pop()):
-      #   transitive via aws-sdk-s3, which pins `lru = "^0.16.3"`. Verified
-      #   2026-08-24 against aws-sdk-s3 1.143.0 (crates.io latest as of that
-      #   date) that the requirement is unchanged -- upgrading aws-sdk-s3
-      #   does not pull the fixed lru 0.18.2.
-      #   Reviewed 2026-10-06 in locked aws-sdk-s3 1.138.1: its sole LruCache
-      #   consumer uses CacheKey(String), without a custom Drop, and calls
-      #   get_or_insert_mut rather than pop. The advisory's panicking-key-Drop
-      #   prerequisite is absent there. Re-review when the SDK changes.
-      # - RUSTSEC-2026-0381 (webpki-roots: bundled `emSign ECC Root CA - G3`
-      #   lets paths through distrusted emSign intermediates; fixed in
-      #   webpki-roots >= 1.0.10). Cargo.lock has webpki-roots 1.0.10. The
-      #   advisory still matches the 0.26.11 copy that sqlx-core 0.8.6 requires,
-      #   but that release is a semver-compatibility shim whose whole API is
-      #   `pub use parent::TLS_SERVER_ROOTS` over webpki-roots ^1, so the roots
-      #   it serves are 1.0.10's, without the distrusted root. Drop this entry
-      #   once sqlx moves to webpki-roots 1, and re-check it if the shim is
-      #   ever locked against a 1.x older than 1.0.10.
+      # - RUSTSEC-2026-0253 (lru 0.16.4): the locked aws-sdk-s3 uses this
+      #   series for S3ExpressIdentityCache. Its key has no custom Drop,
+      #   and the cache uses get_or_insert_mut. Moving S3 to lru 0.18
+      #   requires coordinating the AWS SDK and Smithy protocol types.
       # - RUSTSEC-2026-0387 (crypto-bigint: arithmetic meant to be
       #   constant-time can branch on secret values; fixed in >= 0.7.6).
-      #   Cargo.lock has 0.7.6 for the copy that russh/rsa pulls in. The 0.5.5
-      #   copy is a direct dependency of aws-sigv4 (checked 2026-10-24, still
-      #   on 0.5 in aws-sigv4 1.6.0), and 0.5 has no patched release, so a
-      #   version bump cannot reach it. aws-sigv4 uses it only to derive the
-      #   ECDSA key for SigV4A (multi-region access points); the S3 requests
-      #   this repository makes are signed with plain SigV4 (HMAC-SHA256),
-      #   which does not touch it. Drop this entry once aws-sigv4 moves to
-      #   crypto-bigint >= 0.7.6.
-      # - RUSTSEC-2026-0459 (libsqlite3-sys: bundled SQLite < 3.54.0 can
-      #   return uninitialized page-cache memory when it opens a database
-      #   together with a crafted sibling `-wal` file of a different page
-      #   size; fixed in >= 0.39.0). Cargo.lock has one copy, 0.30.1, shared
-      #   by sqlx-sqlite 0.8 (sea-orm 1.1's `sqlx-sqlite` feature; sqlx 0.8
-      #   requires libsqlite3-sys 0.30, which has no patched release) and
-      #   sqlx-sqlite 0.9 (microsandbox-db in the exactly pinned microsandbox
-      #   SDK; capped at libsqlite3-sys < 0.38). The crate is
-      #   `links = "sqlite3"`, so no second, patched copy can coexist.
-      #   It is reachable. Two code paths open an on-disk database in WAL
-      #   mode:
-      #   * `temps edge` opens `<cache_dir>/analytics.db` through sea-orm and
-      #     sets `journal_mode = WAL` (temps-edge analytics.rs
-      #     AnalyticsStore::open). The cache dir defaults to
-      #     `~/.temps/edge-cache` and is created with the default umask.
-      #   * the experimental microsandbox backend (not linked on musl or
-      #     Intel macOS) opens the SDK's catalog under
-      #     `<data_dir>/microsandbox/db/` in WAL mode in the server process;
-      #     the `msb` VMM process writes the same catalog. The SDK home is
-      #     0700 and Temps-owned.
-      #   The main server database is never SQLite: temps-database only
-      #   accepts postgres:// URLs, and the other SQLite uses are
-      #   `sqlite::memory:` connections and mocks in tests.
-      #   Planting a crafted `-wal` next to either file takes write access to
-      #   a directory the Temps user owns: the Temps user itself (or root), an
-      #   operator who pointed `--cache-dir` at a shared writable path, or,
-      #   for the catalog, a guest that has already escaped into the VMM,
-      #   which ADR-050 treats as holding whatever the VMM can reach. That
-      #   residual risk is accepted until a patched copy is reachable.
-      #   Drop this entry once both sea-orm's sqlx and microsandbox-db allow
-      #   libsqlite3-sys >= 0.39.
+      #   Cargo.lock has 0.7.11 for the copy that russh/rsa pulls in. The 0.5.5
+      #   copy is required by elliptic-curve 0.13 and aws-sigv4 1.5.1.
+      #   Drop this entry once all consumers support the fixed series.
       # Remove an entry once its upstream is fixed/replaced.
       # Install a checksum-verified release binary before audit-check runs.
       # audit-check otherwise compiles cargo-audit from a newly-resolved
@@ -295,6 +216,11 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           ignore: ${{ env.AUDIT_IGNORE }}
+
+      - name: Verify advisory ignores against the cached database
+        run: |
+          python3 -m unittest discover -s scripts -p test_advisory_ignores.py
+          python3 scripts/advisory_ignores.py
 
   cargo-deny:
     name: Rust Licences, Sources & Bans (cargo-deny)
