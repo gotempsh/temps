@@ -58,11 +58,18 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link, useLocation } from 'react-router'
 import { resolveTimeRange } from '@/lib/time-range-filter'
 import { FacetCombobox } from './FacetCombobox'
+import { TooltipProvider } from '@/components/ui/tooltip'
+import {
+  VisitorLocationCell,
+  VisitorSourceCell,
+  VisitorTechnologyCell,
+} from './VisitorIdentityCells'
 import { crawlerLabel } from '@/components/analytics/traffic-filters-shared'
 import {
   VISITOR_COLUMNS,
   DEFAULT_VISITOR_COLUMNS,
   VISITOR_COLUMNS_STORAGE_KEY,
+  VISITOR_COLUMN_CLASS,
   type VisitorColumn,
 } from './visitor-columns'
 
@@ -89,25 +96,6 @@ type FilterKey = (typeof FILTERS)[number]['key']
 function positiveInteger(value: string | undefined, fallback: number) {
   const parsed = Number(value)
   return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : fallback
-}
-
-function browserName(agent: string) {
-  if (/Edg\/|Edge\//.test(agent)) return 'Edge'
-  if (/OPR\/|Opera/.test(agent)) return 'Opera'
-  if (/Firefox\/|FxiOS\//.test(agent)) return 'Firefox'
-  if (/Chrome\/|CriOS\//.test(agent)) return 'Chrome'
-  if (/Safari\//.test(agent)) return 'Safari'
-  return 'Unknown'
-}
-
-function osName(agent: string) {
-  if (/iPhone|iPad|iPod/.test(agent)) return 'iOS'
-  if (agent.includes('Android')) return 'Android'
-  if (agent.includes('CrOS')) return 'ChromeOS'
-  if (agent.includes('Windows')) return 'Windows'
-  if (agent.includes('Mac OS')) return 'macOS'
-  if (agent.includes('Linux')) return 'Linux'
-  return 'Unknown'
 }
 
 export function VisitorsList({
@@ -211,21 +199,10 @@ export function VisitorsList({
         dateRange,
       })
     )
-  const renderLocationFilter = (key: FilterKey, value: string) => (
-    <Button
-      type="button"
-      variant="link"
-      size="sm"
-      className="h-auto max-w-48 truncate p-0 font-normal text-foreground decoration-muted-foreground underline-offset-4"
-      aria-label={`Filter by ${value}`}
-      aria-pressed={filters[key] === value}
-      onClick={() =>
-        updateFilter(key, filters[key] === value ? undefined : value)
-      }
-    >
-      {value}
-    </Button>
-  )
+  const identityFilters = {
+    activeFilter: (key: FilterKey) => filters[key],
+    onFilter: updateFilter,
+  }
 
   const renderValue = (key: VisitorColumn, visitor: VisitorInfo) => {
     switch (key) {
@@ -253,79 +230,35 @@ export function VisitorsList({
           </RecordLink>
         )
       }
-      case 'location': {
-        const parts = [
-          ['filter_city', visitor.city],
-          ['filter_region', visitor.region],
-          ['filter_country', visitor.country],
-        ] as const
-        return (
-          <div className="max-w-64 space-y-1">
-            {parts
-              .filter(
-                ([, value], index) =>
-                  value && (index !== 1 || value !== visitor.city)
-              )
-              .map(([filter, value]) => (
-                <div key={filter}>{renderLocationFilter(filter, value!)}</div>
-              ))}
-            {!visitor.city && !visitor.region && !visitor.country && (
-              <span className="text-muted-foreground">Unknown</span>
-            )}
-          </div>
-        )
-      }
+      case 'location':
+        return <VisitorLocationCell visitor={visitor} {...identityFilters} />
       case 'source':
-        return (
-          <div className="max-w-48 space-y-1">
-            {visitor.first_channel && (
-              <div>
-                {renderLocationFilter('filter_channel', visitor.first_channel)}
-              </div>
-            )}
-            {visitor.first_referrer_hostname && (
-              <div>
-                {renderLocationFilter(
-                  'filter_referrer',
-                  visitor.first_referrer_hostname
-                )}
-              </div>
-            )}
-            {!visitor.first_channel && !visitor.first_referrer_hostname && (
-              <span className="text-muted-foreground">Direct</span>
-            )}
-          </div>
-        )
+        return <VisitorSourceCell visitor={visitor} {...identityFilters} />
       case 'browser':
-        return (
-          <div>
-            <p>{browserName(visitor.user_agent ?? '')}</p>
-            <p className="text-xs text-muted-foreground">
-              {osName(visitor.user_agent ?? '')}
-            </p>
-          </div>
-        )
+        return <VisitorTechnologyCell visitor={visitor} />
       case 'first_seen':
       case 'last_seen': {
         const value = visitor[key]
         return (
           <time
             dateTime={value}
-            title={value}
+            title={fmtDateTime(value)}
             className="block whitespace-nowrap"
           >
-            <span className="block">{fmtRelativeTime(value)}</span>
-            <span className="text-xs text-muted-foreground">
-              {fmtDateTime(value)}
-            </span>
+            {fmtRelativeTime(value)}
           </time>
         )
       }
-      case 'environment':
-        return (
+      case 'environment': {
+        const name =
           environments.data?.find((item) => item.id === visitor.environment_id)
             ?.name ?? `Environment ${visitor.environment_id}`
+        return (
+          <span className="block max-w-40 truncate" title={name}>
+            {name}
+          </span>
         )
+      }
       default:
         return (
           <span
@@ -342,6 +275,7 @@ export function VisitorsList({
   ).map(({ key, label }) => ({
     key,
     header: label,
+    className: VISITOR_COLUMN_CLASS[key],
     render: (visitor) => renderValue(key, visitor),
   }))
 
@@ -614,13 +548,15 @@ export function VisitorsList({
           />
         </div>
       ) : (
-        <DataTable
-          aria-label="Visitors"
-          columns={columns}
-          rows={data?.visitors ?? []}
-          rowKey={(visitor) => visitor.id}
-          isLoading={isLoading}
-        />
+        <TooltipProvider delayDuration={300}>
+          <DataTable
+            aria-label="Visitors"
+            columns={columns}
+            rows={data?.visitors ?? []}
+            rowKey={(visitor) => visitor.id}
+            isLoading={isLoading}
+          />
+        </TooltipProvider>
       )}
       {data && (
         <ResponsivePagination

@@ -22,6 +22,7 @@ use temps_ai::{
     RefreshPolicy, TokenStream, ToolCall,
 };
 
+use crate::error::AiGatewayError;
 use crate::handlers::gateway::wrap_stream_with_usage_tracking;
 use crate::handlers::sse_usage::UsageKind;
 use crate::self_hosted::{is_self_hosted, SelfHostedCapabilities};
@@ -230,6 +231,93 @@ impl GatewayAiService {
             .managed_model()
             .await
             .map(|_| "temps-cloud".to_string())
+    }
+}
+
+/// Classify a failed completion and log it. The log gets the classified
+/// error, never the gateway's: an upstream reply body can echo the prompt or
+/// a credential, and [`completion_error`] is what drops it.
+fn failed_completion(purpose: &str, model: &str, error: AiGatewayError) -> AiError {
+    let failure = completion_error(purpose, model, error);
+    debug!(error = %failure, purpose, model, "AI completion failed");
+    failure
+}
+
+/// Classify a gateway failure so callers can show what to fix. Failures that
+/// say nothing actionable about the provider (database, encryption, request
+/// translation) stay unclassified [`AiError::Provider`] errors.
+fn completion_error(purpose: &str, model: &str, error: AiGatewayError) -> AiError {
+    use temps_ai::ProviderFailureKind as Kind;
+    let (kind, status, retry_after_secs) = match &error {
+        AiGatewayError::ProviderNotConfigured { .. }
+        | AiGatewayError::ProviderKeyNotFound { .. }
+        | AiGatewayError::AmbiguousModel { .. }
+        | AiGatewayError::SelfHostedModelUnavailable { .. }
+        | AiGatewayError::CapabilityNotDeclared { .. }
+        | AiGatewayError::UnsupportedEndpoint { .. } => (Kind::Misconfigured, None, None),
+        AiGatewayError::ModelNotFound { .. } => (Kind::ModelNotFound, None, None),
+        AiGatewayError::ModelNotAllowed { .. } => (Kind::ModelNotAllowed, None, None),
+        AiGatewayError::UpstreamError { status, .. } => {
+            let kind = match status {
+                401 | 403 => Kind::Authentication,
+                404 => Kind::ModelNotFound,
+                408 | 504 => Kind::Timeout,
+                429 => Kind::RateLimited,
+                400..=499 => Kind::Rejected,
+                _ => Kind::ProviderError,
+            };
+            (kind, Some(*status), None)
+        }
+        AiGatewayError::UpstreamMalformedResponse { .. } | AiGatewayError::StreamError { .. } => {
+            (Kind::MalformedResponse, None, None)
+        }
+        AiGatewayError::UpstreamTimeout { .. } => (Kind::Timeout, None, None),
+        AiGatewayError::HttpClient(_) | AiGatewayError::InvalidProviderUrl { .. } => {
+            (Kind::Unreachable, None, None)
+        }
+        AiGatewayError::RateLimited {
+            retry_after_secs, ..
+        } => (Kind::RateLimited, None, Some(*retry_after_secs)),
+        AiGatewayError::BudgetExceeded {
+            retry_after_secs, ..
+        } => (Kind::BudgetExceeded, None, Some(*retry_after_secs)),
+        AiGatewayError::TranslationError { .. }
+        | AiGatewayError::Validation { .. }
+        | AiGatewayError::Encryption(_)
+        | AiGatewayError::Internal { .. }
+        | AiGatewayError::Database(_)
+        | AiGatewayError::UploadTooLarge { .. }
+        | AiGatewayError::UploadCapacity
+        | AiGatewayError::ProjectNotFound { .. }
+        | AiGatewayError::ObjectNotFound { .. } => {
+            return AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: error.to_string(),
+            };
+        }
+    };
+    // An upstream reply body can echo the request (prompts, page content) or,
+    // for a credential failure, the key; `reason` is logged, so keep only the
+    // status. The gateway's own errors carry no provider text.
+    let reason = match &error {
+        AiGatewayError::UpstreamError { status, .. } if kind == Kind::Authentication => {
+            format!("the provider refused its credentials (upstream status {status})")
+        }
+        AiGatewayError::UpstreamError { status, .. } => {
+            format!("the provider answered upstream status {status} for model '{model}'")
+        }
+        AiGatewayError::UpstreamMalformedResponse { .. } | AiGatewayError::StreamError { .. } => {
+            format!("the provider's reply for model '{model}' could not be read")
+        }
+        _ => error.to_string(),
+    };
+    AiError::ProviderFailed {
+        purpose: purpose.to_string(),
+        model: model.to_string(),
+        kind,
+        status,
+        retry_after_secs,
+        reason,
     }
 }
 
@@ -711,13 +799,7 @@ impl AiService for GatewayAiService {
             .gateway
             .chat_completion(&chat_req, &route)
             .await
-            .map_err(|e| {
-                debug!(error = %e, purpose = request.purpose, model, "AI completion failed");
-                AiError::Provider {
-                    purpose: request.purpose.clone(),
-                    reason: e.to_string(),
-                }
-            })?;
+            .map_err(|e| failed_completion(&request.purpose, &model, e))?;
 
         let text = first_text(&resp).unwrap_or_default();
         let json = if wants_json {
@@ -1181,6 +1263,156 @@ mod tests {
     use temps_core::EncryptionService;
 
     use crate::services::ProviderKeyService;
+
+    fn classified(error: AiGatewayError) -> (temps_ai::ProviderFailureKind, Option<u64>, String) {
+        match completion_error("analytics.test", "mock-flash", error) {
+            AiError::ProviderFailed {
+                kind,
+                retry_after_secs,
+                reason,
+                model,
+                ..
+            } => {
+                assert_eq!(model, "mock-flash");
+                (kind, retry_after_secs, reason)
+            }
+            other => panic!("expected a classified provider failure, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_errors_are_classified_without_leaking_credential_replies() {
+        use temps_ai::ProviderFailureKind as Kind;
+        let upstream = |status: u16| AiGatewayError::UpstreamError {
+            model: "mock-flash".into(),
+            status,
+            message: "{\"error\":{\"message\":\"Incorrect API key provided: sk-test-1234\"}}"
+                .into(),
+        };
+        let (kind, _, reason) = classified(upstream(401));
+        assert_eq!(kind, Kind::Authentication);
+        assert!(!reason.contains("sk-test"), "{reason}");
+        assert_eq!(classified(upstream(403)).0, Kind::Authentication);
+        assert_eq!(classified(upstream(404)).0, Kind::ModelNotFound);
+        assert_eq!(classified(upstream(429)).0, Kind::RateLimited);
+        assert_eq!(classified(upstream(504)).0, Kind::Timeout);
+        assert_eq!(classified(upstream(422)).0, Kind::Rejected);
+        assert_eq!(classified(upstream(500)).0, Kind::ProviderError);
+        // No upstream reply body reaches `reason`, which is logged: it can
+        // echo the request as well as credentials.
+        for status in [400, 404, 422, 429, 500, 503] {
+            let (_, _, reason) = classified(upstream(status));
+            assert!(!reason.contains("sk-test"), "{status}: {reason}");
+            assert!(reason.contains(&status.to_string()), "{status}: {reason}");
+        }
+        let (kind, _, reason) = classified(AiGatewayError::UpstreamMalformedResponse {
+            provider: "openai_compatible".into(),
+            reason: "expected JSON, got: summarise these pages: secret-page-text".into(),
+        });
+        assert_eq!(kind, Kind::MalformedResponse);
+        assert!(!reason.contains("secret-page-text"), "{reason}");
+        assert_eq!(
+            classified(AiGatewayError::ModelNotFound {
+                model: "mock-flash".into()
+            })
+            .0,
+            Kind::ModelNotFound
+        );
+        assert_eq!(
+            classified(AiGatewayError::UpstreamTimeout {
+                reason: "deadline".into()
+            })
+            .0,
+            Kind::Timeout
+        );
+        assert_eq!(
+            classified(AiGatewayError::HttpClient("connection refused".into())).0,
+            Kind::Unreachable
+        );
+        assert_eq!(
+            classified(AiGatewayError::UpstreamMalformedResponse {
+                provider: "mock".into(),
+                reason: "not json".into()
+            })
+            .0,
+            Kind::MalformedResponse
+        );
+        assert_eq!(
+            classified(AiGatewayError::RateLimited {
+                project_id: 7,
+                limit: 10,
+                retry_after_secs: 12
+            })
+            .1,
+            Some(12)
+        );
+        assert_eq!(
+            classified(AiGatewayError::BudgetExceeded {
+                project_id: 7,
+                limit_microcents: 1,
+                used_microcents: 2,
+                retry_after_secs: 3600
+            })
+            .0,
+            Kind::BudgetExceeded
+        );
+        assert!(matches!(
+            completion_error(
+                "analytics.test",
+                "mock-flash",
+                AiGatewayError::Internal {
+                    message: "pool closed".into()
+                }
+            ),
+            AiError::Provider { .. }
+        ));
+    }
+
+    /// Collects what a `fmt` subscriber writes, so a test can read the log.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_completion_failure_log_omits_the_upstream_reply() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let failure = tracing::subscriber::with_default(subscriber, || {
+            failed_completion(
+                "analytics.test",
+                "mock-flash",
+                AiGatewayError::UpstreamError {
+                    model: "mock-flash".into(),
+                    status: 401,
+                    message: "Incorrect API key provided: sk-test-1234 for page /private-path"
+                        .into(),
+                },
+            )
+        });
+        assert!(
+            matches!(failure, AiError::ProviderFailed { .. }),
+            "{failure:?}"
+        );
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("AI completion failed"), "{logged}");
+        assert!(logged.contains("upstream status 401"), "{logged}");
+        assert!(!logged.contains("sk-test"), "{logged}");
+        assert!(!logged.contains("/private-path"), "{logged}");
+    }
 
     #[test]
     fn sse_lines_keep_a_character_split_across_chunks() {

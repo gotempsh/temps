@@ -995,6 +995,35 @@
         ],
         "type": "object"
       },
+      "ActivityCooldowns": {
+        "properties": {
+          "preview_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "report_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "website_analysis_secs": {
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ActivityDay": {
         "description": "Daily activity count for a single day",
         "properties": {
@@ -1105,6 +1134,104 @@
           }
         },
         "type": "object"
+      },
+      "ActivityErrorBody": {
+        "description": "RFC 7807 body of every activity error. Fields other than `title`,\n`detail` and `code` appear only when they apply to that code.",
+        "properties": {
+          "code": {
+            "$ref": "#/components/schemas/ActivityErrorCode"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "model": {
+            "description": "The model the AI Gateway routed the request to.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operation": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActivityOperation",
+                "description": "The action that is running or cooling down."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_failure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActivityProviderFailure"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider_status": {
+            "description": "The upstream HTTP status, when the provider answered.",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "retry_after_secs": {
+            "description": "Also sent as the `Retry-After` header.",
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "setup_url": {
+            "description": "Console path where the operator can fix the problem.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "started_at": {
+            "description": "When the running action started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "title",
+          "detail",
+          "code"
+        ],
+        "type": "object"
+      },
+      "ActivityErrorCode": {
+        "description": "Machine-readable reason in an activity error response.",
+        "enum": [
+          "not_found",
+          "validation",
+          "analysis_running",
+          "cooling_down",
+          "server_busy",
+          "superseded",
+          "ai_unavailable",
+          "provider_error",
+          "site_unreadable",
+          "invalid_model_output",
+          "internal"
+        ],
+        "type": "string"
       },
       "ActivityEvent": {
         "description": "A single activity event for the real-time activity feed",
@@ -1400,6 +1527,22 @@
         ],
         "type": "object"
       },
+      "ActivityInProgress": {
+        "properties": {
+          "operation": {
+            "$ref": "#/components/schemas/ActivityOperation"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "started_at"
+        ],
+        "type": "object"
+      },
       "ActivityKind": {
         "description": "What happened to the group.",
         "enum": [
@@ -1412,6 +1555,15 @@
           "split",
           "issue_linked",
           "issue_unlinked"
+        ],
+        "type": "string"
+      },
+      "ActivityOperation": {
+        "description": "An AI-assisted activity action. Each one is limited to one at a time per\nproject and cools down briefly after it spends provider tokens.",
+        "enum": [
+          "website_analysis",
+          "preview",
+          "report"
         ],
         "type": "string"
       },
@@ -1495,6 +1647,23 @@
           "value"
         ],
         "type": "object"
+      },
+      "ActivityProviderFailure": {
+        "description": "Why the AI provider refused or failed the request.",
+        "enum": [
+          "authentication",
+          "model_not_found",
+          "model_not_allowed",
+          "rate_limited",
+          "budget_exceeded",
+          "timeout",
+          "malformed_response",
+          "unreachable",
+          "misconfigured",
+          "rejected",
+          "provider_error"
+        ],
+        "type": "string"
       },
       "ActivityReport": {
         "properties": {
@@ -1728,9 +1897,24 @@
           "configured": {
             "type": "boolean"
           },
+          "cooldowns": {
+            "$ref": "#/components/schemas/ActivityCooldowns",
+            "description": "Seconds until each action can use the AI provider again."
+          },
           "has_recent_activity": {
             "description": "Whether tracked non-crawler visitor events exist in the previous 24 hours.",
             "type": "boolean"
+          },
+          "in_progress": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ActivityInProgress",
+                "description": "The AI-assisted action running for this project right now, if any:\na website analysis or preview started from the console, or a report run."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "last_error": {
             "type": [
@@ -90562,6 +90746,19 @@
       },
       "VisitorInfo": {
         "properties": {
+          "browser": {
+            "description": "Browser named by `user_agent` (e.g. \"Chrome\"), as analytics breakdowns name it",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "browser_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "city": {
             "type": [
               "string",
@@ -90673,6 +90870,19 @@
             "format": "double",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "operating_system": {
+            "description": "Operating system named by `user_agent` (e.g. \"Windows 10\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operating_system_version": {
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -154319,6 +154529,22 @@
                 }
               }
             }
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Access denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
           }
         },
         "security": [
@@ -154356,6 +154582,42 @@
         "responses": {
           "204": {
             "description": "Settings saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Invalid settings"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Access denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "A report run is in progress; `Retry-After` says when its lease ends at the latest"
           }
         },
         "security": [
@@ -154403,19 +154665,90 @@
             }
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
             "description": "Invalid public URL or consent missing"
+          },
+          "401": {
+            "description": "Authentication required"
           },
           "403": {
             "description": "Access denied"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
           "409": {
-            "description": "Busy"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "An analysis is already running for this project"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The public website could not be read"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Cooling down after spending provider tokens, or rate-limited; see `Retry-After`"
           },
           "502": {
-            "description": "Site scan or AI suggestion failed"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider failed or returned unusable output"
           },
           "503": {
-            "description": "AI provider missing"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "AI provider not configured, or analysis capacity busy"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider timed out"
           }
         },
         "security": [
@@ -154463,22 +154796,80 @@
             }
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
             "description": "Invalid goal or sharing disabled"
+          },
+          "401": {
+            "description": "Authentication required"
           },
           "403": {
             "description": "Access denied"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
             "description": "Project not found"
           },
           "409": {
-            "description": "Analysis busy or preview cooling down"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "An analysis is already running for this project"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Cooling down after spending provider tokens, or rate-limited; see `Retry-After`"
           },
           "502": {
-            "description": "AI preview failed"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider failed or returned unusable output"
           },
           "503": {
-            "description": "AI provider not configured"
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "AI provider not configured, or analysis capacity busy"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider timed out"
           }
         },
         "security": [
@@ -154514,6 +154905,82 @@
                 }
               }
             }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Setup incomplete or sharing disabled"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Access denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Analysis already running, or the run was superseded"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Cooling down after spending provider tokens, or rate-limited; see `Retry-After`"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider failed the request"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "AI provider not configured, or analysis capacity busy"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "The AI provider timed out"
           }
         },
         "security": [

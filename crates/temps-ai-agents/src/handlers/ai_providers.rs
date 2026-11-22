@@ -703,6 +703,9 @@ pub async fn refresh_ai_provider_models(
             temps_ai::AiError::NotAvailable => ("not_available", None),
             temps_ai::AiError::NoModel { purpose } => ("no_model", Some(purpose.as_str())),
             temps_ai::AiError::Provider { purpose, .. } => ("provider", Some(purpose.as_str())),
+            temps_ai::AiError::ProviderFailed { purpose, .. } => {
+                ("provider_failed", Some(purpose.as_str()))
+            }
             temps_ai::AiError::StreamInterrupted { purpose, .. } => {
                 ("stream_interrupted", Some(purpose.as_str()))
             }
@@ -1576,6 +1579,7 @@ fn credential_verification_log_fields(error: &temps_ai::AiError) -> (&'static st
                 _ => "other",
             },
         ),
+        temps_ai::AiError::ProviderFailed { kind, .. } => ("provider", kind.as_str()),
         temps_ai::AiError::NotAvailable => ("service", "not_available"),
         temps_ai::AiError::NoModel { .. } => ("service", "no_model"),
         temps_ai::AiError::StreamInterrupted { .. } => ("service", "stream_interrupted"),
