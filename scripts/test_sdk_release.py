@@ -571,6 +571,9 @@ class ReleaseTests(unittest.TestCase):
         # An exact Node, so its bundled npm can stage (a cached older Node 24 may not).
         self.assertRegex(publish, r"node-version: '\d+\.\d+\.\d+'")
         self.assertNotIn('npm publish', publish)
+        # Registries trust exactly one environment, whatever the channel.
+        self.assertIn('    environment: sdk\n', publish)
+        self.assertNotIn('sdk_channel }}', publish.split('    concurrency:')[0])
 
 
 class FakeHistory:
