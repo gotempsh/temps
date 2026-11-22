@@ -79574,7 +79574,11 @@ export type SaveActivitySettingsErrors = {
      */
     403: unknown;
     /**
-     * A report run is in progress; `Retry-After` says when it ends at the latest
+     * Project not found
+     */
+    404: ActivityErrorBody;
+    /**
+     * A report run is in progress; `Retry-After` says when its lease ends at the latest
      */
     409: ActivityErrorBody;
 };
@@ -79728,6 +79732,10 @@ export type RunActivityReportErrors = {
      * Access denied
      */
     403: unknown;
+    /**
+     * Project not found
+     */
+    404: ActivityErrorBody;
     /**
      * Analysis already running, or the run was superseded
      */

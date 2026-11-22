@@ -154290,6 +154290,16 @@
           "403": {
             "description": "Access denied"
           },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
           "409": {
             "content": {
               "application/json": {
@@ -154298,7 +154308,7 @@
                 }
               }
             },
-            "description": "A report run is in progress; `Retry-After` says when it ends at the latest"
+            "description": "A report run is in progress; `Retry-After` says when its lease ends at the latest"
           }
         },
         "security": [
@@ -154602,6 +154612,16 @@
           },
           "403": {
             "description": "Access denied"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ActivityErrorBody"
+                }
+              }
+            },
+            "description": "Project not found"
           },
           "409": {
             "content": {
