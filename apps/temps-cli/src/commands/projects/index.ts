@@ -9,6 +9,7 @@ import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
 import { projectSourceAction } from './source.js'
 import { projectHostingAction } from './hosting.js'
+import { projectContainerSecurityAction } from './container-security.js'
 import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 import { cloudflareCapabilityAction } from './cloudflare-capability.js'
@@ -154,6 +155,16 @@ export function registerProjectsCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--json', 'Output in JSON format')
     .action(projectHostingAction)
+
+  projects
+    .command('container-security')
+    .description('Show or change which Linux capabilities the project\'s containers get back (only NET_BIND_SERVICE can be allowed)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--allow <capabilities...>', 'Allow these capabilities, e.g. NET_BIND_SERVICE (asks for confirmation)')
+    .option('--remove <capabilities...>', 'Stop allowing these capabilities')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip the confirmation (for automation)')
+    .action(projectContainerSecurityAction)
 
   projects
     .command('config')
