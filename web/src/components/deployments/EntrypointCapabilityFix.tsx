@@ -157,32 +157,34 @@ export function EntrypointCapabilityFix({
           , or change the image: {fix.image_fix}
         </p>
       )}
-      {(query.data?.can_edit || query.isError) && (
-        <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap sm:items-center">
-          {query.data?.can_edit && (
-            <Button
-              type="button"
-              size="sm"
-              className="h-7"
-              disabled={apply.isPending || (alreadyAllowed && !onRedeploy)}
-              onClick={() => {
-                if (alreadyAllowed) apply.mutate()
-                else {
-                  setAcknowledged(false)
-                  setConfirmOpen(true)
-                }
-              }}
-            >
-              {apply.isPending && (
-                <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
-              )}
-              {actionLabel}
-            </Button>
+      {query.isError && (
+        <p className="text-muted-foreground" role="note">
+          Could not check whether you can change it. Allow {label} in{' '}
+          <Link to={settingsHref} className="underline underline-offset-4">
+            Container security
+          </Link>{' '}
+          and redeploy, or change the image: {fix.image_fix}
+        </p>
+      )}
+      {query.data?.can_edit && (
+        <Button
+          type="button"
+          size="sm"
+          className="h-7"
+          disabled={apply.isPending || (alreadyAllowed && !onRedeploy)}
+          onClick={() => {
+            if (alreadyAllowed) apply.mutate()
+            else {
+              setAcknowledged(false)
+              setConfirmOpen(true)
+            }
+          }}
+        >
+          {apply.isPending && (
+            <Loader2 className="mr-1.5 h-3 w-3 animate-spin" />
           )}
-          <Button asChild variant="outline" size="sm" className="h-7">
-            <Link to={settingsHref}>Container security</Link>
-          </Button>
-        </div>
+          {actionLabel}
+        </Button>
       )}
       {alreadyAllowed && !apply.isPending && (
         <p className="text-xs text-muted-foreground">
