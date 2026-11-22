@@ -403,6 +403,26 @@ class ReleaseTests(unittest.TestCase):
                 release.publish(packages, self.root, 'npm')
         self.assertEqual([Path(a).parent.name for a in staged], ['blob', 'plugin'])
 
+    def test_a_refused_dependency_keeps_its_place_in_the_approval_order(self):
+        packages = self.npm_packages('analytics-core', 'react-analytics')
+
+        def command(*args, **kwargs):
+            if args == ('npm', '--version'):
+                return '11.19.1'
+            if Path(args[3]).parent.name == 'analytics-core':
+                raise subprocess.CalledProcessError(1, args)
+
+        out = io.StringIO()
+        with patch.object(release, 'pending_files', side_effect=lambda p, d, *_: [d / 'package.tgz']), \
+                patch.object(release, 'guard_npm_channel'), patch.object(release, 'run', side_effect=command), \
+                redirect_stdout(out):
+            with self.assertRaisesRegex(ValueError, 'refused to stage @temps-sdk/analytics-core'):
+                release.publish(packages, self.root, 'npm')
+        self.assertRegex(out.getvalue(), r'in this order so dependencies are public first: '
+                                         r'@temps-sdk/analytics-core@1\.3\.0-beta\.1 \(npm refused to stage it in this run\), '
+                                         r'@temps-sdk/react-analytics@1\.3\.0-beta\.1\. '
+                                         r'Before approving anything listed after a refused version')
+
     def test_package_tags_wait_until_npm_versions_are_approved(self):
         packages = self.npm_packages('analytics-core', 'react-analytics') + [
             dict(self.catalog['python'], key='python', version='1.3.0b1')]

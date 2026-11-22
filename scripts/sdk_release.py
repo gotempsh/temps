@@ -408,10 +408,18 @@ def require_stage_npm():
         raise ValueError(f'npm {raw} cannot stage packages (`npm stage` needs npm {wanted} or later); nothing was uploaded')
 
 
-def approval_steps(waiting):
-    names = ', '.join(f"{p['name']}@{p['version']}" for p in waiting)
+def approval_steps(waiting, refused=()):
+    """Every waiting version in publish order, so a dependency is never left out of the order.
+
+    `refused` marks versions this run could not stage: they keep their place,
+    and nothing after one may be approved until it is public.
+    """
+    names = ', '.join(f"{p['name']}@{p['version']}" + (' (npm refused to stage it in this run)' if p in refused else '')
+                      for p in waiting)
+    blocked = ('Before approving anything listed after a refused version, make that version public: approve it '
+               'if an earlier run staged it, otherwise fix the refusal and rerun this job. ') if refused else ''
     return (f'Approve the staged npm versions, in this order so dependencies are public first: {names}. '
-            'Approve them on npmjs.com, or run `npm stage list` and `npm stage approve <stage-id>` '
+            f'{blocked}Approve them on npmjs.com, or run `npm stage list` and `npm stage approve <stage-id>` '
             '(both need your login and 2FA). Then rerun this job: it skips what is already public '
             'and creates the package tags.')
 
@@ -448,9 +456,7 @@ def stage_npm(selected, output):
             summary(f"{p['name']} {p['version']}: npm refused to stage it (see the log above)")
             continue
         summary(f"{p['name']} {p['version']}: staged on npm, waiting for approval")
-    staged = [p for p, _ in waiting if p not in refused]
-    if staged:
-        summary(approval_steps(staged))
+    summary(approval_steps([p for p, _ in waiting], refused))
     if refused:
         names = ', '.join(f"{p['name']}@{p['version']}" for p in refused)
         raise ValueError(f'npm refused to stage {names}. If npm says the version already exists, an earlier '
