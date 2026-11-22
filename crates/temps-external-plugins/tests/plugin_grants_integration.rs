@@ -311,10 +311,31 @@ async fn test_consume_ai_call_concurrent_requests_allow_exact_daily_limit() {
 async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
     use sea_orm::EntityTrait;
     use temps_entities::external_plugin_actors;
-    use temps_migrations::{Migrator, MigratorTrait, SchemaManager};
+    use temps_migrations::{MigrationTrait, Migrator, MigratorTrait, SchemaManager};
 
-    let Some(database) = boot_database().await else {
-        return;
+    const CONSENT: &str = "m20261108_000001_external_plugin_ai_tools";
+
+    // Exercise rollback at the schema version under test. Later migrations
+    // legitimately refer to the actor tables and must keep their foreign keys.
+    struct ActorConsentSchema;
+    impl MigratorTrait for ActorConsentSchema {
+        fn migrations() -> Vec<Box<dyn MigrationTrait>> {
+            let mut history = Migrator::migrations();
+            let consent = history
+                .iter()
+                .position(|migration| migration.name() == CONSENT)
+                .expect("AI consent migration must be registered");
+            history.truncate(consent + 1);
+            history
+        }
+    }
+    let database = match TestDatabase::with_custom_migrations::<ActorConsentSchema>().await {
+        Ok(database) => database,
+        Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+            eprintln!("Docker unavailable; skipping actor migration rollback: {error}");
+            return;
+        }
+        Err(error) => panic!("historical actor migration database: {error}"),
     };
     let db = database.connection_arc();
     let service = PluginGrantService::new(db.clone());
@@ -340,7 +361,7 @@ async fn test_actor_migration_rolls_back_populated_tables_and_reapplies() {
         .expect("actor migration must be registered");
     let consent_migration = Migrator::migrations()
         .into_iter()
-        .find(|migration| migration.name() == "m20261108_000001_external_plugin_ai_tools")
+        .find(|migration| migration.name() == CONSENT)
         .expect("AI consent migration must be registered");
     let manager = SchemaManager::new(db.as_ref());
     // Roll back dependent columns before dropping their owning table.
