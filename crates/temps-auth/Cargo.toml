@@ -37,7 +37,7 @@ base32 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 qrcode = { workspace = true }
-image = { workspace = true, features = ["default"] }
+image = { workspace = true, features = ["png"] }
 base64 = { workspace = true }
 urlencoding = { workspace = true }
 tracing = { workspace = true }
@@ -50,7 +50,6 @@ rsa = { workspace = true, features = ["pem"] }
 temps-test-utils = { path = "../temps-test-utils" }
 # Paused-clock tests (`start_paused`, `time::advance`).
 tokio = { workspace = true, features = ["test-util"] }
-walkdir = { workspace = true }
 
 [lints]
 workspace = true
