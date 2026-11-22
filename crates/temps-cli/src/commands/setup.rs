@@ -18,7 +18,9 @@ use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
 use std::io::{self, Write};
+mod eager_dns;
 mod generated_hostname;
+use eager_dns::issuance_contact;
 use generated_hostname::{embedded_ipv4_from_zone, generated_domain_for, is_loopback_zone};
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
@@ -1601,12 +1603,6 @@ impl SetupCommand {
         }
     }
 
-    fn eager_acme_contact(&self) -> anyhow::Result<&str> {
-        self.letsencrypt_email.as_deref().ok_or_else(|| anyhow::anyhow!(
-            "Eager DNS-01 issuance requires a deliverable ACME contact. Pass --letsencrypt-email or --email."
-        ))
-    }
-
     fn resolve_acme_contact(
         &mut self,
         admin_email: &str,
@@ -2384,8 +2380,6 @@ impl SetupCommand {
             );
         }
 
-        let acme_email = self.eager_acme_contact()?;
-
         // SSL Certificate Provisioning
         print_section("SSL Certificate Provisioning");
         println!(
@@ -2569,11 +2563,12 @@ impl SetupCommand {
         };
         println!();
 
-        // Check if domain already has a valid certificate. "active_renewal_failed"
-        // still has a usable cert (only its last renewal failed), so it counts too.
-        if temps_entities::domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
-            && domain.certificate.is_some()
-        {
+        let Some(acme_email) = issuance_contact(
+            &domain.status,
+            domain.certificate.is_some(),
+            self.letsencrypt_email.as_deref(),
+        )?
+        else {
             println!(
                 "   {} Domain '{}' already has a valid certificate!",
                 "🎉".bright_green(),
@@ -2608,7 +2603,7 @@ impl SetupCommand {
                 self.admin_password.is_some(),
                 &self.output_format,
             );
-        }
+        };
 
         // Step 4: Request DNS-01 challenge from Let's Encrypt
         print_step(4, 8, "Requesting Let's Encrypt DNS-01 challenge");
@@ -3391,14 +3386,18 @@ mod tests {
         cmd.resolve_installation_inputs().unwrap();
         cmd.resolve_acme_contact("admin@example.com", Some("old@example.com"))
             .unwrap();
-        assert_eq!(cmd.eager_acme_contact().unwrap(), "certs@example.com");
+        assert_eq!(
+            issuance_contact("pending", false, cmd.letsencrypt_email.as_deref()).unwrap(),
+            Some("certs@example.com")
+        );
         let mut unset = parse_setup(&[]);
         unset.resolve_acme_contact("admin@localhost", None).unwrap();
-        assert!(unset
-            .eager_acme_contact()
-            .unwrap_err()
-            .to_string()
-            .contains("--letsencrypt-email"));
+        assert!(
+            issuance_contact("pending", false, unset.letsencrypt_email.as_deref())
+                .unwrap_err()
+                .to_string()
+                .contains("--letsencrypt-email")
+        );
     }
 
     #[test]
