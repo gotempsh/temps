@@ -23,3 +23,18 @@ export const DEFAULT_VISITOR_COLUMNS: VisitorColumn[] = [
   'browser',
 ]
 export const VISITOR_COLUMNS_STORAGE_KEY = 'temps:visitor-columns'
+
+/**
+ * Columns by priority as the table narrows: a phone keeps the visitor and
+ * when they were last seen; the visitor page still shows everything hidden.
+ */
+export const VISITOR_COLUMN_CLASS: Partial<Record<VisitorColumn, string>> = {
+  location: 'hidden @lg:table-cell',
+  source: 'hidden @2xl:table-cell',
+  browser: 'hidden @3xl:table-cell',
+  first_seen: 'hidden @4xl:table-cell',
+  current_page: 'hidden @4xl:table-cell',
+  ip_address: 'hidden @4xl:table-cell',
+  environment: 'hidden @4xl:table-cell',
+  user_agent: 'hidden @4xl:table-cell',
+}

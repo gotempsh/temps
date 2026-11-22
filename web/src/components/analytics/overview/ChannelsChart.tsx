@@ -16,33 +16,10 @@ import {
 import { format } from 'date-fns'
 import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
-import type { LucideIcon } from 'lucide-react'
-import {
-  ChevronLeft,
-  Globe,
-  Link,
-  Mail,
-  Megaphone,
-  Search,
-  Share2,
-  Tag,
-  Zap,
-} from 'lucide-react'
+import { channelIcon } from './channel-identity'
+import { ChevronLeft, Globe } from 'lucide-react'
 import * as React from 'react'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
-
-const CHANNEL_ICONS: Record<string, LucideIcon> = {
-  Direct: Link,
-  Organic: Search,
-  'Organic Search': Search,
-  Paid: Megaphone,
-  'Paid Search': Megaphone,
-  Social: Share2,
-  Referral: Globe,
-  Email: Mail,
-  Display: Tag,
-  Affiliate: Zap,
-}
 
 const CHANNEL_COLORS: Record<string, string> = {
   Direct: 'var(--chart-1)',
@@ -228,9 +205,7 @@ export function ChannelsChart({
         ) : (
           <div className="space-y-3">
             {sortedItems.map((item) => {
-              const Icon = selectedChannel
-                ? null
-                : CHANNEL_ICONS[item.value] || Globe
+              const Icon = selectedChannel ? null : channelIcon(item.value)
               const color = selectedChannel
                 ? undefined
                 : CHANNEL_COLORS[item.value]
