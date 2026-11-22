@@ -2010,6 +2010,7 @@ mod tests {
             log_rotation: None,
             labels: BTreeMap::new(),
             security: SecurityProfile::Trusted,
+            capabilities: Vec::new(),
         }
     }
 

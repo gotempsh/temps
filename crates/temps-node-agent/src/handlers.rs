@@ -402,6 +402,7 @@ fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
         | temps_deployer::DeployerError::SecretMountFailed { .. }
         | temps_deployer::DeployerError::ImageRemoval { .. }
         | temps_deployer::DeployerError::ImageInventory { .. }
+        | temps_deployer::DeployerError::FileCapabilities { .. }
         | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // DockerUnavailable is returned when the control-plane node has no
         // Docker daemon; the caller should direct traffic to a worker node.
@@ -1974,6 +1975,51 @@ pub async fn get_container_info(
                 format!("Failed to get info for container {}: {}", container_id, e),
             )
             .into_response()
+        }
+    }
+}
+
+/// The Linux file capabilities set on one file of a Temps-managed
+/// container, for diagnosing an entrypoint the kernel refused to execute.
+/// Reads only the archive headers, never the file. A container without the
+/// `sh.temps.managed` label reads as absent, like every other route here.
+pub async fn get_file_capabilities(
+    State(state): State<Arc<AgentState>>,
+    Path(container_id): Path<String>,
+    axum::extract::Query(query): axum::extract::Query<
+        temps_deployer::remote::FileCapabilitiesQuery,
+    >,
+) -> impl IntoResponse {
+    match state
+        .container_deployer
+        .get_container_info(&container_id)
+        .await
+    {
+        Ok(info) if is_temps_managed_container(&info) => {}
+        Ok(_) => {
+            return error_response(StatusCode::NOT_FOUND, "Container not found".into())
+                .into_response()
+        }
+        Err(error) => {
+            return error_response(
+                container_error_status(&error),
+                format!("Failed to get info for container {container_id}: {error}"),
+            )
+            .into_response()
+        }
+    }
+    match state
+        .container_deployer
+        .file_capabilities(&container_id, &query.path)
+        .await
+    {
+        Ok(capabilities) => {
+            AgentResponse::ok(temps_deployer::remote::FileCapabilitiesAnswer { capabilities })
+                .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(container_id = %container_id, reason = %error, "Failed to read file capabilities");
+            error_response(container_error_status(&error), error.to_string()).into_response()
         }
     }
 }

@@ -170,6 +170,9 @@ pub struct InstanceSpec {
     pub log_rotation: Option<LogRotation>,
     pub labels: BTreeMap<String, String>,
     pub security: SecurityProfile,
+    /// Capabilities added back to the hardened set. Drivers honour them
+    /// only for `Trusted` and `HostPrivileged` (deployments).
+    pub capabilities: Vec<crate::ContainerCapability>,
 }
 
 /// Where the attacher put the instance: networks to join and the resolver.

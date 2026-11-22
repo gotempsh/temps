@@ -221,6 +221,26 @@ fn admit_with(
         kind_profile(kind)
     };
     spec.security = Some(profile);
+    // A project's capability opt-in reaches its deployment replicas only.
+    // A job, sandbox, function or database that carried one was not built
+    // by the deployment path and is refused rather than silently started
+    // with (or without) it.
+    if !spec.process.capabilities.is_empty() && kind != WorkloadKind::Deployment {
+        let names: Vec<&str> = spec
+            .process
+            .capabilities
+            .iter()
+            .map(|capability| capability.as_str())
+            .collect();
+        return Err(refuse(
+            AdmissionRule::SecurityProfile,
+            format!(
+                "asks for Linux capabilities {}, which only a deployment replica may be granted \
+                 (through its project's container security setting); a {kind} never is",
+                names.join(", ")
+            ),
+        ));
+    }
     if profile == SecurityProfile::Untrusted && spec.network.egress == Some(EgressProfile::Open) {
         // Untrusted workloads get at most `restricted` egress.
         spec.network.egress = Some(EgressProfile::Restricted);
@@ -829,6 +849,43 @@ mod tests {
             app_protocol: Default::default(),
         });
         spec
+    }
+
+    #[test]
+    fn only_a_deployment_replica_may_carry_capabilities() {
+        let owner = Owner::new("deployment", 42);
+        let mut spec = deployment_spec();
+        spec.process.capabilities = vec![temps_workload::ContainerCapability::NetBindService];
+        let admitted =
+            admit(&AdmissionPolicy::default(), input(spec, &owner, None)).expect("admitted");
+        assert_eq!(
+            admitted.process.capabilities,
+            vec![temps_workload::ContainerCapability::NetBindService]
+        );
+        assert_eq!(admitted.security, Some(SecurityProfile::Trusted));
+
+        let cron = owner_cron();
+        let mut job = job_spec("app:1");
+        job.process.capabilities = vec![temps_workload::ContainerCapability::NetBindService];
+        let refused = admit(&AdmissionPolicy::default(), input(job, &cron, None)).unwrap_err();
+        assert_eq!(refused.rule, AdmissionRule::SecurityProfile);
+        assert!(
+            refused.message.contains("NET_BIND_SERVICE") && refused.message.contains("job"),
+            "{}",
+            refused.message
+        );
+
+        // A spec without capabilities is admitted unchanged for every kind.
+        let plain = admit(
+            &AdmissionPolicy::default(),
+            input(job_spec("app:1"), &cron, None),
+        )
+        .expect("admitted");
+        assert!(plain.process.capabilities.is_empty());
+    }
+
+    fn owner_cron() -> Owner {
+        Owner::new("cron", 7)
     }
 
     /// ADR-055 Phase 10: only a deployment replica may ask for a microVM,

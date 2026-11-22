@@ -504,6 +504,7 @@ mod tests {
             log_rotation: None,
             labels: BTreeMap::new(),
             security: temps_workload::SecurityProfile::Trusted,
+            capabilities: Vec::new(),
         }
     }
 

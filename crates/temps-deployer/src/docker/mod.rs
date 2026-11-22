@@ -20,6 +20,7 @@ mod build_dns;
 mod build_failure;
 mod build_limits;
 mod deployer;
+pub(crate) mod file_capabilities;
 mod guards;
 mod image_builder;
 mod log_tail;

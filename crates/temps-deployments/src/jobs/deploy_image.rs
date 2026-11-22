@@ -580,6 +580,10 @@ pub struct DeploymentJobConfig {
     /// outside this crate construct a config that claims control-plane
     /// authorization it was never given.
     pub(crate) control_plane_grants_socket: bool,
+    /// Linux capabilities the project allowed back on top of the hardened
+    /// host config (`projects.allowed_capabilities`). Empty, the default,
+    /// keeps every replica fully hardened.
+    pub allowed_capabilities: Vec<temps_workload::ContainerCapability>,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
     /// (linked-service container names are replaced with their internal
@@ -665,6 +669,7 @@ impl Default for DeploymentJobConfig {
             target_labels: None,
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
             remote_environment_variables: None,
             cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
@@ -5052,6 +5057,18 @@ impl DeployImageJobBuilder {
     ) -> Self {
         self.config.volume_mounts = mounts;
         self.config.volume_pin = pin;
+        self
+    }
+
+    /// The project's container security opt-in: the allow-listed Linux
+    /// capabilities its replicas get back after `cap_drop: ALL`. Every
+    /// deploy path that starts a project's containers passes the
+    /// project's own setting here (`projects::Model::container_capabilities`).
+    pub fn allowed_capabilities(
+        mut self,
+        capabilities: Vec<temps_workload::ContainerCapability>,
+    ) -> Self {
+        self.config.allowed_capabilities = capabilities;
         self
     }
 

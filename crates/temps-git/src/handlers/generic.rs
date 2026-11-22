@@ -435,6 +435,7 @@ mod tests {
             bitbucket_webhook_token: None,
             bitbucket_webhook_hook_id: None,
             generic_webhook_token: None,
+            allowed_capabilities: Vec::new(),
         }
     }
 

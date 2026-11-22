@@ -351,6 +351,10 @@ impl DeployImageJob {
             // second field carries. Both halves must agree.
             project_slug: self.config.project_slug.clone(),
             control_plane_grants_socket: self.config.control_plane_grants_socket,
+            // The project's container security opt-in, read when the job
+            // was built. The executing host applies it in the one hardened
+            // host-config function every project container goes through.
+            allowed_capabilities: self.config.allowed_capabilities.clone(),
         };
 
         Ok(PreparedReplica {

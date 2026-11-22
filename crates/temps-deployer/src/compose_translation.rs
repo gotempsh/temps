@@ -710,6 +710,7 @@ impl<'a> Context<'a> {
             user: field("user")
                 .map(|value| self.scalar(name, "user", value))
                 .transpose()?,
+            capabilities: Vec::new(),
         };
 
         let environment = self.environment(name, definition)?;

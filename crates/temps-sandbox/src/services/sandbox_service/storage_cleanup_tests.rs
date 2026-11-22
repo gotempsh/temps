@@ -1644,6 +1644,7 @@ fn project_row(git_url: Option<&str>) -> projects::Model {
         analytics_identity_mode: Default::default(),
         instantiation_token: None,
         cloud_telemetry_attribute_allowlist: Vec::new(),
+        allowed_capabilities: Vec::new(),
     }
 }
 

@@ -154,6 +154,7 @@ mod tests {
             }),
             labels: BTreeMap::from([("temps.service_type".into(), "postgres".into())]),
             security: SecurityProfile::Data,
+            capabilities: Vec::new(),
         }
     }
 

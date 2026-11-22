@@ -16,6 +16,7 @@
 //! (`temps-workload-env`, `-netpol`, `-ingress`, `-volumes`) and products
 //! can all use it without depending on each other.
 
+pub mod capability;
 pub mod condition;
 pub mod driver;
 pub mod egress;
@@ -26,6 +27,10 @@ pub mod sandbox;
 pub mod spec;
 pub mod stream;
 
+pub use capability::{
+    decode_file_capabilities, CapabilityError, ContainerCapability, FileCapabilities,
+    LINUX_CAPABILITIES,
+};
 pub use condition::{
     Condition, ConditionKind, ConditionStatus, WorkloadEvent, WorkloadPhase, WorkloadStatus,
 };

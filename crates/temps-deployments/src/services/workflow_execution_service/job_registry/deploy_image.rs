@@ -182,6 +182,9 @@ impl FromJobRecord for DeployImageJob {
             project.slug.clone(),
             crate::services::workflow_planner::planned_deploy_caller(config),
         )
+        // The project's container security opt-in, read now so a change
+        // applies to the next deploy and an "allow and redeploy" sees it.
+        .allowed_capabilities(project.container_capabilities())
         .job_id(db_job.job_id.clone())
         .build_job_id(build_job_id)
         .target(DeploymentTarget::Docker {

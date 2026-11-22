@@ -806,6 +806,9 @@ impl ContainerDeployer for DockerRuntime {
             } else {
                 temps_workload::SecurityProfile::Trusted
             },
+            // The project's allow-listed opt-in, added after `cap_drop: ALL`.
+            // Empty (the default) keeps the request unchanged.
+            capabilities: request.allowed_capabilities.clone(),
         };
         let attachments = temps_workload::Attachments {
             network: temps_workload::NetworkAttachment {
@@ -1317,6 +1320,101 @@ impl ContainerDeployer for DockerRuntime {
         }
 
         Ok(logs.into_string())
+    }
+
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        use super::file_capabilities::{
+            parse_tar_head, resolve_link, valid_lookup_path, TarHeadError, MAX_HEAD_BYTES,
+            MAX_SYMLINK_HOPS,
+        };
+        let failed = |path: &str, reason: String| DeployerError::FileCapabilities {
+            container_id: container_id.to_string(),
+            path: path.to_string(),
+            location: "the local Docker daemon".to_string(),
+            reason,
+        };
+        let docker = self.require_docker()?;
+        let mut current = path.to_string();
+        for _ in 0..=MAX_SYMLINK_HOPS {
+            if !valid_lookup_path(&current) {
+                return Err(failed(
+                    &current,
+                    "the path is not absolute or is too long".to_string(),
+                ));
+            }
+            let mut stream = docker.download_from_container(
+                container_id,
+                Some(
+                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                        .path(&current)
+                        .build(),
+                ),
+            );
+            // Read only until the entry's header is complete, never more
+            // than MAX_HEAD_BYTES: the stream (and the file body behind the
+            // header) is dropped as soon as it is.
+            let mut buf: Vec<u8> = Vec::new();
+            let head = loop {
+                match parse_tar_head(&buf) {
+                    Ok(head) => break head,
+                    Err(TarHeadError::Incomplete) if buf.len() < MAX_HEAD_BYTES => {}
+                    Err(TarHeadError::Incomplete) => {
+                        return Err(failed(
+                            &current,
+                            format!("its archive headers exceed {MAX_HEAD_BYTES} bytes"),
+                        ))
+                    }
+                    Err(TarHeadError::Malformed(what)) => {
+                        return Err(failed(&current, format!("unreadable archive ({what})")))
+                    }
+                    Err(TarHeadError::Empty) => {
+                        return Err(failed(&current, "the archive has no entry".to_string()))
+                    }
+                }
+                let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+                    .await
+                    .map_err(|_| {
+                        failed(&current, "Docker did not answer within 10s".to_string())
+                    })?;
+                match chunk {
+                    Some(Ok(bytes)) => {
+                        let room = MAX_HEAD_BYTES.saturating_sub(buf.len());
+                        buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+                    }
+                    Some(Err(error)) => return Err(failed(&current, error.to_string())),
+                    None => {
+                        return Err(failed(
+                            &current,
+                            "the archive ended before the file's header".to_string(),
+                        ))
+                    }
+                }
+            };
+            drop(stream);
+            if let Some(target) = head.link_name.as_deref() {
+                current = resolve_link(&current, target);
+                continue;
+            }
+            return match head.capability_xattr() {
+                None => Ok(None),
+                Some(raw) => temps_workload::decode_file_capabilities(raw)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        failed(
+                            &current,
+                            "its security.capability value is not capability data".to_string(),
+                        )
+                    }),
+            };
+        }
+        Err(failed(
+            path,
+            format!("more than {MAX_SYMLINK_HOPS} symlinks to follow"),
+        ))
     }
 
     async fn stream_container_logs(

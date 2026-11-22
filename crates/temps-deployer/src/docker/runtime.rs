@@ -632,6 +632,7 @@ mod tests {
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
         let err = runtime
             .deploy_container(req)

@@ -272,6 +272,7 @@ async fn test_container_lifecycle() {
                 labels: HashMap::new(),
                 project_slug: None,
                 control_plane_grants_socket: false,
+                allowed_capabilities: Vec::new(),
             };
 
             let deploy_result = runtime.deploy_container(deploy_request).await;
@@ -364,6 +365,7 @@ async fn test_resource_limits_none_means_uncapped() {
         labels: HashMap::new(),
         project_slug: None,
         control_plane_grants_socket: false,
+        allowed_capabilities: Vec::new(),
     };
 
     let inspect_caps = |id: String| {
@@ -460,6 +462,7 @@ fn labelled_request(container_name: &str, deploy_id: Option<&str>) -> DeployRequ
             .unwrap_or_default(),
         project_slug: None,
         control_plane_grants_socket: false,
+        allowed_capabilities: Vec::new(),
     }
 }
 

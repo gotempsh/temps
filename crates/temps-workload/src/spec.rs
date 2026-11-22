@@ -99,6 +99,11 @@ pub struct Process {
     pub workdir: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// Linux capabilities added back to the hardened set (the project's
+    /// allow-listed opt-in). Empty, the default, is fully hardened.
+    /// Admission refuses them for every kind but a deployment.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<crate::ContainerCapability>,
 }
 
 /// How variables reach the process (ADR-052 §3). A property of the kind.

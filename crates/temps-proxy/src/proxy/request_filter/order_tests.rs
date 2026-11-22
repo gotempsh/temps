@@ -215,6 +215,7 @@ fn project(id: i32) -> projects::Model {
         log_ingest_lines_per_sec: None,
         log_ingest_kib_per_sec: None,
         instantiation_token: None,
+        allowed_capabilities: Vec::new(),
     }
 }
 
