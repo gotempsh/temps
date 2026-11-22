@@ -28,9 +28,11 @@
 //! - its last start failed with "cannot assign requested address";
 //! - it publishes at least one port on the mesh address.
 //!
-//! A failed Docker listing is retried with backoff and the address is only
-//! recorded as checked once a listing succeeds, so a Docker daemon that is
-//! slow to answer at boot does not leave the containers stopped. Once it has
+//! A failed Docker listing is retried with capped backoff until Docker
+//! answers, inside the scan itself, so a Docker daemon that is slow to come
+//! up at boot does not leave the containers stopped, also while the agent
+//! runs from its offline snapshot and never completes a sync. The address is
+//! only recorded as checked once a scan's listing succeeded. Once it has
 //! started a container the scan installs the overlay peer routes inside
 //! every overlay container, with the inputs the sync loop's last route sweep
 //! used: that sweep may have listed the running containers before the start,
@@ -47,7 +49,7 @@ use temps_core::retry::RetryConfig;
 use temps_network::Peer;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// How long a scan waits for the sync loop's first route sweep before
 /// leaving the routes of the containers it started to a later sweep. The
@@ -249,17 +251,24 @@ impl StrandedScan {
         self.rebuild_pending |= rebuilt;
         if let Some((scanned, handle)) = self.running.take() {
             if !handle.is_finished() {
-                self.running = Some((scanned, handle));
-                return;
-            }
-            // Finished, so this does not wait. A panicked scan counts as
-            // failed and runs again.
-            if handle.await.unwrap_or(false) {
+                if scanned == address {
+                    self.running = Some((scanned, handle));
+                    return;
+                }
+                // Still waiting for Docker, for an address this node no
+                // longer has: scan for the new one instead.
+                handle.abort();
+            } else if handle.await.unwrap_or(false) {
+                // Finished, so this does not wait. A panicked scan counts as
+                // failed and runs again.
                 self.completed_for = Some(scanned);
             }
         }
         if self.rebuild_pending || self.completed_for != Some(address) {
             self.rebuild_pending = false;
+            // Until this scan succeeds the address is not covered: a scan
+            // for a rebuild that fails runs again on the next tick.
+            self.completed_for = None;
             self.running = Some((address, spawn(address)));
         }
     }
@@ -329,45 +338,81 @@ pub(crate) async fn start_stranded_containers(
     Ok(report)
 }
 
-/// Retries of a failed Docker listing: about two minutes in all. After the
-/// last one the scan reports failure and the sync loop runs it again on its
-/// next tick.
+/// Backoff between Docker listings that failed: 5 s doubling to a 60 s cap,
+/// one list call a minute for as long as Docker does not answer.
 fn listing_retry() -> RetryConfig {
-    RetryConfig::new(6)
+    RetryConfig::new(LISTING_WARN_EVERY)
         .with_base_delay(Duration::from_secs(5))
         .with_max_delay(Duration::from_secs(60))
 }
 
-/// One scan: start the stranded containers, retrying a failed listing per
-/// `retry`, then install the overlay routes of the containers it started.
-/// Returns whether the listing succeeded, i.e. whether the address is
-/// covered.
+/// A listing that keeps failing is logged at `warn` on the first failure and
+/// then every this many failures, at `debug` otherwise.
+const LISTING_WARN_EVERY: u32 = 10;
+
+/// Start the stranded containers, retrying a failed Docker listing with
+/// `retry`'s backoff until one succeeds. Never gives up: the agent cannot
+/// learn from anywhere else that Docker came back, least of all while it
+/// runs from its offline snapshot and completes no sync.
+async fn start_once_docker_answers(
+    engine: &dyn ContainerEngine,
+    address: Ipv4Addr,
+    retry: &RetryConfig,
+) -> StartReport {
+    let mut failures: u32 = 0;
+    loop {
+        match start_stranded_containers(engine, address).await {
+            Ok(report) => {
+                if failures > 0 {
+                    info!(
+                        mesh_address = %address,
+                        failed_attempts = failures,
+                        "Docker answers again; looked for containers stranded by the missing \
+                         WireGuard mesh address"
+                    );
+                }
+                return report;
+            }
+            Err(error) => {
+                let delay = retry.compute_delay(failures);
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures.is_multiple_of(retry.max_attempts.max(1)) {
+                    warn!(
+                        mesh_address = %address,
+                        %error,
+                        failed_attempts = failures,
+                        retry_in_secs = delay.as_secs(),
+                        "could not look for containers that failed to publish on the WireGuard \
+                         mesh address before it existed; retrying until Docker answers. \
+                         Meanwhile check `docker ps -a` for containers exited with \"cannot \
+                         assign requested address\""
+                    );
+                } else {
+                    debug!(
+                        mesh_address = %address,
+                        %error,
+                        failed_attempts = failures,
+                        "Docker listing for stranded containers failed again"
+                    );
+                }
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
+/// One scan: start the stranded containers once Docker answers, then
+/// install the overlay routes of the containers it started.
 pub(crate) async fn run_scan(
     engine: &dyn ContainerEngine,
     address: Ipv4Addr,
     retry: &RetryConfig,
     routes: watch::Receiver<Option<RouteSweep>>,
     route_wait: Duration,
-) -> bool {
-    let report = match retry
-        .retry(|| start_stranded_containers(engine, address))
-        .await
-    {
-        Ok(report) => report,
-        Err(error) => {
-            warn!(
-                mesh_address = %address,
-                %error,
-                attempts = retry.max_attempts,
-                "could not look for containers that failed to publish on the WireGuard mesh \
-                 address before it existed; retrying on the next network sync. Meanwhile check \
-                 `docker ps -a` for containers exited with \"cannot assign requested address\""
-            );
-            return false;
-        }
-    };
+) {
+    let report = start_once_docker_answers(engine, address, retry).await;
     if report.started.is_empty() && report.failed.is_empty() {
-        return true;
+        return;
     }
     info!(
         mesh_address = %address,
@@ -379,7 +424,6 @@ pub(crate) async fn run_scan(
     if !report.started.is_empty() {
         install_routes(engine, address, routes, route_wait).await;
     }
-    true
 }
 
 /// Repeat the sync loop's route sweep for containers a scan started,
@@ -417,7 +461,9 @@ async fn install_routes(
 
 /// Connect to the local Docker daemon and run [`run_scan`]. Spawned by the
 /// network sync loop off its reconcile path once the mesh interface is up;
-/// its output is whether the address is covered (see [`StrandedScan`]).
+/// its output is whether the address is covered (see [`StrandedScan`]):
+/// false only when no Docker client could be built (a malformed
+/// `DOCKER_HOST`), which no retry inside the scan can fix.
 pub(crate) async fn start_containers_stranded_on_mesh(
     address: Ipv4Addr,
     routes: watch::Receiver<Option<RouteSweep>>,
@@ -428,15 +474,16 @@ pub(crate) async fn start_containers_stranded_on_mesh(
             warn!(
                 mesh_address = %address,
                 %error,
-                "could not connect to Docker to start containers that failed to publish on the \
-                 WireGuard mesh address before it existed; retrying on the next network sync. \
-                 Meanwhile check `docker ps -a` for containers exited with \"cannot assign \
-                 requested address\""
+                "could not create a Docker client to start containers that failed to publish on \
+                 the WireGuard mesh address before it existed; check DOCKER_HOST for this agent. \
+                 The next completed network sync tries again. Meanwhile check `docker ps -a` for \
+                 containers exited with \"cannot assign requested address\""
             );
             return false;
         }
     };
-    run_scan(&docker, address, &listing_retry(), routes, ROUTE_SWEEP_WAIT).await
+    run_scan(&docker, address, &listing_retry(), routes, ROUTE_SWEEP_WAIT).await;
+    true
 }
 
 #[cfg(test)]
@@ -648,6 +695,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_failed_scan_for_a_rebuild_runs_again_on_the_next_tick() {
+        let mut scan = StrandedScan::default();
+        assert!(ready(&mut scan, MESH, false, true).await);
+        // The address was covered, then the interface was rebuilt and the
+        // scan for it could not list the containers.
+        assert!(ready(&mut scan, MESH, true, false).await);
+        assert!(ready(&mut scan, MESH, false, true).await);
+        assert!(!ready(&mut scan, MESH, false, true).await);
+    }
+
+    #[tokio::test]
+    async fn a_scan_still_waiting_for_docker_gives_way_to_a_new_mesh_address() {
+        let other = Ipv4Addr::new(10, 201, 0, 9);
+        let mut scan = StrandedScan::default();
+        scan.on_mesh_ready(
+            MESH,
+            false,
+            |_| tokio::spawn(std::future::pending::<bool>()),
+        )
+        .await;
+
+        // Same address: the waiting scan is kept.
+        let mut launched = false;
+        scan.on_mesh_ready(MESH, false, |address| {
+            launched = true;
+            finished(true)(address)
+        })
+        .await;
+        assert!(!launched);
+        // The address moved: scan for the new one.
+        assert!(ready(&mut scan, other, false, true).await);
+        assert!(!ready(&mut scan, other, false, true).await);
+    }
+
+    #[tokio::test]
     async fn a_panicked_scan_counts_as_failed() {
         let mut scan = StrandedScan::default();
         scan.on_mesh_ready(MESH, false, |_| {
@@ -743,36 +825,36 @@ mod tests {
         engine.failing_listings.store(2, Ordering::SeqCst);
         let (_tx, routes) = watch::channel(Some(sweep()));
 
-        assert!(
-            run_scan(
-                &engine,
-                MESH,
-                &quick_retry(3),
-                routes,
-                Duration::from_secs(1)
-            )
-            .await
-        );
+        run_scan(
+            &engine,
+            MESH,
+            &quick_retry(3),
+            routes,
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(*engine.started.lock().expect("started lock"), vec!["app"]);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_docker_listing_that_keeps_failing_reports_the_address_uncovered() {
+    async fn a_docker_listing_keeps_being_retried_until_docker_answers() {
+        // Docker stays down across many retry rounds, as it may while the
+        // agent runs from its offline snapshot and no sync tick comes.
         let engine = stranded_app();
-        engine.failing_listings.store(3, Ordering::SeqCst);
+        engine.failing_listings.store(25, Ordering::SeqCst);
         let (_tx, routes) = watch::channel(Some(sweep()));
 
-        assert!(
-            !run_scan(
-                &engine,
-                MESH,
-                &quick_retry(3),
-                routes,
-                Duration::from_secs(1)
-            )
-            .await
-        );
-        assert!(engine.started.lock().expect("started lock").is_empty());
+        run_scan(
+            &engine,
+            MESH,
+            &quick_retry(3),
+            routes,
+            Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(engine.failing_listings.load(Ordering::SeqCst), 0);
+        assert_eq!(*engine.started.lock().expect("started lock"), vec!["app"]);
     }
 
     #[tokio::test]
@@ -781,16 +863,14 @@ mod tests {
         // The sync loop swept before the scan's start finished.
         let (_tx, routes) = watch::channel(Some(sweep()));
 
-        assert!(
-            run_scan(
-                &engine,
-                MESH,
-                &quick_retry(1),
-                routes,
-                Duration::from_secs(1)
-            )
-            .await
-        );
+        run_scan(
+            &engine,
+            MESH,
+            &quick_retry(1),
+            routes,
+            Duration::from_secs(1),
+        )
+        .await;
         assert_eq!(*engine.swept.lock().expect("swept lock"), vec![sweep()]);
     }
 
@@ -816,7 +896,7 @@ mod tests {
         assert!(engine.swept.lock().expect("swept lock").is_empty());
 
         tx.send_replace(Some(sweep()));
-        assert!(scan.await.expect("scan task"));
+        scan.await.expect("scan task");
         assert_eq!(*engine.swept.lock().expect("swept lock"), vec![sweep()]);
     }
 
@@ -834,34 +914,30 @@ mod tests {
         };
         let (_tx, routes) = watch::channel(None);
 
-        assert!(
-            run_scan(
-                &engine,
-                MESH,
-                &quick_retry(1),
-                routes,
-                Duration::from_secs(60)
-            )
-            .await
-        );
+        run_scan(
+            &engine,
+            MESH,
+            &quick_retry(1),
+            routes,
+            Duration::from_secs(60),
+        )
+        .await;
         assert!(engine.swept.lock().expect("swept lock").is_empty());
     }
 
     #[tokio::test(start_paused = true)]
-    async fn a_scan_gives_up_waiting_for_a_sweep_but_still_covers_the_address() {
+    async fn a_scan_gives_up_waiting_for_a_sweep_that_never_comes() {
         let engine = stranded_app();
         let (_tx, routes) = watch::channel(None);
 
-        assert!(
-            run_scan(
-                &engine,
-                MESH,
-                &quick_retry(1),
-                routes,
-                Duration::from_secs(60)
-            )
-            .await
-        );
+        run_scan(
+            &engine,
+            MESH,
+            &quick_retry(1),
+            routes,
+            Duration::from_secs(60),
+        )
+        .await;
         assert_eq!(*engine.started.lock().expect("started lock"), vec!["app"]);
         assert!(engine.swept.lock().expect("swept lock").is_empty());
     }
