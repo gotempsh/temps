@@ -563,6 +563,9 @@ async fn run(
         config.node_id
     );
     let mut mesh = MeshState::default();
+    // The mesh address last checked for containers Docker could not start
+    // before it existed (see `crate::stranded_start`).
+    let mut stranded_checked_for: Option<std::net::Ipv4Addr> = None;
     // Built from the first snapshot: the underlay device depends on whether
     // the cluster runs the WireGuard mesh.
     let mut manager: Option<(NetworkManager, bool)> = None;
@@ -688,6 +691,28 @@ async fn run(
                                 &mesh_address,
                                 mesh.configured.as_ref().map(|interface| interface.address),
                             );
+                            // At boot Docker starts containers before this
+                            // agent creates the mesh interface, so any that
+                            // publish on the mesh address failed to start
+                            // and Docker will not retry them. Start them now
+                            // that the address exists; off the reconcile
+                            // path, as it inspects every stopped container.
+                            if let Some(address) =
+                                mesh.configured.as_ref().map(|interface| interface.address)
+                            {
+                                if crate::stranded_start::should_check(
+                                    stranded_checked_for,
+                                    address,
+                                    rebuilt,
+                                ) {
+                                    stranded_checked_for = Some(address);
+                                    tokio::spawn(
+                                        crate::stranded_start::start_containers_stranded_on_mesh(
+                                            address,
+                                        ),
+                                    );
+                                }
+                            }
                             if let Some(moved) =
                                 publish_mesh_bind_address(&bind_address, &config, &mesh)
                             {

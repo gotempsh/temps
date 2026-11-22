@@ -26,6 +26,7 @@ mod rewind;
 pub mod route_store;
 pub mod route_sync_client;
 mod runtime_health;
+mod stranded_start;
 pub mod sandbox_handlers;
 pub mod server;
 pub mod service_handlers;
