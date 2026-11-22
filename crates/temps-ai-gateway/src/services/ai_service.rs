@@ -234,6 +234,15 @@ impl GatewayAiService {
     }
 }
 
+/// Classify a failed completion and log it. The log gets the classified
+/// error, never the gateway's: an upstream reply body can echo the prompt or
+/// a credential, and [`completion_error`] is what drops it.
+fn failed_completion(purpose: &str, model: &str, error: AiGatewayError) -> AiError {
+    let failure = completion_error(purpose, model, error);
+    debug!(error = %failure, purpose, model, "AI completion failed");
+    failure
+}
+
 /// Classify a gateway failure so callers can show what to fix. Failures that
 /// say nothing actionable about the provider (database, encryption, request
 /// translation) stay unclassified [`AiError::Provider`] errors.
@@ -790,10 +799,7 @@ impl AiService for GatewayAiService {
             .gateway
             .chat_completion(&chat_req, &route)
             .await
-            .map_err(|e| {
-                debug!(error = %e, purpose = request.purpose, model, "AI completion failed");
-                completion_error(&request.purpose, &model, e)
-            })?;
+            .map_err(|e| failed_completion(&request.purpose, &model, e))?;
 
         let text = first_text(&resp).unwrap_or_default();
         let json = if wants_json {
@@ -1360,6 +1366,52 @@ mod tests {
             ),
             AiError::Provider { .. }
         ));
+    }
+
+    /// Collects what a `fmt` subscriber writes, so a test can read the log.
+    #[derive(Clone, Default)]
+    struct CapturedLog(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLog {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_completion_failure_log_omits_the_upstream_reply() {
+        let log = CapturedLog::default();
+        let writer = log.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        let failure = tracing::subscriber::with_default(subscriber, || {
+            failed_completion(
+                "analytics.test",
+                "mock-flash",
+                AiGatewayError::UpstreamError {
+                    model: "mock-flash".into(),
+                    status: 401,
+                    message: "Incorrect API key provided: sk-test-1234 for page /private-path"
+                        .into(),
+                },
+            )
+        });
+        assert!(
+            matches!(failure, AiError::ProviderFailed { .. }),
+            "{failure:?}"
+        );
+        let logged = String::from_utf8(log.0.lock().unwrap().clone()).unwrap();
+        assert!(logged.contains("AI completion failed"), "{logged}");
+        assert!(logged.contains("upstream status 401"), "{logged}");
+        assert!(!logged.contains("sk-test"), "{logged}");
+        assert!(!logged.contains("/private-path"), "{logged}");
     }
 
     #[test]
