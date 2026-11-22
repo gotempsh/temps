@@ -332,6 +332,98 @@ class ReleaseTests(unittest.TestCase):
             release.publish([package], self.root, 'npm')
             command.assert_not_called()
 
+    def npm_packages(self, *keys):
+        return [dict(key=key, name=f'@temps-sdk/{key}', kind='npm', version='1.3.0-beta.1', channel='beta')
+                for key in keys]
+
+    def test_npm_versions_are_staged_for_approval_never_published_directly(self):
+        packages = self.npm_packages('analytics-core', 'react-analytics')
+        commands = []
+
+        def command(*args, **kwargs):
+            commands.append(args)
+            return '11.19.1\n' if args == ('npm', '--version') else None
+
+        out = io.StringIO()
+        with patch.object(release, 'pending_files', return_value=[Path('package.tgz')]), \
+                patch.object(release, 'guard_npm_channel'), patch.object(release, 'verify_registry') as verify, \
+                patch.object(release, 'run', side_effect=command), redirect_stdout(out):
+            release.publish(packages, self.root, 'npm')
+        staged = [c for c in commands if c[:3] == ('npm', 'stage', 'publish')]
+        self.assertEqual(len(staged), 2)
+        self.assertFalse([c for c in commands if c[:2] == ('npm', 'publish')])
+        self.assertIn('--provenance', staged[0])
+        self.assertEqual(staged[0][staged[0].index('--tag') + 1], 'beta')
+        # A staged version is not public yet, so nothing waits for the registry here.
+        verify.assert_not_called()
+        log = out.getvalue()
+        self.assertIn('staged on npm, waiting for approval', log)
+        self.assertIn('@temps-sdk/analytics-core@1.3.0-beta.1, @temps-sdk/react-analytics@1.3.0-beta.1', log)
+
+    def test_npm_without_stage_support_uploads_nothing(self):
+        for version in ('11.15.0', '10.9.2', 'not-a-version'):
+            with patch.object(release, 'pending_files', return_value=[Path('package.tgz')]), \
+                    patch.object(release, 'guard_npm_channel'), \
+                    patch.object(release, 'run', return_value=version) as command:
+                with self.assertRaisesRegex(ValueError, 'cannot stage packages.*11.16.0'):
+                    release.publish(self.npm_packages('kv'), self.root, 'npm')
+                command.assert_called_once_with('npm', '--version', capture=True)
+        self.assertEqual(release.npm_version_tuple('11.16.0'), (11, 16, 0))
+        self.assertEqual(release.npm_version_tuple('12.2.3-pre.1'), (12, 2, 3))
+
+    def test_a_channel_refusal_stages_nothing(self):
+        packages = self.npm_packages('kv', 'blob')
+
+        def guard(package):
+            if package['key'] == 'blob':
+                raise ValueError('refusing to move beta backwards')
+
+        with patch.object(release, 'pending_files', return_value=[Path('package.tgz')]), \
+                patch.object(release, 'guard_npm_channel', side_effect=guard), \
+                patch.object(release, 'run', return_value='11.19.1') as command:
+            with self.assertRaisesRegex(ValueError, 'backwards'):
+                release.publish(packages, self.root, 'npm')
+        self.assertFalse([c for c in command.call_args_list if c.args[:2] == ('npm', 'stage')])
+
+    def test_one_refused_stage_does_not_leave_the_rest_unstaged(self):
+        packages = self.npm_packages('kv', 'blob', 'plugin')
+        staged = []
+
+        def command(*args, **kwargs):
+            if args == ('npm', '--version'):
+                return '11.19.1'
+            if Path(args[3]).parent.name == 'kv':
+                raise subprocess.CalledProcessError(1, args)
+            staged.append(args[3])
+
+        with patch.object(release, 'pending_files', side_effect=lambda p, d, *_: [d / 'package.tgz']), \
+                patch.object(release, 'guard_npm_channel'), patch.object(release, 'run', side_effect=command), \
+                redirect_stdout(io.StringIO()):
+            with self.assertRaisesRegex(ValueError, r'refused to stage @temps-sdk/kv@1\.3\.0-beta\.1\..*already exists'):
+                release.publish(packages, self.root, 'npm')
+        self.assertEqual([Path(a).parent.name for a in staged], ['blob', 'plugin'])
+
+    def test_package_tags_wait_until_npm_versions_are_approved(self):
+        packages = self.npm_packages('analytics-core', 'react-analytics') + [
+            dict(self.catalog['python'], key='python', version='1.3.0b1')]
+        with patch.object(release, 'pending_files', return_value=[Path('package.tgz')]) as pending:
+            with self.assertRaisesRegex(ValueError, 'no package tag was created.*in this order.*analytics-core.*react-analytics'):
+                release.require_npm_approved(packages, self.root)
+            self.assertEqual(pending.call_count, 2, 'only npm packages wait for approval')
+        with patch.object(release, 'pending_files', return_value=[]):
+            release.require_npm_approved(packages, self.root)
+
+    def test_publish_tags_command_checks_npm_approval_before_any_tag(self):
+        packages = self.npm_packages('kv')
+        with patch.object(release.sys, 'argv', ['sdk_release.py', 'publish-tags', '--tag', 'v1.3.0-beta.1']), \
+                patch.object(release, 'plan', return_value=packages), \
+                patch.object(release, 'verify_artifact_plan'), patch.object(release, 'run', return_value='abc'), \
+                patch.object(release, 'require_npm_approved', side_effect=ValueError('Not public on npm yet')), \
+                patch.object(release, 'publish_tags') as tags:
+            with self.assertRaisesRegex(ValueError, 'Not public on npm yet'):
+                release.main()
+            tags.assert_not_called()
+
     def test_verification_waits_for_registry_visibility_and_is_bounded(self):
         package = dict(self.catalog['cli'], key='cli', version='1.2.3')
         with patch.object(release.time, 'sleep'), patch.object(release, 'pending_files', side_effect=[[Path('package.tgz')], []]) as pending:
@@ -456,6 +548,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn('matrix:', publish)
         self.assertIn('persist-credentials: false', publish)
         self.assertIn('python3 scripts/sdk_release.py publish-tags', publish)
+        # An exact Node, so its bundled npm can stage (a cached older Node 24 may not).
+        self.assertRegex(publish, r"node-version: '\d+\.\d+\.\d+'")
+        self.assertNotIn('npm publish', publish)
 
 
 class FakeHistory:

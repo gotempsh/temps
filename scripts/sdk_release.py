@@ -23,6 +23,8 @@ import urllib.request
 ROOT = Path(__file__).resolve().parents[1]
 SEMVER = r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(alpha|beta|rc)\.(0|[1-9]\d*))?'
 PYVER = r'(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:(a|b|rc)(0|[1-9]\d*))?'
+# `npm stage publish` first shipped in npm 11.16.0.
+MIN_STAGE_NPM = (11, 16, 0)
 
 
 def run(*args, cwd=ROOT, capture=False):
@@ -392,10 +394,83 @@ def verify_registry(packages, output, kind):
             time.sleep(5)
 
 
+def npm_version_tuple(raw):
+    match = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?', raw.strip())
+    return tuple(map(int, match.groups())) if match else None
+
+
+def require_stage_npm():
+    """Fail before any upload when this npm cannot stage packages."""
+    raw = run('npm', '--version', capture=True).strip()
+    found = npm_version_tuple(raw)
+    if found is None or found < MIN_STAGE_NPM:
+        wanted = '.'.join(map(str, MIN_STAGE_NPM))
+        raise ValueError(f'npm {raw} cannot stage packages (`npm stage` needs npm {wanted} or later); nothing was uploaded')
+
+
+def approval_steps(waiting):
+    names = ', '.join(f"{p['name']}@{p['version']}" for p in waiting)
+    return (f'Approve the staged npm versions, in this order so dependencies are public first: {names}. '
+            'Approve them on npmjs.com, or run `npm stage list` and `npm stage approve <stage-id>` '
+            '(both need your login and 2FA). Then rerun this job: it skips what is already public '
+            'and creates the package tags.')
+
+
+def stage_npm(selected, output):
+    """Stage npm versions for a maintainer to approve. Never publishes directly.
+
+    The trusted publisher allows only `npm stage publish`, so a stolen CI token
+    cannot make a version installable: a maintainer approves each one with 2FA.
+    """
+    waiting = []
+    for p in selected:
+        files = pending_files(p, output / p['key'])
+        if files:
+            waiting.append((p, files[0]))
+        else:
+            summary(f"{p['name']} {p['version']}: already published (verified hashes)")
+    if not waiting:
+        return
+    require_stage_npm()
+    # Every channel guard before the first upload, so a refusal stages nothing.
+    for p, _ in waiting:
+        guard_npm_channel(p)
+    refused = []
+    for p, archive in waiting:
+        try:
+            run('npm', 'stage', 'publish', str(archive), '--ignore-scripts', '--access', 'public',
+                '--registry', 'https://registry.npmjs.org',
+                '--tag', 'beta' if p['channel'] == 'beta' else 'latest', '--provenance')
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            # Keep going: one refusal (such as a version staged by an earlier
+            # run and not approved yet) must not leave the rest unstaged.
+            refused.append(p)
+            summary(f"{p['name']} {p['version']}: npm refused to stage it (see the log above)")
+            continue
+        summary(f"{p['name']} {p['version']}: staged on npm, waiting for approval")
+    staged = [p for p, _ in waiting if p not in refused]
+    if staged:
+        summary(approval_steps(staged))
+    if refused:
+        names = ', '.join(f"{p['name']}@{p['version']}" for p in refused)
+        raise ValueError(f'npm refused to stage {names}. If npm says the version already exists, an earlier '
+                         'run staged it: approve it (or reject it), then rerun this job.')
+
+
+def require_npm_approved(packages, output, fetch=registry_json):
+    """Before package tags: every selected npm version must be public with the tested bytes."""
+    waiting = [p for p in packages if p['kind'] == 'npm' and pending_files(p, output / p['key'], fetch)]
+    if waiting:
+        raise ValueError('Not public on npm yet, so no package tag was created. ' + approval_steps(waiting))
+
+
 def publish(packages, output, kind):
     # Reconcile each package just before mutation. A failed/uncertain upload is
     # never blindly repeated: rerun the job with the retained tested artifacts.
     selected = [p for p in packages if p['kind'] == kind]
+    if kind == 'npm':
+        stage_npm(selected, output)
+        return
     if kind == 'crate' and selected and any(pending_files(p, output / p['key']) for p in selected):
         selection = [arg for p in selected for arg in ('-p', p['name'])]
         # --no-verify here and on `cargo publish`: verifying compiles the locked
@@ -415,12 +490,7 @@ def publish(packages, output, kind):
         if not files:
             summary(f"{p['name']} {p['version']}: already published (verified hashes)")
             continue
-        if kind == 'npm':
-            guard_npm_channel(p)
-            run('npm', 'publish', str(files[0]), '--ignore-scripts', '--access', 'public',
-                '--registry', 'https://registry.npmjs.org',
-                '--tag', 'beta' if p['channel'] == 'beta' else 'latest', '--provenance')
-        elif kind == 'crate':
+        if kind == 'crate':
             run('cargo', 'publish', '--locked', '--no-verify', '-p', p['name'])
         else:
             raise ValueError('PyPI publication uses the trusted publishing action')
@@ -543,6 +613,7 @@ def main():
         verify_artifact_plan(output, packages, run('git', 'rev-parse', 'HEAD', capture=True).strip())
         if args.command in ('publish-tags', 'check-tags'):
             if args.command == 'publish-tags':
+                require_npm_approved(packages, output)
                 for kind in ('npm', 'pypi', 'crate'):
                     verify_registry(packages, output, kind)
             publish_tags(packages, check_only=args.command == 'check-tags')
