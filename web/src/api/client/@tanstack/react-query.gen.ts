@@ -11531,10 +11531,12 @@ export const setIncidentUpdateVisibilityMutation = (options?: Partial<Options<Se
 export const getCertificateMethodsQueryKey = (options?: Options<GetCertificateMethodsData>) => createQueryKey('getCertificateMethods', options);
 
 /**
- * Which certificate methods fit this cluster.
+ * Which ways to give a domain HTTPS work here.
  *
- * HTTP-01 needs an ingress that answers on port 80; without one, issue
- * certificates through DNS-01.
+ * Through a tunnel that covers it, or with a Temps certificate by HTTP-01
+ * (needs public port 80) or DNS-01 (through a connected DNS provider, or a
+ * TXT record added by hand). Each says why it does not fit and where to set
+ * it up.
  */
 export const getCertificateMethodsOptions = (options?: Options<GetCertificateMethodsData>) => queryOptions<GetCertificateMethodsResponse, DefaultError, GetCertificateMethodsResponse, ReturnType<typeof getCertificateMethodsQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {
@@ -16377,8 +16379,9 @@ export const getAccessInfoQueryKey = (options?: Options<GetAccessInfoData>) => c
 /**
  * Get information about how the service is being accessed
  *
- * Returns details about the server's access mode, public IP address, private IP address,
- * and domain creation capabilities. Both IP addresses are always included when available.
+ * Returns how this request reached the server, and its public and private IP
+ * addresses when available. Which ways a domain can get HTTPS is per domain:
+ * `GET /ingress/certificate-methods?domain=`.
  */
 export const getAccessInfoOptions = (options?: Options<GetAccessInfoData>) => queryOptions<GetAccessInfoResponse, DefaultError, GetAccessInfoResponse, ReturnType<typeof getAccessInfoQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

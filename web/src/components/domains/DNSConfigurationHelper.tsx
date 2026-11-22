@@ -34,7 +34,7 @@ export function DNSConfigurationHelper() {
   const {
     accessMode,
     getDNSTargetIP,
-    isUsingCloudflare,
+    isOpenedThroughCloudflare,
     needsPortForwarding,
     isLoading,
     publicIP,
@@ -57,47 +57,37 @@ export function DNSConfigurationHelper() {
     )
   }
 
-  // Cloudflare Tunnel - domains managed externally
-  if (isUsingCloudflare()) {
+  // Opened through Cloudflare: that carries this console's hostname (and any
+  // tunnel's names), not the domains served with Temps certificates.
+  if (isOpenedThroughCloudflare()) {
     return (
-      <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
-        <Cloud className="h-4 w-4 text-purple-600" />
-        <AlertTitle>Cloudflare Tunnel Active</AlertTitle>
-        <AlertDescription className="space-y-2 mt-2">
+      <Alert>
+        <Cloud className="h-4 w-4" />
+        <AlertTitle>
+          Point domains served with a Temps certificate at this server
+        </AlertTitle>
+        <AlertDescription className="space-y-3 mt-2">
           <p>
-            Domains and SSL certificates are automatically managed by
-            Cloudflare.
+            This console is open through Cloudflare, so it can&apos;t tell how
+            the internet reaches this server directly. Names a tunnel carries
+            need no record here.
           </p>
-          <div className="flex items-center gap-2 mt-3">
-            <Badge
-              variant="secondary"
-              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
-            >
-              Automatic SSL
-            </Badge>
-            <Badge
-              variant="secondary"
-              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
-            >
-              Managed DNS
-            </Badge>
-            <Badge
-              variant="secondary"
-              className="bg-purple-100 dark:bg-purple-950/40 text-purple-800 dark:text-purple-400"
-            >
-              DDoS protection
-            </Badge>
-          </div>
-          <p className="text-sm mt-3">
-            To add or remove domains, configure them through your{' '}
-            <a
-              href="https://dash.cloudflare.com"
-              target="_blank"
-              rel="noopener noreferrer"
-              className="text-purple-600 dark:text-purple-400 hover:text-purple-700 dark:hover:text-purple-300 underline"
-            >
-              Cloudflare Dashboard
-            </a>
+          {publicIP && (
+            <div className="flex flex-wrap items-center gap-2">
+              <span>Detected public IP</span>
+              <code className="rounded border bg-background px-2 py-0.5 font-mono">
+                {publicIP}
+              </code>
+              <CopyButton
+                value={publicIP}
+                className="h-8 px-3 rounded-md border border-input bg-background hover:bg-accent hover:text-accent-foreground"
+              />
+            </div>
+          )}
+          <p className="text-sm">
+            HTTP-01 needs public port 80 to reach this server; without it, issue
+            the certificate with DNS-01. Serving HTTPS directly needs port 443
+            either way.
           </p>
         </AlertDescription>
       </Alert>

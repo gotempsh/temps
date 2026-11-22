@@ -10763,14 +10763,50 @@
         "type": "object"
       },
       "CertificateMethods": {
-        "description": "Whether HTTP-01 can issue a certificate here: a direct ingress answers\non port 80.",
+        "description": "Which certificate methods, and which tunnels, fit a domain here.",
         "properties": {
+          "dns01_manual": {
+            "$ref": "#/components/schemas/MethodCapability",
+            "description": "A Let's Encrypt certificate validated by a DNS TXT record the\noperator adds by hand. Needs no inbound port and no provider."
+          },
+          "dns01_provider": {
+            "$ref": "#/components/schemas/MethodCapability",
+            "description": "A Let's Encrypt certificate validated by a DNS TXT record that Temps\nwrites through a connected DNS provider."
+          },
+          "dns_provider": {
+            "description": "The DNS provider that would write the DNS-01 record.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "http01": {
+            "$ref": "#/components/schemas/MethodCapability",
+            "description": "A Let's Encrypt certificate validated over public port 80."
+          },
           "http01_available": {
+            "description": "`http01.configured`, kept for consoles that read only this.",
             "type": "boolean"
+          },
+          "tunnel": {
+            "$ref": "#/components/schemas/MethodCapability",
+            "description": "Served through a tunnel that covers the domain, its provider serving\nHTTPS, so no certificate is issued here."
+          },
+          "tunnels": {
+            "description": "The tunnels that cover the domain, most specific first. Without a\ndomain, every tunnel.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
-          "http01_available"
+          "http01_available",
+          "http01",
+          "dns01_provider",
+          "dns01_manual",
+          "tunnel",
+          "tunnels"
         ],
         "type": "object"
       },
@@ -48831,6 +48867,33 @@
         ],
         "type": "string"
       },
+      "MethodCapability": {
+        "description": "One way to give a domain HTTPS, and whether it works here.",
+        "properties": {
+          "configured": {
+            "description": "The method can be used for this domain now.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why it cannot, when `configured` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "The console path that sets up what is missing, when one can.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "type": "object"
+      },
       "Metric": {
         "description": "Aggregate metric for [`LogAnalytics::aggregate`].",
         "oneOf": [
@@ -72840,15 +72903,15 @@
         "description": "Response containing information about how the service is being accessed",
         "properties": {
           "access_mode": {
-            "description": "Mode of access: \"local\", \"direct\", \"nat\", or \"cloudflare_tunnel\"",
+            "description": "How this request reached the server: \"local\", \"direct\", \"nat\", or\n\"cloudflare_tunnel\" (it came through Cloudflare's edge). Describes\nthis request only, never which domains can be added.",
             "type": "string"
           },
           "can_create_domains": {
-            "description": "Whether domain creation is allowed in this mode",
+            "description": "Always `true`: a domain can be added however this request reached\nthe server, and the server never refused one by access mode. How a\ndomain gets HTTPS (a tunnel covering it, HTTP-01, DNS-01) is judged\nper domain by `GET /ingress/certificate-methods?domain=`. Kept for\nolder clients.",
             "type": "boolean"
           },
           "domain_creation_error": {
-            "description": "Error message if domain creation is not allowed",
+            "description": "Always `null`; kept for older clients. See `can_create_domains`.",
             "type": [
               "string",
               "null"
@@ -130716,8 +130779,19 @@
     },
     "/ingress/certificate-methods": {
       "get": {
-        "description": "HTTP-01 needs an ingress that answers on port 80; without one, issue\ncertificates through DNS-01.",
+        "description": "Through a tunnel that covers it, or with a Temps certificate by HTTP-01\n(needs public port 80) or DNS-01 (through a connected DNS provider, or a\nTXT record added by hand). Each says why it does not fit and where to set\nit up.",
         "operationId": "get_certificate_methods",
+        "parameters": [
+          {
+            "description": "The domain to judge, such as `my-app.example.com` or `*.example.com`.\nWithout one, whether each method is set up at all.",
+            "in": "query",
+            "name": "domain",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -130726,7 +130800,20 @@
                   "$ref": "#/components/schemas/CertificateMethods"
                 }
               }
-            }
+            },
+            "description": "The methods that fit the domain"
+          },
+          "400": {
+            "description": "The domain is not a domain name"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "The facts could not be read"
           }
         },
         "security": [
@@ -130734,7 +130821,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Which certificate methods fit this cluster.",
+        "summary": "Which ways to give a domain HTTPS work here.",
         "tags": [
           "Reachability"
         ]
@@ -147711,7 +147798,7 @@
     },
     "/platform/access-info": {
       "get": {
-        "description": "Returns details about the server's access mode, public IP address, private IP address,\nand domain creation capabilities. Both IP addresses are always included when available.",
+        "description": "Returns how this request reached the server, and its public and private IP\naddresses when available. Which ways a domain can get HTTPS is per domain:\n`GET /ingress/certificate-methods?domain=`.",
         "operationId": "get_access_info",
         "responses": {
           "200": {

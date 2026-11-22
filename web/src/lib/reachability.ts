@@ -534,7 +534,12 @@ export function certificateChoices({
         ? 'dns-01'
         : http01Available === true
           ? 'http-01'
-          : null
+          : // Nothing answers publicly on port 80: DNS-01 is the method that
+            // surely works. HTTP-01 stays listed, since port forwarding or a
+            // private CA can still reach this server.
+            http01Available === false
+            ? 'dns-01'
+            : null
   return {
     showHttp01: !wildcard,
     recommended,

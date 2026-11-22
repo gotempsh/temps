@@ -147,11 +147,15 @@ export function AddDomain() {
         if (valid) {
           const domain = form.getValues('domain')
           const covering = tunnelsCovering(domain, connectorsQuery.data ?? [])
+          // The port 80 probe only advises: port forwarding or a private CA
+          // can reach this server where Temps sees no public listener, so it
+          // recommends DNS-01 (certificateChoices) and never switches the
+          // operator's method.
           if (covering.length > 0) {
             // A tunnel carries it: no certificate to issue.
             form.setValue('challengeType', tunnelChoice(covering[0].id))
           } else if (domain.startsWith('*.')) {
-            // Auto-select DNS-01 for wildcard domains
+            // Let's Encrypt issues wildcards only through DNS-01.
             form.setValue('challengeType', 'dns-01')
           } else if (chosenTunnel(form.getValues('challengeType')) != null) {
             form.setValue('challengeType', 'http-01')
@@ -227,6 +231,33 @@ export function AddDomain() {
   }
 
   const watchedValues = useWatch({ control: form.control })
+  // Judged for this domain: whether a DNS provider can write its DNS-01
+  // record, and why HTTP-01 does not fit when it does not.
+  const typedDomain = watchedValues.domain?.trim() ?? ''
+  const domainMethods = useQuery({
+    ...getCertificateMethodsOptions({ query: { domain: typedDomain } }),
+    enabled: step !== 'domain' && typedDomain.length > 0,
+    retry: false,
+    staleTime: 60_000,
+  })
+  // The provider that writes the DNS-01 record, once known; both steps agree.
+  const dnsProvider = domainMethods.data?.dns01_provider.configured
+    ? (domainMethods.data.dns_provider ?? null)
+    : null
+  const dnsLookup: 'loading' | 'failed' | 'ready' = domainMethods.isError
+    ? 'failed'
+    : domainMethods.isSuccess
+      ? 'ready'
+      : 'loading'
+  const dns01Writer = (
+    <Dns01Writer
+      lookup={dnsLookup}
+      provider={dnsProvider}
+      setupPath={domainMethods.data?.dns01_provider.setup_path ?? null}
+      retrying={domainMethods.isFetching}
+      onRetry={() => domainMethods.refetch()}
+    />
+  )
   const covering = tunnelsCovering(
     watchedValues.domain ?? '',
     connectorsQuery.data ?? []
@@ -495,19 +526,15 @@ export function AddDomain() {
                                           <CheckCircle className="h-4 w-4" />
                                           <span>Works without HTTP access</span>
                                         </div>
-                                        <div className="flex items-center gap-2 text-yellow-700 dark:text-yellow-600">
-                                          <Info className="h-4 w-4" />
-                                          <span>
-                                            Requires manual DNS record creation
-                                          </span>
-                                        </div>
+                                        {dns01Writer}
                                       </div>
                                     </div>
                                   </label>
                                 </Card>
                                 {choices.http01Note && (
                                   <p className="text-sm text-muted-foreground">
-                                    {choices.http01Note}
+                                    {domainMethods.data?.http01.reason ??
+                                      choices.http01Note}
                                   </p>
                                 )}
                                 {covering.length === 0 &&
@@ -582,7 +609,11 @@ export function AddDomain() {
                               <span className="font-medium">
                                 {watchedValues.challengeType === 'http-01'
                                   ? 'HTTP-01 (Automatic)'
-                                  : 'DNS-01 (Manual)'}
+                                  : dnsProvider
+                                    ? `DNS-01 (through ${dnsProvider})`
+                                    : dnsLookup === 'ready'
+                                      ? 'DNS-01 (Manual)'
+                                      : 'DNS-01'}
                               </span>
                             </div>
                           </div>
@@ -607,6 +638,47 @@ export function AddDomain() {
                                   <li>
                                     The system will automatically validate and
                                     provision the certificate
+                                  </li>
+                                </ol>
+                              </div>
+                            </AlertDescription>
+                          </Alert>
+                        ) : dnsLookup !== 'ready' ? (
+                          // Unknown yet whether a provider writes the record:
+                          // say so, and never prescribe the manual steps.
+                          <Alert>
+                            <Shield className="h-4 w-4" />
+                            <AlertDescription>
+                              <div className="space-y-2">
+                                <p className="font-medium">
+                                  Next steps (DNS-01):
+                                </p>
+                                {dns01Writer}
+                                <p className="text-sm">
+                                  You can create the domain now: its page shows
+                                  the TXT record and the DNS providers that can
+                                  write it.
+                                </p>
+                              </div>
+                            </AlertDescription>
+                          </Alert>
+                        ) : dnsProvider ? (
+                          <Alert>
+                            <Shield className="h-4 w-4" />
+                            <AlertDescription>
+                              <div className="space-y-2">
+                                <p className="font-medium">
+                                  Next steps (DNS-01 through {dnsProvider}):
+                                </p>
+                                <ol className="list-decimal list-inside space-y-1 text-sm">
+                                  <li>
+                                    On the domain&apos;s page, pick{' '}
+                                    {dnsProvider} for the DNS challenge
+                                  </li>
+                                  <li>Temps adds the TXT record for you</li>
+                                  <li>
+                                    Complete the DNS challenge to provision the
+                                    certificate
                                   </li>
                                 </ol>
                               </div>
@@ -670,6 +742,88 @@ export function AddDomain() {
         </Wizard>
       </div>
     </PageContainer>
+  )
+}
+
+/**
+ * Who writes the DNS-01 TXT record: Temps through a DNS provider that
+ * auto-manages a verified zone for the domain, or the operator by hand.
+ * While the lookup is out or has failed it says so, never "by hand".
+ */
+export function Dns01Writer({
+  lookup,
+  provider,
+  setupPath,
+  retrying,
+  onRetry,
+}: {
+  lookup: 'loading' | 'failed' | 'ready'
+  provider: string | null
+  setupPath: string | null
+  retrying: boolean
+  onRetry: () => void
+}) {
+  if (lookup === 'loading') {
+    return (
+      <div className="flex items-center gap-2 text-muted-foreground">
+        <Info className="h-4 w-4" />
+        <span>Checking whether a DNS provider can write the TXT record…</span>
+      </div>
+    )
+  }
+  if (lookup === 'failed') {
+    return (
+      <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-destructive">
+        <AlertTriangle className="h-4 w-4" />
+        <span>
+          Could not check whether a DNS provider can write the TXT record
+        </span>
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          className="h-7"
+          disabled={retrying}
+          // Inside the option's <label>, which would otherwise name it.
+          aria-label="Retry the DNS provider check"
+          // Enter and Space activate this button; the wizard's own Enter
+          // handlers must not see them and advance instead.
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' || e.key === ' ') e.stopPropagation()
+          }}
+          onClick={(e) => {
+            e.preventDefault()
+            e.stopPropagation()
+            onRetry()
+          }}
+        >
+          {retrying ? 'Retrying…' : 'Retry'}
+        </Button>
+      </div>
+    )
+  }
+  if (provider) {
+    return (
+      <div className="flex items-center gap-2 text-green-700 dark:text-green-600">
+        <CheckCircle className="h-4 w-4" />
+        <span>Temps can write the TXT record through {provider}</span>
+      </div>
+    )
+  }
+  return (
+    <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-yellow-700 dark:text-yellow-600">
+      <Info className="h-4 w-4" />
+      <span>You add one TXT record by hand</span>
+      {setupPath && (
+        <Link
+          to={setupPath}
+          className="text-primary underline underline-offset-4"
+          onClick={(e) => e.stopPropagation()}
+        >
+          Connect a DNS provider
+        </Link>
+      )}
+    </div>
   )
 }
 

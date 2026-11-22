@@ -14,7 +14,11 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ROUTE_FAILURE_IGNORE_REFUSAL } from '@/lib/route-query-failures'
 import { allTunnelsOptions } from '@/lib/tunnel-domains'
-import { DomainResponse } from '@/api/client/types.gen'
+import type {
+  ConnectorView,
+  DomainResponse,
+  HostnameView,
+} from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Badge } from '@/components/ui/badge'
@@ -46,7 +50,6 @@ import {
   Cloud,
   EllipsisVertical,
   Globe,
-  Info,
   Plus,
   RefreshCw,
   Search,
@@ -68,7 +71,6 @@ import {
   tunnelRows,
   type DomainRow,
 } from './domain-rows'
-import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useNavigate } from 'react-router'
 import {
@@ -127,9 +129,6 @@ export function DomainsManagement({
   const navigate = useNavigate()
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
-
-  const { canManageCertificates, canCreateDomains, isUsingCloudflare } =
-    usePlatformCapabilities()
 
   const deleteDomain = useMutation({
     ...deleteDomainMutation(),
@@ -305,7 +304,6 @@ export function DomainsManagement({
                 onOpen={(id) => navigate(`/domains/${id}`)}
                 onRenew={handleRenewDomain}
                 onDelete={setDomainToDelete}
-                canManageCertificates={canManageCertificates}
               />
             ) : (
               connectorId == null && (
@@ -340,18 +338,13 @@ export function DomainsManagement({
                 queryKeyPrefix(listIngressHostnamesQueryKey),
               ]}
             />
-            {canCreateDomains ? (
-              <CreateActionButton
-                to="/domains/add"
-                label="Add domain"
-                icon={<Globe className="h-4 w-4" />}
-              />
-            ) : (
-              <Button disabled>
-                <Globe className="mr-2 h-4 w-4" />
-                Managed by Cloudflare
-              </Button>
-            )}{' '}
+            {/* Always offered: a tunnel covers its own names only, and any
+                other domain can get a Temps certificate (ADR 058 D10). */}
+            <CreateActionButton
+              to="/domains/add"
+              label="Add domain"
+              icon={<Globe className="h-4 w-4" />}
+            />
           </>
         }
       />
@@ -373,16 +366,10 @@ export function DomainsManagement({
         </CollapsibleContent>
       </Collapsible>
 
-      {isUsingCloudflare() && (
-        <Alert className="border-purple-200 dark:border-purple-900 bg-purple-50/50 dark:bg-purple-950/10">
-          <Info className="h-4 w-4 text-purple-600" />
-          <AlertDescription>
-            Domain and certificate management is handled automatically by
-            Cloudflare Tunnel. Add or remove domains through your Cloudflare
-            dashboard.
-          </AlertDescription>
-        </Alert>
-      )}
+      <TunnelCoverage
+        connectors={connectorsQuery.data ?? []}
+        hostnames={hostnamesQuery.data ?? []}
+      />
 
       {failingTunnels > 0 && (
         <Alert variant="destructive">
@@ -532,13 +519,11 @@ function DomainRowMenu({
   onOpen,
   onRenew,
   onDelete,
-  canManageCertificates,
 }: {
   domain: DomainResponse
   onOpen: (id: number) => void
   onRenew: (domain: string) => void
   onDelete: (domain: DomainResponse) => void
-  canManageCertificates: boolean
 }) {
   return (
     <div
@@ -566,7 +551,7 @@ function DomainRowMenu({
             <Globe className="mr-2 h-4 w-4" />
             View details
           </DropdownMenuItem>
-          {isServingCert(domain.status) && canManageCertificates && (
+          {isServingCert(domain.status) && (
             <DropdownMenuItem
               onSelect={(e) => {
                 e.preventDefault()
@@ -675,5 +660,48 @@ function TunnelZoneStatus({
           : 'publishing picked'
         : 'tunnel down'}
     </Badge>
+  )
+}
+
+/**
+ * What each tunnel serves: the names under its domain, and nothing else.
+ * Every other domain gets HTTPS from a Temps certificate.
+ */
+export function TunnelCoverage({
+  connectors,
+  hostnames,
+}: {
+  connectors: ConnectorView[]
+  hostnames: HostnameView[]
+}) {
+  if (connectors.length === 0) return null
+  return (
+    <ul
+      aria-label="Tunnels"
+      className="space-y-1 text-sm text-muted-foreground"
+    >
+      {connectors.map((connector) => {
+        const published = hostnames.filter(
+          (h) => h.connector_id === connector.id && h.state === 'published'
+        ).length
+        return (
+          <li
+            key={connector.id}
+            className="flex min-w-0 items-start gap-2 [overflow-wrap:anywhere]"
+          >
+            <Cloud className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <span>
+              Tunnel <span className="text-foreground">{connector.name}</span>{' '}
+              serves names under{' '}
+              <span className="text-foreground">{connector.domain}</span>
+              {published > 0 && ` · ${published} published`}
+            </span>
+          </li>
+        )
+      })}
+      <li className="pl-5">
+        Other domains get HTTPS from a Temps certificate.
+      </li>
+    </ul>
   )
 }

@@ -5048,11 +5048,41 @@ export type CertStatusResponse = {
 };
 
 /**
- * Whether HTTP-01 can issue a certificate here: a direct ingress answers
- * on port 80.
+ * Which certificate methods, and which tunnels, fit a domain here.
  */
 export type CertificateMethods = {
+    /**
+     * A Let's Encrypt certificate validated by a DNS TXT record the
+     * operator adds by hand. Needs no inbound port and no provider.
+     */
+    dns01_manual: MethodCapability;
+    /**
+     * A Let's Encrypt certificate validated by a DNS TXT record that Temps
+     * writes through a connected DNS provider.
+     */
+    dns01_provider: MethodCapability;
+    /**
+     * The DNS provider that would write the DNS-01 record.
+     */
+    dns_provider?: string | null;
+    /**
+     * A Let's Encrypt certificate validated over public port 80.
+     */
+    http01: MethodCapability;
+    /**
+     * `http01.configured`, kept for consoles that read only this.
+     */
     http01_available: boolean;
+    /**
+     * Served through a tunnel that covers the domain, its provider serving
+     * HTTPS, so no certificate is issued here.
+     */
+    tunnel: MethodCapability;
+    /**
+     * The tunnels that cover the domain, most specific first. Without a
+     * domain, every tunnel.
+     */
+    tunnels: Array<string>;
 };
 
 /**
@@ -22687,6 +22717,24 @@ export type MessageResponse = {
 export type MeteredMode = 'derive_from_invoices' | 'use_subscription' | 'ignore';
 
 /**
+ * One way to give a domain HTTPS, and whether it works here.
+ */
+export type MethodCapability = {
+    /**
+     * The method can be used for this domain now.
+     */
+    configured: boolean;
+    /**
+     * Why it cannot, when `configured` is `false`.
+     */
+    reason?: string | null;
+    /**
+     * The console path that sets up what is missing, when one can.
+     */
+    setup_path?: string | null;
+};
+
+/**
  * Aggregate metric for [`LogAnalytics::aggregate`].
  */
 export type Metric = {
@@ -34161,15 +34209,21 @@ export type ServerTlsMode = 'off' | 'available' | 'required';
  */
 export type ServiceAccessInfo = {
     /**
-     * Mode of access: "local", "direct", "nat", or "cloudflare_tunnel"
+     * How this request reached the server: "local", "direct", "nat", or
+     * "cloudflare_tunnel" (it came through Cloudflare's edge). Describes
+     * this request only, never which domains can be added.
      */
     access_mode: string;
     /**
-     * Whether domain creation is allowed in this mode
+     * Always `true`: a domain can be added however this request reached
+     * the server, and the server never refused one by access mode. How a
+     * domain gets HTTPS (a tunnel covering it, HTTP-01, DNS-01) is judged
+     * per domain by `GET /ingress/certificate-methods?domain=`. Kept for
+     * older clients.
      */
     can_create_domains: boolean;
     /**
-     * Error message if domain creation is not allowed
+     * Always `null`; kept for older clients. See `can_create_domains`.
      */
     domain_creation_error?: string | null;
     /**
@@ -66081,11 +66135,39 @@ export type SetIncidentUpdateVisibilityResponse = SetIncidentUpdateVisibilityRes
 export type GetCertificateMethodsData = {
     body?: never;
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * The domain to judge, such as `my-app.example.com` or `*.example.com`.
+         * Without one, whether each method is set up at all.
+         */
+        domain?: string;
+    };
     url: '/ingress/certificate-methods';
 };
 
+export type GetCertificateMethodsErrors = {
+    /**
+     * The domain is not a domain name
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * The facts could not be read
+     */
+    500: unknown;
+};
+
 export type GetCertificateMethodsResponses = {
+    /**
+     * The methods that fit the domain
+     */
     200: CertificateMethods;
 };
 

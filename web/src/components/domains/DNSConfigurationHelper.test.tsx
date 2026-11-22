@@ -18,7 +18,7 @@ const configured = {
 }
 
 function renderHelper(
-  access_mode: 'direct' | 'local',
+  access_mode: 'direct' | 'local' | 'cloudflare_tunnel',
   settings: Partial<typeof configured>
 ) {
   mockApi({})
@@ -40,7 +40,7 @@ function renderHelper(
           refetch: () => {},
           isLocal: access_mode === 'local',
           isNat: false,
-          isCloudflare: false,
+          isCloudflare: access_mode === 'cloudflare_tunnel',
           isDirect: access_mode === 'direct',
         }}
       >
@@ -66,4 +66,19 @@ test('opened locally, a platform with a public URL is not called local only', ()
 test('with no public URL, local mode still explains what is missing', () => {
   const view = renderHelper('local', {})
   expect(view.getByText('Local Development Mode')).toBeTruthy()
+})
+
+test('opened through Cloudflare, domains served directly are still pointed at this server', () => {
+  const view = renderHelper('cloudflare_tunnel', configured)
+  expect(view.queryByText('Cloudflare Tunnel Active')).toBeNull()
+  expect(view.queryByText(/Cloudflare Dashboard/)).toBeNull()
+  expect(
+    view.getByText(
+      'Point domains served with a Temps certificate at this server'
+    )
+  ).toBeTruthy()
+  expect(view.getByText('203.0.113.10')).toBeTruthy()
+  const note = view.getByText(/HTTP-01 needs public port 80/).textContent
+  expect(note).toContain('without it, issue the certificate with DNS-01')
+  expect(note).toContain('Serving HTTPS directly needs port 443 either way')
 })
