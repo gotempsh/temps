@@ -1286,3 +1286,75 @@ fn start_failure_preserves_container_and_daemon_cause() {
         assert!(message.contains(cause));
     }
 }
+
+/// Reading an entrypoint's file capabilities follows its symlinks the way
+/// the kernel does: `..` leaves a directory symlink from its target. The
+/// layout only exists inside this test's own container; `/app/real` does
+/// not, so a lexical `..` (`/app/entry -> dir/../real` read as `/app/real`)
+/// fails instead of reaching `/opt/real`.
+#[tokio::test]
+async fn file_capabilities_follow_dotdot_through_a_directory_symlink() {
+    let Ok(runtime) = create_test_docker_runtime().await else {
+        println!("Docker or alpine:latest is unavailable, skipping");
+        return;
+    };
+    let docker = Docker::connect_with_local_defaults().expect("local Docker client");
+    let name = format!("temps-test-file-caps-{}", uuid::Uuid::new_v4().simple());
+    let created = docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                    .name(&name)
+                    .build(),
+            ),
+            bollard::models::ContainerCreateBody {
+                image: Some("alpine:latest".to_string()),
+                cmd: Some(vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "mkdir -p /opt/bin /app && touch /opt/real && ln -s /opt/bin /app/dir \
+                     && ln -s dir/../real /app/entry && ln -s ../../app/entry /usr/bin/entry"
+                        .to_string(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create the test container");
+    let id = created.id;
+    let outcome = async {
+        docker
+            .start_container(&id, None::<StartContainerOptions>)
+            .await
+            .expect("start the test container");
+        let mut wait =
+            docker.wait_container(&id, None::<bollard::query_parameters::WaitContainerOptions>);
+        while let Some(status) = wait.next().await {
+            status.expect("the layout script succeeds");
+        }
+        (
+            runtime.file_capabilities(&id, "/app/entry").await,
+            runtime.file_capabilities(&id, "/usr/bin/entry").await,
+            runtime.file_capabilities(&id, "/app/real").await,
+        )
+    }
+    .await;
+    let _ = docker
+        .remove_container(
+            &id,
+            Some(
+                bollard::query_parameters::RemoveContainerOptionsBuilder::new()
+                    .force(true)
+                    .build(),
+            ),
+        )
+        .await;
+
+    let (entry, through_two_links, lexical) = outcome;
+    assert_eq!(entry.expect("/app/entry resolves to /opt/real"), None);
+    assert_eq!(
+        through_two_links.expect("/usr/bin/entry resolves to /opt/real"),
+        None
+    );
+    assert!(lexical.is_err(), "/app/real must not exist: {lexical:?}");
+}

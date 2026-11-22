@@ -1328,8 +1328,7 @@ impl ContainerDeployer for DockerRuntime {
         path: &str,
     ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
         use super::file_capabilities::{
-            parse_tar_head, resolve_link, valid_lookup_path, TarHeadError, MAX_HEAD_BYTES,
-            MAX_SYMLINK_HOPS,
+            resolve_link, valid_lookup_path, ResolveLinkError, MAX_PARENT_LOOKUPS, MAX_SYMLINK_HOPS,
         };
         let failed = |path: &str, reason: String| {
             DeployerError::file_capabilities(container_id, path, "the local Docker daemon", reason)
@@ -1337,63 +1336,35 @@ impl ContainerDeployer for DockerRuntime {
         let docker = self.require_docker()?;
         let mut current = path.to_string();
         for _ in 0..=MAX_SYMLINK_HOPS {
-            if !valid_lookup_path(&current) {
-                return Err(failed(
-                    &current,
-                    "the path is not absolute or is too long".to_string(),
-                ));
-            }
-            let mut stream = docker.download_from_container(
-                container_id,
-                Some(
-                    bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
-                        .path(&current)
-                        .build(),
-                ),
-            );
-            // Read only until the entry's header is complete, never more
-            // than MAX_HEAD_BYTES: the stream (and the file body behind the
-            // header) is dropped as soon as it is.
-            let mut buf: Vec<u8> = Vec::new();
-            let head = loop {
-                match parse_tar_head(&buf) {
-                    Ok(head) => break head,
-                    Err(TarHeadError::Incomplete) if buf.len() < MAX_HEAD_BYTES => {}
-                    Err(TarHeadError::Incomplete) => {
-                        return Err(failed(
-                            &current,
-                            format!("its archive headers exceed {MAX_HEAD_BYTES} bytes"),
-                        ))
-                    }
-                    Err(TarHeadError::Malformed(what)) => {
-                        return Err(failed(&current, format!("unreadable archive ({what})")))
-                    }
-                    Err(TarHeadError::Empty) => {
-                        return Err(failed(&current, "the archive has no entry".to_string()))
-                    }
-                }
-                let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
-                    .await
-                    .map_err(|_| {
-                        failed(&current, "Docker did not answer within 10s".to_string())
-                    })?;
-                match chunk {
-                    Some(Ok(bytes)) => {
-                        let room = MAX_HEAD_BYTES.saturating_sub(buf.len());
-                        buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
-                    }
-                    Some(Err(error)) => return Err(failed(&current, error.to_string())),
-                    None => {
-                        return Err(failed(
-                            &current,
-                            "the archive ended before the file's header".to_string(),
-                        ))
-                    }
-                }
-            };
-            drop(stream);
+            let head = read_archive_head(&docker, container_id, &current)
+                .await
+                .map_err(|reason| failed(&current, reason))?;
             if let Some(target) = head.link_name.as_deref() {
-                current = resolve_link(&current, target);
+                let link = current.clone();
+                current = resolve_link(&link, target, |directory| {
+                    let docker = docker.clone();
+                    async move {
+                        read_archive_head(&docker, container_id, &directory)
+                            .await
+                            .map(|head| head.link_name)
+                    }
+                })
+                .await
+                .map_err(|error| match error {
+                    ResolveLinkError::Lookup { path, error } => failed(&path, error),
+                    ResolveLinkError::TooManyLookups => failed(
+                        &link,
+                        format!(
+                            "resolving its target needs more than {MAX_PARENT_LOOKUPS} directory checks"
+                        ),
+                    ),
+                })?;
+                if !valid_lookup_path(&current) {
+                    return Err(failed(
+                        &current,
+                        "the path is not absolute or is too long".to_string(),
+                    ));
+                }
                 continue;
             }
             return match head.capability_xattr() {
@@ -1488,6 +1459,57 @@ impl ContainerDeployer for DockerRuntime {
             operation: "list a deleted project's images",
             source: Box::new(source),
         })
+    }
+}
+
+/// The leading headers of Docker's one-entry archive of `path` in a
+/// container (a file, a directory or a symlink, which is not followed).
+/// Reads only until the entry's header is complete, never more than
+/// `MAX_HEAD_BYTES`: the stream, and the file body or directory contents
+/// behind the header, is dropped as soon as it is. Errors are the reason.
+async fn read_archive_head(
+    docker: &Docker,
+    container_id: &str,
+    path: &str,
+) -> Result<super::file_capabilities::TarHead, String> {
+    use super::file_capabilities::{
+        parse_tar_head, valid_lookup_path, TarHeadError, MAX_HEAD_BYTES,
+    };
+    if !valid_lookup_path(path) {
+        return Err("the path is not absolute or is too long".to_string());
+    }
+    let mut stream = docker.download_from_container(
+        container_id,
+        Some(
+            bollard::query_parameters::DownloadFromContainerOptionsBuilder::new()
+                .path(path)
+                .build(),
+        ),
+    );
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        match parse_tar_head(&buf) {
+            Ok(head) => return Ok(head),
+            Err(TarHeadError::Incomplete) if buf.len() < MAX_HEAD_BYTES => {}
+            Err(TarHeadError::Incomplete) => {
+                return Err(format!("its archive headers exceed {MAX_HEAD_BYTES} bytes"))
+            }
+            Err(TarHeadError::Malformed(what)) => {
+                return Err(format!("unreadable archive ({what})"))
+            }
+            Err(TarHeadError::Empty) => return Err("the archive has no entry".to_string()),
+        }
+        let chunk = tokio::time::timeout(std::time::Duration::from_secs(10), stream.next())
+            .await
+            .map_err(|_| "Docker did not answer within 10s".to_string())?;
+        match chunk {
+            Some(Ok(bytes)) => {
+                let room = MAX_HEAD_BYTES.saturating_sub(buf.len());
+                buf.extend_from_slice(&bytes[..bytes.len().min(room)]);
+            }
+            Some(Err(error)) => return Err(error.to_string()),
+            None => return Err("the archive ended before the file's header".to_string()),
+        }
     }
 }
 

@@ -12,7 +12,8 @@
 //! file's header has been seen, and never more than [`MAX_HEAD_BYTES`] are
 //! buffered, so a large binary is never downloaded. A symlink (common for
 //! entrypoints, `/usr/bin/app -> /opt/app/bin/app`) is followed up to
-//! [`MAX_SYMLINK_HOPS`] times.
+//! [`MAX_SYMLINK_HOPS`] times, resolving `..` in its target like the kernel
+//! ([`resolve_link`]).
 
 use std::collections::HashMap;
 
@@ -147,28 +148,88 @@ pub(crate) fn parse_tar_head(buf: &[u8]) -> Result<TarHead, TarHeadError> {
     }
 }
 
-/// Where a symlink at `path` pointing at `target` leads, normalised.
-pub(crate) fn resolve_link(path: &str, target: &str) -> String {
-    let base = if target.starts_with('/') {
-        String::new()
-    } else {
-        match path.rfind('/') {
-            Some(index) => path[..index].to_string(),
-            None => String::new(),
-        }
-    };
-    let joined = format!("{base}/{target}");
-    let mut parts: Vec<&str> = Vec::new();
-    for part in joined.split('/') {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop();
-            }
-            other => parts.push(other),
+/// Why [`resolve_link`] could not say where a symlink leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResolveLinkError<E> {
+    /// Reading whether a directory on the way is itself a symlink failed.
+    Lookup { path: String, error: E },
+    /// More than [`MAX_PARENT_LOOKUPS`] directories had to be checked: a
+    /// symlink loop, or a target no real entrypoint has.
+    TooManyLookups,
+}
+
+/// Directories [`resolve_link`] checks before giving up.
+pub(crate) const MAX_PARENT_LOOKUPS: usize = 32;
+
+/// Where a symlink at `path` pointing at `target` leads, resolving `..` the
+/// way the kernel does rather than lexically: when `..` leaves a directory
+/// that is itself a symlink (`/app/entry -> dir/../real` with
+/// `/app/dir -> /opt/bin` leads to `/opt/real`, not `/app/real`), the
+/// symlink is replaced by its target first. `read_link` returns the target
+/// of the symlink at an absolute path, or `None` for anything else.
+///
+/// Only the directories a `..` leaves are checked: leaving a real directory
+/// lands in its parent whatever that resolves to, and Docker's archive
+/// endpoint resolves the remaining directory symlinks itself. It cleans the
+/// path lexically first, so a `..` must never reach it.
+pub(crate) async fn resolve_link<F, Fut, E>(
+    path: &str,
+    target: &str,
+    mut read_link: F,
+) -> Result<String, ResolveLinkError<E>>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<Option<String>, E>>,
+{
+    let mut resolved: Vec<String> = Vec::new();
+    if !target.starts_with('/') {
+        if let Some(index) = path.rfind('/') {
+            resolved.extend(
+                path[..index]
+                    .split('/')
+                    .filter(|part| !part.is_empty() && *part != ".")
+                    .map(str::to_string),
+            );
         }
     }
-    format!("/{}", parts.join("/"))
+    let mut pending: std::collections::VecDeque<String> =
+        target.split('/').map(str::to_string).collect();
+    let mut lookups = 0;
+    while let Some(part) = pending.pop_front() {
+        match part.as_str() {
+            "" | "." => {}
+            ".." => {
+                if resolved.is_empty() {
+                    continue;
+                }
+                lookups += 1;
+                if lookups > MAX_PARENT_LOOKUPS {
+                    return Err(ResolveLinkError::TooManyLookups);
+                }
+                let directory = format!("/{}", resolved.join("/"));
+                let link = read_link(directory.clone()).await.map_err(|error| {
+                    ResolveLinkError::Lookup {
+                        path: directory,
+                        error,
+                    }
+                })?;
+                resolved.pop();
+                if let Some(link) = link {
+                    // Leave the symlink's target instead: splice it in and
+                    // apply this `..` again to its last component.
+                    if link.starts_with('/') {
+                        resolved.clear();
+                    }
+                    pending.push_front("..".to_string());
+                    for component in link.split('/').rev() {
+                        pending.push_front(component.to_string());
+                    }
+                }
+            }
+            other => resolved.push(other.to_string()),
+        }
+    }
+    Ok(format!("/{}", resolved.join("/")))
 }
 
 /// Whether `path` is one Temps will look up: absolute, bounded, no NUL.
@@ -251,15 +312,99 @@ pub(crate) mod tests {
     fn a_symlink_reports_its_target() {
         let head = parse_tar_head(&archive("seqsvr", b'2', "../../seqsvr/Seq", &[])).unwrap();
         assert_eq!(head.link_name.as_deref(), Some("../../seqsvr/Seq"));
+    }
+
+    /// Resolve with `links` as the container's symlinks, recording the
+    /// directories checked.
+    async fn resolve(
+        path: &str,
+        target: &str,
+        links: &[(&str, &str)],
+    ) -> (Result<String, ResolveLinkError<()>>, Vec<String>) {
+        let links: HashMap<String, String> = links
+            .iter()
+            .map(|(from, to)| (from.to_string(), to.to_string()))
+            .collect();
+        let checked = std::sync::Mutex::new(Vec::new());
+        let result = resolve_link(path, target, |directory| {
+            checked.lock().unwrap().push(directory.clone());
+            let link = links.get(&directory).cloned();
+            async move { Ok(link) }
+        })
+        .await;
+        (result, checked.into_inner().unwrap())
+    }
+
+    #[tokio::test]
+    async fn ordinary_links_resolve_and_only_left_directories_are_checked() {
         assert_eq!(
-            resolve_link("/usr/bin/seqsvr", "../../seqsvr/Seq"),
-            "/seqsvr/Seq"
+            resolve("/usr/bin/seqsvr", "../../seqsvr/Seq", &[]).await,
+            (
+                Ok("/seqsvr/Seq".to_string()),
+                vec!["/usr/bin".to_string(), "/usr".to_string()]
+            )
         );
         assert_eq!(
-            resolve_link("/usr/bin/app", "/opt/app/bin/app"),
-            "/opt/app/bin/app"
+            resolve("/usr/bin/app", "/opt/app/bin/app", &[]).await,
+            (Ok("/opt/app/bin/app".to_string()), vec![])
         );
-        assert_eq!(resolve_link("/usr/bin/app", "./real"), "/usr/bin/real");
+        assert_eq!(
+            resolve("/usr/bin/app", "./real", &[]).await,
+            (Ok("/usr/bin/real".to_string()), vec![])
+        );
+        assert_eq!(
+            resolve("/app", "../../x", &[]).await.0,
+            Ok("/x".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn dotdot_leaves_a_directory_symlink_from_its_target() {
+        // The kernel resolves /app/dir to /opt/bin before applying `..`.
+        assert_eq!(
+            resolve("/app/entry", "dir/../real", &[("/app/dir", "/opt/bin")])
+                .await
+                .0,
+            Ok("/opt/real".to_string())
+        );
+        // A relative directory link. `/srv` is never left, so Docker
+        // resolves it, and `/srv/real` is the same file as `/data/srv/real`.
+        assert_eq!(
+            resolve(
+                "/app/entry",
+                "dir/../real",
+                &[("/app/dir", "../srv/bin"), ("/srv", "/data/srv")]
+            )
+            .await
+            .0,
+            Ok("/srv/real".to_string())
+        );
+        // The base directory of the link is a symlink too.
+        assert_eq!(
+            resolve("/bin/app", "../lib/app", &[("/bin", "usr/bin")])
+                .await
+                .0,
+            Ok("/usr/lib/app".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn a_directory_symlink_loop_gives_up_instead_of_spinning() {
+        let (result, checked) = resolve("/a/entry", "../real", &[("/a", "/a/b/..")]).await;
+        assert_eq!(result, Err(ResolveLinkError::TooManyLookups));
+        assert_eq!(checked.len(), MAX_PARENT_LOOKUPS);
+    }
+
+    #[tokio::test]
+    async fn a_failed_directory_check_is_reported_with_its_path() {
+        let result = resolve_link("/usr/bin/app", "../lib/app", |_| async { Err("refused") }).await;
+        assert_eq!(
+            result,
+            Err(ResolveLinkError::Lookup {
+                path: "/usr/bin".to_string(),
+                error: "refused"
+            })
+        );
     }
 
     #[test]
