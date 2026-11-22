@@ -58,7 +58,7 @@ const tunnel = {
 const NO_PORT_80 =
   "HTTP-01 needs Let's Encrypt to reach this server on public port 80, and visitors to reach it on 443."
 
-function methods(domain: string | null) {
+function methods(domain: string | null, provider: string | null = null) {
   return {
     http01_available: false,
     http01: {
@@ -66,19 +66,25 @@ function methods(domain: string | null) {
       reason: NO_PORT_80,
       setup_path: '/settings/nodes/ingress?via=ports',
     },
-    dns01_provider: {
-      configured: false,
-      reason: `No connected DNS provider has a verified zone covering ${domain}`,
-      setup_path: '/dns-providers/add',
-    },
+    dns01_provider: provider
+      ? { configured: true }
+      : {
+          configured: false,
+          reason: `No connected DNS provider auto-manages a verified zone covering ${domain}`,
+          setup_path: '/dns-providers/add',
+        },
     dns01_manual: { configured: true },
     tunnel: { configured: domain?.endsWith('.apps.example.org') ?? false },
-    dns_provider: null,
+    dns_provider: provider,
     tunnels: [],
   }
 }
 
-function renderWizard() {
+type MethodsHandler = (domain: string | null) => Response | Promise<Response>
+
+function renderWizard(
+  answer: MethodsHandler = (domain) => jsonResponse(methods(domain))
+) {
   const asked: (string | null)[] = []
   mockApi({
     'GET /ingress/connectors': () =>
@@ -86,7 +92,7 @@ function renderWizard() {
     'GET /ingress/certificate-methods': (request) => {
       const domain = new URL(request.url).searchParams.get('domain')
       asked.push(domain)
-      return jsonResponse(methods(domain))
+      return answer(domain)
     },
   })
   const client = new QueryClient({
@@ -139,12 +145,7 @@ test('a domain the tunnel does not cover gets a certificate, DNS-01 chosen when 
   expect(view.getByText(/HTTP-01 Challenge/)).toBeTruthy()
   expect(view.getByText('Through a Cloudflare Tunnel')).toBeTruthy()
   expect(view.getByText(/No tunnel covers example.com yet/)).toBeTruthy()
-  const checked = view
-    .getAllByRole('radio')
-    .filter((radio) => radio.getAttribute('aria-checked') === 'true')
-  expect(checked.map((radio) => radio.getAttribute('value'))).toEqual([
-    'dns-01',
-  ])
+  expect(checkedMethod(view)).toEqual(['dns-01'])
 
   // Judged for this domain: why HTTP-01 does not fit, and how DNS-01 works.
   await view.findByText(NO_PORT_80)
@@ -155,4 +156,67 @@ test('a domain the tunnel does not cover gets a certificate, DNS-01 chosen when 
       .getByRole('link', { name: 'Connect a DNS provider' })
       .getAttribute('href')
   ).toBe('/dns-providers/add')
+})
+
+function checkedMethod(view: ReturnType<typeof render>): (string | null)[] {
+  return view
+    .getAllByRole('radio')
+    .filter((radio) => radio.getAttribute('aria-checked') === 'true')
+    .map((radio) => radio.getAttribute('value'))
+}
+
+test('port 80 reachability that arrives after Next still picks DNS-01', async () => {
+  let release = () => {}
+  const late = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const { view } = renderWizard(async (domain) => {
+    // The cluster-wide read answers only after Next was pressed.
+    if (domain == null) await late
+    return jsonResponse(methods(domain))
+  })
+  fireEvent.change(view.getByLabelText('Domain name'), {
+    target: { value: 'example.com' },
+  })
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  await new Promise((resolve) => setTimeout(resolve, 20))
+  release()
+  await view.findByText('How it gets HTTPS')
+  expect(checkedMethod(view)).toEqual(['dns-01'])
+})
+
+test('a failed provider lookup says so and retries, never claiming by hand', async () => {
+  let failures = 1
+  const { view } = renderWizard((domain) => {
+    if (domain != null && failures > 0) {
+      failures--
+      return jsonResponse({ title: 'Reachability Error', status: 500 }, 500)
+    }
+    return jsonResponse(methods(domain))
+  })
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+
+  await view.findByText(
+    'Could not check whether a DNS provider can write the TXT record'
+  )
+  expect(view.queryByText('You add one TXT record by hand')).toBeNull()
+  fireEvent.click(
+    view.getByRole('button', { name: 'Retry the DNS provider check' })
+  )
+  await view.findByText('You add one TXT record by hand')
+})
+
+test('a provider that writes the record is named on both steps', async () => {
+  const { view } = renderWizard((domain) =>
+    jsonResponse(methods(domain, domain == null ? null : 'registrar'))
+  )
+  await tunnelsLoaded()
+  await enterDomain(view, 'example.com')
+  await view.findByText('Temps can write the TXT record through registrar')
+
+  fireEvent.click(view.getByRole('button', { name: 'Next' }))
+  await view.findByText('DNS-01 (through registrar)')
+  expect(view.getByText('Temps adds the TXT record for you')).toBeTruthy()
+  expect(view.queryByText('DNS-01 (Manual)')).toBeNull()
 })

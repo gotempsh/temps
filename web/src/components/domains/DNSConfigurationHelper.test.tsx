@@ -78,5 +78,7 @@ test('opened through Cloudflare, domains served directly are still pointed at th
     )
   ).toBeTruthy()
   expect(view.getByText('203.0.113.10')).toBeTruthy()
-  expect(view.getByText(/HTTP-01 needs ports 80 and 443/)).toBeTruthy()
+  const note = view.getByText(/HTTP-01 needs public port 80/).textContent
+  expect(note).toContain('without it, issue the certificate with DNS-01')
+  expect(note).toContain('Serving HTTPS directly needs port 443 either way')
 })

@@ -102,9 +102,14 @@ pub struct CertificateMethodFacts {
     pub domain: Option<String>,
     /// Something here answers on public port 80 (ADR 064 D4).
     pub http01_reachable: bool,
-    /// The active provider with a verified zone covering the domain; without
-    /// a domain, any active provider.
+    /// The active provider with a verified, auto-managed zone covering the
+    /// domain: the one automatic DNS-01 issuance and renewal write through
+    /// (`DnsProviderService::find_provider_for_domain`). Without a domain,
+    /// any active provider.
     pub dns_provider: Option<String>,
+    /// Why no provider could be picked for the domain, when the lookup found
+    /// a problem rather than nothing (two zones claiming it, say).
+    pub dns_provider_problem: Option<String>,
     /// The tunnels covering the domain, most specific first; without a
     /// domain, every tunnel.
     pub covering_tunnels: Vec<String>,
@@ -137,10 +142,17 @@ pub fn certificate_methods(facts: &CertificateMethodFacts) -> CertificateMethods
     let dns01_provider = match (&facts.dns_provider, domain) {
         (Some(_), _) => MethodCapability::ready(),
         (None, Some(domain)) => MethodCapability::missing(
-            format!(
-                "No connected DNS provider has a verified zone covering {domain}: add the DNS-01 \
-                 TXT record by hand, or connect the provider that hosts its DNS so Temps writes it."
-            ),
+            match &facts.dns_provider_problem {
+                Some(problem) => format!(
+                    "Temps cannot pick a DNS provider for {domain}: {problem}. Add the DNS-01 TXT \
+                     record by hand, or fix the provider's zones."
+                ),
+                None => format!(
+                    "No connected DNS provider auto-manages a verified zone covering {domain}: \
+                     add the DNS-01 TXT record by hand, or connect the provider that hosts its \
+                     DNS (with automatic management on) so Temps writes it and renews it."
+                ),
+            },
             Some(DNS_PROVIDER_SETUP_PATH),
         ),
         (None, None) => MethodCapability::missing(
@@ -217,6 +229,29 @@ pub fn tunnel_covers(tunnel_domain: &str, zone: Option<&str>, domain: &str) -> b
     }
 }
 
+/// The provider DNS-01 would write through for `domain`, or why none can be
+/// picked. Uses the lookup automatic issuance and renewal use
+/// (`find_provider_for_domain`: a verified, auto-managed zone of an active
+/// provider), so the method is advertised only when that path can write the
+/// record. Without a domain, any active provider.
+pub async fn dns_provider_fact(
+    providers: &temps_dns::DnsProviderService,
+    domain: Option<&str>,
+) -> Result<(Option<String>, Option<String>), ReachabilityError> {
+    let Some(domain) = domain else {
+        let active = providers.list_active().await.map_err(IngressError::from)?;
+        return Ok((active.into_iter().next().map(|p| p.name), None));
+    };
+    match providers.find_provider_for_domain(domain).await {
+        Ok(found) => Ok((found.map(|(provider, _)| provider.name), None)),
+        // A misconfiguration the operator can fix: a reason, not a 500.
+        Err(problem @ temps_dns::DnsError::AmbiguousManagedDomain { .. }) => {
+            Ok((None, Some(problem.to_string())))
+        }
+        Err(other) => Err(IngressError::from(other).into()),
+    }
+}
+
 /// Where the facts come from; the reachability service in production.
 #[async_trait]
 pub trait CertificateMethodSource: Send + Sync {
@@ -237,21 +272,8 @@ impl CertificateMethodSource for ReachabilityService {
             .map(parse_domain)
             .transpose()?;
         let http01_reachable = self.http01_available().await?;
-        let providers = &self.deps.dns_providers;
-        let dns_provider = match &domain {
-            Some(domain) => providers
-                .find_verified_zone_for_domain(domain)
-                .await
-                .map_err(IngressError::from)?
-                .map(|(provider, _)| provider.name),
-            None => providers
-                .list_active()
-                .await
-                .map_err(IngressError::from)?
-                .into_iter()
-                .next()
-                .map(|provider| provider.name),
-        };
+        let (dns_provider, dns_provider_problem) =
+            dns_provider_fact(&self.deps.dns_providers, domain.as_deref()).await?;
         let tunnels = self.deps.connectors.tunnel_facts(&[]).await?.tunnels;
         let mut covering = Vec::new();
         let mut other_tunnels = Vec::new();
@@ -277,6 +299,7 @@ impl CertificateMethodSource for ReachabilityService {
             domain,
             http01_reachable,
             dns_provider,
+            dns_provider_problem,
             covering_tunnels: covering.into_iter().map(|(_, _, name)| name).collect(),
             other_tunnels,
         })
@@ -460,6 +483,22 @@ mod tests {
     }
 
     #[test]
+    fn a_zone_claimed_twice_says_why_no_provider_writes_the_record() {
+        let methods = certificate_methods(&CertificateMethodFacts {
+            dns_provider_problem: Some("two zones claim example.com".into()),
+            ..facts("my-app.example.com")
+        });
+        assert!(!methods.dns01_provider.configured);
+        let reason = methods.dns01_provider.reason.unwrap_or_default();
+        assert!(
+            reason.contains("cannot pick a DNS provider for my-app.example.com"),
+            "{reason}"
+        );
+        assert!(reason.contains("two zones claim example.com"), "{reason}");
+        assert!(methods.dns01_manual.configured);
+    }
+
+    #[test]
     fn a_wildcard_is_dns01_only_whatever_the_ports() {
         let methods = certificate_methods(&CertificateMethodFacts {
             http01_reachable: true,
@@ -535,6 +574,132 @@ mod tests {
             refused,
             Err(ReachabilityError::Validation(message)) if message.contains("https://example.com/path")
         ));
+    }
+
+    // ----- the DNS provider lookup ----------------------------------------
+
+    fn providers(db: sea_orm::MockDatabase) -> temps_dns::DnsProviderService {
+        temps_dns::DnsProviderService::new(
+            Arc::new(db.into_connection()),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "certificate-methods-test",
+            )),
+        )
+    }
+
+    fn zone(id: i32, provider_id: i32, domain: &str) -> temps_entities::dns_managed_domains::Model {
+        let now = chrono::Utc::now();
+        temps_entities::dns_managed_domains::Model {
+            id,
+            provider_id,
+            domain: domain.into(),
+            zone_id: None,
+            auto_manage: true,
+            proxied_by_default: false,
+            verified: true,
+            verified_at: Some(now),
+            verification_error: None,
+            generated_hostname_mode: "standard".into(),
+            sync_generated_records: false,
+            zone_access_ok: Some(true),
+            zone_access_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn provider(id: i32, name: &str) -> temps_entities::dns_providers::Model {
+        let now = chrono::Utc::now();
+        temps_entities::dns_providers::Model {
+            id,
+            name: name.into(),
+            provider_type: "cloudflare".into(),
+            credentials: "not-read-here".into(),
+            is_active: true,
+            description: None,
+            last_used_at: None,
+            last_error: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The capability and automatic issuance must agree: the lookup asks
+    /// for an auto-managed zone, as `issue_dns01_through_provider` does.
+    #[tokio::test]
+    async fn the_provider_is_the_one_automatic_issuance_writes_through() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![(
+                    zone(11, 101, "example.com"),
+                    Some(provider(101, "registrar")),
+                )]])
+                .into_connection(),
+        );
+        let service = temps_dns::DnsProviderService::new(
+            db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "certificate-methods-test",
+            )),
+        );
+        let (found, problem) = dns_provider_fact(&service, Some("my-app.example.com"))
+            .await
+            .expect("lookup succeeds");
+        assert_eq!(found.as_deref(), Some("registrar"));
+        assert_eq!(problem, None);
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("the test holds the only connection")
+            .into_transaction_log();
+        let sql = &log[0].statements()[0].sql;
+        assert!(
+            sql.contains(r#""dns_managed_domains"."auto_manage" = "#),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(r#""dns_managed_domains"."verified" = "#),
+            "{sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_zone_only_auto_managed_lookups_skip_is_not_advertised() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<(
+                temps_entities::dns_managed_domains::Model,
+                Option<temps_entities::dns_providers::Model>,
+            )>::new()]);
+        let service = providers(db);
+        let (found, problem) = dns_provider_fact(&service, Some("my-app.example.com"))
+            .await
+            .expect("lookup succeeds");
+        assert_eq!(found, None);
+        assert_eq!(problem, None);
+    }
+
+    #[tokio::test]
+    async fn two_zones_claiming_the_domain_are_a_reason_not_a_failure() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![
+                (zone(11, 101, "example.com"), Some(provider(101, "first"))),
+                (zone(12, 202, "Example.COM."), Some(provider(202, "second"))),
+            ]]);
+        let service = providers(db);
+        let (found, problem) = dns_provider_fact(&service, Some("my-app.example.com"))
+            .await
+            .expect("an ambiguous zone is reported, not raised");
+        assert_eq!(found, None);
+        assert!(problem.is_some_and(|p| p.contains("example.com")));
+    }
+
+    #[tokio::test]
+    async fn a_database_failure_is_raised() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            .append_query_errors(vec![sea_orm::DbErr::Custom("connection reset".into())]);
+        let service = providers(db);
+        assert!(dns_provider_fact(&service, Some("my-app.example.com"))
+            .await
+            .is_err());
     }
 
     // ----- the handler --------------------------------------------------

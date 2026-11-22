@@ -85,8 +85,9 @@ export function DNSConfigurationHelper() {
             </div>
           )}
           <p className="text-sm">
-            HTTP-01 needs ports 80 and 443 to reach this server. If they
-            don&apos;t, issue the certificate with DNS-01.
+            HTTP-01 needs public port 80 to reach this server; without it, issue
+            the certificate with DNS-01. Serving HTTPS directly needs port 443
+            either way.
           </p>
         </AlertDescription>
       </Alert>
