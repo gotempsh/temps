@@ -27,6 +27,7 @@ reqwest = { workspace = true }
 scraper = { workspace = true }
 sha2 = { workspace = true }
 serde = { workspace = true }
+woothee = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 sea-orm = { workspace = true }

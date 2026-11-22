@@ -90576,6 +90576,19 @@
       },
       "VisitorInfo": {
         "properties": {
+          "browser": {
+            "description": "Browser named by `user_agent` (e.g. \"Chrome\"), as analytics breakdowns name it",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "browser_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "city": {
             "type": [
               "string",
@@ -90687,6 +90700,19 @@
             "format": "double",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "operating_system": {
+            "description": "Operating system named by `user_agent` (e.g. \"Windows 10\")",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "operating_system_version": {
+            "type": [
+              "string",
               "null"
             ]
           },

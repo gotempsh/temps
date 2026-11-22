@@ -42301,6 +42301,11 @@ export type VisitorFacetsQuery = VisitorSegmentFilters & {
 };
 
 export type VisitorInfo = {
+    /**
+     * Browser named by `user_agent` (e.g. "Chrome"), as analytics breakdowns name it
+     */
+    browser?: string | null;
+    browser_version?: string | null;
     city?: string | null;
     country?: string | null;
     country_code?: string | null;
@@ -42337,6 +42342,11 @@ export type VisitorInfo = {
     last_seen: string;
     latitude?: number | null;
     longitude?: number | null;
+    /**
+     * Operating system named by `user_agent` (e.g. "Windows 10")
+     */
+    operating_system?: string | null;
+    operating_system_version?: string | null;
     project_id: number;
     region?: string | null;
     timezone?: string | null;
