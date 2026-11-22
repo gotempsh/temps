@@ -190,9 +190,15 @@ fn init() {
 
 extern "C" fn remove_own_containers_at_exit() {
     run_blocking(|docker| async move {
-        let filters = vec![format!("{LABEL_NONCE}={}", process_nonce())];
-        remove_matching(&docker, filters).await;
+        remove_own_containers(&docker).await;
     });
+}
+
+/// Removes the containers this process labelled, and only those: the filter
+/// is this process's nonce, so a concurrent test process keeps its own.
+async fn remove_own_containers(docker: &Docker) {
+    let filters = vec![format!("{LABEL_NONCE}={}", process_nonce())];
+    remove_matching(docker, filters).await;
 }
 
 /// Runs `work` against a Docker client on its own thread and runtime, waiting
@@ -476,5 +482,62 @@ mod tests {
         );
         drop(live);
         std::mem::forget(dead);
+    }
+
+    /// Exit cleanup removes this process's containers and leaves a concurrent
+    /// test process's containers running, even a young one with a live owner
+    /// on the same host.
+    #[tokio::test]
+    async fn exit_cleanup_removes_only_this_process_containers() {
+        let Some(docker) = connect_docker() else {
+            eprintln!("skipping: no Docker endpoint found");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            eprintln!("skipping: Docker is not available");
+            return;
+        }
+        let now = unix_now();
+        let own = match GenericImage::new("alpine", "3")
+            .with_cmd(["sleep", "300"])
+            .with_labels(process_labels(now))
+            .start()
+            .await
+        {
+            Ok(c) => c,
+            Err(error) => {
+                eprintln!("skipping: could not start alpine: {error}");
+                return;
+            }
+        };
+        let other = GenericImage::new("alpine", "3")
+            .with_cmd(["sleep", "300"])
+            .with_labels([
+                (LABEL_TEST.to_string(), "true".to_string()),
+                (LABEL_PID.to_string(), std::process::id().to_string()),
+                (
+                    LABEL_NONCE.to_string(),
+                    "unit-test-concurrent-process".to_string(),
+                ),
+                (LABEL_HOST.to_string(), host_name()),
+                (LABEL_CREATED_AT.to_string(), now.to_string()),
+            ])
+            .start()
+            .await
+            .expect("start the other process's container");
+        let own_id = own.id().to_string();
+
+        remove_own_containers(&docker).await;
+
+        assert!(
+            docker.inspect_container(&own_id, None).await.is_err(),
+            "this process's container must be gone"
+        );
+        assert!(
+            docker.inspect_container(other.id(), None).await.is_ok(),
+            "a concurrent process's container must survive exit cleanup"
+        );
+        drop(other);
+        std::mem::forget(own);
     }
 }
