@@ -16,7 +16,7 @@
 //! sends `HEAD` and reads only the status and headers.
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, SERVER};
@@ -26,6 +26,13 @@ use super::compute::Resolution;
 use super::model::{AddressReachability, Audience, ReachState};
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+fn public_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => temps_core::url_validation::validate_ipv4(&ip).is_ok(),
+        IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip).is_ok(),
+    }
+}
+
 /// The HTTP client's timeout does not cover this lookup, and a slow resolver
 /// would otherwise hold up the verdict for the whole environment.
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(3);
@@ -73,7 +80,7 @@ pub enum ForwardProbe {
 pub fn applies(verdict: &AddressReachability, resolution: &Resolution) -> bool {
     verdict.state == ReachState::Unknown
         && verdict.audience == Audience::Public
-        && matches!(resolution, Resolution::Ips(ips) if !ips.is_empty())
+        && matches!(resolution, Resolution::Ips(ips) if !ips.is_empty() && ips.iter().copied().all(public_address))
 }
 
 fn edge_from(headers: &HeaderMap) -> Option<Edge> {
@@ -108,7 +115,14 @@ async fn lookup_within(
     lookup: impl Future<Output = Result<Vec<SocketAddr>, UrlValidationError>>,
 ) -> Result<Vec<SocketAddr>, ForwardProbe> {
     match tokio::time::timeout(deadline, lookup).await {
-        Ok(Ok(addresses)) => Ok(addresses),
+        Ok(Ok(addresses))
+            if !addresses.is_empty() && addresses.iter().all(|a| public_address(a.ip())) =>
+        {
+            Ok(addresses)
+        }
+        Ok(Ok(_)) => Err(ForwardProbe::Unchecked(format!(
+            "{host} did not resolve exclusively to public addresses"
+        ))),
         Ok(Err(UrlValidationError::DnsResolutionFailed(reason))) => Err(ForwardProbe::Unchecked(
             format!("{host} did not resolve: {reason}"),
         )),
@@ -218,8 +232,21 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn private_answers_never_supply_public_forwarding_evidence() {
+        for raw in ["192.168.1.1", "100.64.0.1", "fd00::1", "::ffff:10.0.0.1"] {
+            let ip: IpAddr = raw.parse().unwrap();
+            assert!(!applies(&elsewhere(), &Resolution::Ips(vec![ip])));
+            let pins = vec![SocketAddr::new(ip, 443)];
+            assert!(matches!(
+                lookup_within(Duration::from_secs(1), "example.com", async { Ok(pins) }).await,
+                Err(ForwardProbe::Unchecked(_))
+            ));
+        }
+    }
+
     fn resolved() -> Resolution {
-        Resolution::Ips(vec!["203.0.113.7".parse().expect("test IP")])
+        Resolution::Ips(vec![std::net::Ipv4Addr::from(1_u32 << 24).into()])
     }
 
     fn headers(pairs: &[(&'static str, &'static str)]) -> HeaderMap {
@@ -381,7 +408,10 @@ mod tests {
 
     #[tokio::test]
     async fn a_lookup_in_time_returns_its_addresses_or_says_why_not() {
-        let addresses = vec!["203.0.113.7:443".parse().expect("test address")];
+        let addresses = vec![SocketAddr::new(
+            std::net::Ipv4Addr::from(1_u32 << 24).into(),
+            443,
+        )];
         let found = lookup_within(Duration::from_secs(1), "myapp.example.test", async {
             Ok(addresses.clone())
         })

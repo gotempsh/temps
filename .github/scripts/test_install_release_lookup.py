@@ -60,8 +60,9 @@ if "api.github.com" not in url:
         open(output, "wb").write(open(archive, "rb").read())
     sys.exit(0)
 routes = json.load(open(os.environ["FAKE_ROUTES"]))
-status, body = routes.get(url.split("/repos/gotempsh/temps/", 1)[1], routes["default"])
+status, body, *exit_codes = routes.get(url.split("/repos/gotempsh/temps/", 1)[1], routes["default"])
 sys.stdout.write(body + "\n" + status)
+sys.exit(exit_codes[0] if exit_codes else 0)
 '''
 
 
@@ -144,8 +145,7 @@ class ReleaseLookupTests(unittest.TestCase):
     def install(self, *arguments, routes=None, status="404", platform="Linux x86_64"):
         """Run the installer against canned API routes (path -> (status, body))."""
         table = {"default": [status, "{}"]}
-        for path, (route_status, body) in (routes or {}).items():
-            table[path] = [route_status, body]
+        table.update(routes or {})
         with tempfile.TemporaryDirectory(prefix="temps-install-lookup-") as temporary:
             root = Path(temporary)
             bin_dir = root / "bin"
@@ -202,6 +202,14 @@ class ReleaseLookupTests(unittest.TestCase):
     def test_network_error_is_explained(self):
         run = self.install(status="000")
         self.assertIn("network or DNS failure", run.output)
+
+    def test_timed_out_beta_listing_discards_partial_http_200(self):
+        partial = minified([release("v1.0.0-beta.1")])[:-1]
+        run = self.install("--channel", "beta", routes={
+            "releases?per_page=100&page=1": ("200", partial, 28),
+        })
+        self.assertIn("network or DNS failure", run.output)
+        self.assert_picked_nothing(run)
 
     def test_beta_lookup_reports_api_errors(self):
         run = self.install("--channel", "beta", status="403")

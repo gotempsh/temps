@@ -18,7 +18,10 @@ use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
 use std::io::{self, Write};
-use std::net::Ipv4Addr;
+mod eager_dns;
+mod generated_hostname;
+use eager_dns::issuance_contact;
+use generated_hostname::{embedded_ipv4_from_zone, generated_domain_for, is_loopback_zone};
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
 use temps_config::AppSettings;
@@ -94,6 +97,11 @@ pub struct SetupCommand {
     /// Admin user email address (required unless --auto is used)
     #[arg(long)]
     pub admin_email: Option<String>,
+
+    /// Default admin and ACME contact for this run. Overrides a saved ACME contact.
+    /// --admin-email and --letsencrypt-email override their respective defaults.
+    #[arg(long)]
+    pub email: Option<String>,
 
     /// Admin user display name (default: "Admin")
     #[arg(long, default_value = "Admin")]
@@ -256,7 +264,7 @@ pub struct SetupCommand {
     /// and (like the sslip.io domain default above) skip SSL/DNS-provider
     /// setup even if --wildcard-domain is explicitly given. Zero prompts
     /// required. Use this for unattended/scripted installs.
-    #[arg(long, default_value = "false")]
+    #[arg(long, visible_alias = "yes", default_value = "false")]
     pub auto: bool,
 }
 
@@ -331,10 +339,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
     Ok(())
 }
 
-/// Result type indicating whether the user was created or password was reset
+/// Only a newly created administrator has a credential to return.
 pub enum AdminUserResult {
     Created(users::Model, String),
-    PasswordReset(users::Model, String),
+    Existing(users::Model),
 }
 
 async fn create_admin_user(
@@ -345,18 +353,6 @@ async fn create_admin_user(
 ) -> anyhow::Result<AdminUserResult> {
     let email_lower = email.to_lowercase();
 
-    // Use provided password or generate a secure one
-    let password = provided_password
-        .map(|p| p.to_string())
-        .unwrap_or_else(generate_secure_password);
-
-    // Hash password with Argon2
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(password.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
-        .to_string();
-
     // Check if user exists
     let existing_user = users::Entity::find()
         .filter(users::Column::Email.eq(&email_lower))
@@ -364,12 +360,6 @@ async fn create_admin_user(
         .await?;
 
     if let Some(existing) = existing_user {
-        // User exists - reset password
-        let mut user_update: users::ActiveModel = existing.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.updated_at = Set(chrono::Utc::now());
-        let updated_user = user_update.update(conn).await?;
-
         // Ensure user has admin role
         let admin_role = roles::Entity::find()
             .filter(roles::Column::Name.eq("admin"))
@@ -385,26 +375,28 @@ async fn create_admin_user(
 
         // Check if user already has admin role
         let has_admin_role = user_roles::Entity::find()
-            .filter(user_roles::Column::UserId.eq(updated_user.id))
+            .filter(user_roles::Column::UserId.eq(existing.id))
             .filter(user_roles::Column::RoleId.eq(admin_role.id))
             .one(conn)
             .await?;
 
         if has_admin_role.is_none() {
-            // Assign admin role
-            let user_role = user_roles::ActiveModel {
-                user_id: Set(updated_user.id),
-                role_id: Set(admin_role.id),
-                created_at: Set(chrono::Utc::now()),
-                updated_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
-            user_role.insert(conn).await?;
+            anyhow::bail!("Setup found existing user {} without the admin role. Supply the existing administrator's email.", existing.id);
         }
-
-        debug!("Reset password for admin user: {}", email_lower);
-        return Ok(AdminUserResult::PasswordReset(updated_user, password));
+        return Ok(AdminUserResult::Existing(existing));
     }
+
+    // Use provided password or generate a secure one
+    let password = provided_password
+        .map(|p| p.to_string())
+        .unwrap_or_else(generate_secure_password);
+
+    // Hash password with Argon2
+    let argon2 = Argon2::default();
+    let password_hash = argon2
+        .hash_password(password.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
+        .to_string();
 
     // Create new user
     let new_user = users::ActiveModel {
@@ -425,12 +417,14 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    let user = new_user.insert(conn).await?;
+    use sea_orm::TransactionTrait;
+    let txn = conn.begin().await?;
+    let user = new_user.insert(&txn).await?;
 
     // Get admin role
     let admin_role = roles::Entity::find()
         .filter(roles::Column::Name.eq("admin"))
-        .one(conn)
+        .one(&txn)
         .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
@@ -449,7 +443,8 @@ async fn create_admin_user(
         ..Default::default()
     };
 
-    user_role.insert(conn).await?;
+    user_role.insert(&txn).await?;
+    txn.commit().await?;
 
     debug!("Created admin user: {}", email_lower);
     Ok(AdminUserResult::Created(user, password))
@@ -795,28 +790,33 @@ async fn detect_public_ip() -> anyhow::Result<String> {
         .timeout(std::time::Duration::from_secs(10))
         .build()?;
 
-    // Try multiple services
-    let services = vec![
-        ("https://api.ipify.org?format=json", "ip"),
-        ("https://ipinfo.io/json", "ip"),
-        ("https://api.myip.com", "ip"),
-    ];
+    #[derive(serde::Deserialize)]
+    struct EchoResponse {
+        ip: std::net::IpAddr,
+    }
 
-    for (url, field) in services {
-        match client.get(url).send().await {
-            Ok(response) => {
-                if let Ok(json) = response.json::<serde_json::Value>().await {
-                    if let Some(ip) = json.get(field).and_then(|v| v.as_str()) {
-                        // Validate it looks like an IP address
-                        if ip.parse::<std::net::IpAddr>().is_ok() {
-                            return Ok(ip.to_string());
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                debug!("Failed to get IP from {}: {}", url, e);
+    // A proxy or private
+    // exit address is not an origin for the installer to publish in DNS.
+    for url in [
+        "https://api.ipify.org?format=json",
+        "https://ipinfo.io/json",
+        "https://api.myip.com",
+    ] {
+        let response = match client
+            .get(url)
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+        {
+            Ok(response) => response,
+            Err(error) => {
+                debug!(%url, %error, "Public IP lookup failed");
                 continue;
+            }
+        };
+        if let Ok(echo) = response.json::<EchoResponse>().await {
+            if is_public_setup_origin(echo.ip) {
+                return Ok(echo.ip.to_string());
             }
         }
     }
@@ -824,6 +824,14 @@ async fn detect_public_ip() -> anyhow::Result<String> {
     Err(anyhow::anyhow!(
         "Unable to auto-detect public IP. Please provide --server-ip manually."
     ))
+}
+
+fn is_public_setup_origin(address: std::net::IpAddr) -> bool {
+    let public = match address {
+        std::net::IpAddr::V4(ip) => validate_ipv4(&ip),
+        std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+    };
+    public.is_ok() && temps_core::known_proxies::known_proxy(address).is_none()
 }
 
 /// Detect the primary private/LAN IP address as a fallback when public IP detection fails.
@@ -1487,8 +1495,8 @@ fn configure_on_demand_tls(
     tls_mode: TlsMode,
 ) {
     let zone = preview_domain.trim();
-    let sslip_ip_is_public =
-        sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
+    let sslip_ip_is_public = embedded_ipv4_from_zone(zone, "sslip.io")
+        .is_none_or(|address| validate_ipv4(&address).is_ok());
     let can_issue = tls_mode == TlsMode::Auto
         && !zone.is_empty()
         && !is_loopback_zone(zone)
@@ -1504,83 +1512,12 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
     wildcard_domain.trim_start_matches("*.").to_string()
 }
 
-/// True if `zone` is a loopback zone (`127.0.0.1.sslip.io`, `localhost`, …) —
-/// local mode, where Let's Encrypt cannot reach the box for the HTTP-01
-/// challenge, so on-demand TLS would never fire. This is the only condition
-/// that gates ADR-018 §6 on-demand-TLS auto-enablement; any other (non-empty,
-/// non-loopback) base domain qualifies, regardless of whether it is sslip.io.
-/// Build the wildcard-DNS base domain for `ip`, using the **dashed** spelling.
-///
-/// Wildcard-DNS services (sslip.io and friends) locate the target address by
-/// scanning the hostname for four numeric components joined by a *single*
-/// separator style, taking the leftmost match — and that match is not anchored
-/// to the base domain. With a dotted base, any generated label ending in a
-/// number donates it to the front of the IP and the name resolves elsewhere:
-///
-/// ```text
-/// observability-starter-1.127.0.0.1.sslip.io  ->  1.127.0.0
-/// pr-42.127.0.0.1.sslip.io                    ->  42.127.0.0
-/// ```
-///
-/// Deployment slugs are `{project}-{n}` and preview environments are
-/// `pr-{number}`, so on a dotted base that is *every* generated hostname. The
-/// dashed spelling makes the separator styles disagree (`1.127-0-0` mixes a dot
-/// and dashes, so it is rejected) and the real `127-0-0-1` wins.
-///
-/// The published installer emits the same dashed form and passes it via
-/// `--wildcard-domain`; this covers `temps setup --auto` generating its own.
-///
-/// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
-/// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
-fn sslip_domain_for(ip: &str) -> anyhow::Result<String> {
-    let address = ip.parse::<Ipv4Addr>().map_err(|error| {
-        anyhow::anyhow!(
-            "Cannot generate a sslip.io domain from server IP '{ip}': {error}. \
-             Automatic domains currently require IPv4; provide --server-ip with a valid IPv4 \
-             address or use an explicit --wildcard-domain."
-        )
-    })?;
-    Ok(format!(
-        "{}.sslip.io",
-        address.to_string().replace('.', "-")
-    ))
-}
-
-fn sslip_ipv4_from_zone(zone: &str) -> Option<Ipv4Addr> {
-    let encoded = zone
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase()
-        .strip_suffix(".sslip.io")?
-        .to_string();
-
-    encoded
-        .parse()
-        .ok()
-        .or_else(|| encoded.replace('-', ".").parse().ok())
-}
-
-fn is_loopback_zone(zone: &str) -> bool {
-    let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
-    z == "localhost"
-        || z.ends_with(".localhost")
-        || z.starts_with("127.0.0.1")
-        || z.contains("127-0-0-1")
-        // `localho.st` is a real public DNS name that resolves to 127.0.0.1 --
-        // used throughout this codebase as the local/loopback dev domain
-        // (see doctor.rs's "default - configure a real domain for
-        // production" warning and the proxy's SameSite-safe cookie tests)
-        // specifically so browsers treat it as a normal internet host. It is
-        // still loopback for ACME purposes: Let's Encrypt's HTTP-01/on-demand
-        // validators cannot reach a box whose public DNS answer is its own
-        // loopback address, so issuance can never succeed and on-demand TLS
-        // must stay off here exactly as it does for `localhost`/`127.0.0.1`.
-        || z == "localho.st"
-        || z.ends_with(".localho.st")
-}
-
 impl SetupCommand {
     fn resolve_installation_inputs(&mut self) -> anyhow::Result<()> {
+        if let Some(email) = &self.email {
+            self.admin_email.get_or_insert_with(|| email.clone());
+            self.letsencrypt_email.get_or_insert_with(|| email.clone());
+        }
         if let Some(path) = &self.admin_password_file {
             let password = fs::read_to_string(path).map_err(|error| {
                 anyhow::anyhow!(
@@ -1884,16 +1821,17 @@ impl SetupCommand {
                     }
                 }
             };
-            let sslip_domain = sslip_domain_for(&ip)?;
+            let suffix = "sslip.io";
+            let sslip_domain = generated_domain_for(&ip, suffix)?;
             print_success(&format!(
-                "No --wildcard-domain given — defaulting to sslip.io: {}",
+                "No --wildcard-domain given — using the generated domain {}",
                 format!("*.{sslip_domain}").bright_cyan()
             ));
-            print_warning(
-                "The generated hostname uses the third-party sslip.io DNS service and is \
-                 intended for quick-start use. Configure your own wildcard domain for production.",
-            );
-            if sslip_ipv4_from_zone(&sslip_domain)
+            print_warning(&format!(
+                "The generated hostname uses the {suffix} DNS service and is \
+                 intended for quick-start use. Configure your own wildcard domain for production."
+            ));
+            if embedded_ipv4_from_zone(&sslip_domain, suffix)
                 .is_some_and(|address| validate_ipv4(&address).is_err())
             {
                 print_warning(
@@ -1922,7 +1860,7 @@ impl SetupCommand {
         // resources (e.g., GitHub App installations) that reference user_id=0
         rt.block_on(ensure_system_user(db.as_ref()))?;
 
-        // Create admin user (or reset password if user exists)
+        // Create the bootstrap administrator on the first run.
         print_section("Admin User Setup");
         let (user, password) = match rt.block_on(create_admin_user(
             db.as_ref(),
@@ -1934,9 +1872,9 @@ impl SetupCommand {
                 print_success("Admin user created");
                 (user, password)
             }
-            AdminUserResult::PasswordReset(user, password) => {
-                print_success("Admin user password reset");
-                (user, password)
+            AdminUserResult::Existing(user) => {
+                print_success("Existing administrator retained");
+                (user, String::new())
             }
         };
 
@@ -2618,11 +2556,11 @@ impl SetupCommand {
         };
         println!();
 
-        // Check if domain already has a valid certificate. "active_renewal_failed"
-        // still has a usable cert (only its last renewal failed), so it counts too.
-        if temps_entities::domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
-            && domain.certificate.is_some()
-        {
+        let Some(acme_email) = issuance_contact(
+            DomainService::can_reuse_serving_certificate(&domain),
+            self.letsencrypt_email.as_deref(),
+        )?
+        else {
             println!(
                 "   {} Domain '{}' already has a valid certificate!",
                 "🎉".bright_green(),
@@ -2657,13 +2595,13 @@ impl SetupCommand {
                 self.admin_password.is_some(),
                 &self.output_format,
             );
-        }
+        };
 
         // Step 4: Request DNS-01 challenge from Let's Encrypt
         print_step(4, 8, "Requesting Let's Encrypt DNS-01 challenge");
         print_spinner_step("Contacting Let's Encrypt ACME server");
         let challenge_data =
-            rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))?;
+            rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email))?;
         print_spinner_done();
 
         if challenge_data.status == "completed" {
@@ -2871,8 +2809,7 @@ impl SetupCommand {
                 }
 
                 // Request a new challenge (this creates a new ACME order)
-                match rt.block_on(domain_service.request_challenge(&wildcard_domain, &admin_email))
-                {
+                match rt.block_on(domain_service.request_challenge(&wildcard_domain, acme_email)) {
                     Ok(new_challenge) => {
                         if new_challenge.status == "completed" {
                             // Certificate was issued immediately (unlikely but possible)
@@ -2971,7 +2908,7 @@ impl SetupCommand {
                 "Requesting certificate issuance (attempt {}/{})",
                 attempt, max_retries
             ));
-            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, &admin_email)) {
+            match rt.block_on(domain_service.complete_challenge(&wildcard_domain, acme_email)) {
                 Ok(completed_domain) => {
                     print_spinner_done();
                     // Success means a cert is being served. "active_renewal_failed" also
@@ -3291,6 +3228,59 @@ mod tests {
     use super::*;
     use clap::Parser;
 
+    #[tokio::test]
+    async fn setup_rerun_preserves_admin_password() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let encryption = EncryptionService::new_from_password("test");
+        UserService::new(test_db.db.clone(), std::sync::Arc::new(encryption))
+            .initialize_roles()
+            .await
+            .unwrap();
+        let email = "admin@example.com";
+        use sea_orm::ConnectionTrait;
+        db.execute_unprepared(
+            "ALTER TABLE user_roles ADD CONSTRAINT reject_test_assignment CHECK (FALSE) NOT VALID",
+        )
+        .await
+        .unwrap();
+        assert!(create_admin_user(db, email, "Admin", None).await.is_err());
+        assert!(users::Entity::find()
+            .filter(users::Column::Email.eq(email))
+            .one(db)
+            .await
+            .unwrap()
+            .is_none());
+        db.execute_unprepared("ALTER TABLE user_roles DROP CONSTRAINT reject_test_assignment")
+            .await
+            .unwrap();
+        let AdminUserResult::Created(first, _) =
+            create_admin_user(db, email, "Admin", None).await.unwrap()
+        else {
+            panic!("expected a fresh administrator")
+        };
+        for supplied in [None, Some("different-password")] {
+            let AdminUserResult::Existing(existing) =
+                create_admin_user(db, email, "Admin", supplied)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected the original administrator")
+            };
+            assert_eq!(existing.password_hash, first.password_hash);
+            assert_eq!(existing.updated_at, first.updated_at);
+        }
+    }
+
     /// Importing a certificate over a domain whose ACME or on-demand attempts
     /// failed leaves no trace of that failure: the console would otherwise
     /// show a stale cause next to a working certificate, and the next
@@ -3359,6 +3349,78 @@ mod tests {
             panic!("expected setup command");
         };
         command
+    }
+
+    #[test]
+    fn public_detection_rejects_private_and_reserved_echo_results() {
+        for address in [
+            "127.0.0.1",
+            "192.168.1.1",
+            "203.0.113.10",
+            "2001:db8::1",
+            "::1",
+        ] {
+            assert!(
+                !is_public_setup_origin(address.parse().unwrap()),
+                "{address}"
+            );
+        }
+    }
+
+    #[test]
+    fn eager_dns_uses_the_resolved_contact_and_explains_a_missing_one() {
+        let mut cmd = parse_setup(&[
+            "--email",
+            "certs@example.com",
+            "--admin-email",
+            "admin@example.com",
+        ]);
+        cmd.resolve_installation_inputs().unwrap();
+        cmd.resolve_acme_contact("admin@example.com", Some("old@example.com"))
+            .unwrap();
+        assert_eq!(
+            issuance_contact(false, cmd.letsencrypt_email.as_deref()).unwrap(),
+            Some("certs@example.com")
+        );
+        let mut unset = parse_setup(&[]);
+        unset.resolve_acme_contact("admin@localhost", None).unwrap();
+        assert!(issuance_contact(false, unset.letsencrypt_email.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("--letsencrypt-email"));
+    }
+
+    #[test]
+    fn unattended_email_flags_override_saved_contacts() {
+        let mut setup = parse_setup(&["--yes", "--email", "owner@example.com"]);
+        assert!(setup.auto);
+        setup.resolve_installation_inputs().unwrap();
+        setup.apply_auto_defaults();
+        assert!(setup.non_interactive);
+        let admin = setup.admin_email.clone().unwrap();
+        setup
+            .resolve_acme_contact(&admin, Some("previous@example.com"))
+            .unwrap();
+        assert_eq!(admin, "owner@example.com");
+        assert_eq!(
+            setup.letsencrypt_email.as_deref(),
+            Some("owner@example.com")
+        );
+
+        let mut separate = parse_setup(&[
+            "--email",
+            "owner@example.com",
+            "--admin-email",
+            "admin@example.com",
+            "--letsencrypt-email",
+            "certs@example.com",
+        ]);
+        separate.resolve_installation_inputs().unwrap();
+        assert_eq!(separate.admin_email.as_deref(), Some("admin@example.com"));
+        assert_eq!(
+            separate.letsencrypt_email.as_deref(),
+            Some("certs@example.com")
+        );
     }
 
     #[test]
@@ -3444,6 +3506,21 @@ mod tests {
         assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
     }
 
+    #[test]
+    fn generated_domain_validates_the_dns_suffix() {
+        let address = "203.0.113.10";
+        assert_eq!(
+            generated_domain_for(address, "example.com").unwrap(),
+            "203-0-113-10.example.com"
+        );
+        for suffix in ["", "https://example.com", "*.example.com", "a..example.com"] {
+            assert!(generated_domain_for(address, suffix).is_err());
+        }
+        let mut settings = AppSettings::default();
+        configure_on_demand_tls(&mut settings, "192-168-1-1.sslip.io", TlsMode::Auto);
+        assert!(!settings.on_demand_tls.enabled);
+    }
+
     /// Pins the dashed spelling. Reverting this to the dotted form still
     /// compiles and passes every other check, while silently making every
     /// generated app hostname on a quick-start install resolve to a third
@@ -3451,22 +3528,23 @@ mod tests {
     #[test]
     fn sslip_domain_uses_the_dashed_ip_spelling() {
         assert_eq!(
-            sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain"),
+            generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain"),
             "127-0-0-1.sslip.io"
         );
         assert_eq!(
-            sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain"),
+            generated_domain_for("203.0.113.42", "sslip.io").expect("IPv4 should produce a domain"),
             "203-0-113-42.sslip.io"
         );
         // The generated base must stay loopback-detectable, or `temps setup`
         // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
         assert!(is_loopback_zone(
-            &sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain")
+            &generated_domain_for("127.0.0.1", "sslip.io").expect("IPv4 should produce a domain")
         ));
         assert!(!is_loopback_zone(
-            &sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain")
+            &generated_domain_for("203.0.113.42", "sslip.io")
+                .expect("IPv4 should produce a domain")
         ));
-        assert!(sslip_domain_for("2001:db8::1")
+        assert!(generated_domain_for("2001:db8::1", "sslip.io")
             .expect_err("IPv6 should require an explicit wildcard domain")
             .to_string()
             .contains("currently require IPv4"));

@@ -409,6 +409,12 @@ impl DomainService {
         has_material && not_expiring_imminently
     }
 
+    /// Whether setup may keep this serving certificate without placing a new order.
+    pub fn can_reuse_serving_certificate(domain: &domains::Model) -> bool {
+        domains::CERT_SERVING_STATUSES.contains(&domain.status.as_str())
+            && Self::has_usable_certificate(domain)
+    }
+
     /// Status to fall back to when a renewal/order is abandoned.
     ///
     /// `renewal_failed = true`  → the renewal attempt failed. If a usable cert is still
@@ -4707,6 +4713,26 @@ mod tests {
             failure_cause: None,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    #[test]
+    fn setup_reuses_only_serving_certificates_with_usable_material() {
+        for status in domains::CERT_SERVING_STATUSES {
+            let mut domain = domain_with_cert(Some("cert"), Some("key"), None);
+            domain.status = status.into();
+            for minutes in [None, Some(-1), Some(2), Some(60)] {
+                domain.expiration_time = minutes.map(|m| Utc::now() + chrono::Duration::minutes(m));
+                assert_eq!(
+                    DomainService::can_reuse_serving_certificate(&domain),
+                    minutes == Some(60)
+                );
+            }
+            domain.status = "pending".into();
+            assert!(!DomainService::can_reuse_serving_certificate(&domain));
+            domain.status = status.into();
+            domain.private_key = None;
+            assert!(!DomainService::can_reuse_serving_certificate(&domain));
         }
     }
 
