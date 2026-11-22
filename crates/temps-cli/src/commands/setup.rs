@@ -337,10 +337,10 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
     Ok(())
 }
 
-/// Result type indicating whether the user was created or password was reset
+/// Only a newly created administrator has a credential to return.
 pub enum AdminUserResult {
     Created(users::Model, String),
-    PasswordReset(users::Model, String),
+    Existing(users::Model),
 }
 
 async fn create_admin_user(
@@ -351,18 +351,6 @@ async fn create_admin_user(
 ) -> anyhow::Result<AdminUserResult> {
     let email_lower = email.to_lowercase();
 
-    // Use provided password or generate a secure one
-    let password = provided_password
-        .map(|p| p.to_string())
-        .unwrap_or_else(generate_secure_password);
-
-    // Hash password with Argon2
-    let argon2 = Argon2::default();
-    let password_hash = argon2
-        .hash_password(password.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
-        .to_string();
-
     // Check if user exists
     let existing_user = users::Entity::find()
         .filter(users::Column::Email.eq(&email_lower))
@@ -370,12 +358,6 @@ async fn create_admin_user(
         .await?;
 
     if let Some(existing) = existing_user {
-        // User exists - reset password
-        let mut user_update: users::ActiveModel = existing.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.updated_at = Set(chrono::Utc::now());
-        let updated_user = user_update.update(conn).await?;
-
         // Ensure user has admin role
         let admin_role = roles::Entity::find()
             .filter(roles::Column::Name.eq("admin"))
@@ -391,26 +373,28 @@ async fn create_admin_user(
 
         // Check if user already has admin role
         let has_admin_role = user_roles::Entity::find()
-            .filter(user_roles::Column::UserId.eq(updated_user.id))
+            .filter(user_roles::Column::UserId.eq(existing.id))
             .filter(user_roles::Column::RoleId.eq(admin_role.id))
             .one(conn)
             .await?;
 
         if has_admin_role.is_none() {
-            // Assign admin role
-            let user_role = user_roles::ActiveModel {
-                user_id: Set(updated_user.id),
-                role_id: Set(admin_role.id),
-                created_at: Set(chrono::Utc::now()),
-                updated_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
-            user_role.insert(conn).await?;
+            anyhow::bail!("Setup found existing user {} without the admin role. Supply the existing administrator's email.", existing.id);
         }
-
-        debug!("Reset password for admin user: {}", email_lower);
-        return Ok(AdminUserResult::PasswordReset(updated_user, password));
+        return Ok(AdminUserResult::Existing(existing));
     }
+
+    // Use provided password or generate a secure one
+    let password = provided_password
+        .map(|p| p.to_string())
+        .unwrap_or_else(generate_secure_password);
+
+    // Hash password with Argon2
+    let argon2 = Argon2::default();
+    let password_hash = argon2
+        .hash_password(password.as_bytes())
+        .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
+        .to_string();
 
     // Create new user
     let new_user = users::ActiveModel {
@@ -1878,7 +1862,7 @@ impl SetupCommand {
         // resources (e.g., GitHub App installations) that reference user_id=0
         rt.block_on(ensure_system_user(db.as_ref()))?;
 
-        // Create admin user (or reset password if user exists)
+        // Create the bootstrap administrator on the first run.
         print_section("Admin User Setup");
         let (user, password) = match rt.block_on(create_admin_user(
             db.as_ref(),
@@ -1890,9 +1874,9 @@ impl SetupCommand {
                 print_success("Admin user created");
                 (user, password)
             }
-            AdminUserResult::PasswordReset(user, password) => {
-                print_success("Admin user password reset");
-                (user, password)
+            AdminUserResult::Existing(user) => {
+                print_success("Existing administrator retained");
+                (user, String::new())
             }
         };
 
@@ -3246,6 +3230,43 @@ fn finish_setup(
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[tokio::test]
+    async fn setup_rerun_preserves_admin_password() {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Docker unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let db = test_db.db.as_ref();
+        let encryption = EncryptionService::new_from_password("test");
+        UserService::new(test_db.db.clone(), std::sync::Arc::new(encryption))
+            .initialize_roles()
+            .await
+            .unwrap();
+        let email = "admin@example.com";
+        let AdminUserResult::Created(first, _) =
+            create_admin_user(db, email, "Admin", None).await.unwrap()
+        else {
+            panic!("expected a fresh administrator")
+        };
+        for supplied in [None, Some("different-password")] {
+            let AdminUserResult::Existing(existing) =
+                create_admin_user(db, email, "Admin", supplied)
+                    .await
+                    .unwrap()
+            else {
+                panic!("expected the original administrator")
+            };
+            assert_eq!(existing.password_hash, first.password_hash);
+            assert_eq!(existing.updated_at, first.updated_at);
+        }
+    }
 
     /// Importing a certificate over a domain whose ACME or on-demand attempts
     /// failed leaves no trace of that failure: the console would otherwise
