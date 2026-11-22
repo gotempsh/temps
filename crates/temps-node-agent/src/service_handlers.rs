@@ -199,6 +199,26 @@ fn exec_failure_message(
 /// name is left to Docker, which reports it as before. Returns the app
 /// network's name when the container joins it, so the caller can apply the
 /// cloud-metadata egress block the deployer applies to it.
+/// The Docker network a managed-service container joins on this node.
+///
+/// A control plane asks for *its* Temps app network by name, but each node has
+/// its own: the name comes from each process's `TEMPS_NETWORK_NAME`, and a
+/// control plane installed from the Compose package names it differently
+/// from a worker's default. Joining the requested name as-is then fails with
+/// "network not found". Any requested network therefore means this node's
+/// Temps app network; no request keeps Docker's default.
+pub(crate) fn node_service_network(requested: Option<&str>, app_network: &str) -> Option<String> {
+    let requested = requested?;
+    if requested != app_network {
+        tracing::debug!(
+            requested,
+            app_network,
+            "the control plane named its own Temps network; using this node's"
+        );
+    }
+    Some(app_network.to_string())
+}
+
 async fn ensure_service_network<'a>(
     docker: &bollard::Docker,
     requested: Option<&'a str>,
@@ -427,9 +447,13 @@ async fn run_service_create(
         );
     }
 
+    let service_network = node_service_network(
+        request.network.as_deref(),
+        temps_core::NETWORK_NAME.as_str(),
+    );
     match ensure_service_network(
         docker,
-        request.network.as_deref(),
+        service_network.as_deref(),
         temps_core::NETWORK_NAME.as_str(),
     )
     .await
@@ -463,7 +487,7 @@ async fn run_service_create(
     let mut host_config = bollard::models::HostConfig {
         binds: Some(binds),
         port_bindings: Some(port_bindings),
-        network_mode: request.network.clone(),
+        network_mode: service_network.clone(),
         dns_search: dns_servers
             .as_ref()
             .map(|_| vec!["temps.local".to_string()]),
@@ -990,9 +1014,13 @@ pub async fn create_service_workload(
         }
     }
 
+    let service_network = node_service_network(
+        request.network.as_deref(),
+        temps_core::NETWORK_NAME.as_str(),
+    );
     match ensure_service_network(
         docker,
-        request.network.as_deref(),
+        service_network.as_deref(),
         temps_core::NETWORK_NAME.as_str(),
     )
     .await
@@ -1024,7 +1052,7 @@ pub async fn create_service_workload(
         return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
     }
 
-    let node = node_attachment(&state, request.network.clone());
+    let node = node_attachment(&state, service_network.clone());
     let attach_overlay: temps_service_protocol::AfterCreate<'_> = Box::new(|id: String| {
         Box::pin(async move {
             if let Err(e) = attach_to_overlay_if_present(docker, &id).await {
@@ -3074,7 +3102,24 @@ mod service_port_binding_tests {
 
 #[cfg(test)]
 mod service_network_tests {
-    use super::ensure_service_network;
+    use super::{ensure_service_network, node_service_network};
+
+    /// Regression: a control plane installed from the Compose package names
+    /// its Temps network `temps-docker-workloads`, a worker keeps the default
+    /// `temps-app-network`, and every managed service placed on the worker
+    /// failed with "network temps-docker-workloads not found".
+    #[test]
+    fn a_requested_network_means_this_nodes_temps_network() {
+        assert_eq!(
+            node_service_network(Some("temps-docker-workloads"), "temps-app-network"),
+            Some("temps-app-network".to_string())
+        );
+        assert_eq!(
+            node_service_network(Some("temps-app-network"), "temps-app-network"),
+            Some("temps-app-network".to_string())
+        );
+        assert_eq!(node_service_network(None, "temps-app-network"), None);
+    }
 
     async fn docker() -> Option<bollard::Docker> {
         let docker = match bollard::Docker::connect_with_local_defaults() {
