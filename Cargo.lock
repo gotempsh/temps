@@ -12505,6 +12505,7 @@ dependencies = [
  "urlencoding",
  "utoipa",
  "uuid",
+ "woothee",
 ]
 
 [[package]]

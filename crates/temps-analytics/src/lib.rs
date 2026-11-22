@@ -23,6 +23,7 @@ pub mod plugin;
 pub mod retention;
 pub mod traits;
 pub mod types;
+pub mod user_agent;
 pub mod visitor_audit;
 pub mod visitor_identity;
 

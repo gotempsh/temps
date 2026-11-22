@@ -137,6 +137,12 @@ pub struct VisitorInfo {
     pub country_code: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: Option<bool>,
+    /// Browser named by `user_agent` (e.g. "Chrome"), as analytics breakdowns name it
+    pub browser: Option<String>,
+    pub browser_version: Option<String>,
+    /// Operating system named by `user_agent` (e.g. "Windows 10")
+    pub operating_system: Option<String>,
+    pub operating_system_version: Option<String>,
     /// Most recent page path visited by this visitor
     pub current_page: Option<String>,
     // First-visit attribution
