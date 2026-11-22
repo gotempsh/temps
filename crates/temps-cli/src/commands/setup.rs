@@ -2557,8 +2557,7 @@ impl SetupCommand {
         println!();
 
         let Some(acme_email) = issuance_contact(
-            &domain.status,
-            domain.certificate.is_some(),
+            DomainService::can_reuse_serving_certificate(&domain),
             self.letsencrypt_email.as_deref(),
         )?
         else {
@@ -3380,17 +3379,15 @@ mod tests {
         cmd.resolve_acme_contact("admin@example.com", Some("old@example.com"))
             .unwrap();
         assert_eq!(
-            issuance_contact("pending", false, cmd.letsencrypt_email.as_deref()).unwrap(),
+            issuance_contact(false, cmd.letsencrypt_email.as_deref()).unwrap(),
             Some("certs@example.com")
         );
         let mut unset = parse_setup(&[]);
         unset.resolve_acme_contact("admin@localhost", None).unwrap();
-        assert!(
-            issuance_contact("pending", false, unset.letsencrypt_email.as_deref())
-                .unwrap_err()
-                .to_string()
-                .contains("--letsencrypt-email")
-        );
+        assert!(issuance_contact(false, unset.letsencrypt_email.as_deref())
+            .unwrap_err()
+            .to_string()
+            .contains("--letsencrypt-email"));
     }
 
     #[test]
