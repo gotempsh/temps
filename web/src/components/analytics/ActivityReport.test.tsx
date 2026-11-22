@@ -207,3 +207,43 @@ test('a cooldown after a successful analysis counts down on the button row', asy
     ).disabled
   ).toBe(true)
 })
+
+test('Run now is blocked while any action runs for the project, not only a report', async () => {
+  const configured = (overrides: Partial<ActivityStatus> = {}) =>
+    activityStatus({
+      settings_revision: 1,
+      settings: {
+        ...activityStatus().settings,
+        share_activity_with_ai: true,
+        environment_id: 3,
+      },
+      ...overrides,
+    })
+  let status = configured({
+    in_progress: {
+      operation: 'website_analysis',
+      started_at: new Date(Date.now() - 5_000).toISOString(),
+    },
+  })
+  mockApi({
+    'GET /projects/7/environments': () => jsonResponse([environment]),
+    'GET /projects/7/environments/3/domains': () => jsonResponse([]),
+    'GET /projects/7/analytics/activity': () => jsonResponse(status),
+  })
+  renderPage()
+  const runNow = await screen.findByRole('button', { name: 'Run now' })
+  // The report lease is free (`running: false`), but a website analysis is
+  // in progress, so the server would refuse a report.
+  await waitFor(() => expect((runNow as HTMLButtonElement).disabled).toBe(true))
+
+  // Once nothing runs, the next status poll re-enables it.
+  status = configured()
+  await waitFor(
+    () =>
+      expect(
+        (screen.getByRole('button', { name: 'Run now' }) as HTMLButtonElement)
+          .disabled
+      ).toBe(false),
+    { timeout: 4000 }
+  )
+})

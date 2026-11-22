@@ -287,12 +287,19 @@ fn completion_error(purpose: &str, model: &str, error: AiGatewayError) -> AiErro
             };
         }
     };
-    // A credential failure's body can echo the key: keep only its status.
-    let reason = match kind {
-        Kind::Authentication => format!(
-            "the provider refused its credentials (upstream status {})",
-            status.unwrap_or_default()
-        ),
+    // An upstream reply body can echo the request (prompts, page content) or,
+    // for a credential failure, the key; `reason` is logged, so keep only the
+    // status. The gateway's own errors carry no provider text.
+    let reason = match &error {
+        AiGatewayError::UpstreamError { status, .. } if kind == Kind::Authentication => {
+            format!("the provider refused its credentials (upstream status {status})")
+        }
+        AiGatewayError::UpstreamError { status, .. } => {
+            format!("the provider answered upstream status {status} for model '{model}'")
+        }
+        AiGatewayError::UpstreamMalformedResponse { .. } | AiGatewayError::StreamError { .. } => {
+            format!("the provider's reply for model '{model}' could not be read")
+        }
         _ => error.to_string(),
     };
     AiError::ProviderFailed {
@@ -1285,6 +1292,19 @@ mod tests {
         assert_eq!(classified(upstream(504)).0, Kind::Timeout);
         assert_eq!(classified(upstream(422)).0, Kind::Rejected);
         assert_eq!(classified(upstream(500)).0, Kind::ProviderError);
+        // No upstream reply body reaches `reason`, which is logged: it can
+        // echo the request as well as credentials.
+        for status in [400, 404, 422, 429, 500, 503] {
+            let (_, _, reason) = classified(upstream(status));
+            assert!(!reason.contains("sk-test"), "{status}: {reason}");
+            assert!(reason.contains(&status.to_string()), "{status}: {reason}");
+        }
+        let (kind, _, reason) = classified(AiGatewayError::UpstreamMalformedResponse {
+            provider: "openai_compatible".into(),
+            reason: "expected JSON, got: summarise these pages: secret-page-text".into(),
+        });
+        assert_eq!(kind, Kind::MalformedResponse);
+        assert!(!reason.contains("secret-page-text"), "{reason}");
         assert_eq!(
             classified(AiGatewayError::ModelNotFound {
                 model: "mock-flash".into()

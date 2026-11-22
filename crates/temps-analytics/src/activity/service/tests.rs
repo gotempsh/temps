@@ -337,6 +337,25 @@ async fn scheduler_handles_no_due_projects_and_database_failures() {
     ));
 }
 
+/// Yields until `waiters` requests hold a capacity-waiter slot. Fails at once
+/// if a waiter task already exited (it can no longer queue), and after a
+/// bounded number of yields otherwise; a yield count, not a deadline, so it
+/// also bounds paused-clock tests.
+async fn until_capacity_waiters(
+    service: &ActivityService,
+    waiters: usize,
+    exited: impl Fn() -> bool,
+) {
+    for _ in 0..10_000 {
+        if MAX_CAPACITY_WAITERS - service.capacity_waiters.available_permits() >= waiters {
+            return;
+        }
+        assert!(!exited(), "a waiter task exited before it queued");
+        tokio::task::yield_now().await;
+    }
+    panic!("{waiters} capacity waiter(s) never queued");
+}
+
 #[tokio::test]
 async fn capacity_waiters_are_bounded_and_served_in_fifo_order() {
     let service = Arc::new(service(
@@ -363,9 +382,7 @@ async fn capacity_waiters_are_bounded_and_served_in_fifo_order() {
         first_sender.send(1).await.unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
     });
-    while service.capacity_waiters.available_permits() == MAX_CAPACITY_WAITERS {
-        tokio::task::yield_now().await;
-    }
+    until_capacity_waiters(&service, 1, || first.is_finished()).await;
 
     let second_service = service.clone();
     let second = tokio::spawn(async move {
@@ -381,9 +398,7 @@ async fn capacity_waiters_are_bounded_and_served_in_fifo_order() {
             .unwrap();
         sender.send(2).await.unwrap();
     });
-    while service.capacity_waiters.available_permits() > MAX_CAPACITY_WAITERS - 2 {
-        tokio::task::yield_now().await;
-    }
+    until_capacity_waiters(&service, 2, || first.is_finished() || second.is_finished()).await;
 
     drop(initial);
     assert_eq!(receiver.recv().await, Some(1));
@@ -431,9 +446,11 @@ async fn scheduled_waiter_survives_interactive_timeout_and_gets_capacity() {
             .await
             .map(|_| ())
     });
-    while service.capacity_waiters.available_permits() == MAX_CAPACITY_WAITERS {
-        tokio::task::yield_now().await;
-    }
+    // Scheduled runs skip the waiter budget: only the interactive one queues.
+    until_capacity_waiters(&service, 1, || {
+        scheduled.is_finished() || interactive.is_finished()
+    })
+    .await;
     tokio::time::advance(CAPACITY_WAIT_TIMEOUT + Duration::from_secs(1)).await;
     // Capacity is free of project 2's own work: it is another project's wait.
     assert!(matches!(
@@ -530,6 +547,107 @@ fn cooldown_cap_evicts_the_oldest_entry_instead_of_blocking_other_projects() {
 }
 
 #[test]
+fn a_lease_past_the_time_limit_still_reports_the_wait_until_it_ends() {
+    let now = Utc::now();
+    let Some(ActivityError::AnalysisRunning {
+        retry_after_secs, ..
+    }) = Some(ActivityService::lease_running(
+        1,
+        "Sample site 1",
+        Some(now - chrono::Duration::minutes(10)),
+        Some(now + chrono::Duration::seconds(60)),
+    ))
+    else {
+        panic!("a held lease is a running report");
+    };
+    // The run's own time limit passed long ago; the lease has a minute left.
+    assert!((59..=60).contains(&retry_after_secs), "{retry_after_secs}");
+}
+
+struct FailingAi(ProviderFailureKind);
+
+#[async_trait::async_trait]
+impl AiService for FailingAi {
+    async fn chat_stream(
+        &self,
+        _: temps_ai::ChatTurnRequest,
+    ) -> Result<temps_ai::TokenStream, AiError> {
+        Err(AiError::NotAvailable)
+    }
+
+    async fn is_available(&self) -> bool {
+        true
+    }
+
+    async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+        Err(AiError::ProviderFailed {
+            purpose: request.purpose,
+            model: "test-model".into(),
+            kind: self.0,
+            status: None,
+            retry_after_secs: None,
+            reason: "test failure".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn an_unreadable_reply_cools_down_but_a_rejected_request_does_not() {
+    for (kind, cools_down) in [
+        (ProviderFailureKind::MalformedResponse, true),
+        (ProviderFailureKind::ModelNotFound, false),
+        (ProviderFailureKind::Authentication, false),
+        (ProviderFailureKind::Unreachable, false),
+    ] {
+        let svc = ActivityService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            Arc::new(FailingAi(kind)),
+        );
+        let usage = ProviderUse::default();
+        let result = svc.complete(1, &usage, AiRequest::default()).await;
+        assert!(
+            matches!(result, Err(ActivityError::Provider { kind: k, .. }) if k == kind),
+            "{kind:?}"
+        );
+        assert_eq!(
+            usage.cooldown(PROJECT_COOLDOWN).is_some(),
+            cools_down,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_request_that_used_the_provider_still_cools_down() {
+    let svc = ActivityService::new(
+        Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        Arc::new(FakeAi {
+            available: true,
+            fail: false,
+        }),
+    );
+    // Cancelled before it reached the provider: free to retry.
+    drop(svc.cooldown_on_exit(1, ActivityOperation::Preview));
+    assert!(svc
+        .cooldowns
+        .remaining(1, ActivityOperation::Preview)
+        .is_none());
+    // Cancelled after the provider spent tokens (a dropped request future
+    // drops the guard): the cooldown starts anyway.
+    let exit = svc.cooldown_on_exit(1, ActivityOperation::Preview);
+    exit.usage.spent_tokens.store(true, Ordering::Relaxed);
+    drop(exit);
+    assert!(svc
+        .cooldowns
+        .remaining(1, ActivityOperation::Preview)
+        .is_some());
+    assert!(svc
+        .cooldowns
+        .remaining(1, ActivityOperation::WebsiteAnalysis)
+        .is_none());
+}
+
+#[test]
 fn only_spent_tokens_or_a_rate_limit_start_a_cooldown() {
     let usage = ProviderUse::default();
     assert_eq!(usage.cooldown(PROJECT_COOLDOWN), None);
@@ -549,16 +667,31 @@ async fn scheduler_continues_after_busy_project() {
         BTreeMap::from([("project_id".into(), 1_i32.into())]),
         BTreeMap::from([("project_id".into(), 2_i32.into())]),
     ];
+    // Each project resolves its environment, then loses the claim to a live
+    // lease held by another run: the re-read reports it running.
+    let leased = || {
+        let mut row = stored();
+        row.insert(
+            "locked_until".into(),
+            Some(Utc::now() + chrono::Duration::minutes(4)).into(),
+        );
+        row
+    };
+    let no_claim = Vec::<BTreeMap<String, sea_orm::Value>>::new;
     let db = Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([
                 due,
                 vec![project(1)],
                 vec![stored()],
-                Vec::<BTreeMap<String, sea_orm::Value>>::new(),
+                vec![environment(1)],
+                no_claim(),
+                vec![leased()],
                 vec![project(2)],
                 vec![stored()],
-                Vec::<BTreeMap<String, sea_orm::Value>>::new(),
+                vec![environment(1)],
+                no_claim(),
+                vec![leased()],
             ])
             .into_connection(),
     );
@@ -573,7 +706,22 @@ async fn scheduler_continues_after_busy_project() {
     service.run_due().await.unwrap();
     drop(service);
     let db = Arc::try_unwrap(db).unwrap();
-    assert_eq!(db.into_transaction_log().len(), 7);
+    let log = db
+        .into_transaction_log()
+        .iter()
+        .map(|transaction| format!("{transaction:?}"))
+        .collect::<Vec<_>>();
+    assert_eq!(log.len(), 11, "{log:#?}");
+    // Project 1's busy claim did not stop the scheduler: project 2 reached
+    // its own claim.
+    for (index, project_id) in [(4, 1), (9, 2)] {
+        assert!(log[index].contains("SET locked_until"), "{}", log[index]);
+        assert!(
+            log[index].contains(&format!("Values([Int(Some({project_id}))")),
+            "{}",
+            log[index]
+        );
+    }
 }
 
 #[test]
@@ -895,7 +1043,11 @@ async fn run_reports_a_live_lease_as_running_and_a_cooldown_with_its_wait() {
     assert_eq!(operation, ActivityOperation::Report);
     assert_eq!(project_name, "Sample site 1");
     assert_eq!(started_at.timestamp(), started.timestamp());
-    assert!((90..=100).contains(&retry_after_secs), "{retry_after_secs}");
+    // `Retry-After` follows the lease, which outlasts the run's time limit.
+    assert!(
+        (239..=240).contains(&retry_after_secs),
+        "{retry_after_secs}"
+    );
 
     let mut cooling = stored();
     cooling.insert(
@@ -1168,7 +1320,18 @@ async fn real_database_run_isolated_auditable_and_recovers_from_failure() {
             .len(),
         1
     );
-    // A preview uses unsaved categories without replacing a report, revision or schedule.
+    // A preview uses unsaved categories without replacing a report, revision,
+    // schedule or the persisted report cooldown (the snapshot below leaves out
+    // countdowns, which change with time, so the timestamp is compared too).
+    let persisted_cooldown = || async {
+        svc.stored(1)
+            .await
+            .unwrap()
+            .expect("the report row exists")
+            .cooldown_until
+    };
+    let cooldown_before = persisted_cooldown().await;
+    assert!(cooldown_before.is_some());
     let before = stored_view(&svc).await;
     let preview = svc.preview(1, preview_request()).await.unwrap();
     assert_eq!(preview.settings.categories.len(), 1);
@@ -1178,6 +1341,7 @@ async fn real_database_run_isolated_auditable_and_recovers_from_failure() {
     assert!(preview.report.visitors[0].evidence[0].properties.is_empty());
     assert_eq!(preview.report.settings_revision, 0);
     assert_eq!(stored_view(&svc).await, before);
+    assert_eq!(persisted_cooldown().await, cooldown_before);
     assert!(matches!(
         svc.preview(1, preview_request()).await,
         Err(ActivityError::CoolingDown {
@@ -1228,6 +1392,7 @@ async fn real_database_run_isolated_auditable_and_recovers_from_failure() {
         Err(ActivityError::Provider { .. })
     ));
     assert_eq!(stored_view(&svc).await, before);
+    assert_eq!(persisted_cooldown().await, cooldown_before);
     db.execute_unprepared("UPDATE visitor_activity_reports SET cooldown_until = NULL")
         .await
         .unwrap();

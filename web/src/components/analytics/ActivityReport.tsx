@@ -197,7 +197,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                         !data.settings_revision ||
                         !data.settings.share_activity_with_ai ||
                         !!running ||
-                        reportGate.cooldownSecs > 0 ||
+                        // Any action running for the project, or the
+                        // report's cooldown: the server would refuse it.
+                        reportGate.blocked ||
                         status.isFetching ||
                         status.isError ||
                         data.selected_environment_id !==

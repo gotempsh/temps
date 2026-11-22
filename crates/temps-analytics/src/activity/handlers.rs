@@ -225,7 +225,8 @@ async fn get_activity_status(
     params(("project_id" = i32, Path)), request_body = ActivitySettings,
     responses((status = 204, description = "Settings saved"), (status = 400, description = "Invalid settings", body = ActivityErrorBody),
         (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
-        (status = 409, description = "A report run is in progress; `Retry-After` says when it ends at the latest", body = ActivityErrorBody)),
+        (status = 404, description = "Project not found", body = ActivityErrorBody),
+        (status = 409, description = "A report run is in progress; `Retry-After` says when its lease ends at the latest", body = ActivityErrorBody)),
     security(("bearer_auth" = [])))]
 async fn save_activity_settings(
     RequireAuth(auth): RequireAuth,
@@ -254,6 +255,7 @@ async fn save_activity_settings(
     params(("project_id" = i32, Path)), responses((status = 200, body = ActivityReport),
         (status = 400, description = "Setup incomplete or sharing disabled", body = ActivityErrorBody),
         (status = 401, description = "Authentication required"), (status = 403, description = "Access denied"),
+        (status = 404, description = "Project not found", body = ActivityErrorBody),
         (status = 409, description = "Analysis already running, or the run was superseded", body = ActivityErrorBody),
         (status = 429, description = "Cooling down after spending provider tokens, or rate-limited; see `Retry-After`", body = ActivityErrorBody),
         (status = 502, description = "The AI provider failed the request", body = ActivityErrorBody),

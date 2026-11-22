@@ -10598,10 +10598,15 @@ async fn test_visitor_activity_cooldown_is_nullable_and_reversible() -> anyhow::
     {
         Ok(container) => container,
         Err(error) => {
-            eprintln!(
-                "Skipping visitor_activity_reports.cooldown_until migration test: Docker unavailable: {error}"
-            );
-            return Ok(());
+            // Only a missing Docker skips the test; any other startup failure
+            // is a broken setup and must stay visible.
+            if !temps_test_utils::docker_available().await {
+                eprintln!(
+                    "Skipping visitor_activity_reports.cooldown_until migration test: Docker unavailable"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
         }
     };
     let port = container.get_host_port_ipv4(5432).await?;

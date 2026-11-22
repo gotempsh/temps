@@ -224,6 +224,25 @@ impl ProviderUse {
     }
 }
 
+/// Starts `operation`'s cooldown when dropped if `usage` shows the provider
+/// was used, so a request cancelled after spending tokens still cools down,
+/// while one that failed before reaching the provider stays retryable.
+struct CooldownOnExit<'a> {
+    cooldowns: &'a Cooldowns,
+    project_id: i32,
+    operation: ActivityOperation,
+    usage: ProviderUse,
+}
+
+impl Drop for CooldownOnExit<'_> {
+    fn drop(&mut self) {
+        if let Some(cooldown) = self.usage.cooldown(PROJECT_COOLDOWN) {
+            self.cooldowns
+                .start(self.project_id, self.operation, cooldown);
+        }
+    }
+}
+
 fn ceil_secs(duration: Duration) -> u64 {
     duration.as_secs() + u64::from(duration.subsec_nanos() > 0)
 }
@@ -257,6 +276,34 @@ impl ActivityService {
             started_at,
             retry_after_secs: ceil_secs(operation.time_limit().saturating_sub(elapsed)).max(1),
         }
+    }
+
+    /// The error for a report run holding the persisted lease: it may take
+    /// until `locked_until`, so `Retry-After` never ends before the lease.
+    fn lease_running(
+        project_id: i32,
+        project_name: &str,
+        started_at: Option<DateTime<Utc>>,
+        locked_until: Option<DateTime<Utc>>,
+    ) -> ActivityError {
+        let now = Utc::now();
+        let mut error = Self::running(
+            project_id,
+            project_name,
+            ActivityOperation::Report,
+            started_at.unwrap_or(now),
+        );
+        if let (
+            ActivityError::AnalysisRunning {
+                retry_after_secs, ..
+            },
+            Some(until),
+        ) = (&mut error, locked_until)
+        {
+            let lease_left = (until - now).to_std().unwrap_or_default();
+            *retry_after_secs = ceil_secs(lease_left).max(1);
+        }
+        error
     }
 
     async fn acquire_capacity(
@@ -359,15 +406,19 @@ impl ActivityService {
         }
     }
 
-    /// Start `operation`'s cooldown only if it used the provider.
-    fn finish_interactive(
+    /// Tracks an interactive action's provider use and starts its cooldown on
+    /// every exit, success, failure or a dropped request, if it used the
+    /// provider.
+    fn cooldown_on_exit(
         &self,
         project_id: i32,
         operation: ActivityOperation,
-        usage: &ProviderUse,
-    ) {
-        if let Some(cooldown) = usage.cooldown(PROJECT_COOLDOWN) {
-            self.cooldowns.start(project_id, operation, cooldown);
+    ) -> CooldownOnExit<'_> {
+        CooldownOnExit {
+            cooldowns: &self.cooldowns,
+            project_id,
+            operation,
+            usage: ProviderUse::default(),
         }
     }
 
@@ -385,6 +436,16 @@ impl ActivityService {
                 Ok(response)
             }
             Err(error) => {
+                // The provider generated a reply the gateway could not read:
+                // it may have billed for it, and an immediate retry would pay
+                // again, so it cools down like a completion.
+                if let AiError::ProviderFailed {
+                    kind: ProviderFailureKind::MalformedResponse,
+                    ..
+                } = &error
+                {
+                    usage.spent_tokens.store(true, Ordering::Relaxed);
+                }
                 if let AiError::ProviderFailed {
                     kind: ProviderFailureKind::RateLimited,
                     retry_after_secs,
@@ -666,10 +727,13 @@ impl ActivityService {
                 false,
             )
             .await?;
-        let usage = ProviderUse::default();
+        // Declared after the guards above, so it drops first: the cooldown is
+        // in place before the admission frees the project.
+        let exit = self.cooldown_on_exit(project_id, operation);
+        let usage = &exit.usage;
         let result = tokio::time::timeout(operation.time_limit(), async {
             let pages = super::site_context::read_site(project_id, &url).await?;
-            self.generate_goals(project_id, environment_id, pages, &usage)
+            self.generate_goals(project_id, environment_id, pages, usage)
                 .await
         })
         .await
@@ -679,7 +743,6 @@ impl ActivityService {
                 "Goal suggestions timed out after 90 seconds",
             ))
         });
-        self.finish_interactive(project_id, operation, &usage);
         result
     }
 
@@ -778,9 +841,10 @@ impl ActivityService {
                 false,
             )
             .await?;
-        let usage = ProviderUse::default();
+        let exit = self.cooldown_on_exit(project_id, operation);
+        let usage = &exit.usage;
         let result = tokio::time::timeout(operation.time_limit(), async {
-            let response = self.complete(project_id, &usage, AiRequest {
+            let response = self.complete(project_id, usage, AiRequest {
                 purpose: "analytics.activity_setup".into(),
                 project_id: Some(project_id),
                 provider: Some("gateway".into()),
@@ -800,10 +864,9 @@ impl ActivityService {
             validate_settings(project_id, &settings)
                 .map_err(|e| analysis_error(project_id, format!("Invalid generated categories: {e}")))
                 .map_err(|e| invalid_output(e, &model))?;
-            let outcome = self.analyze(project_id, &settings, 0, Utc::now(), &VisitorCheckpoints::default(), &usage).await?;
+            let outcome = self.analyze(project_id, &settings, 0, Utc::now(), &VisitorCheckpoints::default(), usage).await?;
             Ok(ActivityPreview { settings, report: outcome.report })
         }).await.unwrap_or_else(|_| Err(analysis_error(project_id, "Preview timed out after 120 seconds")));
-        self.finish_interactive(project_id, operation, &usage);
         result
     }
 
@@ -836,16 +899,12 @@ impl ActivityService {
             .await.map_err(|e| Self::db_error(project_id, "save settings", e))?;
         if result.rows_affected() == 0 {
             // Only a live report run blocks saving.
-            let started_at = self
-                .stored(project_id)
-                .await?
-                .and_then(|row| row.last_started_at)
-                .unwrap_or_else(Utc::now);
-            return Err(Self::running(
+            let row = self.stored(project_id).await?;
+            return Err(Self::lease_running(
                 project_id,
                 &project_name,
-                ActivityOperation::Report,
-                started_at,
+                row.as_ref().and_then(|row| row.last_started_at),
+                row.as_ref().and_then(|row| row.locked_until),
             ));
         }
         Ok(())
@@ -1155,11 +1214,11 @@ impl ActivityService {
         };
         let now = Utc::now();
         if row.locked_until.is_some_and(|until| until > now) {
-            return Self::running(
+            return Self::lease_running(
                 project_id,
                 project_name,
-                ActivityOperation::Report,
-                row.last_started_at.unwrap_or(now),
+                row.last_started_at,
+                row.locked_until,
             );
         }
         if let Some(remaining) = row
