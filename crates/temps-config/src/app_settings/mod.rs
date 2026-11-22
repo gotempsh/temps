@@ -1864,9 +1864,6 @@ pub struct ManagedServiceHealthcheckSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct OnDemandTlsSettings {
-    /// DNS suffix under which setup embeds an IPv4 address when no domain was supplied.
-    pub generated_hostname_suffix: String,
-
     /// Master switch. When `false` the proxy's on-demand cert gate rejects
     /// every SNI and no issuance is ever triggered. New installations start
     /// with it `true`; a stored settings row that predates this section keeps
@@ -1909,12 +1906,9 @@ fn legacy_on_demand_tls_settings() -> OnDemandTlsSettings {
     OnDemandTlsSettings::default()
 }
 
-pub const DEFAULT_GENERATED_HOSTNAME_SUFFIX: &str = "sslip.io";
-
 impl Default for OnDemandTlsSettings {
     fn default() -> Self {
         Self {
-            generated_hostname_suffix: DEFAULT_GENERATED_HOSTNAME_SUFFIX.to_string(),
             enabled: false,
             zone: None,
             max_concurrent: 3,

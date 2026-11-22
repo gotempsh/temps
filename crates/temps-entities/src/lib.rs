@@ -95,7 +95,6 @@ pub mod dns_resolver_reports;
 pub mod domain_certificate_settings;
 pub mod domain_delivery_bindings;
 pub mod domain_delivery_previews;
-pub mod domain_public_https;
 pub mod domains;
 pub mod durable_job_deliveries;
 pub mod durable_jobs;

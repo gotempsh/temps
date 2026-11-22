@@ -1495,12 +1495,8 @@ fn configure_on_demand_tls(
     tls_mode: TlsMode,
 ) {
     let zone = preview_domain.trim();
-    let sslip_ip_is_public =
-        embedded_ipv4_from_zone(zone, &app_settings.on_demand_tls.generated_hostname_suffix)
-            .or_else(|| {
-                embedded_ipv4_from_zone(zone, temps_config::DEFAULT_GENERATED_HOSTNAME_SUFFIX)
-            })
-            .is_none_or(|address| validate_ipv4(&address).is_ok());
+    let sslip_ip_is_public = embedded_ipv4_from_zone(zone, "sslip.io")
+        .is_none_or(|address| validate_ipv4(&address).is_ok());
     let can_issue = tls_mode == TlsMode::Auto
         && !zone.is_empty()
         && !is_loopback_zone(zone)
@@ -1825,10 +1821,7 @@ impl SetupCommand {
                     }
                 }
             };
-            let suffix = existing_app_settings
-                .as_ref()
-                .map(|s| s.on_demand_tls.generated_hostname_suffix.as_str())
-                .unwrap_or(temps_config::DEFAULT_GENERATED_HOSTNAME_SUFFIX);
+            let suffix = "sslip.io";
             let sslip_domain = generated_domain_for(&ip, suffix)?;
             print_success(&format!(
                 "No --wildcard-domain given — using the generated domain {}",
@@ -3517,7 +3510,7 @@ mod tests {
     }
 
     #[test]
-    fn generated_domain_uses_the_stored_dns_suffix() {
+    fn generated_domain_validates_the_dns_suffix() {
         let address = "203.0.113.10";
         assert_eq!(
             generated_domain_for(address, "example.com").unwrap(),
@@ -3527,8 +3520,7 @@ mod tests {
             assert!(generated_domain_for(address, suffix).is_err());
         }
         let mut settings = AppSettings::default();
-        settings.on_demand_tls.generated_hostname_suffix = "example.com".into();
-        configure_on_demand_tls(&mut settings, "192-168-1-1.example.com", TlsMode::Auto);
+        configure_on_demand_tls(&mut settings, "192-168-1-1.sslip.io", TlsMode::Auto);
         assert!(!settings.on_demand_tls.enabled);
     }
 

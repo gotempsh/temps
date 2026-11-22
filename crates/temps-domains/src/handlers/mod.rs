@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub(crate) mod domain_handler;
-mod public_https;
 pub(crate) mod types;
 
 pub use domain_handler::configure_routes;

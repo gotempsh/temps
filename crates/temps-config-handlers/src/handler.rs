@@ -5203,7 +5203,6 @@ mod tests {
             ..Default::default()
         };
         s.on_demand_tls = OnDemandTlsSettings {
-            generated_hostname_suffix: "example.com".into(),
             enabled: true,
             zone: Some("deploy.example.test".into()),
             max_concurrent: 5,

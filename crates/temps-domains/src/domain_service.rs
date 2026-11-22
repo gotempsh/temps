@@ -1,8 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-pub mod public_https;
-
 use anyhow::Result;
 use chrono::{DateTime, Duration, SubsecRound, Utc};
 use sea_orm::{
