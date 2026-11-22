@@ -1079,7 +1079,7 @@ Manage environment variables
 
 - `list` (`ls`) - List environment variables
 - `get` - Get a specific environment variable
-- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 - `delete` (`rm`, `unset`) - Delete an environment variable
 - `import` - Import environment variables from a .env file
 - `export` - Export environment variables to .env format
@@ -1110,7 +1110,7 @@ Get a specific environment variable
 
 #### `environments vars set`
 
-Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 
 **Usage:** `environments vars set <key> [value] [options]`
 
@@ -3563,7 +3563,7 @@ Point the project at a repository and branch; services that follow it are update
 |------|-------------|---------|----------|
 | `-c, --connection <id>` | Git connection id (see: git-providers / connections) | - | No |
 | `--public <provider>` | Use a public repository without a connection: github or gitlab | - | No |
-| `-r, --repo <owner/name|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
+| `-r, --repo <owner/name\|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
 | `-b, --branch <branch>` | Branch to deploy from, e.g. main | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
@@ -6107,7 +6107,7 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
-| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--variants <json\|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
 | `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -6323,8 +6323,8 @@ Create a survey (a draft unless --status active)
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
-| `-q, --questions <json|@file|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
-| `-t, --targeting <json|@file|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
+| `-q, --questions <json\|@file\|->` | Questions as a JSON array of {id, kind, prompt, optional?, choices?, scale?, lower_label?, upper_label?} | - | Yes |
+| `-t, --targeting <json\|@file\|->` | When to show it: {path_pattern?, trigger_event?, sample_rate?, once_per_visitor?, flag?: {key, value}} | - | No |
 | `--description <text>` | Internal description | - | No |
 | `--status <status>` | draft (default) or active | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -6342,8 +6342,8 @@ Change a survey; only the options given are changed
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--name <name>` | New name | - | No |
 | `--description <text>` | New description ("" clears it) | - | No |
-| `-q, --questions <json|@file|->` | Replace the questions | - | No |
-| `-t, --targeting <json|@file|->` | Replace when it is shown | - | No |
+| `-q, --questions <json\|@file\|->` | Replace the questions | - | No |
+| `-t, --targeting <json\|@file\|->` | Replace when it is shown | - | No |
 | `--status <status>` | draft, active, paused or completed | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -7779,8 +7779,8 @@ Search log lines across projects (newest first)
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -7807,8 +7807,8 @@ Distinct values and counts per field for the same filter scope
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -7833,8 +7833,8 @@ Attribute keys observed in the window, most common first (requires the ClickHous
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -7861,8 +7861,8 @@ Line counts bucketed over time, optionally split by a label or attribute (requir
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -7889,8 +7889,8 @@ Group-by aggregation over lines (requires the ClickHouse line index)
 | `--start-time <iso>` | Window start (ISO 8601); overrides --since | - | No |
 | `--end-time <iso>` | Window end (ISO 8601); defaults to now | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
-| `--project <id|slug|name>` | Restrict to a project, repeatable | `` | No |
-| `--external-service <id|name>` | Restrict to a managed database/service, repeatable | `` | No |
+| `--project <id\|slug\|name>` | Restrict to a project, repeatable | `` | No |
+| `--external-service <id\|name>` | Restrict to a managed database/service, repeatable | `` | No |
 | `--scope <kind:id>` | Explicit resource identity, e.g. application:12, repeatable | `` | No |
 | `--level <level>` | TRACE\|DEBUG\|INFO\|WARN\|ERROR, repeatable | `` | No |
 | `--env <name>` | Environment, repeatable | `` | No |
@@ -7931,7 +7931,7 @@ List the saved searches of a project, pinned first
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `logs saved create`
@@ -7943,7 +7943,7 @@ Save a log search
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--name <name>` | Name, unique within the project | - | Yes |
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--description <text>` | What the search is for | - | No |
 | `--source <kind>` | collected (default), application, or service | - | No |
 | `--level <level>` | Log level, repeatable | `` | No |
@@ -7968,7 +7968,7 @@ Delete a saved search (refused while an alert rule counts it)
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 
 #### `logs saved series`
 
@@ -7980,7 +7980,7 @@ Chart a saved search over time: matching lines per bucket, or a numeric field
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--since <duration>` | Window ending now, e.g. 30m, 6h, 1d (default 1h) | - | No |
 | `--bucket-secs <n>` | Bucket width in seconds (default 60) | - | No |
 | `--metric <spec>` | count (default), or avg\|sum\|max\|p50\|p95\|p99\|count_distinct:<attribute> | - | No |
@@ -8004,7 +8004,7 @@ List the ingest keys of a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 #### `logs keys create`
@@ -8016,7 +8016,7 @@ Create an ingest key; the key is printed once
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--name <name>` | Name, e.g. the host or collector | - | Yes |
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 | `--service <name>` | Service label for lines that name none | - | No |
 | `--environment <id>` | Pin lines to an environment id | - | No |
 | `--json` | Output in JSON format | - | No |
@@ -8031,7 +8031,7 @@ Revoke an ingest key; collectors using it are refused
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--project <slug|id>` | Project (defaults to the linked project) | - | No |
+| `--project <slug\|id>` | Project (defaults to the linked project) | - | No |
 
 ## `email-domains` (alias: `edom`)
 
@@ -9202,7 +9202,7 @@ Create a template: every service (an app, what `projects` manages), the database
 | `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored); the value is visible in shell history, so prefer --secret-file | - | No |
 | `--secret-file <[service:]KEY=PATH...>` | Set a secret variable from a file, byte-for-byte (PATH - reads stdin) | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline from each --secret-file value | - | No |
-| `--database <type=new|type=new:name|type=id...>` | Create or link each database the template needs (default: create) | - | No |
+| `--database <type=new\|type=new:name\|type=id...>` | Create or link each database the template needs (default: create) | - | No |
 | `--fork-connection <id>` | Starters only: copy the code into a new repository on this git connection | - | No |
 | `--repo-name <name>` | Name of the new repository (with --fork-connection) | - | No |
 | `--repo-owner <owner>` | Account or organization for the new repository | - | No |
@@ -9632,7 +9632,7 @@ Switch between persistent and cookieless tracking, or accept/refuse browser iden
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--mode <mode>` | One of persistent, cookieless | - | No |
-| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `--browser-identify <accept\|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -10419,10 +10419,10 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
-| `--egress-allow <host|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-allow <host\|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
 | `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
-| `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
+| `--node <name\|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
 | `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
@@ -10698,7 +10698,7 @@ Show or set who may open the preview URLs: Temps login (default), the preview pa
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
-| `--allow-ip <ip|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--allow-ip <ip\|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
 | `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
 | `--json` | Output as JSON | - | No |
 
@@ -10714,7 +10714,7 @@ Show or set where the sandbox may connect to: the internet, nothing, or only lis
 |------|-------------|---------|----------|
 | `--internet` | Remove the restriction | - | No |
 | `--deny-all` | Allow no outbound traffic at all | - | No |
-| `--allow <host|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--allow <host\|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`
@@ -12231,8 +12231,8 @@ bunx @temps-sdk/cli@latest environments list --project my-app
 bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # Store a secret from a file, or pipe it from a password manager (never type it on the command line)
-bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt
-op read op://vault/db/password | bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-stdin
+bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read op://vault/db/password | bunx @temps-sdk/cli@latest environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # View environment variables
 bunx @temps-sdk/cli@latest environments vars list --project my-app

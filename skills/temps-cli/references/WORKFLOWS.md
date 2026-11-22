@@ -80,14 +80,18 @@ history, `ps` or CI logs:
 
 ```bash
 bunx @temps-sdk/cli@latest --target-context staging environments vars set \
-  --project example DATABASE_URL --secret --value-file ./database-url.txt
+  --project example DATABASE_URL --secret --value-file ./database-url.txt \
+  --environments staging
 
 op read op://vault/db/url | bunx @temps-sdk/cli@latest --target-context staging \
-  environments vars set --project example DATABASE_URL --secret --value-stdin
+  environments vars set --project example DATABASE_URL --secret --value-stdin \
+  --environments staging
 ```
 
+`--environments` is required when there is no terminal to pick them on (CI).
 The value is sent byte-for-byte; add `--trim-trailing-newline` when the file
-ends with a newline the value should not have. If neither a file nor a pipe is
+ends with a newline the value should not have. Turn shell tracing (`set -x`)
+off first, since it can echo an expanded secret into CI logs. If neither a file nor a pipe is
 available, omit the value and let the user type it at the prompt.
 
 Verify only the variable name and metadata. Never reveal or echo its value.

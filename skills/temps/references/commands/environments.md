@@ -91,7 +91,7 @@ Manage environment variables
 
 - `list` (`ls`) - List environment variables
 - `get` - Get a specific environment variable
-- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 - `delete` (`rm`, `unset`) - Delete an environment variable
 - `import` - Import environment variables from a .env file
 - `export` - Export environment variables to .env format
@@ -122,7 +122,7 @@ Get a specific environment variable
 
 #### `environments vars set`
 
-Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 
 **Usage:** `environments vars set <key> [value] [options]`
 

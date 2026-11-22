@@ -43,7 +43,7 @@ bunx @temps-sdk/cli configure
 
 ### Secrets and credentials
 
-Never type a secret on the command line, where it lands in shell history, `ps` output and CI logs. Commands that set a variable or secret value take `--value-file <path>` or `--value-stdin`; flags that carry a credential (`--token`, `--password`, `--api-key`, `--api-token`, `--secret`, `--secret-key`, `--secret-access-key`, `--bot-token`, `--git-password`, `--webhook-url`) take `--<flag>-file <path>` and `--<flag>-stdin`. Values are sent byte-for-byte; `--trim-trailing-newline` drops one trailing newline.
+Never type a secret on the command line, where it lands in shell history, `ps` output and CI logs. Commands that set a variable or secret value take `--value-file <path>` or `--value-stdin`; flags that carry a credential (`--token`, `--password`, `--api-key`, `--api-token`, `--secret`, `--secret-key`, `--secret-access-key`, `--bot-token`, `--git-password`, `--webhook-url`) take `--<flag>-file <path>` and `--<flag>-stdin`. Values are sent byte-for-byte; `--trim-trailing-newline` drops one trailing newline. The exception is `project-groups vars set`, which has always dropped one final newline from `--value-stdin` and does the same for `--value-file`. The CLI never prints the value, but a shell with tracing on (`set -x`) can echo an expanded secret into CI logs before the CLI runs, so turn tracing off around secrets.
 
 ## Commands
 
@@ -1130,7 +1130,7 @@ Get a specific environment variable
 
 #### `environments vars set`
 
-Set an environment variable. For a secret, read the value from a file or stdin (`--value-file`, `--value-stdin`) so it stays out of shell history, `ps` and CI logs.
+Set an environment variable. For a secret, read the value from a file or stdin (`--value-file`, `--value-stdin`) so it stays out of shell history and `ps`; the CLI never prints it.
 
 **Options:**
 
@@ -1145,11 +1145,11 @@ Set an environment variable. For a secret, read the value from a file or stdin (
 | `--value-stdin` | Read the value from stdin, e.g. piped from a secret manager | - | No |
 | `--trim-trailing-newline` | Drop exactly one trailing newline (`\n` or `\r\n`) from a value read from a file or stdin | - | No |
 
-Pass exactly one of `<value>`, `--value-file` or `--value-stdin`; with none, the CLI prompts (masked for `--secret`). Values are capped at 1 MiB and must be UTF-8 text.
+Pass exactly one of `<value>`, `--value-file` or `--value-stdin`; with none, the CLI prompts (masked for `--secret`). Values are capped at 1 MiB and must be UTF-8 text. Without `--environments`, the environments are picked on the terminal; with no terminal (CI), pass `--environments`.
 
 ```bash
-temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt
-op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin
+temps environments vars set DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read op://vault/db/password | temps environments vars set DB_PASSWORD --secret --value-stdin --environments production
 ```
 
 #### `environments vars delete` (alias: `rm`, `unset`)
@@ -5123,8 +5123,8 @@ bunx @temps-sdk/cli environments list --project my-app
 bunx @temps-sdk/cli environments vars set --project my-app DATABASE_URL --environments production
 
 # Store a secret from a file, or pipe it from a password manager
-bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt
-op read op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin
+bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read op://vault/db/password | bunx @temps-sdk/cli environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # View environment variables
 bunx @temps-sdk/cli environments vars list --project my-app

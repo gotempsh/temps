@@ -1013,7 +1013,7 @@ Manage environment variables
 
 - `list` (`ls`) - List environment variables
 - `get` - Get a specific environment variable
-- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+- `set` - Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 - `delete` (`rm`, `unset`) - Delete an environment variable
 - `import` - Import environment variables from a .env file
 - `export` - Export environment variables to .env format
@@ -1042,7 +1042,7 @@ Get a specific environment variable
 
 #### `environments vars set <key> [value]`
 
-Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history, `ps` and CI logs
+Set an environment variable. For a secret, read the value from a file or stdin (--value-file, --value-stdin) so it stays out of shell history and `ps`; the CLI never prints it
 
 **Options:**
 
@@ -3875,7 +3875,7 @@ Update a flag definition (default value, description, visibility)
 | `--description <text>` | New description | - | No |
 | `--client-visible` | Expose this flag to browsers | - | No |
 | `--no-client-visible` | Make this flag server-only | - | No |
-| `--variants <json|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
+| `--variants <json\|@file>` | Replace the variants, as a JSON array of {key, value, description?} (or @path to a file) | - | No |
 | `--exposure-rate <percent>` | Share of visitors (0-100) whose browser records a flag_exposure event; 0 turns it off | - | No |
 | `--json` | Output in JSON format | - | No |
 
@@ -4315,7 +4315,7 @@ Switch between persistent and cookieless tracking, or accept/refuse browser iden
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--mode <mode>` | One of persistent, cookieless | - | No |
-| `--browser-identify <accept|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
+| `--browser-identify <accept\|refuse>` | Whether identify() from the browser is applied; refuse leaves identify to the app's backend | - | No |
 | `-y, --yes` | Skip confirmation | - | No |
 | `--json` | Output in JSON format | - | No |
 

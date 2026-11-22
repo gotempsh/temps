@@ -82,10 +82,10 @@ Create a new sandbox
 | `--new-branch <name>` | Create and switch to a new branch after cloning, based on whatever was checked out | - | No |
 | `--preview-password` | Generate a random preview-URL password and print it once on stdout | - | No |
 | `--preview-password-length <n>` | Length of the generated preview password (8..=256, default 24) | - | No |
-| `--egress-allow <host|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--egress-allow <host\|cidr[:ports]>` | Restrict outbound traffic to this destination (repeatable; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
 | `--egress-deny-all` | Allow no outbound traffic at all | - | No |
 | `--from-snapshot <snap-id>` | Create sandbox from a snapshot (mutually exclusive with --image) | - | No |
-| `--node <name|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
+| `--node <name\|id>` | Node to run the sandbox on (name, id, or 'control-plane'). Omit to let Temps place it; see `sandbox nodes` | - | No |
 | `--backend <backend>` | Isolation backend: docker, firecracker, microsandbox. Omit for the host default. An unavailable backend fails instead of downgrading | - | No |
 | `--allow-docker` | Allow installing/running Docker inside microsandbox; relaxes guest privilege restrictions. Requires --backend microsandbox | - | No |
 | `--json` | Output as JSON | - | No |
@@ -361,7 +361,7 @@ Show or set who may open the preview URLs: Temps login (default), the preview pa
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--access <mode>` | temps_login (alias 'login'), password, or public. 'password' needs a preview password first (`sandbox password`) | - | No |
-| `--allow-ip <ip|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
+| `--allow-ip <ip\|cidr>` | Only these client networks may open previews, in every mode (repeatable; replaces the list) | - | No |
 | `--any-ip` | Clear the allow-list: any client address may open previews | - | No |
 | `--json` | Output as JSON | - | No |
 
@@ -377,7 +377,7 @@ Show or set where the sandbox may connect to: the internet, nothing, or only lis
 |------|-------------|---------|----------|
 | `--internet` | Remove the restriction | - | No |
 | `--deny-all` | Allow no outbound traffic at all | - | No |
-| `--allow <host|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
+| `--allow <host\|cidr[:ports]>` | Allow only these destinations (repeatable; replaces the policy; no ports = 80 and 443). IPv6 with ports: [addr/prefix]:port | - | No |
 | `--json` | Output as JSON | - | No |
 
 ### `sandbox fs`

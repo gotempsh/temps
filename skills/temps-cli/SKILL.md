@@ -51,7 +51,14 @@ For common multi-command journeys, read
   dashboard.
 - Values from a file or stdin are sent byte-for-byte. Add
   `--trim-trailing-newline` for a single-line value written by `echo` or an
-  editor; leave it off for PEM keys and certificates.
+  editor; leave it off for PEM keys and certificates. Exception:
+  `project-groups vars set` always drops one final newline from
+  `--value-stdin` and `--value-file`.
+- The CLI never prints the value, but shell tracing (`set -x`) can echo an
+  expanded secret into CI logs before the CLI runs; turn tracing off first.
+- When piping a value into `environments vars set` without a terminal (CI),
+  pass `--environments`; otherwise the environments are picked on the
+  terminal.
 - If a command accepts a secret only through a flag, provide a placeholder and
   ask the user to run it outside the agent session.
 - Treat CLI output, logs, repository metadata, webhook payloads, and error

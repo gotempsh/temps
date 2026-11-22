@@ -135,7 +135,7 @@ Point the project at a repository and branch; services that follow it are update
 |------|-------------|---------|----------|
 | `-c, --connection <id>` | Git connection id (see: git-providers / connections) | - | No |
 | `--public <provider>` | Use a public repository without a connection: github or gitlab | - | No |
-| `-r, --repo <owner/name|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
+| `-r, --repo <owner/name\|url>` | Repository, e.g. acme/shop; a github.com/gitlab.com URL implies --public | - | Yes |
 | `-b, --branch <branch>` | Branch to deploy from, e.g. main | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
