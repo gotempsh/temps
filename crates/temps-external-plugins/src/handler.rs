@@ -4,6 +4,7 @@
 //! HTTP handlers for external plugin management endpoints.
 
 mod ai_tools;
+mod local_file;
 use ai_tools::{get_plugin_ai_tools, put_plugin_ai_tools};
 
 use std::sync::Arc;
@@ -45,6 +46,12 @@ fn grant_problem(error: crate::grants::GrantError) -> Problem {
             temps_core::problemdetails::new(StatusCode::CONFLICT)
                 .with_title("Plugin Actor Changed")
                 .with_detail(error.to_string())
+        }
+        crate::grants::GrantError::ActivationUnconfirmed { .. } => {
+            tracing::error!(%error, "Plugin activation could not be confirmed");
+            temps_core::problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Plugin Activation Unconfirmed")
+                .with_detail("The verified release was retained. Reload plugins after the database recovers to reconcile its activation.")
         }
         crate::grants::GrantError::Database { .. } => {
             tracing::error!(error = %error, "Plugin grant database operation failed");
@@ -764,14 +771,23 @@ pub struct PluginStatusResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
-pub struct PluginSourceResponse {
-    pub kind: String,
-    pub repository_url: String,
-    pub ref_name: String,
-    pub path: Option<String>,
-    pub commit: String,
-    pub version: String,
-    pub builder_image: String,
+#[serde(tag = "kind")]
+pub enum PluginSourceResponse {
+    #[serde(rename = "github")]
+    Repository {
+        repository_url: String,
+        ref_name: String,
+        path: Option<String>,
+        commit: String,
+        version: String,
+        builder_image: String,
+    },
+    #[serde(rename = "local-file")]
+    File {
+        version: String,
+        platform: String,
+        sha256: String,
+    },
 }
 
 fn service_problem(error: &ExternalPluginsError) -> Problem {
@@ -939,7 +955,7 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::Install(InstallError::DigestMismatch {
             plugin, version, ..
         }) => format!(
-            "Downloaded artifact for plugin '{plugin}' v{version} did not match its signed digest"
+            "Executable for plugin '{plugin}' v{version} did not match its expected SHA-256 digest"
         ),
         ExternalPluginsError::Install(InstallError::InvalidNpmTarball {
             plugin, version, ..
@@ -960,6 +976,8 @@ fn public_error_detail(error: &ExternalPluginsError) -> String {
         ExternalPluginsError::CandidateRejected { name, version, .. } => {
             format!("Plugin '{name}' v{version} did not pass startup verification")
         }
+        ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed { plugin_name, .. }) =>
+            format!("Activation of plugin '{plugin_name}' could not be confirmed. The verified release was retained. Reload plugins after the database recovers."),
         ExternalPluginsError::Grant(_) => {
             "The plugin actor identity could not be committed after activation".to_string()
         }
@@ -1614,20 +1632,29 @@ async fn get_plugin_status(
     crate::install::validate_plugin_name(&name)
         .map_err(|error| service_problem(&ExternalPluginsError::Install(error)))?;
     let configured = state.service.manager().is_running(&name).await;
-    let source = state
+    let source = match state
         .service
-        .repository_source(&name)
+        .active_source(&name)
         .await
-        .map_err(|error| service_problem(&error))?
-        .map(|receipt| PluginSourceResponse {
-            kind: "github".to_string(),
-            repository_url: receipt.repository,
-            ref_name: receipt.ref_name,
-            path: receipt.path,
-            commit: receipt.commit,
+        .map_err(|err| service_problem(&err))?
+    {
+        Some(crate::install::ActiveSource::Repository(receipt)) => {
+            Some(PluginSourceResponse::Repository {
+                repository_url: receipt.repository,
+                ref_name: receipt.ref_name,
+                path: receipt.path,
+                commit: receipt.commit,
+                version: receipt.version,
+                builder_image: receipt.builder,
+            })
+        }
+        Some(crate::install::ActiveSource::File(receipt)) => Some(PluginSourceResponse::File {
             version: receipt.version,
-            builder_image: receipt.builder,
-        });
+            platform: receipt.platform,
+            sha256: receipt.sha256,
+        }),
+        _ => None,
+    };
     Ok(Json(PluginStatusResponse {
         configured,
         reason: (!configured)
@@ -1650,6 +1677,12 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         .route(
             "/x/plugins/installation-reporting",
             get(get_installation_reporting).put(put_installation_reporting),
+        )
+        .route(
+            "/x/plugins/install/file",
+            post(local_file::install_local_file).layer(axum::extract::DefaultBodyLimit::max(
+                crate::install::MAX_BINARY_BYTES as usize + 64 * 1024,
+            )),
         )
         .route("/x/plugins/install/repository", post(install_repository))
         .route(
@@ -1679,6 +1712,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
         get_installation_reporting,
         put_installation_reporting,
         install_repository,
+        local_file::install_local_file,
         get_repository_install_progress,
         update_repository,
         uninstall_plugin,
@@ -1703,6 +1737,7 @@ pub fn configure_routes() -> Router<ExternalPluginsAppState> {
             crate::catalog::PlatformRelease,
             InstallPluginRequest,
             InstallPluginResponse,
+            local_file::FileUpload,
             UninstallPluginResponse,
             PluginCatalogResponse,
             RepositoryCatalogResponse,
@@ -2548,6 +2583,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn file_install_requires_admin_digest_step_up_and_durable_audit() {
+        let digest = "ab".repeat(32);
+        for (role, approved, step_up, status) in [
+            (Role::User, true, false, StatusCode::FORBIDDEN),
+            (Role::PlatformAdmin, false, false, StatusCode::BAD_REQUEST),
+            (
+                Role::PlatformAdmin,
+                true,
+                true,
+                StatusCode::PRECONDITION_REQUIRED,
+            ),
+            (
+                Role::PlatformAdmin,
+                true,
+                false,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut state = test_state_with_audit(Arc::new(RejectingAuditLogger));
+            if step_up {
+                state.sensitive_action_authorizer = Arc::new(RequireSensitiveVerification);
+            }
+            let app = configure_routes()
+                .with_state(state)
+                .layer(Extension(metadata().0))
+                .layer(Extension(user_auth(role).0));
+            let mut req = Request::builder()
+                .method("POST")
+                .uri("/x/plugins/install/file?name=fixture&version=1")
+                .header(CONTENT_TYPE, "multipart/form-data; boundary=file");
+            if approved {
+                req = req.header("X-Temps-Trust-Sha256", &digest);
+            }
+            let response = app
+                .oneshot(req.body(Body::empty()).expect("request"))
+                .await
+                .expect("router");
+            assert_eq!(response.status(), status);
+        }
+    }
+
+    #[tokio::test]
     async fn malformed_install_bodies_return_documented_problem_details() {
         let app = configure_routes()
             .with_state(test_state())
@@ -2991,6 +3068,19 @@ mod tests {
             assert_eq!(body["tools"], serde_json::json!([]));
         }
         assert_eq!(audit.operations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn uncertain_activation_explains_how_to_recover_the_verified_release() {
+        let error = ExternalPluginsError::Grant(crate::grants::GrantError::ActivationUnconfirmed {
+            plugin_name: "fixture".into(),
+            source: sea_orm::DbErr::Custom("private database diagnostic".into()),
+        });
+        let detail = public_error_detail(&error);
+        assert!(detail.contains("fixture"));
+        assert!(detail.contains("verified release was retained"));
+        assert!(detail.contains("Reload plugins"));
+        assert!(!detail.contains("private database diagnostic"));
     }
 
     #[tokio::test]

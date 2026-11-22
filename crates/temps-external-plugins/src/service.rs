@@ -277,6 +277,13 @@ impl ExternalPluginsService {
         Ok(())
     }
 
+    pub(crate) async fn active_source(
+        &self,
+        name: &str,
+    ) -> Result<Option<crate::install::ActiveSource>, ExternalPluginsError> {
+        Ok(crate::install::active_source(&self.manager.config().plugins_dir, name).await?)
+    }
+
     pub(crate) async fn repository_source(
         &self,
         name: &str,
@@ -421,9 +428,63 @@ impl ExternalPluginsService {
             &output,
         )
         .await?;
+        let actor_id = self
+            .promote_operator_candidate(
+                &candidate,
+                crate::manager::repository_actor_source(
+                    &selected.source.repository,
+                    selected.source.path.as_deref(),
+                ),
+                progress,
+            )
+            .await?;
+        Ok(RepositoryInstallOutcome {
+            name: candidate.name,
+            version: candidate.version,
+            platform,
+            sha256,
+            source_commit: selected.source.commit,
+            actor_id,
+        })
+    }
+    pub(crate) async fn install_file(
+        &self,
+        receipt: &crate::install::LocalFileReceipt,
+        path: &std::path::Path,
+    ) -> Result<(), ExternalPluginsError> {
+        if !self.manager.config().persistent_installations {
+            return Err(ExternalPluginsError::PersistentStorageRequired);
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        if self.closing.load(Ordering::Acquire) {
+            return Err(ExternalPluginsError::ShuttingDown);
+        }
+        validate_plugin_name(&receipt.plugin_name)?;
+        let dir = &self.manager.config().plugins_dir;
+        let source = crate::install::active_source(dir, &receipt.plugin_name).await?;
+        if !matches!(source, None | Some(crate::install::ActiveSource::File(_))) {
+            return Err(repository::RepositoryError::SourceConflict {
+                name: receipt.plugin_name.clone(),
+                repository: "local file".into(),
+            }
+            .into());
+        }
+        let candidate = PluginInstaller::prepare_file(dir, receipt, path).await?;
+        self.promote_operator_candidate(&candidate, receipt.actor_source(), None)
+            .await?;
+        Ok(())
+    }
+
+    async fn promote_operator_candidate(
+        &self,
+        candidate: &crate::install::InstallCandidate,
+        source_identity: String,
+        progress: Option<&ProgressHandle>,
+    ) -> Result<String, ExternalPluginsError> {
         if let Some(progress) = progress {
             progress.advance(Stage::StartingPlugin).await;
         }
+        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
         let pending = match self
             .manager
             .prepare_candidate(
@@ -431,10 +492,7 @@ impl ExternalPluginsService {
                 &candidate.version,
                 &candidate.sha256,
                 &candidate.binary_path,
-                crate::manager::repository_actor_source(
-                    &selected.source.repository,
-                    selected.source.path.as_deref(),
-                ),
+                source_identity,
             )
             .await
         {
@@ -444,15 +502,14 @@ impl ExternalPluginsService {
                     plugin = %candidate.name,
                     version = %candidate.version,
                     reason = %reason,
-                    "Repository plugin candidate failed startup verification"
+                    "Plugin candidate failed startup verification"
                 );
-                let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-                if let Err(error) = installer.discard(&candidate).await {
-                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected repository candidate");
+                if let Err(error) = installer.discard(candidate).await {
+                    tracing::warn!(plugin = %candidate.name, error = %error, "Failed to discard rejected plugin candidate");
                 }
                 return Err(ExternalPluginsError::CandidateRejected {
-                    name: candidate.name,
-                    version: candidate.version,
+                    name: candidate.name.clone(),
+                    version: candidate.version.clone(),
                     reason,
                 });
             }
@@ -462,6 +519,7 @@ impl ExternalPluginsService {
                 Ok((actor_id, source)) => (actor_id.to_string(), source.to_string()),
                 Err(reason) => {
                     self.manager.discard_candidate(pending).await;
+                    let _ = installer.discard(candidate).await;
                     return Err(ExternalPluginsError::CandidateRejected {
                         name: candidate.name.clone(),
                         version: candidate.version.clone(),
@@ -472,55 +530,74 @@ impl ExternalPluginsService {
         if let Some(progress) = progress {
             progress.advance(Stage::PromotingPlugin).await;
         }
-        let installer = PluginInstaller::new(self.manager.config().registry.clone())?;
-        let activation_rollback = match installer.capture_activation(&candidate).await {
+        let activation_rollback = match installer.capture_activation(candidate).await {
             Ok(rollback) => rollback,
             Err(error) => {
                 self.manager.discard_candidate(pending).await;
+                let _ = installer.discard(candidate).await;
                 return Err(error.into());
             }
         };
-        if let Err(error) = installer.activate(&candidate).await {
+        if let Err(error) = installer.activate(candidate).await {
             self.manager.discard_candidate(pending).await;
-            let _ = installer.discard(&candidate).await;
+            let _ = installer.discard(candidate).await;
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
         self.ai_tools
             .publish(temps_ai_api_tools::PluginToolsIndex::default());
         self.manager.promote_candidate(pending).await;
         self.refresh_runtime_surfaces().await;
-        let actor_id = candidate_actor_id;
-        Ok(RepositoryInstallOutcome {
-            name: candidate.name,
-            version: candidate.version,
-            platform,
-            sha256,
-            source_commit: selected.source.commit,
-            actor_id,
-        })
+        Ok(candidate_actor_id)
     }
+
+    async fn commit_candidate_actor(
+        &self,
+        installer: &PluginInstaller,
+        candidate: &crate::install::InstallCandidate,
+        actor_id: &str,
+        source_identity: &str,
+        rollback: crate::install::ActivationRollback,
+    ) -> Result<(), crate::grants::GrantError> {
+        let grants = crate::grants::PluginGrantService::new(self.db.clone());
+        let result = grants
+            .commit_actor(
+                &candidate.name,
+                actor_id,
+                &candidate.sha256,
+                source_identity,
+            )
+            .await;
+        match &result {
+            Ok(()) => {}
+            Err(crate::grants::GrantError::ActivationUnconfirmed { .. }) => {
+                // Keep the verified receipt and release for reconciliation on reload.
+                self.ai_tools
+                    .publish(self.ai_tools.snapshot().without_plugin(&candidate.name));
+            }
+            Err(_) => {
+                // Preparation is provisional. A rolled-back transaction leaves the
+                // previous actor and its grants intact, including on first install.
+                if let Err(error) = installer.rollback_candidate(candidate, rollback).await {
+                    tracing::error!(plugin = %candidate.name, %error, "Failed to restore the previous plugin activation");
+                }
+            }
+        }
+        result
+    }
+
     /// Install the bridge plugins use to call the platform's own HTTP API.
     ///
     /// The console builds its router *after* plugins start (the router
@@ -874,13 +951,14 @@ impl ExternalPluginsService {
 
         // Source identity is bidirectional: signed registry installs must not
         // silently replace an administrator-selected repository release.
-        if crate::install::repository_source(
-            &self.manager.config().plugins_dir,
-            &selected.identity.name,
-        )
-        .await?
-        .is_some()
-        {
+        if !matches!(
+            crate::install::active_source(
+                &self.manager.config().plugins_dir,
+                &selected.identity.name
+            )
+            .await?,
+            None | Some(crate::install::ActiveSource::Registry)
+        ) {
             return Err(repository::RepositoryError::SourceConflict {
                 name: selected.identity.name.clone(),
                 repository: "signed registry".to_string(),
@@ -960,26 +1038,17 @@ impl ExternalPluginsService {
             }
             return Err(error.into());
         }
-        let grant_service = crate::grants::PluginGrantService::new(self.db.clone());
-        if let Err(error) = grant_service
-            .commit_actor(
-                &candidate.name,
+        if let Err(error) = self
+            .commit_candidate_actor(
+                &installer,
+                &candidate,
                 &candidate_actor_id,
-                &candidate.sha256,
                 &candidate_source_identity,
+                activation_rollback,
             )
             .await
         {
-            let first_install = activation_rollback.was_first_install();
-            if let Err(rollback_error) = installer.restore_activation(activation_rollback).await {
-                tracing::error!(plugin = %candidate.name, error = %rollback_error, "Failed to restore plugin activation after actor identity commit failed");
-            }
             self.manager.discard_candidate(pending).await;
-            if first_install {
-                if let Err(revoke_error) = grant_service.revoke_actor(&candidate.name).await {
-                    tracing::error!(plugin = %candidate.name, error = %revoke_error, "Failed to revoke actor created for rejected first installation");
-                }
-            }
             return Err(error.into());
         }
         self.ai_tools
@@ -2578,6 +2647,91 @@ except Exception:
             "a rejected queued install must not create plugin state"
         );
     }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_reload_preserves_the_process_and_actor_when_a_different_file_is_active() {
+        use crate::install::{LocalFileReceipt, LocalFileSource};
+        if !std::path::Path::new("/usr/bin/python3").exists() {
+            return;
+        }
+        let database = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping single plugin reload fixture: Docker unavailable");
+                return;
+            }
+            Err(error) => panic!("fixture database: {error}"),
+        };
+        let root = tempfile::tempdir_in("/tmp").unwrap();
+        let name = "reload-fixture";
+        let version = "1.0.0";
+        let mut config =
+            ExternalPluginConfig::new(root.path().into(), "postgres://localhost/test".into());
+        config.sockets_dir = root.path().join("sockets");
+        std::fs::create_dir_all(&config.sockets_dir).unwrap();
+        let service =
+            ExternalPluginsService::new_empty(config.clone(), None, database.connection_arc());
+        let binary = root.path().join("upload");
+        let mut bytes = protocol_v2_fixture(name, version);
+        std::fs::write(&binary, &bytes).unwrap();
+        let mut receipt = LocalFileReceipt {
+            source: LocalFileSource::File,
+            plugin_name: name.into(),
+            version: version.into(),
+            platform: platform_target().unwrap(),
+            sha256: hex::encode(Sha256::digest(&bytes)),
+        };
+        service.install_file(&receipt, &binary).await.unwrap();
+        let original = service.manager.socket_path_for(name).await.unwrap();
+
+        // The new receipt and actor have committed, while the original process remains live.
+        bytes.extend_from_slice(b"\n# replacement release\n");
+        std::fs::write(&binary, &bytes).unwrap();
+        receipt.sha256 = hex::encode(Sha256::digest(&bytes));
+        let candidate = PluginInstaller::prepare_file(&config.plugins_dir, &receipt, &binary)
+            .await
+            .unwrap();
+        PluginInstaller::new(config.registry.clone())
+            .unwrap()
+            .activate(&candidate)
+            .await
+            .unwrap();
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let source = receipt.actor_source();
+        let actor = grants.prepare_actor(name, &source).await.unwrap().actor.id;
+        grants
+            .commit_actor(name, &actor, &receipt.sha256, &source)
+            .await
+            .unwrap();
+
+        let error = service.manager.reload_plugin(name).await.unwrap_err();
+        assert!(error.contains("different release"), "{error}");
+        assert_eq!(
+            service.manager.socket_path_for(name).await.as_ref(),
+            Some(&original)
+        );
+        assert!(original.exists());
+        let settings = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(settings.actor_id, actor);
+        assert_eq!(settings.installation_revision, receipt.sha256);
+
+        service.reload_plugins().await.unwrap();
+        service.manager.reload_plugin(name).await.unwrap();
+        let socket = service.manager.socket_path_for(name).await.unwrap();
+        tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("replacement socket accepts connections");
+        let pid = std::fs::read_to_string(config.pids_dir.join(format!("{name}.pid")))
+            .expect("replacement PID file");
+        assert!(pid.trim().parse::<u32>().is_ok_and(|pid| pid > 0));
+        let reloaded = service.plugin_ai_tools(name).await.unwrap();
+        assert_eq!(reloaded.actor_id, actor);
+        assert_eq!(reloaded.installation_revision, receipt.sha256);
+        service.shutdown_all().await;
+    }
+
     #[tokio::test]
     #[cfg(unix)]
     async fn installed_plugin_tools_are_discoverable_gated_and_callable_over_http() {
@@ -2648,7 +2802,10 @@ websocket_key = headers["sec-websocket-key"]"#);
         let spec = serde_json::from_value(spec).unwrap();
         registry.bind(
             InternalApiCaller::new_allowlisted(
-                service.proxy_router.read().await.clone(),
+                crate::plugin::DynamicPluginRouter {
+                    inner: service.proxy_router(),
+                }
+                .router(),
                 &spec,
                 vec![],
             ),
@@ -2679,6 +2836,60 @@ websocket_key = headers["sec-websocket-key"]"#);
                 crate::ai_tools::UpdatePluginAiTools {
                     actor_id: settings.actor_id.clone(),
                     installation_revision: settings.installation_revision.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        // The actor commit can be durable while the previous verified process
+        // still serves requests. Consent for B must never expose A's schema.
+        let grants = crate::grants::PluginGrantService::new(database.connection_arc());
+        let other_digest = "ab".repeat(32);
+        grants
+            .commit_binary_hash("reports", &other_digest)
+            .await
+            .unwrap();
+        let other = service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: settings.actor_id.clone(),
+                    installation_revision: other_digest,
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(other.enabled);
+        assert!(other.tools.is_empty());
+        service.rebuild_ai_tools().await;
+        assert!(handle
+            .get()
+            .unwrap()
+            .search("plugin.reports", &scope)
+            .is_empty());
+        assert!(handle
+            .get()
+            .unwrap()
+            .call("plugin.reports.list", serde_json::json!({}), &scope)
+            .await
+            .is_err());
+
+        // Reload reconciles the installed binary and requires its own approval.
+        service.reload_plugins().await.unwrap();
+        let reloaded = service.plugin_ai_tools("reports").await.unwrap();
+        assert_eq!(
+            reloaded.installation_revision,
+            settings.installation_revision
+        );
+        assert!(!reloaded.enabled);
+        assert_eq!(reloaded.tools.len(), 1);
+        service
+            .update_plugin_ai_tools(
+                "reports",
+                crate::ai_tools::UpdatePluginAiTools {
+                    actor_id: reloaded.actor_id,
+                    installation_revision: reloaded.installation_revision,
                     enabled: true,
                 },
             )
