@@ -379,6 +379,18 @@ pub(crate) mod tests {
             .0,
             Ok("/srv/real".to_string())
         );
+        // A lookup path with `..` in it, resolved as an absolute target.
+        assert_eq!(
+            resolve("/", "/app/dir/../real", &[("/app/dir", "/opt/bin")])
+                .await
+                .0,
+            Ok("/opt/real".to_string())
+        );
+        // Without `..`, a lookup path needs no directory checks.
+        assert_eq!(
+            resolve("/", "/app//./server", &[("/app", "/srv")]).await,
+            (Ok("/app/server".to_string()), vec![])
+        );
         // The base directory of the link is a symlink too.
         assert_eq!(
             resolve("/bin/app", "../lib/app", &[("/bin", "usr/bin")])

@@ -1287,8 +1287,9 @@ fn start_failure_preserves_container_and_daemon_cause() {
     }
 }
 
-/// Reading an entrypoint's file capabilities follows its symlinks the way
-/// the kernel does: `..` leaves a directory symlink from its target. The
+/// Reading an entrypoint's file capabilities follows its symlinks, and a
+/// `..` in the path it is given, the way the kernel does: `..` leaves a
+/// directory symlink from its target. The
 /// layout only exists inside this test's own container; `/app/real` does
 /// not, so a lexical `..` (`/app/entry -> dir/../real` read as `/app/real`)
 /// fails instead of reaching `/opt/real`.
@@ -1335,6 +1336,7 @@ async fn file_capabilities_follow_dotdot_through_a_directory_symlink() {
         (
             runtime.file_capabilities(&id, "/app/entry").await,
             runtime.file_capabilities(&id, "/usr/bin/entry").await,
+            runtime.file_capabilities(&id, "/app/dir/../real").await,
             runtime.file_capabilities(&id, "/app/real").await,
         )
     }
@@ -1350,10 +1352,15 @@ async fn file_capabilities_follow_dotdot_through_a_directory_symlink() {
         )
         .await;
 
-    let (entry, through_two_links, lexical) = outcome;
+    let (entry, through_two_links, dotdot_path, lexical) = outcome;
     assert_eq!(entry.expect("/app/entry resolves to /opt/real"), None);
     assert_eq!(
         through_two_links.expect("/usr/bin/entry resolves to /opt/real"),
+        None
+    );
+    // The path an exec error names can hold `..` itself.
+    assert_eq!(
+        dotdot_path.expect("/app/dir/../real resolves to /opt/real"),
         None
     );
     assert!(lexical.is_err(), "/app/real must not exist: {lexical:?}");

@@ -1327,44 +1327,34 @@ impl ContainerDeployer for DockerRuntime {
         container_id: &str,
         path: &str,
     ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
-        use super::file_capabilities::{
-            resolve_link, valid_lookup_path, ResolveLinkError, MAX_PARENT_LOOKUPS, MAX_SYMLINK_HOPS,
-        };
+        use super::file_capabilities::{valid_lookup_path, MAX_SYMLINK_HOPS};
         let failed = |path: &str, reason: String| {
             DeployerError::file_capabilities(container_id, path, "the local Docker daemon", reason)
         };
+        let invalid =
+            |path: &str| failed(path, "the path is not absolute or is too long".to_string());
+        if !valid_lookup_path(path) {
+            return Err(invalid(path));
+        }
         let docker = self.require_docker()?;
-        let mut current = path.to_string();
+        // Docker cleans a `..` in the requested path lexically, so resolve
+        // the path itself first, as the kernel did when it ran it
+        // (`/app/dir/../real` with `/app/dir -> /opt/bin` is `/opt/real`).
+        // A path without `..` needs no directory checks.
+        let mut current = resolve_in_container(&docker, container_id, path, "/", path)
+            .await
+            .map_err(|(at, reason)| failed(&at, reason))?;
         for _ in 0..=MAX_SYMLINK_HOPS {
+            if !valid_lookup_path(&current) {
+                return Err(invalid(&current));
+            }
             let head = read_archive_head(&docker, container_id, &current)
                 .await
                 .map_err(|reason| failed(&current, reason))?;
             if let Some(target) = head.link_name.as_deref() {
-                let link = current.clone();
-                current = resolve_link(&link, target, |directory| {
-                    let docker = docker.clone();
-                    async move {
-                        read_archive_head(&docker, container_id, &directory)
-                            .await
-                            .map(|head| head.link_name)
-                    }
-                })
-                .await
-                .map_err(|error| match error {
-                    ResolveLinkError::Lookup { path, error } => failed(&path, error),
-                    ResolveLinkError::TooManyLookups => failed(
-                        &link,
-                        format!(
-                            "resolving its target needs more than {MAX_PARENT_LOOKUPS} directory checks"
-                        ),
-                    ),
-                })?;
-                if !valid_lookup_path(&current) {
-                    return Err(failed(
-                        &current,
-                        "the path is not absolute or is too long".to_string(),
-                    ));
-                }
+                current = resolve_in_container(&docker, container_id, &current, &current, target)
+                    .await
+                    .map_err(|(at, reason)| failed(&at, reason))?;
                 continue;
             }
             return match head.capability_xattr() {
@@ -1460,6 +1450,36 @@ impl ContainerDeployer for DockerRuntime {
             source: Box::new(source),
         })
     }
+}
+
+/// Where `target`, the target of a symlink at `link` (or an absolute path,
+/// with `link` `/`), leads inside a container, resolving `..` the way the
+/// kernel does ([`super::file_capabilities::resolve_link`]). `subject` names
+/// the path in an error, which is the path it concerns and the reason.
+async fn resolve_in_container(
+    docker: &std::sync::Arc<Docker>,
+    container_id: &str,
+    subject: &str,
+    link: &str,
+    target: &str,
+) -> Result<String, (String, String)> {
+    use super::file_capabilities::{resolve_link, ResolveLinkError, MAX_PARENT_LOOKUPS};
+    resolve_link(link, target, |directory| {
+        let docker = docker.clone();
+        async move {
+            read_archive_head(&docker, container_id, &directory)
+                .await
+                .map(|head| head.link_name)
+        }
+    })
+    .await
+    .map_err(|error| match error {
+        ResolveLinkError::Lookup { path, error } => (path, error),
+        ResolveLinkError::TooManyLookups => (
+            subject.to_string(),
+            format!("resolving it needs more than {MAX_PARENT_LOOKUPS} directory checks"),
+        ),
+    })
 }
 
 /// The leading headers of Docker's one-entry archive of `path` in a
