@@ -30,6 +30,13 @@ END; $$;
     }
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         manager.get_connection().execute_unprepared(r#"
+LOCK TABLE plugin_watch_deliveries IN ACCESS EXCLUSIVE MODE;
+DO $$
+BEGIN
+    IF EXISTS (SELECT 1 FROM plugin_watch_deliveries WHERE status='pending' AND wake_message_id IS NOT NULL) THEN
+        RAISE EXCEPTION 'Cannot roll back plugin watch recovery while a pending wake has a prepared message. Finish or cancel the pending wake before retrying.';
+    END IF;
+END; $$;
 CREATE OR REPLACE FUNCTION claim_plugin_watch_turn() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN
     UPDATE plugin_watch_deliveries d SET status='delivered' FROM plugin_chat_watches w,external_plugin_actors a

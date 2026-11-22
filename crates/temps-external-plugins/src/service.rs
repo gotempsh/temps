@@ -1627,8 +1627,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    mod watch_pool;
+
+    #[cfg(unix)]
     fn protocol_v2_fixture(name: &str, version: &str) -> Vec<u8> {
-        let manifest = PluginManifest::builder(name, version).build();
+        protocol_fixture_manifest(PluginManifest::builder(name, version).build())
+    }
+
+    #[cfg(unix)]
+    fn protocol_fixture_manifest(manifest: PluginManifest) -> Vec<u8> {
         let hello = serde_json::to_string(&temps_plugin_protocol::HandshakeMessage::Hello(
             temps_plugin_protocol::PluginHello {
                 protocol_version: temps_plugin_protocol::EXTERNAL_PLUGIN_PROTOCOL_VERSION,

@@ -221,6 +221,24 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
     .unwrap()
     .is_some());
 
+    db.execute_unprepared(
+        "UPDATE plugin_chat_watches SET paused=true,mode='wake' WHERE conversation_id=9912",
+    )
+    .await
+    .unwrap();
+    let paused_delivery = "eaa3ad48-fb15-4271-8327-b6ea5da64219";
+    db.execute_unprepared("INSERT INTO plugin_watch_deliveries(id,watch_id,event_id) SELECT 'eaa3ad48-fb15-4271-8327-b6ea5da64219',id,'paused-wake' FROM plugin_chat_watches WHERE conversation_id=9912").await.unwrap();
+    assert!(!wake_is_pending(&db, paused_delivery).await.unwrap());
+    let status = temps_entities::plugin_watch_deliveries::Entity::find_by_id(
+        uuid::Uuid::parse_str(paused_delivery).unwrap(),
+    )
+    .one(db.as_ref())
+    .await
+    .unwrap()
+    .unwrap()
+    .status;
+    assert_eq!(status, "skipped");
+
     let transaction = db.begin().await.unwrap();
     transaction
         .execute_unprepared("SELECT transaction_timestamp()")
@@ -246,4 +264,93 @@ VALUES(9913,'5127c44a-a841-46bb-b69e-597f3204c7ac','hash','changed','2','{"resou
         cutoff.try_get::<bool>("", "valid").unwrap(),
         "creation and resumption begin after subject authorization"
     );
+    transaction.commit().await.unwrap();
+    let fresh = "1d62e06c-be53-4c71-a307-f1c06447cdb2";
+    db.execute_unprepared("INSERT INTO plugin_watch_deliveries(id,watch_id,event_id) SELECT '1d62e06c-be53-4c71-a307-f1c06447cdb2',id,'new-wake' FROM plugin_chat_watches WHERE conversation_id=9912 AND source='changed'").await.unwrap();
+    let watch_row = || {
+        temps_entities::plugin_chat_watches::Entity::find_by_id(delivered.watch_id).one(db.as_ref())
+    };
+    let since = watch_row().await.unwrap().unwrap().active_since;
+    let resume = || {
+        Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            RESUME_WATCH,
+            [
+                delivered.watch_id.to_string().into(),
+                9912i64.into(),
+                9901i32.into(),
+            ],
+        )
+    };
+    assert!(db.query_one(resume()).await.unwrap().is_some());
+    assert_eq!(watch_row().await.unwrap().unwrap().active_since, since);
+    assert!(wake_is_pending(&db, fresh).await.unwrap());
+    db.execute_unprepared("UPDATE plugin_chat_watches SET paused=true WHERE conversation_id=9912 AND source='changed'").await.unwrap();
+    assert!(db.query_one(resume()).await.unwrap().is_some());
+    assert!(!wake_is_pending(&db, fresh).await.unwrap());
+}
+
+#[test]
+fn numeric_watch_subjects_compare_by_value_and_string_subjects_remain_exact() {
+    let declaration = |kind: &str| {
+        serde_json::from_value(json!({
+        "type":"report.changed","title":"Report changed","filterable":["resource"],
+        "attributes_schema":{"type":"object","properties":{"resource":{"type":kind}},"required":["resource"]}
+    })).unwrap()
+    };
+    let integer = declaration("integer");
+    let filter = json!({"resource":4});
+    assert_eq!(
+        watch_filter(&integer, "+4", None).unwrap(),
+        (filter.clone(), "4".to_string())
+    );
+    assert_eq!(watch_filter(&integer, "004", Some(&filter)).unwrap().1, "4");
+    assert!(watch_filter(&integer, "5", Some(&filter)).is_err());
+    assert!(watch_filter(&integer, "other", Some(&filter)).is_err());
+    assert!(watch_filter(&declaration("string"), "+4", Some(&json!({"resource":"4"}))).is_err());
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_wake_timeout_leaves_one_owned_preparation_to_finish() {
+    use axum::routing::post;
+    let slots = Arc::new(tokio::sync::Semaphore::new(1));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let finish = Arc::new(tokio::sync::Notify::new());
+    let completed = Arc::new(tokio::sync::Notify::new());
+    let route = Router::new().route(
+        "/",
+        post({
+            let (started, finish, completed) = (started.clone(), finish.clone(), completed.clone());
+            move || async move {
+                started.notify_one();
+                finish.notified().await;
+                completed.notify_one();
+                StatusCode::ACCEPTED
+            }
+        }),
+    );
+    let request = || Request::post("/").body(Body::empty()).unwrap();
+    let first = tokio::spawn({
+        let (route, slots) = (route.clone(), slots.clone());
+        async move { dispatch_watch_request(route, request(), Some(&slots)).await }
+    });
+    started.notified().await;
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    assert!(matches!(
+        first.await.unwrap(),
+        Err(WatchError::Rejected {
+            status: StatusCode::GATEWAY_TIMEOUT,
+            ..
+        })
+    ));
+    assert!(matches!(
+        dispatch_watch_request(route, request(), Some(&slots)).await,
+        Err(WatchError::Rejected {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            ..
+        })
+    ));
+    finish.notify_one();
+    completed.notified().await;
+    assert!(slots.try_acquire().is_ok(), "a later wake can now start");
 }

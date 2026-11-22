@@ -78,22 +78,27 @@ export function ChatPluginWatches({
       ),
   })
   const panel = watches.data
-  const previousDeliveries = useRef(new Map<string, number>())
+  const previousDeliveries = useRef<{
+    chat: string
+    counts: Map<string, number>
+  } | null>(null)
   const refreshFailure = useRef(false)
   useEffect(() => {
     if (!panel) return
     let cancelled = false
-    const changed = panel.watches.filter((watch) => {
-      const before = previousDeliveries.current.get(watch.id)
-      return (
-        watch.mode === 'notify' &&
-        before !== undefined &&
-        watch.delivered > before
-      )
-    })
+    const baseline = previousDeliveries.current
     const counts = new Map(panel.watches.map((w) => [w.id, w.delivered]))
+    if (baseline?.chat !== chat) {
+      previousDeliveries.current = { chat, counts }
+      refreshFailure.current = false
+      return
+    }
+    const changed = panel.watches.filter((watch) => {
+      const before = baseline.counts.get(watch.id) ?? 0
+      return watch.mode === 'notify' && watch.delivered > before
+    })
     if (!changed.length) {
-      previousDeliveries.current = counts
+      previousDeliveries.current = { chat, counts }
       return
     }
     async function refresh() {
@@ -107,7 +112,7 @@ export function ChatPluginWatches({
         refreshFailure.current = true
         return
       }
-      previousDeliveries.current = counts
+      previousDeliveries.current = { chat, counts }
       refreshFailure.current = false
       for (const watch of changed)
         toast.info(`${watch.label || watch.subject} · ${watch.source}`)

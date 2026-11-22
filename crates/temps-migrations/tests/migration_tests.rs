@@ -10437,5 +10437,35 @@ async fn watch_delivery_recovery_migration_preserves_existing_receipts() -> anyh
         Migrator::down(&db, Some(1)).await?;
         assert!(!column_exists(&db, "plugin_watch_deliveries", "wake_message_id").await?);
     }
+    Migrator::up(&db, Some(1)).await?;
+    db.execute_unprepared(r#"
+        INSERT INTO users(id,name,email) VALUES(9911,'Owner','owner@example.test');
+        INSERT INTO sessions(id,user_id,session_token,expires_at,mfa_pending) VALUES(9911,9911,'test-session',now()+interval '1 day',false);
+        INSERT INTO ai_conversations(id,public_id,context_type,context_id,created_by) VALUES(9911,'test-chat','assistant','assistant',9911);
+        INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,predicate,mode,session_id)
+        SELECT 9911,id,'digest','changed','1','{}','wake',9911 FROM external_plugin_actors WHERE plugin_name='reports';
+        INSERT INTO ai_messages(id,conversation_id,role,content) VALUES(9911,9911,'user','Resource changed');
+        INSERT INTO plugin_watch_deliveries(watch_id,event_id,wake_message_id)
+        SELECT id,'prepared',9911 FROM plugin_chat_watches WHERE conversation_id=9911;
+    "#).await?;
+    let error = Migrator::down(&db, Some(1))
+        .await
+        .expect_err("prepared wake must survive rollback");
+    assert!(error
+        .to_string()
+        .contains("pending wake has a prepared message"));
+    let row = db
+        .query_one(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT wake_message_id FROM plugin_watch_deliveries WHERE event_id='prepared'",
+        ))
+        .await?
+        .expect("prepared delivery");
+    assert_eq!(row.try_get::<i64>("", "wake_message_id")?, 9911);
+    db.execute_unprepared(
+        "UPDATE plugin_watch_deliveries SET status='skipped' WHERE event_id='prepared'",
+    )
+    .await?;
+    Migrator::down(&db, Some(1)).await?;
     Ok(())
 }

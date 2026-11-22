@@ -162,3 +162,40 @@ test('a later poll retries a failed transcript refresh even when the delivery co
     window.removeEventListener(CHAT_WATCH_DELIVERY_EVENT, refresh)
   }
 })
+
+test('first poll of a new notify watch refreshes once after the initial snapshot', async () => {
+  let added = false
+  let refreshes = 0
+  const original = { ...watch, delivered: 3 }
+  const api = mockApi({
+    ['GET ' + route]: () =>
+      jsonResponse({
+        sources: [],
+        watches: added
+          ? [original, { ...watch, id: 'new-watch', delivered: 1 }]
+          : [original],
+      }),
+  })
+  const refresh = (event: Event) => {
+    const { respond } = (event as CustomEvent<WatchRefreshDetail>).detail
+    refreshes++
+    respond(Promise.resolve(true))
+  }
+  window.addEventListener(CHAT_WATCH_DELIVERY_EVENT, refresh)
+  try {
+    const cache = new QueryClient()
+    const view = mount(cache)
+    await view.findByRole('button', { name: 'Remove Build reports' })
+    expect(refreshes).toBe(0)
+    added = true
+    const poll = () =>
+      cache.invalidateQueries({ queryKey: ['plugin-watches', 'chat-1'] })
+    await poll()
+    await waitFor(() => expect(refreshes).toBe(1))
+    await poll()
+    expect(refreshes).toBe(1)
+  } finally {
+    window.removeEventListener(CHAT_WATCH_DELIVERY_EVENT, refresh)
+    api.restore()
+  }
+})

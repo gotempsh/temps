@@ -162,6 +162,7 @@ use tower::ServiceExt;
 use utoipa::ToSchema;
 
 pub(crate) struct WatchHost {
+    wake_preparations: Arc<tokio::sync::Semaphore>,
     router: Router,
     users: Arc<UserService>,
     crypto: Arc<temps_core::CookieCrypto>,
@@ -257,6 +258,40 @@ impl WatchMode {
     }
 }
 
+fn watch_filter(
+    declaration: &temps_plugin_protocol::watch::PublishedEvent,
+    subject: &str,
+    predicate: Option<&serde_json::Value>,
+) -> Result<(serde_json::Value, String), WatchError> {
+    let filter = predicate
+        .cloned()
+        .or_else(|| declaration.filter_for_subject(subject))
+        .ok_or_else(|| {
+            reject(
+                StatusCode::BAD_REQUEST,
+                "Supply the resource filter declared by this plugin",
+            )
+        })?;
+    let scope = declaration.subject(&filter, true).ok_or_else(|| {
+        reject(
+            StatusCode::BAD_REQUEST,
+            "Unknown, missing or incorrectly typed watch filter",
+        )
+    })?;
+    if predicate.is_some() && !subject.is_empty() {
+        let typed_scope = declaration
+            .filter_for_subject(subject)
+            .and_then(|f| declaration.subject(&f, true));
+        if typed_scope.as_ref() != Some(&scope) {
+            return Err(reject(
+                StatusCode::BAD_REQUEST,
+                "Filter and subject refer to different resources",
+            ));
+        }
+    }
+    Ok((filter, scope))
+}
+
 impl WatchHost {
     async fn request(
         &self,
@@ -278,22 +313,17 @@ impl WatchHost {
         let metadata = temps_core::build_request_metadata(&req, &self.crypto);
         req.extensions_mut().insert(metadata);
         req.extensions_mut().insert(auth.clone());
+        let is_wake = delivery.is_some();
         if let Some(id) = delivery {
             req.extensions_mut()
                 .insert(temps_core::ai_tool_call::PluginWatchDelivery(id));
         }
-        tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            self.router.clone().oneshot(req),
+        dispatch_watch_request(
+            self.router.clone(),
+            req,
+            is_wake.then_some(&self.wake_preparations),
         )
         .await
-        .map_err(|_| {
-            reject(
-                StatusCode::GATEWAY_TIMEOUT,
-                "Watch authorization or dispatch timed out",
-            )
-        })?
-        .map_err(|e| match e {})
     }
     async fn chat_access(&self, auth: &AuthContext, chat: &str) -> Result<(), WatchError> {
         if !key(chat, 128) {
@@ -363,8 +393,64 @@ impl WatchHost {
         }))
     }
 }
+/// Timeout bounds the caller's wait. A wake that already claimed a turn must
+/// finish the normal handler's preparation and register its turn monitor.
+/// Keep at most one such preparation per host, including after timeout.
+async fn dispatch_watch_request(
+    router: Router,
+    request: Request<Body>,
+    wake_preparations: Option<&Arc<tokio::sync::Semaphore>>,
+) -> Result<Response, WatchError> {
+    let response = async {
+        let request = router.oneshot(request);
+        if let Some(slots) = wake_preparations {
+            let slot = slots.clone().try_acquire_owned().map_err(|_| {
+                reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "A previous chat wake is still being prepared",
+                )
+            })?;
+            tokio::spawn(async move {
+                let _slot = slot;
+                request.await
+            })
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "Chat wake preparation task failed");
+                reject(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "Chat wake preparation failed",
+                )
+            })?
+            .map_err(|e| match e {})
+        } else {
+            request.await.map_err(|e| match e {})
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), response)
+        .await
+        .map_err(|_| {
+            reject(
+                StatusCode::GATEWAY_TIMEOUT,
+                "Watch authorization or dispatch timed out",
+            )
+        })?
+}
+
 // Use the post-authorization statement time for both the insert default and resumption.
-const RESUME_WATCH: &str = "UPDATE plugin_chat_watches SET paused=false,active_since=statement_timestamp(),session_id=$3 WHERE id=$1::uuid AND conversation_id=$2";
+const RESUME_WATCH: &str = r#"
+    WITH eligible AS (
+        SELECT w.id, w.paused FROM plugin_chat_watches w
+        JOIN external_plugin_actors a ON a.id=w.actor_id AND a.active AND a.ai_tools_enabled AND a.binary_sha256=w.digest
+        WHERE w.id=$1::uuid AND w.conversation_id=$2 FOR UPDATE OF w FOR SHARE OF a
+    ), resumed AS (
+        UPDATE plugin_chat_watches w SET paused=false,active_since=statement_timestamp(),session_id=$3
+        FROM eligible e WHERE e.id=w.id AND e.paused RETURNING w.id
+    ), cleared AS (
+        UPDATE plugin_watch_deliveries d SET status='skipped' FROM resumed
+        WHERE d.watch_id=resumed.id AND d.status IN ('pending','blocked')
+    )
+    SELECT id FROM eligible"#;
 
 impl ExternalPluginsService {
     pub fn start_watch_delivery(
@@ -376,6 +462,7 @@ impl ExternalPluginsService {
         if self
             .watch_host
             .set(WatchHost {
+                wake_preparations: Arc::new(tokio::sync::Semaphore::new(1)),
                 router,
                 users,
                 crypto,
@@ -488,17 +575,20 @@ SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate
         let host = self.watch_host()?;
         host.chat_access(auth, chat).await?;
         let _lifecycle = self.lifecycle.lock().await;
-        let txn = self.db.begin().await.map_err(store("begin watch change"))?;
-        let row = txn
-            .query_one(Statement::from_sql_and_values(
-                DatabaseBackend::Postgres,
-                "SELECT id FROM ai_conversations WHERE public_id=$1 AND created_by=$2 FOR UPDATE",
-                [chat.into(), auth.user_id().into()],
-            ))
+        // Finish pool-backed discovery and subject authorization before reserving
+        // a connection for the write. The final transaction rechecks ownership.
+        let owner_query = Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM ai_conversations WHERE public_id=$1 AND created_by=$2",
+            [chat.into(), auth.user_id().into()],
+        );
+        let missing = || reject(StatusCode::NOT_FOUND, format!("Chat {chat} does not exist"));
+        let conv: i64 = self
+            .db
+            .query_one(owner_query)
             .await
-            .map_err(store("lock conversation watches"))?
-            .ok_or_else(|| reject(StatusCode::NOT_FOUND, format!("Chat {chat} does not exist")))?;
-        let conv: i64 = row
+            .map_err(store("resolve watch owner"))?
+            .ok_or_else(missing)?
             .try_get("", "id")
             .map_err(store("read conversation ID"))?;
         let sql = match change {
@@ -521,35 +611,23 @@ SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate
                             "Watch source or approved plugin revision changed",
                         )
                     })?;
-                let filter = predicate
-                    .clone()
-                    .or_else(|| entry.declaration.filter_for_subject(subject))
-                    .ok_or_else(|| {
-                        reject(
-                            StatusCode::BAD_REQUEST,
-                            "Supply the resource filter declared by this plugin",
-                        )
-                    })?;
-                let scope = entry.declaration.subject(&filter, true).ok_or_else(|| {
-                    reject(
-                        StatusCode::BAD_REQUEST,
-                        "Unknown, missing or incorrectly typed watch filter",
-                    )
-                })?;
-                if !subject.is_empty() && subject != &scope {
-                    return Err(reject(
-                        StatusCode::BAD_REQUEST,
-                        "Filter and subject refer to different resources",
-                    ));
-                }
+                let (filter, scope) = watch_filter(&entry.declaration, subject, predicate.as_ref())?;
                 let label = host.subject_access(auth, plugin, source, &scope).await?;
-                Statement::from_sql_and_values(DatabaseBackend::Postgres,
-                    "INSERT INTO plugin_chat_watches(conversation_id,actor_id,digest,source,subject,mode,session_id,predicate,label)
-                     SELECT $1,id,$2,$3,$4,$5,$6,$8,$9 FROM external_plugin_actors WHERE plugin_name=$7
-                     AND active AND ai_tools_enabled AND binary_sha256=$2
-                     AND (SELECT count(*) FROM plugin_chat_watches WHERE conversation_id=$1)<32 ON CONFLICT DO NOTHING",
-                    [conv.into(),digest.clone().into(),source.clone().into(),scope.into(),mode.as_str().into(),
-                     (*session).into(),plugin.clone().into(),filter.into(),label.into()])
+                Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"INSERT INTO plugin_chat_watches
+                         (conversation_id, actor_id, digest, source, subject, mode, session_id, predicate, label)
+                       SELECT $1, a.id, $2, $3, $4, $5, $6, $8, $9
+                       FROM external_plugin_actors a
+                       WHERE a.plugin_name=$7 AND a.active AND a.ai_tools_enabled AND a.binary_sha256=$2
+                         AND (SELECT count(*) FROM plugin_chat_watches WHERE conversation_id=$1)<32
+                       FOR SHARE OF a ON CONFLICT DO NOTHING"#,
+                    [
+                        conv.into(), digest.clone().into(), source.clone().into(), scope.into(),
+                        mode.as_str().into(), (*session).into(), plugin.clone().into(),
+                        filter.into(), label.into(),
+                    ],
+                )
             }
             WatchChange::Remove { id } => Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
@@ -562,7 +640,15 @@ SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate
                 [id.to_string().into(), conv.into()],
             ),
             WatchChange::Resume { id } => {
-                let row=txn.query_one(Statement::from_sql_and_values(DatabaseBackend::Postgres,"SELECT a.plugin_name,w.source,w.subject FROM plugin_chat_watches w JOIN external_plugin_actors a ON a.id=w.actor_id WHERE w.id=$1::uuid AND w.conversation_id=$2 AND a.active AND a.ai_tools_enabled AND w.digest=a.binary_sha256",[id.to_string().into(),conv.into()])).await.map_err(store("resolve watch for resume"))?.ok_or_else(||reject(StatusCode::CONFLICT,"Watch or approved plugin revision changed"))?;
+                let row = self.db.query_one(Statement::from_sql_and_values(
+                    DatabaseBackend::Postgres,
+                    r#"SELECT a.plugin_name, w.source, w.subject FROM plugin_chat_watches w
+                       JOIN external_plugin_actors a ON a.id=w.actor_id AND a.active
+                         AND a.ai_tools_enabled AND w.digest=a.binary_sha256
+                       WHERE w.id=$1::uuid AND w.conversation_id=$2"#,
+                    [id.to_string().into(), conv.into()],
+                )).await.map_err(store("resolve watch for resume"))?
+                  .ok_or_else(|| reject(StatusCode::CONFLICT, "Watch or approved plugin revision changed"))?;
                 let field = |name| {
                     row.try_get::<String>("", name)
                         .map_err(store("load watch subject"))
@@ -581,17 +667,34 @@ SELECT w.id::text,a.plugin_name AS plugin,w.source,w.subject,w.label,w.predicate
                 )
             }
         };
-        let result = txn
-            .execute(sql)
-            .await
-            .map_err(store("apply watch change"))?;
-        if result.rows_affected() == 0 {
+        let txn = self.db.begin().await.map_err(store("begin watch change"))?;
+        txn.query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM ai_conversations WHERE id=$1 AND created_by=$2 AND public_id=$3 FOR UPDATE",
+            [conv.into(), auth.user_id().into(), chat.into()],
+        ))
+        .await
+        .map_err(store("lock conversation watches"))?
+        .ok_or_else(missing)?;
+        let applied = if matches!(change, WatchChange::Resume { .. }) {
+            txn.query_one(sql)
+                .await
+                .map_err(store("resume watch"))?
+                .is_some()
+        } else {
+            txn.execute(sql)
+                .await
+                .map_err(store("apply watch change"))?
+                .rows_affected()
+                != 0
+        };
+        if !applied {
             return Err(reject(
                 StatusCode::CONFLICT,
                 "Watch already exists, is missing, or the 32-watch limit was reached",
             ));
         }
-        if let WatchChange::Pause { id } | WatchChange::Resume { id } = change {
+        if let WatchChange::Pause { id } = change {
             txn.execute(Statement::from_sql_and_values(DatabaseBackend::Postgres,"UPDATE plugin_watch_deliveries SET status='skipped' WHERE watch_id=$1::uuid AND status IN ('pending','blocked')",[id.to_string().into()])).await.map_err(store("clear pending deliveries"))?;
         }
         txn.commit()
@@ -731,6 +834,9 @@ UPDATE plugin_watch_deliveries SET status='skipped' FROM suspended
         host.subject_access(&auth, &d.plugin, &d.source, &d.subject)
             .await?;
         if d.mode == "wake" {
+            if !wake_is_pending(&self.db, &d.id).await? {
+                return Ok(());
+            }
             // The plugin sends identifiers only. Authorization and per-write
             // confirmation are the same as for a normal turn in this chat.
             let body = serde_json::to_vec(&serde_json::json!({
@@ -761,6 +867,27 @@ UPDATE plugin_watch_deliveries SET status='skipped' FROM suspended
         }
         Ok(())
     }
+}
+
+/// A lease can precede a pause. Retire paused work and check the current
+/// delivery immediately before posting to the conversation. Its message trigger
+/// verifies the state again in the insert transaction across different hosts.
+async fn wake_is_pending(db: &DatabaseConnection, id: &str) -> Result<bool, WatchError> {
+    Ok(db
+        .query_one(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            r#"
+        WITH skipped AS (
+            UPDATE plugin_watch_deliveries d SET status='skipped' FROM plugin_chat_watches w
+            WHERE d.id=$1::uuid AND d.status='pending' AND d.watch_id=w.id AND w.paused
+        )
+        SELECT 1 FROM plugin_watch_deliveries d JOIN plugin_chat_watches w ON w.id=d.watch_id
+        WHERE d.id=$1::uuid AND d.status='pending' AND w.mode='wake' AND NOT w.paused"#,
+            [id.into()],
+        ))
+        .await
+        .map_err(store("recheck leased wake"))?
+        .is_some())
 }
 
 async fn append_watch_notification(
