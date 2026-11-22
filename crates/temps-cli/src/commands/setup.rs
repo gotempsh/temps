@@ -837,8 +837,11 @@ async fn detect_public_ip() -> anyhow::Result<String> {
 }
 
 fn is_public_setup_origin(address: std::net::IpAddr) -> bool {
-    temps_core::url_validation::validate_outbound_ip(address).is_ok()
-        && temps_core::known_proxies::known_proxy(address).is_none()
+    let public = match address {
+        std::net::IpAddr::V4(ip) => validate_ipv4(&ip),
+        std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+    };
+    public.is_ok() && temps_core::known_proxies::known_proxy(address).is_none()
 }
 
 /// Detect the primary private/LAN IP address as a fallback when public IP detection fails.
