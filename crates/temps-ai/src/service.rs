@@ -471,6 +471,18 @@ pub trait AiService: Send + Sync {
         })
     }
 
+    /// Principals who started a turn with `provider`'s harness within
+    /// `within`, most recent first. Automatic CLI updates use it so they only
+    /// reach workspaces that are in use; empty for a provider without a
+    /// persistent workspace.
+    async fn recent_workspace_principals(
+        &self,
+        _provider: &str,
+        _within: std::time::Duration,
+    ) -> Vec<i32> {
+        Vec::new()
+    }
+
     /// Invalidate account-scoped capability state after credentials change.
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {}
 

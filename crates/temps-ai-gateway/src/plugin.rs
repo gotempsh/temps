@@ -17,8 +17,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
     services::{
-        GatewayService, ProviderKeyService, ProviderModelService, ProviderPreferenceService,
-        StructuredOutputService, UsageService,
+        CodingAgentService, GatewayService, ModelCatalogService, ProviderKeyService,
+        ProviderModelService, ProviderPreferenceService, StructuredOutputService, UsageService,
     },
 };
 
@@ -403,6 +403,44 @@ mod opencode_auth_tests {
     }
 }
 
+/// Upgrade-safe catalog bootstrap: keys created before the model inventory
+/// migration would otherwise advertise zero models until an administrator
+/// manually pressed Refresh. Static adapter models are inserted synchronously
+/// and live discovery replaces their availability metadata in the background
+/// without delaying boot.
+async fn bootstrap_provider_models(
+    provider_key_service: &Arc<ProviderKeyService>,
+    provider_model_service: &Arc<ProviderModelService>,
+) {
+    match provider_key_service.list_active().await {
+        Ok(keys) => {
+            for key in keys {
+                if let Err(error) = provider_model_service.seed_bootstrap(&key).await {
+                    tracing::warn!(
+                        provider_key_id = key.id,
+                        %error,
+                        "Could not seed the upgraded AI model catalog"
+                    );
+                }
+                let models = provider_model_service.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = models.refresh(key.id).await {
+                        tracing::warn!(
+                            provider_key_id = key.id,
+                            %error,
+                            "Background AI model catalog refresh failed; bootstrap models remain available"
+                        );
+                    }
+                });
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "Could not enumerate provider keys for model catalog bootstrap"
+        ),
+    }
+}
+
 impl TempsPlugin for AiGatewayPlugin {
     fn name(&self) -> &'static str {
         "ai_gateway"
@@ -437,38 +475,19 @@ impl TempsPlugin for AiGatewayPlugin {
             ));
             context.register_service(provider_model_service.clone());
 
-            // Upgrade-safe catalog bootstrap: keys created before the model
-            // inventory migration would otherwise advertise zero models until
-            // an administrator manually pressed Refresh. Static adapter models
-            // are inserted synchronously and live discovery replaces their
-            // availability metadata in the background without delaying boot.
-            match provider_key_service.list_active().await {
-                Ok(keys) => {
-                    for key in keys {
-                        if let Err(error) = provider_model_service.seed_bootstrap(&key).await {
-                            tracing::warn!(
-                                provider_key_id = key.id,
-                                %error,
-                                "Could not seed the upgraded AI model catalog"
-                            );
-                        }
-                        let models = provider_model_service.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = models.refresh(key.id).await {
-                                tracing::warn!(
-                                    provider_key_id = key.id,
-                                    %error,
-                                    "Background AI model catalog refresh failed; bootstrap models remain available"
-                                );
-                            }
-                        });
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "Could not enumerate provider keys for model catalog bootstrap"
-                ),
-            }
+            // ADR 112: the runtime model catalog. Its background task first
+            // applies the stored catalog (so a restart without network keeps
+            // it), then refreshes it and rediscovers provider keys' models on
+            // the configured interval.
+            let model_catalog_service = Arc::new(ModelCatalogService::new(
+                db.clone(),
+                provider_key_service.clone(),
+                provider_model_service.clone(),
+            ));
+            context.register_service(model_catalog_service.clone());
+            model_catalog_service.clone().spawn_background();
+
+            bootstrap_provider_models(&provider_key_service, &provider_model_service).await;
 
             // ADR-022: register the general AI foundation so any feature can get
             // text or typed/structured output from the configured model through
@@ -677,6 +696,13 @@ impl TempsPlugin for AiGatewayPlugin {
             context.register_service(structured_output_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let coding_agent_service = Arc::new(CodingAgentService::new(
+                db.clone(),
+                ai_service.clone(),
+                audit_service.clone(),
+            ));
+            context.register_service(coding_agent_service.clone());
+            coding_agent_service.clone().spawn_background();
             let project_access_checker =
                 context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
@@ -692,6 +718,8 @@ impl TempsPlugin for AiGatewayPlugin {
                 provider_key_service,
                 provider_model_service,
                 provider_preference_service,
+                model_catalog_service,
+                coding_agent_service,
                 usage_service,
                 audit_service,
                 telemetry,
@@ -716,6 +744,8 @@ impl TempsPlugin for AiGatewayPlugin {
         let routes = handlers::configure_admin_routes()
             .merge(handlers::configure_usage_routes())
             .merge(handlers::configure_limits_routes())
+            .merge(handlers::configure_model_catalog_routes())
+            .merge(handlers::configure_coding_agent_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_native_routes())
@@ -738,6 +768,12 @@ impl TempsPlugin for AiGatewayPlugin {
         schema.merge(limits_schema);
         let pricing_schema = <handlers::pricing::AiGatewayPricingApiDoc as OpenApiTrait>::openapi();
         schema.merge(pricing_schema);
+        let catalog_schema =
+            <handlers::model_catalog::AiGatewayModelCatalogApiDoc as OpenApiTrait>::openapi();
+        schema.merge(catalog_schema);
+        let coding_agents_schema =
+            <handlers::coding_agents::AiCodingAgentsApiDoc as OpenApiTrait>::openapi();
+        schema.merge(coding_agents_schema);
         let provider_status_schema =
             <handlers::provider_status::AiProviderStatusApiDoc as OpenApiTrait>::openapi();
         schema.merge(provider_status_schema);

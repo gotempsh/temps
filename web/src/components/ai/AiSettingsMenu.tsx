@@ -9,7 +9,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { BarChart3, Box, KeyRound, Settings } from 'lucide-react'
+import { BarChart3, Box, Boxes, KeyRound, Settings } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
 import { Link } from 'react-router'
 
@@ -27,6 +27,12 @@ const AI_SETTINGS_LINKS: readonly SettingsLink[] = [
     label: 'AI providers & API keys',
     detail: 'Add or replace keys, choose models',
     Icon: KeyRound,
+  },
+  {
+    to: '/ai-gateway/models',
+    label: 'New models & coding agents',
+    detail: 'Refresh model prices, update Claude Code, Codex, OpenCode',
+    Icon: Boxes,
   },
   {
     to: '/sandboxes/settings',

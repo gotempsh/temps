@@ -342,7 +342,7 @@ pub struct CreateProviderKeyRequest {
     pub api_key: SecretString,
     /// Required for "openai_compatible", e.g. "http://10.0.0.5:8000/v1".
     pub base_url: Option<String>,
-    /// Model id to pin for this provider (e.g. "gpt-4o-mini"). Required for
+    /// Model id to pin for this provider (e.g. "gpt-6.2-sol"). Required for
     /// "openai_compatible": it must be one of the models the server lists
     /// (see `POST /ai/providers/discover`), and is used to verify the key.
     pub default_model: Option<String>,

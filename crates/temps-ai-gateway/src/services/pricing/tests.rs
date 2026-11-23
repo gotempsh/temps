@@ -639,6 +639,7 @@ fn test_cache_fields_omitted_when_none() {
         batch_input_per_million: None,
         batch_output_per_million: None,
         deprecated: false,
+        source: PriceSource::Bundled,
     };
     let json = serde_json::to_string(&model).unwrap();
     assert!(!json.contains("cache_write_5m"));
@@ -846,6 +847,115 @@ fn the_openrouter_low_cost_default_is_priced_at_its_own_rate() {
     assert_eq!(
         estimate_cost_microcents(default, 300_000, 0, PromptTokensDetails::default()),
         60_000
+    );
+}
+
+// ============================================================================
+// Runtime catalog (ADR 112)
+// ============================================================================
+
+fn catalog_price(model: &str, input: f64, output: f64) -> CatalogPrice {
+    CatalogPrice {
+        provider: "openai".into(),
+        model: model.into(),
+        display_name: model.into(),
+        input_per_million: input,
+        output_per_million: output,
+        cache_read_per_million: None,
+        cache_write_per_million: None,
+        deprecated: false,
+    }
+}
+
+#[test]
+fn a_catalog_price_overrides_a_listed_model_and_prices_new_ones() {
+    let pricing = rate_table().with_catalog(&[
+        catalog_price("gpt-6.2-sol", 1.0, 4.0),
+        catalog_price("example-next-model", 3.0, 9.0),
+    ]);
+    assert_eq!(pricing.applied.len(), 2);
+    let sol = pricing.table.rates_for("gpt-6.2-sol").unwrap().base;
+    assert_eq!((sol.input, sol.output), (1.0, 4.0));
+    // A dated snapshot of a catalog-only id is priced by prefix.
+    let next = pricing
+        .table
+        .rates_for("example-next-model-2026-12-01")
+        .unwrap()
+        .base;
+    assert_eq!((next.input, next.output), (3.0, 9.0));
+    // The worst case never moves with catalog prices.
+    assert_eq!(pricing.table.worst_case, rate_table().worst_case);
+}
+
+#[test]
+fn a_catalog_never_makes_a_paid_model_free_or_accepts_absurd_prices() {
+    let pricing = rate_table().with_catalog(&[
+        catalog_price("gpt-6.2-sol", 0.0, 0.0),
+        catalog_price("example-nan", f64::NAN, 1.0),
+        catalog_price("example-negative", -1.0, 1.0),
+        catalog_price("example-huge", MAX_CATALOG_PRICE_PER_MILLION * 2.0, 1.0),
+        // A model no bundled row bills may be free.
+        catalog_price("example-free", 0.0, 0.0),
+    ]);
+    assert_eq!(
+        pricing.applied.keys().collect::<Vec<_>>(),
+        vec!["example-free"]
+    );
+    assert_eq!(
+        pricing.table.rates_for("gpt-6.2-sol"),
+        rate_table().rates_for("gpt-6.2-sol")
+    );
+}
+
+#[test]
+fn a_catalog_price_keeps_the_bundled_long_context_tier_and_dearest_write_tier() {
+    // GPT-6.2 Sol bills prompts above 272k tokens at a higher rate and
+    // lists a 12-hour cache write at 2.5x input.
+    let mut price = catalog_price("gpt-6.2-sol", 2.0, 10.0);
+    price.cache_write_per_million = Some(2.5);
+    let pricing = rate_table().with_catalog(&[price]);
+    let rates = pricing.table.rates_for("gpt-6.2-sol").unwrap();
+    let bundled = rate_table().rates_for("gpt-6.2-sol").unwrap();
+    assert_eq!(rates.long_context, bundled.long_context);
+    assert!(rates.base.cache_write >= bundled.base.cache_write);
+
+    // A catalog base above the bundled long tier raises the long tier with it.
+    let pricing = rate_table().with_catalog(&[catalog_price("gpt-6.2-sol", 50.0, 100.0)]);
+    let (_, long) = pricing
+        .table
+        .rates_for("gpt-6.2-sol")
+        .unwrap()
+        .long_context
+        .unwrap();
+    assert!(long.input >= 50.0 && long.output >= 100.0);
+}
+
+#[test]
+fn installed_catalog_prices_drive_estimates_and_the_price_list() {
+    let _serial = CATALOG_TEST_LOCK.blocking_lock();
+    let model = "example-runtime-catalog-only-model";
+    assert!(!is_priced(model));
+    let unpriced = estimate_cost_microcents(model, 1_000_000, 0, PromptTokensDetails::default());
+
+    assert_eq!(install_catalog_prices(&[catalog_price(model, 1.5, 6.0)]), 1);
+    assert!(is_priced(model));
+    assert_eq!(
+        estimate_cost_microcents(model, 1_000_000, 0, PromptTokensDetails::default()),
+        1_500_000
+    );
+    let row = effective_pricing()
+        .into_iter()
+        .find(|row| row.model == model)
+        .expect("a catalog-only model is listed");
+    assert_eq!(row.source, PriceSource::Catalog);
+    assert!(build_pricing().iter().all(|row| row.model != model));
+
+    // An empty catalog restores the bundled table.
+    assert_eq!(install_catalog_prices(&[]), 0);
+    assert!(!is_priced(model));
+    assert_eq!(
+        estimate_cost_microcents(model, 1_000_000, 0, PromptTokensDetails::default()),
+        unpriced
     );
 }
 

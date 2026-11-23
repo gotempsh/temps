@@ -14,19 +14,40 @@
 //! When a provider announces a dated price change (a promotion that ends, or
 //! a scheduled increase), the row carries the price that applies after the
 //! change, so a release that outlives the date never undercounts spend.
+//!
+//! A running instance can layer a runtime model catalog over this table
+//! (ADR 112, [`install_catalog_prices`]): its prices replace a listed model's
+//! base rates and price models this release does not know. The bundled table
+//! stays the fallback, keeps every long-context tier, and alone decides the
+//! worst-case rate charged for models no price covers.
 
-use serde::Serialize;
+use std::collections::HashMap;
+use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::types::PromptTokensDetails;
 
+/// Where a model's price comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    /// The price table bundled with this Temps release.
+    #[default]
+    Bundled,
+    /// The runtime model catalog (Settings: AI Gateway > Models).
+    Catalog,
+}
+
 /// Pricing for a single model, all values in USD per 1M tokens.
 /// Fields are optional because not every provider supports every pricing tier.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPricing {
-    /// Model identifier (e.g. "gpt-5.4", "claude-sonnet-4-6")
+    /// Model identifier (e.g. "gpt-6.2-sol", "claude-sonnet-5-5")
     pub model: String,
-    /// Human-readable model name (e.g. "Claude Sonnet 4.6")
+    /// Human-readable model name (e.g. "Claude Sonnet 5.5")
     pub display_name: String,
     /// Provider ID (e.g. "openai", "anthropic")
     pub provider: String,
@@ -52,6 +73,8 @@ pub struct ModelPricing {
     /// Whether the model is deprecated
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
+    /// Whether the price is the bundled one or comes from the runtime catalog.
+    pub source: PriceSource,
 }
 
 // ============================================================================
@@ -248,6 +271,7 @@ impl PricingBuilder {
                 batch_input_per_million: self.batch_input,
                 batch_output_per_million: self.batch_output,
                 deprecated: self.deprecated,
+                source: PriceSource::Bundled,
             },
             provenance: self.provenance,
             long_context: self.long_context,
@@ -1270,6 +1294,7 @@ impl Rates {
 /// USD per 1M tokens and usage costs are stored in microcents (1e-6 USD, as
 /// `estimated_cost_microcents` documents), a rate is directly the cost of one
 /// token in that unit: `$2.50 / 1M tokens` is `2.5` microcents per token.
+#[derive(Clone)]
 struct RateTable {
     by_model: std::collections::HashMap<String, Rates>,
     /// Rates charged for models that are not priced, so an unlisted model can
@@ -1354,9 +1379,203 @@ fn cost_at(
     cost.ceil().clamp(0.0, i64::MAX as f64) as i64
 }
 
+/// The bundled table, before any runtime catalog price is applied.
 fn rate_table() -> &'static RateTable {
-    static TABLE: std::sync::OnceLock<RateTable> = std::sync::OnceLock::new();
+    static TABLE: OnceLock<RateTable> = OnceLock::new();
     TABLE.get_or_init(|| RateTable::from_entries(catalog()))
+}
+
+// ============================================================================
+// Runtime catalog (ADR 112)
+// ============================================================================
+
+/// Upper bound for a catalog price, USD per 1M tokens. The dearest listed
+/// model bills well under this; a larger figure is a unit or parsing error,
+/// not a price, and would turn every estimate into a spend-cap breach.
+pub const MAX_CATALOG_PRICE_PER_MILLION: f64 = 10_000.0;
+
+/// A validated price from the runtime model catalog, USD per 1M tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogPrice {
+    /// Temps provider id.
+    pub provider: String,
+    pub model: String,
+    pub display_name: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: Option<f64>,
+    /// The catalog's one cache-write price (the shortest-lived tier).
+    pub cache_write_per_million: Option<f64>,
+    pub deprecated: bool,
+}
+
+/// Whether `price` is a usable per-million price.
+pub fn is_valid_catalog_price(price: f64) -> bool {
+    price.is_finite() && (0.0..=MAX_CATALOG_PRICE_PER_MILLION).contains(&price)
+}
+
+/// The rates estimates use: the bundled table with the runtime catalog's
+/// prices applied, and the catalog prices that were applied.
+struct EffectivePricing {
+    table: RateTable,
+    applied: HashMap<String, CatalogPrice>,
+}
+
+fn effective() -> &'static ArcSwap<EffectivePricing> {
+    static EFFECTIVE: OnceLock<ArcSwap<EffectivePricing>> = OnceLock::new();
+    EFFECTIVE.get_or_init(|| {
+        ArcSwap::from_pointee(EffectivePricing {
+            table: rate_table().clone(),
+            applied: HashMap::new(),
+        })
+    })
+}
+
+/// Rates for a catalog price, or `None` when it must not replace the
+/// bundled row.
+///
+/// * A catalog never makes a model free that the bundled table bills: a zero
+///   price for a paid model is a catalog error, and would lift every spend cap
+///   for it.
+/// * A catalog publishes one cache-write price (the shortest-lived tier). The
+///   bundled row's dearest write tier, scaled to the catalog's input price,
+///   still applies, so a 1-hour write is not billed at the 5-minute rate. A
+///   catalog without a cache-read price keeps the bundled cache discount,
+///   scaled the same way.
+/// * The bundled long-context tier is kept, raised to at least the new base
+///   rates: a catalog publishes no tiers, and a long prompt must never bill
+///   below a short one.
+fn catalog_rates(price: &CatalogPrice, bundled: Option<Rates>) -> Option<Rates> {
+    let input = price.input_per_million;
+    let output = price.output_per_million;
+    if !is_valid_catalog_price(input) || !is_valid_catalog_price(output) {
+        return None;
+    }
+    let usable = |rate: Option<f64>| rate.filter(|rate| is_valid_catalog_price(*rate));
+    if let Some(bundled) = bundled {
+        let bundled_paid = bundled.base.input > 0.0 || bundled.base.output > 0.0;
+        if bundled_paid && input <= 0.0 && output <= 0.0 {
+            return None;
+        }
+    }
+    // A bundled rate scaled to the catalog's input price, keeping the
+    // bundled row's ratio to its input rate.
+    let scaled = |rate: fn(&TierRates) -> f64| {
+        bundled
+            .filter(|bundled| bundled.base.input > 0.0)
+            .map(|bundled| input * (rate(&bundled.base) / bundled.base.input))
+    };
+    let base = TierRates {
+        input,
+        output,
+        cache_read: usable(price.cache_read_per_million)
+            .or_else(|| scaled(|tier| tier.cache_read))
+            .unwrap_or(input),
+        cache_write: usable(price.cache_write_per_million)
+            .unwrap_or(input)
+            .max(scaled(|tier| tier.cache_write).unwrap_or(0.0))
+            .max(input),
+    };
+    let long_context = bundled
+        .and_then(|bundled| bundled.long_context)
+        .map(|(above, tier)| (above, tier.max(base)));
+    Some(Rates { base, long_context })
+}
+
+impl RateTable {
+    /// This table with `prices` applied by exact model id. The worst case is
+    /// kept: catalog prices are not reviewed like this table, so they never
+    /// raise or lower what an unpriced model is charged.
+    fn with_catalog(&self, prices: &[CatalogPrice]) -> EffectivePricing {
+        let mut by_model = self.by_model.clone();
+        let mut applied = HashMap::new();
+        for price in prices {
+            let bundled = self.by_model.get(&price.model).copied();
+            if let Some(rates) = catalog_rates(price, bundled) {
+                by_model.insert(price.model.clone(), rates);
+                applied.insert(price.model.clone(), price.clone());
+            }
+        }
+        EffectivePricing {
+            table: RateTable {
+                by_model,
+                worst_case: self.worst_case,
+            },
+            applied,
+        }
+    }
+}
+
+/// Serialises tests that install catalog prices: the effective table is
+/// process-wide, so two such tests must not run at once.
+#[cfg(test)]
+pub(crate) static CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Replace the runtime catalog prices estimates use. Returns how many were
+/// applied; the rest were invalid or would have made a paid model free. An
+/// empty slice restores the bundled table.
+pub fn install_catalog_prices(prices: &[CatalogPrice]) -> usize {
+    let pricing = rate_table().with_catalog(prices);
+    let applied = pricing.applied.len();
+    effective().store(Arc::new(pricing));
+    applied
+}
+
+/// How many runtime catalog prices are applied.
+pub fn catalog_price_count() -> usize {
+    effective().load().applied.len()
+}
+
+/// Whether a price covers `model`: the runtime catalog or the bundled table
+/// lists it, by exact id or as a dated or tagged variant of a listed id.
+/// Every other model is estimated at the worst-case rate, and its usage is
+/// recorded as having no known price.
+pub fn is_priced(model: &str) -> bool {
+    effective().load().table.rates_for(model).is_some()
+}
+
+/// The effective price list: the bundled rows with runtime catalog prices
+/// applied, followed by the models only the catalog lists.
+pub fn effective_pricing() -> Vec<ModelPricing> {
+    let current = effective().load();
+    let mut rows = build_pricing();
+    let mut seen = std::collections::HashSet::new();
+    for row in &mut rows {
+        if let Some(price) = current.applied.get(&row.model) {
+            row.input_per_million = price.input_per_million;
+            row.output_per_million = price.output_per_million;
+            row.cache_hit_per_million = price.cache_read_per_million;
+            if price.cache_write_per_million.is_some() {
+                row.cache_write_5m_per_million = price.cache_write_per_million;
+            }
+            row.batch_input_per_million = None;
+            row.batch_output_per_million = None;
+            row.deprecated = row.deprecated || price.deprecated;
+            row.source = PriceSource::Catalog;
+        }
+        seen.insert(row.model.clone());
+    }
+    let mut extra: Vec<&CatalogPrice> = current
+        .applied
+        .values()
+        .filter(|price| !seen.contains(&price.model))
+        .collect();
+    extra.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
+    rows.extend(extra.into_iter().map(|price| ModelPricing {
+        model: price.model.clone(),
+        display_name: price.display_name.clone(),
+        provider: price.provider.clone(),
+        input_per_million: price.input_per_million,
+        output_per_million: price.output_per_million,
+        cache_write_5m_per_million: price.cache_write_per_million,
+        cache_write_1h_per_million: None,
+        cache_hit_per_million: price.cache_read_per_million,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        deprecated: price.deprecated,
+        source: PriceSource::Catalog,
+    }));
+    rows
 }
 
 /// Estimate the provider cost of a request in microcents (1e-6 USD).
@@ -1377,7 +1596,8 @@ pub fn estimate_cost_microcents(
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> i64 {
-    let table = rate_table();
+    let current = effective().load();
+    let table = &current.table;
     let rates = table.rates_for(model).unwrap_or(table.worst_case);
     cost_at(
         rates.for_request(input_tokens.max(0)),
@@ -1402,7 +1622,8 @@ pub fn estimate_batch_total_cost_microcents(
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> i64 {
-    let table = rate_table();
+    let current = effective().load();
+    let table = &current.table;
     let rates = table.rates_for(model).unwrap_or(table.worst_case);
     cost_at(rates.base, input_tokens, output_tokens, cache)
 }
@@ -1421,7 +1642,7 @@ pub fn long_context_cost_microcents(
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> Option<i64> {
-    let (above, tier) = rate_table().rates_for(model)?.long_context?;
+    let (above, tier) = effective().load().table.rates_for(model)?.long_context?;
     (input_tokens > above).then(|| cost_at(tier, input_tokens, output_tokens, cache))
 }
 

@@ -222,6 +222,40 @@ struct HarnessUpdateState {
 
 type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
 
+/// When each principal last started a sandboxed turn, for automatic CLI
+/// updates. Bounded: entries older than [`RECENT_TURN_RETENTION`] are dropped
+/// once the map reaches [`RECENT_TURN_CAPACITY`], and a full map of fresh
+/// entries stops recording new principals until some expire.
+type RecentTurns = Arc<std::sync::Mutex<HashMap<i32, Instant>>>;
+const RECENT_TURN_CAPACITY: usize = 4096;
+const RECENT_TURN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+fn record_recent_turn(turns: &RecentTurns, principal_id: i32, now: Instant) {
+    let mut turns = turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if turns.len() >= RECENT_TURN_CAPACITY && !turns.contains_key(&principal_id) {
+        turns.retain(|_, at| now.saturating_duration_since(*at) < RECENT_TURN_RETENTION);
+        if turns.len() >= RECENT_TURN_CAPACITY {
+            return;
+        }
+    }
+    turns.insert(principal_id, now);
+}
+
+fn recent_principals(turns: &RecentTurns, within: Duration, now: Instant) -> Vec<i32> {
+    let turns = turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut recent: Vec<(i32, Instant)> = turns
+        .iter()
+        .filter(|(_, at)| now.saturating_duration_since(**at) <= within)
+        .map(|(principal, at)| (*principal, *at))
+        .collect();
+    recent.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    recent.into_iter().map(|(principal, _)| principal).collect()
+}
+
 /// Marks a workspace's harness as "updating" and clears the mark when dropped.
 ///
 /// The update runs in a detached task that owns this guard, so a client that
@@ -1023,6 +1057,8 @@ pub struct AgentCliAiService {
     /// Last known harness version status per principal's workspace, and
     /// whether an update is running (see `harness_update`).
     harness_updates: HarnessUpdates,
+    /// When each principal last started a sandboxed turn (automatic updates).
+    recent_turns: RecentTurns,
     /// Credential replacement takes the write side; discoveries hold the read
     /// side. This keeps invalidation a hard freshness boundary while allowing
     /// different principals to refresh concurrently.
@@ -1427,6 +1463,7 @@ impl AgentCliAiService {
             workspace_models: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_model_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             harness_updates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            recent_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_model_refresh_barrier: Arc::new(tokio::sync::RwLock::new(())),
             host_model_refresh: Arc::new(tokio::sync::Mutex::new(HostModelRefreshState::default())),
         }
@@ -2025,7 +2062,7 @@ impl AgentCliAiService {
             hu::VERSION_COMMAND_TIMEOUT,
             sandbox_provider.exec(
                 &handle,
-                hu::install_writable_probe_command(),
+                hu::install_writable_probe_command(package),
                 HashMap::new(),
                 None,
             ),
@@ -2613,6 +2650,7 @@ impl AgentCliAiService {
             purpose: purpose.clone(),
             reason: "sandboxed harness turn is missing its authenticated principal".into(),
         })?;
+        record_recent_turn(&self.recent_turns, principal_id, Instant::now());
         if !request.tools.is_empty() && request.harness_mcp_server.is_none() {
             return Err(AiError::Provider {
                 purpose,
@@ -5384,6 +5422,13 @@ impl AiService for AgentCliAiService {
             })
     }
 
+    async fn recent_workspace_principals(&self, provider: &str, within: Duration) -> Vec<i32> {
+        if provider != self.provider.name() {
+            return Vec::new();
+        }
+        recent_principals(&self.recent_turns, within, Instant::now())
+    }
+
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {
         // Credential replacement is a hard freshness boundary. Wait for an
         // old-credential discovery already in flight, then clear anything it
@@ -7146,6 +7191,42 @@ mod tests {
         assert!(service.cached_sandbox_handle("app-one").is_none());
     }
 
+    #[test]
+    fn recent_turns_are_bounded_and_listed_most_recent_first() {
+        let turns: RecentTurns = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let start = Instant::now();
+        record_recent_turn(&turns, 1, start);
+        record_recent_turn(&turns, 2, start + Duration::from_secs(60));
+        record_recent_turn(&turns, 3, start + Duration::from_secs(120));
+        let now = start + Duration::from_secs(180);
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(3600), now),
+            vec![3, 2, 1]
+        );
+        // Only turns within the window count (2 started 120s ago, 1 180s ago).
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(130), now),
+            vec![3, 2]
+        );
+        // A new turn moves a principal to the front.
+        record_recent_turn(&turns, 1, now);
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(10), now),
+            vec![1]
+        );
+
+        // A full map drops stale entries to make room, and records nothing
+        // more while every entry is fresh.
+        let full: RecentTurns = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        for principal in 0..RECENT_TURN_CAPACITY as i32 {
+            record_recent_turn(&full, principal, start);
+        }
+        record_recent_turn(&full, -1, start);
+        assert!(!full.lock().unwrap().contains_key(&-1));
+        record_recent_turn(&full, -1, start + RECENT_TURN_RETENTION);
+        assert_eq!(full.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn sandbox_slot_serializes_conversations_in_one_application() {
         let provider: Arc<dyn AiCliProvider> = Arc::new(MockProvider {
@@ -7794,7 +7875,10 @@ mod tests {
         }
 
         fn is_update(command: &[String]) -> bool {
-            command.windows(2).any(|pair| pair == ["npm", "install"])
+            // The update is one `sh -c` script that picks the installer.
+            command
+                .iter()
+                .any(|argument| argument.contains("exec npm install -g"))
         }
     }
 

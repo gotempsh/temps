@@ -713,7 +713,7 @@ pub struct TraceQuery {
     /// Filter by deployment ID (direct column on otel_spans).
     pub deployment_id: Option<i32>,
     /// Filter by span attributes (exact match on JSONB keys).
-    /// e.g. {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4"}
+    /// e.g. {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.2-sol"}
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
