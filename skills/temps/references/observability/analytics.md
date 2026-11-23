@@ -104,7 +104,7 @@ mobile with identical windows and segment filters:
 After runtime help confirms support, append either
 `analytics performance -p my-app --period 7d --device desktop` or
 `analytics performance -p my-app --period 7d --device mobile` to the verified,
-latest stable invocation from [../cli-runtime.md](../cli-runtime.md).
+documented invocation from [../cli-runtime.md](../cli-runtime.md).
 
 Add `--group-by path` to locate slow pages, or group by `country`, `region`,
 `city`, `device_type`, `browser`, or `operating_system`. Narrow the same query

@@ -1,11 +1,11 @@
 ---
 name: temps-cli
-description: Operate Temps through the latest stable `@temps-sdk/cli` package with bunx or npx. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a CLI command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, browser Performance Insights/Core Web Vitals, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
+description: Operate Temps through the published `@temps-sdk/cli` package with bunx or npx. Use when the user mentions Temps CLI, `@temps-sdk/cli`, a CLI command, or asks to deploy, configure, inspect, automate, or administer Temps from a terminal. Covers contexts, projects, deployments, environments, services, domains, monitoring, backups, telemetry, browser Performance Insights/Core Web Vitals, Cloud, platform administration, and read-only managed-data browsing. Apply the target-context, secret-handling, confirmation, and verification rules for every agentic CLI operation.
 ---
 
 # Temps CLI
 
-Use the latest stable zero-install package invocation to operate a Temps server. Prefer
+Use the zero-install package invocation below to operate a Temps server. Prefer
 `bunx @temps-sdk/cli@latest`; use `npx @temps-sdk/cli@latest` when Bun is not
 available. Treat this skill as procedural guidance and command documentation,
 not as authorization to mutate a server.
@@ -16,7 +16,7 @@ not as authorization to mutate a server.
    runner. Prefer `bunx` when both exist.
 2. Check the current stable runtime as shown below, then run
    `bunx @temps-sdk/cli@latest --version` (or its `npx` equivalent).
-   Keep the explicit `@latest` channel.
+   Keep the explicit channel tag.
 3. Identify the requested operation and locate its command in
    [references/COMMANDS.md](references/COMMANDS.md). Search only the relevant
    command group instead of loading the entire reference.
@@ -82,7 +82,9 @@ When Bun is unavailable, use npm:
 npx @temps-sdk/cli@latest --version
 ```
 
-Use `@latest` to select the stable release; use beta only when explicitly requested.
+The channel tag in these commands is the npm dist-tag that publishes the CLI version
+this skill documents (`latest` for a release, `beta` for a prerelease); use a
+different version only when explicitly requested.
 Do not assume a globally installed CLI or execute downloaded shell scripts.
 
 For Performance Insights, confirm `analytics performance --help` exists in the

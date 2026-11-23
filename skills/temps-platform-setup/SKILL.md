@@ -39,7 +39,7 @@ Apply these rules to every workflow:
    mode, channel, console URL, app URL pattern, domain, and admin email. Never
    read, print, copy, or use the generated password or API key.
 4. **Use browser device authorization for a person.** The agent starts the
-   latest stable CLI login, gives the user the exact short-lived approval URL and code,
+   Temps CLI login, gives the user the exact short-lived approval URL and code,
    keeps the process running, and waits for approval. Never ask the user to
    paste an API key or place one in a command, URL, file, log, or response.
 5. **Use an explicit context.** All verification and later operations name the
@@ -290,7 +290,7 @@ verification. Report the exact console URL once verified.
 ## Browser device authorization handoff
 
 Follow the adjacent [temps-cli skill](../temps-cli/SKILL.md) to select `bunx` or
-`npx`, check its version, and inspect runtime help. Use `@latest`; do not
+`npx`, check its version, and inspect runtime help. Keep its channel tag; do not
 assume a globally installed CLI.
 
 First verify the console is reachable, then start login yourself in a
@@ -416,7 +416,7 @@ or untrusted log content.
 
 ## Related skills
 
-- [temps-cli](../temps-cli/SKILL.md): latest stable CLI and command reference.
+- [temps-cli](../temps-cli/SKILL.md): CLI invocation and command reference.
 - [deploy-to-temps](../deploy-to-temps/SKILL.md): deploy an application after
   platform setup.
 - [add-custom-domain](../add-custom-domain/SKILL.md): configure a project
