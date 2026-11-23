@@ -290,7 +290,8 @@ export function GroupDatabaseList({
           databases from a service&apos;s Databases tab.
         </p>
       </div>
-      {loading ? (
+      {/* Loaded rows stay visible while other requests load or retry. */}
+      {loading && databases.length === 0 ? (
         <Skeleton className="h-14 w-full" />
       ) : databases.length === 0 ? (
         <div className="rounded-lg border border-dashed">

@@ -112,7 +112,8 @@ export function ScopedList({
   fanoutOf?: string
   children: ReactNode
 }) {
-  if (state.loading) {
+  // Rows already loaded stay visible while other requests load or retry.
+  if (state.loading && isEmpty) {
     return (
       <div
         className="space-y-2 rounded-lg border p-4"

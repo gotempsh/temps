@@ -59,6 +59,15 @@ describe('a scoped list', () => {
     )
   })
 
+  test('shows a skeleton only while there is nothing to show', () => {
+    renderList({ ...complete, loading: true }, true)
+    expect(screen.getByRole('status', { name: 'Loading domains' }))
+    cleanup()
+    renderList({ ...complete, loading: true }, false)
+    expect(screen.getByText('the list'))
+    expect(screen.queryByRole('status', { name: 'Loading domains' })).toBeNull()
+  })
+
   test('a partial list shows what it has and says it is partial', () => {
     renderList({ ...complete, truncated: true }, false)
     expect(screen.getByText('the list'))

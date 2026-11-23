@@ -79,6 +79,11 @@ describe("the project overview's databases", () => {
     expect(screen.getByText(/Only the first .* services are checked/))
   })
 
+  test('rows that loaded stay visible while a retry loads', () => {
+    renderList([cache], { loading: true })
+    expect(screen.getByText('cache'))
+  })
+
   test('a complete read offers no retry', () => {
     renderList([cache], {})
     expect(screen.queryByRole('button', { name: 'Retry databases' })).toBeNull()
