@@ -1320,8 +1320,17 @@ curl -s -o /dev/null -w '%{http_code}\n' -A 'temps-sdk-release' https://crates.i
      --env sdk --allow-stage-publish --yes
    ```
 
-   `npm trust` keeps one entry per package: replace an existing one with
-   `npm trust list` and `npm trust revoke --id <id>` first. An npm
+   To replace an existing entry, such as one for an older environment, find
+   its id and revoke it, naming the package (outside its directory npm would
+   otherwise pick the current folder's `package.json`):
+
+   ```sh
+   npm trust list @temps-sdk/<package> --json
+   npm trust revoke @temps-sdk/<package> --id <id>
+   ```
+
+   Entries added on npmjs.com sit alongside the CLI's, so check that only the
+   `sdk` one is left. An npm
    configuration expires unless it publishes within 2 days. Add it no more than
    2 days before the first tag that publishes, and recreate it if it expired.
 
