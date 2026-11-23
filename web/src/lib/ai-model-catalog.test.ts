@@ -11,6 +11,8 @@ import {
   formatPerMillion,
   formatTokens,
   isNewerVersion,
+  latestReleaseVersion,
+  newestVersion,
 } from './ai-model-catalog'
 
 const settings = {
@@ -55,9 +57,18 @@ describe('catalog settings form', () => {
   it('accepts only https URLs and intervals from 1 to 168 hours', () => {
     const valid = catalogSettingsToForm(settings)
     expect(catalogSettingsSchema.safeParse(valid).success).toBe(true)
+    expect(
+      catalogSettingsSchema.safeParse({
+        ...valid,
+        sourceUrl: 'https://mirror.example.com/models@v1.json',
+      }).success
+    ).toBe(true)
     for (const sourceUrl of [
       'http://mirror.example.com/a.json',
       'mirror.example.com',
+      'https://mirror.example.com/a.json?token=secret',
+      'https://mirror.example.com/a.json#secret',
+      'https://user:secret@mirror.example.com/a.json',
     ]) {
       expect(
         catalogSettingsSchema.safeParse({ ...valid, sourceUrl }).success
@@ -141,6 +152,85 @@ describe('agentVersionState', () => {
       kind: 'unknown',
       reason: 'The workspace could not be inspected',
     })
+  })
+
+  it('shows a release the registry found even when the workspace cache is stale', () => {
+    expect(
+      agentVersionState(
+        { latest_version: '2.1.2' },
+        {
+          installed_version: '2.1.1',
+          latest_version: '2.1.1',
+          update_available: false,
+          updating: false,
+        }
+      )
+    ).toEqual({ kind: 'behind', installed: '2.1.1', latest: '2.1.2' })
+  })
+
+  it('is unknown, not up to date, when no latest version could be looked up', () => {
+    expect(
+      agentVersionState(
+        { latest_version: null },
+        {
+          installed_version: '1.2.3',
+          latest_version: null,
+          update_available: false,
+          updating: false,
+          detail: 'lookup failed',
+        }
+      )
+    ).toEqual({ kind: 'unknown', installed: '1.2.3', reason: 'lookup failed' })
+    expect(
+      agentVersionState(
+        { latest_version: null, error: 'The npm registry did not answer' },
+        {
+          installed_version: '1.2.3',
+          latest_version: null,
+          update_available: false,
+          updating: false,
+        }
+      )
+    ).toEqual({
+      kind: 'unknown',
+      installed: '1.2.3',
+      reason: 'The npm registry did not answer',
+    })
+  })
+
+  it('trusts whichever check ran last', () => {
+    const workspace = {
+      installed_version: '2.1.2',
+      latest_version: '2.1.2',
+      update_available: false,
+      updating: false,
+    }
+    // The workspace was just updated after npm withdrew 2.1.3; the registry
+    // answer is from before that.
+    expect(
+      agentVersionState(
+        { latest_version: '2.1.3', checked_at: '2026-11-23T10:00:00Z' },
+        { ...workspace, checked_at: '2026-11-23T12:00:00Z' }
+      )
+    ).toEqual({ kind: 'current', installed: '2.1.2' })
+    // "Check for releases" ran after the workspace's cached check.
+    expect(
+      agentVersionState(
+        { latest_version: '2.1.3', checked_at: '2026-11-23T12:00:00Z' },
+        { ...workspace, checked_at: '2026-11-23T10:00:00Z' }
+      )
+    ).toEqual({ kind: 'behind', installed: '2.1.2', latest: '2.1.3' })
+    expect(latestReleaseVersion({ latest_version: null }, workspace)).toBe(
+      '2.1.2'
+    )
+  })
+
+  it('picks the newer of two versions', () => {
+    expect(newestVersion('2.1.1', '2.1.2')).toBe('2.1.2')
+    expect(newestVersion('2.1.2', '2.1.1')).toBe('2.1.2')
+    expect(newestVersion(null, '1.0.0')).toBe('1.0.0')
+    expect(newestVersion('1.0.0', undefined)).toBe('1.0.0')
+    expect(newestVersion(null, null)).toBeNull()
   })
 
   it('compares release numbers, ignoring pre-release suffixes', () => {

@@ -132,3 +132,57 @@ test('a failed refresh, unpriced models and a workspace behind are all shown', (
   expect(markup).toContain('2.1.263')
   expect(markup).toContain('2.1.330 available')
 })
+
+test('a failed unpriced-model check is reported, not shown as zero unpriced models', () => {
+  const markup = render((client) => {
+    client.setQueryData(['aiModelCatalog', 'status'], status())
+    client.setQueryData(['aiModelCatalog', 'models', '__all', '', 1], {
+      items: [],
+      total: 0,
+      page: 1,
+      page_size: 20,
+    })
+    const query = client.getQueryCache().build(client, {
+      queryKey: ['aiModelCatalog', 'unpriced'],
+    })
+    query.setState({
+      ...query.state,
+      status: 'error',
+      error: {
+        title: 'Internal Server Error',
+        status: 500,
+        detail: 'database unavailable',
+      } as never,
+      fetchStatus: 'idle',
+    })
+  })
+  expect(markup).toContain('models without a known price unavailable')
+  expect(markup).not.toContain('have no known price')
+})
+
+test('a failed recheck is reported even when an earlier clean result is cached', () => {
+  const markup = render((client) => {
+    client.setQueryData(['aiModelCatalog', 'status'], status())
+    client.setQueryData(['aiModelCatalog', 'models', '__all', '', 1], {
+      items: [],
+      total: 0,
+      page: 1,
+      page_size: 20,
+    })
+    client.setQueryData(['aiModelCatalog', 'unpriced'], {
+      models: [],
+      total: 0,
+    })
+    const query = client.getQueryCache().find({
+      queryKey: ['aiModelCatalog', 'unpriced'],
+    })!
+    // What a failed refetch leaves: the previous data and an error.
+    query.setState({
+      ...query.state,
+      status: 'error',
+      error: { title: 'Bad Gateway', status: 502, detail: 'x' } as never,
+      fetchStatus: 'idle',
+    })
+  })
+  expect(markup).toContain('models without a known price unavailable')
+})

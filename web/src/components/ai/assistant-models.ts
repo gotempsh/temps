@@ -51,27 +51,6 @@ export function assistantModelOptions(
   )
 }
 
-/** Characters a provider model id is made of (`claude-opus-5-5`, `openai/gpt-6.2-sol`, `llama3:70b`). */
-const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,199}$/
-
-/**
- * A model typed into the search that the list does not hold, offered as is:
- * providers publish models before any catalogue lists them, and the gateway
- * serves an unlisted model (priced at its ceiling until a price is known).
- * `null` when the query is empty, is not a model id, or names a listed model.
- */
-export function customModelCandidate(
-  options: readonly AssistantModelOption[],
-  query: string
-): string | null {
-  const candidate = query.trim()
-  if (!MODEL_ID.test(candidate)) return null
-  const lower = candidate.toLowerCase()
-  return options.some((option) => option.id.toLowerCase() === lower)
-    ? null
-    : candidate
-}
-
 /** Case-insensitive match on the model's name or id. Empty query keeps all. */
 export function filterAssistantModels(
   options: readonly AssistantModelOption[],

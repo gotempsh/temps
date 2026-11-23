@@ -29,7 +29,7 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { agentVersionState } from '@/lib/ai-model-catalog'
+import { agentVersionState, latestReleaseVersion } from '@/lib/ai-model-catalog'
 import { extractProblemDetails } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, RefreshCw } from 'lucide-react'
@@ -231,7 +231,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
     ? problemMessage(workspace.error, 'Your workspace could not be inspected')
     : null
   const state = agentVersionState(agent, workspace.data, workspaceError)
-  const latest = agent.latest_version ?? workspace.data?.latest_version ?? null
+  const latest = latestReleaseVersion(agent, workspace.data)
 
   return (
     <TableRow>
@@ -305,9 +305,12 @@ function VersionState({
       )
     case 'unknown':
       return (
-        <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
-          {state.reason}
-        </span>
+        <div className="space-y-1">
+          {state.installed ? <div>{state.installed}</div> : null}
+          <span className="text-xs text-muted-foreground [overflow-wrap:anywhere]">
+            {state.reason}
+          </span>
+        </div>
       )
   }
 }

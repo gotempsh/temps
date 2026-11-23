@@ -13,6 +13,10 @@ import type {
   GenAiTraceSummary,
 } from '@/api/client/types.gen'
 import {
+  invalidateProviderModels,
+  providerModelInventoryKey,
+} from '@/lib/provider-model-cache'
+import {
   traceTimeBounds,
   traceTimeBoundsFromSearch,
   type TraceTimeBounds,
@@ -485,7 +489,7 @@ function ProviderKeyModelDetail({
     id: number
     model_id: string
   } | null>(null)
-  const queryKey = ['providerModelInventory', providerKey.id]
+  const queryKey = providerModelInventoryKey(providerKey.id)
   const detailQuery = useQuery({
     queryKey,
     queryFn: async () => {
@@ -503,7 +507,7 @@ function ProviderKeyModelDetail({
         throwOnError: true,
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey })
+      invalidateProviderModels(queryClient, providerKey.id)
       toast.success(`${providerKey.display_name} models refreshed`)
     },
     onError: (error) =>
@@ -520,7 +524,7 @@ function ProviderKeyModelDetail({
       }),
     onSuccess: () => {
       setModelId('')
-      queryClient.invalidateQueries({ queryKey })
+      invalidateProviderModels(queryClient, providerKey.id)
       toast.success('Manual model added')
     },
     onError: (error) =>
@@ -535,7 +539,7 @@ function ProviderKeyModelDetail({
         body: { is_enabled: enabled },
         throwOnError: true,
       }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+    onSuccess: () => invalidateProviderModels(queryClient, providerKey.id),
     onError: (error) =>
       toast.error('Could not update model', {
         description: apiErrorMessage(error),
@@ -549,7 +553,7 @@ function ProviderKeyModelDetail({
         throwOnError: true,
       }),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey })
+      invalidateProviderModels(queryClient, providerKey.id)
       queryClient.invalidateQueries({ queryKey: ['providerKeys'] })
       toast.success('Default model updated')
     },
@@ -564,7 +568,7 @@ function ProviderKeyModelDetail({
         path: { id: providerKey.id, model_row_id: id },
         throwOnError: true,
       }),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey }),
+    onSuccess: () => invalidateProviderModels(queryClient, providerKey.id),
     onError: (error) =>
       toast.error('Could not delete model', {
         description: apiErrorMessage(error),
@@ -4228,7 +4232,7 @@ export function AiGatewayPage() {
         )
       ),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['providerModelInventory'] })
+      invalidateProviderModels(queryClient)
       toast.success('Gateway model catalogs refreshed')
     },
     onError: (error) =>

@@ -37,6 +37,10 @@ export const catalogSettingsSchema = z.object({
     .refine(
       (value) => value === '' || /^https:\/\/[^\s/]+/i.test(value),
       'Use an https:// URL, or leave blank for the Temps catalog'
+    )
+    .refine(
+      (value) => !/[?#]/.test(value) && !/^[a-z]+:\/\/[^/]*@/i.test(value),
+      'A catalog is a public document: the URL cannot carry a query, fragment or credentials'
     ),
   refreshIntervalHours: z
     .string()
@@ -93,6 +97,7 @@ export function formatTokens(value: number | null | undefined): string {
 
 export interface AgentReleaseLike {
   latest_version?: string | null
+  checked_at?: string | null
   error?: string | null
 }
 
@@ -101,6 +106,7 @@ export interface WorkspaceHarnessLike {
   latest_version?: string | null
   update_available: boolean
   updating: boolean
+  checked_at?: string | null
   detail?: string | null
 }
 
@@ -108,12 +114,47 @@ export type AgentVersionState =
   | { kind: 'updating' }
   | { kind: 'behind'; installed: string; latest: string }
   | { kind: 'current'; installed: string }
-  | { kind: 'unknown'; reason: string }
+  | { kind: 'unknown'; reason: string; installed?: string }
 
 /**
- * How the CLI in the caller's workspace compares with the latest release.
- * The workspace's own check wins; the registry's latest fills in when the
- * workspace could not look it up.
+ * The newer of two release versions; either may be missing. A version that
+ * does not parse loses to one that does.
+ */
+export function newestVersion(
+  a: string | null | undefined,
+  b: string | null | undefined
+): string | null {
+  if (!a) return b ?? null
+  if (!b) return a
+  return isNewerVersion(b, a) ? b : a
+}
+
+/**
+ * The latest release by the most recent of the two checks: the workspace's
+ * own (cached for hours) and the registry's. A release "Check for releases"
+ * just found is not hidden behind a stale workspace answer, and a workspace
+ * just updated is not told about a release npm has since withdrawn. Without
+ * both timestamps, the newer version.
+ */
+export function latestReleaseVersion(
+  release: AgentReleaseLike,
+  workspace: WorkspaceHarnessLike | null | undefined
+): string | null {
+  const fromWorkspace = workspace?.latest_version ?? null
+  const fromRegistry = release.latest_version ?? null
+  if (!fromWorkspace || !fromRegistry) return fromWorkspace ?? fromRegistry
+  const workspaceAt = Date.parse(workspace?.checked_at ?? '')
+  const registryAt = Date.parse(release.checked_at ?? '')
+  if (Number.isFinite(workspaceAt) && Number.isFinite(registryAt)) {
+    return workspaceAt >= registryAt ? fromWorkspace : fromRegistry
+  }
+  return newestVersion(fromWorkspace, fromRegistry)
+}
+
+/**
+ * How the CLI in the caller's workspace compares with the latest release
+ * (see `latestReleaseVersion`). With no latest version at all the state is
+ * unknown, never up to date.
  */
 export function agentVersionState(
   release: AgentReleaseLike,
@@ -122,7 +163,7 @@ export function agentVersionState(
 ): AgentVersionState {
   if (workspace?.updating) return { kind: 'updating' }
   const installed = workspace?.installed_version ?? null
-  const latest = workspace?.latest_version ?? release.latest_version ?? null
+  const latest = latestReleaseVersion(release, workspace)
   if (!installed) {
     return {
       kind: 'unknown',
@@ -135,7 +176,18 @@ export function agentVersionState(
   if (workspace?.update_available && latest) {
     return { kind: 'behind', installed, latest }
   }
-  if (latest && isNewerVersion(latest, installed)) {
+  if (!latest) {
+    return {
+      kind: 'unknown',
+      installed,
+      reason:
+        workspace?.detail ??
+        workspaceError ??
+        release.error ??
+        'The latest release could not be looked up.',
+    }
+  }
+  if (isNewerVersion(latest, installed)) {
     return { kind: 'behind', installed, latest }
   }
   return { kind: 'current', installed }

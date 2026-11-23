@@ -58,6 +58,19 @@ export function UnpricedModelsAlert() {
       return data
     },
   })
+  // A failed check must not look like a clean one, even when an earlier
+  // result is cached (a failed refetch keeps it): the operator would not know
+  // that spend-cap pricing went unchecked.
+  if (unpriced.isError) {
+    return (
+      <ReadFailure
+        resource="models without a known price"
+        error={unpriced.error}
+        onRetry={() => unpriced.refetch()}
+        retrying={unpriced.isFetching}
+      />
+    )
+  }
   if (!unpriced.data || unpriced.data.total === 0) return null
   const shown = unpriced.data.models.slice(0, 10)
   const more = unpriced.data.total - shown.length

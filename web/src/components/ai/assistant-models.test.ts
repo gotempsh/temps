@@ -4,7 +4,6 @@
 import { describe, expect, it } from 'bun:test'
 import {
   assistantModelOptions,
-  customModelCandidate,
   describeModel,
   filterAssistantModels,
   formatContextLength,
@@ -190,30 +189,5 @@ describe('imageSupport', () => {
     expect(imageSupport({})).toBe('unknown')
     expect(imageSupport(null)).toBe('unknown')
     expect(imageSupport(undefined)).toBe('unknown')
-  })
-})
-
-describe('customModelCandidate', () => {
-  const options = assistantModelOptions([
-    row({ model_id: 'vendor/model-a' }),
-    row({ model_id: 'model-b' }),
-  ])
-
-  it('offers a typed model id the list does not hold', () => {
-    expect(customModelCandidate(options, '  vendor/model-c ')).toBe(
-      'vendor/model-c'
-    )
-    expect(customModelCandidate(options, 'llama3:70b')).toBe('llama3:70b')
-  })
-
-  it('does not offer a listed model, whatever its case', () => {
-    expect(customModelCandidate(options, 'Vendor/Model-A')).toBeNull()
-  })
-
-  it('does not offer an empty query or text that is not a model id', () => {
-    expect(customModelCandidate(options, '   ')).toBeNull()
-    expect(customModelCandidate(options, 'fast cheap model')).toBeNull()
-    expect(customModelCandidate(options, '-leading-dash')).toBeNull()
-    expect(customModelCandidate(options, 'a'.repeat(201))).toBeNull()
   })
 })
