@@ -848,3 +848,42 @@ fn the_openrouter_low_cost_default_is_priced_at_its_own_rate() {
         60_000
     );
 }
+
+#[test]
+fn every_bootstrap_chat_model_has_a_built_in_rate() {
+    use crate::providers::openai_compat::OpenAiCompatProvider;
+    use crate::providers::AiProvider;
+    // A new key is seeded with these before discovery supplies anything, so
+    // an unpriced one would be charged the worst-case rate against spend
+    // caps from its first request.
+    for provider in [
+        OpenAiCompatProvider::openai(),
+        OpenAiCompatProvider::xai(),
+        OpenAiCompatProvider::openrouter(),
+    ] {
+        for model in provider.available_models() {
+            if !crate::providers::is_chat_model_id(&model.id) {
+                continue;
+            }
+            assert!(
+                rate_table().rates_for(&model.id).is_some(),
+                "bootstrap model {} has no built-in rate",
+                model.id
+            );
+        }
+    }
+}
+
+#[test]
+fn openrouter_gemini_and_grok_routes_bill_their_listed_rates() {
+    // Microcents are per-token rates times tokens: $1 per 1M tokens bills
+    // 1 microcent per token.
+    let cost = |model, input| estimate(model, input, 1_000_000);
+    assert_eq!(
+        cost("google/gemini-4-hydrogen", 1_000_000),
+        1_500_000 + 7_500_000
+    );
+    // Grok 4.7 doubles from 200,000 prompt tokens on (inclusive).
+    assert_eq!(cost("x-ai/grok-4.7", 199_999), 399_998 + 6_000_000);
+    assert_eq!(cost("x-ai/grok-4.7", 200_000), 800_000 + 12_000_000);
+}

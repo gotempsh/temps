@@ -265,9 +265,10 @@ const OPENAI_LONG_CONTEXT: i64 = 272_000;
 const GEMINI_LONG_CONTEXT: i64 = 200_000;
 const XAI_LONG_CONTEXT: i64 = 200_000 - 1;
 /// OpenRouter lists a route's long-context rates as an override from
-/// `min_prompt_tokens` on (inclusive): 100,000 for Claude Haiku 5.5 and
-/// 272,000 for GPT-6.x.
+/// `min_prompt_tokens` on (inclusive): 100,000 for Claude Haiku 5.5,
+/// 200,000 for Grok 4.6 and later, and 272,000 for GPT-6.x.
 const OPENROUTER_HAIKU_LONG_CONTEXT: i64 = 100_000 - 1;
+const OPENROUTER_XAI_LONG_CONTEXT: i64 = 200_000 - 1;
 const OPENROUTER_OPENAI_LONG_CONTEXT: i64 = 272_000 - 1;
 
 pub fn build_pricing() -> Vec<ModelPricing> {
@@ -1105,6 +1106,28 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             3.0,
             15.0,
         )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "google/gemini-4-hydrogen",
+            "Gemini 4 Hydrogen (via OpenRouter)",
+            1.50,
+            7.50,
+        )
+        .cache(0.0, 0.0, 0.075)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "x-ai/grok-4.7",
+            "Grok 4.7 (via OpenRouter)",
+            2.0,
+            6.0,
+        )
+        .cache(0.0, 0.0, 0.50)
+        .long_context(OPENROUTER_XAI_LONG_CONTEXT, 4.0, 12.0)
+        .long_cache_read(1.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
