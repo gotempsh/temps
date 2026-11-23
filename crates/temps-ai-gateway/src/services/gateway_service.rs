@@ -963,11 +963,9 @@ impl GatewayService {
         }
 
         let fallback_model = match provider_id {
-            "openai" => Some("gpt-5-nano"),
-            "anthropic" => Some("claude-haiku-4-5"),
-            "xai" => Some("grok-4.5"),
-            "gemini" => Some("gemini-3.5-flash-lite"),
-            "openrouter" => Some("openai/gpt-4o-mini"),
+            "openai" | "anthropic" | "xai" | "gemini" | "openrouter" => {
+                crate::providers::low_cost_default_model(provider_id)
+            }
             OPENAI_COMPATIBLE => {
                 if base_url.is_none() {
                     return Err(AiGatewayError::Validation {

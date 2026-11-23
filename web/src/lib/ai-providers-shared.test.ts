@@ -3,9 +3,23 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  AI_PROVIDERS,
   providerFromAddParam,
   providerKeyEndpoint,
 } from './ai-providers-shared'
+
+describe('AI_PROVIDERS', () => {
+  test('samples use a current low-cost model of each vendor', () => {
+    const defaults = Object.fromEntries(
+      AI_PROVIDERS.map((provider) => [provider.id, provider.defaultModel])
+    )
+    expect(defaults.openai).toBe('gpt-6-luna')
+    expect(defaults.anthropic).toBe('claude-haiku-5-5')
+    expect(defaults.xai).toBe('grok-4.7')
+    expect(defaults.gemini).toBe('gemini-3.5-flash-lite')
+    expect(defaults.openrouter).toBe('openai/gpt-6-luna')
+  })
+})
 
 describe('providerFromAddParam', () => {
   test('resolves a supported provider id from the deep link', () => {

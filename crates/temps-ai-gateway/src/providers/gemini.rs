@@ -568,18 +568,20 @@ impl AiProvider for GeminiProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
+        // Bootstrap fallback only: a key's live catalog (discovered from
+        // /v1beta/models) replaces this list once it is refreshed.
         let models = [
+            "gemini-4-neon",
+            "gemini-4-hydrogen",
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-3.8-flash",
             "gemini-3.6-flash",
-            "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
-            "gemini-3.1-pro",
+            "gemini-3.1-pro-preview",
             "gemini-3.1-flash-lite",
-            "gemini-3-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
             "gemini-2.5-flash-lite",
-            "gemini-2-flash",
-            "gemini-2-flash-lite",
         ];
         models
             .iter()

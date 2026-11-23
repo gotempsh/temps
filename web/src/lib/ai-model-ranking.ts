@@ -24,7 +24,7 @@ export function aiModelRelevanceScore(modelId: string): number {
   let score = 0
 
   const version = id.match(
-    /(?:gpt|gemini|grok)[-_]?(\d+)(?:[.-](\d+))?|claude-(?:opus|sonnet|haiku|fable)-?(\d+)(?:[.-](\d+))?/
+    /(?:gpt|gemini|grok)[-_]?(\d+)(?:[.-](\d+))?|claude-(?:opus|sonnet|haiku|fable|mythos)-?(\d+)(?:[.-](\d+))?/
   )
   const major = Number(version?.[1] ?? version?.[3] ?? 0)
   const minor = Number(version?.[2] ?? version?.[4] ?? 0)

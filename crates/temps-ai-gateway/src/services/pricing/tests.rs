@@ -107,11 +107,11 @@ fn the_provenance_check_rejects_a_missing_source_date_or_foreign_host() {
         .build();
     assert!(provenance_problem(&bad_date).is_some());
     let foreign = PricingBuilder::new("openai", "m", "M", 1.0, 2.0)
-        .checked("https://example.com/prices", CHECKED_2026_11_15)
+        .checked("https://example.com/prices", CHECKED_2026_11_23)
         .build();
     assert!(provenance_problem(&foreign).is_some());
     let good = PricingBuilder::new("openai", "m", "M", 1.0, 2.0)
-        .checked(OPENAI_PRICING, CHECKED_2026_11_15)
+        .checked(OPENAI_PRICING, CHECKED_2026_11_23)
         .build();
     assert_eq!(provenance_problem(&good), None);
 }
@@ -417,10 +417,10 @@ fn long_context_cost_is_given_only_for_a_listed_long_tier_the_prompt_crosses() {
 fn unconfirmed_rows_do_not_raise_the_worst_case() {
     let table = RateTable::from_entries(vec![
         PricingBuilder::new("openai", "cheap", "Cheap", 1.0, 2.0)
-            .checked(OPENAI_PRICING, CHECKED_2026_11_15)
+            .checked(OPENAI_PRICING, CHECKED_2026_11_23)
             .build(),
         PricingBuilder::new("openai", "stale", "Stale", 99.0, 999.0)
-            .unconfirmed(OPENAI_PRICING, CHECKED_2026_11_15)
+            .unconfirmed(OPENAI_PRICING, CHECKED_2026_11_23)
             .build(),
     ]);
     let base = table.worst_case.base;
@@ -670,4 +670,78 @@ fn test_pricing_builder_defaults() {
     assert!(!model.deprecated);
     assert!(entry.provenance.is_none());
     assert!(entry.long_context.is_none());
+}
+
+#[test]
+fn current_generation_models_are_priced_at_their_own_rates() {
+    // Rows checked on 2026-11-23 against each provider's pricing page.
+    let worst = estimate("totally-unlisted-model", 1_000, 1_000);
+    for (model, input, output) in [
+        ("claude-fable-5-2", 8.0_f64, 40.0_f64),
+        ("claude-mythos-5-2", 8.0, 40.0),
+        ("claude-mythos-5-1", 10.0, 50.0),
+        ("claude-opus-5-5", 4.0, 20.0),
+        ("claude-sonnet-5-5", 2.0, 10.0),
+        ("claude-haiku-5-5", 0.10, 0.50),
+        ("gpt-6.2-astra", 8.0, 40.0),
+        ("gpt-6.2-sol", 2.0, 10.0),
+        ("gemini-4-neon", 3.0, 15.0),
+        ("anthropic/claude-fable-5.2", 8.0, 40.0),
+        ("openai/gpt-6.2-sol", 2.0, 10.0),
+        ("deepseek/deepseek-v4-pro", 0.90, 1.50),
+    ] {
+        let cost = estimate(model, 1_000, 1_000);
+        assert_eq!(
+            cost,
+            (1_000.0 * input + 1_000.0 * output).ceil() as i64,
+            "{model}"
+        );
+        assert!(cost < worst, "{model} is charged below the worst case");
+    }
+}
+
+#[test]
+fn gpt_6_2_bills_long_prompts_and_cache_writes_at_its_listed_tiers() {
+    // Over 272K input tokens: $16 / $60 for GPT-6.2 Astra.
+    assert_eq!(
+        estimate("gpt-6.2-astra", 272_001, 1_000),
+        (272_001.0 * 16.0 + 1_000.0 * 60.0_f64).ceil() as i64
+    );
+    // A written token bills at the 12-hour write rate, $20.
+    assert_eq!(with_cache("gpt-6.2-astra", 1_000, 0, 0, 1_000), 1_000 * 20);
+}
+
+#[test]
+fn retired_claude_ids_price_by_prefix_instead_of_the_worst_case() {
+    // Dated ids of retired models used to fall through to the worst case.
+    assert_eq!(
+        estimate("claude-sonnet-4-20250514", 1_000, 1_000),
+        1_000 * 3 + 1_000 * 15
+    );
+    assert_eq!(
+        estimate("claude-opus-4-1-20250805", 1_000, 1_000),
+        1_000 * 15 + 1_000 * 75
+    );
+    // A listed longer id still wins over the shorter retired one.
+    assert_eq!(
+        estimate("claude-opus-4-6-20260205", 1_000, 1_000),
+        estimate("claude-opus-4-6", 1_000, 1_000)
+    );
+    assert_eq!(
+        estimate("claude-sonnet-4-6", 1_000, 1_000),
+        1_000 * 3 + 1_000 * 15
+    );
+    assert!(listed("claude-sonnet-4").deprecated);
+}
+
+#[test]
+fn a_dearer_dated_snapshot_is_not_priced_as_its_cheaper_alias() {
+    assert_eq!(
+        estimate("deepseek/deepseek-v4.1-flash-1017", 1_000_000, 0),
+        300_000
+    );
+    assert!(
+        estimate("deepseek/deepseek-v4.1-flash", 1_000_000, 0)
+            < estimate("deepseek/deepseek-v4.1-flash-1017", 1_000_000, 0)
+    );
 }

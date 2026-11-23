@@ -631,28 +631,23 @@ impl AiProvider for AnthropicProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
-        vec![
-            ModelInfo {
-                id: "claude-opus-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-sonnet-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-fable-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
-            ModelInfo {
-                id: "claude-haiku-4-5".to_string(),
-                object: "model".to_string(),
-                owned_by: "anthropic".to_string(),
-            },
+        // Bootstrap fallback only: a key's live catalog (discovered from
+        // /v1/models) replaces this list once it is refreshed.
+        [
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-5-5",
+            "claude-fable-5-2",
+            "claude-opus-5",
+            "claude-sonnet-5",
         ]
+        .into_iter()
+        .map(|id| ModelInfo {
+            id: id.to_string(),
+            object: "model".to_string(),
+            owned_by: "anthropic".to_string(),
+        })
+        .collect()
     }
 
     async fn chat_completion(

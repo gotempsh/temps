@@ -66,7 +66,7 @@ const GEMINI_PRICING: &str = "https://aistudio.google.com/docs/pricing";
 const OPENROUTER_MODELS: &str = "https://openrouter.ai/api/v1/models";
 
 /// Date (UTC) of the last full check of the table against every source above.
-const CHECKED_2026_11_15: &str = "2026-11-15";
+const CHECKED_2026_11_23: &str = "2026-11-23";
 
 /// Where a row's prices come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -284,7 +284,7 @@ fn catalog() -> Vec<CatalogEntry> {
 
 fn anthropic_rows() -> Vec<CatalogEntry> {
     const A: &str = ANTHROPIC_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         PricingBuilder::new(
             "anthropic",
@@ -313,6 +313,41 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
             .batch(5.0, 25.0)
             .checked(A, D)
             .build(),
+        // Claude Mythos models are available to verified organizations only,
+        // at the prices of their Fable counterparts.
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5-2",
+            "Claude Mythos 5.2",
+            8.0,
+            40.0,
+        )
+        .cache(10.0, 16.0, 0.20)
+        .batch(4.0, 20.0)
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5-1",
+            "Claude Mythos 5.1",
+            10.0,
+            50.0,
+        )
+        .cache(12.50, 20.0, 0.25)
+        .batch(5.0, 25.0)
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5",
+            "Claude Mythos 5",
+            10.0,
+            50.0,
+        )
+        .cache(12.50, 20.0, 1.0)
+        .batch(5.0, 25.0)
+        .checked(A, D)
+        .build(),
         PricingBuilder::new("anthropic", "claude-opus-5-5", "Claude Opus 5.5", 4.0, 20.0)
             .cache(5.0, 8.0, 0.20)
             .batch(2.0, 10.0)
@@ -341,6 +376,26 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
         PricingBuilder::new("anthropic", "claude-opus-4-5", "Claude Opus 4.5", 5.0, 25.0)
             .cache(6.25, 10.0, 0.50)
             .batch(2.50, 12.50)
+            .checked(A, D)
+            .build(),
+        // Retired on the Claude API but still listed for the cloud platforms
+        // that serve them; kept so usage recorded on them still prices.
+        PricingBuilder::new(
+            "anthropic",
+            "claude-opus-4-1",
+            "Claude Opus 4.1",
+            15.0,
+            75.0,
+        )
+        .cache(18.75, 30.0, 1.50)
+        .batch(7.50, 37.50)
+        .deprecated()
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new("anthropic", "claude-opus-4", "Claude Opus 4", 15.0, 75.0)
+            .cache(18.75, 30.0, 1.50)
+            .batch(7.50, 37.50)
+            .deprecated()
             .checked(A, D)
             .build(),
         PricingBuilder::new(
@@ -383,6 +438,14 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
         .deprecated()
         .checked(A, D)
         .build(),
+        // Retired on the Claude API; dated ids such as
+        // `claude-sonnet-4-20250514` price as this row by prefix.
+        PricingBuilder::new("anthropic", "claude-sonnet-4", "Claude Sonnet 4", 3.0, 15.0)
+            .cache(3.75, 6.0, 0.30)
+            .batch(1.50, 7.50)
+            .deprecated()
+            .checked(A, D)
+            .build(),
         PricingBuilder::new(
             "anthropic",
             "claude-haiku-5-5",
@@ -413,10 +476,28 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
 
 fn openai_rows() -> Vec<CatalogEntry> {
     const O: &str = OPENAI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // Models marked deprecated are "Deprecated" or "Shut down" on their
         // model pages under https://developers.openai.com/api/docs/models.
+        PricingBuilder::new("openai", "gpt-6.2-astra", "GPT-6.2 Astra", 8.0, 40.0)
+            .cache_read(0.40)
+            .batch(4.0, 20.0)
+            .long_context(OPENAI_LONG_CONTEXT, 16.0, 60.0)
+            .long_cache_read(0.80)
+            .long_cache_write(40.0)
+            .cache_write_ceiling(20.0)
+            .checked(O, D)
+            .build(),
+        PricingBuilder::new("openai", "gpt-6.2-sol", "GPT-6.2 Sol", 2.0, 10.0)
+            .cache_read(0.10)
+            .batch(1.0, 5.0)
+            .long_context(OPENAI_LONG_CONTEXT, 4.0, 15.0)
+            .long_cache_read(0.2)
+            .long_cache_write(10.0)
+            .cache_write_ceiling(5.0)
+            .checked(O, D)
+            .build(),
         PricingBuilder::new("openai", "gpt-6-astra", "GPT-6 Astra", 10.0, 50.0)
             .cache_read(1.0)
             .batch(5.0, 25.0)
@@ -634,7 +715,7 @@ fn openai_rows() -> Vec<CatalogEntry> {
 
 fn xai_rows() -> Vec<CatalogEntry> {
     const X: &str = XAI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         PricingBuilder::new("xai", "grok-4.7", "Grok 4.7", 2.0, 6.0)
             .cache(0.0, 0.0, 0.50)
@@ -760,7 +841,7 @@ fn xai_rows() -> Vec<CatalogEntry> {
 
 fn gemini_rows() -> Vec<CatalogEntry> {
     const G: &str = GEMINI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // Text input prices; audio input is billed higher on several models.
         // Gemini 4 Carbon and Argon rise to these prices on 2026-12-01, and
@@ -773,6 +854,11 @@ fn gemini_rows() -> Vec<CatalogEntry> {
         PricingBuilder::new("gemini", "gemini-4-argon", "Gemini 4 Argon", 4.0, 20.0)
             .cache(0.0, 0.0, 0.20)
             .batch(2.0, 10.0)
+            .checked(G, D)
+            .build(),
+        PricingBuilder::new("gemini", "gemini-4-neon", "Gemini 4 Neon", 3.0, 15.0)
+            .cache(0.0, 0.0, 0.15)
+            .batch(1.50, 7.50)
             .checked(G, D)
             .build(),
         PricingBuilder::new(
@@ -888,7 +974,7 @@ fn gemini_rows() -> Vec<CatalogEntry> {
 
 fn openrouter_rows() -> Vec<CatalogEntry> {
     const R: &str = OPENROUTER_MODELS;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // OpenRouter passes through hundreds of upstream models with
         // per-model pricing that changes independently of Temps releases;
@@ -941,6 +1027,51 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
         .build(),
         PricingBuilder::new(
             "openrouter",
+            "anthropic/claude-fable-5.2",
+            "Claude Fable 5.2 (via OpenRouter)",
+            8.0,
+            40.0,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "anthropic/claude-haiku-5.5",
+            "Claude Haiku 5.5 (via OpenRouter)",
+            0.10,
+            0.50,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6.2-astra",
+            "GPT-6.2 Astra (via OpenRouter)",
+            8.0,
+            40.0,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6.2-sol",
+            "GPT-6.2 Sol (via OpenRouter)",
+            2.0,
+            10.0,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "google/gemini-4-neon",
+            "Gemini 4 Neon (via OpenRouter)",
+            3.0,
+            15.0,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
             "meta-llama/llama-3.3-70b-instruct",
             "Llama 3.3 70B (via OpenRouter)",
             0.71,
@@ -954,6 +1085,35 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             "DeepSeek Chat (via OpenRouter)",
             0.2574,
             1.0287,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4-pro",
+            "DeepSeek V4 Pro (via OpenRouter)",
+            0.90,
+            1.50,
+        )
+        .checked(R, D)
+        .build(),
+        // The undated route is cheaper than its dated `-1017` snapshot, so
+        // both are listed: the snapshot must not price by prefix as this one.
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4.1-flash",
+            "DeepSeek V4.1 Flash (via OpenRouter)",
+            0.0498,
+            0.1992,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4.1-flash-1017",
+            "DeepSeek V4.1 Flash 1017 (via OpenRouter)",
+            0.30,
+            1.20,
         )
         .checked(R, D)
         .build(),

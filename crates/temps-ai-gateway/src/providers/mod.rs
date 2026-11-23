@@ -143,6 +143,21 @@ pub fn route_model_to_provider(model: &str) -> Option<&'static str> {
     None
 }
 
+/// A low-cost, current chat model per vendor provider, used for internal calls
+/// when nothing names one and to verify a new key. Self-hosted providers have
+/// none: their model is whatever the administrator picked from the server's
+/// own listing.
+pub fn low_cost_default_model(provider: &str) -> Option<&'static str> {
+    Some(match provider {
+        "openai" => "gpt-6-luna",
+        "anthropic" => "claude-haiku-5-5",
+        "gemini" => "gemini-3.5-flash-lite",
+        "xai" => "grok-4.7",
+        "openrouter" => "openai/gpt-6-luna",
+        _ => return None,
+    })
+}
+
 /// OpenAI-compatible providers reuse the same adapter with different config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {

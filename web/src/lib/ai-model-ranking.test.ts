@@ -34,4 +34,31 @@ describe('AI model relevance sorting', () => {
       ])
     ).toEqual(['gemini-3.6-flash', 'gemini-3.5-flash', 'gemini-2.5-flash'])
   })
+
+  test('puts the current generation of every vendor first', () => {
+    expect(
+      sortAiModelIdsByRelevance([
+        'gpt-5.6-sol',
+        'gpt-6-luna',
+        'gpt-6.2-sol',
+        'gpt-image-2',
+      ])
+    ).toEqual(['gpt-6.2-sol', 'gpt-6-luna', 'gpt-5.6-sol', 'gpt-image-2'])
+    expect(
+      sortAiModelIdsByRelevance([
+        'claude-haiku-4-5',
+        'claude-mythos-5-2',
+        'claude-opus-5',
+        'claude-opus-5-5',
+      ])
+    ).toEqual([
+      'claude-opus-5-5',
+      'claude-mythos-5-2',
+      'claude-opus-5',
+      'claude-haiku-4-5',
+    ])
+    expect(
+      sortAiModelIdsByRelevance(['gemini-3.8-flash', 'gemini-4-neon'])
+    ).toEqual(['gemini-4-neon', 'gemini-3.8-flash'])
+  })
 })

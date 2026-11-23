@@ -1002,15 +1002,18 @@ fn upstream_url(
 
 fn resolve_claude_model(selected_model: Option<&str>) -> Result<String, AiError> {
     let model = match selected_model.map(str::trim) {
-        None | Some("") | Some("default") | Some("sonnet") => "claude-sonnet-5",
-        Some("opus") => "claude-opus-5",
+        // Claude Code's aliases name a family; the relay pins the current
+        // model of it. A concrete `claude-*` id passes through, so a model
+        // released after this build is selectable without a Temps change.
+        None | Some("") | Some("default") | Some("sonnet") => "claude-sonnet-5-5",
+        Some("opus") => "claude-opus-5-5",
         // `[1m]` values are account-aware Claude CLI context selectors, not
         // Anthropic Messages API model identifiers. The CLI keeps the selector
         // for its launch; the relay pins the upstream body to the corresponding
         // existing concrete family.
-        Some("sonnet[1m]") => "claude-sonnet-5",
-        Some("opus[1m]") => "claude-opus-5",
-        Some("haiku") => "claude-haiku-4-5",
+        Some("sonnet[1m]") => "claude-sonnet-5-5",
+        Some("opus[1m]") => "claude-opus-5-5",
+        Some("haiku") => "claude-haiku-5-5",
         Some(model) if model.starts_with("claude-") => model,
         Some(model) => {
             return Err(AiError::Provider {
@@ -1596,15 +1599,27 @@ mod tests {
 
     #[test]
     fn relay_resolves_default_and_aliases_to_concrete_models() {
-        assert_eq!(resolve_claude_model(None).unwrap(), "claude-sonnet-5");
-        assert_eq!(resolve_claude_model(Some("opus")).unwrap(), "claude-opus-5");
+        assert_eq!(resolve_claude_model(None).unwrap(), "claude-sonnet-5-5");
+        assert_eq!(
+            resolve_claude_model(Some("opus")).unwrap(),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            resolve_claude_model(Some("haiku")).unwrap(),
+            "claude-haiku-5-5"
+        );
         assert_eq!(
             resolve_claude_model(Some("opus[1m]")).unwrap(),
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             resolve_claude_model(Some("sonnet[1m]")).unwrap(),
-            "claude-sonnet-5"
+            "claude-sonnet-5-5"
+        );
+        // A concrete id newer than this build is passed through unchanged.
+        assert_eq!(
+            resolve_claude_model(Some("claude-fable-5-2")).unwrap(),
+            "claude-fable-5-2"
         );
         assert!(resolve_claude_model(Some("unbounded-provider-model")).is_err());
     }
@@ -1612,8 +1627,8 @@ mod tests {
     #[test]
     fn claude_one_million_selector_never_reaches_the_upstream_model_field() {
         for (selector, concrete) in [
-            ("opus[1m]", "claude-opus-5"),
-            ("sonnet[1m]", "claude-sonnet-5"),
+            ("opus[1m]", "claude-opus-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
         ] {
             let selected = resolve_claude_model(Some(selector)).unwrap();
             let request = serde_json::json!({ "model": selector, "max_tokens": 1024 });
