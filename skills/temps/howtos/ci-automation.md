@@ -1,6 +1,6 @@
 # CI automation
 
-Use `@temps-sdk/cli@latest` and the runtime preflight from [the CLI runtime](../references/cli-runtime.md).
+Use `@temps-sdk/cli@beta` and the runtime preflight from [the CLI runtime](../references/cli-runtime.md).
 
 - Store `TEMPS_TOKEN` and `TEMPS_API_URL` in the CI provider's secret store.
 - Use a dedicated least-privilege identity and named `ci` context; never copy a
