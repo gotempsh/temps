@@ -3,6 +3,7 @@
 
 pub mod gateway;
 pub mod limits;
+pub mod model_catalog;
 pub mod native;
 pub mod pricing;
 mod provider_audit;
@@ -15,6 +16,7 @@ pub mod usage;
 
 pub use gateway::configure_gateway_routes;
 pub use limits::configure_limits_routes;
+pub use model_catalog::configure_model_catalog_routes;
 pub use native::configure_native_routes;
 pub use pricing::configure_pricing_routes;
 pub use provider_status::configure_provider_status_routes;

@@ -121,9 +121,12 @@ fn catalogue_cost_microcents(
 
 /// Cost of a request whose model the catalogue publishes no price for.
 ///
-/// A vendor model goes to the built-in price list, which charges a model it
-/// does not list at the most expensive listed rate, so an unknown model can
-/// never be a way around a spend cap. A self-hosted server has no vendor price
+/// A vendor model goes to the built-in price list (with the runtime model
+/// catalog applied), which charges a model it does not list at the most
+/// expensive listed rate, so an unknown model can never be a way around a
+/// spend cap. That figure is a ceiling, not a price: the caller records it with
+/// no known price (see `pricing::is_priced`), so reports flag the model as
+/// "price unknown" instead of presenting the ceiling as its cost. A self-hosted server has no vendor price
 /// to approximate: its model ids are whatever the operator named them, and
 /// charging them as the dearest cloud model reports a bill nobody pays. It is
 /// recorded at zero with no known price (`None`), which reports read as "no
@@ -148,6 +151,45 @@ fn unlisted_cost_microcents(
             pricing::estimate_batch_total_cost_microcents(model, input_tokens, output_tokens, cache)
         }
     })
+}
+
+/// The cost to record for a request no caller priced, and whether a known
+/// price gave it. `catalogue` is the key catalogue's price for the request
+/// (`None` when it publishes none).
+pub(crate) fn recorded_cost_microcents(
+    provider: &str,
+    model: &str,
+    catalogue: Option<i64>,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+    count: UsageCount,
+) -> (i64, bool) {
+    match catalogue {
+        Some(cost) => (
+            catalogue_cost_microcents(
+                provider,
+                model,
+                cost,
+                input_tokens,
+                output_tokens,
+                cache,
+                count,
+            ),
+            true,
+        ),
+        None => match unlisted_cost_microcents(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cache,
+            count,
+        ) {
+            Some(cost) => (cost, crate::services::pricing::is_priced(model)),
+            None => (0, false),
+        },
+    }
 }
 
 // ============================================================================
@@ -621,7 +663,8 @@ impl UsageService {
         // and spend caps and per-project reports have a cost to work with:
         // from the model catalogue first (it carries cache prices; a long
         // prompt is raised to the listed long-context cost), then from
-        // the built-in price list (see `unlisted_cost_microcents`). BYOK
+        // the built-in price list (see `unlisted_cost_microcents`); a model no
+        // price covers is charged the worst case and recorded unpriced. BYOK
         // requests are priced too; reports separate them as non-operator cost.
         // A batch total is never priced by long-context tiers, since its
         // requests' prompt lengths are not known. Whether a known price gave
@@ -629,7 +672,7 @@ impl UsageService {
         let (estimated_cost_microcents, price_known) = if estimated_cost_microcents > 0 {
             (estimated_cost_microcents, true)
         } else {
-            match self
+            let catalogue = self
                 .estimate_cost_microcents(
                     connection,
                     provider,
@@ -638,32 +681,16 @@ impl UsageService {
                     output_tokens,
                     cache,
                 )
-                .await
-            {
-                Some(cost) => (
-                    catalogue_cost_microcents(
-                        provider,
-                        model,
-                        cost,
-                        input_tokens,
-                        output_tokens,
-                        cache,
-                        count,
-                    ),
-                    true,
-                ),
-                None => match unlisted_cost_microcents(
-                    provider,
-                    model,
-                    input_tokens,
-                    output_tokens,
-                    cache,
-                    count,
-                ) {
-                    Some(cost) => (cost, true),
-                    None => (0, false),
-                },
-            }
+                .await;
+            recorded_cost_microcents(
+                provider,
+                model,
+                catalogue,
+                input_tokens,
+                output_tokens,
+                cache,
+                count,
+            )
         };
         let record = ai_usage_logs::ActiveModel {
             timestamp: Set(chrono::Utc::now()),

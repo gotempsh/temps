@@ -1,0 +1,1014 @@
+{
+  "anthropic": {
+    "id": "anthropic",
+    "name": "Anthropic",
+    "models": {
+      "claude-fable-5": {
+        "id": "claude-fable-5",
+        "name": "Claude Fable 5",
+        "cost": {
+          "input": 10.0,
+          "output": 50.0,
+          "cache_read": 1.0,
+          "cache_write": 12.5
+        }
+      },
+      "claude-fable-5-1": {
+        "id": "claude-fable-5-1",
+        "name": "Claude Fable 5.1",
+        "cost": {
+          "input": 10.0,
+          "output": 50.0,
+          "cache_read": 0.25,
+          "cache_write": 12.5
+        }
+      },
+      "claude-fable-5-2": {
+        "id": "claude-fable-5-2",
+        "name": "Claude Fable 5.2",
+        "cost": {
+          "input": 8.0,
+          "output": 40.0,
+          "cache_read": 0.2,
+          "cache_write": 10.0
+        }
+      },
+      "claude-haiku-4-5": {
+        "id": "claude-haiku-4-5",
+        "name": "Claude Haiku 4.5",
+        "cost": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.1,
+          "cache_write": 1.25
+        }
+      },
+      "claude-haiku-5-5": {
+        "id": "claude-haiku-5-5",
+        "name": "Claude Haiku 5.5",
+        "cost": {
+          "input": 0.1,
+          "output": 0.5,
+          "cache_read": 0.01,
+          "cache_write": 0.125
+        }
+      },
+      "claude-mythos-5": {
+        "id": "claude-mythos-5",
+        "name": "Claude Mythos 5",
+        "cost": {
+          "input": 10.0,
+          "output": 50.0,
+          "cache_read": 1.0,
+          "cache_write": 12.5
+        }
+      },
+      "claude-mythos-5-1": {
+        "id": "claude-mythos-5-1",
+        "name": "Claude Mythos 5.1",
+        "cost": {
+          "input": 10.0,
+          "output": 50.0,
+          "cache_read": 0.25,
+          "cache_write": 12.5
+        }
+      },
+      "claude-mythos-5-2": {
+        "id": "claude-mythos-5-2",
+        "name": "Claude Mythos 5.2",
+        "cost": {
+          "input": 8.0,
+          "output": 40.0,
+          "cache_read": 0.2,
+          "cache_write": 10.0
+        }
+      },
+      "claude-opus-4": {
+        "id": "claude-opus-4",
+        "name": "Claude Opus 4",
+        "cost": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "deprecated": true
+      },
+      "claude-opus-4-1": {
+        "id": "claude-opus-4-1",
+        "name": "Claude Opus 4.1",
+        "cost": {
+          "input": 15.0,
+          "output": 75.0,
+          "cache_read": 1.5,
+          "cache_write": 18.75
+        },
+        "deprecated": true
+      },
+      "claude-opus-4-5": {
+        "id": "claude-opus-4-5",
+        "name": "Claude Opus 4.5",
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "claude-opus-4-6": {
+        "id": "claude-opus-4-6",
+        "name": "Claude Opus 4.6",
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "claude-opus-4-7": {
+        "id": "claude-opus-4-7",
+        "name": "Claude Opus 4.7",
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "claude-opus-4-8": {
+        "id": "claude-opus-4-8",
+        "name": "Claude Opus 4.8",
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "claude-opus-5": {
+        "id": "claude-opus-5",
+        "name": "Claude Opus 5",
+        "cost": {
+          "input": 5.0,
+          "output": 25.0,
+          "cache_read": 0.5,
+          "cache_write": 6.25
+        }
+      },
+      "claude-opus-5-5": {
+        "id": "claude-opus-5-5",
+        "name": "Claude Opus 5.5",
+        "cost": {
+          "input": 4.0,
+          "output": 20.0,
+          "cache_read": 0.2,
+          "cache_write": 5.0
+        }
+      },
+      "claude-sonnet-4": {
+        "id": "claude-sonnet-4",
+        "name": "Claude Sonnet 4",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "deprecated": true
+      },
+      "claude-sonnet-4-5": {
+        "id": "claude-sonnet-4-5",
+        "name": "Claude Sonnet 4.5",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        },
+        "deprecated": true
+      },
+      "claude-sonnet-4-6": {
+        "id": "claude-sonnet-4-6",
+        "name": "Claude Sonnet 4.6",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.3,
+          "cache_write": 3.75
+        }
+      },
+      "claude-sonnet-5": {
+        "id": "claude-sonnet-5",
+        "name": "Claude Sonnet 5",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
+        }
+      },
+      "claude-sonnet-5-5": {
+        "id": "claude-sonnet-5-5",
+        "name": "Claude Sonnet 5.5",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0,
+          "cache_read": 0.1,
+          "cache_write": 2.5
+        }
+      }
+    }
+  },
+  "google": {
+    "id": "google",
+    "name": "Google",
+    "models": {
+      "gemini-2-flash": {
+        "id": "gemini-2-flash",
+        "name": "Gemini 2 Flash",
+        "cost": {
+          "input": 0.1,
+          "output": 0.4,
+          "cache_read": 0.025,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-2-flash-lite": {
+        "id": "gemini-2-flash-lite",
+        "name": "Gemini 2 Flash Lite",
+        "cost": {
+          "input": 0.075,
+          "output": 0.3,
+          "cache_read": 0.01875,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-2.5-flash": {
+        "id": "gemini-2.5-flash",
+        "name": "Gemini 2.5 Flash",
+        "cost": {
+          "input": 0.3,
+          "output": 2.5,
+          "cache_read": 0.03,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gemini-2.5-flash-lite": {
+        "id": "gemini-2.5-flash-lite",
+        "name": "Gemini 2.5 Flash Lite",
+        "cost": {
+          "input": 0.1,
+          "output": 0.4,
+          "cache_read": 0.01,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-2.5-pro": {
+        "id": "gemini-2.5-pro",
+        "name": "Gemini 2.5 Pro",
+        "cost": {
+          "input": 1.5,
+          "output": 10.0,
+          "cache_read": 0.15,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gemini-3-flash": {
+        "id": "gemini-3-flash",
+        "name": "Gemini 3 Flash",
+        "cost": {
+          "input": 0.5,
+          "output": 3.0,
+          "cache_read": 0.05,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.1-flash-lite": {
+        "id": "gemini-3.1-flash-lite",
+        "name": "Gemini 3.1 Flash Lite",
+        "cost": {
+          "input": 0.25,
+          "output": 1.5,
+          "cache_read": 0.025,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.1-pro": {
+        "id": "gemini-3.1-pro",
+        "name": "Gemini 3.1 Pro",
+        "cost": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.5-flash": {
+        "id": "gemini-3.5-flash",
+        "name": "Gemini 3.5 Flash",
+        "cost": {
+          "input": 1.5,
+          "output": 9.0,
+          "cache_read": 0.15,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.5-flash-lite": {
+        "id": "gemini-3.5-flash-lite",
+        "name": "Gemini 3.5 Flash-Lite",
+        "cost": {
+          "input": 0.3,
+          "output": 2.5,
+          "cache_read": 0.03,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.6-flash": {
+        "id": "gemini-3.6-flash",
+        "name": "Gemini 3.6 Flash",
+        "cost": {
+          "input": 1.5,
+          "output": 7.5,
+          "cache_read": 0.15,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-3.8-flash": {
+        "id": "gemini-3.8-flash",
+        "name": "Gemini 3.8 Flash",
+        "cost": {
+          "input": 1.5,
+          "output": 7.5,
+          "cache_read": 0.15,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-4-argon": {
+        "id": "gemini-4-argon",
+        "name": "Gemini 4 Argon",
+        "cost": {
+          "input": 4.0,
+          "output": 20.0,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-4-carbon": {
+        "id": "gemini-4-carbon",
+        "name": "Gemini 4 Carbon",
+        "cost": {
+          "input": 4.0,
+          "output": 20.0,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-4-hydrogen": {
+        "id": "gemini-4-hydrogen",
+        "name": "Gemini 4 Hydrogen",
+        "cost": {
+          "input": 1.5,
+          "output": 7.5,
+          "cache_read": 0.075,
+          "cache_write": 0.0
+        }
+      },
+      "gemini-4-neon": {
+        "id": "gemini-4-neon",
+        "name": "Gemini 4 Neon",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0,
+          "cache_read": 0.15,
+          "cache_write": 0.0
+        }
+      }
+    }
+  },
+  "openai": {
+    "id": "openai",
+    "name": "OpenAI",
+    "models": {
+      "gpt-4.1": {
+        "id": "gpt-4.1",
+        "name": "GPT-4.1",
+        "cost": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-4.1-mini": {
+        "id": "gpt-4.1-mini",
+        "name": "GPT-4.1 Mini",
+        "cost": {
+          "input": 0.4,
+          "output": 1.6,
+          "cache_read": 0.1,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-4.1-nano": {
+        "id": "gpt-4.1-nano",
+        "name": "GPT-4.1 Nano",
+        "cost": {
+          "input": 0.1,
+          "output": 0.4,
+          "cache_read": 0.025,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-4o": {
+        "id": "gpt-4o",
+        "name": "GPT-4o",
+        "cost": {
+          "input": 2.5,
+          "output": 10.0,
+          "cache_read": 1.25,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-4o-mini": {
+        "id": "gpt-4o-mini",
+        "name": "GPT-4o Mini",
+        "cost": {
+          "input": 0.15,
+          "output": 0.6,
+          "cache_read": 0.075,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5": {
+        "id": "gpt-5",
+        "name": "GPT-5",
+        "cost": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5-mini": {
+        "id": "gpt-5-mini",
+        "name": "GPT-5 Mini",
+        "cost": {
+          "input": 0.25,
+          "output": 2.0,
+          "cache_read": 0.025,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5-nano": {
+        "id": "gpt-5-nano",
+        "name": "GPT-5 Nano",
+        "cost": {
+          "input": 0.05,
+          "output": 0.4,
+          "cache_read": 0.005,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5-pro": {
+        "id": "gpt-5-pro",
+        "name": "GPT-5 Pro",
+        "cost": {
+          "input": 15.0,
+          "output": 120.0
+        },
+        "deprecated": true
+      },
+      "gpt-5.1": {
+        "id": "gpt-5.1",
+        "name": "GPT-5.1",
+        "cost": {
+          "input": 1.25,
+          "output": 10.0,
+          "cache_read": 0.125,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5.2": {
+        "id": "gpt-5.2",
+        "name": "GPT-5.2",
+        "cost": {
+          "input": 1.75,
+          "output": 14.0,
+          "cache_read": 0.175,
+          "cache_write": 0.0
+        }
+      },
+      "gpt-5.2-pro": {
+        "id": "gpt-5.2-pro",
+        "name": "GPT-5.2 Pro",
+        "cost": {
+          "input": 21.0,
+          "output": 168.0
+        }
+      },
+      "gpt-5.4": {
+        "id": "gpt-5.4",
+        "name": "GPT-5.4",
+        "cost": {
+          "input": 2.5,
+          "output": 15.0,
+          "cache_read": 0.25,
+          "cache_write": 0.0
+        }
+      },
+      "gpt-5.4-mini": {
+        "id": "gpt-5.4-mini",
+        "name": "GPT-5.4 Mini",
+        "cost": {
+          "input": 0.75,
+          "output": 4.5,
+          "cache_read": 0.075,
+          "cache_write": 0.0
+        }
+      },
+      "gpt-5.4-nano": {
+        "id": "gpt-5.4-nano",
+        "name": "GPT-5.4 Nano",
+        "cost": {
+          "input": 0.2,
+          "output": 1.25,
+          "cache_read": 0.02,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "gpt-5.4-pro": {
+        "id": "gpt-5.4-pro",
+        "name": "GPT-5.4 Pro",
+        "cost": {
+          "input": 30.0,
+          "output": 180.0
+        }
+      },
+      "gpt-5.5": {
+        "id": "gpt-5.5",
+        "name": "GPT-5.5",
+        "cost": {
+          "input": 5.0,
+          "output": 30.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
+        }
+      },
+      "gpt-5.5-pro": {
+        "id": "gpt-5.5-pro",
+        "name": "GPT-5.5 Pro",
+        "cost": {
+          "input": 30.0,
+          "output": 180.0
+        }
+      },
+      "gpt-5.6": {
+        "id": "gpt-5.6",
+        "name": "GPT-5.6",
+        "cost": {
+          "input": 5.0,
+          "output": 30.0,
+          "cache_read": 0.5
+        }
+      },
+      "gpt-5.6-luna": {
+        "id": "gpt-5.6-luna",
+        "name": "GPT-5.6 Luna",
+        "cost": {
+          "input": 0.2,
+          "output": 1.2,
+          "cache_read": 0.02
+        }
+      },
+      "gpt-5.6-sol": {
+        "id": "gpt-5.6-sol",
+        "name": "GPT-5.6 Sol",
+        "cost": {
+          "input": 5.0,
+          "output": 30.0,
+          "cache_read": 0.5
+        }
+      },
+      "gpt-5.6-terra": {
+        "id": "gpt-5.6-terra",
+        "name": "GPT-5.6 Terra",
+        "cost": {
+          "input": 2.0,
+          "output": 12.0,
+          "cache_read": 0.2
+        }
+      },
+      "gpt-6-astra": {
+        "id": "gpt-6-astra",
+        "name": "GPT-6 Astra",
+        "cost": {
+          "input": 10.0,
+          "output": 50.0,
+          "cache_read": 1.0
+        }
+      },
+      "gpt-6-luna": {
+        "id": "gpt-6-luna",
+        "name": "GPT-6 Luna",
+        "cost": {
+          "input": 0.1,
+          "output": 0.5,
+          "cache_read": 0.01
+        }
+      },
+      "gpt-6-sol": {
+        "id": "gpt-6-sol",
+        "name": "GPT-6 Sol",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0,
+          "cache_read": 0.2
+        }
+      },
+      "gpt-6.1-sol": {
+        "id": "gpt-6.1-sol",
+        "name": "GPT-6.1 Sol",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0,
+          "cache_read": 0.1
+        }
+      },
+      "gpt-6.1-terra": {
+        "id": "gpt-6.1-terra",
+        "name": "GPT-6.1 Terra",
+        "cost": {
+          "input": 1.0,
+          "output": 5.0,
+          "cache_read": 0.05
+        }
+      },
+      "gpt-6.2-astra": {
+        "id": "gpt-6.2-astra",
+        "name": "GPT-6.2 Astra",
+        "cost": {
+          "input": 8.0,
+          "output": 40.0,
+          "cache_read": 0.4
+        }
+      },
+      "gpt-6.2-sol": {
+        "id": "gpt-6.2-sol",
+        "name": "GPT-6.2 Sol",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0,
+          "cache_read": 0.1
+        }
+      },
+      "o3": {
+        "id": "o3",
+        "name": "o3",
+        "cost": {
+          "input": 2.0,
+          "output": 8.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "o3-mini": {
+        "id": "o3-mini",
+        "name": "o3 Mini",
+        "cost": {
+          "input": 1.1,
+          "output": 4.4,
+          "cache_read": 0.55,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      },
+      "o3-pro": {
+        "id": "o3-pro",
+        "name": "o3 Pro",
+        "cost": {
+          "input": 20.0,
+          "output": 80.0
+        },
+        "deprecated": true
+      },
+      "o4-mini": {
+        "id": "o4-mini",
+        "name": "o4-mini",
+        "cost": {
+          "input": 1.1,
+          "output": 4.4,
+          "cache_read": 0.55,
+          "cache_write": 0.0
+        },
+        "deprecated": true
+      }
+    }
+  },
+  "openrouter": {
+    "id": "openrouter",
+    "name": "OpenRouter",
+    "models": {
+      "anthropic/claude-fable-5.2": {
+        "id": "anthropic/claude-fable-5.2",
+        "name": "Claude Fable 5.2 (via OpenRouter)",
+        "cost": {
+          "input": 8.0,
+          "output": 40.0
+        }
+      },
+      "anthropic/claude-haiku-5.5": {
+        "id": "anthropic/claude-haiku-5.5",
+        "name": "Claude Haiku 5.5 (via OpenRouter)",
+        "cost": {
+          "input": 0.1,
+          "output": 0.5
+        }
+      },
+      "anthropic/claude-opus-5.5": {
+        "id": "anthropic/claude-opus-5.5",
+        "name": "Claude Opus 5.5 (via OpenRouter)",
+        "cost": {
+          "input": 4.0,
+          "output": 20.0
+        }
+      },
+      "anthropic/claude-sonnet-5": {
+        "id": "anthropic/claude-sonnet-5",
+        "name": "Claude Sonnet 5 (via OpenRouter)",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0
+        }
+      },
+      "anthropic/claude-sonnet-5.5": {
+        "id": "anthropic/claude-sonnet-5.5",
+        "name": "Claude Sonnet 5.5 (via OpenRouter)",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0
+        }
+      },
+      "deepseek/deepseek-chat": {
+        "id": "deepseek/deepseek-chat",
+        "name": "DeepSeek Chat (via OpenRouter)",
+        "cost": {
+          "input": 0.2574,
+          "output": 1.0287
+        }
+      },
+      "deepseek/deepseek-v4-pro": {
+        "id": "deepseek/deepseek-v4-pro",
+        "name": "DeepSeek V4 Pro (via OpenRouter)",
+        "cost": {
+          "input": 0.9,
+          "output": 1.5
+        }
+      },
+      "deepseek/deepseek-v4.1-flash": {
+        "id": "deepseek/deepseek-v4.1-flash",
+        "name": "DeepSeek V4.1 Flash (via OpenRouter)",
+        "cost": {
+          "input": 0.0498,
+          "output": 0.1992
+        }
+      },
+      "deepseek/deepseek-v4.1-flash-1017": {
+        "id": "deepseek/deepseek-v4.1-flash-1017",
+        "name": "DeepSeek V4.1 Flash 1017 (via OpenRouter)",
+        "cost": {
+          "input": 0.3,
+          "output": 1.2
+        }
+      },
+      "google/gemini-4-neon": {
+        "id": "google/gemini-4-neon",
+        "name": "Gemini 4 Neon (via OpenRouter)",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0
+        }
+      },
+      "meta-llama/llama-3.3-70b-instruct": {
+        "id": "meta-llama/llama-3.3-70b-instruct",
+        "name": "Llama 3.3 70B (via OpenRouter)",
+        "cost": {
+          "input": 0.71,
+          "output": 0.71
+        }
+      },
+      "openai/gpt-4o": {
+        "id": "openai/gpt-4o",
+        "name": "GPT-4o (via OpenRouter)",
+        "cost": {
+          "input": 2.5,
+          "output": 10.0
+        }
+      },
+      "openai/gpt-4o-mini": {
+        "id": "openai/gpt-4o-mini",
+        "name": "GPT-4o Mini (via OpenRouter)",
+        "cost": {
+          "input": 0.15,
+          "output": 0.6
+        }
+      },
+      "openai/gpt-6-luna": {
+        "id": "openai/gpt-6-luna",
+        "name": "GPT-6 Luna (via OpenRouter)",
+        "cost": {
+          "input": 0.1,
+          "output": 0.5
+        }
+      },
+      "openai/gpt-6.2-astra": {
+        "id": "openai/gpt-6.2-astra",
+        "name": "GPT-6.2 Astra (via OpenRouter)",
+        "cost": {
+          "input": 8.0,
+          "output": 40.0
+        }
+      },
+      "openai/gpt-6.2-sol": {
+        "id": "openai/gpt-6.2-sol",
+        "name": "GPT-6.2 Sol (via OpenRouter)",
+        "cost": {
+          "input": 2.0,
+          "output": 10.0
+        }
+      }
+    }
+  },
+  "xai": {
+    "id": "xai",
+    "name": "xAI",
+    "models": {
+      "grok-3": {
+        "id": "grok-3",
+        "name": "Grok 3",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0
+        }
+      },
+      "grok-3-mini": {
+        "id": "grok-3-mini",
+        "name": "Grok 3 Mini",
+        "cost": {
+          "input": 0.3,
+          "output": 0.5
+        }
+      },
+      "grok-4-0709": {
+        "id": "grok-4-0709",
+        "name": "Grok 4",
+        "cost": {
+          "input": 3.0,
+          "output": 15.0
+        }
+      },
+      "grok-4-1-fast-non-reasoning": {
+        "id": "grok-4-1-fast-non-reasoning",
+        "name": "Grok 4-1 Fast Non-Reasoning",
+        "cost": {
+          "input": 0.2,
+          "output": 0.5
+        }
+      },
+      "grok-4-1-fast-reasoning": {
+        "id": "grok-4-1-fast-reasoning",
+        "name": "Grok 4-1 Fast Reasoning",
+        "cost": {
+          "input": 0.2,
+          "output": 0.5
+        }
+      },
+      "grok-4-fast-non-reasoning": {
+        "id": "grok-4-fast-non-reasoning",
+        "name": "Grok 4 Fast Non-Reasoning",
+        "cost": {
+          "input": 0.2,
+          "output": 0.5
+        }
+      },
+      "grok-4-fast-reasoning": {
+        "id": "grok-4-fast-reasoning",
+        "name": "Grok 4 Fast Reasoning",
+        "cost": {
+          "input": 0.2,
+          "output": 0.5
+        }
+      },
+      "grok-4.20": {
+        "id": "grok-4.20",
+        "name": "Grok 4.20",
+        "cost": {
+          "input": 1.25,
+          "output": 2.5,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.20-0309-non-reasoning": {
+        "id": "grok-4.20-0309-non-reasoning",
+        "name": "Grok 4.20 Non-Reasoning",
+        "cost": {
+          "input": 1.25,
+          "output": 2.5,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.20-0309-reasoning": {
+        "id": "grok-4.20-0309-reasoning",
+        "name": "Grok 4.20 Reasoning",
+        "cost": {
+          "input": 1.25,
+          "output": 2.5,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.20-multi-agent-0309": {
+        "id": "grok-4.20-multi-agent-0309",
+        "name": "Grok 4.20 Multi-Agent",
+        "cost": {
+          "input": 1.25,
+          "output": 2.5,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.3": {
+        "id": "grok-4.3",
+        "name": "Grok 4.3",
+        "cost": {
+          "input": 1.25,
+          "output": 2.5,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.5": {
+        "id": "grok-4.5",
+        "name": "Grok 4.5",
+        "cost": {
+          "input": 2.0,
+          "output": 6.0,
+          "cache_read": 0.3,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.6": {
+        "id": "grok-4.6",
+        "name": "Grok 4.6",
+        "cost": {
+          "input": 2.0,
+          "output": 6.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
+        }
+      },
+      "grok-4.7": {
+        "id": "grok-4.7",
+        "name": "Grok 4.7",
+        "cost": {
+          "input": 2.0,
+          "output": 6.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
+        }
+      },
+      "grok-build-0.1": {
+        "id": "grok-build-0.1",
+        "name": "Grok Build 0.1",
+        "cost": {
+          "input": 1.0,
+          "output": 2.0,
+          "cache_read": 0.2,
+          "cache_write": 0.0
+        }
+      },
+      "grok-code-fast-1": {
+        "id": "grok-code-fast-1",
+        "name": "Grok Code Fast 1",
+        "cost": {
+          "input": 0.2,
+          "output": 1.5
+        }
+      }
+    }
+  }
+}

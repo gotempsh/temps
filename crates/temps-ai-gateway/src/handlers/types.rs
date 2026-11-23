@@ -6,8 +6,8 @@ use temps_core::AuditLogger;
 
 use super::provider_status::AiProviderStatusCache;
 use crate::services::{
-    AiLimitsService, GatewayService, NativeApiService, ProviderKeyService, ProviderModelService,
-    ProviderPreferenceService, StructuredOutputService, UsageService,
+    AiLimitsService, GatewayService, ModelCatalogService, NativeApiService, ProviderKeyService,
+    ProviderModelService, ProviderPreferenceService, StructuredOutputService, UsageService,
 };
 
 pub struct AiGatewayAppState {
@@ -16,6 +16,7 @@ pub struct AiGatewayAppState {
     pub provider_key_service: Arc<ProviderKeyService>,
     pub provider_model_service: Arc<ProviderModelService>,
     pub provider_preference_service: Arc<ProviderPreferenceService>,
+    pub model_catalog_service: Arc<ModelCatalogService>,
     pub usage_service: Arc<UsageService>,
     pub limits_service: Arc<AiLimitsService>,
     pub audit_service: Arc<dyn AuditLogger>,
@@ -35,6 +36,7 @@ pub async fn create_ai_gateway_app_state(
     provider_key_service: Arc<ProviderKeyService>,
     provider_model_service: Arc<ProviderModelService>,
     provider_preference_service: Arc<ProviderPreferenceService>,
+    model_catalog_service: Arc<ModelCatalogService>,
     usage_service: Arc<UsageService>,
     audit_service: Arc<dyn AuditLogger>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -54,6 +56,7 @@ pub async fn create_ai_gateway_app_state(
         provider_key_service,
         provider_model_service,
         provider_preference_service,
+        model_catalog_service,
         usage_service,
         limits_service,
         audit_service,
@@ -62,5 +65,56 @@ pub async fn create_ai_gateway_app_state(
         structured_output_service,
         native_api_service,
         project_access_checker,
+    })
+}
+
+/// App state over `db` for handler tests: every service is real, nothing is
+/// started in the background, and audit records go to `audit`.
+#[cfg(test)]
+pub(crate) fn test_app_state(
+    db: Arc<sea_orm::DatabaseConnection>,
+    audit: Arc<dyn AuditLogger>,
+) -> Arc<AiGatewayAppState> {
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .expect("test encryption key is valid"),
+    );
+    let provider_key_service = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+    let gateway_service = Arc::new(GatewayService::new(provider_key_service.clone()));
+    let provider_model_service = Arc::new(ProviderModelService::new(
+        db.clone(),
+        provider_key_service.clone(),
+        gateway_service.clone(),
+    ));
+    let model_catalog_service = Arc::new(ModelCatalogService::new(
+        db.clone(),
+        provider_key_service.clone(),
+        provider_model_service.clone(),
+    ));
+    let usage_service = Arc::new(UsageService::new(db.clone()));
+    let ai: Arc<dyn temps_ai::AiService> = Arc::new(crate::services::GatewayAiService::new(
+        gateway_service.clone(),
+        db.clone(),
+    ));
+    Arc::new(AiGatewayAppState {
+        db: db.clone(),
+        gateway_service: gateway_service.clone(),
+        provider_key_service,
+        provider_model_service,
+        provider_preference_service: Arc::new(ProviderPreferenceService::new(db.clone())),
+        model_catalog_service,
+        usage_service: usage_service.clone(),
+        limits_service: Arc::new(AiLimitsService::new(db.clone(), usage_service.clone())),
+        audit_service: audit,
+        telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+        provider_status_cache: Arc::new(AiProviderStatusCache::default()),
+        structured_output_service: Arc::new(StructuredOutputService::new(
+            ai,
+            usage_service.clone(),
+        )),
+        native_api_service: Arc::new(NativeApiService::new(db, gateway_service, usage_service)),
+        project_access_checker: None,
     })
 }
