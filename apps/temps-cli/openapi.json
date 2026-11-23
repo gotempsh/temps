@@ -2402,7 +2402,7 @@
         "description": "Response DTO for a single agent — masks the encrypted API key.",
         "properties": {
           "ai_model": {
-            "description": "Preferred model for the CLI (e.g. \"sonnet\", \"gpt-5-codex\"). `None` means default.",
+            "description": "Preferred model for the CLI (e.g. \"sonnet\", \"gpt-6.2-sol\"). `None` means default.",
             "type": [
               "string",
               "null"
@@ -14154,6 +14154,105 @@
         ],
         "type": "object"
       },
+      "CodingAgentRelease": {
+        "description": "The latest published release of one coding-agent CLI.",
+        "properties": {
+          "binary": {
+            "description": "Executable name inside a workspace.",
+            "type": "string"
+          },
+          "checked_at": {
+            "description": "When the registry was last asked.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "description": "Why the latest version is unknown, when it is.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latest_version": {
+            "description": "Latest version on the npm registry, when it could be read.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "npm_package": {
+            "type": "string"
+          },
+          "provider_id": {
+            "description": "Temps provider id (`claude_cli`, `codex_cli`, `opencode`).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_id",
+          "name",
+          "binary",
+          "npm_package"
+        ],
+        "type": "object"
+      },
+      "CodingAgentSettings": {
+        "description": "Instance-wide coding-agent settings.",
+        "properties": {
+          "auto_update": {
+            "description": "Install newer CLI releases in workspaces in use without asking.",
+            "type": "boolean"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "auto_update"
+        ],
+        "type": "object"
+      },
+      "CodingAgentSettingsUpdate": {
+        "description": "A settings change; omitted fields are left as they are.",
+        "properties": {
+          "auto_update": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "CodingAgentsOverview": {
+        "description": "Every coding-agent CLI Temps manages, with its latest release, and the\nauto-update setting.",
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/CodingAgentRelease"
+            },
+            "type": "array"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/CodingAgentSettings"
+          }
+        },
+        "required": [
+          "settings",
+          "agents"
+        ],
+        "type": "object"
+      },
       "CommandOutcome": {
         "description": "Result of a command the server ran in the sandbox.",
         "properties": {
@@ -20761,7 +20860,7 @@
             ]
           },
           "default_model": {
-            "description": "Model id to pin for this provider (e.g. \"gpt-4o-mini\"). Required for\n\"openai_compatible\": it must be one of the models the server lists\n(see `POST /ai/providers/discover`), and is used to verify the key.",
+            "description": "Model id to pin for this provider (e.g. \"gpt-6.2-sol\"). Required for\n\"openai_compatible\": it must be one of the models the server lists\n(see `POST /ai/providers/discover`), and is used to verify the key.",
             "type": [
               "string",
               "null"
@@ -50252,6 +50351,236 @@
         ],
         "type": "object"
       },
+      "ModelCatalogEntry": {
+        "description": "One stored catalog model.",
+        "properties": {
+          "cache_read_per_million": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "cache_write_per_million": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "context_window": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "deprecated": {
+            "type": "boolean"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "fetched_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "input_per_million": {
+            "description": "USD per 1M input tokens; `null` when the catalog publishes no price.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "max_output_tokens": {
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model_id": {
+            "type": "string"
+          },
+          "output_per_million": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "release_date": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "supports_reasoning": {
+            "type": "boolean"
+          },
+          "supports_tools": {
+            "type": "boolean"
+          },
+          "supports_vision": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "provider",
+          "model_id",
+          "display_name",
+          "supports_tools",
+          "supports_vision",
+          "supports_reasoning",
+          "deprecated",
+          "source_url",
+          "fetched_at"
+        ],
+        "type": "object"
+      },
+      "ModelCatalogEntryPage": {
+        "description": "A page of stored catalog models.",
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/ModelCatalogEntry"
+            },
+            "type": "array"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "total",
+          "page",
+          "page_size"
+        ],
+        "type": "object"
+      },
+      "ModelCatalogRefreshResult": {
+        "description": "What a successful refresh stored.",
+        "properties": {
+          "applied_prices": {
+            "description": "Prices applied over the bundled table.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped": {
+            "description": "Entries rejected as invalid.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ModelCatalogStatus"
+          },
+          "stored": {
+            "description": "Models stored.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "stored",
+          "applied_prices",
+          "skipped",
+          "status"
+        ],
+        "type": "object"
+      },
+      "ModelCatalogSettings": {
+        "description": "Where the catalog comes from and how it is refreshed.",
+        "properties": {
+          "auto_refresh": {
+            "description": "Refresh the catalog in the background.",
+            "type": "boolean"
+          },
+          "default_source_url": {
+            "description": "The catalog published in the Temps repository.",
+            "type": "string"
+          },
+          "discover_provider_models": {
+            "description": "Rediscover every active provider key's models on the same interval.",
+            "type": "boolean"
+          },
+          "effective_source_url": {
+            "description": "The URL refreshes fetch.",
+            "type": "string"
+          },
+          "refresh_interval_hours": {
+            "description": "Hours between background refreshes (1 to 168).",
+            "format": "int32",
+            "type": "integer"
+          },
+          "source_url": {
+            "description": "Custom catalog URL; `null` uses `default_source_url`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "effective_source_url",
+          "default_source_url",
+          "auto_refresh",
+          "refresh_interval_hours",
+          "discover_provider_models"
+        ],
+        "type": "object"
+      },
+      "ModelCatalogSettingsUpdate": {
+        "description": "A change to the catalog settings. Absent fields are left as they are.",
+        "properties": {
+          "auto_refresh": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "discover_provider_models": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "refresh_interval_hours": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "source_url": {
+            "description": "A custom `https://` catalog URL, or an empty string to go back to the\ncatalog published in the Temps repository.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ModelCatalogSource": {
         "description": "Provenance of a provider model inventory. Only live and unexpired cached\ninventories are authoritative enough to reject a saved model. Bootstrap\nand stale inventories remain useful for selectors, but must not block a\nturn because account entitlements may legitimately differ.",
         "enum": [
@@ -50261,6 +50590,93 @@
           "bootstrap"
         ],
         "type": "string"
+      },
+      "ModelCatalogStatus": {
+        "description": "The catalog's settings and the outcome of its last refresh.",
+        "properties": {
+          "applied_price_count": {
+            "description": "Catalog prices currently applied over the bundled table.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bundled_model_count": {
+            "description": "Models the bundled price table lists.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "entry_count": {
+            "description": "Models stored by the last successful refresh.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "last_attempt_at": {
+            "description": "When a refresh last started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_discovery_at": {
+            "description": "When provider keys' models were last rediscovered in the background.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_error": {
+            "description": "Why the last attempt failed; `null` after a success.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_refreshed_at": {
+            "description": "When a refresh last succeeded.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_source_url": {
+            "description": "The URL the stored catalog came from.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_refresh_at": {
+            "description": "When the next background refresh is due; `null` when automatic\nrefresh is off.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "refreshing": {
+            "description": "A refresh is running right now.",
+            "type": "boolean"
+          },
+          "settings": {
+            "$ref": "#/components/schemas/ModelCatalogSettings"
+          },
+          "skipped_count": {
+            "description": "Entries the last successful refresh rejected as invalid.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "settings",
+          "entry_count",
+          "skipped_count",
+          "applied_price_count",
+          "bundled_model_count",
+          "refreshing"
+        ],
+        "type": "object"
       },
       "ModelDetails": {
         "description": "What a provider's model catalogue says about one model, kept so a user can\nchoose between models without leaving the console. Every field is optional\nbecause catalogues differ: OpenRouter publishes all of them, others few.",
@@ -50422,7 +50838,7 @@
             "type": "boolean"
           },
           "display_name": {
-            "description": "Human-readable model name (e.g. \"Claude Sonnet 4.6\")",
+            "description": "Human-readable model name (e.g. \"Claude Sonnet 5.5\")",
             "type": "string"
           },
           "input_per_million": {
@@ -50431,7 +50847,7 @@
             "type": "number"
           },
           "model": {
-            "description": "Model identifier (e.g. \"gpt-5.4\", \"claude-sonnet-4-6\")",
+            "description": "Model identifier (e.g. \"gpt-6.2-sol\", \"claude-sonnet-5-5\")",
             "type": "string"
           },
           "output_per_million": {
@@ -50442,6 +50858,10 @@
           "provider": {
             "description": "Provider ID (e.g. \"openai\", \"anthropic\")",
             "type": "string"
+          },
+          "source": {
+            "$ref": "#/components/schemas/PriceSource",
+            "description": "Whether the price is the bundled one or comes from the runtime catalog."
           }
         },
         "required": [
@@ -50449,7 +50869,8 @@
           "display_name",
           "provider",
           "input_per_million",
-          "output_per_million"
+          "output_per_million",
+          "source"
         ],
         "type": "object"
       },
@@ -59571,6 +59992,14 @@
             "type": "object"
           }
         ]
+      },
+      "PriceSource": {
+        "description": "Where a model's price comes from.",
+        "enum": [
+          "bundled",
+          "catalog"
+        ],
+        "type": "string"
       },
       "PricingResponse": {
         "properties": {
@@ -85176,6 +85605,53 @@
         ],
         "type": "object"
       },
+      "UnpricedModel": {
+        "description": "A model enabled on a provider key that no price covers: its usage is\ncharged the worst-case rate and reported as \"price unknown\".",
+        "properties": {
+          "model_id": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "provider_key_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "provider_key_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider_key_id",
+          "provider_key_name",
+          "provider",
+          "model_id"
+        ],
+        "type": "object"
+      },
+      "UnpricedModelReport": {
+        "description": "Enabled models no price covers.",
+        "properties": {
+          "models": {
+            "description": "Up to 100 models, ordered by provider key and model id.",
+            "items": {
+              "$ref": "#/components/schemas/UnpricedModel"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "How many there are in total.",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "models",
+          "total"
+        ],
+        "type": "object"
+      },
       "UnsupportedFeature": {
         "description": "A feature from the source platform that cannot be migrated",
         "properties": {
@@ -100092,6 +100568,141 @@
         "x-maturity": "beta"
       }
     },
+    "/ai/coding-agents": {
+      "get": {
+        "operationId": "list_coding_agents",
+        "parameters": [
+          {
+            "description": "Ask the npm registry again instead of using the six-hour cache\n(at most once a minute).",
+            "in": "query",
+            "name": "refresh",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodingAgentsOverview"
+                }
+              }
+            },
+            "description": "Coding agents and their latest releases"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Every coding-agent CLI Temps manages, its latest published release, and\nwhether newer releases are installed automatically.",
+        "tags": [
+          "AI Coding Agents"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/ai/coding-agents/settings": {
+      "patch": {
+        "operationId": "update_coding_agent_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CodingAgentSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CodingAgentSettings"
+                }
+              }
+            },
+            "description": "Settings saved"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Turn automatic coding-agent updates on or off.",
+        "tags": [
+          "AI Coding Agents"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/ai/conversations": {
       "get": {
         "operationId": "list_all_conversations",
@@ -104525,6 +105136,393 @@
         "x-maturity": "beta"
       }
     },
+    "/ai/model-catalog": {
+      "get": {
+        "operationId": "get_model_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelCatalogStatus"
+                }
+              }
+            },
+            "description": "Catalog status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The runtime model catalog's settings and the outcome of its last refresh.",
+        "tags": [
+          "AI Gateway Model Catalog"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/ai/model-catalog/models": {
+      "get": {
+        "operationId": "list_model_catalog_entries",
+        "parameters": [
+          {
+            "description": "Temps provider id (`openai`, `anthropic`, `gemini`, `xai`, `openrouter`).",
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive part of the model id or name.",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number, from 1 (default 1).",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default 20, max 100).",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelCatalogEntryPage"
+                }
+              }
+            },
+            "description": "A page of catalog models"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The stored catalog's models, newest release first.",
+        "tags": [
+          "AI Gateway Model Catalog"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/ai/model-catalog/refresh": {
+      "post": {
+        "operationId": "refresh_model_catalog",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelCatalogRefreshResult"
+                }
+              }
+            },
+            "description": "Catalog refreshed"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The configured source URL is not allowed"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A refresh is already running"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The source failed or served an invalid catalog"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The source did not answer in time"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Fetch the catalog now, store it and apply its prices. On failure the\nprevious catalog stays in use and the reason is recorded in the status.",
+        "tags": [
+          "AI Gateway Model Catalog"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/ai/model-catalog/settings": {
+      "patch": {
+        "operationId": "update_model_catalog_settings",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ModelCatalogSettingsUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ModelCatalogSettings"
+                }
+              }
+            },
+            "description": "Settings saved"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid source URL or interval"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change where the catalog comes from and how it is refreshed.",
+        "tags": [
+          "AI Gateway Model Catalog"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/ai/model-catalog/unpriced": {
+      "get": {
+        "operationId": "list_unpriced_models",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UnpricedModelReport"
+                }
+              }
+            },
+            "description": "Enabled models without a price"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Database error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Models enabled on a provider key that no price covers. Their usage is\ncharged the worst-case rate, so spend caps still hold, and is reported as\n\"price unknown\".",
+        "tags": [
+          "AI Gateway Model Catalog"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/ai/pending-actions/{action_public_id}": {
       "get": {
         "operationId": "get_user_pending_action",
@@ -104826,7 +105824,7 @@
                 }
               }
             },
-            "description": "Model pricing information"
+            "description": "Model pricing: the bundled table with the runtime model catalog applied"
           },
           "401": {
             "content": {
@@ -143850,7 +144848,7 @@
             }
           },
           {
-            "description": "Filter by model (gpt-4, claude-sonnet-4-20250514, etc.)",
+            "description": "Filter by model (gpt-6.2-sol, claude-sonnet-5-5, etc.)",
             "in": "query",
             "name": "gen_ai_model",
             "required": false,
@@ -201420,6 +202418,14 @@
     {
       "description": "Model pricing endpoints",
       "name": "AI Gateway Pricing"
+    },
+    {
+      "description": "Runtime model catalog endpoints",
+      "name": "AI Gateway Model Catalog"
+    },
+    {
+      "description": "Coding-agent CLI release endpoints",
+      "name": "AI Coding Agents"
     },
     {
       "description": "Gateway capability and summary-default endpoints",

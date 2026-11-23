@@ -32,6 +32,7 @@ import {
 } from './assistant-model-hooks'
 import { toast } from 'sonner'
 import {
+  customModelCandidate,
   describeModel,
   filterAssistantModels,
   lacksToolCalling,
@@ -90,6 +91,10 @@ export function AssistantModelList({
   const rest = useMemo(
     () => visible.filter((option) => !popular.includes(option)),
     [visible, popular]
+  )
+  const custom = useMemo(
+    () => customModelCandidate(models.options, query),
+    [models.options, query]
   )
   const renderRow = (option: AssistantModelOption) => (
     <ModelRow
@@ -155,10 +160,20 @@ export function AssistantModelList({
         )}
         aria-label="Models"
       >
+        {custom ? (
+          <CustomModelRow
+            modelId={custom}
+            selected={custom === value}
+            disabled={disabled}
+            onSelect={() => onChange(custom)}
+          />
+        ) : null}
         {visible.length === 0 ? (
-          <li className="px-2 py-3 text-sm text-muted-foreground">
-            No model matches “{query.trim()}”.
-          </li>
+          custom ? null : (
+            <li className="px-2 py-3 text-sm text-muted-foreground">
+              No model matches “{query.trim()}”.
+            </li>
+          )
         ) : (
           <>
             {popular.length > 0 ? (
@@ -173,6 +188,48 @@ export function AssistantModelList({
         )}
       </ul>
     </div>
+  )
+}
+
+/** Use a model id the list does not hold, exactly as typed. */
+function CustomModelRow({
+  modelId,
+  selected,
+  disabled,
+  onSelect,
+}: {
+  modelId: string
+  selected: boolean
+  disabled?: boolean
+  onSelect: () => void
+}) {
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={onSelect}
+        disabled={disabled}
+        aria-pressed={selected}
+        className={cn(
+          'flex w-full items-start gap-2 rounded-md border border-dashed px-3 py-2 text-left text-sm hover:bg-accent disabled:opacity-50',
+          selected && 'border-primary bg-accent'
+        )}
+      >
+        <Check
+          className={cn('mt-0.5 size-4 shrink-0', !selected && 'invisible')}
+          aria-hidden
+        />
+        <span className="min-w-0 flex-1">
+          <span className="block font-medium [overflow-wrap:anywhere]">
+            Use “{modelId}”
+          </span>
+          <span className="block text-xs text-muted-foreground">
+            Not listed yet; priced at the gateway ceiling until a price is
+            known.
+          </span>
+        </span>
+      </button>
+    </li>
   )
 }
 

@@ -27,6 +27,7 @@ describe('feature maturity route mapping', () => {
   test('labels the assistant and gateway pages, and nothing for retired AI routes', () => {
     expect(featureKeyForPath('/chat')).toBe('ai-chat')
     expect(featureKeyForPath('/ai-gateway/limits')).toBe('ai-gateway')
+    expect(featureKeyForPath('/ai-gateway/models')).toBe('ai-gateway')
     // Harnesses, the harness workspace and workflows were retired; their old
     // URLs only redirect, so they carry no maturity of their own.
     expect(featureKeyForPath('/ai-first')).toBeUndefined()
