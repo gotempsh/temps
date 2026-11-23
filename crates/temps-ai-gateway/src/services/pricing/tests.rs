@@ -997,3 +997,12 @@ fn openrouter_gemini_and_grok_routes_bill_their_listed_rates() {
     assert_eq!(cost("x-ai/grok-4.7", 199_999), 399_998 + 6_000_000);
     assert_eq!(cost("x-ai/grok-4.7", 200_000), 800_000 + 12_000_000);
 }
+
+#[test]
+fn an_unpublished_grok_release_is_unpriced_rather_than_borrowing_a_rate() {
+    // Grok 4.8 has no published API price yet. Until the runtime catalog
+    // supplies one, it must surface as price unknown, never as Grok 4.7's
+    // rate matched by prefix.
+    assert!(!is_priced("grok-4.8"));
+    assert!(is_priced("grok-4.7"));
+}

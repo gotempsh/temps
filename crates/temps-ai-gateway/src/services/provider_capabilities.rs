@@ -380,6 +380,9 @@ mod tests {
         assert_eq!(ids("xai", "grok-4.6"), ["low", "medium", "high", "xhigh"]);
         assert_eq!(ids("xai", "grok-4.5"), ["low", "medium", "high"]);
         assert!(ids("xai", "grok-4.3").is_empty());
+        // A later 4.x release that discovery finds before Temps knows it
+        // keeps the newest family's effort controls without a code change.
+        assert_eq!(ids("xai", "grok-4.8"), ["low", "medium", "high", "xhigh"]);
         // Grok 4.20 predates 4.5 though its number compares higher, and
         // neither of its SKUs takes an effort.
         for model in [
