@@ -851,7 +851,7 @@ fn the_openrouter_low_cost_default_is_priced_at_its_own_rate() {
 }
 
 // ============================================================================
-// Runtime catalog (ADR 112)
+// Runtime catalog (ADR 113)
 // ============================================================================
 
 fn catalog_price(model: &str, input: f64, output: f64) -> CatalogPrice {

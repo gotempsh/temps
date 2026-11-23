@@ -619,6 +619,51 @@ def set_lockfile_versions(edits, package, version, root, dependents=()):
                       rf'\g<1>{version}\g<2>', what=f'path package entry for {name} {old}')
 
 
+def set_stamped_versions(edits, package, version):
+    """Rewrite `name@old` in committed files generated from the package (catalog `stamped`).
+
+    The CLI's command reference records the CLI version it was generated from, and a
+    test keeps it equal to the manifest, so a bump that skipped it would fail the build.
+    """
+    name, old = package['name'], package['version']
+    for path in package.get('stamped', []):
+        edits.replace(path, rf'{re.escape(name)}@{re.escape(old)}(?![0-9A-Za-z.+-])', f'{name}@{version}',
+                      what=f'{name}@{old} stamp')
+
+
+# The npm dist-tag that publishes each release channel (see sdk_release.channel).
+DIST_TAGS = {'stable': 'latest', 'beta': 'beta'}
+
+
+def set_channel_pins(edits, package, version):
+    """Move `name@<dist-tag>` invocations in committed docs (catalog `channel_pinned` globs).
+
+    The skills run the CLI as `bunx @temps-sdk/cli@latest` while it is stable and
+    `@beta` while its version is a prerelease, so the commands they document exist
+    in the CLI they run. When a bump changes the channel, every pin moves with it;
+    finding none fails closed, because the docs have drifted from the catalog.
+    """
+    patterns = package.get('channel_pinned', [])
+    if not patterns:
+        return
+    old, new = (DIST_TAGS[release.channel(v, package['kind'])] for v in (package['version'], version))
+    if old == new:
+        return
+    name = package['name']
+    pin = re.compile(rf'{re.escape(name)}@{old}(?![\w-])')
+    paths = sorted({match.relative_to(edits.root).as_posix()
+                    for pattern in patterns for match in edits.root.glob(pattern) if match.is_file()})
+    moved = 0
+    for path in paths:
+        text, count = pin.subn(f'{name}@{new}', edits.text(path))
+        if count:
+            edits.files[path] = text
+            moved += count
+    if not moved:
+        raise ValueError(f"{package['key']}: no file matching {', '.join(patterns)} pins {name}@{old}; "
+                         f'pin the documented commands to @{old} before moving them to @{new}')
+
+
 def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True, at_tag=False):
     """Select and version SDK releases for server tag `tag`; returns (selection, changed files).
 
@@ -680,6 +725,8 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
         if version != package['version']:
             set_manifest_version(edits, package, version)
             set_lockfile_versions(edits, package, version, root, dependents)
+            set_stamped_versions(edits, package, version)
+            set_channel_pins(edits, package, version)
         for dependent in dependents:
             set_dependency_pins(edits, dependent, package, version)
         set_lockfile_ranges(edits, package, version, root, dependents)

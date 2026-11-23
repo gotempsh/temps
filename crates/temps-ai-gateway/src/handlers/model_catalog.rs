@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Runtime AI model catalog endpoints (ADR 112): status, settings, "Refresh
+//! Runtime AI model catalog endpoints (ADR 113): status, settings, "Refresh
 //! now", the stored catalog, and the enabled models no price covers.
 //!
 //! Reading needs `ai_gateway:read`. Changing the catalog changes the prices

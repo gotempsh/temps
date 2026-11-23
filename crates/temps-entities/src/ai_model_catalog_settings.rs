@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Where the runtime AI model catalog comes from and how it is refreshed
-//! (ADR 112).
+//! (ADR 113).
 //!
 //! A single row (`id = 1`). Without a row the defaults apply: the built-in
 //! source, automatic refresh every 24 hours and periodic rediscovery of each

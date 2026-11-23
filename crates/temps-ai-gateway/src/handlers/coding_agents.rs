@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Coding-agent CLI endpoints (ADR 112): the latest release of Claude Code,
+//! Coding-agent CLI endpoints (ADR 113): the latest release of Claude Code,
 //! Codex and OpenCode, and the instance's automatic-update setting.
 //!
 //! The version installed in a workspace and the "Update" action are the

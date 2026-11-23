@@ -4,7 +4,7 @@
 import { z } from 'zod'
 
 /**
- * Pure helpers for the AI models page (ADR 112): the runtime model catalog
+ * Pure helpers for the AI models page (ADR 113): the runtime model catalog
  * and the coding-agent CLIs.
  */
 

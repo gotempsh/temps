@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Errors of the runtime model catalog (ADR 112).
+//! Errors of the runtime model catalog (ADR 113).
 
 use thiserror::Error;
 

@@ -165,10 +165,20 @@ function generateCommandIndex(commands: CommandInfo[]): string {
   return `${index}\n## Commands\n\n`
 }
 
+/**
+ * The npm dist-tag that publishes `version`: a prerelease ships on `beta`, a
+ * release on `latest`. The examples use it so they run the CLI the reference
+ * documents, and SDK release preparation moves the skills' pins with it.
+ */
+export function npmChannel(version: string): 'beta' | 'latest' {
+  return version.includes('-') ? 'beta' : 'latest'
+}
+
 function generateHeader(
   format: 'markdown' | 'mdx' = 'markdown',
   version: string,
 ): string {
+  const channel = npmChannel(version)
   const mdxMetadata = `export const metadata = {
   title: 'CLI Reference',
   description: 'Complete reference for the Temps CLI - all commands, options, and usage examples.',
@@ -188,10 +198,10 @@ function generateHeader(
 ## Installation
 
 \`\`\`bash
-bunx @temps-sdk/cli@latest [command]
+bunx @temps-sdk/cli@${channel} [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@latest [command]
+npx @temps-sdk/cli@${channel} [command]
 \`\`\`
 
 ## Authentication
@@ -200,10 +210,10 @@ Before using most commands, you need to authenticate:
 
 \`\`\`bash
 # Login interactively
-bunx @temps-sdk/cli@latest login
+bunx @temps-sdk/cli@${channel} login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@latest configure
+bunx @temps-sdk/cli@${channel} configure
 \`\`\`
 
 ## Global Options
@@ -220,6 +230,7 @@ bunx @temps-sdk/cli@latest configure
 }
 
 function generateFooter(version: string): string {
+  const channel = npmChannel(version)
   return `
 ---
 
@@ -229,55 +240,55 @@ function generateFooter(version: string): string {
 
 \`\`\`bash
 # Login to Temps
-bunx @temps-sdk/cli@latest login
+bunx @temps-sdk/cli@${channel} login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@latest --target-context production projects create --name my-app
+bunx @temps-sdk/cli@${channel} --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@latest --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@${channel} --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@latest deployments logs --project my-app --follow
+bunx @temps-sdk/cli@${channel} deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@latest runtime-logs --project my-app
+bunx @temps-sdk/cli@${channel} runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@latest containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@${channel} containers list --project-id 1 --environment-id 1
 \`\`\`
 
 ### Managing Environments
 
 \`\`\`bash
 # List environments
-bunx @temps-sdk/cli@latest environments list --project my-app
+bunx @temps-sdk/cli@${channel} environments list --project my-app
 
 # Set an environment variable on the intended server (prompts for the value)
-bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DATABASE_URL --environments production
+bunx @temps-sdk/cli@${channel} --target-context production environments vars set --project my-app DATABASE_URL --environments production
 
 # Store a secret from a file, or pipe it from a password manager (never type it on the command line)
-bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
-op read --no-newline op://vault/db/password | bunx @temps-sdk/cli@latest --target-context production environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
+bunx @temps-sdk/cli@${channel} --target-context production environments vars set --project my-app DB_PASSWORD --secret --value-file ./db-password.txt --environments production
+op read --no-newline op://vault/db/password | bunx @temps-sdk/cli@${channel} --target-context production environments vars set --project my-app DB_PASSWORD --secret --value-stdin --environments production
 
 # View environment variables
-bunx @temps-sdk/cli@latest environments vars list --project my-app
+bunx @temps-sdk/cli@${channel} environments vars list --project my-app
 \`\`\`
 
 ### Managing Domains
 
 \`\`\`bash
 # Request a certificate for a domain on the intended server
-bunx @temps-sdk/cli@latest --target-context production domains add --domain app.example.com
+bunx @temps-sdk/cli@${channel} --target-context production domains add --domain app.example.com
 
 # Route the domain to a project environment
-bunx @temps-sdk/cli@latest --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
+bunx @temps-sdk/cli@${channel} --target-context production custom-domains create --project-id 1 --environment-id 1 --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@latest domains list
+bunx @temps-sdk/cli@${channel} domains list
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@latest --target-context production domains remove --domain app.example.com
+bunx @temps-sdk/cli@${channel} --target-context production domains remove --domain app.example.com
 \`\`\`
 
 ## Environment Variables
@@ -297,7 +308,7 @@ Configuration is stored in:
 - **Config file**: \`~/.temps/config.json\`
 - **Credentials**: Stored securely in \`~/.temps/\` with restricted file permissions
 
-Use \`bunx @temps-sdk/cli@latest configure show\` to view current configuration.
+Use \`bunx @temps-sdk/cli@${channel} configure show\` to view current configuration.
 
 ## Support
 

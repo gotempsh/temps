@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Runtime AI model catalog (ADR 112).
+//! Runtime AI model catalog (ADR 113).
 //!
 //! A Temps release bundles a price table (`services::pricing`) and per
 //! provider model lists. Both age between releases, so a running instance

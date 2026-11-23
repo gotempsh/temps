@@ -15,9 +15,16 @@ LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
 CLI_SKILLS = ("temps", "temps-cli", "temps-platform-setup")
 
 
+# Dist-tags the skills may run: `latest` while the documented CLI is a release,
+# `beta` while it is a prerelease. SDK release preparation moves them together.
+CLI_CHANNEL = re.compile(r"@temps-sdk/cli@(latest|beta)(?![\w.-])")
+FIXED_PIN = re.compile(r"(?:bunx|npx) @temps-sdk/cli@(?!(?:latest|beta)(?![\w.-]))[^\s`]+")
+
+
 def check_cli_references(skills_root: Path) -> list[str]:
-    """Reject stale executable version pins while allowing source attribution."""
+    """Reject fixed version pins and mixed channels while allowing source attribution."""
     errors = []
+    channels: dict[str, str] = {}
     for skill in CLI_SKILLS:
         root = skills_root / skill
         if not root.is_dir():
@@ -25,10 +32,15 @@ def check_cli_references(skills_root: Path) -> list[str]:
             continue
         for markdown in root.rglob("*.md"):
             text = markdown.read_text()
-            if re.search(r"(?:bunx|npx) @temps-sdk/cli@(?!latest\b)[^\s`]+", text):
+            if FIXED_PIN.search(text):
                 errors.append(f"{markdown.relative_to(skills_root)}: stale CLI invocation pin")
+            for channel in CLI_CHANNEL.findall(text):
+                channels.setdefault(channel, str(markdown.relative_to(skills_root)))
             if "expected_temps_cli_integrity=" in text:
                 errors.append(f"{markdown.relative_to(skills_root)}: stale static integrity guard")
+    if len(channels) > 1:
+        found = ", ".join(f"@{channel} in {path}" for channel, path in sorted(channels.items()))
+        errors.append(f"CLI invocations mix channels ({found}); use one channel everywhere")
     return errors
 
 

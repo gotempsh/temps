@@ -30,7 +30,7 @@
     {
       "id": 3,
       "prompt": "Show me the latest errors for project 42 in staging. Do not change anything.",
-      "expected_output": "Routes directly to the errors command reference, uses an explicit staging context and a latest stable CLI invocation, performs only read operations, and does not load deployment or observability setup guides.",
+      "expected_output": "Routes directly to the errors command reference, uses an explicit staging context and the documented CLI invocation, performs only read operations, and does not load deployment or observability setup guides.",
       "files": [],
       "expectations": [
         "Uses only the relevant errors command-group reference",

@@ -1,4 +1,4 @@
-# ADR 112: New models and coding-agent releases without a Temps release
+# ADR 113: New models and coding-agent releases without a Temps release
 
 ## Status
 

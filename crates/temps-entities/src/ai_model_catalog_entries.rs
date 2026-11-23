@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The last runtime AI model catalog that fetched and validated (ADR 112).
+//! The last runtime AI model catalog that fetched and validated (ADR 113).
 //!
 //! Replaced as a whole on each successful refresh. An entry overrides the
 //! bundled price table for its model; the bundled table still prices every

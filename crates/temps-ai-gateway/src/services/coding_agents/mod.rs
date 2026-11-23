@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Coding-agent CLIs (Claude Code, Codex, OpenCode) kept current without a
-//! Temps release (ADR 112).
+//! Temps release (ADR 113).
 //!
 //! * The latest published release of each CLI is read from the npm registry,
 //!   cached for six hours, and shown beside the version installed in the

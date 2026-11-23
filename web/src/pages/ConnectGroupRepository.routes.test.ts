@@ -63,8 +63,22 @@ describe('project repository routes', () => {
 
   test('the project overview is not shadowed by it', () => {
     const route = leafOf(groupHref('shop'))
-    expect(route?.path).toBe('/p/:slug')
+    expect(route?.path).toBe('/p/:slug/*')
     expect(route?.elementName).toBe('ProjectGroupDetail')
+  })
+
+  test("the project's own pages are served by the project", () => {
+    for (const page of [
+      'databases',
+      'domains',
+      'backups',
+      'logs',
+      'settings',
+    ]) {
+      const route = leafOf(`${groupHref('shop')}/${page}`)
+      expect(route?.path).toBe('/p/:slug/*')
+      expect(route?.elementName).toBe('ProjectGroupDetail')
+    }
   })
 
   test('the import follow-up is carried in the search string only', () => {

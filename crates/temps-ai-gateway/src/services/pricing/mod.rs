@@ -16,7 +16,7 @@
 //! change, so a release that outlives the date never undercounts spend.
 //!
 //! A running instance can layer a runtime model catalog over this table
-//! (ADR 112, [`install_catalog_prices`]): its prices replace a listed model's
+//! (ADR 113, [`install_catalog_prices`]): its prices replace a listed model's
 //! base rates and price models this release does not know. The bundled table
 //! stays the fallback, keeps every long-context tier, and alone decides the
 //! worst-case rate charged for models no price covers.
@@ -1412,7 +1412,7 @@ fn rate_table() -> &'static RateTable {
 }
 
 // ============================================================================
-// Runtime catalog (ADR 112)
+// Runtime catalog (ADR 113)
 // ============================================================================
 
 /// Upper bound for a catalog price, USD per 1M tokens. The dearest listed

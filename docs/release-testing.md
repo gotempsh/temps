@@ -1089,6 +1089,15 @@ and registry contents produce the same files, and a second run changes nothing.
   (npm `workspace:` ranges, Cargo path dependencies, uv path sources, Go
   `replace` directives) with at least a patch, transitively, and rewrites their
   exact pins (the plugin SDK's `=` requirement on the protocol).
+- **Stamped files.** A catalog entry's `stamped` list names committed files
+  generated from the package that record `<name>@<version>`, such as the CLI
+  command reference `skills/temps-cli/references/COMMANDS.md`. A bump rewrites
+  that stamp; a stamp that no longer matches the manifest stops preparation.
+- **Channel pins.** A catalog entry's `channel_pinned` globs name files that run
+  the package by dist-tag, such as the skills' `bunx @temps-sdk/cli@latest`.
+  When a bump changes the channel (a stable version to a beta, or back), every
+  `<name>@latest` moves to `<name>@beta` or the reverse, so the documented
+  commands exist in the CLI the skills run; finding no pin stops preparation.
 - **Guards, failing closed.** A version already published or tagged, a registry
   stable release ahead of the computed version, a stable package depending on a
   prerelease sibling, a Go v2+ version, or a target tag that already exists.

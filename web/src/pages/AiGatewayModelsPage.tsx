@@ -18,7 +18,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 
 /**
- * Models newer than this release (ADR 112): the runtime catalog that prices
+ * Models newer than this release (ADR 113): the runtime catalog that prices
  * them, the models no price covers, and the coding-agent CLIs that offer them.
  */
 export function AiGatewayModelsPage() {

@@ -475,7 +475,7 @@ impl TempsPlugin for AiGatewayPlugin {
             ));
             context.register_service(provider_model_service.clone());
 
-            // ADR 112: the runtime model catalog. Its background task first
+            // ADR 113: the runtime model catalog. Its background task first
             // applies the stored catalog (so a restart without network keeps
             // it), then refreshes it and rediscovers provider keys' models on
             // the configured interval.

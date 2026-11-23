@@ -10653,7 +10653,7 @@ async fn test_visitor_activity_cooldown_is_nullable_and_reversible() -> anyhow::
     Ok(())
 }
 
-/// The runtime model catalog tables (ADR 112) are new, so an upgrade changes
+/// The runtime model catalog tables (ADR 113) are new, so an upgrade changes
 /// no existing row. A settings row takes the documented defaults, only one
 /// settings row can exist, the interval is bounded and a model is stored
 /// once per provider. `down` drops the three tables.

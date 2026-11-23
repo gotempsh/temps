@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 //! Instance settings for coding-agent CLIs (Claude Code, Codex, OpenCode)
-//! (ADR 112).
+//! (ADR 113).
 //!
 //! A single row (`id = 1`); without one, `auto_update` is `false`.
 

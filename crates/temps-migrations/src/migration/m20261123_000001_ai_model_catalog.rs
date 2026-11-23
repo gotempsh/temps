@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Runtime AI model catalog and coding-agent update settings (ADR 112).
+//! Runtime AI model catalog and coding-agent update settings (ADR 113).
 //!
 //! A Temps release bundles a price table and model lists that age: providers
 //! publish new models and change prices between releases. These tables let a
