@@ -22,7 +22,8 @@ import { getErrorMessage } from '@/utils/errorHandling'
 import { GroupRoutesSummary } from './GroupRoutesSummary'
 import { UnfinishedImportsNotice } from './UnfinishedImportsNotice'
 import { GROUP_FANOUT_LIMIT } from '@/lib/group-scoped-lists'
-import { useGroupDatabases } from './useGroupResources'
+import type { GroupDatabase } from '@/lib/group-scoped-lists'
+import { useGroupDatabases, type ScopedListState } from './useGroupResources'
 import {
   environmentLink,
   primaryEnvironment,
@@ -253,15 +254,30 @@ function VisitServiceLink({
 
 /** Databases linked to any service in the group, with who uses each. */
 function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
-  const { databases, loading, failed, truncated } = useGroupDatabases(
-    group.projects
-  )
+  const { databases, ...state } = useGroupDatabases(group.projects)
+  return <GroupDatabaseList databases={databases} state={state} />
+}
+
+export function GroupDatabaseList({
+  databases,
+  state,
+}: {
+  databases: GroupDatabase[]
+  state: ScopedListState
+}) {
+  const { loading, failed, truncated, refetch } = state
   const truncatedNote = truncated ? (
     <p className="px-3 py-2 text-xs text-muted-foreground">
       Only the first {GROUP_FANOUT_LIMIT} services are checked, so this list may
       be incomplete.
     </p>
   ) : null
+  const retry = (
+    <Button variant="outline" size="sm" onClick={refetch}>
+      <RefreshCw className="size-4" />
+      Retry databases
+    </Button>
+  )
 
   return (
     <section aria-labelledby="group-databases" className="space-y-3">
@@ -285,6 +301,9 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
                 ? `None of the first ${GROUP_FANOUT_LIMIT} services has a linked database.`
                 : 'No databases are linked to these services yet.'}
           </p>
+          {failed > 0 && (
+            <div className="flex justify-center pb-4">{retry}</div>
+          )}
           {failed > 0 && truncatedNote}
         </div>
       ) : (
@@ -308,10 +327,13 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
             </Link>
           ))}
           {failed > 0 && (
-            <p className="px-3 py-2 text-xs text-destructive">
-              Links for {failed} {failed === 1 ? 'service' : 'services'} could
-              not be loaded, so this list may be incomplete.
-            </p>
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3 py-2">
+              <p className="text-xs text-destructive">
+                Links for {failed} {failed === 1 ? 'service' : 'services'} could
+                not be loaded, so this list may be incomplete.
+              </p>
+              {retry}
+            </div>
           )}
           {truncatedNote}
         </div>

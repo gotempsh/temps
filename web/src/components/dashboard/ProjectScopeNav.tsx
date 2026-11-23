@@ -134,7 +134,9 @@ export function ProjectScopeHeader({
         </DropdownMenuTrigger>
         <DropdownMenuContent
           align="start"
-          className="max-h-80 w-(--radix-dropdown-menu-trigger-width) min-w-56 overflow-y-auto"
+          // Above the mobile sidebar sheet (z-[9999]), on the layer Popover and
+          // Select use, so the switcher opens over the sheet, not behind it.
+          className="z-[10002] max-h-80 w-(--radix-dropdown-menu-trigger-width) min-w-56 overflow-y-auto"
         >
           <DropdownMenuLabel className="text-xs text-muted-foreground">
             Projects

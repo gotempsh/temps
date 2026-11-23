@@ -24,10 +24,11 @@ export interface ScopedListState {
   failed: number
   /** The project has more members than one list requests. */
   truncated: boolean
+  /** Re-requests the failed requests; what loaded stays shown. */
   refetch: () => void
 }
 
-function summarize(
+export function summarize(
   results: readonly {
     isLoading: boolean
     isError: boolean
@@ -40,7 +41,7 @@ function summarize(
     failed: results.filter((r) => r.isError).length,
     truncated,
     refetch: () => {
-      for (const result of results) void result.refetch()
+      for (const result of results) if (result.isError) void result.refetch()
     },
   }
 }
