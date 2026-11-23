@@ -19545,6 +19545,98 @@ export type HttpMethod = 'GET' | 'HEAD' | 'POST' | 'PUT' | 'PATCH' | 'DELETE' | 
 export type HttpPolicy = 'https_only' | 'allow_http' | 'allow_all';
 
 /**
+ * What coordination did for this project in the last 30 days.
+ */
+export type IdenticalBuildActivityResponse = {
+    /**
+     * Builds of this project building for their group right now.
+     */
+    building: number;
+    /**
+     * Coordinated builds that built their own image.
+     */
+    built: number;
+    /**
+     * Deployments that deployed an identical build's image instead of building.
+     */
+    reused: number;
+    /**
+     * Builds of this project waiting for an identical build right now.
+     */
+    waiting: number;
+};
+
+/**
+ * What a build does when an identical build is already running.
+ */
+export type IdenticalBuildMode = 'parallel' | 'queue' | 'share';
+
+/**
+ * One mode, explained for the console and the CLI.
+ */
+export type IdenticalBuildModeOption = {
+    /**
+     * What the mode does, in plain words.
+     */
+    description: string;
+    /**
+     * A concrete case.
+     */
+    example: string;
+    id: IdenticalBuildMode;
+    label: string;
+};
+
+/**
+ * Which builds count as "the same group" for queueing.
+ *
+ * The scope only ever widens queueing. Reusing an image always requires the
+ * full fingerprint to match, whatever the scope.
+ */
+export type IdenticalBuildScope = 'fingerprint' | 'source';
+
+/**
+ * One grouping scope, explained for the console and the CLI.
+ */
+export type IdenticalBuildScopeOption = {
+    description: string;
+    id: IdenticalBuildScope;
+    label: string;
+};
+
+export type IdenticalBuildsResponse = {
+    /**
+     * The last 30 days.
+     */
+    activity: IdenticalBuildActivityResponse;
+    /**
+     * Whether the caller may change the setting.
+     */
+    can_edit: boolean;
+    /**
+     * The longest a build waits before it fails with a reason.
+     */
+    max_wait_seconds: number;
+    /**
+     * What this project's builds do when an identical build is running.
+     * `parallel` (the default) builds every deployment. Applies from the
+     * next build.
+     */
+    mode: IdenticalBuildMode;
+    modes: Array<IdenticalBuildModeOption>;
+    /**
+     * How long after it succeeded a shared image is offered to identical
+     * builds that start later.
+     */
+    reuse_window_seconds: number;
+    /**
+     * Which builds wait for each other.
+     */
+    scope: IdenticalBuildScope;
+    scopes: Array<IdenticalBuildScopeOption>;
+};
+
+/**
  * What an identify call did.
  */
 export type IdentifyOutcome = 'updated' | 'unchanged' | 'visitor_not_found' | 'cookieless_project' | 'browser_identify_refused' | 'server_identity_kept';
@@ -40821,6 +40913,14 @@ export type UpdateHostImagePreparationBody = {
      * upgrade changes the default. `false` stops that; it removes nothing.
      */
     keep_prepared: boolean;
+};
+
+export type UpdateIdenticalBuildsRequest = {
+    mode: IdenticalBuildMode;
+    /**
+     * Defaults to `fingerprint`.
+     */
+    scope?: IdenticalBuildScope;
 };
 
 export type UpdateInboundFilterRequest = {
@@ -77637,6 +77737,84 @@ export type SetProjectHostingResponses = {
 };
 
 export type SetProjectHostingResponse = SetProjectHostingResponses[keyof SetProjectHostingResponses];
+
+export type GetIdenticalBuildsData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type GetIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type GetIdenticalBuildsResponse = GetIdenticalBuildsResponses[keyof GetIdenticalBuildsResponses];
+
+export type UpdateIdenticalBuildsData = {
+    body: UpdateIdenticalBuildsRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/identical-builds';
+};
+
+export type UpdateIdenticalBuildsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * An unknown mode or scope
+     */
+    422: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateIdenticalBuildsResponses = {
+    200: IdenticalBuildsResponse;
+};
+
+export type UpdateIdenticalBuildsResponse = UpdateIdenticalBuildsResponses[keyof UpdateIdenticalBuildsResponses];
 
 export type GetLastDeploymentData = {
     body?: never;

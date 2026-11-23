@@ -42012,6 +42012,160 @@
         ],
         "type": "string"
       },
+      "IdenticalBuildActivityResponse": {
+        "description": "What coordination did for this project in the last 30 days.",
+        "properties": {
+          "building": {
+            "description": "Builds of this project building for their group right now.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "built": {
+            "description": "Coordinated builds that built their own image.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reused": {
+            "description": "Deployments that deployed an identical build's image instead of building.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "waiting": {
+            "description": "Builds of this project waiting for an identical build right now.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "reused",
+          "built",
+          "waiting",
+          "building"
+        ],
+        "type": "object"
+      },
+      "IdenticalBuildMode": {
+        "description": "What a build does when an identical build is already running.",
+        "enum": [
+          "parallel",
+          "queue",
+          "share"
+        ],
+        "type": "string"
+      },
+      "IdenticalBuildModeOption": {
+        "description": "One mode, explained for the console and the CLI.",
+        "properties": {
+          "description": {
+            "description": "What the mode does, in plain words.",
+            "type": "string"
+          },
+          "example": {
+            "description": "A concrete case.",
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/IdenticalBuildMode"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "description",
+          "example"
+        ],
+        "type": "object"
+      },
+      "IdenticalBuildScope": {
+        "description": "Which builds count as \"the same group\" for queueing.\n\nThe scope only ever widens queueing. Reusing an image always requires the\nfull fingerprint to match, whatever the scope.",
+        "enum": [
+          "fingerprint",
+          "source"
+        ],
+        "type": "string"
+      },
+      "IdenticalBuildScopeOption": {
+        "description": "One grouping scope, explained for the console and the CLI.",
+        "properties": {
+          "description": {
+            "type": "string"
+          },
+          "id": {
+            "$ref": "#/components/schemas/IdenticalBuildScope"
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "description"
+        ],
+        "type": "object"
+      },
+      "IdenticalBuildsResponse": {
+        "properties": {
+          "activity": {
+            "$ref": "#/components/schemas/IdenticalBuildActivityResponse",
+            "description": "The last 30 days."
+          },
+          "can_edit": {
+            "description": "Whether the caller may change the setting.",
+            "type": "boolean"
+          },
+          "max_wait_seconds": {
+            "description": "The longest a build waits before it fails with a reason.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/IdenticalBuildMode",
+            "description": "What this project's builds do when an identical build is running.\n`parallel` (the default) builds every deployment. Applies from the\nnext build."
+          },
+          "modes": {
+            "items": {
+              "$ref": "#/components/schemas/IdenticalBuildModeOption"
+            },
+            "type": "array"
+          },
+          "reuse_window_seconds": {
+            "description": "How long after it succeeded a shared image is offered to identical\nbuilds that start later.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/IdenticalBuildScope",
+            "description": "Which builds wait for each other."
+          },
+          "scopes": {
+            "items": {
+              "$ref": "#/components/schemas/IdenticalBuildScopeOption"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "scope",
+          "modes",
+          "scopes",
+          "reuse_window_seconds",
+          "max_wait_seconds",
+          "activity",
+          "can_edit"
+        ],
+        "type": "object"
+      },
       "IdentifyOutcome": {
         "description": "What an identify call did.",
         "enum": [
@@ -86992,6 +87146,22 @@
         },
         "required": [
           "keep_prepared"
+        ],
+        "type": "object"
+      },
+      "UpdateIdenticalBuildsRequest": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "$ref": "#/components/schemas/IdenticalBuildMode"
+          },
+          "scope": {
+            "$ref": "#/components/schemas/IdenticalBuildScope",
+            "description": "Defaults to `fingerprint`."
+          }
+        },
+        "required": [
+          "mode"
         ],
         "type": "object"
       },
@@ -150636,6 +150806,113 @@
           "Projects"
         ],
         "x-maturity": "experimental"
+      }
+    },
+    "/projects/{id}/identical-builds": {
+      "get": {
+        "operationId": "get_identical_builds",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdenticalBuildsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ]
+      },
+      "put": {
+        "operationId": "update_identical_builds",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateIdenticalBuildsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IdenticalBuildsResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "422": {
+            "description": "An unknown mode or scope"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Projects"
+        ]
       }
     },
     "/projects/{id}/last-deployment": {

@@ -10,6 +10,7 @@ import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfi
 import { projectSourceAction } from './source.js'
 import { projectHostingAction } from './hosting.js'
 import { projectContainerSecurityAction } from './container-security.js'
+import { projectIdenticalBuildsAction } from './identical-builds.js'
 import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 import { cloudflareCapabilityAction } from './cloudflare-capability.js'
@@ -165,6 +166,17 @@ export function registerProjectsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip the confirmation (for automation)')
     .action(projectContainerSecurityAction)
+
+  projects
+    .command('identical-builds')
+    .description(
+      'Show or change what the project\'s builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image'
+    )
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--mode <mode>', 'parallel (default), queue or share')
+    .option('--scope <scope>', 'Which builds wait for each other: fingerprint (default) or source (same repository and path)')
+    .option('--json', 'Output in JSON format')
+    .action(projectIdenticalBuildsAction)
 
   projects
     .command('config')

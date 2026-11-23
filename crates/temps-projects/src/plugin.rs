@@ -97,6 +97,12 @@ impl TempsPlugin for ProjectsPlugin {
             );
             context.register_service(container_security_service);
 
+            // How a project's builds coordinate with identical builds (ADR 113)
+            let identical_build_settings_service = Arc::new(
+                crate::services::identical_builds::IdenticalBuildSettingsService::new(db.clone()),
+            );
+            context.register_service(identical_build_settings_service);
+
             // Where apps send telemetry, for the framework-agnostic setup
             let ingest_setup_service =
                 Arc::new(crate::services::IngestSetupService::new(db.clone()));
@@ -161,6 +167,14 @@ impl TempsPlugin for ProjectsPlugin {
                 sensitive_action_authorizer: sensitive_action_authorizer.clone(),
             },
         );
+        let identical_builds_state = Arc::new(
+            crate::handlers::identical_builds::IdenticalBuildsAppState {
+                identical_build_settings_service: context
+                    .require_service::<crate::services::identical_builds::IdenticalBuildSettingsService>(),
+                audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
+            },
+        );
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             external_service_manager,
@@ -193,6 +207,10 @@ impl TempsPlugin for ProjectsPlugin {
             .merge(
                 crate::handlers::container_security::configure_container_security_routes()
                     .with_state(container_security_state),
+            )
+            .merge(
+                crate::handlers::identical_builds::configure_identical_builds_routes()
+                    .with_state(identical_builds_state),
             );
         Some(PluginRoutes::new(routes))
     }

@@ -1580,6 +1580,8 @@ mod tests {
             cross_project_trace_sharing: true,
             serves_own_temps_api: false,
             allowed_capabilities: Vec::new(),
+            identical_build_mode: Default::default(),
+            identical_build_scope: Default::default(),
         }
     }
 

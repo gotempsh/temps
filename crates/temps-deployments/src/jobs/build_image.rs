@@ -24,6 +24,9 @@ use temps_entities::preset::{Preset as StoredPreset, PresetConfig as StoredPrese
 use temps_presets;
 use tokio::time::{sleep, Duration};
 
+mod identical_build;
+pub use identical_build::{IdenticalBuildSettings, REUSED_IMAGE_FROM_DEPLOYMENT_OUTPUT};
+
 // Generated JavaScript workspace builds need root lockfiles and sibling packages.
 // Existing Dockerfiles return before this helper and keep their selected context.
 fn preset_build_root(
@@ -1018,6 +1021,9 @@ pub struct BuildImageJob {
     /// itself: the way back to the control plane. `None` for every other
     /// build.
     offload_fallback: Option<OffloadFallback>,
+    /// How this build coordinates with identical builds (ADR 113); `None`
+    /// for a project in `parallel` mode, which builds on its own.
+    identical_builds: Option<IdenticalBuildSettings>,
 }
 
 /// A file an attempt generated in the build context, and how to put the
@@ -1141,7 +1147,14 @@ impl BuildImageJob {
             worker_build_arg_keys: BTreeSet::new(),
             platform_builders: Vec::new(),
             offload_fallback: None,
+            identical_builds: None,
         }
+    }
+
+    /// Coordinate this build with identical builds (ADR 113).
+    pub fn with_identical_builds(mut self, settings: Option<IdenticalBuildSettings>) -> Self {
+        self.identical_builds = settings;
+        self
     }
 
     pub fn with_offload_fallback(mut self, fallback: Option<OffloadFallback>) -> Self {
@@ -3088,6 +3101,23 @@ impl BuildImageJob {
 }
 
 impl BuildImageJob {
+    /// Build the image, without coordinating with identical builds.
+    async fn execute_build(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        // A build offloaded from a control plane that could build it itself
+        // asks the node for a free slot now, when it is about to be sent.
+        if let Some(fallback) = &self.offload_fallback {
+            if let Some(reason) = self.offload_node_stays_busy(fallback, &context).await? {
+                tracing::warn!(
+                    node_id = fallback.node_id,
+                    node = %fallback.node_name,
+                    "Build node stayed busy; building on the control plane: {reason}"
+                );
+                return Box::pin(self.on_control_plane(fallback, &reason).run(context)).await;
+            }
+        }
+        self.run(context).await
+    }
+
     /// Build the image where this job is configured to build it.
     async fn run(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
         // Never fall through to the control plane's daemon when local
@@ -3135,6 +3165,18 @@ impl BuildImageJob {
             .finish_worker_build(&context, &image_output.image_tag)
             .await?;
 
+        self.record_image_outputs(&mut context, &image_output, self.remote_builder_node_id)?;
+        Ok(JobResult::success(context))
+    }
+
+    /// Record the image a build produced (or reused) as this job's outputs,
+    /// with the `.temps.yaml` health settings of the build context.
+    fn record_image_outputs(
+        &self,
+        context: &mut WorkflowContext,
+        image_output: &ImageOutput,
+        builder_node_id: Option<i32>,
+    ) -> Result<(), WorkflowError> {
         // Set typed job outputs
         context.set_output(&self.job_id, "image_tag", &image_output.image_tag)?;
         context.set_output(&self.job_id, "image_id", &image_output.image_id)?;
@@ -3156,7 +3198,7 @@ impl BuildImageJob {
             "image_tags_by_platform",
             &image_output.image_tags_by_platform,
         )?;
-        context.set_output(&self.job_id, "builder_node_id", self.remote_builder_node_id)?;
+        context.set_output(&self.job_id, "builder_node_id", builder_node_id)?;
         if let Some(config) = &image_output.image_config {
             context.set_output(&self.job_id, "image_config", config)?;
         }
@@ -3195,7 +3237,7 @@ impl BuildImageJob {
             PathBuf::from(&image_output.image_tag),
         );
 
-        Ok(JobResult::success(context))
+        Ok(())
     }
 }
 
@@ -3218,19 +3260,9 @@ impl WorkflowTask for BuildImageJob {
     }
 
     async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
-        // A build offloaded from a control plane that could build it itself
-        // asks the node for a free slot now, when it is about to be sent.
-        if let Some(fallback) = &self.offload_fallback {
-            if let Some(reason) = self.offload_node_stays_busy(fallback, &context).await? {
-                tracing::warn!(
-                    node_id = fallback.node_id,
-                    node = %fallback.node_name,
-                    "Build node stayed busy; building on the control plane: {reason}"
-                );
-                return Box::pin(self.on_control_plane(fallback, &reason).run(context)).await;
-            }
-        }
-        self.run(context).await
+        // Waiting for an identical build happens first, before a worker is
+        // asked for a build slot, so a waiting build holds none.
+        self.execute_with_identical_builds(context).await
     }
 
     async fn execute_with_cancellation(
@@ -3345,6 +3377,7 @@ pub struct BuildImageJobBuilder {
     worker_build_arg_keys: BTreeSet<String>,
     platform_builders: Vec<WorkerPlatformBuilder>,
     offload_fallback: Option<OffloadFallback>,
+    identical_builds: Option<IdenticalBuildSettings>,
 }
 
 impl BuildImageJobBuilder {
@@ -3367,7 +3400,15 @@ impl BuildImageJobBuilder {
             worker_build_arg_keys: BTreeSet::new(),
             platform_builders: Vec::new(),
             offload_fallback: None,
+            identical_builds: None,
         }
+    }
+
+    /// Coordinate the build with identical builds of other deployments
+    /// (ADR 113). Omit it for a project in `parallel` mode.
+    pub fn identical_builds(mut self, settings: IdenticalBuildSettings) -> Self {
+        self.identical_builds = Some(settings);
+        self
     }
 
     /// Let a build moved to a worker return to the control plane when the
@@ -3543,7 +3584,8 @@ impl BuildImageJobBuilder {
             .with_control_plane_copy(self.control_plane_copy)
             .with_worker_build_arg_keys(self.worker_build_arg_keys)
             .with_platform_builders(self.platform_builders)
-            .with_offload_fallback(self.offload_fallback);
+            .with_offload_fallback(self.offload_fallback)
+            .with_identical_builds(self.identical_builds);
 
         Ok(job)
     }

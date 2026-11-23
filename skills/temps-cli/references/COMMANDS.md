@@ -303,6 +303,7 @@ Manage services: each one deployable app (the console calls these Services). To 
 - `source` - Show or change how a service is deployed (primary source, and whether it also accepts `drop` uploads)
 - `hosting` - Show or set whether Temps runs the app (hosted) or it runs elsewhere (external, labelled External and never deployed)
 - `container-security` - Show or change which Linux capabilities the project's deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)
+- `identical-builds` - Show or change what the project's builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a service
 
@@ -544,6 +545,19 @@ Show or change which Linux capabilities the project's deployment containers get 
 | `--remove <capabilities...>` | Stop allowing these capabilities | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip the confirmation (for automation) | - | No |
+
+### `projects identical-builds`
+
+Show or change what the project's builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--mode <mode>` | parallel (default), queue or share | - | No |
+| `--scope <scope>` | Which builds wait for each other: fingerprint (default) or source (same repository and path) | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `projects config`
 

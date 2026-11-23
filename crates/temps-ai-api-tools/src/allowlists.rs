@@ -205,6 +205,9 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_compose_security",
     // Which capabilities a project's containers get back; names only.
     "get_container_security",
+    // How identical builds coordinate, and counts of what that did; no
+    // fingerprints, values or other projects.
+    "get_identical_builds",
     "get_project_service_template",
     // The public IPs and whether domains can be created: what a user needs
     // to point a DNS record at this platform.
@@ -1049,6 +1052,8 @@ pub const AI_WRITE_ALLOWLIST: &[&str] = &[
     // runs it, never a permission mode, and the handler still requires an
     // instance administrator. Narrowing back is an ordinary confirmed write.
     "update_container_security",
+    // ── Identical builds (reversible: `parallel` is today's behaviour) ──
+    "update_identical_builds",
     // ── Container runtime control (reversible) ──
     "restart_container",
     "stop_container",
