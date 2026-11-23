@@ -49,8 +49,11 @@ The URL alone decides the sidebar (`resolveConsoleScope` in
 | Service in a project | `/projects/:slug/*` | The same project sidebar, with the service open as a nested level showing its sections. |
 | Standalone service | `/projects/:slug/*` | The service's own menu, with the same "All projects" header. |
 
-Project pages show only that project's resources. Each one has a single
-explicit link to the server-wide list ("All databases on this server").
+Project pages show only that project's resources, with one exception: the
+database source of project Logs has no project filter yet, so it shows
+database logs from the whole server and says so ("Showing all on this
+server"; see the table below). Each project page has a single explicit link
+to the server-wide list ("All databases on this server").
 Nothing became unreachable. Every server-wide list is still in the global
 sidebar. Every project page is a ⌘K destination ("Storefront · Databases").
 Old URLs redirect.
@@ -156,7 +159,8 @@ ordinary view, editable by hand.
    - unknown `/p/:slug/*` → `/p/:slug`
    - `/monitoring/providers/edit/:id` → `/settings/notifications/:id`
 
-   Bookmarks keep working. The `?section=` and other parameters ride along.
+   Bookmarks keep working. The `?section=` and other parameters, and the
+   `#hash`, ride along.
 2. **Backend filters** (table above), then drop the console fan-out.
 3. **Views:** the `views` table, the panel registry, then migrate
    `metric_dashboards` (the old URLs redirect).

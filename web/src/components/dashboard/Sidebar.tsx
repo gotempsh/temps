@@ -71,7 +71,7 @@ import {
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
 import { type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { Link, useLocation, useNavigate } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
@@ -340,11 +340,12 @@ export default function AppSidebar() {
           <ServiceScopeNav
             slug={scope.serviceSlug}
             route={scope.route}
-            standalone={(service) => (
+            standalone={(service, notice) => (
               <ProjectNav
                 slug={scope.serviceSlug}
                 route={scope.route}
                 project={service}
+                notice={notice}
               />
             )}
           />
@@ -905,10 +906,13 @@ function ProjectNav({
   slug,
   route,
   project,
+  notice,
 }: {
   slug: string
   route: string
   project: ProjectResponse | undefined
+  /** Shown under the header, such as a failed project lookup. */
+  notice?: ReactNode
 }) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
@@ -925,6 +929,7 @@ function ProjectNav({
   return (
     <>
       <ProjectScopeHeader title={project?.name ?? 'Loading…'} />
+      {notice}
       {groups.map((group, index) => (
         <SidebarGroup
           key={group.label ?? index}

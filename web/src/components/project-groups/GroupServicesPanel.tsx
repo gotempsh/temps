@@ -21,6 +21,7 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { GroupRoutesSummary } from './GroupRoutesSummary'
 import { UnfinishedImportsNotice } from './UnfinishedImportsNotice'
+import { GROUP_FANOUT_LIMIT } from '@/lib/group-scoped-lists'
 import { useGroupDatabases } from './useGroupResources'
 import {
   environmentLink,
@@ -252,7 +253,15 @@ function VisitServiceLink({
 
 /** Databases linked to any service in the group, with who uses each. */
 function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
-  const { databases, loading, failed } = useGroupDatabases(group.projects)
+  const { databases, loading, failed, truncated } = useGroupDatabases(
+    group.projects
+  )
+  const truncatedNote = truncated ? (
+    <p className="px-3 py-2 text-xs text-muted-foreground">
+      Only the first {GROUP_FANOUT_LIMIT} services are checked, so this list may
+      be incomplete.
+    </p>
+  ) : null
 
   return (
     <section aria-labelledby="group-databases" className="space-y-3">
@@ -268,11 +277,16 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
       {loading ? (
         <Skeleton className="h-14 w-full" />
       ) : databases.length === 0 ? (
-        <p className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
-          {failed > 0
-            ? `Linked databases could not be loaded for ${failed} ${failed === 1 ? 'service' : 'services'}.`
-            : 'No databases are linked to these services yet.'}
-        </p>
+        <div className="rounded-lg border border-dashed">
+          <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+            {failed > 0
+              ? `Linked databases could not be loaded for ${failed} ${failed === 1 ? 'service' : 'services'}.`
+              : truncated
+                ? `None of the first ${GROUP_FANOUT_LIMIT} services has a linked database.`
+                : 'No databases are linked to these services yet.'}
+          </p>
+          {failed > 0 && truncatedNote}
+        </div>
       ) : (
         <div className="divide-y rounded-lg border">
           {databases.map((db) => (
@@ -299,6 +313,7 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
               not be loaded, so this list may be incomplete.
             </p>
           )}
+          {truncatedNote}
         </div>
       )}
     </section>

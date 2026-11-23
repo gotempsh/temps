@@ -18,6 +18,7 @@ import {
   type LucideIcon,
 } from 'lucide-react'
 import type { ProjectGroupResponse } from '@/api/client/types.gen'
+import { RecordLink, RecordRow } from '@temps-sdk/ds'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
@@ -83,8 +84,12 @@ function ServerWideButton({ to, children }: { to: string; children: string }) {
   )
 }
 
-/** Loading, failure, partial and empty states shared by the lists. */
-function ScopedList({
+/**
+ * Loading, failure, partial and empty states shared by the lists. An empty
+ * result is only "nothing here yet" when every request succeeded and none
+ * was left out; otherwise it says the list could not be read in full.
+ */
+export function ScopedList({
   state,
   isEmpty,
   noun,
@@ -92,6 +97,7 @@ function ScopedList({
   emptyTitle,
   emptyDescription,
   emptyAction,
+  fanoutOf = 'services',
   children,
 }: {
   state: ScopedListState
@@ -102,6 +108,8 @@ function ScopedList({
   emptyTitle: string
   emptyDescription: string
   emptyAction?: ReactNode
+  /** What the fan-out is capped on, for the truncation notice. */
+  fanoutOf?: string
   children: ReactNode
 }) {
   if (state.loading) {
@@ -117,46 +125,48 @@ function ScopedList({
       </div>
     )
   }
-  const partial =
-    state.failed > 0 || state.truncated ? (
-      <Alert variant={state.failed > 0 ? 'destructive' : 'default'}>
-        <AlertTitle>This list may be incomplete</AlertTitle>
-        <AlertDescription>
-          <p>
-            {state.failed > 0
-              ? `${state.failed} ${state.failed === 1 ? 'request' : 'requests'} for this project's ${noun} failed.`
-              : `Only the first ${GROUP_FANOUT_LIMIT} are included.`}
-          </p>
-          {state.failed > 0 && (
-            <Button
-              variant="outline"
-              size="sm"
-              className="mt-3"
-              onClick={state.refetch}
-            >
-              <RefreshCw className="size-4" />
-              Retry {noun}
-            </Button>
-          )}
-        </AlertDescription>
-      </Alert>
-    ) : null
-  if (isEmpty) {
+  const incomplete = state.failed > 0 || state.truncated
+  if (isEmpty && !incomplete) {
     return (
-      <div className="space-y-4">
-        {partial}
-        <div className="rounded-lg border bg-card">
-          <EmptyState
-            size="compact"
-            icon={icon}
-            title={emptyTitle}
-            description={emptyDescription}
-            action={emptyAction}
-          />
-        </div>
+      <div className="rounded-lg border bg-card">
+        <EmptyState
+          size="compact"
+          icon={icon}
+          title={emptyTitle}
+          description={emptyDescription}
+          action={emptyAction}
+        />
       </div>
     )
   }
+  const partial = incomplete ? (
+    <Alert variant={state.failed > 0 ? 'destructive' : 'default'}>
+      <AlertTitle>
+        {isEmpty
+          ? `This project's ${noun} could not be read in full`
+          : 'This list may be incomplete'}
+      </AlertTitle>
+      <AlertDescription>
+        <p>
+          {state.failed > 0
+            ? `${state.failed} ${state.failed === 1 ? 'request' : 'requests'} for this project's ${noun} failed.`
+            : `Only the first ${GROUP_FANOUT_LIMIT} ${fanoutOf} are included${isEmpty ? `, and they have no ${noun}` : ''}.`}
+        </p>
+        {state.failed > 0 && (
+          <Button
+            variant="outline"
+            size="sm"
+            className="mt-3"
+            onClick={state.refetch}
+          >
+            <RefreshCw className="size-4" />
+            Retry {noun}
+          </Button>
+        )}
+      </AlertDescription>
+    </Alert>
+  ) : null
+  if (isEmpty) return partial
   return (
     <div className="space-y-4">
       {partial}
@@ -220,14 +230,13 @@ export function GroupDeploymentsPage({
             </TableHeader>
             <TableBody>
               {deployments.map((deployment) => (
-                <TableRow key={`${deployment.service.id}-${deployment.id}`}>
+                <RecordRow key={`${deployment.service.id}-${deployment.id}`}>
                   <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <Link
+                    <RecordLink
                       to={`${projectRoot(deployment.service.slug)}/deployments/${deployment.id}`}
-                      className="hover:underline"
                     >
                       {deployment.service.name} #{deployment.id}
-                    </Link>
+                    </RecordLink>
                     <span className="block text-xs text-muted-foreground @xl:hidden">
                       {deployment.environment.name}
                     </span>
@@ -244,7 +253,7 @@ export function GroupDeploymentsPage({
                   <TableCell className="text-right text-muted-foreground">
                     <TimeAgo date={deployment.created_at} />
                   </TableCell>
-                </TableRow>
+                </RecordRow>
               ))}
             </TableBody>
           </Table>
@@ -304,13 +313,13 @@ export function GroupDomainsPage({ group }: { group: ProjectGroupResponse }) {
             </TableHeader>
             <TableBody>
               {domains.map((domain) => (
-                <TableRow key={domain.id}>
+                <RecordRow key={domain.id}>
                   <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <ServiceLink
-                      slug={domain.service.slug}
-                      name={domain.domain}
-                      sub="domains"
-                    />
+                    <RecordLink
+                      to={`${projectRoot(domain.service.slug)}/domains`}
+                    >
+                      {domain.domain}
+                    </RecordLink>
                     <span className="block text-xs text-muted-foreground @xl:hidden">
                       {domain.service.name}
                     </span>
@@ -327,7 +336,7 @@ export function GroupDomainsPage({ group }: { group: ProjectGroupResponse }) {
                   <TableCell className="text-right">
                     <Badge variant="outline">{domain.status}</Badge>
                   </TableCell>
-                </TableRow>
+                </RecordRow>
               ))}
             </TableBody>
           </Table>
@@ -373,15 +382,17 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
             </TableHeader>
             <TableBody>
               {databases.map((db) => (
-                <TableRow key={db.id}>
+                <RecordRow key={db.id}>
                   <TableCell className="font-medium">
-                    <Link
-                      to={`/storage/${db.id}`}
-                      className="flex items-center gap-2 hover:underline [overflow-wrap:anywhere]"
-                    >
-                      <ServiceLogo service={db.type} className="size-4" />
-                      {db.name}
-                    </Link>
+                    <span className="flex items-center gap-2">
+                      <ServiceLogo
+                        service={db.type}
+                        className="size-4 shrink-0"
+                      />
+                      <RecordLink to={`/storage/${db.id}`}>
+                        {db.name}
+                      </RecordLink>
+                    </span>
                     <span className="block text-xs text-muted-foreground @xl:hidden">
                       Used by {db.usedBy.map((m) => m.name).join(', ')}
                     </span>
@@ -401,7 +412,7 @@ export function GroupDatabasesPage({ group }: { group: ProjectGroupResponse }) {
                   <TableCell className="text-right">
                     <Badge variant="outline">{db.status}</Badge>
                   </TableCell>
-                </TableRow>
+                </RecordRow>
               ))}
             </TableBody>
           </Table>
@@ -439,6 +450,7 @@ export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
         state={state}
         isEmpty={backups.length === 0}
         noun="backups"
+        fanoutOf="services or databases"
         icon={DatabaseBackup}
         emptyTitle={
           databases.length === 0
@@ -462,14 +474,11 @@ export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
             </TableHeader>
             <TableBody>
               {backups.map((backup) => (
-                <TableRow key={`${backup.database.id}-${backup.id}`}>
+                <RecordRow key={`${backup.database.id}-${backup.id}`}>
                   <TableCell className="font-medium [overflow-wrap:anywhere]">
-                    <Link
-                      to={`/storage/${backup.database.id}`}
-                      className="hover:underline"
-                    >
+                    <RecordLink to={`/storage/${backup.database.id}`}>
                       {backup.database.name}
-                    </Link>
+                    </RecordLink>
                     <span className="block text-xs text-muted-foreground @xl:hidden">
                       {backup.s3_source_name}
                     </span>
@@ -486,7 +495,7 @@ export function GroupBackupsPage({ group }: { group: ProjectGroupResponse }) {
                   <TableCell className="text-right text-muted-foreground">
                     <TimeAgo date={backup.started_at} />
                   </TableCell>
-                </TableRow>
+                </RecordRow>
               ))}
             </TableBody>
           </Table>

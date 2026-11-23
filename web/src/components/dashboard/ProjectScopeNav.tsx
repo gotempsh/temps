@@ -8,9 +8,10 @@ import {
   ChevronsUpDown,
   FolderOpen,
   Plus,
+  RefreshCw,
   Rocket,
 } from 'lucide-react'
-import { Link, useLocation, useNavigate } from 'react-router'
+import { Link, useLocation } from 'react-router'
 import type {
   ProjectGroupResponse,
   ProjectResponse,
@@ -89,7 +90,6 @@ export function ProjectScopeHeader({
   currentGroupSlug?: string
 }) {
   const { compact, closeOnMobile } = useCompact()
-  const navigate = useNavigate()
   const { groups, isPending } = useProjectGroups()
   if (compact) {
     return (
@@ -145,20 +145,27 @@ export function ProjectScopeHeader({
             <DropdownMenuItem disabled>No other projects</DropdownMenuItem>
           ) : (
             groups.map((group) => (
-              <DropdownMenuItem
-                key={group.id}
-                onSelect={() => navigate(groupHref(group.slug))}
-              >
-                <span className="min-w-0 flex-1 truncate">{group.name}</span>
-                {group.slug === currentGroupSlug && (
-                  <Check className="size-4" aria-label="Current project" />
-                )}
+              <DropdownMenuItem key={group.id} asChild>
+                <Link
+                  to={groupHref(group.slug)}
+                  onClick={closeOnMobile}
+                  aria-current={
+                    group.slug === currentGroupSlug ? 'page' : undefined
+                  }
+                >
+                  <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                  {group.slug === currentGroupSlug && (
+                    <Check className="size-4" aria-label="Current project" />
+                  )}
+                </Link>
               </DropdownMenuItem>
             ))
           )}
           <DropdownMenuSeparator />
-          <DropdownMenuItem onSelect={() => navigate('/projects')}>
-            All projects
+          <DropdownMenuItem asChild>
+            <Link to="/projects" onClick={closeOnMobile}>
+              All projects
+            </Link>
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
@@ -420,8 +427,14 @@ export function ServiceScopeNav({
 }: {
   slug: string
   route: string
-  /** The menu of a service that belongs to no project. */
-  standalone: (service: ProjectResponse | undefined) => React.ReactNode
+  /**
+   * The service's own menu: for a service that belongs to no project, or,
+   * with a `notice`, when its project could not be looked up.
+   */
+  standalone: (
+    service: ProjectResponse | undefined,
+    notice?: React.ReactNode
+  ) => React.ReactNode
 }) {
   const project = useQuery(getProjectBySlugOptions({ path: { slug } }))
   const membership = useServiceGroup(project.data?.id)
@@ -445,5 +458,65 @@ export function ServiceScopeNav({
       </>
     )
   }
+  // A failed lookup is not "no project": say so and offer a retry, keeping
+  // the service's own pages reachable meanwhile.
+  if (project.data && membership.isError) {
+    return (
+      <>
+        {standalone(
+          project.data,
+          <MembershipError
+            serviceName={project.data.name}
+            onRetry={() => void membership.refetch()}
+          />
+        )}
+      </>
+    )
+  }
   return <>{standalone(project.data)}</>
+}
+
+function MembershipError({
+  serviceName,
+  onRetry,
+}: {
+  serviceName: string
+  onRetry: () => void
+}) {
+  const { compact } = useCompact()
+  if (compact) {
+    return (
+      <SidebarGroup>
+        <SidebarMenu>
+          <SidebarMenuItem>
+            <SidebarMenuButton
+              tooltip={`Could not load ${serviceName}'s project. Retry`}
+              className="justify-center text-destructive"
+              onClick={onRetry}
+            >
+              <RefreshCw />
+            </SidebarMenuButton>
+          </SidebarMenuItem>
+        </SidebarMenu>
+      </SidebarGroup>
+    )
+  }
+  return (
+    <SidebarGroup>
+      <div role="alert" className="space-y-2 rounded-md border p-3 text-xs">
+        <p className="text-muted-foreground">
+          Could not load the project {serviceName} belongs to, so its navigation
+          is unavailable.
+        </p>
+        <button
+          type="button"
+          onClick={onRetry}
+          className="inline-flex items-center gap-1.5 rounded-md border px-2 py-1 font-medium transition-colors hover:bg-sidebar-accent"
+        >
+          <RefreshCw className="size-3.5" />
+          Retry
+        </button>
+      </div>
+    </SidebarGroup>
+  )
 }

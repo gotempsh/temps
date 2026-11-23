@@ -64,8 +64,8 @@ import { legacyGroupTabRedirect } from '@/lib/console-scope'
  */
 export function ProjectGroupDetail() {
   const { slug = '' } = useParams()
-  const { search } = useLocation()
-  const legacyTab = legacyGroupTabRedirect(slug, search)
+  const { search, hash } = useLocation()
+  const legacyTab = legacyGroupTabRedirect(slug, search, hash)
   const {
     data: group,
     isLoading,

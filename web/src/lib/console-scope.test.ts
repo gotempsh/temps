@@ -165,8 +165,25 @@ describe('legacyGroupTabRedirect', () => {
     )
   })
 
+  test('keeps the hash, so a deep link still lands on its section', () => {
+    expect(
+      legacyGroupTabRedirect(
+        'shop',
+        '?tab=settings&section=routes',
+        '#setting-routes'
+      )
+    ).toBe('/p/shop/settings?section=routes#setting-routes')
+    expect(legacyGroupTabRedirect('shop', '?tab=variables', '#api')).toBe(
+      '/p/shop/variables#api'
+    )
+    expect(legacyGroupTabRedirect('shop', '?tab=variables', '')).toBe(
+      '/p/shop/variables'
+    )
+  })
+
   test('leaves a URL without a tab alone', () => {
     expect(legacyGroupTabRedirect('shop', '')).toBeNull()
     expect(legacyGroupTabRedirect('shop', '?import=1')).toBeNull()
+    expect(legacyGroupTabRedirect('shop', '', '#routes')).toBeNull()
   })
 })

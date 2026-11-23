@@ -200,7 +200,8 @@ const LEGACY_GROUP_TABS: Record<string, string> = {
  */
 export function legacyGroupTabRedirect(
   slug: string,
-  search: string
+  search: string,
+  hash = ''
 ): string | null {
   const params = new URLSearchParams(search)
   const tab = params.get('tab')
@@ -210,7 +211,7 @@ export function legacyGroupTabRedirect(
   const rest = params.toString()
   const root = `/p/${encodeURIComponent(slug)}`
   const path = target ? `${root}/${target}` : root
-  return rest ? `${path}?${rest}` : path
+  return `${rest ? `${path}?${rest}` : path}${hash}`
 }
 
 /**

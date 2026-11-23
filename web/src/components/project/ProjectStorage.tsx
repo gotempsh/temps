@@ -586,24 +586,19 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     />
   )
 
-  if (linksError || (pickerOpen && servicesError)) {
+  if (linksError) {
     return (
       <div className="space-y-6">
         {header}
         <Alert variant="destructive">
           <AlertTitle>Databases could not be loaded</AlertTitle>
           <AlertDescription>
-            {linksError
-              ? 'Could not determine which databases are linked to this service.'
-              : 'Could not load the databases on this server.'}
+            Could not determine which databases are linked to this service.
             <Button
               variant="outline"
               size="sm"
               className="ml-3"
-              onClick={() => {
-                if (pickerOpen) void refetchServices()
-                void refetchServicesLinked()
-              }}
+              onClick={() => void refetchServicesLinked()}
             >
               Retry databases
             </Button>
@@ -718,6 +713,23 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 aria-label="Loading databases on this server"
                 className="h-24 animate-pulse rounded-lg bg-muted"
               />
+            ) : servicesError ? (
+              <Alert variant="destructive">
+                <AlertTitle>
+                  The databases on this server could not be loaded
+                </AlertTitle>
+                <AlertDescription>
+                  The databases linked above are unaffected.
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="ml-3"
+                    onClick={() => void refetchServices()}
+                  >
+                    Retry
+                  </Button>
+                </AlertDescription>
+              </Alert>
             ) : (
               <>
                 <p className="text-xs text-muted-foreground">

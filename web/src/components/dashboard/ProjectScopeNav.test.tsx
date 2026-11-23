@@ -2,7 +2,13 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, describe, expect, test } from 'bun:test'
-import { cleanup, render, within } from '@testing-library/react'
+import {
+  cleanup,
+  fireEvent,
+  render,
+  waitFor,
+  within,
+} from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import type { ReactNode } from 'react'
@@ -156,5 +162,62 @@ describe('ServiceScopeNav', () => {
       </Shell>
     )
     expect(await view.findByText('standalone menu for solo'))
+  })
+
+  test('a failed project lookup says so and retries, keeping the service menu', async () => {
+    let lookups = 0
+    mockApi({
+      'GET /projects/by-slug/api': () =>
+        jsonResponse({ ...api, source_type: 'docker_image' }),
+      'GET /projects/12/group': () => {
+        lookups += 1
+        return jsonResponse({ title: 'Unavailable' }, 500)
+      },
+    })
+    const view = render(
+      <Shell at="/projects/api">
+        <ServiceScopeNav
+          slug="api"
+          route=""
+          standalone={(service, notice) => (
+            <>
+              {notice}
+              <p>standalone menu for {service?.slug}</p>
+            </>
+          )}
+        />
+      </Shell>
+    )
+    const alert = await view.findByRole('alert')
+    expect(alert.textContent).toContain('Could not load the project api')
+    expect(view.getByText('standalone menu for api'))
+    fireEvent.click(within(alert).getByRole('button', { name: 'Retry' }))
+    await waitFor(() => expect(lookups).toBe(2))
+  })
+
+  test('the project switcher lists projects as links', async () => {
+    mockApi({
+      'GET /project-groups': () =>
+        jsonResponse({ groups: [group], total: 1, page: 1, per_page: 100 }),
+    })
+    const view = render(
+      <Shell at="/p/storefront">
+        <GroupNav group={group} activeSection="overview" />
+      </Shell>
+    )
+    fireEvent.pointerDown(
+      view.getByRole('button', { name: /Storefront: switch project/ }),
+      { button: 0, ctrlKey: false }
+    )
+    const menu = await view.findByRole('menu')
+    await waitFor(() => {
+      const items = within(menu).getAllByRole('menuitem')
+      const links = items.map((item) => [
+        item.tagName,
+        item.getAttribute('href'),
+      ])
+      expect(links).toContainEqual(['A', '/p/storefront'])
+      expect(links).toContainEqual(['A', '/projects'])
+    })
   })
 })
