@@ -26,7 +26,7 @@ pub struct Model {
     /// NULL means use the built-in prompt for the trigger type.
     pub prompt: Option<String>,
     pub ai_provider: String,
-    /// Preferred model for this agent (e.g. "sonnet", "gpt-5-codex").
+    /// Preferred model for this agent (e.g. "sonnet", "gpt-6.2-sol").
     /// NULL means: let the CLI pick its default.
     pub ai_model: Option<String>,
     #[serde(skip_serializing)]
