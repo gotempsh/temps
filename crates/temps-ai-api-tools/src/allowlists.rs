@@ -453,6 +453,14 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_conversation_detail",
     "get_pricing",
     "list_provider_keys",
+    // Model catalog: source, refresh status, effective prices and models
+    // with no known price. The source URL is validated to carry no
+    // credentials, so nothing secret is returned.
+    "get_model_catalog",
+    "list_model_catalog_entries",
+    "list_unpriced_models",
+    // Coding-agent CLIs: installed vs latest published version per workspace.
+    "list_coding_agents",
     // ── Status page: monitors/incidents/uptime ──
     "list_monitors",
     "get_monitor",
