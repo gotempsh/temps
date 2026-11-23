@@ -264,6 +264,11 @@ const ANTHROPIC_HAIKU_LONG_CONTEXT: i64 = 100_000;
 const OPENAI_LONG_CONTEXT: i64 = 272_000;
 const GEMINI_LONG_CONTEXT: i64 = 200_000;
 const XAI_LONG_CONTEXT: i64 = 200_000 - 1;
+/// OpenRouter lists a route's long-context rates as an override from
+/// `min_prompt_tokens` on (inclusive): 100,000 for Claude Haiku 5.5 and
+/// 272,000 for GPT-6.x.
+const OPENROUTER_HAIKU_LONG_CONTEXT: i64 = 100_000 - 1;
+const OPENROUTER_OPENAI_LONG_CONTEXT: i64 = 272_000 - 1;
 
 pub fn build_pricing() -> Vec<ModelPricing> {
     catalog().into_iter().map(|entry| entry.pricing).collect()
@@ -1041,6 +1046,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             0.10,
             0.50,
         )
+        .long_context(OPENROUTER_HAIKU_LONG_CONTEXT, 0.50, 2.50)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1050,6 +1056,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             8.0,
             40.0,
         )
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 16.0, 60.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1059,6 +1066,17 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 4.0, 15.0)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6-luna",
+            "GPT-6 Luna (via OpenRouter)",
+            0.10,
+            0.50,
+        )
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 0.20, 0.75)
         .checked(R, D)
         .build(),
         PricingBuilder::new(

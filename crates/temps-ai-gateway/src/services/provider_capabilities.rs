@@ -84,12 +84,17 @@ fn thinking_modes(provider: &str, model: &str) -> (Vec<SelectOption>, Option<Str
 }
 
 /// `(major, minor)` of a versioned model id such as `gpt-6.2-sol` or
-/// `gemini-3.8-flash` (`minor` is 0 when absent, as in `gpt-6-luna`).
+/// `gemini-3.8-flash` (`minor` is 0 when absent, as in `gpt-6-luna` or the
+/// dated snapshot `gpt-5-2025-08-07`).
 /// `None` when `model` does not start with `prefix` and a number.
 fn family_version(model: &str, prefix: &str) -> Option<(u16, u16)> {
-    let rest = model.to_ascii_lowercase();
-    let rest = rest.strip_prefix(prefix)?;
-    let mut components = rest.split(['.', '-']);
+    let lower = model.to_ascii_lowercase();
+    let rest = lower.strip_prefix(prefix)?;
+    // The version ends at the first `-`: what follows is a variant (`-sol`)
+    // or a dated snapshot (`gpt-5-2025-08-07`), never a minor version, which
+    // only a `.` introduces.
+    let version = rest.split('-').next()?;
+    let mut components = version.split('.');
     let major = components.next()?.parse::<u16>().ok()?;
     let minor = components
         .next()
@@ -378,6 +383,26 @@ mod tests {
         assert_eq!(ids("gemini", "gemini-3.8-flash"), ["low", "medium", "high"]);
         assert_eq!(ids("gemini", "gemini-3.6-flash")[0], "minimal");
         assert!(ids("gemini", "gemini-2.5-pro").is_empty());
+    }
+
+    #[test]
+    fn a_dated_snapshot_is_not_read_as_a_minor_version() {
+        assert_eq!(family_version("gpt-5-2025-08-07", "gpt-"), Some((5, 0)));
+        assert_eq!(
+            family_version("gpt-6.2-sol-2026-11-01", "gpt-"),
+            Some((6, 2))
+        );
+        assert_eq!(family_version("gpt-6-luna", "gpt-"), Some((6, 0)));
+        assert_eq!(family_version("grok-4-1-fast", "grok-"), Some((4, 0)));
+        assert_eq!(family_version("gemini-3.8-flash", "gemini-"), Some((3, 8)));
+        assert_eq!(family_version("gpt-image-1", "gpt-"), None);
+        // GPT-5 snapshots keep GPT-5's levels; `none` and `max` are 5.6+.
+        let ids: Vec<String> = thinking_modes("openai", "gpt-5-2025-08-07")
+            .0
+            .into_iter()
+            .map(|mode| mode.id)
+            .collect();
+        assert_eq!(ids, ["low", "medium", "high", "xhigh"]);
     }
 
     #[test]

@@ -277,9 +277,10 @@ fn worst_case_is_the_most_expensive_confirmed_row() {
     // GPT-5.4 Pro and GPT-5.5 Pro, at $30 / $180, are the dearest today.
     assert_eq!((base.input, base.output), (30.0, 180.0));
     // Their long-context tier, $60 / $270, is the dearest long tier, and
-    // it starts at the lowest confirmed threshold (Claude Haiku 5.5's).
+    // it starts at the lowest confirmed threshold (Claude Haiku 5.5's on
+    // OpenRouter, which applies from 100,000 prompt tokens on).
     let (above, long) = table.worst_case.long_context.expect("a long tier");
-    assert_eq!(above, ANTHROPIC_HAIKU_LONG_CONTEXT);
+    assert_eq!(above, OPENROUTER_HAIKU_LONG_CONTEXT);
     assert_eq!((long.input, long.output), (60.0, 270.0));
 }
 
@@ -743,5 +744,53 @@ fn a_dearer_dated_snapshot_is_not_priced_as_its_cheaper_alias() {
     assert!(
         estimate("deepseek/deepseek-v4.1-flash", 1_000_000, 0)
             < estimate("deepseek/deepseek-v4.1-flash-1017", 1_000_000, 0)
+    );
+}
+
+#[test]
+fn openrouter_routes_bill_long_prompts_from_their_listed_thresholds() {
+    let none = PromptTokensDetails::default();
+    // Claude Haiku 5.5 via OpenRouter: $0.10/$0.50, and $0.50/$2.50 from
+    // 100,000 prompt tokens on (inclusive).
+    assert_eq!(
+        estimate_cost_microcents("anthropic/claude-haiku-5.5", 99_999, 1_000, none),
+        (99_999.0_f64 * 0.10 + 1_000.0 * 0.50).ceil() as i64
+    );
+    assert_eq!(
+        estimate_cost_microcents("anthropic/claude-haiku-5.5", 100_000, 1_000, none),
+        100_000 / 2 + 2_500
+    );
+    // GPT-6.2 Sol via OpenRouter switches at 272,000 prompt tokens.
+    assert_eq!(
+        estimate_cost_microcents("openai/gpt-6.2-sol", 271_999, 0, none),
+        271_999 * 2
+    );
+    assert_eq!(
+        estimate_cost_microcents("openai/gpt-6.2-sol", 272_000, 0, none),
+        272_000 * 4
+    );
+    assert_eq!(
+        estimate_cost_microcents("openai/gpt-6.2-astra", 272_000, 0, none),
+        272_000 * 16
+    );
+}
+
+#[test]
+fn the_openrouter_low_cost_default_is_priced_at_its_own_rate() {
+    let default = crate::providers::low_cost_default_model("openrouter").unwrap();
+    assert_eq!(default, "openai/gpt-6-luna");
+    let row = listed(default);
+    assert_eq!(
+        (row.input_per_million, row.output_per_million),
+        (0.10, 0.50)
+    );
+    assert_eq!(
+        estimate_cost_microcents(default, 100_000, 0, PromptTokensDetails::default()),
+        10_000
+    );
+    // From 272,000 prompt tokens the route bills $0.20 per 1M input tokens.
+    assert_eq!(
+        estimate_cost_microcents(default, 300_000, 0, PromptTokensDetails::default()),
+        60_000
     );
 }
