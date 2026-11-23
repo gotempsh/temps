@@ -168,7 +168,7 @@ Keep a project's rules in version control with `edge-rules export` and
 ## Automate in CI
 
 Store `TEMPS_TOKEN` and `TEMPS_API_URL` in the CI provider's secret store. Use
-`@temps-sdk/cli@latest` for the current stable release. Record `--version` in
+`@temps-sdk/cli@latest`, the channel these commands document. Record `--version` in
 the job output and check command `--help` before relying on flags.
 
 Run an identity check before mutation:
