@@ -34,3 +34,18 @@ export function redirectTarget(to: string, search: string, hash: string): To {
     hash: targetHash || hash,
   }
 }
+
+/**
+ * Fills `:name` segments of a redirect's target from the matched route's
+ * parameters (`/settings/notifications/:id` with `{ id: '7' }`). A segment
+ * whose parameter is missing is left as written.
+ */
+export function fillRouteParams(
+  to: string,
+  params: Readonly<Record<string, string | undefined>>
+): string {
+  return to.replace(/:([A-Za-z_][A-Za-z0-9_]*)/g, (segment, name: string) => {
+    const value = params[name]
+    return value === undefined ? segment : encodeURIComponent(value)
+  })
+}

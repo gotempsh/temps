@@ -3,19 +3,12 @@
 
 import { useMemo } from 'react'
 import { Link } from 'react-router'
-import { useQueries, useQuery } from '@tanstack/react-query'
+import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { Database, ExternalLink, Plus, RefreshCw } from 'lucide-react'
-import {
-  getProjectsQueryKey,
-  listProjectServicesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { getProjectsQueryKey } from '@/api/client/@tanstack/react-query.gen'
 import { getProjects } from '@/api/client/sdk.gen'
-import type {
-  ProjectGroupResponse,
-  ProjectResponse,
-  ServiceTypeRoute,
-} from '@/api/client'
+import type { ProjectGroupResponse, ProjectResponse } from '@/api/client'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
@@ -28,6 +21,7 @@ import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { GroupRoutesSummary } from './GroupRoutesSummary'
 import { UnfinishedImportsNotice } from './UnfinishedImportsNotice'
+import { useGroupDatabases } from './useGroupResources'
 import {
   environmentLink,
   primaryEnvironment,
@@ -258,35 +252,7 @@ function VisitServiceLink({
 
 /** Databases linked to any service in the group, with who uses each. */
 function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
-  const results = useQueries({
-    queries: group.projects.map((p) => ({
-      ...listProjectServicesOptions({ path: { project_id: p.id } }),
-      retry: false,
-    })),
-  })
-  const loading = results.some((r) => r.isLoading)
-  const failed = results.filter((r) => r.isError).length
-
-  const databases = useMemo(() => {
-    const byId = new Map<
-      number,
-      { id: number; name: string; type: ServiceTypeRoute; usedBy: string[] }
-    >()
-    results.forEach((result, index) => {
-      const member = group.projects[index]
-      for (const link of result.data ?? []) {
-        const entry = byId.get(link.service.id) ?? {
-          id: link.service.id,
-          name: link.service.name,
-          type: link.service.service_type,
-          usedBy: [],
-        }
-        if (member) entry.usedBy.push(member.name)
-        byId.set(link.service.id, entry)
-      }
-    })
-    return [...byId.values()].sort((a, b) => a.name.localeCompare(b.name))
-  }, [group.projects, results])
+  const { databases, loading, failed } = useGroupDatabases(group.projects)
 
   return (
     <section aria-labelledby="group-databases" className="space-y-3">
@@ -321,7 +287,7 @@ function GroupDatabases({ group }: { group: ProjectGroupResponse }) {
               <div className="min-w-0 flex-1">
                 <p className="truncate text-sm font-medium">{db.name}</p>
                 <p className="truncate text-xs text-muted-foreground">
-                  Used by {db.usedBy.join(', ')}
+                  Used by {db.usedBy.map((m) => m.name).join(', ')}
                 </p>
               </div>
               <Database className="size-4 text-muted-foreground" />

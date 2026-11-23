@@ -752,7 +752,7 @@ const FullAppRoutes = () => {
                         <Route path="/tools" element={<PlatformTools />} />
                         <Route path="/projects" element={<Projects />} />
                         <Route
-                          path="/p/:slug"
+                          path="/p/:slug/*"
                           element={<ProjectGroupDetail />}
                         />
                         <Route
@@ -879,9 +879,12 @@ const FullAppRoutes = () => {
                               <RedirectWithQuery to="/settings/notifications/new" />
                             }
                           />
+                          {/* Same page as Settings › Notifications › provider. */}
                           <Route
                             path="providers/edit/:id"
-                            element={<EditNotificationProvider />}
+                            element={
+                              <RedirectWithQuery to="/settings/notifications/:id" />
+                            }
                           />
                           <Route
                             path=":section"

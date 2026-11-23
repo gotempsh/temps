@@ -5,7 +5,7 @@ import { afterEach, expect, test } from 'bun:test'
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router'
 import { cleanup, render } from '@testing-library/react'
 import { installBrowserWindow } from '@/test/dom'
-import { redirectTarget } from '@/lib/redirect-target'
+import { fillRouteParams, redirectTarget } from '@/lib/redirect-target'
 import { RedirectWithQuery } from './RedirectWithQuery'
 
 installBrowserWindow()
@@ -83,5 +83,30 @@ test('a relative redirect inside nested routes keeps the query too', () => {
   )
   expect(view.getByTestId('where').textContent).toBe(
     '/monitoring/alerts?search=x'
+  )
+})
+
+test('route parameters fill the target, encoded; missing ones stay', () => {
+  expect(fillRouteParams('/settings/notifications/:id', { id: '7' })).toBe(
+    '/settings/notifications/7'
+  )
+  expect(fillRouteParams('/p/:slug/x', { slug: 'a b' })).toBe('/p/a%20b/x')
+  expect(fillRouteParams('/p/:slug', {})).toBe('/p/:slug')
+})
+
+test('a moved page with a parameter lands on its one canonical URL', () => {
+  const view = render(
+    <MemoryRouter initialEntries={['/monitoring/providers/edit/7?from=x']}>
+      <Routes>
+        <Route
+          path="/monitoring/providers/edit/:id"
+          element={<RedirectWithQuery to="/settings/notifications/:id" />}
+        />
+        <Route path="*" element={<Where />} />
+      </Routes>
+    </MemoryRouter>
+  )
+  expect(view.getByTestId('where').textContent).toBe(
+    '/settings/notifications/7?from=x'
   )
 })
