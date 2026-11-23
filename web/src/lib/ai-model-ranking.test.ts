@@ -61,4 +61,27 @@ describe('AI model relevance sorting', () => {
       sortAiModelIdsByRelevance(['gemini-3.8-flash', 'gemini-4-neon'])
     ).toEqual(['gemini-4-neon', 'gemini-3.8-flash'])
   })
+
+  test('never reads a dated snapshot as a newer minor version', () => {
+    expect(
+      sortAiModelIdsByRelevance([
+        'claude-mythos-5-20261101',
+        'claude-sonnet-4-20250514',
+        'claude-mythos-5-2',
+        'claude-opus-5-5',
+      ])
+    ).toEqual([
+      'claude-opus-5-5',
+      'claude-mythos-5-2',
+      'claude-mythos-5-20261101',
+      'claude-sonnet-4-20250514',
+    ])
+    expect(
+      sortAiModelIdsByRelevance([
+        'gpt-5-2025-08-07',
+        'gpt-6.2-sol',
+        'gpt-5.6-sol',
+      ])
+    ).toEqual(['gpt-6.2-sol', 'gpt-5.6-sol', 'gpt-5-2025-08-07'])
+  })
 })

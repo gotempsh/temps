@@ -23,8 +23,10 @@ export function aiModelRelevanceScore(modelId: string): number {
   const id = modelId.toLowerCase()
   let score = 0
 
+  // A minor version is one or two digits: the eight-digit date of a dated
+  // snapshot (`claude-sonnet-4-20250514`, `gpt-5-2025-08-07`) is not one.
   const version = id.match(
-    /(?:gpt|gemini|grok)[-_]?(\d+)(?:[.-](\d+))?|claude-(?:opus|sonnet|haiku|fable|mythos)-?(\d+)(?:[.-](\d+))?/
+    /(?:gpt|gemini|grok)[-_]?(\d+)(?:[.-](\d{1,2})(?!\d))?|claude-(?:opus|sonnet|haiku|fable|mythos)-?(\d+)(?:[.-](\d{1,2})(?!\d))?/
   )
   const major = Number(version?.[1] ?? version?.[3] ?? 0)
   const minor = Number(version?.[2] ?? version?.[4] ?? 0)
