@@ -603,12 +603,25 @@ impl SandboxService {
                 .git_provider_manager
                 .repository_clone_url(connection_id, owner, name)
                 .await
-                .map_err(|error| SandboxError::ProjectRepositoryUnresolved {
-                    project_id,
-                    name: project.name.clone(),
-                    connection_id,
-                    repository: format!("{owner}/{name}"),
-                    reason: error.to_string(),
+                .map_err(|error| {
+                    // The provider's own error describes a connection the
+                    // caller may not own (an organization's), so it is logged
+                    // here, once for every create path, and kept out of what
+                    // the caller reads (`SandboxError::caller_detail`).
+                    tracing::warn!(
+                        project_id,
+                        connection_id,
+                        repository = %format!("{owner}/{name}"),
+                        reason = %error,
+                        "project repository could not be resolved for a sandbox seed"
+                    );
+                    SandboxError::ProjectRepositoryUnresolved {
+                        project_id,
+                        name: project.name.clone(),
+                        connection_id,
+                        repository: format!("{owner}/{name}"),
+                        reason: error.to_string(),
+                    }
                 })?,
             ProjectCloneUrl::None => {
                 // A Git project with no repository is inconsistent state and

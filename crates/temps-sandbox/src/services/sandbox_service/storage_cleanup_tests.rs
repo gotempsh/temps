@@ -2030,6 +2030,65 @@ async fn source_from_project_reports_which_repository_its_connection_could_not_f
     let _ = std::fs::remove_dir_all(&data_root);
 }
 
+/// `GET /v1/sandboxes/creations/{id}` reads the creation record back, so a
+/// failed project seed must record the caller-safe text there, as the 502
+/// does, never the provider's error about a connection the caller may not own.
+#[tokio::test]
+async fn a_failed_project_seed_keeps_the_providers_error_out_of_the_creation_record() {
+    let mut server = mockito::Server::new_async().await;
+    let repository = server
+        .mock("GET", "/repos/acme/api")
+        .with_status(404)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"message":"Not Found"}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let connection = git_connection(None, "connection-token");
+    let data_root = unique_data_root("project-seed-progress");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![project_row(None)]])
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let creation_id = "project-seed-progress-1";
+    let err = service
+        .create_sandbox(
+            1,
+            CreateSandboxRequest {
+                project_id: Some(12),
+                creation_id: Some(creation_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a repository the connection cannot read fails the create");
+    let SandboxError::ProjectRepositoryUnresolved { ref reason, .. } = err else {
+        panic!("expected ProjectRepositoryUnresolved, got {err:?}");
+    };
+    assert!(!reason.is_empty(), "the error itself keeps the diagnostic");
+
+    let creation = service
+        .creations
+        .get(1, creation_id)
+        .expect("the failed create keeps its record");
+    let recorded = creation.error.expect("a failed create records its error");
+    assert_eq!(recorded, err.caller_detail());
+    assert!(!recorded.contains(reason.as_str()), "{recorded}");
+    let failed_step = creation
+        .steps
+        .iter()
+        .find_map(|step| step.error.as_deref())
+        .expect("the failed step records its error");
+    assert_eq!(failed_step, recorded);
+    repository.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
 #[tokio::test]
 async fn source_from_project_errors_when_the_project_is_missing() {
     let data_root = unique_data_root("project-missing");

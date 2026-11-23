@@ -188,23 +188,10 @@ impl From<SandboxError> for Problem {
             SandboxError::ProjectHasNoRepo { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Project Has No Repository")
                 .with_detail(error.to_string()),
-            SandboxError::ProjectRepositoryUnresolved {
-                project_id,
-                connection_id,
-                ref repository,
-                ref reason,
-                ..
-            } => {
-                // The provider's own error text describes a connection the
-                // caller may not own (an organization's), so it goes to the
-                // log; the response names the project and repository.
-                tracing::warn!(
-                    project_id,
-                    connection_id,
-                    repository = %repository,
-                    reason = %reason,
-                    "project repository could not be resolved for a sandbox seed"
-                );
+            // The provider's own error text describes a connection the caller
+            // may not own (an organization's); it was logged where the error
+            // was raised, and the response names the project and repository.
+            SandboxError::ProjectRepositoryUnresolved { .. } => {
                 problemdetails::new(StatusCode::BAD_GATEWAY)
                     .with_title("Project Repository Unavailable")
                     .with_detail(error.caller_detail())
@@ -3447,7 +3434,7 @@ mod tests {
     }
 
     #[test]
-    fn unresolved_project_repository_problem_keeps_the_provider_error_in_the_log() {
+    fn unresolved_project_repository_problem_keeps_the_provider_error_out_of_the_response() {
         let problem = Problem::from(SandboxError::ProjectRepositoryUnresolved {
             project_id: 3,
             name: "example-project".into(),

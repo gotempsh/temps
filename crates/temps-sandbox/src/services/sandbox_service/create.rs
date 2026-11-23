@@ -115,7 +115,10 @@ impl SandboxService {
         let result = self.create_sandbox_steps(user_id, req, &progress).await;
         match &result {
             Ok(_) => progress.succeed(UNREPORTED_STEP_DETAIL),
-            Err(error) => progress.fail(&error.to_string()),
+            // The record is read back by the caller (`GET
+            // /v1/sandboxes/creations/{id}`), so it gets the caller-safe text;
+            // a provider's diagnostic stays in the server log.
+            Err(error) => progress.fail(&error.caller_detail()),
         }
         result
     }
