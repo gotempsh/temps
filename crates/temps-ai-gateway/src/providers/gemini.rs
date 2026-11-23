@@ -24,6 +24,22 @@ impl Default for GeminiProvider {
     }
 }
 
+/// Major version of a `gemini-<major>[.<minor>]-...` model id.
+fn gemini_major_version(model: &str) -> Option<u32> {
+    model
+        .to_ascii_lowercase()
+        .strip_prefix("gemini-")?
+        .split(['.', '-'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Gemini 3 and later take a `thinkingLevel` instead of a thinking budget.
+fn uses_thinking_levels(model: &str) -> bool {
+    gemini_major_version(model).is_some_and(|major| major >= 3)
+}
+
 impl GeminiProvider {
     pub fn new() -> Self {
         let client = ProviderHttpClient::new(Duration::from_secs(300));
@@ -188,7 +204,7 @@ impl GeminiProvider {
                 .as_ref()
                 .and_then(|extra| extra.get("reasoning_effort"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|_| request.model.starts_with("gemini-3"))
+                .filter(|_| uses_thinking_levels(&request.model))
                 .map(|level| GeminiThinkingConfig {
                     thinking_level: level.to_string(),
                 }),
@@ -1032,6 +1048,32 @@ mod tests {
         let config = translated.generation_config.unwrap();
         assert_eq!(config.max_output_tokens, Some(1000));
         assert_eq!(config.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn test_translate_request_maps_thinking_for_gemini_4_and_later_only() {
+        for (model, expected) in [
+            ("gemini-4-hydrogen", Some("high")),
+            ("gemini-4.1-neon", Some("high")),
+            ("gemini-10-pro", Some("high")),
+            ("gemini-3-flash-preview", Some("high")),
+            ("gemini-2.5-pro", None),
+            ("gemini-flash-latest", None),
+        ] {
+            let mut request = make_request(Vec::new());
+            request.model = model.to_string();
+            request.extra = Some(serde_json::Map::from_iter([(
+                "reasoning_effort".to_string(),
+                serde_json::json!("high"),
+            )]));
+            let value = serde_json::to_value(GeminiProvider::translate_request(&request))
+                .expect("request serializes");
+            assert_eq!(
+                value["generationConfig"]["thinkingConfig"]["thinkingLevel"].as_str(),
+                expected,
+                "{model}"
+            );
+        }
     }
 
     #[test]
