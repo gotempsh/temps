@@ -223,9 +223,13 @@ class ReleaseTests(unittest.TestCase):
     def test_cli_is_available_for_main_release_selection(self):
         catalog = release.read_json(release.ROOT / '.github/releases/packages.json')
         self.assertEqual(catalog['cli'], {
-            'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli'})
+            'kind': 'npm', 'path': 'apps/temps-cli', 'name': '@temps-sdk/cli',
+            'stamped': ['skills/temps-cli/references/COMMANDS.md']})
         package = next(p for p in release.catalog_packages() if p['key'] == 'cli')
         self.assertEqual(release.plan(package['tag']), [package])
+        # The generated command reference names the current CLI version, so `prepare` can move it.
+        reference = (release.ROOT / 'skills/temps-cli/references/COMMANDS.md').read_text()
+        self.assertIn(f"`@temps-sdk/cli@{package['version']}`", reference)
 
     def test_npm_archive_checks_manifest_dependencies_and_entrypoints(self):
         package = dict(self.catalog['cli'], key='cli', version='1.2.3')
@@ -903,6 +907,26 @@ class PrepareTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'app: depends on @temps-sdk/core 1.1.0-beta.1, which is neither published'):
             self.prepare('v9.0.0-beta.1')
         self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+
+    def test_a_bump_rewrites_the_version_stamped_in_generated_files(self):
+        reference = 'skills/cli/COMMANDS.md'
+        self.write(reference, '> Generated from: `@temps-sdk/cli@0.1.38`\n\n`@temps-sdk/cli@0.1.380` is another version.\n')
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38'}, stamped=[reference])
+        self.change('cli', 'feat: deploy previews')
+        _, files = self.prepare('v9.0.0-beta.1')
+        self.assertIn(reference, files)
+        self.assertEqual(self.read(reference), '> Generated from: `@temps-sdk/cli@0.1.39-beta.1`\n\n'
+                                               '`@temps-sdk/cli@0.1.380` is another version.\n')
+
+    def test_a_stale_version_stamp_fails_before_anything_is_written(self):
+        reference = 'skills/cli/COMMANDS.md'
+        self.write(reference, '> Generated from: `@temps-sdk/cli@0.1.37`\n')
+        self.add('cli', 'npm', '0.1.38', published={'0.1.38'}, stamped=[reference])
+        self.change('cli', 'feat: deploy previews')
+        with self.assertRaisesRegex(ValueError, r'COMMANDS\.md: expected 1 @temps-sdk/cli@0\.1\.38 stamp, found 0'):
+            self.prepare('v9.0.0-beta.1')
+        self.assertEqual(self.read('.github/releases/prepared.json'), '{}\n')
+        self.assertEqual(self.version('cli'), '0.1.38')
 
     def test_prepare_is_idempotent(self):
         self.add('analytics-core', 'npm', '0.0.6', published={'0.0.6'})

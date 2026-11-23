@@ -619,6 +619,18 @@ def set_lockfile_versions(edits, package, version, root, dependents=()):
                       rf'\g<1>{version}\g<2>', what=f'path package entry for {name} {old}')
 
 
+def set_stamped_versions(edits, package, version):
+    """Rewrite `name@old` in committed files generated from the package (catalog `stamped`).
+
+    The CLI's command reference records the CLI version it was generated from, and a
+    test keeps it equal to the manifest, so a bump that skipped it would fail the build.
+    """
+    name, old = package['name'], package['version']
+    for path in package.get('stamped', []):
+        edits.replace(path, rf'{re.escape(name)}@{re.escape(old)}(?![0-9A-Za-z.+-])', f'{name}@{version}',
+                      what=f'{name}@{old} stamp')
+
+
 def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True, at_tag=False):
     """Select and version SDK releases for server tag `tag`; returns (selection, changed files).
 
@@ -680,6 +692,7 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
         if version != package['version']:
             set_manifest_version(edits, package, version)
             set_lockfile_versions(edits, package, version, root, dependents)
+            set_stamped_versions(edits, package, version)
         for dependent in dependents:
             set_dependency_pins(edits, dependent, package, version)
         set_lockfile_ranges(edits, package, version, root, dependents)
