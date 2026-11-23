@@ -44,8 +44,14 @@ apart. Model availability and prices must not depend on that schedule.
   read and everything else is skipped without being parsed into memory. A row
   is rejected when a price is negative, not finite, or above
   $10,000 per 1M tokens. A catalog can lower a price but never make a paid
-  model free, and the bundled long-context tiers stay in force.
-- **Fetch limits**: `https://` only, no credentials in the URL, no private,
+  model free, and the bundled long-context tiers stay in force, including for
+  a dated snapshot of a bundled model. A model id listed under two providers
+  keeps each provider's price: usage is recorded at the serving provider's
+  price, and where only the model is known the dearer one applies, whatever
+  the catalog order.
+- **Fetch limits**: `https://` only, no credentials, query string or fragment
+  in the URL (it is shown to every gateway reader, stored on each entry and
+  logged, so a signed or token-bearing URL is refused), no private,
   loopback or metadata addresses (checked when the URL is saved and again by
   the resolver when connecting), no redirects, 30 s timeout, 16 MiB body,
   20,000 models.
@@ -66,8 +72,7 @@ apart. Model availability and prices must not depend on that schedule.
   /ai/model-catalog/models` (paginated, default 20, max 100) and `GET
   /ai/model-catalog/unpriced`. Writes need `ai_gateway:write` and
   `system:admin`, because a catalog reprices every project's usage, and are
-  audit-logged with the source host only (a custom URL's path or query may
-  carry a token).
+  audit-logged with the source host only.
 
 ### D2. Coding-agent CLIs kept current at runtime
 
@@ -94,9 +99,10 @@ apart. Model availability and prices must not depend on that schedule.
   are reproducible. Published runtime images bundle the latest stable release
   of each CLI at build time, never older than the pin, and record the versions
   in `sh.temps.cli.*` image labels.
-- **Model entry**: pickers accept any model id, with the catalog and the
-  provider's own list as suggestions, so a model newer than both is still
-  usable.
+- **Model entry**: a gateway key's models come from live discovery, so a
+  model newer than the catalog is selectable once the key's models are
+  refreshed. The key's enabled-model list stays the operator's policy: an id
+  that is not on it is refused, never typed in around it.
 
 ### D3. Console
 

@@ -26,10 +26,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
-use sea_orm::sea_query::OnConflict;
+use sea_orm::sea_query::{NullOrdering, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    FromQueryResult, Order, PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set,
+    TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use temps_entities::{
@@ -73,6 +74,20 @@ const INSERT_BATCH: usize = 500;
 const MAX_ERROR_LEN: usize = 500;
 /// Most unpriced models listed in one report.
 const MAX_UNPRICED_LISTED: usize = 100;
+
+/// Rows the unpriced-model report reads per query, so its memory is bounded
+/// by this, not by the installation's whole model inventory.
+const UNPRICED_SCAN_CHUNK: u64 = 500;
+
+/// The columns the unpriced-model report needs from a model and its key.
+#[derive(Debug, FromQueryResult)]
+struct UnpricedCandidate {
+    provider_key_id: i32,
+    provider_key_name: String,
+    provider: String,
+    model_id: String,
+    metadata: Option<serde_json::Value>,
+}
 
 // ============================================================================
 // DTOs
@@ -412,18 +427,18 @@ fn stored_price(row: &ai_model_catalog_entries::Model) -> Option<pricing::Catalo
 
 /// Whether a key's model has a price: its discovered listing publishes one,
 /// or the effective price table covers its id.
-fn model_is_priced(row: &ai_provider_models::Model) -> bool {
+fn model_is_priced(row: &UnpricedCandidate) -> bool {
     let listed = row
         .metadata
-        .clone()
-        .and_then(|metadata| serde_json::from_value::<ModelDetails>(metadata).ok())
+        .as_ref()
+        .and_then(|metadata| ModelDetails::deserialize(metadata).ok())
         .is_some_and(|details| {
             details
                 .input_price_per_million
                 .zip(details.output_price_per_million)
                 .is_some_and(|(input, output)| input.is_finite() && output.is_finite())
         });
-    listed || pricing::is_priced(&row.model_id)
+    listed || pricing::is_priced_for(&row.provider, &row.model_id)
 }
 
 // ============================================================================
@@ -611,8 +626,14 @@ impl ModelCatalogService {
             }
         }
         let total = query.clone().count(self.db.as_ref()).await?;
+        // Undated entries go last: PostgreSQL puts NULL first in a descending
+        // sort, which would push every dated release off the first page.
         let items = query
-            .order_by_desc(ai_model_catalog_entries::Column::ReleaseDate)
+            .order_by_with_nulls(
+                ai_model_catalog_entries::Column::ReleaseDate,
+                Order::Desc,
+                NullOrdering::Last,
+            )
             .order_by_asc(ai_model_catalog_entries::Column::Provider)
             .order_by_asc(ai_model_catalog_entries::Column::ModelId)
             .offset(temps_core::config::page_offset(page, page_size))
@@ -630,29 +651,86 @@ impl ModelCatalogService {
     /// Models enabled on an active vendor key that no price covers.
     /// Self-hosted keys are left out: their models have no vendor price by
     /// design and are recorded at zero.
+    ///
+    /// Reads only the columns it needs, `UNPRICED_SCAN_CHUNK` rows at a time,
+    /// and keeps at most `MAX_UNPRICED_LISTED` of them, so memory does not
+    /// grow with the model inventory; the rest are only counted.
     pub async fn unpriced_models(&self) -> Result<UnpricedModelReport, ModelCatalogError> {
-        let rows = ai_provider_models::Entity::find()
-            .find_also_related(ai_provider_keys::Entity)
-            .filter(ai_provider_models::Column::IsEnabled.eq(true))
-            .filter(ai_provider_models::Column::IsAvailable.eq(true))
-            .filter(ai_provider_keys::Column::IsActive.eq(true))
-            .order_by_asc(ai_provider_models::Column::ProviderKeyId)
-            .order_by_asc(ai_provider_models::Column::ModelId)
-            .all(self.db.as_ref())
-            .await?;
-        let mut unpriced = rows
-            .into_iter()
-            .filter_map(|(model, key)| key.map(|key| (model, key)))
-            .filter(|(_, key)| !crate::self_hosted::is_self_hosted(&key.provider))
-            .filter(|(model, _)| !model_is_priced(model))
-            .map(|(model, key)| UnpricedModel {
-                provider_key_id: key.id,
-                provider_key_name: key.display_name,
-                provider: key.provider,
-                model_id: model.model_id,
-            });
-        let models: Vec<UnpricedModel> = unpriced.by_ref().take(MAX_UNPRICED_LISTED).collect();
-        let total = models.len() + unpriced.count();
+        self.scan_unpriced(UNPRICED_SCAN_CHUNK, |_| async {}).await
+    }
+
+    /// `unpriced_models`, reading `chunk_size` rows per query and calling
+    /// `after_chunk` with the chunk number after each one (tests change the
+    /// inventory there).
+    async fn scan_unpriced<F, Fut>(
+        &self,
+        chunk_size: u64,
+        mut after_chunk: F,
+    ) -> Result<UnpricedModelReport, ModelCatalogError>
+    where
+        F: FnMut(usize) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use sea_orm::Condition;
+        let mut models = Vec::new();
+        let mut total = 0usize;
+        // Keyset pagination on the unique (key, model) pair: a row enabled,
+        // disabled or removed during the scan cannot shift a later row past
+        // the cursor, as an OFFSET would.
+        let mut after: Option<(i32, String)> = None;
+        for chunk_number in 0.. {
+            let mut query = ai_provider_models::Entity::find()
+                .select_only()
+                .column(ai_provider_models::Column::ProviderKeyId)
+                .column(ai_provider_models::Column::ModelId)
+                .column(ai_provider_models::Column::Metadata)
+                .column_as(ai_provider_keys::Column::DisplayName, "provider_key_name")
+                .column_as(ai_provider_keys::Column::Provider, "provider")
+                .inner_join(ai_provider_keys::Entity)
+                .filter(ai_provider_models::Column::IsEnabled.eq(true))
+                .filter(ai_provider_models::Column::IsAvailable.eq(true))
+                .filter(ai_provider_keys::Column::IsActive.eq(true));
+            if let Some((key_id, model_id)) = &after {
+                query = query.filter(
+                    Condition::any()
+                        .add(ai_provider_models::Column::ProviderKeyId.gt(*key_id))
+                        .add(
+                            Condition::all()
+                                .add(ai_provider_models::Column::ProviderKeyId.eq(*key_id))
+                                .add(ai_provider_models::Column::ModelId.gt(model_id.clone())),
+                        ),
+                );
+            }
+            let chunk = query
+                .order_by_asc(ai_provider_models::Column::ProviderKeyId)
+                .order_by_asc(ai_provider_models::Column::ModelId)
+                .limit(chunk_size)
+                .into_model::<UnpricedCandidate>()
+                .all(self.db.as_ref())
+                .await?;
+            let full = chunk.len() as u64 == chunk_size;
+            after = chunk
+                .last()
+                .map(|row| (row.provider_key_id, row.model_id.clone()));
+            for row in chunk {
+                if crate::self_hosted::is_self_hosted(&row.provider) || model_is_priced(&row) {
+                    continue;
+                }
+                total += 1;
+                if models.len() < MAX_UNPRICED_LISTED {
+                    models.push(UnpricedModel {
+                        provider_key_id: row.provider_key_id,
+                        provider_key_name: row.provider_key_name,
+                        provider: row.provider,
+                        model_id: row.model_id,
+                    });
+                }
+            }
+            if !full {
+                break;
+            }
+            after_chunk(chunk_number).await;
+        }
         Ok(UnpricedModelReport { models, total })
     }
 
@@ -660,6 +738,8 @@ impl ModelCatalogService {
     /// without network access keeps the last catalog.
     pub async fn load_stored(&self) -> Result<usize, ModelCatalogError> {
         let rows = ai_model_catalog_entries::Entity::find()
+            .order_by_asc(ai_model_catalog_entries::Column::Provider)
+            .order_by_asc(ai_model_catalog_entries::Column::ModelId)
             .limit(source::MAX_CATALOG_MODELS as u64)
             .all(self.db.as_ref())
             .await?;

@@ -21,7 +21,7 @@
 //! stays the fallback, keeps every long-context tier, and alone decides the
 //! worst-case rate charged for models no price covers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, OnceLock};
 
 use arc_swap::ArcSwap;
@@ -1247,6 +1247,19 @@ struct Rates {
 }
 
 impl Rates {
+    /// Each rate at the higher of the two, and the long-context tier (when
+    /// either has one) from the lower threshold, so the result never bills
+    /// below either input.
+    fn dearest(self, other: Rates) -> Rates {
+        let base = self.base.max(other.base);
+        let long_context = match (self.long_context, other.long_context) {
+            (Some((a, tier_a)), Some((b, tier_b))) => Some((a.min(b), tier_a.max(tier_b))),
+            (one, other) => one.or(other),
+        }
+        .map(|(above, tier)| (above, tier.max(base)));
+        Rates { base, long_context }
+    }
+
     fn from_entry(entry: &CatalogEntry) -> Self {
         let pricing = &entry.pricing;
         let input = pricing.input_per_million;
@@ -1346,18 +1359,31 @@ impl RateTable {
     /// Rates for `model`: its exact id, or else the longest listed id it
     /// extends at a `-`, `:` or `@` boundary. `None` when it is not listed.
     fn rates_for(&self, model: &str) -> Option<Rates> {
-        self.by_model.get(model).copied().or_else(|| {
-            self.by_model
-                .iter()
-                .filter(|(id, _)| {
-                    model.strip_prefix(id.as_str()).is_some_and(|rest| {
-                        rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
-                    })
-                })
-                .max_by_key(|(id, _)| id.len())
-                .map(|(_, rates)| *rates)
-        })
+        lookup_rates(&self.by_model, model)
     }
+}
+
+/// `model`'s rates in `by_model`: its exact id, or else the longest listed id
+/// it extends at a `-`, `:` or `@` boundary.
+fn lookup_rates(by_model: &HashMap<String, Rates>, model: &str) -> Option<Rates> {
+    by_model
+        .get(model)
+        .copied()
+        .or_else(|| prefix_rates(by_model, model).map(|(_, rates)| rates))
+}
+
+/// The longest id in `by_model` that `model` extends at a `-`, `:` or `@`
+/// boundary, with its length.
+fn prefix_rates(by_model: &HashMap<String, Rates>, model: &str) -> Option<(usize, Rates)> {
+    by_model
+        .iter()
+        .filter(|(id, _)| {
+            model.strip_prefix(id.as_str()).is_some_and(|rest| {
+                rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
+            })
+        })
+        .max_by_key(|(id, _)| id.len())
+        .map(|(id, rates)| (id.len(), *rates))
 }
 
 /// Cost of one request at `tier`, in microcents, rounded up.
@@ -1416,9 +1442,41 @@ pub fn is_valid_catalog_price(price: f64) -> bool {
 
 /// The rates estimates use: the bundled table with the runtime catalog's
 /// prices applied, and the catalog prices that were applied.
+///
+/// A catalog may list one model id under several providers at different
+/// prices. `by_provider` keeps each provider's own rate, for callers that know
+/// which provider served the request; `table`, used when only the model is
+/// known, holds the dearest of them, so the result does not depend on catalog
+/// order and never bills below any provider's price.
 struct EffectivePricing {
     table: RateTable,
-    applied: HashMap<String, CatalogPrice>,
+    by_provider: HashMap<String, HashMap<String, Rates>>,
+    applied: BTreeMap<(String, String), CatalogPrice>,
+}
+
+impl EffectivePricing {
+    /// Rates for `model` served by `provider`. An exact id always wins over
+    /// a prefix, so a bundled `gpt-5.5-pro` row is not replaced by a catalog
+    /// price for `gpt-5.5`: the provider's own catalog row for the exact id,
+    /// then the table's; otherwise the longest matching prefix in either, the
+    /// provider's row on a tie.
+    fn rates_for(&self, provider: &str, model: &str) -> Option<Rates> {
+        let own = self.by_provider.get(provider);
+        if let Some(rates) = own.and_then(|by_model| by_model.get(model)) {
+            return Some(*rates);
+        }
+        if let Some(rates) = self.table.by_model.get(model) {
+            return Some(*rates);
+        }
+        let own_prefix = own.and_then(|by_model| prefix_rates(by_model, model));
+        let table_prefix = prefix_rates(&self.table.by_model, model);
+        match (own_prefix, table_prefix) {
+            (Some((own_len, own)), Some((table_len, table))) => {
+                Some(if own_len >= table_len { own } else { table })
+            }
+            (own, table) => own.or(table).map(|(_, rates)| rates),
+        }
+    }
 }
 
 fn effective() -> &'static ArcSwap<EffectivePricing> {
@@ -1426,7 +1484,8 @@ fn effective() -> &'static ArcSwap<EffectivePricing> {
     EFFECTIVE.get_or_init(|| {
         ArcSwap::from_pointee(EffectivePricing {
             table: rate_table().clone(),
-            applied: HashMap::new(),
+            by_provider: HashMap::new(),
+            applied: BTreeMap::new(),
         })
     })
 }
@@ -1486,21 +1545,38 @@ impl RateTable {
     /// This table with `prices` applied by exact model id. The worst case is
     /// kept: catalog prices are not reviewed like this table, so they never
     /// raise or lower what an unpriced model is charged.
+    ///
+    /// Each price is checked against the bundled rates the model already
+    /// had, by exact id or inherited from the id it extends (a dated
+    /// snapshot of a tiered model keeps its parent's long-context tier and
+    /// cannot be made free).
     fn with_catalog(&self, prices: &[CatalogPrice]) -> EffectivePricing {
-        let mut by_model = self.by_model.clone();
-        let mut applied = HashMap::new();
+        let mut catalog_by_model: HashMap<String, Rates> = HashMap::new();
+        let mut by_provider: HashMap<String, HashMap<String, Rates>> = HashMap::new();
+        let mut applied = BTreeMap::new();
         for price in prices {
-            let bundled = self.by_model.get(&price.model).copied();
-            if let Some(rates) = catalog_rates(price, bundled) {
-                by_model.insert(price.model.clone(), rates);
-                applied.insert(price.model.clone(), price.clone());
-            }
+            let bundled = self.rates_for(&price.model);
+            let Some(rates) = catalog_rates(price, bundled) else {
+                continue;
+            };
+            by_provider
+                .entry(price.provider.clone())
+                .or_default()
+                .insert(price.model.clone(), rates);
+            catalog_by_model
+                .entry(price.model.clone())
+                .and_modify(|existing| *existing = existing.dearest(rates))
+                .or_insert(rates);
+            applied.insert((price.provider.clone(), price.model.clone()), price.clone());
         }
+        let mut by_model = self.by_model.clone();
+        by_model.extend(catalog_by_model);
         EffectivePricing {
             table: RateTable {
                 by_model,
                 worst_case: self.worst_case,
             },
+            by_provider,
             applied,
         }
     }
@@ -1534,6 +1610,12 @@ pub fn is_priced(model: &str) -> bool {
     effective().load().table.rates_for(model).is_some()
 }
 
+/// Whether a price covers `model` when `provider` serves it: that provider's
+/// catalog price, or any price `is_priced` finds.
+pub fn is_priced_for(provider: &str, model: &str) -> bool {
+    effective().load().rates_for(provider, model).is_some()
+}
+
 /// The effective price list: the bundled rows with runtime catalog prices
 /// applied, followed by the models only the catalog lists.
 pub fn effective_pricing() -> Vec<ModelPricing> {
@@ -1541,7 +1623,10 @@ pub fn effective_pricing() -> Vec<ModelPricing> {
     let mut rows = build_pricing();
     let mut seen = std::collections::HashSet::new();
     for row in &mut rows {
-        if let Some(price) = current.applied.get(&row.model) {
+        if let Some(price) = current
+            .applied
+            .get(&(row.provider.clone(), row.model.clone()))
+        {
             row.input_per_million = price.input_per_million;
             row.output_per_million = price.output_per_million;
             row.cache_hit_per_million = price.cache_read_per_million;
@@ -1553,14 +1638,15 @@ pub fn effective_pricing() -> Vec<ModelPricing> {
             row.deprecated = row.deprecated || price.deprecated;
             row.source = PriceSource::Catalog;
         }
-        seen.insert(row.model.clone());
+        seen.insert((row.provider.clone(), row.model.clone()));
     }
-    let mut extra: Vec<&CatalogPrice> = current
+    // `applied` is ordered by (provider, model), so the extra rows are too.
+    let extra: Vec<&CatalogPrice> = current
         .applied
-        .values()
-        .filter(|price| !seen.contains(&price.model))
+        .iter()
+        .filter(|(key, _)| !seen.contains(*key))
+        .map(|(_, price)| price)
         .collect();
-    extra.sort_by(|a, b| (&a.provider, &a.model).cmp(&(&b.provider, &b.model)));
     rows.extend(extra.into_iter().map(|price| ModelPricing {
         model: price.model.clone(),
         display_name: price.display_name.clone(),
@@ -1607,6 +1693,42 @@ pub fn estimate_cost_microcents(
     )
 }
 
+/// `estimate_cost_microcents` for a request `provider` served: that
+/// provider's own catalog price wins over another provider's for the same id.
+pub fn estimate_cost_microcents_for(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let current = effective().load();
+    let rates = current
+        .rates_for(provider, model)
+        .unwrap_or(current.table.worst_case);
+    cost_at(
+        rates.for_request(input_tokens.max(0)),
+        input_tokens,
+        output_tokens,
+        cache,
+    )
+}
+
+/// `estimate_batch_total_cost_microcents` for a batch `provider` served.
+pub fn estimate_batch_total_cost_microcents_for(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let current = effective().load();
+    let rates = current
+        .rates_for(provider, model)
+        .unwrap_or(current.table.worst_case);
+    cost_at(rates.base, input_tokens, output_tokens, cache)
+}
+
 /// Estimate the provider cost of a batch's total usage, in microcents.
 ///
 /// Like `estimate_cost_microcents`, but at the base tier: the total of many
@@ -1637,12 +1759,16 @@ pub fn estimate_batch_total_cost_microcents(
 /// usage service records the higher of that figure and this one, so a long
 /// prompt to a tiered model is never recorded at the base rate.
 pub fn long_context_cost_microcents(
+    provider: &str,
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> Option<i64> {
-    let (above, tier) = effective().load().table.rates_for(model)?.long_context?;
+    let (above, tier) = effective()
+        .load()
+        .rates_for(provider, model)?
+        .long_context?;
     (input_tokens > above).then(|| cost_at(tier, input_tokens, output_tokens, cache))
 }
 

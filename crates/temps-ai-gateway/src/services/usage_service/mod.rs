@@ -111,6 +111,7 @@ fn catalogue_cost_microcents(
         return catalogue_cost;
     }
     crate::services::pricing::long_context_cost_microcents(
+        provider,
         model,
         input_tokens,
         output_tokens,
@@ -144,12 +145,20 @@ fn unlisted_cost_microcents(
         return None;
     }
     Some(match count {
-        UsageCount::OneRequest => {
-            pricing::estimate_cost_microcents(model, input_tokens, output_tokens, cache)
-        }
-        UsageCount::BatchTotal => {
-            pricing::estimate_batch_total_cost_microcents(model, input_tokens, output_tokens, cache)
-        }
+        UsageCount::OneRequest => pricing::estimate_cost_microcents_for(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cache,
+        ),
+        UsageCount::BatchTotal => pricing::estimate_batch_total_cost_microcents_for(
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            cache,
+        ),
     })
 }
 
@@ -186,7 +195,10 @@ pub(crate) fn recorded_cost_microcents(
             cache,
             count,
         ) {
-            Some(cost) => (cost, crate::services::pricing::is_priced(model)),
+            Some(cost) => (
+                cost,
+                crate::services::pricing::is_priced_for(provider, model),
+            ),
             None => (0, false),
         },
     }

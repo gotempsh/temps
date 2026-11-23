@@ -247,7 +247,6 @@ fn only_public_https_urls_without_credentials_are_catalog_sources() {
         "http://catalog.example.com/api.json",
         "ftp://catalog.example.com/api.json",
         "https://user:secret@catalog.example.com/api.json",
-        "https://token@catalog.example.com/api.json",
         "https://127.0.0.1/api.json",
         "https://localhost/api.json",
         "https://10.0.0.5/api.json",
@@ -256,12 +255,60 @@ fn only_public_https_urls_without_credentials_are_catalog_sources() {
         "not a url",
     ] {
         match validate_source_url(url) {
-            Err(ModelCatalogError::InvalidSourceUrl { url: got, .. }) => assert_eq!(got, url),
+            // The error names the URL, with any credentials cut out.
+            Err(ModelCatalogError::InvalidSourceUrl { url: got, .. }) => {
+                assert_eq!(got, url.replace("user:secret@", ""))
+            }
             other => panic!("{url} was accepted: {other:?}"),
         }
     }
     let long = format!("https://catalog.example.com/{}", "a".repeat(2100));
     assert!(validate_source_url(&long).is_err());
+}
+
+#[test]
+fn a_token_bearing_catalog_url_is_rejected_and_never_echoed() {
+    for (url, shown) in [
+        (
+            "https://token@catalog.example.com/api.json",
+            "https://catalog.example.com/api.json",
+        ),
+        (
+            "https://catalog.example.com/api.json?token=secret",
+            "https://catalog.example.com/api.json",
+        ),
+        (
+            "https://catalog.example.com/api.json?sig=0a1b2c3d4e5f",
+            "https://catalog.example.com/api.json",
+        ),
+        (
+            "https://catalog.example.com/api.json#secret",
+            "https://catalog.example.com/api.json",
+        ),
+        (
+            "https://user:secret@catalog.example.com/v1/api.json?x=1",
+            "https://catalog.example.com/v1/api.json",
+        ),
+        // A mistyped scheme delimiter still parses with userinfo.
+        (
+            "https:/user:secret@catalog.example.com/api.json",
+            "https://catalog.example.com/api.json",
+        ),
+        // Unparseable input that could hold a credential is withheld.
+        ("not a url user:secret@host", "withheld"),
+    ] {
+        match validate_source_url(url) {
+            Err(error @ ModelCatalogError::InvalidSourceUrl { .. }) => {
+                let message = error.to_string();
+                assert!(message.contains(shown), "{message}");
+                // The credential values, not the validator's own wording.
+                for secret in ["secret", "token@", "token=", "0a1b2c3d4e5f"] {
+                    assert!(!message.contains(secret), "{url}: {message}");
+                }
+            }
+            other => panic!("{url} was accepted: {other:?}"),
+        }
+    }
 }
 
 #[test]
@@ -664,4 +711,135 @@ async fn enabled_models_no_price_covers_are_reported_and_self_hosted_ones_are_no
             model_id: "vendor/example-unknown".into(),
         }]
     );
+}
+
+#[tokio::test]
+async fn undated_catalog_entries_sort_after_every_dated_release() {
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let _serial = CATALOG_TEST_LOCK.lock().await;
+    let service = service_on(test_db.connection_arc());
+    let dated = |id: &str, date: Option<&str>| CatalogModel {
+        release_date: date.map(str::to_string),
+        ..model("openai", id, None)
+    };
+    let models = (0..3)
+        .map(|i| dated(&format!("example-undated-{i}"), None))
+        .chain([
+            dated("example-older", Some("2026-01-15")),
+            dated("example-newest", Some("2026-11-20")),
+        ])
+        .collect();
+    service
+        .store_and_apply(
+            &ParsedCatalog { models, skipped: 0 },
+            "https://catalog.example.com/a",
+        )
+        .await
+        .unwrap();
+
+    let ids: Vec<String> = service
+        .list_entries(ModelCatalogEntryFilter::default(), 1, 20)
+        .await
+        .unwrap()
+        .items
+        .into_iter()
+        .map(|entry| entry.model_id)
+        .collect();
+    assert_eq!(
+        ids,
+        [
+            "example-newest",
+            "example-older",
+            "example-undated-0",
+            "example-undated-1",
+            "example-undated-2"
+        ]
+    );
+    // The first page of one is the newest release, not an undated entry.
+    let first = service
+        .list_entries(ModelCatalogEntryFilter::default(), 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(first.items[0].model_id, "example-newest");
+    pricing::install_catalog_prices(&[]);
+}
+
+#[tokio::test]
+async fn the_unpriced_report_scans_in_chunks_and_counts_beyond_what_it_lists() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) \
+         VALUES (911, 'openrouter', 'Router', 'enc', true)",
+    )
+    .await
+    .unwrap();
+    // More rows than one scan chunk, and more unpriced ones than are listed.
+    let unpriced = UNPRICED_SCAN_CHUNK as usize + 120;
+    db.execute_unprepared(&format!(
+        "INSERT INTO ai_provider_models \
+         (provider_key_id, model_id, display_name, source, is_available, is_enabled, metadata) \
+         SELECT 911, 'vendor/example-bulk-' || lpad(g::text, 4, '0'), 'Bulk', 'discovered', \
+                true, true, NULL \
+         FROM generate_series(1, {unpriced}) AS g"
+    ))
+    .await
+    .unwrap();
+    let report = service_on(db).unpriced_models().await.unwrap();
+    assert_eq!(report.total, unpriced);
+    assert_eq!(report.models.len(), MAX_UNPRICED_LISTED);
+    assert_eq!(report.models[0].model_id, "vendor/example-bulk-0001");
+    assert_eq!(report.models[0].provider_key_name, "Router");
+}
+
+#[tokio::test]
+async fn a_model_disabled_mid_scan_does_not_hide_a_later_unpriced_one() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) \
+         VALUES (921, 'openrouter', 'Router', 'enc', true)",
+    )
+    .await
+    .unwrap();
+    // Two priced rows fill the first chunk; the unpriced one follows.
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_models \
+         (provider_key_id, model_id, display_name, source, is_available, is_enabled, metadata) VALUES \
+         (921, 'vendor/a-priced', 'A', 'discovered', true, true, \
+          '{\"input_price_per_million\": 1.0, \"output_price_per_million\": 2.0}'), \
+         (921, 'vendor/b-priced', 'B', 'discovered', true, true, \
+          '{\"input_price_per_million\": 1.0, \"output_price_per_million\": 2.0}'), \
+         (921, 'vendor/c-unknown', 'C', 'discovered', true, true, NULL)",
+    )
+    .await
+    .unwrap();
+    let service = service_on(db.clone());
+    let report = service
+        .scan_unpriced(2, |chunk| {
+            let db = db.clone();
+            async move {
+                // An administrator disables an already-scanned model.
+                if chunk == 0 {
+                    db.execute_unprepared(
+                        "UPDATE ai_provider_models SET is_enabled = false \
+                         WHERE provider_key_id = 921 AND model_id = 'vendor/a-priced'",
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+        })
+        .await
+        .unwrap();
+    assert_eq!(report.total, 1);
+    assert_eq!(report.models[0].model_id, "vendor/c-unknown");
 }

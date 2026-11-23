@@ -314,13 +314,19 @@ pub fn parse_catalog(url: &str, body: &[u8]) -> Result<ParsedCatalog, ModelCatal
 // Source URL and fetch
 // ----------------------------------------------------------------------------
 
-/// Check a catalog source URL: `https://` only, no credentials, and not a
-/// private, loopback or metadata address. Hostnames are checked again when
-/// the connection is made (the hardened client's resolver), and redirects are
-/// never followed, so a public host cannot hand the request to a private one.
+/// Check a catalog source URL: `https://` only, no credentials, no query
+/// string or fragment, and not a private, loopback or metadata address.
+/// Hostnames are checked again when the connection is made (the hardened
+/// client's resolver), and redirects are never followed, so a public host
+/// cannot hand the request to a private one.
+///
+/// A catalog is a public document. The saved URL is returned to every gateway
+/// reader, stored on each catalog entry and written to refresh logs, so
+/// nothing that could carry an access token (userinfo, a signed query, a
+/// fragment) is accepted.
 pub fn validate_source_url(url: &str) -> Result<Url, ModelCatalogError> {
     let invalid = |reason: &str| ModelCatalogError::InvalidSourceUrl {
-        url: url.to_string(),
+        url: redacted_source_url(url),
         reason: reason.to_string(),
     };
     if url.len() > 2048 {
@@ -335,9 +341,35 @@ pub fn validate_source_url(url: &str) -> Result<Url, ModelCatalogError> {
             "the URL must not carry credentials; a catalog is a public document",
         ));
     }
+    if parsed.query().is_some() || parsed.fragment().is_some() {
+        return Err(invalid(
+            "the URL must not have a query string or fragment; a catalog is a public \
+             document and signed or token-bearing URLs are not supported",
+        ));
+    }
     temps_core::url_validation::validate_external_url(url)
         .map_err(|error| invalid(&error.to_string()))?;
     Ok(parsed)
+}
+
+/// A rejected source URL as it may appear in an error: userinfo, query and
+/// fragment removed, so a mistyped signed URL is never echoed back or logged.
+/// Input the URL parser cannot read is withheld when it could hold a
+/// credential (`@`, `?` or `#`), since there is no reliable way to cut it out.
+fn redacted_source_url(url: &str) -> String {
+    match Url::parse(url) {
+        Ok(mut parsed) => {
+            let _ = parsed.set_username("");
+            let _ = parsed.set_password(None);
+            parsed.set_query(None);
+            parsed.set_fragment(None);
+            parsed.to_string()
+        }
+        Err(_) if url.contains(['@', '?', '#']) => {
+            "(withheld: the URL may contain credentials)".to_string()
+        }
+        Err(_) => url.to_string(),
+    }
 }
 
 /// Fetch a catalog body, bounded in time and size.

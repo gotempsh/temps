@@ -690,6 +690,19 @@ mod tests {
             Some(r#"{"source_url":"https://catalog.example.com/v1/api.json?token=secret","refresh_interval_hours":12}"#),
         )
         .await;
+        // A token-bearing URL would be returned to every gateway reader and
+        // logged on refresh, so it is refused and not echoed back.
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert!(!body.contains("secret"), "{body}");
+        assert!(audit.records.lock().unwrap().is_empty());
+
+        let (status, body) = call(
+            app(db.clone(), audit.clone(), Some(auth(Role::Admin))),
+            "PATCH",
+            "/ai/model-catalog/settings",
+            Some(r#"{"source_url":"https://catalog.example.com/v1/api.json","refresh_interval_hours":12}"#),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK, "{body}");
         let saved: serde_json::Value = serde_json::from_str(&body).unwrap();
         assert_eq!(saved["refresh_interval_hours"], 12);

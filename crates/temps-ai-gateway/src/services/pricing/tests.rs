@@ -392,24 +392,24 @@ fn long_context_cost_is_given_only_for_a_listed_long_tier_the_prompt_crosses() {
     let none = PromptTokensDetails::default();
     // gpt-5.4 bills $5 / $22.50 per 1M above 272,000 input tokens.
     assert_eq!(
-        long_context_cost_microcents("gpt-5.4", 300_000, 0, none),
+        long_context_cost_microcents("openai", "gpt-5.4", 300_000, 0, none),
         Some(300_000 * 5)
     );
     assert_eq!(
-        long_context_cost_microcents("gpt-5.4-2026-03-05", 300_000, 0, none),
+        long_context_cost_microcents("openai", "gpt-5.4-2026-03-05", 300_000, 0, none),
         Some(300_000 * 5)
     );
     assert_eq!(
-        long_context_cost_microcents("gpt-5.4", 272_000, 0, none),
+        long_context_cost_microcents("openai", "gpt-5.4", 272_000, 0, none),
         None
     );
     // gpt-4o has no long tier; an unlisted model has no listed tier.
     assert_eq!(
-        long_context_cost_microcents("gpt-4o", 2_000_000, 0, none),
+        long_context_cost_microcents("openai", "gpt-4o", 2_000_000, 0, none),
         None
     );
     assert_eq!(
-        long_context_cost_microcents("totally-unlisted-model", 2_000_000, 0, none),
+        long_context_cost_microcents("openai", "totally-unlisted-model", 2_000_000, 0, none),
         None
     );
 }
@@ -898,7 +898,11 @@ fn a_catalog_never_makes_a_paid_model_free_or_accepts_absurd_prices() {
         catalog_price("example-free", 0.0, 0.0),
     ]);
     assert_eq!(
-        pricing.applied.keys().collect::<Vec<_>>(),
+        pricing
+            .applied
+            .keys()
+            .map(|(_, model)| model.as_str())
+            .collect::<Vec<_>>(),
         vec!["example-free"]
     );
     assert_eq!(
@@ -1005,4 +1009,124 @@ fn an_unpublished_grok_release_is_unpriced_rather_than_borrowing_a_rate() {
     // rate matched by prefix.
     assert!(!is_priced("grok-4.8"));
     assert!(is_priced("grok-4.7"));
+}
+
+fn priced_by(provider: &str, model: &str, input: f64, output: f64) -> CatalogPrice {
+    CatalogPrice {
+        provider: provider.into(),
+        ..catalog_price(model, input, output)
+    }
+}
+
+#[test]
+fn one_model_id_under_two_providers_keeps_each_providers_price() {
+    let model = "example-shared-catalog-model";
+    // Either catalog order gives the same result.
+    for prices in [
+        [
+            priced_by("openai", model, 3.0, 12.0),
+            priced_by("openrouter", model, 1.0, 4.0),
+        ],
+        [
+            priced_by("openrouter", model, 1.0, 4.0),
+            priced_by("openai", model, 3.0, 12.0),
+        ],
+    ] {
+        let pricing = rate_table().with_catalog(&prices);
+        assert_eq!(pricing.applied.len(), 2);
+        let openai = pricing.rates_for("openai", model).unwrap().base;
+        let openrouter = pricing.rates_for("openrouter", model).unwrap().base;
+        assert_eq!((openai.input, openai.output), (3.0, 12.0));
+        assert_eq!((openrouter.input, openrouter.output), (1.0, 4.0));
+        // Without the provider, the dearer price applies: never below either.
+        let any = pricing.table.rates_for(model).unwrap().base;
+        assert_eq!((any.input, any.output), (3.0, 12.0));
+        // A provider the catalog does not list for it falls back to that.
+        let other = pricing.rates_for("xai", model).unwrap().base;
+        assert_eq!((other.input, other.output), (3.0, 12.0));
+    }
+}
+
+#[test]
+fn provider_aware_estimates_and_the_price_list_keep_both_providers() {
+    let _serial = CATALOG_TEST_LOCK.blocking_lock();
+    let model = "example-shared-installed-model";
+    let none = PromptTokensDetails::default();
+    assert_eq!(
+        install_catalog_prices(&[
+            priced_by("openai", model, 3.0, 12.0),
+            priced_by("openrouter", model, 1.0, 4.0),
+        ]),
+        2
+    );
+    assert_eq!(
+        estimate_cost_microcents_for("openrouter", model, 1_000_000, 0, none),
+        1_000_000
+    );
+    assert_eq!(
+        estimate_cost_microcents_for("openai", model, 1_000_000, 0, none),
+        3_000_000
+    );
+    assert_eq!(
+        estimate_batch_total_cost_microcents_for("openrouter", model, 1_000_000, 0, none),
+        1_000_000
+    );
+    assert!(is_priced_for("openrouter", model));
+    let listed: Vec<(String, f64)> = effective_pricing()
+        .into_iter()
+        .filter(|row| row.model == model)
+        .map(|row| (row.provider, row.input_per_million))
+        .collect();
+    assert_eq!(
+        listed,
+        vec![("openai".to_string(), 3.0), ("openrouter".to_string(), 1.0)]
+    );
+    assert_eq!(install_catalog_prices(&[]), 0);
+}
+
+#[test]
+fn a_catalog_row_for_a_dated_snapshot_keeps_its_parents_safeguards() {
+    // gpt-5.4 bills prompts above 272k tokens higher; a catalog that lists
+    // one of its dated snapshots publishes no tier.
+    let snapshot = "gpt-5.4-2026-03-05";
+    let parent = rate_table().rates_for(snapshot).unwrap();
+    let parent_long = parent.long_context.expect("gpt-5.4 has a long tier");
+
+    let pricing = rate_table().with_catalog(&[catalog_price(snapshot, 2.0, 10.0)]);
+    let rates = pricing.table.rates_for(snapshot).unwrap();
+    assert_eq!((rates.base.input, rates.base.output), (2.0, 10.0));
+    let (above, long) = rates.long_context.expect("the parent's tier is kept");
+    assert_eq!(above, parent_long.0);
+    assert!(long.input >= parent_long.1.input.min(2.0));
+    assert!(long.input >= rates.base.input);
+
+    // A zero price cannot make the paid snapshot free.
+    let pricing = rate_table().with_catalog(&[catalog_price(snapshot, 0.0, 0.0)]);
+    assert!(pricing.applied.is_empty());
+    assert_eq!(pricing.table.rates_for(snapshot), Some(parent));
+}
+
+#[test]
+fn an_exact_bundled_price_beats_a_providers_catalog_price_for_its_parent() {
+    // A catalog that prices gpt-5.4 but omits gpt-5.4-pro must not bill Pro
+    // at the parent's rate.
+    let bundled_pro = rate_table().rates_for("gpt-5.4-pro").unwrap();
+    let pricing = rate_table().with_catalog(&[catalog_price("gpt-5.4", 2.5, 15.0)]);
+    assert_eq!(
+        pricing.rates_for("openai", "gpt-5.4-pro"),
+        Some(bundled_pro)
+    );
+    // A dated Pro snapshot still follows the longer bundled Pro id.
+    assert_eq!(
+        pricing.rates_for("openai", "gpt-5.4-pro-2026-03-05"),
+        Some(bundled_pro)
+    );
+    // The parent itself and its own snapshots take the catalog price.
+    let parent = pricing.rates_for("openai", "gpt-5.4").unwrap().base;
+    assert_eq!((parent.input, parent.output), (2.5, 15.0));
+    let snapshot = pricing
+        .rates_for("openai", "gpt-5.4-2026-03-05")
+        .unwrap()
+        .base;
+    assert_eq!((snapshot.input, snapshot.output), (2.5, 15.0));
 }

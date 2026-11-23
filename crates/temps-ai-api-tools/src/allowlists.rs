@@ -454,8 +454,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_pricing",
     "list_provider_keys",
     // Model catalog: source, refresh status, effective prices and models
-    // with no known price. The source URL is validated to carry no
-    // credentials, so nothing secret is returned.
+    // with no known price. The source URL is refused at save time if it has
+    // userinfo, a query string or a fragment, so it cannot carry a token.
     "get_model_catalog",
     "list_model_catalog_entries",
     "list_unpriced_models",
