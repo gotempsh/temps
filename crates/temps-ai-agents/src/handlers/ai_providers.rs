@@ -1005,8 +1005,21 @@ fn provider_catalog_dto_from_runtime(
         ))
     };
     let (runtime_models, model_source) = if discovered_models.is_empty() {
+        // Without discovery the bootstrap list is a guess, and a release that
+        // refreshes it must not take away a default the operator saved: it
+        // was accepted when saved and stays selectable until discovery says
+        // otherwise.
+        let saved_default = provider_cfg
+            .default_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty() && !entry.models.contains(model));
+        let models: Vec<&str> = saved_default
+            .into_iter()
+            .chain(entry.models.iter().copied())
+            .collect();
         (
-            bootstrap_runtime_models(entry.models),
+            bootstrap_runtime_models(&models),
             temps_ai::ModelCatalogSource::Bootstrap,
         )
     } else {
@@ -2852,6 +2865,53 @@ mod tests {
         );
         assert!(codex_configured.workspace_ready);
         assert!(codex_configured.workspace_readiness_hint.is_none());
+    }
+
+    #[test]
+    fn bootstrap_catalog_keeps_a_saved_default_it_no_longer_lists() {
+        let codex =
+            crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
+        let saved = "vendor-model-saved-before-upgrade";
+        assert!(!codex.models.contains(&saved));
+        let dto = |default_model: Option<&str>| {
+            provider_catalog_dto_from_runtime(
+                codex,
+                temps_config::ProviderConfig {
+                    default_model: default_model.map(str::to_string),
+                    ..Default::default()
+                },
+                true,
+                Some("api_key".to_string()),
+                false,
+                None,
+                None,
+                None,
+                Vec::new(),
+                temps_ai::ModelCatalogSource::Bootstrap,
+                None,
+                None,
+            )
+        };
+
+        let kept = dto(Some(saved));
+        assert_eq!(kept.default_runtime_model_id.as_deref(), Some(saved));
+        assert_eq!(kept.models.first().map(String::as_str), Some(saved));
+        assert_eq!(kept.models.len(), codex.models.len() + 1);
+
+        // A saved default the list already has is not duplicated, and no
+        // saved default keeps the list's own first entry.
+        let listed = dto(Some(codex.models[1]));
+        assert_eq!(listed.models.len(), codex.models.len());
+        assert_eq!(
+            listed.default_runtime_model_id.as_deref(),
+            Some(codex.models[1])
+        );
+        let unset = dto(None);
+        assert_eq!(unset.models.len(), codex.models.len());
+        assert_eq!(
+            unset.default_runtime_model_id.as_deref(),
+            Some(codex.models[0])
+        );
     }
 
     fn compatible_document(verified_model: Option<&str>) -> String {
