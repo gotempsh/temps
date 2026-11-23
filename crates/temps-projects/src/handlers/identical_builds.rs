@@ -155,7 +155,7 @@ pub struct IdenticalBuildsResponse {
 #[serde(deny_unknown_fields)]
 pub struct UpdateIdenticalBuildsRequest {
     pub mode: IdenticalBuildMode,
-    /// Defaults to `fingerprint`.
+    /// Defaults to `source` (same repository and path).
     #[serde(default)]
     pub scope: IdenticalBuildScope,
 }
@@ -535,6 +535,37 @@ mod tests {
         assert_eq!(event["mode"], "share");
         assert_eq!(event["scope"], "fingerprint");
         assert_eq!(event["ip_address"], "198.51.100.7");
+    }
+
+    #[tokio::test]
+    async fn queueing_without_a_scope_groups_by_repository_and_path() {
+        let h = harness(
+            empty_db()
+                .append_query_results([vec![stored("parallel", "source")]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([activity_rows()]),
+        );
+        let admin = AuthContext::new_session(user(), Role::Admin);
+        let (status, body) = send(
+            h.router,
+            "PUT",
+            Some(serde_json::json!({ "mode": "queue" })),
+            Some(admin),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["mode"], "queue");
+        assert_eq!(body["scope"], "source");
+        assert_eq!(
+            body["scopes"][0]["id"], "source",
+            "the default is listed first"
+        );
+        let recorded = h.audit.recorded();
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].1["scope"], "source");
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@ function settings(
 ): IdenticalBuildsResponse {
   return {
     mode: 'parallel',
-    scope: 'fingerprint',
+    scope: 'source',
     modes: [
       {
         id: 'parallel',
@@ -43,14 +43,14 @@ function settings(
     ],
     scopes: [
       {
-        id: 'fingerprint',
-        label: 'Identical builds only',
-        description: 'Same commit, path and build-time values.',
-      },
-      {
         id: 'source',
         label: 'Same repository and path',
         description: 'Any commit or values.',
+      },
+      {
+        id: 'fingerprint',
+        label: 'Identical builds only',
+        description: 'Same commit, path and build-time values.',
       },
     ],
     reuse_window_seconds: 1800,
@@ -103,9 +103,12 @@ test('choosing share saves the mode and scope', async () => {
     await screen.findByRole('radio', { name: 'Build once and share' })
   )
   expect(await screen.findByText('Which builds wait')).toBeTruthy()
-  fireEvent.click(
-    screen.getByRole('radio', { name: 'Same repository and path' })
-  )
+  // Builds of the same repository and path queue together by default.
+  expect(
+    screen
+      .getByRole('radio', { name: 'Same repository and path' })
+      .getAttribute('aria-checked')
+  ).toBe('true')
   fireEvent.click(screen.getByRole('button', { name: 'Save' }))
   await waitFor(() => expect(bodies.length).toBe(1))
   expect(bodies[0]).toEqual({ mode: 'share', scope: 'source' })
@@ -115,6 +118,24 @@ test('choosing share saves the mode and scope', async () => {
         .disabled
     ).toBe(true)
   )
+})
+
+test('narrowing the wait to identical builds saves the fingerprint scope', async () => {
+  const bodies: unknown[] = []
+  mockApi({
+    [`GET ${PATH}`]: () => jsonResponse(settings({ mode: 'queue' })),
+    [`PUT ${PATH}`]: async (request) => {
+      bodies.push(await request.json())
+      return jsonResponse(settings({ mode: 'queue', scope: 'fingerprint' }))
+    },
+  })
+  const screen = renderCard()
+  fireEvent.click(
+    await screen.findByRole('radio', { name: 'Identical builds only' })
+  )
+  fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+  await waitFor(() => expect(bodies.length).toBe(1))
+  expect(bodies[0]).toEqual({ mode: 'queue', scope: 'fingerprint' })
 })
 
 test('a reader sees the setting but cannot change it', async () => {

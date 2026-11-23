@@ -34,7 +34,7 @@ Two columns on `projects`, not environment variables (AGENTS.md
 | Column | Values | Default |
 |---|---|---|
 | `identical_build_mode` | `parallel`, `queue`, `share` | `parallel` |
-| `identical_build_scope` | `fingerprint`, `source` | `fingerprint` |
+| `identical_build_scope` | `source`, `fingerprint` | `source` |
 
 - `parallel` is what every build did before. It is the default for existing
   and new projects, so nothing changes on upgrade.
@@ -43,10 +43,15 @@ Two columns on `projects`, not environment variables (AGENTS.md
 - `share`: as `queue`, and a build whose full fingerprint matches a build that
   succeeded in another `share` project with the same access boundary (D4)
   deploys that image instead of building.
-- The scope decides the group a build queues in: the full fingerprint, or the
-  repository and build path whatever the commit or values (`source`). **The
-  scope only ever widens queueing. Reusing an image always requires the full
-  fingerprint.**
+- The scope decides the group a build queues in: the repository and build
+  path whatever the commit or values (`source`, the default), or only the full
+  fingerprint (`fingerprint`). The default is `source` because builds of one
+  repository and path almost always differ in some build-time value (D2), so a
+  fingerprint group would rarely queue anything and a coordinating project
+  would still run them side by side. **The scope only ever widens queueing.
+  Reusing an image always requires the full fingerprint**, so under `source` a
+  `share` build waits for the build of its source and then reuses its image
+  only if the fingerprints match, building its own otherwise.
 
 `GET/PUT /projects/{id}/identical-builds` reads and changes it (`projects:read`
 / `projects:write` on the project, audited as
@@ -96,8 +101,8 @@ low-entropy secret without the install's key.
 A consequence worth stating: preset builds declare every project variable,
 including Temps' own per-project values (`SENTRY_PROJECT`, the deployment
 token), so across projects they practically never share an image. That is the
-correct answer for them, since those values can reach the build. `queue`
-with scope `source` is what serialises them; `share` pays off for repository
+correct answer for them, since those values can reach the build. The
+default scope `source` is what serialises them; `share` pays off for repository
 Dockerfiles that declare only the values they need.
 
 ### D3. Durable coordination: `identical_builds`

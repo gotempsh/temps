@@ -8,12 +8,12 @@ import { runWithApi } from '../../lib/mock-api.js'
 
 const settings = {
   mode: 'parallel',
-  scope: 'fingerprint',
+  scope: 'source',
   modes: [
     { id: 'parallel', label: 'Build every deployment', description: 'd', example: 'e' },
     { id: 'share', label: 'Build once and share the image', description: 'd', example: 'e' },
   ],
-  scopes: [{ id: 'fingerprint', label: 'Same build', description: 'd' }],
+  scopes: [{ id: 'source', label: 'Same repository and path', description: 'd' }],
   reuse_window_seconds: 1800,
   max_wait_seconds: 5400,
   activity: { reused: 2, built: 1, waiting: 0, building: 0 },
@@ -29,7 +29,7 @@ describe('parseMode and parseScope', () => {
 
   test('reject anything else, listing what is accepted', () => {
     expect(() => parseMode('always')).toThrow(/parallel, queue, share/)
-    expect(() => parseScope('repo')).toThrow(/fingerprint, source/)
+    expect(() => parseScope('repo')).toThrow(/source, fingerprint/)
   })
 })
 

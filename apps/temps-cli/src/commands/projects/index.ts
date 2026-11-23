@@ -174,7 +174,7 @@ export function registerProjectsCommands(program: Command): void {
     )
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--mode <mode>', 'parallel (default), queue or share')
-    .option('--scope <scope>', 'Which builds wait for each other: fingerprint (default) or source (same repository and path)')
+    .option('--scope <scope>', 'Which builds wait for each other: source (same repository and path, the default) or fingerprint (only identical builds)')
     .option('--json', 'Output in JSON format')
     .action(projectIdenticalBuildsAction)
 

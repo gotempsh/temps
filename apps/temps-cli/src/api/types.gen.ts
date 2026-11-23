@@ -40529,7 +40529,7 @@ export type UpdateHostImagePreparationBody = {
 export type UpdateIdenticalBuildsRequest = {
     mode: IdenticalBuildMode;
     /**
-     * Defaults to `fingerprint`.
+     * Defaults to `source` (same repository and path).
      */
     scope?: IdenticalBuildScope;
 };

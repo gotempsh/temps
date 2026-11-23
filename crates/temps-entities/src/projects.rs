@@ -303,10 +303,10 @@ pub struct Model {
     #[sea_orm(default_value = "parallel")]
     #[serde(default)]
     pub identical_build_mode: IdenticalBuildMode,
-    /// ADR 113: which builds count as identical for queueing: the full
-    /// fingerprint (the default) or every build of the same repository and
-    /// path. Image reuse always requires the full fingerprint.
-    #[sea_orm(default_value = "fingerprint")]
+    /// ADR 113: which builds count as identical for queueing: every build of
+    /// the same repository and path (the default) or only builds with the
+    /// same full fingerprint. Image reuse always requires the full fingerprint.
+    #[sea_orm(default_value = "source")]
     #[serde(default)]
     pub identical_build_scope: IdenticalBuildScope,
 }

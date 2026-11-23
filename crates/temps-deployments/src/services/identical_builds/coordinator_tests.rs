@@ -387,6 +387,33 @@ async fn a_different_fingerprint_queues_in_the_same_source_group_but_builds_its_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn by_default_builds_of_the_same_repository_and_path_queue_whatever_the_commit() {
+    let Some(f) = fixture().await else { return };
+    let (a, b, c) = (
+        f.project("a").await,
+        f.project("b").await,
+        f.project("c").await,
+    );
+    let mut first = f.ticket(a, IdenticalBuildMode::Queue, "fp-commit-1").await;
+    let mut second = f.ticket(b, IdenticalBuildMode::Queue, "fp-commit-2").await;
+    let mut elsewhere = f.ticket(c, IdenticalBuildMode::Queue, "fp-commit-3").await;
+    for ticket in [&mut first, &mut second, &mut elsewhere] {
+        ticket.scope = IdenticalBuildScope::default();
+    }
+    elsewhere.identity.source_key = "source-2".to_string();
+
+    let lease = f.build(&first).await;
+    // Another path of the repository is another group: it builds at once.
+    let other_lease = f.build(&elsewhere).await;
+    let (task, _events) = f.wait_in_line(&second).await;
+    assert_eq!(f.state(second.deployment_id).await.0, "waiting");
+
+    lease.succeed(None).await.unwrap();
+    assert!(matches!(finished(task).await.unwrap(), Admission::Build(_)));
+    other_lease.succeed(None).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn another_access_boundary_never_reuses_and_never_sees_the_leader() {
     let Some(f) = fixture().await else { return };
     let (a, b) = (f.project("a").await, f.project("b").await);

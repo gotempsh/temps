@@ -12,7 +12,7 @@ import { colors, info, json, keyValue, newline, success } from '../../ui/output.
 const CLI = 'bunx @temps-sdk/cli'
 
 const MODES: readonly IdenticalBuildMode[] = ['parallel', 'queue', 'share']
-const SCOPES: readonly IdenticalBuildScope[] = ['fingerprint', 'source']
+const SCOPES: readonly IdenticalBuildScope[] = ['source', 'fingerprint']
 
 interface IdenticalBuildsOptions {
   project?: string

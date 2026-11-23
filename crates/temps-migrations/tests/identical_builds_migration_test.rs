@@ -144,7 +144,7 @@ async fn test_identical_builds_migration_defaults_constraints_and_reverses() -> 
     .await?;
     assert_eq!(
         (mode.as_str(), scope.as_str()),
-        ("parallel", "fingerprint"),
+        ("parallel", "source"),
         "an existing project must keep building in parallel after the upgrade"
     );
 

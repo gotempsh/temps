@@ -36,7 +36,7 @@ impl MigrationTrait for Migration {
                 "ALTER TABLE projects
                     ADD COLUMN IF NOT EXISTS identical_build_mode text NOT NULL DEFAULT 'parallel';
                  ALTER TABLE projects
-                    ADD COLUMN IF NOT EXISTS identical_build_scope text NOT NULL DEFAULT 'fingerprint';
+                    ADD COLUMN IF NOT EXISTS identical_build_scope text NOT NULL DEFAULT 'source';
                  ALTER TABLE projects
                     DROP CONSTRAINT IF EXISTS projects_identical_build_mode_check;
                  ALTER TABLE projects

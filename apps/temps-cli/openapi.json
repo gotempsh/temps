@@ -87157,7 +87157,7 @@
           },
           "scope": {
             "$ref": "#/components/schemas/IdenticalBuildScope",
-            "description": "Defaults to `fingerprint`."
+            "description": "Defaults to `source` (same repository and path)."
           }
         },
         "required": [

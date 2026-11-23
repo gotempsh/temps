@@ -556,7 +556,7 @@ Show or change what the project's builds do when an identical build (same reposi
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `--mode <mode>` | parallel (default), queue or share | - | No |
-| `--scope <scope>` | Which builds wait for each other: fingerprint (default) or source (same repository and path) | - | No |
+| `--scope <scope>` | Which builds wait for each other: source (same repository and path, the default) or fingerprint (only identical builds) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `projects config`

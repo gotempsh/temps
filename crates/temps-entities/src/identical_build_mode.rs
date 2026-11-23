@@ -116,21 +116,23 @@ pub enum IdenticalBuildScope {
     /// Only builds with the same full fingerprint (repository, commit, build
     /// context, Dockerfile, preset, platform, build-time values) wait for
     /// each other.
-    #[default]
     #[sea_orm(string_value = "fingerprint")]
     Fingerprint,
 
     /// Every build of the same repository and build path waits for the
     /// others, whatever the commit or build-time values: at most one build of
-    /// that source runs at a time.
+    /// that source runs at a time. The default: builds of one repository and
+    /// path never run side by side once a project coordinates.
+    #[default]
     #[sea_orm(string_value = "source")]
     Source,
 }
 
 impl IdenticalBuildScope {
+    /// The default first, as the console and CLI list them.
     pub const ALL: [IdenticalBuildScope; 2] = [
-        IdenticalBuildScope::Fingerprint,
         IdenticalBuildScope::Source,
+        IdenticalBuildScope::Fingerprint,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -229,10 +231,8 @@ mod tests {
     fn existing_projects_keep_building_in_parallel() {
         assert_eq!(IdenticalBuildMode::default(), IdenticalBuildMode::Parallel);
         assert!(!IdenticalBuildMode::default().coordinates());
-        assert_eq!(
-            IdenticalBuildScope::default(),
-            IdenticalBuildScope::Fingerprint
-        );
+        assert_eq!(IdenticalBuildScope::default(), IdenticalBuildScope::Source);
+        assert_eq!(IdenticalBuildScope::ALL[0], IdenticalBuildScope::default());
     }
 
     #[test]

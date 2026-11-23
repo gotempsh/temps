@@ -26,7 +26,7 @@ import { z } from 'zod'
 
 const schema = z.object({
   mode: z.enum(['parallel', 'queue', 'share']),
-  scope: z.enum(['fingerprint', 'source']),
+  scope: z.enum(['source', 'fingerprint']),
 })
 
 type FormValues = z.infer<typeof schema>
@@ -45,7 +45,7 @@ function ProjectIdenticalBuilds({ projectId }: { projectId: number }) {
   const data = query.data
   const form = useForm<FormValues>({
     resolver: zodResolver(schema),
-    defaultValues: { mode: 'parallel', scope: 'fingerprint' },
+    defaultValues: { mode: 'parallel', scope: 'source' },
   })
   const { reset } = form
 
