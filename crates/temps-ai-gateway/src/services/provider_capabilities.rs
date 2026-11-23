@@ -45,25 +45,33 @@ fn thinking_modes(provider: &str, model: &str) -> (Vec<SelectOption>, Option<Str
             _ => {}
         }
     }
-    if provider == "xai" && family_version(model, "grok-").is_some_and(|version| version >= (4, 5))
-    {
-        return thinking_options(&["low", "medium", "high"], "high");
+    if provider == "xai" {
+        // xAI documents `reasoning_effort` for Grok 4.5 and later 4.x
+        // releases (`xhigh` from 4.6). Grok 4.20 is an earlier release whose
+        // number only compares higher, and its reasoning and non-reasoning
+        // SKUs take no effort.
+        let lower = model.to_ascii_lowercase();
+        if !lower.contains("non-reasoning") {
+            match family_version(model, "grok-") {
+                Some((4, minor)) if (6..10).contains(&minor) => {
+                    return thinking_options(&["low", "medium", "high", "xhigh"], "high")
+                }
+                Some((4, 5)) => return thinking_options(&["low", "medium", "high"], "high"),
+                _ => {}
+            }
+        }
     }
-    if provider == "anthropic"
-        && [
-            "claude-sonnet-5",
-            "claude-opus-5",
-            "claude-fable-5",
-            "claude-mythos-5",
-            "claude-haiku-5",
-        ]
-        .iter()
-        .any(|family| model.starts_with(family))
-    {
+    if provider == "anthropic" && crate::providers::anthropic::uses_adaptive_thinking(model) {
         // Adaptive thinking effort values differ between Claude SKUs and can
         // change independently. Advertise the portable intersection here;
         // live model discovery remains the source of truth for model ids.
-        return thinking_options(&["low", "medium", "high"], "high");
+        // Each default is the model's own (`medium` on Claude Haiku 5.5).
+        let default = if model.starts_with("claude-haiku-5") {
+            "medium"
+        } else {
+            "high"
+        };
+        return thinking_options(&["low", "medium", "high"], default);
     }
     if provider == "gemini" {
         match family_version(model, "gemini-") {
@@ -368,8 +376,20 @@ mod tests {
         assert_eq!(ids("openai", "gpt-5.4"), ["low", "medium", "high", "xhigh"]);
         assert_eq!(ids("openai", "o3"), ["low", "medium", "high", "xhigh"]);
         assert!(ids("openai", "gpt-4o").is_empty());
-        assert_eq!(ids("xai", "grok-4.7"), ["low", "medium", "high"]);
+        assert_eq!(ids("xai", "grok-4.7"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(ids("xai", "grok-4.6"), ["low", "medium", "high", "xhigh"]);
+        assert_eq!(ids("xai", "grok-4.5"), ["low", "medium", "high"]);
         assert!(ids("xai", "grok-4.3").is_empty());
+        // Grok 4.20 predates 4.5 though its number compares higher, and
+        // neither of its SKUs takes an effort.
+        for model in [
+            "grok-4.20",
+            "grok-4.20-0309-reasoning",
+            "grok-4.20-0309-non-reasoning",
+            "grok-4.20-multi-agent",
+        ] {
+            assert!(ids("xai", model).is_empty(), "{model}");
+        }
         for model in ["claude-haiku-5-5", "claude-mythos-5-2", "claude-opus-5-5"] {
             assert_eq!(
                 ids("anthropic", model),
@@ -378,6 +398,10 @@ mod tests {
             );
         }
         assert!(ids("anthropic", "claude-haiku-4-5").is_empty());
+        // Each Claude model starts at its own default effort.
+        let default = |model: &str| thinking_modes("anthropic", model).1;
+        assert_eq!(default("claude-haiku-5-5").as_deref(), Some("medium"));
+        assert_eq!(default("claude-opus-5-5").as_deref(), Some("high"));
         assert_eq!(ids("gemini", "gemini-4-neon"), ["low", "medium", "high"]);
         // Gemini 3.8 Flash has no `minimal` level, unlike 3.6 Flash.
         assert_eq!(ids("gemini", "gemini-3.8-flash"), ["low", "medium", "high"]);
