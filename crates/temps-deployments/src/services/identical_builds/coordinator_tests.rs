@@ -50,9 +50,14 @@ struct Fixture {
 async fn fixture() -> Option<Fixture> {
     let test_db = match TestDatabase::with_migrations().await {
         Ok(db) => db,
-        Err(error) => {
-            eprintln!("Skipping identical build coordination test: no PostgreSQL ({error})");
+        // Only a missing container runtime skips; a migration that fails
+        // against a reachable database fails the test.
+        Err(error) if temps_test_utils::is_container_runtime_unavailable(&format!("{error:#}")) => {
+            eprintln!("Skipping identical build coordination test: no PostgreSQL ({error:#})");
             return None;
+        }
+        Err(error) => {
+            panic!("identical build coordination tests need migrated PostgreSQL: {error:#}")
         }
     };
     let db = test_db.connection_arc();
@@ -73,6 +78,7 @@ impl Fixture {
             main_branch: Set("main".to_string()),
             preset: Set(Preset::NextJs),
             directory: Set("/".to_string()),
+            identical_build_mode: Set(IdenticalBuildMode::Share),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
             is_deleted: Set(false),
@@ -138,6 +144,27 @@ impl Fixture {
         }
     }
 
+    async fn sql(&self, sql: &str) {
+        self.db.execute_unprepared(sql).await.unwrap();
+    }
+
+    /// A worker node in `status`.
+    async fn node(&self, name: &str, status: &str) -> i32 {
+        let row = self
+            .db
+            .query_one(statement(
+                "INSERT INTO nodes (name, token_hash, address, private_address, role, status, \
+                    labels, capacity, created_at, updated_at) \
+                 VALUES ($1, 'hash', '10.0.0.2:3100', '10.0.0.2', 'worker', $2, '{}', '{}', now(), now()) \
+                 RETURNING id",
+                vec![name.into(), status.into()],
+            ))
+            .await
+            .unwrap()
+            .expect("node row");
+        row.try_get("", "id").unwrap()
+    }
+
     async fn state(&self, deployment_id: i32) -> (String, Option<i32>, Option<String>) {
         let row = self
             .db
@@ -198,12 +225,31 @@ fn image(tag: &str) -> SharedImage {
         image_tag: tag.to_string(),
         image_id: "sha256:abc".to_string(),
         size_bytes: 1024,
-        builder_node_id: Some(3),
+        builder_node_id: None,
         image_tags_by_platform: HashMap::new(),
         builder_node_ids_by_platform: HashMap::new(),
         image_ids_by_platform: HashMap::new(),
         image_config: None,
         dockerfile_preset: Some("nextjs".to_string()),
+        build_root: Some(".".to_string()),
+        dockerfile_path: Some("Dockerfile".to_string()),
+    }
+}
+
+/// An observer that reports every control-plane image as gone.
+struct ControlPlanePruned(Arc<Recorder>);
+
+#[async_trait::async_trait]
+impl AdmissionObserver for ControlPlanePruned {
+    async fn observe(&self, event: AdmissionEvent) {
+        self.0.observe(event).await;
+    }
+
+    async fn control_plane_image_missing(&self, image: &SharedImage) -> Option<String> {
+        Some(format!(
+            "the control plane no longer holds '{}'",
+            image.image_tag
+        ))
     }
 }
 
@@ -603,4 +649,157 @@ async fn the_access_boundary_lists_the_project_teams() {
         "unrestricted"
     );
     assert_eq!(boundary_label(&[2, 9]), "teams:2,9");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_project_that_left_share_mode_no_longer_offers_its_image() {
+    let Some(f) = fixture().await else { return };
+    let (a, b) = (f.project("a").await, f.project("b").await);
+    let leader = f.ticket(a, IdenticalBuildMode::Share, "fp-1").await;
+    f.build(&leader)
+        .await
+        .succeed(Some(&image("a:latest")))
+        .await
+        .unwrap();
+    f.sql(&format!(
+        "UPDATE projects SET identical_build_mode = 'parallel' WHERE id = {a}"
+    ))
+    .await;
+    let follower = f.ticket(b, IdenticalBuildMode::Share, "fp-1").await;
+    let admission = f
+        .coordinator
+        .admit(&follower, Recorder::new().as_ref())
+        .await
+        .unwrap();
+    assert!(matches!(admission, Admission::Build(_)), "{admission:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn team_grants_changed_since_the_build_stop_reuse() {
+    let Some(f) = fixture().await else { return };
+    let (a, b) = (f.project("a").await, f.project("b").await);
+    // Built while project a was unrestricted...
+    let leader = f.ticket(a, IdenticalBuildMode::Share, "fp-1").await;
+    f.build(&leader)
+        .await
+        .succeed(Some(&image("a:latest")))
+        .await
+        .unwrap();
+    // ...then restricted to a team: b's viewers may no longer see it.
+    f.sql(
+        "INSERT INTO teams (name, slug, created_by, created_at, updated_at) \
+         VALUES ('Team four', 'team-four', 1, now(), now())",
+    )
+    .await;
+    f.sql(&format!(
+        "INSERT INTO project_team_access (project_id, team_id, role, granted_by, created_at, updated_at) \
+         SELECT {a}, id, 'developer', 1, now(), now() FROM teams WHERE slug = 'team-four'"
+    ))
+    .await;
+    let follower = f.ticket(b, IdenticalBuildMode::Share, "fp-1").await;
+    let admission = f
+        .coordinator
+        .admit(&follower, Recorder::new().as_ref())
+        .await
+        .unwrap();
+    assert!(matches!(admission, Admission::Build(_)), "{admission:?}");
+
+    // The requester's own grants count too: c registered as unrestricted,
+    // but is restricted by the time it looks.
+    let c = f.project("c").await;
+    let fresh = f.ticket(c, IdenticalBuildMode::Share, "fp-2").await;
+    let d = f.project("d").await;
+    f.build(&f.ticket(d, IdenticalBuildMode::Share, "fp-2").await)
+        .await
+        .succeed(Some(&image("d:latest")))
+        .await
+        .unwrap();
+    f.sql(&format!(
+        "INSERT INTO project_team_access (project_id, team_id, role, granted_by, created_at, updated_at) \
+         SELECT {c}, id, 'developer', 1, now(), now() FROM teams WHERE slug = 'team-four'"
+    ))
+    .await;
+    let admission = f
+        .coordinator
+        .admit(&fresh, Recorder::new().as_ref())
+        .await
+        .unwrap();
+    assert!(matches!(admission, Admission::Build(_)), "{admission:?}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_image_on_an_inactive_worker_is_not_reused_and_the_log_says_why() {
+    let Some(f) = fixture().await else { return };
+    let (a, b, c) = (
+        f.project("a").await,
+        f.project("b").await,
+        f.project("c").await,
+    );
+    let worker = f.node("builder-1", "offline").await;
+    let on_worker = SharedImage {
+        builder_node_id: Some(worker),
+        ..image("a:latest")
+    };
+    f.build(&f.ticket(a, IdenticalBuildMode::Share, "fp-1").await)
+        .await
+        .succeed(Some(&on_worker))
+        .await
+        .unwrap();
+
+    let recorder = Recorder::new();
+    let follower = f.ticket(b, IdenticalBuildMode::Share, "fp-1").await;
+    let admission = f
+        .coordinator
+        .admit(&follower, recorder.as_ref())
+        .await
+        .unwrap();
+    assert!(matches!(admission, Admission::Build(_)), "{admission:?}");
+    let events = recorder.events();
+    assert!(
+        events.iter().any(|event| matches!(
+            event,
+            AdmissionEvent::ReuseUnavailable { reason, .. } if reason.contains("not active")
+        )),
+        "{events:?}"
+    );
+    drop(admission);
+
+    // Back online: the same image is offered again.
+    f.sql(&format!(
+        "UPDATE nodes SET status = 'active' WHERE id = {worker}"
+    ))
+    .await;
+    let later = f.ticket(c, IdenticalBuildMode::Share, "fp-1").await;
+    match f
+        .coordinator
+        .admit(&later, Recorder::new().as_ref())
+        .await
+        .unwrap()
+    {
+        Admission::Reuse(reused) => assert_eq!(reused.image.builder_node_id, Some(worker)),
+        other => panic!("expected reuse, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_control_plane_image_that_is_gone_is_not_reused() {
+    let Some(f) = fixture().await else { return };
+    let (a, b) = (f.project("a").await, f.project("b").await);
+    f.build(&f.ticket(a, IdenticalBuildMode::Share, "fp-1").await)
+        .await
+        .succeed(Some(&image("a:latest")))
+        .await
+        .unwrap();
+    let recorder = Recorder::new();
+    let follower = f.ticket(b, IdenticalBuildMode::Share, "fp-1").await;
+    let admission = f
+        .coordinator
+        .admit(&follower, &ControlPlanePruned(recorder.clone()))
+        .await
+        .unwrap();
+    assert!(matches!(admission, Admission::Build(_)), "{admission:?}");
+    assert!(recorder.events().iter().any(|event| matches!(
+        event,
+        AdmissionEvent::ReuseUnavailable { reason, .. } if reason.contains("a:latest")
+    )));
 }

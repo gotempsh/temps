@@ -106,6 +106,13 @@ pub(crate) fn describe_event(event: &AdmissionEvent) -> String {
                 leader_name(leader)
             )
         }
+        AdmissionEvent::ReuseUnavailable {
+            deployment_id,
+            reason,
+        } => format!(
+            "The image of an identical build (deployment #{deployment_id}) cannot be reused: \
+             {reason}. This deployment does not depend on it"
+        ),
     }
 }
 
@@ -141,6 +148,38 @@ impl AdmissionObserver for BuildLogObserver<'_> {
                 "Could not write an identical build event to the build log"
             );
         }
+    }
+
+    async fn control_plane_image_missing(&self, image: &SharedImage) -> Option<String> {
+        let mut tags: Vec<(&str, Option<&str>)> = vec![(&image.image_tag, Some(&image.image_id))];
+        for (platform, tag) in &image.image_tags_by_platform {
+            tags.push((
+                tag,
+                image
+                    .image_ids_by_platform
+                    .get(platform)
+                    .map(String::as_str),
+            ));
+        }
+        for (tag, expected) in tags {
+            match self.job.image_builder.inspect_image(tag).await {
+                Ok(info) => {
+                    if let Some(expected) = expected {
+                        if !super::super::node_image::same_image_id(&info.id, expected) {
+                            return Some(format!(
+                                "the control plane's '{tag}' is now a different image"
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    return Some(format!(
+                        "the control plane no longer holds '{tag}' ({error})"
+                    ));
+                }
+            }
+        }
+        None
     }
 }
 
@@ -212,8 +251,24 @@ impl BuildImageJob {
                 let result = self.execute_build(context).await;
                 let outcome = match &result {
                     Ok(job_result) => {
-                        let image = if settings.mode.shares_images() {
-                            match shared_image(&job_result.context, &self.job_id) {
+                        let built_where_identified = built_on(&job_result.context, &self.job_id)
+                            == self.remote_builder_node_id;
+                        if !built_where_identified {
+                            // The worker stayed busy or refused, and the
+                            // control plane built it with other inputs (every
+                            // value, its own platform): not what the
+                            // fingerprint describes, so not offered.
+                            tracing::info!(
+                                deployment_id = ticket.deployment_id,
+                                "Identical build ran on another builder than it was identified for; its image is not offered for reuse"
+                            );
+                        }
+                        let image = if settings.mode.shares_images() && built_where_identified {
+                            match shared_image(
+                                &job_result.context,
+                                &self.job_id,
+                                &self.download_job_id,
+                            ) {
                                 Ok(image) => Some(image),
                                 Err(error) => {
                                     tracing::warn!(
@@ -370,6 +425,7 @@ impl BuildImageJob {
             cache_from: &self.build_config.cache_from,
             build_args: &self.build_config.build_args,
             buildkit_build_args: &self.build_config.build_args_buildkit,
+            public_names: &self.worker_build_arg_keys,
         };
         let identity =
             identify(&inputs, settings.key.as_ref()).map_err(|error| error.to_string())?;
@@ -396,16 +452,25 @@ impl BuildImageJob {
     ) -> Result<JobResult, WorkflowError> {
         self.log(&context, describe_reuse(reused)).await?;
         let repo = RepositoryOutput::from_context(&context, &self.download_job_id)?;
-        let build_context = repo
-            .repo_dir
-            .join(self.build_config.build_context.as_deref().unwrap_or("."));
-        let dockerfile_path = build_context.join(
-            self.build_config
-                .dockerfile_path
-                .as_deref()
-                .unwrap_or("Dockerfile"),
-        );
         let image = &reused.image;
+        // Where the identical build actually built from (a workspace build
+        // widens the context), in this deployment's own checkout.
+        let configured = self.build_config.build_context.as_deref().unwrap_or(".");
+        let build_root = image
+            .build_root
+            .as_deref()
+            .filter(|root| is_contained(root))
+            .unwrap_or(configured);
+        let build_context = repo.repo_dir.join(build_root);
+        let dockerfile_path = match image.dockerfile_path.as_deref().filter(|p| is_contained(p)) {
+            Some(path) => repo.repo_dir.join(path),
+            None => repo.repo_dir.join(configured).join(
+                self.build_config
+                    .dockerfile_path
+                    .as_deref()
+                    .unwrap_or("Dockerfile"),
+            ),
+        };
         let output = ImageOutput {
             image_tag: image.image_tag.clone(),
             image_id: image.image_id.clone(),
@@ -428,11 +493,53 @@ impl BuildImageJob {
     }
 }
 
+/// The worker node a finished build recorded as holding its image; `None`
+/// when the control plane built it.
+fn built_on(context: &WorkflowContext, job_id: &str) -> Option<i32> {
+    context
+        .get_output::<Option<i32>>(job_id, "builder_node_id")
+        .ok()
+        .flatten()
+        .flatten()
+}
+
+/// `path` relative to `root`, as a contained `/`-separated path, when it is
+/// inside it.
+fn checkout_relative(root: &Path, path: &Path) -> Option<String> {
+    let relative: PathBuf = match path.strip_prefix(root) {
+        Ok(relative) => relative.to_path_buf(),
+        // One side may be spelled through a symlink (`/tmp` and
+        // `/private/tmp`).
+        Err(_) => {
+            let root = root.canonicalize().ok()?;
+            let path = path.canonicalize().ok()?;
+            path.strip_prefix(&root).ok()?.to_path_buf()
+        }
+    };
+    let relative = relative.to_str()?.trim_start_matches('/');
+    let relative = if relative.is_empty() { "." } else { relative };
+    is_contained(relative).then(|| relative.to_string())
+}
+
 /// The image a successful build recorded, as offered to identical builds.
-fn shared_image(context: &WorkflowContext, job_id: &str) -> Result<SharedImage, WorkflowError> {
+fn shared_image(
+    context: &WorkflowContext,
+    job_id: &str,
+    download_job_id: &str,
+) -> Result<SharedImage, WorkflowError> {
     let output = ImageOutput::from_context(context, job_id)?;
-    let builder_node_id: Option<i32> = context.get_output(job_id, "builder_node_id")?.flatten();
+    let builder_node_id = built_on(context, job_id);
+    let checkout = RepositoryOutput::from_context(context, download_job_id)
+        .ok()
+        .map(|repo| repo.repo_dir);
+    let relative = |path: &Path| {
+        checkout
+            .as_deref()
+            .and_then(|root| checkout_relative(root, path))
+    };
     Ok(SharedImage {
+        build_root: relative(&output.build_context),
+        dockerfile_path: relative(&output.dockerfile_path),
         image_tag: output.image_tag,
         image_id: output.image_id,
         size_bytes: output.size_bytes,
@@ -536,6 +643,8 @@ mod tests {
                 image_ids_by_platform: Default::default(),
                 image_config: None,
                 dockerfile_preset: None,
+                build_root: None,
+                dockerfile_path: None,
             },
             repository: "acme/shop".into(),
             commit_sha: "0123456789abcdef0123456789abcdef01234567".into(),
@@ -545,6 +654,54 @@ mod tests {
             line.contains("Reused image from deployment #41, built from acme/shop@0123456"),
             "{line}"
         );
+    }
+
+    #[test]
+    fn an_unreachable_image_says_why_and_names_its_build() {
+        let line = describe_event(&AdmissionEvent::ReuseUnavailable {
+            deployment_id: 41,
+            reason: "the build node holding it (3) is not active".into(),
+        });
+        assert!(line.contains("deployment #41"), "{line}");
+        assert!(line.contains("(3) is not active"), "{line}");
+        assert!(line.contains("does not depend on it"), "{line}");
+    }
+
+    #[test]
+    fn the_build_root_is_recorded_relative_to_the_checkout() {
+        let checkout = Path::new("/work/deployment-4/repository");
+        // A workspace build widened `apps/web` to the repository root.
+        assert_eq!(checkout_relative(checkout, checkout).as_deref(), Some("."));
+        assert_eq!(
+            checkout_relative(checkout, &checkout.join("apps/web")).as_deref(),
+            Some("apps/web")
+        );
+        assert_eq!(
+            checkout_relative(checkout, &checkout.join("apps/web/Dockerfile")).as_deref(),
+            Some("apps/web/Dockerfile")
+        );
+        // Outside the checkout: not recorded, the follower uses its own.
+        assert_eq!(
+            checkout_relative(checkout, Path::new("/tmp/elsewhere")),
+            None
+        );
+    }
+
+    #[test]
+    fn only_a_build_that_ran_where_it_was_identified_is_offered() {
+        let mut context =
+            crate::test_utils::create_test_context("wf-identical".to_string(), 1, 1, 1);
+        // A control-plane fallback records no builder node.
+        context
+            .set_output("build_image", "builder_node_id", Option::<i32>::None)
+            .unwrap();
+        assert_eq!(built_on(&context, "build_image"), None);
+        context
+            .set_output("build_image", "builder_node_id", Some(7))
+            .unwrap();
+        assert_eq!(built_on(&context, "build_image"), Some(7));
+        // No output at all reads as the control plane.
+        assert_eq!(built_on(&context, "other_job"), None);
     }
 
     #[test]

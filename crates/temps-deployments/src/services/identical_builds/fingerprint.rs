@@ -128,6 +128,12 @@ pub struct BuildInputs<'a> {
     pub cache_from: &'a [String],
     pub build_args: &'a [(String, String)],
     pub buildkit_build_args: &'a [(String, String)],
+    /// Names the planner recorded as public. Whether a value is public
+    /// decides whether the builder receives it (a worker gets only public
+    /// values, and a repository Dockerfile does not get a non-public value
+    /// that would stay in the image), so two builds with the same value but
+    /// a different visibility build different images.
+    pub public_names: &'a BTreeSet<String>,
 }
 
 /// The keys a build coordinates on.
@@ -338,6 +344,12 @@ pub fn identify(
         for (name, value) in values.iter() {
             canonical.field(label, name.as_bytes());
             canonical.field(label, value.as_bytes());
+            let visibility: &[u8] = if inputs.public_names.contains(*name) {
+                b"public"
+            } else {
+                b"non-public"
+            };
+            canonical.field(label, visibility);
         }
     }
 
@@ -382,6 +394,7 @@ mod tests {
         platforms: Vec<String>,
         args: Vec<(String, String)>,
         cache_from: Vec<String>,
+        public: BTreeSet<String>,
     }
 
     fn owned(dockerfile: Option<&str>, args: &[(&str, &str)]) -> Owned {
@@ -394,6 +407,7 @@ mod tests {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             cache_from: Vec::new(),
+            public: BTreeSet::new(),
         }
     }
 
@@ -417,6 +431,7 @@ mod tests {
                 cache_from: &self.cache_from,
                 build_args: &self.args,
                 buildkit_build_args: &[],
+                public_names: &self.public,
             }
         }
 
@@ -457,6 +472,22 @@ mod tests {
         let a = owned(Some(DOCKERFILE), &[("NPM_AUTH", "token-a")]);
         let b = owned(Some(DOCKERFILE), &[("NPM_AUTH", "token-b")]);
         assert_ne!(a.identify().fingerprint, b.identify().fingerprint);
+    }
+
+    #[test]
+    fn the_same_value_marked_public_in_one_build_only_never_matches() {
+        // The builder receives a public value but withholds a non-public
+        // one the Dockerfile would keep in the image: different images.
+        const FINAL_STAGE_ARG: &str = "FROM alpine\nARG BUILD_LABEL\nRUN echo $BUILD_LABEL\n";
+        let public = owned(Some(FINAL_STAGE_ARG), &[("BUILD_LABEL", "blue")]);
+        let mut public = public;
+        public.public.insert("BUILD_LABEL".to_string());
+        let secret = owned(Some(FINAL_STAGE_ARG), &[("BUILD_LABEL", "blue")]);
+        assert_ne!(public.identify().fingerprint, secret.identify().fingerprint);
+        // A public name the build does not read changes nothing.
+        let mut unread = owned(Some(FINAL_STAGE_ARG), &[("BUILD_LABEL", "blue")]);
+        unread.public.insert("SOMETHING_ELSE".to_string());
+        assert_eq!(unread.identify().fingerprint, secret.identify().fingerprint);
     }
 
     #[test]

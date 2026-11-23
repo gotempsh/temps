@@ -133,6 +133,32 @@ pub struct SharedImage {
     pub image_config: Option<BuiltImageConfig>,
     #[serde(default)]
     pub dockerfile_preset: Option<String>,
+    /// The directory the image was built from, relative to the checkout. A
+    /// workspace build widens the configured context to the repository
+    /// root, and the deploy job reads settings from where the build ran, so
+    /// a reusing deployment resolves this in its own checkout. `None` when
+    /// it could not be told; the reusing deployment then uses its own
+    /// configured context.
+    #[serde(default)]
+    pub build_root: Option<String>,
+    /// The Dockerfile the image was built from, relative to the checkout.
+    #[serde(default)]
+    pub dockerfile_path: Option<String>,
+}
+
+impl SharedImage {
+    /// The worker nodes that hold this image (or one of its architectures);
+    /// empty when the control plane holds it.
+    pub fn holder_node_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = self
+            .builder_node_id
+            .into_iter()
+            .chain(self.builder_node_ids_by_platform.values().copied())
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 /// A build whose image this build deploys instead of building.
@@ -174,12 +200,25 @@ pub enum AdmissionEvent {
         leader: LeaderView,
         state: IdenticalBuildState,
     },
+    /// An identical build's image can no longer be reached where it was
+    /// built, so this build does not deploy it. Reuse requires the same
+    /// access boundary, so the source may be named.
+    ReuseUnavailable { deployment_id: i32, reason: String },
 }
 
-/// Receives [`AdmissionEvent`]s while a build waits.
+/// Receives [`AdmissionEvent`]s while a build waits, and answers what only
+/// the build's own process can check.
 #[async_trait]
 pub trait AdmissionObserver: Send + Sync {
     async fn observe(&self, event: AdmissionEvent);
+
+    /// Whether an image the control plane holds (no worker node in
+    /// [`SharedImage::holder_node_ids`]) is still there, or why not. The
+    /// coordinator checks worker-held images itself, against the nodes'
+    /// status.
+    async fn control_plane_image_missing(&self, _image: &SharedImage) -> Option<String> {
+        None
+    }
 }
 
 /// What a coordinated build does next.
@@ -457,9 +496,15 @@ impl IdenticalBuildCoordinator {
         let started = Instant::now();
         let mut followed: Option<LeaderView> = None;
         let mut announced = false;
+        // Identical builds whose image turned out to be unreachable: not
+        // offered again to this build.
+        let mut unreachable: Vec<i32> = Vec::new();
         loop {
             if ticket.mode.shares_images() {
-                if let Some(reused) = self.find_reusable(ticket).await? {
+                if let Some(reused) = self
+                    .find_reachable_reusable(ticket, observer, &mut unreachable)
+                    .await?
+                {
                     self.mark_reused(build_id, ticket, &reused).await?;
                     guard.disarm();
                     info!(
@@ -565,23 +610,128 @@ impl IdenticalBuildCoordinator {
             ))
     }
 
+    /// The newest reusable image this build can actually reach, skipping
+    /// (and reporting once) those whose holder is gone.
+    async fn find_reachable_reusable(
+        &self,
+        ticket: &BuildTicket,
+        observer: &dyn AdmissionObserver,
+        unreachable: &mut Vec<i32>,
+    ) -> Result<Option<ReusedBuild>, IdenticalBuildError> {
+        for candidate in self.find_reusable(ticket).await? {
+            if unreachable.contains(&candidate.build_id) {
+                continue;
+            }
+            let missing = match candidate.image.holder_node_ids() {
+                nodes if nodes.is_empty() => {
+                    observer.control_plane_image_missing(&candidate.image).await
+                }
+                nodes => self.inactive_holders(ticket, &nodes).await?,
+            };
+            match missing {
+                None => return Ok(Some(candidate)),
+                Some(reason) => {
+                    info!(
+                        deployment_id = ticket.deployment_id,
+                        source_deployment_id = candidate.deployment_id,
+                        %reason,
+                        "Not reusing an identical build's image: it cannot be reached"
+                    );
+                    unreachable.push(candidate.build_id);
+                    observer
+                        .observe(AdmissionEvent::ReuseUnavailable {
+                            deployment_id: candidate.deployment_id,
+                            reason,
+                        })
+                        .await;
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Why the worker nodes holding an image cannot hand it over, if they
+    /// cannot: a node that is not `active` (offline, draining, removed) is
+    /// not asked, the deploy job would fail on it.
+    async fn inactive_holders(
+        &self,
+        ticket: &BuildTicket,
+        nodes: &[i32],
+    ) -> Result<Option<String>, IdenticalBuildError> {
+        let placeholders: Vec<String> = (1..=nodes.len()).map(|i| format!("${i}")).collect();
+        let rows = self
+            .db
+            .query_all(statement(
+                &format!(
+                    "SELECT id FROM nodes WHERE status = 'active' AND id IN ({})",
+                    placeholders.join(", ")
+                ),
+                nodes.iter().map(|id| Value::from(*id)).collect(),
+            ))
+            .await
+            .map_err(IdenticalBuildError::database(
+                ticket.deployment_id,
+                "check the nodes holding a reusable image for",
+            ))?;
+        let active = rows
+            .iter()
+            .map(|row| row.try_get::<i32>("", "id"))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(IdenticalBuildError::database(
+                ticket.deployment_id,
+                "check the nodes holding a reusable image for",
+            ))?;
+        let gone: Vec<String> = nodes
+            .iter()
+            .filter(|id| !active.contains(id))
+            .map(i32::to_string)
+            .collect();
+        Ok((!gone.is_empty()).then(|| {
+            format!(
+                "the build node{} holding it ({}) {} not active",
+                if gone.len() == 1 { "" } else { "s" },
+                gone.join(", "),
+                if gone.len() == 1 { "is" } else { "are" },
+            )
+        }))
+    }
+
+    /// Succeeded share builds this build may deploy, newest first. Both
+    /// projects must still be in `share` mode, and both must still have the
+    /// access boundary recorded for this build: team grants changed since
+    /// either build registered make the image unavailable rather than
+    /// letting it cross a boundary.
     async fn find_reusable(
         &self,
         ticket: &BuildTicket,
-    ) -> Result<Option<ReusedBuild>, IdenticalBuildError> {
-        let row = self
+    ) -> Result<Vec<ReusedBuild>, IdenticalBuildError> {
+        const CURRENT_BOUNDARY: &str =
+            "(SELECT COALESCE('teams:' || string_agg(team_id::text, ',' \
+            ORDER BY team_id), 'unrestricted') FROM (SELECT DISTINCT team_id \
+            FROM project_team_access WHERE project_id = {project}) teams)";
+        let rows = self
             .db
-            .query_one(statement(
-                "SELECT id, deployment_id, project_id, image, repository, commit_sha \
-                 FROM identical_builds \
-                 WHERE fingerprint = $1 AND access_boundary = $2 AND mode = 'share' \
-                   AND state = 'succeeded' AND image IS NOT NULL \
-                   AND finished_at > now() - ($3::bigint * interval '1 millisecond') \
-                 ORDER BY finished_at DESC LIMIT 1",
+            .query_all(statement(
+                &format!(
+                    "SELECT b.id, b.deployment_id, b.project_id, b.image, b.repository, b.commit_sha \
+                     FROM identical_builds b \
+                     JOIN projects source ON source.id = b.project_id \
+                     JOIN projects requester ON requester.id = $4 \
+                     WHERE b.fingerprint = $1 AND b.access_boundary = $2 AND b.mode = 'share' \
+                       AND b.state = 'succeeded' AND b.image IS NOT NULL \
+                       AND b.finished_at > now() - ($3::bigint * interval '1 millisecond') \
+                       AND source.identical_build_mode = 'share' AND NOT source.is_deleted \
+                       AND requester.identical_build_mode = 'share' \
+                       AND {source_boundary} = $2 AND {requester_boundary} = $2 \
+                     ORDER BY b.finished_at DESC LIMIT 5",
+                    source_boundary = CURRENT_BOUNDARY.replace("{project}", "b.project_id"),
+                    requester_boundary = CURRENT_BOUNDARY.replace("{project}", "$4"),
+                ),
                 vec![
                     ticket.identity.fingerprint.clone().into(),
                     ticket.access_boundary.clone().into(),
                     millis(self.timing.reuse_window),
+                    ticket.project_id.into(),
                 ],
             ))
             .await
@@ -589,9 +739,6 @@ impl IdenticalBuildCoordinator {
                 ticket.deployment_id,
                 "look up a reusable image for",
             ))?;
-        let Some(row) = row else {
-            return Ok(None);
-        };
         let read = |row: &QueryResult| -> Result<_, DbErr> {
             Ok((
                 row.try_get::<i32>("", "id")?,
@@ -602,32 +749,35 @@ impl IdenticalBuildCoordinator {
                 row.try_get::<String>("", "commit_sha")?,
             ))
         };
-        let (build_id, deployment_id, project_id, image, repository, commit_sha) = read(&row)
-            .map_err(IdenticalBuildError::database(
-                ticket.deployment_id,
-                "read the reusable image for",
-            ))?;
-        let image: SharedImage = match serde_json::from_value(image) {
-            Ok(image) => image,
-            Err(error) => {
-                // Written by a different version, or damaged: build instead.
-                warn!(
-                    build_id,
-                    deployment_id = ticket.deployment_id,
-                    %error,
-                    "Ignoring an identical build whose stored image cannot be read"
-                );
-                return Ok(None);
-            }
-        };
-        Ok(Some(ReusedBuild {
-            build_id,
-            deployment_id,
-            same_project: project_id == ticket.project_id,
-            image,
-            repository,
-            commit_sha,
-        }))
+        let mut reusable = Vec::with_capacity(rows.len());
+        for row in rows {
+            let (build_id, deployment_id, project_id, image, repository, commit_sha) = read(&row)
+                .map_err(
+                IdenticalBuildError::database(ticket.deployment_id, "read the reusable image for"),
+            )?;
+            let image: SharedImage = match serde_json::from_value(image) {
+                Ok(image) => image,
+                Err(error) => {
+                    // Written by a different version, or damaged: skip it.
+                    warn!(
+                        build_id,
+                        deployment_id = ticket.deployment_id,
+                        %error,
+                        "Ignoring an identical build whose stored image cannot be read"
+                    );
+                    continue;
+                }
+            };
+            reusable.push(ReusedBuild {
+                build_id,
+                deployment_id,
+                same_project: project_id == ticket.project_id,
+                image,
+                repository,
+                commit_sha,
+            });
+        }
+        Ok(reusable)
     }
 
     async fn mark_reused(
