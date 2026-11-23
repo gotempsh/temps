@@ -17,8 +17,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
     services::{
-        GatewayService, ModelCatalogService, ProviderKeyService, ProviderModelService,
-        ProviderPreferenceService, StructuredOutputService, UsageService,
+        CodingAgentService, GatewayService, ModelCatalogService, ProviderKeyService,
+        ProviderModelService, ProviderPreferenceService, StructuredOutputService, UsageService,
     },
 };
 
@@ -696,6 +696,13 @@ impl TempsPlugin for AiGatewayPlugin {
             context.register_service(structured_output_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let coding_agent_service = Arc::new(CodingAgentService::new(
+                db.clone(),
+                ai_service.clone(),
+                audit_service.clone(),
+            ));
+            context.register_service(coding_agent_service.clone());
+            coding_agent_service.clone().spawn_background();
             let project_access_checker =
                 context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
@@ -712,6 +719,7 @@ impl TempsPlugin for AiGatewayPlugin {
                 provider_model_service,
                 provider_preference_service,
                 model_catalog_service,
+                coding_agent_service,
                 usage_service,
                 audit_service,
                 telemetry,
@@ -737,6 +745,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_usage_routes())
             .merge(handlers::configure_limits_routes())
             .merge(handlers::configure_model_catalog_routes())
+            .merge(handlers::configure_coding_agent_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_native_routes())
@@ -762,6 +771,9 @@ impl TempsPlugin for AiGatewayPlugin {
         let catalog_schema =
             <handlers::model_catalog::AiGatewayModelCatalogApiDoc as OpenApiTrait>::openapi();
         schema.merge(catalog_schema);
+        let coding_agents_schema =
+            <handlers::coding_agents::AiCodingAgentsApiDoc as OpenApiTrait>::openapi();
+        schema.merge(coding_agents_schema);
         let provider_status_schema =
             <handlers::provider_status::AiProviderStatusApiDoc as OpenApiTrait>::openapi();
         schema.merge(provider_status_schema);

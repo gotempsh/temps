@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+pub mod coding_agents;
 pub mod gateway;
 pub mod limits;
 pub mod model_catalog;
@@ -14,6 +15,7 @@ pub mod structured_output;
 pub mod types;
 pub mod usage;
 
+pub use coding_agents::configure_coding_agent_routes;
 pub use gateway::configure_gateway_routes;
 pub use limits::configure_limits_routes;
 pub use model_catalog::configure_model_catalog_routes;

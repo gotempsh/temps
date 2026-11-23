@@ -6,8 +6,9 @@ use temps_core::AuditLogger;
 
 use super::provider_status::AiProviderStatusCache;
 use crate::services::{
-    AiLimitsService, GatewayService, ModelCatalogService, NativeApiService, ProviderKeyService,
-    ProviderModelService, ProviderPreferenceService, StructuredOutputService, UsageService,
+    AiLimitsService, CodingAgentService, GatewayService, ModelCatalogService, NativeApiService,
+    ProviderKeyService, ProviderModelService, ProviderPreferenceService, StructuredOutputService,
+    UsageService,
 };
 
 pub struct AiGatewayAppState {
@@ -17,6 +18,7 @@ pub struct AiGatewayAppState {
     pub provider_model_service: Arc<ProviderModelService>,
     pub provider_preference_service: Arc<ProviderPreferenceService>,
     pub model_catalog_service: Arc<ModelCatalogService>,
+    pub coding_agent_service: Arc<CodingAgentService>,
     pub usage_service: Arc<UsageService>,
     pub limits_service: Arc<AiLimitsService>,
     pub audit_service: Arc<dyn AuditLogger>,
@@ -37,6 +39,7 @@ pub async fn create_ai_gateway_app_state(
     provider_model_service: Arc<ProviderModelService>,
     provider_preference_service: Arc<ProviderPreferenceService>,
     model_catalog_service: Arc<ModelCatalogService>,
+    coding_agent_service: Arc<CodingAgentService>,
     usage_service: Arc<UsageService>,
     audit_service: Arc<dyn AuditLogger>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
@@ -57,6 +60,7 @@ pub async fn create_ai_gateway_app_state(
         provider_model_service,
         provider_preference_service,
         model_catalog_service,
+        coding_agent_service,
         usage_service,
         limits_service,
         audit_service,
@@ -98,6 +102,11 @@ pub(crate) fn test_app_state(
         gateway_service.clone(),
         db.clone(),
     ));
+    let coding_agent_service = Arc::new(CodingAgentService::new(
+        db.clone(),
+        ai.clone(),
+        audit.clone(),
+    ));
     Arc::new(AiGatewayAppState {
         db: db.clone(),
         gateway_service: gateway_service.clone(),
@@ -105,6 +114,7 @@ pub(crate) fn test_app_state(
         provider_model_service,
         provider_preference_service: Arc::new(ProviderPreferenceService::new(db.clone())),
         model_catalog_service,
+        coding_agent_service,
         usage_service: usage_service.clone(),
         limits_service: Arc::new(AiLimitsService::new(db.clone(), usage_service.clone())),
         audit_service: audit,

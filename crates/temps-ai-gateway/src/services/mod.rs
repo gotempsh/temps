@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod ai_service;
+pub mod coding_agents;
 pub mod gateway_service;
 pub mod limits_service;
 pub mod model_catalog;
@@ -15,6 +16,7 @@ pub mod structured_output;
 pub mod usage_service;
 
 pub use ai_service::GatewayAiService;
+pub use coding_agents::{CodingAgentError, CodingAgentService};
 pub use gateway_service::{
     ByokOverride, CredentialType, GatewayService, ResolvedCredentials, SelfHostedListing, ServedBy,
 };
