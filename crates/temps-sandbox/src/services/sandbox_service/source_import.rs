@@ -371,6 +371,11 @@ pub(super) fn project_clone_url(project: &projects::Model) -> ProjectCloneUrl<'_
     {
         return ProjectCloneUrl::Stored(url);
     }
+    // Repository metadata left on a git-less project type (a manual upload,
+    // an image) is not a source: its workspace starts empty, as it always has.
+    if !project.source_type.requires_git_info() {
+        return ProjectCloneUrl::None;
+    }
     let owner = project.repo_owner.trim();
     let name = project.repo_name.trim();
     match project.git_provider_connection_id {
@@ -495,6 +500,18 @@ pub(super) fn clone_url_names_repository(
         name.trim_matches('/')
     );
     path.eq_ignore_ascii_case(&expected)
+}
+
+/// The HTTP-Basic pair for cloning with a connection's stored token: the
+/// username the provider expects with it (`oauth2` for GitLab, `x-token-auth`
+/// for Bitbucket, `x-access-token` otherwise), as a deployment of the same
+/// repository sends. The token goes in the password slot and is injected via
+/// GIT_ASKPASS (never argv, never URL).
+pub(super) fn connection_clone_credentials(provider_type: &str, token: String) -> (String, String) {
+    (
+        GitProviderManager::clone_username_for_provider_type(provider_type).to_string(),
+        token,
+    )
 }
 
 /// Which rule let a stored connection authenticate a seed.
@@ -849,10 +866,7 @@ impl SandboxService {
                 reason: format!("resolve git token: {}", e),
             })?;
 
-        // GitHub/GitLab both accept `x-access-token` as the username for
-        // token-based HTTPS auth. The token goes in the password slot and
-        // is injected via GIT_ASKPASS (never argv, never URL).
-        Ok(("x-access-token".to_string(), token))
+        Ok(connection_clone_credentials(&provider.provider_type, token))
     }
 
     /// Run the actual `git clone` inside the sandbox. Credentials (if any)

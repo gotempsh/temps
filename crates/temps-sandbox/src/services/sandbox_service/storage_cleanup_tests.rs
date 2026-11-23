@@ -15,7 +15,7 @@ use super::{
     reconcile::VM_RECONCILE_REPORTED_IDS,
     source_import::{
         authorize_seed_connection, clean_git_environment, clone_url_names_repository,
-        project_clone_url, sandbox_image_is_trusted_for_credentials,
+        connection_clone_credentials, project_clone_url, sandbox_image_is_trusted_for_credentials,
         sanitize_privileged_import_environment, tarball_extract_command,
         validate_connection_clone_origin, ProjectCloneUrl, ProjectRepositoryGrant,
         SeedConnectionAuthority, SourceNetworkPin,
@@ -1738,7 +1738,9 @@ async fn source_from_project_errors_when_the_project_has_no_repo() {
 #[tokio::test]
 async fn source_from_project_allows_an_empty_workspace_for_manual_projects() {
     let data_root = unique_data_root("manual-project-no-repo");
-    let mut manual_project = project_without_repository();
+    // Repository metadata and a connection are still on the row: a git-less
+    // project type starts empty regardless, and no provider is asked.
+    let mut manual_project = project_row(None);
     manual_project.source_type = temps_entities::source_type::SourceType::Manual;
     let db = MockDatabase::new(DatabaseBackend::Postgres)
         .append_query_results([vec![manual_project]])
@@ -1783,6 +1785,29 @@ fn a_project_without_a_stored_url_clones_through_its_connection() {
                 name: "api",
             },
             "git_url {git_url:?}"
+        );
+    }
+}
+
+#[test]
+fn a_git_less_project_never_clones_through_its_connection() {
+    let mut manual = project_row(None);
+    manual.source_type = temps_entities::source_type::SourceType::Manual;
+    assert_eq!(project_clone_url(&manual), ProjectCloneUrl::None);
+}
+
+#[test]
+fn a_connection_token_clones_with_the_username_its_provider_expects() {
+    for (provider_type, username) in [
+        ("bitbucket", "x-token-auth"),
+        ("gitlab", "oauth2"),
+        ("github", "x-access-token"),
+        ("gitea", "x-access-token"),
+    ] {
+        assert_eq!(
+            connection_clone_credentials(provider_type, "repo-token".to_string()),
+            (username.to_string(), "repo-token".to_string()),
+            "{provider_type}"
         );
     }
 }
