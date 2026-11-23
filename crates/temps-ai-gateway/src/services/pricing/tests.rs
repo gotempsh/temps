@@ -776,6 +776,60 @@ fn openrouter_routes_bill_long_prompts_from_their_listed_thresholds() {
 }
 
 #[test]
+fn openrouter_routes_bill_cache_reads_and_writes_at_their_listed_rates_in_both_tiers() {
+    // 50,000 prompt tokens below every threshold and 300,000 above it; a
+    // tenth of each read from the cache and a tenth written to it.
+    // (model, short (read, write) rates, long (read, write) rates), per
+    // OpenRouter's listing; a write bills at the dearest (1-hour) tier.
+    for (model, short, long) in [
+        ("anthropic/claude-haiku-5.5", (0.01, 0.20), (0.05, 1.0)),
+        ("openai/gpt-6.2-astra", (0.40, 10.0), (0.80, 20.0)),
+        ("openai/gpt-6.2-sol", (0.10, 2.50), (0.20, 5.0)),
+        ("openai/gpt-6-luna", (0.01, 0.125), (0.02, 0.25)),
+    ] {
+        let rates = rate_table().rates_for(model).expect("listed");
+        let (above, long_tier) = rates.long_context.expect("a long tier");
+        for (input, (read_rate, write_rate), tier) in
+            [(50_000_i64, short, rates.base), (300_000, long, long_tier)]
+        {
+            assert_eq!(input > above, tier == long_tier, "{model} at {input}");
+            let details = PromptTokensDetails {
+                cached_tokens: input / 10,
+                cache_write_tokens: input / 10,
+            };
+            let expected = ((input - input / 5) as f64 * tier.input
+                + (input / 10) as f64 * read_rate
+                + (input / 10) as f64 * write_rate)
+                .ceil() as i64;
+            assert_eq!(
+                estimate_cost_microcents(model, input, 0, details),
+                expected,
+                "{model} at {input} prompt tokens"
+            );
+        }
+    }
+    // The Anthropic routes publish both write tiers and the cache-read rate.
+    for (model, write_5m, write_1h, hit) in [
+        ("anthropic/claude-opus-5.5", 5.0, 8.0, 0.20),
+        ("anthropic/claude-sonnet-5.5", 2.50, 4.0, 0.10),
+        ("anthropic/claude-sonnet-5", 2.50, 4.0, 0.20),
+        ("anthropic/claude-fable-5.2", 10.0, 16.0, 0.20),
+        ("anthropic/claude-haiku-5.5", 0.125, 0.20, 0.01),
+    ] {
+        let row = listed(model);
+        assert_eq!(
+            (
+                row.cache_write_5m_per_million,
+                row.cache_write_1h_per_million,
+                row.cache_hit_per_million
+            ),
+            (Some(write_5m), Some(write_1h), Some(hit)),
+            "{model}"
+        );
+    }
+}
+
+#[test]
 fn the_openrouter_low_cost_default_is_priced_at_its_own_rate() {
     let default = crate::providers::low_cost_default_model("openrouter").unwrap();
     assert_eq!(default, "openai/gpt-6-luna");

@@ -1010,6 +1010,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             4.0,
             20.0,
         )
+        .cache(5.0, 8.0, 0.20)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1019,6 +1020,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .cache(2.50, 4.0, 0.10)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1028,6 +1030,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .cache(2.50, 4.0, 0.20)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1037,6 +1040,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             8.0,
             40.0,
         )
+        .cache(10.0, 16.0, 0.20)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1046,7 +1050,10 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             0.10,
             0.50,
         )
+        .cache(0.125, 0.20, 0.01)
         .long_context(OPENROUTER_HAIKU_LONG_CONTEXT, 0.50, 2.50)
+        .long_cache_read(0.05)
+        .long_cache_write(1.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1056,7 +1063,11 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             8.0,
             40.0,
         )
+        .cache_read(0.40)
+        .cache_write_ceiling(10.0)
         .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 16.0, 60.0)
+        .long_cache_read(0.80)
+        .long_cache_write(20.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1066,7 +1077,11 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .cache_read(0.10)
+        .cache_write_ceiling(2.50)
         .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 4.0, 15.0)
+        .long_cache_read(0.20)
+        .long_cache_write(5.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -1076,7 +1091,11 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             0.10,
             0.50,
         )
+        .cache_read(0.01)
+        .cache_write_ceiling(0.125)
         .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 0.20, 0.75)
+        .long_cache_read(0.02)
+        .long_cache_write(0.25)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
