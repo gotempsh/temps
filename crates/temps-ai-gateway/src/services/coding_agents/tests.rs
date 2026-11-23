@@ -38,6 +38,10 @@ struct FakeWorkspaces {
     behind: Vec<i32>,
     busy: Vec<i32>,
     failing: Vec<i32>,
+    /// The release lookup fails: an installed version, no latest one.
+    lookup_failing: Vec<i32>,
+    /// npm exits zero but the CLI on PATH still reports the old version.
+    stale_after_update: Vec<i32>,
     updates: Mutex<Vec<(String, i32)>>,
     status_checks: Mutex<usize>,
 }
@@ -82,6 +86,14 @@ impl AiService for FakeWorkspaces {
         _refresh: bool,
     ) -> Result<HarnessUpdateStatus, AiError> {
         *self.status_checks.lock().unwrap() += 1;
+        if self.lookup_failing.contains(&principal_id) {
+            return Ok(HarnessUpdateStatus {
+                latest_version: None,
+                update_available: false,
+                detail: Some("npm view timed out".into()),
+                ..status(provider, "1.0.0", "1.0.0")
+            });
+        }
         Ok(if self.behind.contains(&principal_id) {
             status(provider, "1.0.0", "1.1.0")
         } else {
@@ -110,6 +122,9 @@ impl AiService for FakeWorkspaces {
             .lock()
             .unwrap()
             .push((provider.to_string(), principal_id));
+        if self.stale_after_update.contains(&principal_id) {
+            return Ok(status(provider, "1.0.0", "1.1.0"));
+        }
         Ok(status(provider, "1.1.0", "1.1.0"))
     }
 }
@@ -396,6 +411,67 @@ async fn only_workspaces_behind_are_updated_audited_and_not_retried_soon() {
     assert_eq!(second.checked, 1);
     assert_eq!(second.busy, 1);
     assert_eq!(ai.updates.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn a_failed_lookup_or_an_update_that_did_not_take_is_a_failure_not_a_success() {
+    let Some(db) = test_db().await else { return };
+    let ai = Arc::new(FakeWorkspaces {
+        recent: HashMap::from([("claude_cli", vec![1, 2])]),
+        behind: vec![2],
+        lookup_failing: vec![1],
+        stale_after_update: vec![2],
+        ..Default::default()
+    });
+    let audit = Arc::new(RecordingAudit::default());
+    let service = service(
+        db.connection_arc(),
+        ai.clone(),
+        audit.clone(),
+        "https://registry.invalid/",
+    );
+    enable_auto_update(&service).await;
+
+    let pass = service.run_auto_update_pass().await.unwrap();
+    assert_eq!(
+        pass,
+        AutoUpdatePass {
+            checked: 2,
+            updated: 0,
+            failed: 2,
+            busy: 0
+        }
+    );
+    // The lookup failure installs nothing; the stale update was attempted
+    // but is not audited as a success.
+    assert_eq!(
+        *ai.updates.lock().unwrap(),
+        vec![("claude_cli".to_string(), 2)]
+    );
+    assert!(audit.records.lock().unwrap().is_empty());
+}
+
+#[test]
+fn an_update_counts_only_when_the_cli_reports_the_new_version() {
+    let before = status("claude_cli", "1.0.0", "1.1.0");
+    assert!(update_took_effect(
+        &before,
+        &status("claude_cli", "1.1.0", "1.1.0")
+    ));
+    // A release published between the check and the install is still new.
+    assert!(update_took_effect(
+        &before,
+        &status("claude_cli", "1.2.0", "1.2.0")
+    ));
+    assert!(!update_took_effect(
+        &before,
+        &status("claude_cli", "1.0.0", "1.1.0")
+    ));
+    let unreadable = HarnessUpdateStatus {
+        installed_version: None,
+        ..status("claude_cli", "1.1.0", "1.1.0")
+    };
+    assert!(!update_took_effect(&before, &unreadable));
 }
 
 #[tokio::test]

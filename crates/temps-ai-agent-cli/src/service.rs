@@ -230,6 +230,17 @@ type RecentTurns = Arc<std::sync::Mutex<HashMap<i32, Instant>>>;
 const RECENT_TURN_CAPACITY: usize = 4096;
 const RECENT_TURN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// Whether `workspace` is `principal_id`'s persistent global workspace (its
+/// work directory is `global-user-{principal_id}`), the one automatic CLI
+/// updates act on. Application sandboxes have their own directories.
+fn is_global_workspace(workspace: &temps_ai::HarnessWorkspace, principal_id: i32) -> bool {
+    workspace
+        .host_work_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == format!("global-user-{principal_id}"))
+}
+
 fn record_recent_turn(turns: &RecentTurns, principal_id: i32, now: Instant) {
     let mut turns = turns
         .lock()
@@ -2650,7 +2661,6 @@ impl AgentCliAiService {
             purpose: purpose.clone(),
             reason: "sandboxed harness turn is missing its authenticated principal".into(),
         })?;
-        record_recent_turn(&self.recent_turns, principal_id, Instant::now());
         if !request.tools.is_empty() && request.harness_mcp_server.is_none() {
             return Err(AiError::Provider {
                 purpose,
@@ -2675,6 +2685,12 @@ impl AgentCliAiService {
                     reason: "another harness turn is already running in this application sandbox"
                         .into(),
                 })?;
+        // Automatic CLI updates check and update the principal's global
+        // workspace only, so only an accepted turn there marks it active. A
+        // turn in an application sandbox must not wake the global one.
+        if is_global_workspace(&workspace, principal_id) {
+            record_recent_turn(&self.recent_turns, principal_id, Instant::now());
+        }
         let handle = self
             .get_or_create_sandbox(&workspace, request.project_id)
             .await?;
@@ -7189,6 +7205,18 @@ mod tests {
 
         service.evict_sandbox_handle("app-one");
         assert!(service.cached_sandbox_handle("app-one").is_none());
+    }
+
+    #[test]
+    fn only_the_principals_own_global_workspace_counts_as_recent_activity() {
+        let workspace = |dir: &str| temps_ai::HarnessWorkspace {
+            sandbox_label: "0a1b2c".into(),
+            host_work_dir: PathBuf::from(format!("/managed/{dir}")),
+        };
+        assert!(is_global_workspace(&workspace("global-user-42"), 42));
+        assert!(!is_global_workspace(&workspace("global-user-42"), 4));
+        assert!(!is_global_workspace(&workspace("global-user-420"), 42));
+        assert!(!is_global_workspace(&workspace("app_0a1b2c3d"), 42));
     }
 
     #[test]

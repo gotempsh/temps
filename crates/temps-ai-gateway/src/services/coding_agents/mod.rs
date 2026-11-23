@@ -364,7 +364,29 @@ impl CodingAgentService {
                 return;
             }
         };
-        if !status.update_available || status.updating {
+        if status.updating {
+            self.record_attempt(provider_id, principal_id, now);
+            return;
+        }
+        // Without a latest version there is nothing to compare: the release
+        // lookup failed (registry timeout, `npm view` error). That is a failed
+        // check, not an up-to-date CLI.
+        if status.latest_version.is_none() {
+            self.record_attempt(provider_id, principal_id, now);
+            outcome.failed += 1;
+            warn!(
+                provider_id,
+                principal_id,
+                installed = status.installed_version.as_deref().unwrap_or("unknown"),
+                detail = status
+                    .detail
+                    .as_deref()
+                    .unwrap_or("no latest version reported"),
+                "Coding-agent release lookup failed; automatic update skipped"
+            );
+            return;
+        }
+        if !status.update_available {
             self.record_attempt(provider_id, principal_id, now);
             return;
         }
@@ -373,6 +395,21 @@ impl CodingAgentService {
             .update_workspace_harness(provider_id, principal_id)
             .await
         {
+            Ok(updated) if !update_took_effect(&status, &updated) => {
+                // npm exited zero, but the CLI on PATH still reports an old
+                // version or none (a second copy earlier on PATH, a broken
+                // install). Not a success: no success audit.
+                self.record_attempt(provider_id, principal_id, now);
+                outcome.failed += 1;
+                warn!(
+                    provider_id,
+                    principal_id,
+                    expected = status.latest_version.as_deref().unwrap_or("unknown"),
+                    installed = updated.installed_version.as_deref().unwrap_or("unknown"),
+                    detail = updated.detail.as_deref().unwrap_or(""),
+                    "Automatic coding-agent update finished but the installed version did not change to the latest"
+                );
+            }
             Ok(updated) => {
                 self.record_attempt(provider_id, principal_id, now);
                 outcome.updated += 1;
@@ -505,5 +542,25 @@ impl AuditOperation for AutoUpdateAudit {
 
     fn serialize(&self) -> temps_core::AuditResult<String> {
         temps_core::serialize_audit_operation(self)
+    }
+}
+
+/// Whether an update reported as successful actually installed a new CLI:
+/// the binary now reports a version, no newer release is left, and it is not
+/// older than the latest release the check saw.
+fn update_took_effect(
+    before: &temps_ai::HarnessUpdateStatus,
+    after: &temps_ai::HarnessUpdateStatus,
+) -> bool {
+    use temps_ai_agent_cli::harness_update::is_newer;
+    let Some(installed) = after.installed_version.as_deref() else {
+        return false;
+    };
+    if after.update_available {
+        return false;
+    }
+    match before.latest_version.as_deref() {
+        Some(latest) => !is_newer(latest, installed),
+        None => before.installed_version.as_deref() != Some(installed),
     }
 }

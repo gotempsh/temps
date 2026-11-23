@@ -660,7 +660,7 @@ async fn create_provider_key(
     // Verify the key works before persisting it. Fails fast with a 400 so
     // the UI doesn't end up with a stored-but-broken credential. The base
     // URL is validated (with DNS) before anything is sent.
-    app_state
+    let verified_model = app_state
         .gateway_service
         .test_provider(
             &request.provider,
@@ -678,6 +678,12 @@ async fn create_provider_key(
                     .map(|_| request.provider.as_str()),
             )
         })?;
+    // A key with no chosen model that only verified on an earlier low-cost
+    // model (the current one was refused) defaults to the model that
+    // answered, shown on the key like any default, instead of internal calls
+    // starting from the refused one.
+    let default_model =
+        default_after_verification(&request.provider, default_model, verified_model);
 
     let mut key = app_state
         .provider_key_service
@@ -1154,7 +1160,7 @@ async fn test_provider_key_inline(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let response = match result {
-        Ok(()) => TestProviderKeyResponse {
+        Ok(_) => TestProviderKeyResponse {
             success: true,
             provider: request.provider,
             error: None,
@@ -1216,7 +1222,7 @@ async fn test_provider_key_by_id(
     let latency_ms = start.elapsed().as_millis() as u64;
 
     let response = match result {
-        Ok(()) => TestProviderKeyResponse {
+        Ok(_) => TestProviderKeyResponse {
             success: true,
             provider: provider_name,
             error: None,
@@ -1340,8 +1346,45 @@ mod replacement_check_tests {
     }
 }
 
+/// The default model a new key is created with: the one requested, else the
+/// model verification succeeded on when that was a fallback (the provider
+/// refused the current low-cost model), else none.
+fn default_after_verification(
+    provider: &str,
+    requested: Option<String>,
+    verified: String,
+) -> Option<String> {
+    requested.or_else(|| {
+        (crate::providers::low_cost_default_model(provider) != Some(verified.as_str()))
+            .then_some(verified)
+    })
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_key_verified_on_a_fallback_model_defaults_to_it() {
+        // Verified on the current low-cost model: no default is pinned.
+        assert_eq!(
+            super::default_after_verification("openai", None, "gpt-6-luna".into()),
+            None
+        );
+        // The current one was refused and gpt-5-nano answered.
+        assert_eq!(
+            super::default_after_verification("openai", None, "gpt-5-nano".into()),
+            Some("gpt-5-nano".to_string())
+        );
+        // A model the administrator chose always wins.
+        assert_eq!(
+            super::default_after_verification(
+                "openai",
+                Some("gpt-6.2-sol".into()),
+                "gpt-6.2-sol".into()
+            ),
+            Some("gpt-6.2-sol".to_string())
+        );
+    }
+
     use super::*;
 
     fn upstream_error() -> AiGatewayError {
