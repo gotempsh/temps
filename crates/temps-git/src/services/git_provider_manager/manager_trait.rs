@@ -27,6 +27,20 @@ fn token_error(
     }
 }
 
+/// A provider that cannot find or read the repository fails the clone; a
+/// token refresh that failed on the way keeps [`token_error`]'s mapping.
+fn repository_lookup_error(
+    error: GitProviderManagerError,
+) -> crate::services::git_provider_manager_trait::GitProviderManagerError {
+    use crate::services::git_provider_manager_trait::GitProviderManagerError as TraitError;
+    match error {
+        GitProviderManagerError::RepositoryOperation { .. } => {
+            TraitError::CloneError(error.to_string())
+        }
+        other => token_error(other),
+    }
+}
+
 #[async_trait]
 impl GitProviderManagerTrait for GitProviderManager {
     async fn clone_repository(
@@ -75,38 +89,16 @@ impl GitProviderManagerTrait for GitProviderManager {
 
         // Get repository info — also retry-on-auth, since the same stale
         // token would fail here before we ever reach the clone.
-        let repo = match provider_service
-            .get_repository(&access_token, repo_owner, repo_name)
+        let repo = self
+            .fetch_connection_repository(
+                connection_id,
+                &provider_service,
+                &access_token,
+                repo_owner,
+                repo_name,
+            )
             .await
-        {
-            Ok(r) => r,
-            Err(e) if Self::is_auth_failure(&e.to_string()) => {
-                tracing::warn!(
-                    connection_id,
-                    "get_repository hit auth failure ({}); force-refreshing token and retrying",
-                    e
-                );
-                let refreshed = self
-                    .force_refresh_connection_token(connection_id)
-                    .await
-                    .map_err(token_error)?;
-                provider_service
-                    .get_repository(&refreshed, repo_owner, repo_name)
-                    .await
-                    .map_err(|err| {
-                        TraitError::CloneError(format!(
-                            "Failed to get repository after token refresh: {}",
-                            err
-                        ))
-                    })?
-            }
-            Err(e) => {
-                return Err(TraitError::CloneError(format!(
-                    "Failed to get repository: {}",
-                    e
-                )))
-            }
-        };
+            .map_err(repository_lookup_error)?;
 
         // Clone the repository. On auth failure (libgit2 surfaces 401/403 as a
         // generic credential error), force-refresh the OAuth token and retry
@@ -279,38 +271,16 @@ impl GitProviderManagerTrait for GitProviderManager {
             .await
             .map_err(token_error)?;
 
-        let repo = match provider_service
-            .get_repository(&access_token, repo_owner, repo_name)
+        let repo = self
+            .fetch_connection_repository(
+                connection_id,
+                &provider_service,
+                &access_token,
+                repo_owner,
+                repo_name,
+            )
             .await
-        {
-            Ok(r) => r,
-            Err(e) if Self::is_auth_failure(&e.to_string()) => {
-                tracing::warn!(
-                    connection_id,
-                    "get_repository hit auth failure ({}); force-refreshing token and retrying",
-                    e
-                );
-                let refreshed = self
-                    .force_refresh_connection_token(connection_id)
-                    .await
-                    .map_err(token_error)?;
-                provider_service
-                    .get_repository(&refreshed, repo_owner, repo_name)
-                    .await
-                    .map_err(|err| {
-                        TraitError::CloneError(format!(
-                            "Failed to get repository after token refresh: {}",
-                            err
-                        ))
-                    })?
-            }
-            Err(e) => {
-                return Err(TraitError::CloneError(format!(
-                    "Failed to get repository: {}",
-                    e
-                )))
-            }
-        };
+            .map_err(repository_lookup_error)?;
 
         let username = Self::clone_username_for_provider_type(&provider.provider_type).to_string();
         let clone_url = repo.clone_url.clone();

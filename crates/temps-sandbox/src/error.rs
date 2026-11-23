@@ -272,6 +272,21 @@ pub enum SandboxError {
     )]
     ProjectHasNoRepo { project_id: i32, name: String },
 
+    /// The project stores no clone URL, and asking its git connection for
+    /// the URL of the repository it names failed (the repository is gone,
+    /// the connection lost access or needs reauthorizing). Mapped to HTTP
+    /// 502: the provider, not the request, is what failed.
+    #[error(
+        "Project {project_id} ('{name}') stores no clone URL, and git connection {connection_id} could not look up its repository {repository}: {reason}"
+    )]
+    ProjectRepositoryUnresolved {
+        project_id: i32,
+        name: String,
+        connection_id: i32,
+        repository: String,
+        reason: String,
+    },
+
     /// An operation exceeded the per-sandbox timeout.
     #[error("Operation timed out in sandbox {sandbox_id} after {timeout_secs}s")]
     Timeout {

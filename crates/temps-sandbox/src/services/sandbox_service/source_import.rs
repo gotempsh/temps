@@ -346,6 +346,203 @@ pub(super) fn validate_connection_clone_origin(
     Ok(())
 }
 
+/// Where a project's workspace clones from.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum ProjectCloneUrl<'a> {
+    /// The project stores its clone URL.
+    Stored(&'a str),
+    /// No stored URL, but the project names its repository and the
+    /// connection that reaches it, which is all a deployment of it uses.
+    FromConnection {
+        connection_id: i32,
+        owner: &'a str,
+        name: &'a str,
+    },
+    /// Nothing to clone from.
+    None,
+}
+
+pub(super) fn project_clone_url(project: &projects::Model) -> ProjectCloneUrl<'_> {
+    if let Some(url) = project
+        .git_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        return ProjectCloneUrl::Stored(url);
+    }
+    let owner = project.repo_owner.trim();
+    let name = project.repo_name.trim();
+    match project.git_provider_connection_id {
+        Some(connection_id) if !owner.is_empty() && !name.is_empty() => {
+            ProjectCloneUrl::FromConnection {
+                connection_id,
+                owner,
+                name,
+            }
+        }
+        _ => ProjectCloneUrl::None,
+    }
+}
+
+/// A seed source derived from a project, with the grant that lets that
+/// project's own connection authenticate it.
+#[derive(Debug)]
+pub(super) struct ProjectSeed {
+    pub(super) source: SandboxSource,
+    pub(super) repository: Option<ProjectRepositoryGrant>,
+}
+
+/// Authority to clone one project's repository with that project's git
+/// connection, whoever owns the connection.
+///
+/// The handler admits a `project_id` only after `project_scope_guard!`,
+/// `project_access_guard!` and `GitRepositoriesRead`, so the caller may
+/// already read this repository through the project: its deployments clone
+/// it with this connection. Outside tests the grant is minted only by
+/// [`SandboxService::source_from_project`], never from request input, and
+/// [`Self::authorize`] confines it to the URL derived there, which must name
+/// the project's `repo_owner/repo_name` at the connection's provider.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ProjectRepositoryGrant {
+    project_id: i32,
+    connection_id: i32,
+    repo_owner: String,
+    repo_name: String,
+    clone_url: String,
+}
+
+impl ProjectRepositoryGrant {
+    pub(super) fn for_project(project: &projects::Model, clone_url: &str) -> Option<Self> {
+        let repo_owner = project.repo_owner.trim();
+        let repo_name = project.repo_name.trim();
+        if repo_owner.is_empty() || repo_name.is_empty() {
+            return None;
+        }
+        Some(Self {
+            project_id: project.id,
+            connection_id: project.git_provider_connection_id?,
+            repo_owner: repo_owner.to_string(),
+            repo_name: repo_name.to_string(),
+            clone_url: clone_url.to_string(),
+        })
+    }
+
+    /// Does this grant cover cloning `clone_url` with `connection_id`?
+    pub(super) fn authorize(
+        &self,
+        connection_id: i32,
+        clone_url: &str,
+        provider: &temps_entities::git_providers::Model,
+    ) -> Result<(), SandboxError> {
+        if connection_id != self.connection_id {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "Git connection {connection_id} is not the connection of project {} (connection {})",
+                    self.project_id, self.connection_id
+                ),
+            });
+        }
+        if clone_url != self.clone_url
+            || !clone_url_names_repository(clone_url, provider, &self.repo_owner, &self.repo_name)
+        {
+            return Err(SandboxError::Validation {
+                message: format!(
+                    "Git connection {connection_id} may seed project {}'s sandbox only from its repository {}/{}; the project's clone URL does not point at it",
+                    self.project_id, self.repo_owner, self.repo_name
+                ),
+            });
+        }
+        validate_connection_clone_origin(clone_url, provider)
+    }
+}
+
+/// Does `clone_url` address exactly `owner/name` beneath the provider's base
+/// URL? Same origin as the provider, path `<base path>/<owner>/<name>` with an
+/// optional `.git`, no query or fragment. Provider paths are compared without
+/// case, as GitHub and GitLab resolve them.
+pub(super) fn clone_url_names_repository(
+    clone_url: &str,
+    provider: &temps_entities::git_providers::Model,
+    owner: &str,
+    name: &str,
+) -> bool {
+    let Some(base) = provider
+        .base_url
+        .as_deref()
+        .or_else(|| default_git_provider_base_url(&provider.provider_type))
+        .and_then(|base| url::Url::parse(base).ok())
+    else {
+        return false;
+    };
+    let Ok(clone) = url::Url::parse(clone_url) else {
+        return false;
+    };
+    if clone.query().is_some() || clone.fragment().is_some() {
+        return false;
+    }
+    let path = clone.path().trim_end_matches('/');
+    let path = path
+        .len()
+        .checked_sub(".git".len())
+        .filter(|split| path.is_char_boundary(*split))
+        .filter(|split| path[*split..].eq_ignore_ascii_case(".git"))
+        .map_or(path, |split| &path[..split]);
+    let expected = format!(
+        "{}/{}/{}",
+        base.path().trim_end_matches('/'),
+        owner.trim_matches('/'),
+        name.trim_matches('/')
+    );
+    path.eq_ignore_ascii_case(&expected)
+}
+
+/// Which rule let a stored connection authenticate a seed.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SeedConnectionAuthority {
+    /// The caller owns the connection: any repository at its provider.
+    CallerOwned,
+    /// The project-derived seed of the project's own repository.
+    ProjectRepository,
+}
+
+fn connection_not_owned(connection_id: i32) -> SandboxError {
+    SandboxError::Validation {
+        message: format!("Git connection {connection_id} is not owned by the requesting user"),
+    }
+}
+
+/// Decide whether `user_id` may clone `clone_url` with a stored connection.
+///
+/// A caller-supplied `git_connection_id` must belong to the caller. A
+/// project-derived seed (`project_repository` is `Some`) may also use the
+/// project's own connection, including an organization-level one with no
+/// owner, but only for that project's repository. A caller who owns the
+/// connection keeps the ownership rule even when the project binding does
+/// not hold.
+pub(super) fn authorize_seed_connection(
+    user_id: i32,
+    connection_id: i32,
+    connection_owner: Option<i32>,
+    clone_url: &str,
+    provider: &temps_entities::git_providers::Model,
+    project_repository: Option<&ProjectRepositoryGrant>,
+) -> Result<SeedConnectionAuthority, SandboxError> {
+    let caller_owns = connection_owner == Some(user_id);
+    if let Some(grant) = project_repository {
+        match grant.authorize(connection_id, clone_url, provider) {
+            Ok(()) => return Ok(SeedConnectionAuthority::ProjectRepository),
+            Err(error) if !caller_owns => return Err(error),
+            Err(_) => {}
+        }
+    }
+    if caller_owns {
+        Ok(SeedConnectionAuthority::CallerOwned)
+    } else {
+        Err(connection_not_owned(connection_id))
+    }
+}
+
 impl SandboxService {
     /// Derive a git seed source from a project's connected repository.
     ///
@@ -353,6 +550,11 @@ impl SandboxService {
     /// project should be able to say "give me a workspace on this" without
     /// re-typing the clone URL or re-picking the credential. The project
     /// row already knows both, so we read them here.
+    ///
+    /// The clone URL is the project's `git_url`. Projects that never stored
+    /// one but name their repository (`repo_owner`/`repo_name`) and its
+    /// connection clone from the URL the provider reports for it, the same
+    /// lookup a deployment of the project makes.
     ///
     /// Checks out the project's `main_branch` and reuses its
     /// `git_provider_connection_id`, so private repos clone without the
@@ -362,47 +564,64 @@ impl SandboxService {
     ///
     /// Authorization is the caller's responsibility: handlers gate this
     /// with `project_scope_guard!` + `project_access_guard!` before the
-    /// request reaches the service.
+    /// request reaches the service. The returned [`ProjectRepositoryGrant`]
+    /// records that check for the credential step.
     pub(super) async fn source_from_project(
         &self,
         project_id: i32,
-    ) -> Result<Option<SandboxSource>, SandboxError> {
+    ) -> Result<Option<ProjectSeed>, SandboxError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or(SandboxError::ProjectNotFound { project_id })?;
 
-        let url = project
-            .git_url
-            .as_ref()
-            .map(|u| u.trim())
-            .filter(|u| !u.is_empty());
-
-        let Some(url) = url else {
-            // A Git project with no repository is inconsistent state and
-            // must still fail closed. Git-less project types, however, are
-            // intentionally valid deployment targets: their persistent
-            // workspace begins empty and is populated by the agent or a file
-            // upload instead of a clone.
-            if project.source_type.requires_git_info() {
-                return Err(SandboxError::ProjectHasNoRepo {
+        let url = match project_clone_url(&project) {
+            ProjectCloneUrl::Stored(url) => url.to_string(),
+            ProjectCloneUrl::FromConnection {
+                connection_id,
+                owner,
+                name,
+            } => self
+                .git_provider_manager
+                .repository_clone_url(connection_id, owner, name)
+                .await
+                .map_err(|error| SandboxError::ProjectRepositoryUnresolved {
                     project_id,
                     name: project.name.clone(),
-                });
+                    connection_id,
+                    repository: format!("{owner}/{name}"),
+                    reason: error.to_string(),
+                })?,
+            ProjectCloneUrl::None => {
+                // A Git project with no repository is inconsistent state and
+                // must still fail closed. Git-less project types, however,
+                // are intentionally valid deployment targets: their
+                // persistent workspace begins empty and is populated by the
+                // agent or a file upload instead of a clone.
+                if project.source_type.requires_git_info() {
+                    return Err(SandboxError::ProjectHasNoRepo {
+                        project_id,
+                        name: project.name.clone(),
+                    });
+                }
+                return Ok(None);
             }
-            return Ok(None);
         };
 
-        Ok(Some(SandboxSource::Git {
-            url: url.to_string(),
-            revision: Some(project.main_branch.clone()),
-            depth: None,
-            username: None,
-            password: None,
-            git_connection_id: project.git_provider_connection_id,
-            destination: None,
-            strip_git_metadata: false,
+        let repository = ProjectRepositoryGrant::for_project(&project, &url);
+        Ok(Some(ProjectSeed {
+            source: SandboxSource::Git {
+                url,
+                revision: Some(project.main_branch.clone()),
+                depth: None,
+                username: None,
+                password: None,
+                git_connection_id: project.git_provider_connection_id,
+                destination: None,
+                strip_git_metadata: false,
+            },
+            repository,
         }))
     }
 
@@ -414,12 +633,17 @@ impl SandboxService {
     /// per-clone shim script rather than embedded in the URL or argv.
     /// This keeps the token out of `.git/config`, `ps`, and the provider's
     /// exec logs. The shim is shredded immediately after clone.
+    ///
+    /// `project_repository` is `Some` only for a source derived from
+    /// `project_id`; it lets that project's connection authenticate the
+    /// clone of the project's own repository ([`authorize_seed_connection`]).
     pub(crate) async fn seed_source(
         &self,
         internal_id: i32,
         public_id: &str,
         user_id: i32,
         source: &SandboxSource,
+        project_repository: Option<&ProjectRepositoryGrant>,
     ) -> Result<(), SandboxError> {
         // Resolve once immediately before the network operation and force the
         // client to dial that validated address. Validation performed earlier
@@ -463,7 +687,7 @@ impl SandboxService {
                 // the "both set" combination before we get here.
                 let creds = if let Some(conn_id) = git_connection_id {
                     Some(
-                        self.resolve_connection_creds(user_id, *conn_id, url)
+                        self.resolve_connection_creds(user_id, *conn_id, url, project_repository)
                             .await?,
                     )
                 } else if let (Some(u), Some(p)) = (username.as_deref(), password.as_deref()) {
@@ -524,14 +748,16 @@ impl SandboxService {
     }
 
     /// Resolve a stored git provider connection to an HTTP-Basic
-    /// (username, password) pair. Enforces that the connection is owned
-    /// by the calling user so one user can't clone repos using another
-    /// user's token.
-    async fn resolve_connection_creds(
+    /// (username, password) pair. [`authorize_seed_connection`] decides
+    /// whether the caller may use the connection: one user can't clone repos
+    /// using another user's token, except a project's own repository through
+    /// that project's connection.
+    pub(super) async fn resolve_connection_creds(
         &self,
         user_id: i32,
         connection_id: i32,
         clone_url: &str,
+        project_repository: Option<&ProjectRepositoryGrant>,
     ) -> Result<(String, String), SandboxError> {
         let connection = self
             .git_provider_manager
@@ -541,19 +767,10 @@ impl SandboxService {
                 message: format!("Git connection {} not available: {}", connection_id, e),
             })?;
 
-        // Ownership check. Connections without a user_id are
-        // organization/platform-level and not usable from per-user
-        // sandboxes.
-        match connection.user_id {
-            Some(owner) if owner == user_id => {}
-            _ => {
-                return Err(SandboxError::Validation {
-                    message: format!(
-                        "Git connection {} is not owned by the requesting user",
-                        connection_id
-                    ),
-                });
-            }
+        // A caller-supplied connection is refused before anything else about
+        // it is read when the caller does not own it.
+        if project_repository.is_none() && connection.user_id != Some(user_id) {
+            return Err(connection_not_owned(connection_id));
         }
 
         let provider = self
@@ -576,6 +793,53 @@ impl SandboxService {
         }
         validate_connection_clone_origin(clone_url, &provider)?;
 
+        let authority = authorize_seed_connection(
+            user_id,
+            connection_id,
+            connection.user_id,
+            clone_url,
+            &provider,
+            project_repository,
+        )?;
+
+        // A GitHub App installation can mint a token for this one repository
+        // with `contents: read`; use it whenever the project's repository is
+        // what is being cloned. Other connections have no narrower credential
+        // than the one deployments of the project already use.
+        if let (SeedConnectionAuthority::ProjectRepository, Some(grant)) =
+            (&authority, project_repository)
+        {
+            if connection.installation_id.is_some() {
+                let scoped = self
+                    .git_provider_manager
+                    .mint_scoped_repo_token_for_connection(
+                        connection_id,
+                        &grant.repo_owner,
+                        &grant.repo_name,
+                        temps_git::ScopedTokenOp::Fetch,
+                    )
+                    .await
+                    .map_err(|e| SandboxError::ExecFailed {
+                        sandbox_id: format!("connection#{}", connection_id),
+                        reason: format!(
+                            "mint a read-only token for {}/{}: {}",
+                            grant.repo_owner, grant.repo_name, e
+                        ),
+                    })?;
+                tracing::info!(
+                    project_id = grant.project_id,
+                    connection_id,
+                    "seeding a project sandbox with a repository-scoped read-only token"
+                );
+                return Ok((scoped.username, scoped.password));
+            }
+            tracing::info!(
+                project_id = grant.project_id,
+                connection_id,
+                "seeding a project sandbox with the project's git connection"
+            );
+        }
+
         let token = self
             .git_provider_manager
             .get_connection_token(connection_id)
@@ -595,8 +859,11 @@ impl SandboxService {
     /// are injected via an ephemeral `GIT_ASKPASS` shim and exported env
     /// vars. We never log `env_map` values and never embed the token in
     /// argv or the URL.
-    #[allow(clippy::too_many_arguments)]
-    async fn run_git_clone(
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one call site passes the resolved clone parameters through"
+    )]
+    pub(super) async fn run_git_clone(
         &self,
         handle: &temps_sandbox_providers::SandboxHandle,
         internal_id: i32,
@@ -690,7 +957,9 @@ impl SandboxService {
         // Compose the shell script. When creds are present we write the
         // root-only credential files plus an askpass shim. Git itself runs
         // under `env -i`; the shim reads those files, so secrets enter neither
-        // Git's argv nor its inherited environment. We always shred/remove the
+        // Git's argv nor its inherited environment. The script unsets the
+        // variables once the files exist, so no later step of the import
+        // (the quota monitor, `cp`) inherits them. We always shred/remove the
         // whole auth directory before returning so a subsequent user
         // shell in the sandbox can't read stale state.
         let script = if creds.is_some() {
@@ -698,7 +967,7 @@ impl SandboxService {
                 "set +x; set -eu; \
                  {target_guard} {staging_prepare} {auth_prepare} \
                  trap 'find {auth_dir} -type f -exec shred -u {{}} \\; 2>/dev/null || true; find {auth_dir} -depth -delete 2>/dev/null || true; {restore_target}' EXIT; \
-                 umask 077; printf '%s' \"$GIT_USER\" > {user_file}; printf '%s' \"$GIT_PASS\" > {password_file}; \
+                 umask 077; printf '%s' \"$GIT_USER\" > {user_file}; printf '%s' \"$GIT_PASS\" > {password_file}; unset GIT_USER GIT_PASS; \
                  cat > {ask} <<'TEMPS_ASKPASS_EOF'\n\
 #!/bin/sh\n\
 case \"$1\" in\n\
@@ -870,7 +1139,7 @@ TEMPS_ASKPASS_EOF\n\
                 operation: "clone source".into(),
             });
         }
-        self.seed_source(row.id, &row.public_id, user_id, source)
+        self.seed_source(row.id, &row.public_id, user_id, source, None)
             .await?;
         let changes = sandboxes::ActiveModel {
             id: Set(row.id),

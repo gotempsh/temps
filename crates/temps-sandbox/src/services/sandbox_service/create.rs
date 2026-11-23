@@ -151,16 +151,21 @@ impl SandboxService {
         // An explicit `source` always wins — `project_id` only supplies a
         // default, so a caller can create a workspace attributed to a
         // project while seeding it from a fork or a different branch.
-        let source = if req.from_snapshot_artifact.is_some() {
+        //
+        // Only a project-derived source carries a `ProjectRepositoryGrant`,
+        // which lets the project's own git connection authenticate the clone
+        // of the project's repository. An explicit source keeps the rule that
+        // a stored connection must belong to the caller.
+        let (source, project_repository) = if req.from_snapshot_artifact.is_some() {
             // project_id remains valid attribution, but must not implicitly
             // clone over the workspace restored from the snapshot.
-            None
+            (None, None)
         } else {
             match (req.source.clone(), req.project_id) {
                 // Caller-supplied: already validated by the handler, which owns
                 // the request-shape rules too. Re-checking here would duplicate a
                 // DNS lookup on every create for no gain.
-                (Some(explicit), _) => Some(explicit),
+                (Some(explicit), _) => (Some(explicit), None),
                 // Project-derived: the handler never saw this URL, so it is
                 // validated here — the layer that produced it. `projects.git_url`
                 // is checked for IP literals on the project side but never
@@ -168,14 +173,14 @@ impl SandboxService {
                 // otherwise pass; and a row predating that guard can still carry
                 // `user:password@`, which would land in `source_repo_url` and be
                 // echoed back out of the API.
-                (None, Some(project_id)) => {
-                    let derived = self.source_from_project(project_id).await?;
-                    if let Some(source) = derived.as_ref() {
-                        validate_resolved_source(source).await?;
+                (None, Some(project_id)) => match self.source_from_project(project_id).await? {
+                    Some(seed) => {
+                        validate_resolved_source(&seed.source).await?;
+                        (Some(seed.source), seed.repository)
                     }
-                    derived
-                }
-                (None, None) => None,
+                    None => (None, None),
+                },
+                (None, None) => (None, None),
             }
         };
 
@@ -618,7 +623,13 @@ impl SandboxService {
                 },
             );
             if let Err(e) = self
-                .seed_source(row.id, &public_id_value, user_id, &source)
+                .seed_source(
+                    row.id,
+                    &public_id_value,
+                    user_id,
+                    &source,
+                    project_repository.as_ref(),
+                )
                 .await
             {
                 tracing::warn!(

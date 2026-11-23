@@ -188,6 +188,11 @@ impl From<SandboxError> for Problem {
             SandboxError::ProjectHasNoRepo { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Project Has No Repository")
                 .with_detail(error.to_string()),
+            SandboxError::ProjectRepositoryUnresolved { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Project Repository Unavailable")
+                    .with_detail(error.to_string())
+            }
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
                 .with_detail(error.to_string()),
