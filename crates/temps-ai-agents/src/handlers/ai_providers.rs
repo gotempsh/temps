@@ -918,13 +918,15 @@ async fn provider_catalog_dto(
     dto.login_supported = login_supported;
     dto.login_unavailable_reason = login_unavailable_reason;
     if let Some(snapshot) = workspace_snapshot {
-        dto.models = snapshot
-            .capabilities
-            .models
+        let mut runtime_models = snapshot.capabilities.models;
+        if snapshot.model_source == temps_ai::ModelCatalogSource::Bootstrap {
+            keep_saved_default(&mut runtime_models, dto.default_model.as_deref());
+        }
+        dto.models = runtime_models
             .iter()
             .map(|model| model.id.clone())
             .collect();
-        dto.runtime_models = snapshot.capabilities.models;
+        dto.runtime_models = runtime_models;
         dto.default_runtime_model_id = dto
             .default_model
             .clone()
@@ -1005,23 +1007,9 @@ fn provider_catalog_dto_from_runtime(
         ))
     };
     let (runtime_models, model_source) = if discovered_models.is_empty() {
-        // Without discovery the bootstrap list is a guess, and a release that
-        // refreshes it must not take away a default the operator saved: it
-        // was accepted when saved and stays selectable until discovery says
-        // otherwise.
-        let saved_default = provider_cfg
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty() && !entry.models.contains(model));
-        let models: Vec<&str> = saved_default
-            .into_iter()
-            .chain(entry.models.iter().copied())
-            .collect();
-        (
-            bootstrap_runtime_models(&models),
-            temps_ai::ModelCatalogSource::Bootstrap,
-        )
+        let mut models = bootstrap_runtime_models(entry.models);
+        keep_saved_default(&mut models, provider_cfg.default_model.as_deref());
+        (models, temps_ai::ModelCatalogSource::Bootstrap)
     } else {
         (
             discovered_models
@@ -2078,6 +2066,19 @@ fn runtime_model_capability(
     }
 }
 
+/// Without discovery the model list is the bundled guess, and a release that
+/// refreshes it must not take away a default the operator saved: it was
+/// accepted when saved and stays listed, first, until discovery says
+/// otherwise.
+fn keep_saved_default(models: &mut Vec<temps_ai::ModelCapability>, saved: Option<&str>) {
+    let Some(saved) = saved.map(str::trim).filter(|saved| !saved.is_empty()) else {
+        return;
+    };
+    if !models.iter().any(|model| model.id == saved) {
+        models.splice(0..0, bootstrap_runtime_models(&[saved]));
+    }
+}
+
 fn bootstrap_runtime_models(models: &[&str]) -> Vec<temps_ai::ModelCapability> {
     models
         .iter()
@@ -2687,6 +2688,53 @@ mod tests {
         assert_eq!(
             dto.models_refreshed_at.as_deref(),
             Some("2026-09-08T00:00:00Z")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_bootstrap_workspace_snapshot_keeps_the_saved_default() {
+        crate::ai_cli::invalidate_status_cache().await;
+        let codex =
+            crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
+        let saved = "vendor-model-saved-before-upgrade";
+        let provider_config = temps_config::ProviderConfig {
+            auth_type: "api_key".to_string(),
+            credentials_encrypted: Some("encrypted-key".to_string()),
+            default_model: Some(saved.to_string()),
+            ..Default::default()
+        };
+        let snapshot = |source| temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities: crate::ai_cli::provider_capabilities_from_models("codex_cli", Vec::new())
+                .expect("Codex capability contract"),
+            model_source: source,
+            models_refreshed_at: None,
+        };
+
+        // A cold workspace cache answers with the bundled list, which no
+        // longer has the saved model: it stays listed and selected.
+        let dto = provider_catalog_dto(
+            codex,
+            provider_config.clone(),
+            Some(snapshot(temps_ai::ModelCatalogSource::Bootstrap)),
+            None,
+        )
+        .await;
+        assert_eq!(dto.models.first().map(String::as_str), Some(saved));
+        assert_eq!(dto.runtime_models.len(), codex.models.len() + 1);
+        assert_eq!(dto.default_runtime_model_id.as_deref(), Some(saved));
+
+        // A real inventory is authoritative: a model it lacks is not added.
+        let dto = provider_catalog_dto(
+            codex,
+            provider_config,
+            Some(snapshot(temps_ai::ModelCatalogSource::Live)),
+            None,
+        )
+        .await;
+        assert!(!dto.models.iter().any(|model| model == saved));
+        assert_eq!(
+            dto.default_runtime_model_id.as_deref(),
+            Some(codex.models[0])
         );
     }
 
