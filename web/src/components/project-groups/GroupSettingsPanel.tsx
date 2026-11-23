@@ -46,7 +46,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { SectionNavLayout } from '@/components/layout/SectionNavLayout'
 import { getErrorMessage } from '@/utils/errorHandling'
-import { groupHref, serviceCount } from '@/lib/terminology'
+import { groupHref, groupSettingsHref, serviceCount } from '@/lib/terminology'
 import { useInvalidateGroups } from './useProjectGroups'
 import { DisconnectRepositoryDialog } from './DisconnectRepositoryDialog'
 import { GroupRoutesSettings } from './GroupRoutesSettings'
@@ -247,7 +247,7 @@ export function GroupSettingsPanel({
         key: p.key,
         title: p.title,
         icon: p.icon,
-        to: { search: `?tab=settings&section=${p.key}` },
+        to: { search: `?section=${p.key}` },
         active: p.key === page,
       }))}
     >
@@ -331,7 +331,7 @@ function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
       await invalidate()
       toast.success('Project updated')
       if (updated.slug !== group.slug) {
-        navigate(`${groupHref(updated.slug)}?tab=settings&section=general`, {
+        navigate(groupSettingsHref(updated.slug, 'general'), {
           replace: true,
         })
       }

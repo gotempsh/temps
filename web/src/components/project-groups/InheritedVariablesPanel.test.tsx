@@ -8,7 +8,7 @@ import { MemoryRouter } from 'react-router'
 import type { ProjectResponse } from '@/api/client'
 import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
-import { groupHref } from '@/lib/terminology'
+import { groupVariablesHref } from '@/lib/terminology'
 import { InheritedVariablesPanel } from './InheritedVariablesPanel'
 
 installBrowserWindow()
@@ -45,9 +45,7 @@ test('a project with no shared variables is one line that leads to adding one', 
   const view = renderPanel([])
 
   const add = await view.findByRole('link', { name: 'Add a shared variable' })
-  expect(add.getAttribute('href')).toBe(
-    `${groupHref(group.slug)}?tab=variables`
-  )
+  expect(add.getAttribute('href')).toBe(groupVariablesHref(group.slug))
   expect(view.getByText(/every service in Storefront/)).toBeTruthy()
   // Nothing is inherited, so no card, heading or second link to the same place.
   expect(view.queryByText(/Inherited from project/)).toBeNull()

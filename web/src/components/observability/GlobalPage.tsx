@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, type ReactNode } from 'react'
+import { useCallback, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -20,8 +20,9 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
-import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useServiceScope } from '@/contexts/ServiceScopeContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useScopedBreadcrumbs } from '@/hooks/useScopedBreadcrumbs'
 import {
   OBSERVABILITY_PAGE_SIZE,
   observationError,
@@ -70,6 +71,21 @@ export function ProjectScope({
   view: GlobalView
   disabled?: boolean
 }) {
+  const scope = useServiceScope()
+  if (scope) {
+    // Inside a project the picker lists only the project's services.
+    return (
+      <FilterSelect
+        label={`Service in ${scope.label}`}
+        value={view.projectId ? String(view.projectId) : ''}
+        onChange={(id) => view.patch({ project_id: id })}
+        disabled={disabled || scope.services.length === 0}
+        options={scope.services.map(
+          (service) => [String(service.id), service.name] as const
+        )}
+      />
+    )
+  }
   return (
     <ProjectSelect
       ariaLabel="Service scope"
@@ -80,6 +96,19 @@ export function ProjectScope({
       disabled={disabled}
       className="h-9 sm:w-52"
     />
+  )
+}
+
+/** The one explicit way from a project's page to the server-wide one. */
+export function ServerWideLink({
+  scope,
+}: {
+  scope: { serverWide: { title: string; url: string } }
+}) {
+  return (
+    <Button asChild variant="outline" size="sm">
+      <Link to={scope.serverWide.url}>{scope.serverWide.title}</Link>
+    </Button>
   )
 }
 
@@ -113,18 +142,21 @@ export function GlobalPage({
     [patchView]
   )
   const [searchText, setSearchText] = useUrlBoundText(view.search, commitSearch)
-  const { setBreadcrumbs } = useBreadcrumbs()
-  useEffect(() => setBreadcrumbs([{ label: title }]), [title, setBreadcrumbs])
+  const scope = useServiceScope()
+  useScopedBreadcrumbs(title)
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title={title}
         description={description}
         actions={
-          <RefreshButton
-            queryKeys={refreshQueryKeys}
-            onRefresh={view.advance}
-          />
+          <div className="flex items-center gap-2">
+            {scope && <ServerWideLink scope={scope} />}
+            <RefreshButton
+              queryKeys={refreshQueryKeys}
+              onRefresh={view.advance}
+            />
+          </div>
         }
       />
       <div
