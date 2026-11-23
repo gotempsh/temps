@@ -321,8 +321,10 @@ fn default_model_for_provider(provider: &str) -> Option<String> {
 
 /// The internal-call model for a key with no pin, given its enabled and
 /// available catalog sorted by id: the first low-cost model the key serves,
-/// else its first chat model. An empty catalog (never refreshed) falls back
-/// to the provider's current low-cost model.
+/// else its first chat model, else its first model at all (the id heuristic
+/// must never leave a key that serves something with no model). An empty
+/// catalog (never refreshed) falls back to the provider's current low-cost
+/// model.
 fn catalog_default_model(provider: &str, catalog_ids: &[String]) -> Option<String> {
     if catalog_ids.is_empty() {
         return default_model_for_provider(provider);
@@ -337,6 +339,7 @@ fn catalog_default_model(provider: &str, catalog_ids: &[String]) -> Option<Strin
                 .find(|id| crate::providers::is_chat_model_id(id))
                 .cloned()
         })
+        .or_else(|| catalog_ids.first().cloned())
 }
 
 /// First model id from an `allowed_models` JSON array (`["a","b"]` -> "a").
@@ -1831,8 +1834,17 @@ mod tests {
             catalog_default_model("openai", &[]),
             Some("gpt-6-luna".to_string())
         );
-        // A catalog of only non-chat models names nothing.
-        assert_eq!(catalog_default_model("openai", &ids(&["dall-e-3"])), None);
+        // An audio-capable chat model is a chat model.
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3", "gpt-audio", "tts-1"])),
+            Some("gpt-audio".to_string())
+        );
+        // A key whose ids all look non-chat still gets its first model, as
+        // before, rather than none.
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3"])),
+            Some("dall-e-3".to_string())
+        );
     }
 
     #[test]

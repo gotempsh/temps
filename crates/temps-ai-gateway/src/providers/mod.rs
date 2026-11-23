@@ -168,7 +168,8 @@ pub fn low_cost_models(provider: &str) -> &'static [&'static str] {
 
 /// Whether a catalog id names a model that answers chat requests. Vendor
 /// catalogs also list image, speech, transcription, embedding and moderation
-/// models, which must never be picked as a fallback chat model.
+/// models, which must never be picked as a fallback chat model. Audio-capable
+/// chat models (`gpt-audio`) answer chat and stay eligible.
 pub fn is_chat_model_id(model: &str) -> bool {
     let id = model.to_ascii_lowercase();
     let id = id.rsplit('/').next().unwrap_or(id.as_str());
@@ -190,7 +191,6 @@ pub fn is_chat_model_id(model: &str) -> bool {
         "-tts",
         "-transcribe",
         "-realtime",
-        "-audio",
         "-moderation",
     ];
     !NON_CHAT_PREFIXES
