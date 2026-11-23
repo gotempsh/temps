@@ -196786,6 +196786,16 @@
           },
           "500": {
             "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The project stores no clone URL and its git connection could not look up the project's repository"
           }
         },
         "security": [

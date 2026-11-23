@@ -1225,7 +1225,9 @@ impl SandboxLinkService {
                     );
                     return Err(SandboxLinkError::Sandbox {
                         conversation_id: target.public_id.clone(),
-                        reason: format!("could not create a sandbox: {error}"),
+                        // `caller_detail` keeps a provider's error about a
+                        // connection the user may not own in the log above.
+                        reason: format!("could not create a sandbox: {}", error.caller_detail()),
                     });
                 }
             };

@@ -106466,7 +106466,13 @@ export type CreateSandboxErrors = {
      * Internal server error
      */
     500: unknown;
+    /**
+     * The project stores no clone URL and its git connection could not look up the project's repository
+     */
+    502: ProblemDetails;
 };
+
+export type CreateSandboxError = CreateSandboxErrors[keyof CreateSandboxErrors];
 
 export type CreateSandboxResponses = {
     /**

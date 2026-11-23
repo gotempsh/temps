@@ -188,10 +188,26 @@ impl From<SandboxError> for Problem {
             SandboxError::ProjectHasNoRepo { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Project Has No Repository")
                 .with_detail(error.to_string()),
-            SandboxError::ProjectRepositoryUnresolved { .. } => {
+            SandboxError::ProjectRepositoryUnresolved {
+                project_id,
+                connection_id,
+                ref repository,
+                ref reason,
+                ..
+            } => {
+                // The provider's own error text describes a connection the
+                // caller may not own (an organization's), so it goes to the
+                // log; the response names the project and repository.
+                tracing::warn!(
+                    project_id,
+                    connection_id,
+                    repository = %repository,
+                    reason = %reason,
+                    "project repository could not be resolved for a sandbox seed"
+                );
                 problemdetails::new(StatusCode::BAD_GATEWAY)
                     .with_title("Project Repository Unavailable")
-                    .with_detail(error.to_string())
+                    .with_detail(error.caller_detail())
             }
             SandboxError::Timeout { .. } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
                 .with_title("Sandbox Operation Timed Out")
@@ -1338,7 +1354,8 @@ async fn build_summary_responses(
         (status = 400, description = "Validation error, including a CPU, memory, process or disk limit outside the allowed range or above the administrator's maximum"),
         (status = 401, description = "Unauthorized"),
         (status = 422, description = "Requested node does not exist, is not allowed to run sandboxes, is not active, or no node is eligible; or the user already has the maximum number of sandboxes an administrator allows"),
-        (status = 500, description = "Internal server error")
+        (status = 500, description = "Internal server error"),
+        (status = 502, description = "The project stores no clone URL and its git connection could not look up the project's repository", body = temps_core::problemdetails::ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -3427,6 +3444,30 @@ mod tests {
         assert!(detail.contains("docker pull"));
         // The registry's own text stays in the server log, not the response.
         assert!(!detail.contains("manifest unknown"));
+    }
+
+    #[test]
+    fn unresolved_project_repository_problem_keeps_the_provider_error_in_the_log() {
+        let problem = Problem::from(SandboxError::ProjectRepositoryUnresolved {
+            project_id: 3,
+            name: "example-project".into(),
+            connection_id: 11,
+            repository: "example-owner/example-repository".into(),
+            reason: "GET https://git.example.test/api returned 404 for installation 99".into(),
+        });
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        assert_eq!(problem.body["title"], "Project Repository Unavailable");
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("Project 3"), "{detail}");
+        assert!(
+            detail.contains("example-owner/example-repository"),
+            "{detail}"
+        );
+        assert!(detail.contains("git connection 11"), "{detail}");
+        // The provider's own text describes a connection the caller may not
+        // own; it stays in the server log, not the response.
+        assert!(!detail.contains("git.example.test"), "{detail}");
+        assert!(!detail.contains("installation 99"), "{detail}");
     }
 
     #[test]
