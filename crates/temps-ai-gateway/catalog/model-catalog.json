@@ -726,7 +726,9 @@
         "name": "Claude Fable 5.2 (via OpenRouter)",
         "cost": {
           "input": 8.0,
-          "output": 40.0
+          "output": 40.0,
+          "cache_read": 0.2,
+          "cache_write": 10.0
         }
       },
       "anthropic/claude-haiku-5.5": {
@@ -734,7 +736,9 @@
         "name": "Claude Haiku 5.5 (via OpenRouter)",
         "cost": {
           "input": 0.1,
-          "output": 0.5
+          "output": 0.5,
+          "cache_read": 0.01,
+          "cache_write": 0.125
         }
       },
       "anthropic/claude-opus-5.5": {
@@ -742,7 +746,9 @@
         "name": "Claude Opus 5.5 (via OpenRouter)",
         "cost": {
           "input": 4.0,
-          "output": 20.0
+          "output": 20.0,
+          "cache_read": 0.2,
+          "cache_write": 5.0
         }
       },
       "anthropic/claude-sonnet-5": {
@@ -750,7 +756,9 @@
         "name": "Claude Sonnet 5 (via OpenRouter)",
         "cost": {
           "input": 2.0,
-          "output": 10.0
+          "output": 10.0,
+          "cache_read": 0.2,
+          "cache_write": 2.5
         }
       },
       "anthropic/claude-sonnet-5.5": {
@@ -758,7 +766,9 @@
         "name": "Claude Sonnet 5.5 (via OpenRouter)",
         "cost": {
           "input": 2.0,
-          "output": 10.0
+          "output": 10.0,
+          "cache_read": 0.1,
+          "cache_write": 2.5
         }
       },
       "deepseek/deepseek-chat": {
@@ -791,6 +801,16 @@
         "cost": {
           "input": 0.3,
           "output": 1.2
+        }
+      },
+      "google/gemini-4-hydrogen": {
+        "id": "google/gemini-4-hydrogen",
+        "name": "Gemini 4 Hydrogen (via OpenRouter)",
+        "cost": {
+          "input": 1.5,
+          "output": 7.5,
+          "cache_read": 0.075,
+          "cache_write": 0.0
         }
       },
       "google/gemini-4-neon": {
@@ -830,7 +850,8 @@
         "name": "GPT-6 Luna (via OpenRouter)",
         "cost": {
           "input": 0.1,
-          "output": 0.5
+          "output": 0.5,
+          "cache_read": 0.01
         }
       },
       "openai/gpt-6.2-astra": {
@@ -838,7 +859,8 @@
         "name": "GPT-6.2 Astra (via OpenRouter)",
         "cost": {
           "input": 8.0,
-          "output": 40.0
+          "output": 40.0,
+          "cache_read": 0.4
         }
       },
       "openai/gpt-6.2-sol": {
@@ -846,7 +868,18 @@
         "name": "GPT-6.2 Sol (via OpenRouter)",
         "cost": {
           "input": 2.0,
-          "output": 10.0
+          "output": 10.0,
+          "cache_read": 0.1
+        }
+      },
+      "x-ai/grok-4.7": {
+        "id": "x-ai/grok-4.7",
+        "name": "Grok 4.7 (via OpenRouter)",
+        "cost": {
+          "input": 2.0,
+          "output": 6.0,
+          "cache_read": 0.5,
+          "cache_write": 0.0
         }
       }
     }
