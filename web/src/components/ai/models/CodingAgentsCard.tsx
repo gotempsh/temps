@@ -29,7 +29,13 @@ import {
   TableHeader,
   TableRow,
 } from '@/components/ui/table'
-import { agentVersionState, latestReleaseVersion } from '@/lib/ai-model-catalog'
+import {
+  agentVersionState,
+  latestReleaseVersion,
+  releaseCheckOutcome,
+  updateOutcome,
+  type Outcome,
+} from '@/lib/ai-model-catalog'
 import { extractProblemDetails } from '@/utils/errorHandling'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Loader2, RefreshCw } from 'lucide-react'
@@ -40,6 +46,13 @@ function problemMessage(error: unknown, fallback: string): string {
   const problem = extractProblemDetails(error)
   return problem?.detail ?? problem?.title ?? fallback
 }
+
+function announce(outcome: Outcome) {
+  toast[outcome.level](outcome.message)
+}
+
+/** How often a row re-reads its status while an update runs. */
+const UPDATING_POLL_MS = 5_000
 
 /**
  * Claude Code, Codex and OpenCode: the version in your workspace, the latest
@@ -68,7 +81,7 @@ export function CodingAgentsCard() {
       void queryClient.invalidateQueries({
         queryKey: [...CODING_AGENTS_QUERY_KEY, 'workspace'],
       })
-      toast.success('Checked for new releases')
+      announce(releaseCheckOutcome(data.agents))
     },
     onError: (error) =>
       toast.error(problemMessage(error, 'Releases could not be checked')),
@@ -197,16 +210,41 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
     'workspace',
     agent.provider_id,
   ] as const
+  // Only what was last read: looking inside the workspace would start or
+  // wake it just because this page was opened. "Check workspace" reads it.
   const workspace = useQuery({
     queryKey: workspaceKey,
     queryFn: async () => {
       const { data } = await getAiProviderHarnessUpdate({
         path: { provider_id: agent.provider_id },
+        query: { cached_only: true },
         throwOnError: true,
       })
       return data
     },
     retry: false,
+    // An update started elsewhere (the automatic pass) ends on its own.
+    refetchInterval: (query) =>
+      query.state.data?.updating ? UPDATING_POLL_MS : false,
+  })
+
+  const inspect = useMutation({
+    mutationFn: async () => {
+      const { data } = await getAiProviderHarnessUpdate({
+        path: { provider_id: agent.provider_id },
+        query: { refresh: true },
+        throwOnError: true,
+      })
+      return data
+    },
+    onSuccess: (status) => queryClient.setQueryData(workspaceKey, status),
+    onError: (error) =>
+      toast.error(
+        problemMessage(
+          error,
+          `Your ${agent.name} workspace could not be checked`
+        )
+      ),
   })
 
   const update = useMutation({
@@ -219,9 +257,7 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
     },
     onSuccess: (status) => {
       queryClient.setQueryData(workspaceKey, status)
-      toast.success(
-        `${agent.name} updated to ${status.installed_version ?? 'the latest release'}`
-      )
+      announce(updateOutcome(agent.name, status))
     },
     onError: (error) =>
       toast.error(problemMessage(error, `${agent.name} could not be updated`)),
@@ -243,6 +279,11 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
         <div className="text-xs text-muted-foreground @xl:hidden">
           Latest {latest ?? 'unknown'}
         </div>
+        {agent.error ? (
+          <div className="text-xs text-destructive [overflow-wrap:anywhere] @xl:hidden">
+            {agent.error}
+          </div>
+        ) : null}
       </TableCell>
       <TableCell className="align-top">
         {workspace.isPending ? (
@@ -260,22 +301,36 @@ function CodingAgentRow({ agent }: { agent: CodingAgentRelease }) {
         ) : null}
       </TableCell>
       <TableCell className="text-right align-top">
-        <Button
-          size="sm"
-          variant={state.kind === 'behind' ? 'default' : 'outline'}
-          disabled={
-            update.isPending ||
-            state.kind === 'updating' ||
-            state.kind === 'current' ||
-            workspace.isPending
-          }
-          onClick={() => update.mutate()}
-        >
-          {update.isPending || state.kind === 'updating' ? (
-            <Loader2 className="size-4 animate-spin" />
-          ) : null}
-          Update
-        </Button>
+        {state.kind === 'unchecked' ? (
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={inspect.isPending}
+            onClick={() => inspect.mutate()}
+          >
+            {inspect.isPending ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : null}
+            Check workspace
+          </Button>
+        ) : (
+          <Button
+            size="sm"
+            variant={state.kind === 'behind' ? 'default' : 'outline'}
+            disabled={
+              update.isPending ||
+              state.kind === 'updating' ||
+              state.kind === 'current' ||
+              workspace.isPending
+            }
+            onClick={() => update.mutate()}
+          >
+            {update.isPending || state.kind === 'updating' ? (
+              <Loader2 className="size-4 animate-spin" />
+            ) : null}
+            Update
+          </Button>
+        )}
       </TableCell>
     </TableRow>
   )
@@ -289,6 +344,12 @@ function VersionState({
   switch (state.kind) {
     case 'updating':
       return <Badge variant="secondary">Updating…</Badge>
+    case 'unchecked':
+      return (
+        <span className="text-xs text-muted-foreground">
+          Not checked yet. Checking starts your workspace if it is stopped.
+        </span>
+      )
     case 'behind':
       return (
         <div className="space-y-1">

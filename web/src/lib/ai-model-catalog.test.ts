@@ -8,11 +8,14 @@ import {
   catalogSettingsSchema,
   catalogSettingsToForm,
   catalogSourceLabel,
+  clampPage,
   formatPerMillion,
   formatTokens,
   isNewerVersion,
   latestReleaseVersion,
   newestVersion,
+  releaseCheckOutcome,
+  updateOutcome,
 } from './ai-model-catalog'
 
 const settings = {
@@ -238,5 +241,123 @@ describe('agentVersionState', () => {
     expect(isNewerVersion('2.1.263', '2.1.263')).toBe(false)
     expect(isNewerVersion('2.1.263-beta.1', '2.1.263')).toBe(false)
     expect(isNewerVersion('unknown', '2.1.263')).toBe(false)
+  })
+})
+
+describe('agentVersionState after a withdrawn release', () => {
+  it('ignores the workspace flag once a newer check says the release is gone', () => {
+    // The workspace cached 1.1.0 at 10:00; npm withdrew it and an 11:00
+    // registry check reports 1.0.0, which is what is installed.
+    expect(
+      agentVersionState(
+        { latest_version: '1.0.0', checked_at: '2026-11-24T11:00:00Z' },
+        {
+          installed_version: '1.0.0',
+          latest_version: '1.1.0',
+          update_available: true,
+          updating: false,
+          checked_at: '2026-11-24T10:00:00Z',
+        }
+      )
+    ).toEqual({ kind: 'current', installed: '1.0.0' })
+  })
+})
+
+describe('agentVersionState before the workspace was read', () => {
+  it('is unchecked rather than unknown when nothing was read yet', () => {
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        {
+          installed_version: null,
+          latest_version: null,
+          update_available: false,
+          updating: false,
+          checked_at: null,
+          detail: null,
+        }
+      )
+    ).toEqual({ kind: 'unchecked' })
+    // A failed read is not "unchecked": it says why.
+    expect(
+      agentVersionState(
+        { latest_version: '1.1.0' },
+        {
+          installed_version: null,
+          update_available: false,
+          updating: false,
+          checked_at: '2026-11-24T10:00:00Z',
+          detail: 'the installed version could not be read from the workspace',
+        }
+      )
+    ).toEqual({
+      kind: 'unknown',
+      reason: 'the installed version could not be read from the workspace',
+    })
+  })
+})
+
+describe('updateOutcome', () => {
+  it('is a success only when the workspace reports the new version', () => {
+    expect(
+      updateOutcome('Codex', {
+        installed_version: '1.1.0',
+        latest_version: '1.1.0',
+        update_available: false,
+        updating: false,
+      })
+    ).toEqual({ level: 'success', message: 'Codex updated to 1.1.0' })
+    const stillBehind = updateOutcome('Codex', {
+      installed_version: '1.0.0',
+      latest_version: '1.1.0',
+      update_available: true,
+      updating: false,
+    })
+    expect(stillBehind.level).toBe('warning')
+    expect(stillBehind.message).toContain('still reports 1.0.0')
+    const unreadable = updateOutcome('Codex', {
+      installed_version: null,
+      latest_version: '1.1.0',
+      update_available: false,
+      updating: false,
+      detail: 'the installed version could not be read from the workspace',
+    })
+    expect(unreadable.level).toBe('warning')
+    expect(unreadable.message).toContain('could not be read')
+    expect(unreadable.message).not.toContain('latest release')
+  })
+})
+
+describe('releaseCheckOutcome', () => {
+  it('reports lookups that failed instead of a plain success', () => {
+    expect(releaseCheckOutcome([{ name: 'Codex' }])).toEqual({
+      level: 'success',
+      message: 'Checked for new releases',
+    })
+    expect(
+      releaseCheckOutcome([
+        { name: 'Claude Code', error: 'registry returned 503' },
+        { name: 'Codex' },
+      ])
+    ).toEqual({
+      level: 'warning',
+      message: 'Releases could not be looked up for Claude Code',
+    })
+    expect(
+      releaseCheckOutcome([
+        { name: 'Claude Code', error: 'registry returned 503' },
+        { name: 'Codex', error: 'registry returned 503' },
+      ]).level
+    ).toBe('error')
+  })
+})
+
+describe('clampPage', () => {
+  it('moves back to the last page that exists', () => {
+    expect(clampPage(2, 10, 20)).toBe(1)
+    expect(clampPage(3, 41, 20)).toBe(3)
+    expect(clampPage(5, 41, 20)).toBe(3)
+    expect(clampPage(2, 0, 20)).toBe(1)
+    expect(clampPage(0, 30, 20)).toBe(1)
   })
 })

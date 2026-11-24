@@ -85,6 +85,20 @@ export function formatPerMillion(value: number | null | undefined): string {
   return `$${value.toFixed(digits).replace(/(\.\d*?[1-9])0+$|\.0+$/, '$1')}`
 }
 
+/**
+ * The page to show for `page` once the list holds `total` items: the last
+ * page that exists when `page` is past it (a refresh shrank the list), never
+ * below 1.
+ */
+export function clampPage(
+  page: number,
+  total: number,
+  pageSize: number
+): number {
+  const lastPage = Math.max(1, Math.ceil(total / pageSize))
+  return Math.min(Math.max(1, page), lastPage)
+}
+
 /** `200K`, `1M`: a context window at a glance. */
 export function formatTokens(value: number | null | undefined): string {
   if (value === null || value === undefined) return '—'
@@ -112,6 +126,8 @@ export interface WorkspaceHarnessLike {
 
 export type AgentVersionState =
   | { kind: 'updating' }
+  /** Never read: reading it would start or wake the workspace. */
+  | { kind: 'unchecked' }
   | { kind: 'behind'; installed: string; latest: string }
   | { kind: 'current'; installed: string }
   | { kind: 'unknown'; reason: string; installed?: string }
@@ -162,6 +178,15 @@ export function agentVersionState(
   workspaceError?: string | null
 ): AgentVersionState {
   if (workspace?.updating) return { kind: 'updating' }
+  if (
+    workspace &&
+    !workspace.checked_at &&
+    !workspace.installed_version &&
+    !workspace.detail &&
+    !workspaceError
+  ) {
+    return { kind: 'unchecked' }
+  }
   const installed = workspace?.installed_version ?? null
   const latest = latestReleaseVersion(release, workspace)
   if (!installed) {
@@ -173,7 +198,14 @@ export function agentVersionState(
         'The version in your workspace has not been read yet.',
     }
   }
-  if (workspace?.update_available && latest) {
+  // The workspace's own flag holds only for the release it was computed
+  // against: once a newer registry check says otherwise (a withdrawn
+  // release), compare the versions instead.
+  if (
+    workspace?.update_available &&
+    latest &&
+    latest === workspace.latest_version
+  ) {
     return { kind: 'behind', installed, latest }
   }
   if (!latest) {
@@ -207,4 +239,63 @@ export function isNewerVersion(latest: string, installed: string): boolean {
     if (a[index] !== b[index]) return a[index] > b[index]
   }
   return false
+}
+
+export interface Outcome {
+  level: 'success' | 'warning' | 'error'
+  message: string
+}
+
+/**
+ * What to tell the operator after Update returned. The installer exiting
+ * zero is not enough: the version the workspace reports afterwards decides.
+ */
+export function updateOutcome(
+  name: string,
+  status: WorkspaceHarnessLike
+): Outcome {
+  const installed = status.installed_version ?? null
+  if (!installed) {
+    return {
+      level: 'warning',
+      message: `${name} was installed, but its version could not be read${
+        status.detail ? `: ${status.detail}` : ''
+      }`,
+    }
+  }
+  if (status.update_available) {
+    return {
+      level: 'warning',
+      message: `${name} still reports ${installed}${
+        status.latest_version ? ` (latest ${status.latest_version})` : ''
+      }; another copy may come first on PATH`,
+    }
+  }
+  return { level: 'success', message: `${name} updated to ${installed}` }
+}
+
+/**
+ * What to tell the operator after Check for releases: the request succeeds
+ * even when the registry lookup for an agent failed, which the row reports
+ * in its `error`.
+ */
+export function releaseCheckOutcome(
+  agents: Array<{ name: string; error?: string | null }>
+): Outcome {
+  const failed = agents.filter((agent) => agent.error)
+  if (failed.length === 0) {
+    return { level: 'success', message: 'Checked for new releases' }
+  }
+  if (failed.length === agents.length) {
+    return {
+      level: 'error',
+      message: `Releases could not be looked up: ${failed[0]?.error ?? 'the registry did not answer'}`,
+    }
+  }
+  return {
+    level: 'warning',
+    message: `Releases could not be looked up for ${failed
+      .map((agent) => agent.name)
+      .join(', ')}`,
+  }
 }
