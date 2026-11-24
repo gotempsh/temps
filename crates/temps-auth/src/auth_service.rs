@@ -198,8 +198,12 @@ impl From<sea_orm::DbErr> for AuthError {
 /// change keep their single-use credential in that one column. The stored
 /// value is tagged with the purpose, and each flow only looks up its own tag,
 /// so a credential minted for one flow can never be redeemed by the other.
-/// The raw token handed to the user is unchanged (a UUID, which never contains
-/// `:`), so links and cookies keep their existing shape.
+///
+/// Only the SHA-256 digest of the token is stored (`<tag><sha256 hex>`): the
+/// raw token exists only in the emailed link or the sealed first-login cookie,
+/// so reading the database does not yield a usable credential. Rows written
+/// before tokens were hashed hold the raw token and simply stop matching; they
+/// expired within an hour anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PasswordTokenPurpose {
     /// `POST /auth/password-reset/verify`, token sent by email.
@@ -218,16 +222,29 @@ impl PasswordTokenPurpose {
 
     /// The value persisted in `users.password_reset_token` for `token`.
     pub(crate) fn stored_value(self, token: &str) -> String {
-        format!("{}{}", self.prefix(), token)
+        use sha2::{Digest, Sha256};
+        format!(
+            "{}{}",
+            self.prefix(),
+            hex::encode(Sha256::digest(token.as_bytes()))
+        )
+    }
+
+    /// Whether `stored` is this purpose's value for the presented `token`,
+    /// compared in constant time. The database lookup already matched on the
+    /// digest; this re-check keeps the decision independent of how the
+    /// database compares strings.
+    fn matches(self, stored: Option<&str>, token: &str) -> bool {
+        !token.is_empty()
+            && stored.is_some_and(|stored| {
+                constant_time_eq(stored.as_bytes(), self.stored_value(token).as_bytes())
+            })
     }
 }
 
-/// Whether `token` has the shape of an untagged credential written before
-/// purpose tags existed. Generated tokens are UUIDs and never contain `:`; a
-/// presented value with `:` is refused here so it can never be matched against
-/// a tagged row through the legacy lookup.
-fn is_legacy_password_token_shape(token: &str) -> bool {
-    !token.is_empty() && !token.contains(':')
+/// Compare two byte strings without an early exit on the first difference.
+pub(crate) fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 pub struct AuthService {
@@ -1060,7 +1077,8 @@ impl AuthService {
             .await?
             .ok_or(UserAuthError::InvalidToken)?;
 
-        if !user.must_change_password
+        if !PasswordTokenPurpose::FirstLogin.matches(user.password_reset_token.as_deref(), token)
+            || !user.must_change_password
             || user
                 .password_reset_expires
                 .is_none_or(|expires_at| expires_at < Utc::now())
@@ -1122,28 +1140,20 @@ impl AuthService {
                     //
                     // Only email-reset credentials are accepted: a first-login token
                     // (minted after a temporary-password sign-in) is never valid here.
-                    // An untagged value predates purpose tags and is accepted only on
-                    // an account that is not awaiting a forced change: first-login
-                    // tokens exist only while `must_change_password` is set, so such
-                    // a value can only be an in-flight email reset from before the
-                    // upgrade.
-                    let column = temps_entities::users::Column::PasswordResetToken;
-                    let mut matches = sea_orm::Condition::any().add(
-                        column.eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
-                    );
-                    if is_legacy_password_token_shape(&request.token) {
-                        matches = matches.add(
-                            sea_orm::Condition::all()
-                                .add(column.eq(request.token.as_str()))
-                                .add(temps_entities::users::Column::MustChangePassword.eq(false)),
-                        );
-                    }
                     let user = temps_entities::users::Entity::find()
-                        .filter(matches)
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken
+                                .eq(PasswordTokenPurpose::EmailReset.stored_value(&request.token)),
+                        )
                         .lock_exclusive()
                         .one(transaction)
                         .await?
                         .ok_or(UserAuthError::InvalidToken)?;
+                    if !PasswordTokenPurpose::EmailReset
+                        .matches(user.password_reset_token.as_deref(), &request.token)
+                    {
+                        return Err(UserAuthError::InvalidToken);
+                    }
 
                     // Check if token is expired
                     if user
@@ -1227,7 +1237,9 @@ impl AuthService {
                         .await?
                         .ok_or(UserAuthError::InvalidToken)?;
 
-                    if !user.must_change_password
+                    if !PasswordTokenPurpose::FirstLogin
+                        .matches(user.password_reset_token.as_deref(), &request.token)
+                        || !user.must_change_password
                         || user
                             .password_reset_expires
                             .is_none_or(|expires_at| expires_at < Utc::now())
@@ -3269,51 +3281,140 @@ mod tests {
             .unwrap();
     }
 
-    /// Reset emails sent before the upgrade stored the token untagged. They
-    /// keep working for accounts not awaiting a forced change (the only state
-    /// in which an untagged value can be an email reset), and nowhere else.
+    /// Rows written before tokens were hashed hold the raw token (tagged or
+    /// not). They no longer redeem through either flow: the lookup only ever
+    /// matches a digest.
     #[tokio::test]
-    async fn legacy_untagged_email_reset_token_remains_valid_only_without_forced_change() {
-        let (db, auth_service, _) = setup_test_env().await;
+    async fn legacy_plaintext_reset_tokens_no_longer_redeem() {
+        let Some((db, auth_service, _)) = verification_test_env().await else {
+            return;
+        };
         let user = create_test_user(&db.db, "legacy-reset@example.com", "OldPassword123!").await;
         let legacy_token = Uuid::new_v4().to_string();
-        let mut user_update: users::ActiveModel = user.clone().into();
-        user_update.password_reset_token = Set(Some(legacy_token.clone()));
-        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
-        user_update.must_change_password = Set(true);
-        let flagged = user_update.update(db.db.as_ref()).await.unwrap();
 
-        // Ambiguous while the account awaits a forced change: refused by both flows.
-        assert!(matches!(
-            auth_service
+        for (stored, must_change_password) in [
+            (legacy_token.clone(), false),
+            (format!("email-reset:{legacy_token}"), false),
+            (format!("first-login:{legacy_token}"), true),
+        ] {
+            let mut user_update: users::ActiveModel = user.clone().into();
+            user_update.password_reset_token = Set(Some(stored.clone()));
+            user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+            user_update.must_change_password = Set(must_change_password);
+            user_update.update(db.db.as_ref()).await.unwrap();
+
+            let email_reset = auth_service
                 .reset_password(ResetPasswordRequest {
                     token: legacy_token.clone(),
                     new_password: "Legacy-Reset-123!".to_string(),
                 })
-                .await,
-            Err(UserAuthError::InvalidToken)
-        ));
-        assert!(matches!(
-            auth_service
+                .await;
+            assert!(
+                matches!(email_reset, Err(UserAuthError::InvalidToken)),
+                "{stored}: {email_reset:?}"
+            );
+            let first_login = auth_service
                 .reset_required_password(ResetPasswordRequest {
                     token: legacy_token.clone(),
                     new_password: "Legacy-Reset-123!".to_string(),
                 })
-                .await,
-            Err(UserAuthError::InvalidToken)
-        ));
+                .await;
+            assert!(
+                matches!(first_login, Err(UserAuthError::InvalidToken)),
+                "{stored}: {first_login:?}"
+            );
+        }
+        let unchanged = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(unchanged.password_hash, user.password_hash);
+    }
 
-        let mut user_update: users::ActiveModel = flagged.into();
-        user_update.must_change_password = Set(false);
-        user_update.update(db.db.as_ref()).await.unwrap();
+    /// The emailed reset token is stored only as a tagged digest, redeems
+    /// exactly once, and a wrong token is refused.
+    #[tokio::test]
+    async fn email_reset_token_is_stored_hashed_and_single_use() {
+        let Some((db, auth_service, email_service)) = verification_test_env().await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "hashed-reset@example.com", "OldPassword123!").await;
+        auth_service
+            .request_password_reset("hashed-reset@example.com")
+            .await
+            .unwrap();
+        let raw = emailed_reset_token(&email_service);
+
+        let stored = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap()
+            .password_reset_token
+            .expect("a reset token is stored");
+        assert_ne!(stored, raw, "the raw token must not be stored");
+        assert!(!stored.contains(&raw), "{stored}");
+        assert_eq!(stored, PasswordTokenPurpose::EmailReset.stored_value(&raw));
+        assert_eq!(stored.len(), "email-reset:".len() + 64);
+
+        for wrong in [
+            Uuid::new_v4().to_string(),
+            stored.clone(),
+            stored["email-reset:".len()..].to_string(),
+            String::new(),
+        ] {
+            let result = auth_service
+                .reset_password(ResetPasswordRequest {
+                    token: wrong.clone(),
+                    new_password: "Wrong-Token-123!".to_string(),
+                })
+                .await;
+            assert!(
+                matches!(result, Err(UserAuthError::InvalidToken)),
+                "{wrong:?}: {result:?}"
+            );
+        }
+
         let reset = auth_service
             .reset_password(ResetPasswordRequest {
-                token: legacy_token,
-                new_password: "Legacy-Reset-123!".to_string(),
+                token: raw.clone(),
+                new_password: "Hashed-Reset-123!".to_string(),
             })
             .await
             .unwrap();
         assert!(reset.password_reset_token.is_none());
+        assert!(reset.password_reset_expires.is_none());
+
+        let reused = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: raw,
+                new_password: "Reused-Token-123!".to_string(),
+            })
+            .await;
+        assert!(
+            matches!(reused, Err(UserAuthError::InvalidToken)),
+            "{reused:?}"
+        );
+    }
+
+    #[test]
+    fn stored_reset_values_are_tagged_digests_per_purpose() {
+        let token = "0f5a7c1e-3b2d-4c8e-9a6f-1d2e3f4a5b6c";
+        let email = PasswordTokenPurpose::EmailReset.stored_value(token);
+        let first = PasswordTokenPurpose::FirstLogin.stored_value(token);
+        assert!(email.starts_with("email-reset:"), "{email}");
+        assert!(first.starts_with("first-login:"), "{first}");
+        assert_eq!(email["email-reset:".len()..], first["first-login:".len()..]);
+        assert!(!email.contains(token));
+        assert!(PasswordTokenPurpose::EmailReset.matches(Some(&email), token));
+        assert!(!PasswordTokenPurpose::FirstLogin.matches(Some(&email), token));
+        assert!(!PasswordTokenPurpose::EmailReset.matches(Some(&email), "other"));
+        assert!(!PasswordTokenPurpose::EmailReset.matches(None, token));
+        assert!(!PasswordTokenPurpose::EmailReset.matches(Some(&email), ""));
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abx"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 
     #[tokio::test]
@@ -3321,22 +3422,27 @@ mod tests {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "user@example.com", "oldpassword").await;
 
-        // Set expired reset token
+        // Set an expired (correctly hashed) reset token, so only the expiry
+        // can be what refuses it.
         let reset_token = Uuid::new_v4().to_string();
         let mut user_update: users::ActiveModel = user.into();
-        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
         user_update.password_reset_expires = Set(Some(Utc::now() - Duration::hours(1)));
         user_update.update(db.db.as_ref()).await.unwrap();
 
         let request = ResetPasswordRequest {
             token: reset_token,
-            new_password: "newpassword".to_string(),
+            new_password: "NewPassword123!".to_string(),
         };
 
         let result = auth_service.reset_password(request).await;
 
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), UserAuthError::InvalidToken);
+        assert!(
+            matches!(result, Err(UserAuthError::InvalidToken)),
+            "{result:?}"
+        );
     }
 
     // Email Verification Tests

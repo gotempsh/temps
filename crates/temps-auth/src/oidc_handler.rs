@@ -25,6 +25,7 @@ use crate::audit::{
     LoginAudit, OidcProviderCreatedAudit, OidcProviderDeletedAudit, OidcProviderUpdatedAudit,
     OidcRoleMappingCreatedAudit, OidcRoleMappingDeletedAudit,
 };
+use crate::auth_service::constant_time_eq;
 use crate::oidc_errors::OidcError;
 use crate::oidc_service::{OidcLoginStart, OidcService, LOGIN_STATE_TTL_MINUTES};
 use crate::oidc_types::{
@@ -124,10 +125,6 @@ fn clear_login_binding_cookie(state: &str, secure: bool) -> Result<HeaderValue, 
     .max_age(cookie::time::Duration::ZERO)
     .build();
     cookie_header_value(&cookie)
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// True when the request carries the cookie that was set when the login
