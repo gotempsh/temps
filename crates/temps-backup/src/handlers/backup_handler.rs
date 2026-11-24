@@ -4027,4 +4027,196 @@ mod tests {
             .unwrap()
             .contains("External service 404"));
     }
+
+    /// `DELETE /backups/{id}` through the router: the integer `id` the list
+    /// returns resolves to the backup, and the deletion runs on its UUID (a
+    /// running backup is refused with a 409 that names that UUID). An unknown
+    /// integer is a 404 problem, and no token is a 401.
+    mod delete_backup_route {
+        use super::*;
+        use crate::handlers::test_support::{test_state, RecordingAuditLogger};
+        use axum::body::Body;
+        use axum::http::{HeaderMap, Request};
+        use sea_orm::{ActiveModelTrait, Set};
+        use tower::ServiceExt;
+
+        fn admin() -> temps_auth::AuthContext {
+            let now = chrono::Utc::now();
+            // A persisted browser session: deleting a backup is a sensitive
+            // action, which an API key or an unpersisted session cannot do.
+            temps_auth::AuthContext::new_persisted_session(
+                temps_entities::users::Model {
+                    id: 1,
+                    name: "Backup admin".to_string(),
+                    email: "backup-admin@example.com".to_string(),
+                    password_hash: None,
+                    email_verified: true,
+                    email_verification_token: None,
+                    email_verification_expires: None,
+                    password_reset_token: None,
+                    password_reset_expires: None,
+                    must_change_password: false,
+                    deleted_at: None,
+                    mfa_secret: None,
+                    mfa_enabled: false,
+                    mfa_recovery_codes: None,
+                    oidc_subject: None,
+                    oidc_provider_id: None,
+                    created_at: now,
+                    updated_at: now,
+                },
+                temps_auth::Role::Admin,
+                99,
+            )
+        }
+
+        fn delete(path: &str, auth: Option<temps_auth::AuthContext>) -> Request<Body> {
+            let mut request = Request::builder()
+                .method("DELETE")
+                .uri(path)
+                .body(Body::empty())
+                .expect("request builds");
+            request.extensions_mut().insert(RequestMetadata {
+                ip_address: "203.0.113.10".to_string(),
+                user_agent: "backup-delete-route-test".to_string(),
+                headers: HeaderMap::new(),
+                visitor_id_cookie: None,
+                session_id_cookie: None,
+                base_url: "http://localhost".to_string(),
+                scheme: "http".to_string(),
+                host: "localhost".to_string(),
+                is_secure: false,
+            });
+            if let Some(auth) = auth {
+                request.extensions_mut().insert(auth);
+            }
+            request
+        }
+
+        async fn send(
+            app: axum::Router,
+            request: Request<Body>,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = app.oneshot(request).await.expect("router answers");
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let body = if bytes.is_empty() {
+                serde_json::Value::Null
+            } else {
+                serde_json::from_slice(&bytes).expect("JSON body")
+            };
+            (status, body)
+        }
+
+        #[tokio::test]
+        async fn without_a_token_it_is_401() {
+            let db = Arc::new(
+                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+            );
+            let app = configure_routes().with_state(test_state(
+                db,
+                Arc::new(RecordingAuditLogger::default()),
+                None,
+            ));
+            let (status, _) = send(app, delete("/backups/1", None)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED);
+        }
+
+        #[tokio::test]
+        async fn the_integer_id_resolves_to_the_backup_it_lists() {
+            let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+                Ok(test_db) => test_db,
+                Err(error) => {
+                    println!("TestDatabase unavailable, skipping: {error}");
+                    return;
+                }
+            };
+            let audit = Arc::new(RecordingAuditLogger::default());
+            let state = test_state(test_db.db.clone(), audit.clone(), None);
+            let source = state
+                .backup_service
+                .persist_verified_s3_source(CreateS3SourceRequest {
+                    name: "route-test".to_string(),
+                    bucket_name: "backups".to_string(),
+                    bucket_path: "route-test".to_string(),
+                    access_key_id: SecretString::new("access".to_string()),
+                    secret_key: SecretString::new("secret".to_string()),
+                    region: "us-east-1".to_string(),
+                    endpoint: Some("http://storage.example.test:9000".to_string()),
+                    use_tls: None,
+                    force_path_style: Some(true),
+                    is_default: None,
+                    backing_service_id: None,
+                    worker_credentials: None,
+                })
+                .await
+                .expect("source is stored");
+            let creator = temps_entities::users::ActiveModel {
+                name: Set("Backup admin".to_string()),
+                email: Set("backup-admin@example.com".to_string()),
+                email_verified: Set(true),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("user is stored");
+            let uuid = "0f9e3c4a-6b1d-4c2e-9a7f-5d8b2e1c3a40";
+            let backup = temps_entities::backups::ActiveModel {
+                name: Set("nightly".to_string()),
+                backup_id: Set(uuid.to_string()),
+                schedule_id: Set(None),
+                backup_type: Set("full".to_string()),
+                state: Set("running".to_string()),
+                started_at: Set(chrono::Utc::now()),
+                finished_at: Set(None),
+                size_bytes: Set(None),
+                file_count: Set(None),
+                s3_source_id: Set(source.id),
+                s3_location: Set(format!("s3://backups/route-test/{uuid}")),
+                error_message: Set(None),
+                metadata: Set("{}".to_string()),
+                checksum: Set(None),
+                compression_type: Set("gzip".to_string()),
+                created_by: Set(creator.id),
+                expires_at: Set(None),
+                tags: Set("[]".to_string()),
+                schedule_run_id: Set(None),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("backup is stored");
+            let app = configure_routes().with_state(state);
+
+            let (status, body) = send(
+                app.clone(),
+                delete(&format!("/backups/{}", backup.id), Some(admin())),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            let detail = body["detail"].as_str().expect("problem detail");
+            assert!(detail.contains(uuid), "{detail}");
+            assert!(detail.contains("running"), "{detail}");
+            let audited = audit
+                .operations
+                .lock()
+                .expect("audit mutex")
+                .iter()
+                .map(|(_, record)| record.clone())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(audited.contains(uuid), "audit names the UUID: {audited}");
+
+            let missing = backup.id + 1000;
+            let (status, body) =
+                send(app, delete(&format!("/backups/{missing}"), Some(admin()))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(body["detail"]
+                .as_str()
+                .expect("problem detail")
+                .contains(&missing.to_string()));
+        }
+    }
 }
