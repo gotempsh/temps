@@ -84,6 +84,7 @@ use presets::{
     project_type_for_resolved_preset, resolve_preset_patch, resolve_preset_selection,
     validate_preset_config,
 };
+pub use presets::{fold_top_level_build_settings, TopLevelBuildSettings};
 use source_directory::{
     normalize_project_directory, normalized_stored_directory, pull_only_root_directory_value,
     SourceDirectoryTarget,
