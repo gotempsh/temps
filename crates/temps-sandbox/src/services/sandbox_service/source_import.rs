@@ -849,12 +849,26 @@ impl SandboxService {
                         temps_git::ScopedTokenOp::Fetch,
                     )
                     .await
-                    .map_err(|e| SandboxError::ExecFailed {
-                        sandbox_id: format!("connection#{}", connection_id),
-                        reason: format!(
-                            "mint a read-only token for {}/{}: {}",
-                            grant.repo_owner, grant.repo_name, e
-                        ),
+                    .map_err(|error| {
+                        // The connection may be an organization's, which the
+                        // caller does not own: the provider's error stays in
+                        // the server log, the caller is told which repository.
+                        tracing::warn!(
+                            project_id = grant.project_id,
+                            connection_id,
+                            repository = %format!("{}/{}", grant.repo_owner, grant.repo_name),
+                            reason = %error,
+                            "could not mint a read-only token for a project sandbox seed"
+                        );
+                        SandboxError::ExecFailed {
+                            sandbox_id: format!("connection#{}", connection_id),
+                            reason: format!(
+                                "could not mint a read-only token for {}/{} through git \
+                                 connection {}; check that the connection's GitHub App \
+                                 installation still has access to the repository",
+                                grant.repo_owner, grant.repo_name, connection_id
+                            ),
+                        }
                     })?;
                 tracing::info!(
                     project_id = grant.project_id,

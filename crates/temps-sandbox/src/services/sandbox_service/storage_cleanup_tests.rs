@@ -2402,6 +2402,45 @@ async fn a_project_seed_resolves_the_token_of_an_organization_level_connection()
     let _ = std::fs::remove_dir_all(&data_root);
 }
 
+/// Minting the read-only token goes through a connection the caller may not
+/// own (an organization's), so a failure names the repository and the
+/// connection, never the provider's own error.
+#[tokio::test]
+async fn a_failed_scoped_token_mint_keeps_the_providers_error_from_the_caller() {
+    let server = mockito::Server::new_async().await;
+    let provider = github_provider_at(&server.url());
+    let mut connection = git_connection(None, "org-token");
+    // Not a number: the provider refuses it before any request, with its own
+    // error text, which must not reach the caller.
+    connection.installation_id = Some("installation-detail-77".into());
+    let data_root = unique_data_root("project-scoped-mint-fails");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        // The connection and its provider for authorization, then the
+        // mint's connection, provider and provider service.
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let err = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect_err("an installation that cannot mint a token");
+
+    let detail = err.caller_detail();
+    assert!(
+        detail.contains("could not mint a read-only token for acme/api through git connection 3"),
+        "{detail}"
+    );
+    assert!(!detail.contains("installation-detail-77"), "{detail}");
+    assert!(!detail.contains("Invalid installation_id"), "{detail}");
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
 #[test]
 fn a_project_seed_is_refused_for_any_repository_but_the_projects() {
     let github = git_provider("github", None);
