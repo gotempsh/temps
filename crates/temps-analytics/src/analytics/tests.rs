@@ -286,7 +286,7 @@ async fn test_live_visitors_honour_the_datacenter_opt_out() -> anyhow::Result<()
     let live_visitor = visitor::ActiveModel {
         visitor_id: Set("live-datacenter-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ip_address_id: Set(Some(hosting_ip.id)),
@@ -368,7 +368,7 @@ async fn test_live_visitors_need_a_recent_counted_event() -> anyhow::Result<()> 
     let established = visitor::ActiveModel {
         visitor_id: Set("established-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now - chrono::Duration::hours(1)),
         last_seen: Set(now),
         has_activity: Set(true),
@@ -639,7 +639,7 @@ async fn test_general_stats_excludes_sessions_without_human_page_views() -> anyh
     let human_visitor = visitor::ActiveModel {
         visitor_id: Set("human-session-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ..Default::default()
@@ -760,7 +760,7 @@ async fn test_event_counts_and_general_stats_leave_out_excluded_events() -> anyh
         let row = visitor::ActiveModel {
             visitor_id: Set(visitor_id.to_string()),
             project_id: Set(project.id),
-            environment_id: Set(environment.id),
+            environment_id: Set(Some(environment.id)),
             first_seen: Set(at),
             last_seen: Set(at),
             is_crawler: Set(is_crawler),
@@ -934,7 +934,7 @@ async fn test_get_session_details_with_legacy_v2_session_id() -> anyhow::Result<
     let test_visitor = visitor::ActiveModel {
         visitor_id: Set("v2-session-test-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(chrono::Utc::now()),
         last_seen: Set(chrono::Utc::now()),
         ..Default::default()
@@ -1076,7 +1076,7 @@ async fn test_bounce_derived_from_session_pageview_counts() -> anyhow::Result<()
             visitor::ActiveModel {
                 visitor_id: Set(uuid),
                 project_id: Set(project_id),
-                environment_id: Set(environment_id),
+                environment_id: Set(Some(environment_id)),
                 first_seen: Set(chrono::Utc::now()),
                 last_seen: Set(chrono::Utc::now()),
                 ..Default::default()
@@ -1286,7 +1286,7 @@ async fn test_get_page_path_visitors_bounce_has_real_time_on_page() -> anyhow::R
     let test_visitor = visitor::ActiveModel {
         visitor_id: Set("bounce-duration-test-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ..Default::default()
@@ -1393,7 +1393,7 @@ async fn test_get_page_path_visitors_clamps_upper_bound_time_on_page() -> anyhow
     let test_visitor = visitor::ActiveModel {
         visitor_id: Set("clamp-upper-bound-test-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ..Default::default()
@@ -1490,7 +1490,7 @@ async fn test_get_visitor_journey_exit_page_has_real_time_on_page() -> anyhow::R
     let test_visitor = visitor::ActiveModel {
         visitor_id: Set("journey-duration-test-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ..Default::default()
@@ -1588,7 +1588,7 @@ async fn test_get_visitor_journey_clamps_upper_bound_time_on_page() -> anyhow::R
     let test_visitor = visitor::ActiveModel {
         visitor_id: Set("journey-clamp-upper-bound-visitor".to_string()),
         project_id: Set(project.id),
-        environment_id: Set(environment.id),
+        environment_id: Set(Some(environment.id)),
         first_seen: Set(now),
         last_seen: Set(now),
         ..Default::default()
@@ -2192,7 +2192,7 @@ async fn test_get_page_path_detail_bounds_session_scan_by_date() -> anyhow::Resu
         let visitor = temps_entities::visitor::ActiveModel {
             visitor_id: Set(name.to_string()),
             project_id: Set(project_id),
-            environment_id: Set(env_id),
+            environment_id: Set(Some(env_id)),
             first_seen: Set(w0),
             last_seen: Set(w0),
             ..Default::default()
@@ -2488,7 +2488,7 @@ async fn test_time_on_page_window_semantics_across_page_queries() -> anyhow::Res
     let visitor = temps_entities::visitor::ActiveModel {
         visitor_id: Set("window-semantics-visitor".to_string()),
         project_id: Set(project_id),
-        environment_id: Set(env_id),
+        environment_id: Set(Some(env_id)),
         first_seen: Set(t0),
         last_seen: Set(t0),
         ..Default::default()
@@ -2683,7 +2683,7 @@ async fn insert_visitor(
     let row = visitor::ActiveModel {
         visitor_id: Set(guid.to_string()),
         project_id: Set(scope.project_id),
-        environment_id: Set(scope.environment_id),
+        environment_id: Set(Some(scope.environment_id)),
         first_seen: Set(first_seen),
         last_seen: Set(first_seen),
         ..Default::default()

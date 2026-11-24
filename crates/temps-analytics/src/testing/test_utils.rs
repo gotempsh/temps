@@ -199,7 +199,7 @@ impl AnalyticsTestUtils {
         let test_visitor = visitor::ActiveModel {
             visitor_id: Set("test_visitor_1".to_string()),
             project_id: Set(test_project.id),
-            environment_id: Set(test_environment.id), // Add environment_id
+            environment_id: Set(Some(test_environment.id)), // Add environment_id
             first_seen: Set(Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap()),
             last_seen: Set(Utc.with_ymd_and_hms(2024, 1, 1, 10, 1, 0).unwrap()),
             custom_data: Set(None),

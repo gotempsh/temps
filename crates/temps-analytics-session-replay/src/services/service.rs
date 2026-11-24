@@ -217,7 +217,7 @@ pub struct VisitorInfo {
     pub id: i32,
     pub visitor_id: String,
     pub project_id: i32,
-    pub environment_id: i32,
+    pub environment_id: Option<i32>,
     pub first_seen: UtcDateTime,
     pub last_seen: UtcDateTime,
     pub user_agent: Option<String>,
@@ -247,7 +247,7 @@ pub struct SessionReplayQueryResult {
     pub visitor_internal_id: i32,
     pub visitor_uuid: String,
     pub visitor_project_id: i32,
-    pub visitor_environment_id: i32,
+    pub visitor_environment_id: Option<i32>,
     pub visitor_first_seen: UtcDateTime,
     pub visitor_last_seen: UtcDateTime,
     pub visitor_user_agent: Option<String>,
@@ -287,7 +287,7 @@ struct SessionWithVisitorAndCountRow {
     pub visitor_internal_id: i32,
     pub visitor_uuid: String,
     pub visitor_project_id: i32,
-    pub visitor_environment_id: i32,
+    pub visitor_environment_id: Option<i32>,
     pub visitor_first_seen: UtcDateTime,
     pub visitor_last_seen: UtcDateTime,
     pub visitor_user_agent: Option<String>,
@@ -345,7 +345,7 @@ pub struct SessionReplayWithVisitor {
     pub visitor_user_agent: Option<String>,
     pub visitor_uuid: String,
     pub visitor_project_id: i32,
-    pub visitor_environment_id: i32,
+    pub visitor_environment_id: Option<i32>,
     pub visitor_first_seen: UtcDateTime,
     pub visitor_last_seen: UtcDateTime,
     pub visitor_is_crawler: bool,
@@ -371,17 +371,6 @@ pub struct SessionEvent {
 pub struct SessionReplayWithEvents {
     pub session: SessionReplayInfo,
     pub events: Vec<SessionEvent>,
-}
-
-/// Translate `visitor.environment_id`'s legacy `0` sentinel into `None`.
-///
-/// `visitor.environment_id` is `NOT NULL` with no foreign key, so the analytics
-/// ingest path encodes "no environment" there as a magic `0`
-/// (`events_service.rs`). `session_replay_sessions.environment_id` *does* have
-/// a foreign key, so copying the sentinel across would FK-violate. Making that
-/// column nullable is only half the fix; this is the other half.
-fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
-    (visitor_environment_id != 0).then_some(visitor_environment_id)
 }
 
 /// Cap on visitor rows `initialize_session` may create per project per
@@ -643,7 +632,7 @@ impl SessionReplayService {
                     &txn,
                     &metadata.visitor_id,
                     project_id,
-                    environment_id.unwrap_or(0),
+                    environment_id,
                     &metadata.user_agent,
                 )
                 .await?
@@ -786,7 +775,7 @@ impl SessionReplayService {
         txn: &DatabaseTransaction,
         visitor_id: &str,
         project_id: i32,
-        environment_id: i32,
+        environment_id: Option<i32>,
         user_agent: &str,
     ) -> Result<i32, SessionReplayError> {
         let now = chrono::Utc::now();
@@ -1165,7 +1154,7 @@ impl SessionReplayService {
 
         let visitor_id_int = visitor.id;
         let project_id = visitor.project_id;
-        let environment_id = environment_id_from_visitor(visitor.environment_id);
+        let environment_id = visitor.environment_id;
 
         // Unpack the events
         let unpacked = self.unpack_events(&packed_data)?;
@@ -1277,7 +1266,7 @@ impl SessionReplayService {
                 .ok_or_else(|| SessionReplayError::VisitorNotFound(visitor_id.to_string()))?;
 
             let project_id = visitor.project_id;
-            let environment_id = environment_id_from_visitor(visitor.environment_id);
+            let environment_id = visitor.environment_id;
 
             // Parse user agent if available
             let browser_info = if let Some(meta) = metadata.as_ref() {
@@ -1725,7 +1714,7 @@ impl SessionReplayService {
             pub visitor_internal_id: i32,
             pub visitor_uuid: String,
             pub visitor_project_id: i32,
-            pub visitor_environment_id: i32,
+            pub visitor_environment_id: Option<i32>,
             pub visitor_first_seen: UtcDateTime,
             pub visitor_last_seen: UtcDateTime,
             pub visitor_user_agent: Option<String>,
@@ -2007,7 +1996,7 @@ impl SessionReplayService {
             pub visitor_internal_id: i32,
             pub visitor_uuid: String,
             pub visitor_project_id: i32,
-            pub visitor_environment_id: i32,
+            pub visitor_environment_id: Option<i32>,
             pub visitor_first_seen: UtcDateTime,
             pub visitor_last_seen: UtcDateTime,
             pub visitor_user_agent: Option<String>,
@@ -2377,7 +2366,7 @@ mod tests {
         );
     }
 
-    fn make_visitor_model(environment_id: i32) -> visitor::Model {
+    fn make_visitor_model(environment_id: Option<i32>) -> visitor::Model {
         let now = chrono::Utc::now();
         visitor::Model {
             id: 5,
@@ -2440,7 +2429,7 @@ mod tests {
                     rows_affected: 1,
                 }])
                 // 1. visitor lookup
-                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![make_visitor_model(Some(3))]])
                 // 1b. the visitor's `last_seen` is refreshed
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
@@ -2517,7 +2506,7 @@ mod tests {
                     last_insert_id: 0,
                     rows_affected: 1,
                 }])
-                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![make_visitor_model(Some(3))]])
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
                     rows_affected: 1,
@@ -2568,7 +2557,7 @@ mod tests {
                     last_insert_id: 0,
                     rows_affected: 1,
                 }])
-                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![make_visitor_model(Some(3))]])
                 // The refresh matches no row: retention removed it.
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
@@ -2625,7 +2614,7 @@ mod tests {
                     last_insert_id: 0,
                     rows_affected: 1,
                 }])
-                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![make_visitor_model(Some(3))]])
                 .append_exec_results(vec![sea_orm::MockExecResult {
                     last_insert_id: 0,
                     rows_affected: 1,
@@ -2666,16 +2655,6 @@ mod tests {
             insert.contains("Int(Some(3))") && insert.contains("Int(Some(11))"),
             "a fully resolved route must keep its attribution: {insert}"
         );
-    }
-
-    /// `visitor.environment_id` is `NOT NULL` with no FK, so the analytics
-    /// ingest path still encodes "no environment" there as a magic `0`. That
-    /// sentinel must not be copied into `session_replay_sessions`, whose
-    /// `environment_id` *does* have an FK.
-    #[test]
-    fn environment_id_from_visitor_maps_zero_sentinel_to_none() {
-        assert_eq!(environment_id_from_visitor(0), None);
-        assert_eq!(environment_id_from_visitor(3), Some(3));
     }
 
     /// Build the wire payload the browser SDK sends: zlib-compressed JSON,

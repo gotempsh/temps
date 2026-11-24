@@ -1837,7 +1837,7 @@ mod tests {
             let v = visitor::ActiveModel {
                 visitor_id: Set(format!("visitor-{}", i)),
                 project_id: Set(project.id),
-                environment_id: Set(environment.id),
+                environment_id: Set(Some(environment.id)),
                 first_seen: Set(now - Duration::days(1)),
                 last_seen: Set(now),
                 is_crawler: Set(false),
