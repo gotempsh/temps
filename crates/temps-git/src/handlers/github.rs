@@ -3,10 +3,10 @@
 
 use axum::{
     extract::{DefaultBodyLimit, Query, State},
-    http::{HeaderMap, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     response::{Json, Redirect},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -15,8 +15,13 @@ use std::sync::Arc;
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
+use super::github_manifest_binding::{
+    clear_binding_cookies, issue_binding, verify_binding, ManifestBindingError,
+};
 use super::types::GitAppState as AppState;
+use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{new as problem_new, Problem};
+use temps_core::RequestMetadata;
 use temps_core::telemetry::{OperationFailureCode, TelemetryEvent, TelemetryEventKind};
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
@@ -37,6 +42,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             "/webhook/git/github/callback",
             get(github_app_installation_callback),
         ) // Installation callback
+        .route(
+            "/git-providers/github/manifest-state",
+            post(start_github_app_manifest),
+        )
         .route("/webhook/git/github/install", get(github_install_webhook))
         .route(
             "/webhook/source/github/install",
@@ -65,6 +74,97 @@ struct RedirectQuery {
     code: String,
     state: String,
     source: Option<String>,
+}
+
+/// OpenAPI for the console-facing GitHub App manifest endpoint. The redirect
+/// callbacks GitHub itself calls are not part of the documented API.
+#[derive(utoipa::OpenApi)]
+#[openapi(
+    paths(start_github_app_manifest),
+    components(schemas(GithubAppManifestStateResponse))
+)]
+pub struct GithubManifestApiDoc;
+
+/// Response for [`start_github_app_manifest`].
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct GithubAppManifestStateResponse {
+    /// Pass this as the `state` query parameter when submitting the manifest
+    /// to GitHub. It is bound to this browser by an HttpOnly cookie and
+    /// expires after 15 minutes.
+    pub state: String,
+}
+
+/// Start creating a GitHub App from a manifest.
+///
+/// Returns the `state` to send to GitHub and sets an HttpOnly cookie that
+/// binds it to the signed-in user. GitHub's redirect back to
+/// `/webhook/git/github/auth` carries no session (the session cookie is
+/// `SameSite=Strict`), so that cookie is the only proof that the conversion
+/// was started from this console; without it the callback refuses the code.
+#[utoipa::path(
+    post,
+    path = "/git-providers/github/manifest-state",
+    responses(
+        (status = 200, description = "State issued and bound to this browser", body = GithubAppManifestStateResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Git Providers",
+    security(("bearer_auth" = []))
+)]
+async fn start_github_app_manifest(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<(HeaderMap, Json<GithubAppManifestStateResponse>), Problem> {
+    permission_guard!(auth, GitProvidersCreate);
+
+    let user_id = auth.user_id();
+    let issued = issue_binding(
+        &state.cookie_crypto,
+        user_id,
+        metadata.is_secure,
+        chrono::Utc::now().timestamp(),
+    )
+    .map_err(|reason| {
+        error!(user_id, "Failed to start GitHub App manifest flow: {}", reason);
+        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("GitHub App Setup Failed")
+            .with_detail(format!(
+                "Could not start the GitHub App setup for user {user_id}: {reason}"
+            ))
+    })?;
+
+    info!(user_id, "GitHub App manifest flow started");
+
+    let mut headers = HeaderMap::new();
+    headers.insert(header::SET_COOKIE, issued.set_cookie);
+    headers.insert(
+        header::CACHE_CONTROL,
+        axum::http::HeaderValue::from_static("no-store"),
+    );
+    Ok((
+        headers,
+        Json(GithubAppManifestStateResponse {
+            state: issued.state,
+        }),
+    ))
+}
+
+fn manifest_binding_problem(error: ManifestBindingError) -> Problem {
+    let status = match error {
+        ManifestBindingError::MissingState => StatusCode::BAD_REQUEST,
+        ManifestBindingError::MissingCookie
+        | ManifestBindingError::Unreadable
+        | ManifestBindingError::Expired
+        | ManifestBindingError::StateMismatch => StatusCode::FORBIDDEN,
+    };
+    problem_new(status)
+        .with_title("GitHub App Setup Not Verified")
+        .with_detail(format!(
+            "The GitHub App was not registered in Temps: {error}"
+        ))
 }
 
 /// Handle GitHub App manifest conversion with source tracking
@@ -654,6 +754,7 @@ async fn find_github_app_provider_for_installation(
 async fn github_app_auth_callback(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
+    request_headers: HeaderMap,
 ) -> Result<(HeaderMap, Redirect), Problem> {
     let code = params.get("code").cloned().unwrap_or_default();
     let state_param = params.get("state").cloned();
@@ -674,6 +775,47 @@ async fn github_app_auth_callback(
         return Err(problem_new(StatusCode::BAD_REQUEST)
             .with_title("Missing Authorization Code")
             .with_detail("The 'code' parameter is required"));
+    }
+
+    // Check if this is a manifest conversion flow (only code + state, no installation_id)
+    let is_manifest_flow =
+        params.len() == 2 && params.contains_key("code") && params.contains_key("state");
+
+    if is_manifest_flow {
+        info!(
+            "Detected manifest conversion flow with state: {:?}",
+            state_param
+        );
+        // This request carries no session, so the only proof that a signed-in
+        // user started this conversion is the sealed binding cookie issued by
+        // `start_github_app_manifest`. Without it anyone holding a manifest
+        // code for an App they created could register it as a Git provider.
+        let started_by = match verify_binding(
+            &state.cookie_crypto,
+            &request_headers,
+            state_param.as_deref(),
+            chrono::Utc::now().timestamp(),
+        ) {
+            Ok(user_id) => user_id,
+            Err(error) => {
+                warn!(
+                    reason = %error,
+                    "Refused GitHub App manifest conversion without a valid binding"
+                );
+                return Err(manifest_binding_problem(error));
+            }
+        };
+        info!(
+            user_id = started_by,
+            "Converting GitHub App manifest started by user {}", started_by
+        );
+        let (mut headers, redirect) =
+            handle_manifest_conversion_with_source(&state, code, state_param).await?;
+        // The binding is single-use.
+        for cookie in clear_binding_cookies() {
+            headers.append(header::SET_COOKIE, cookie);
+        }
+        return Ok((headers, redirect));
     }
 
     // Use the operator-configured external URL — never reflect client headers.
@@ -760,18 +902,6 @@ async fn github_app_auth_callback(
         return Ok((response_headers, Redirect::to(&redirect_url)));
     }
 
-    // Check if this is a manifest conversion flow (only code + state, no installation_id)
-    let is_manifest_flow =
-        params.len() == 2 && params.contains_key("code") && params.contains_key("state");
-
-    if is_manifest_flow {
-        info!(
-            "Detected manifest conversion flow with state: {:?}",
-            state_param
-        );
-        // This is a manifest conversion - the code needs to be exchanged for a GitHub App
-        return handle_manifest_conversion_with_source(&state, code, state_param).await;
-    }
 
     // For auth-only flow (no installation_id yet), redirect and wait for webhook
     info!("OAuth authorization code received without installation_id - waiting for installation webhook");

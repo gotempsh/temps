@@ -213,6 +213,7 @@ impl TempsPlugin for GitPlugin {
                 connection_health_service,
                 telemetry,
                 sensitive_action_authorizer,
+                context.require_service::<temps_core::CookieCrypto>(),
             );
             context.register_plugin_state("git", git_app_state);
 

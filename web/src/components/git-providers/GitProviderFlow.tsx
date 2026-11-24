@@ -13,6 +13,7 @@ import {
   listConnectionsQueryKey,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { client } from '@/api/client/client.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -429,7 +430,28 @@ export function GitProviderFlow({
     setTimeout(() => setCopiedCallback(false), 2000)
   }
 
-  const handleCreateGitHubAppManifest = () => {
+  // GitHub's redirect back to the console carries no session cookie, so the
+  // server binds the manifest `state` to this signed-in browser with an
+  // HttpOnly cookie. Without that binding it refuses to register the App.
+  const requestGitHubManifestState = async (): Promise<string> => {
+    const response = await client.post({
+      url: '/git-providers/github/manifest-state',
+      security: [{ scheme: 'bearer', type: 'http' }],
+    })
+    const data = response.data as { state?: string } | undefined
+    if (!data?.state) {
+      const problem = response.error as
+        { detail?: string; title?: string } | undefined
+      throw new Error(
+        problem?.detail ??
+          problem?.title ??
+          'Could not start the GitHub App setup. Check that you may create git providers.'
+      )
+    }
+    return data.state
+  }
+
+  const handleCreateGitHubAppManifest = async () => {
     try {
       // The manifest fixes the App's webhook URL at creation. Without the
       // public callback URL there is nothing correct to submit.
@@ -465,7 +487,7 @@ export function GitProviderFlow({
       setIsCreatingApp(true)
 
       const appName = `temps-${Math.random().toString(36).substring(2, 8)}`
-      const source = crypto.randomUUID()
+      const source = await requestGitHubManifestState()
 
       const baseUrl = `${window.location.origin}`
       const appUrl = `${baseUrl}`
@@ -613,7 +635,7 @@ export function GitProviderFlow({
     } else if (method === 'existing-app') {
       handleExistingAppInstall()
     } else if (method === 'app') {
-      handleCreateGitHubAppManifest()
+      void handleCreateGitHubAppManifest()
     } else if (method === 'gitlab-pat') {
       setCurrentStep('configure-gitlab-pat')
     } else if (method === 'gitlab-app') {

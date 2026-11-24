@@ -2042,9 +2042,12 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
                 .as_str()
                 .ok_or("private_key required")?
                 .to_string(),
+            // An empty secret would make every delivery's HMAC forgeable.
             webhook_secret: config["webhook_secret"]
                 .as_str()
-                .ok_or("webhook_secret required")?
+                .map(str::trim)
+                .filter(|secret| !secret.is_empty())
+                .ok_or("webhook_secret required (it must not be empty)")?
                 .to_string(),
         }),
         "gitlab_app" => Ok(AuthMethod::GitLabApp {
@@ -2108,7 +2111,8 @@ fn parse_auth_method(method_type: &str, config: serde_json::Value) -> Result<Aut
 #[derive(utoipa::OpenApi)]
 #[openapi(
     nest (
-        (path = "/", api = crate::handlers::repositories::RepositoriesApiDoc)
+        (path = "/", api = crate::handlers::repositories::RepositoriesApiDoc),
+        (path = "/", api = crate::handlers::github::GithubManifestApiDoc)
     ),
     paths(
         create_git_provider,

@@ -8,6 +8,7 @@ pub mod compose_preview_problem;
 pub mod generic;
 pub mod gitea;
 pub mod github;
+pub(crate) mod github_manifest_binding;
 pub mod gitlab;
 pub mod public;
 pub mod repositories;
@@ -165,6 +166,7 @@ mod public_route_tests {
             ),
             Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             Arc::new(AllowSensitiveActions),
+            Arc::new(temps_core::CookieCrypto::from_bytes(&[7u8; 32])),
         )
     }
 
@@ -243,6 +245,50 @@ mod public_route_tests {
                 "{path} is session-bound and must not be on the public router"
             );
         }
+    }
+
+    /// An unauthenticated caller holding a manifest `code` for a GitHub App
+    /// they created must not be able to register it as a Git provider. The
+    /// mock database has nothing queued and the code is never sent to GitHub:
+    /// a 403 here proves the request was refused before either.
+    #[tokio::test]
+    async fn github_manifest_callback_without_binding_cookie_is_refused() {
+        for path in [
+            "/webhook/git/github/auth?code=attacker-code&state=attacker-state",
+            "/webhook/git/github/auth?state=attacker-state&code=attacker-code",
+        ] {
+            assert_eq!(
+                status(configure_routes(), get(path)).await,
+                StatusCode::FORBIDDEN,
+                "{path} must not convert a manifest without the console's binding"
+            );
+        }
+
+        let forged = Request::builder()
+            .uri("/webhook/git/github/auth?code=attacker-code&state=s")
+            .header(
+                "cookie",
+                r#"temps_github_manifest={"state":"s","user_id":1,"expires_at":9999999999}"#,
+            )
+            .body(Body::empty())
+            .expect("request builds");
+        assert_eq!(
+            status(configure_routes(), forged).await,
+            StatusCode::FORBIDDEN,
+            "an unsealed cookie must not stand in for the binding"
+        );
+    }
+
+    #[tokio::test]
+    async fn github_manifest_state_requires_authentication() {
+        assert_eq!(
+            status(
+                configure_routes(),
+                post("/git-providers/github/manifest-state", "")
+            )
+            .await,
+            StatusCode::UNAUTHORIZED
+        );
     }
 
     #[tokio::test]

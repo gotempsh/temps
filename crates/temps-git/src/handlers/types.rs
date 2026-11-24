@@ -35,6 +35,9 @@ pub struct GitAppState {
     pub compose_checker: Option<Arc<dyn temps_presets::compose_check::ComposeConfigurationChecker>>,
     /// Restricts project-scoped previews to members of that project.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Seals the GitHub App manifest binding cookie, which ties the
+    /// unauthenticated manifest callback to the signed-in user who started it.
+    pub cookie_crypto: Arc<temps_core::CookieCrypto>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -48,6 +51,7 @@ pub fn create_git_app_state(
     connection_health_service: Arc<ConnectionHealthService>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
+    cookie_crypto: Arc<temps_core::CookieCrypto>,
 ) -> Arc<GitAppState> {
     Arc::new(GitAppState {
         git_provider_manager,
@@ -63,6 +67,7 @@ pub fn create_git_app_state(
         // its services.
         compose_checker: None,
         project_access_checker: None,
+        cookie_crypto,
     })
 }
 

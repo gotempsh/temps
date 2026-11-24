@@ -1171,6 +1171,15 @@ impl GithubAppService {
             .as_str()
             .unwrap_or("")
             .to_string();
+        // Webhook deliveries are authenticated only by this secret. Storing
+        // an App without one would leave its HMAC computable by anyone.
+        if webhook_secret_val.trim().is_empty() {
+            return Err(GithubAppServiceError::Validation(format!(
+                "GitHub App '{}' (id {}) was created without a webhook secret; recreate it with webhooks enabled",
+                app_data["name"].as_str().unwrap_or("unknown"),
+                app_data["id"].as_i64().unwrap_or(0)
+            )));
+        }
         let private_key_val = app_data["pem"].as_str().unwrap_or("").to_string();
 
         // Extract html_url or slug to construct the GitHub App URL
@@ -1468,6 +1477,17 @@ impl GithubAppService {
         for github_app in github_apps {
             // webhook_secret is already decrypted in GitHubAppData
             let webhook_secret = github_app.webhook_secret;
+
+            // An HMAC keyed with the empty string is computable by anyone, so
+            // an App stored without a webhook secret must never authenticate
+            // a delivery: accepting it would let any caller forge push events.
+            if webhook_secret.is_empty() {
+                warn!(
+                    "GitHub App '{}' (provider {}) has no webhook secret; its deliveries are rejected. Set a webhook secret on the App in GitHub and update the provider in Temps.",
+                    github_app.name, github_app.provider_id
+                );
+                continue;
+            }
 
             let mut mac = match Hmac::<Sha256>::new_from_slice(webhook_secret.as_bytes()) {
                 Ok(mac) => mac,
