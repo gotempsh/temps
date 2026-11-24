@@ -588,7 +588,7 @@ for (const width of [390, 1280]) {
     await page.getByRole('button', { name: 'Change goal' }).click()
     await expect(
       page.getByRole('heading', { name: 'Suggested goals' })
-    ).toBeVisible()
+    ).toBeFocused()
     await page
       .getByRole('button', {
         name: 'Choose Documentation interest',
