@@ -317,7 +317,9 @@ for (const width of [390, 1280]) {
       failure.getByRole('button', { name: 'Try again', exact: true })
     ).toBeVisible()
     expect(saved).toBe(false)
-    await page.getByRole('button', { name: 'Preview my visitors' }).click()
+    await failure
+      .getByRole('button', { name: 'Try again', exact: true })
+      .click()
     await expect(page.getByText(report.summary)).toBeVisible()
     await page
       .getByRole('button', { name: 'Enable daily reports', exact: true })
