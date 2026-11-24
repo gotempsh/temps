@@ -8200,3 +8200,93 @@ async fn deployment_config_writers_lock_before_merging_and_commit_before_returni
         assert_eq!(config, serde_json::json!([7, 0]), "{writer}");
     }
 }
+
+/// `PUT /projects/{id}` without `repo_owner`/`repo_name` used to store the
+/// literal "unknown" for both, detaching the project from its repository.
+#[tokio::test]
+async fn update_project_keeps_the_repository_when_it_is_omitted() {
+    if !temps_test_utils::docker_available().await {
+        println!("Docker not available, skipping");
+        return;
+    }
+    let test_db = TestDatabase::with_migrations().await.unwrap();
+    let db = test_db.db.clone();
+    let project_service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+    let project = temps_entities::projects::ActiveModel {
+        name: Set("Repo Project".to_string()),
+        slug: Set("repo-project".to_string()),
+        repo_name: Set("service-repo".to_string()),
+        repo_owner: Set("service-owner".to_string()),
+        directory: Set("/".to_string()),
+        git_provider_connection_id: Set(None),
+        main_branch: Set("main".to_string()),
+        preset: Set(Preset::Nixpacks),
+        ..Default::default()
+    }
+    .insert(db.as_ref())
+    .await
+    .unwrap();
+
+    let request = |repo_owner: Option<&str>, repo_name: Option<&str>| CreateProjectRequest {
+        cloudflare_enabled: None,
+        delivery_provider: None,
+        name: "Repo Project Renamed".to_string(),
+        expected_slug: None,
+        repo_name: repo_name.map(str::to_string),
+        repo_owner: repo_owner.map(str::to_string),
+        directory: "/".to_string(),
+        main_branch: "main".to_string(),
+        preset: Preset::Nixpacks.to_string(),
+        preset_config: None,
+        environment_variables: None,
+        git_url: None,
+        git_provider_connection_id: None,
+        automatic_deploy: false,
+        exposed_port: None,
+        cpu_request: None,
+        cpu_limit: None,
+        memory_request: None,
+        memory_limit: None,
+        is_public_repo: None,
+        storage_service_ids: vec![],
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
+        source_type: temps_entities::source_type::SourceType::Git,
+        template_slug: None,
+        hosting: Default::default(),
+    };
+
+    project_service
+        .update_project(
+            project.id,
+            request(None, None),
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+        .expect("an update that omits the repository succeeds");
+    let stored = temps_entities::projects::Entity::find_by_id(project.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.name, "Repo Project Renamed");
+    assert_eq!(stored.repo_owner, "service-owner");
+    assert_eq!(stored.repo_name, "service-repo");
+
+    // A repository that is sent is still applied.
+    project_service
+        .update_project(
+            project.id,
+            request(Some("other-owner"), Some("other-repo")),
+            temps_core::docker_socket_grant::DeployCaller::default(),
+        )
+        .await
+        .expect("an update that names the repository succeeds");
+    let stored = temps_entities::projects::Entity::find_by_id(project.id)
+        .one(db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(stored.repo_owner, "other-owner");
+    assert_eq!(stored.repo_name, "other-repo");
+}
