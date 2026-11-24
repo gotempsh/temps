@@ -9,7 +9,12 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 
-export function OrphanBackupBadge({ label = 'orphan' }: { label?: string }) {
+/**
+ * Marks a backup found in S3 that this Temps server has no record of. The one
+ * name for such a backup on every page: not "orphan", which implies the
+ * server that made it is gone, when it may still be running.
+ */
+export function FoundInS3Badge() {
   return (
     <TooltipProvider>
       <Tooltip>
@@ -21,7 +26,7 @@ export function OrphanBackupBadge({ label = 'orphan' }: { label?: string }) {
               className: 'cursor-help text-xs',
             })}
           >
-            {label}
+            Found in S3
           </span>
         </TooltipTrigger>
         <TooltipContent className="max-w-64">

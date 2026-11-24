@@ -137,7 +137,7 @@ import {
   patchRestoreSelection,
   type RestoreSelectionPatch,
 } from './service-restore/restore-selection'
-import { OrphanBackupBadge } from './service-restore/OrphanBackupBadge'
+import { FoundInS3Badge } from './service-restore/FoundInS3Badge'
 import { cancelRefusal } from './service-restore/run-context'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
@@ -1157,7 +1157,7 @@ export function ServiceRestore() {
                           Tracked
                         </Badge>
                       ) : (
-                        <OrphanBackupBadge label="Found in S3" />
+                        <FoundInS3Badge />
                       )
                     return (
                       <TableRow
