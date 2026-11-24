@@ -53,6 +53,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'USER_LOGOUT', label: 'User Logout' },
       { value: 'PASSWORD_RESET', label: 'Password Reset' },
       { value: 'EMAIL_VERIFIED', label: 'Email Verified' },
+      {
+        value: 'EMAIL_VERIFICATION_REQUESTED',
+        label: 'Email Verification Requested',
+      },
       PERMISSION_DENIED_FILTER,
     ],
   },
@@ -66,6 +70,10 @@ export const OPERATION_GROUPS: OperationGroup[] = [
       { value: 'ROLE_ASSIGNED', label: 'Role Assigned' },
       { value: 'ROLE_REMOVED', label: 'Role Removed' },
       { value: 'ADMIN_PASSWORD_RESET', label: 'Password Reset by Admin' },
+      {
+        value: 'USER_EMAIL_MARKED_VERIFIED',
+        label: 'Email Marked Verified by Admin',
+      },
     ],
   },
   {

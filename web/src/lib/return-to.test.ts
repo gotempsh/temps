@@ -87,6 +87,7 @@ describe('captureReturnTo', () => {
     '/mfa-verify',
     '/forgot-password',
     '/auth/reset-password',
+    '/auth/verify',
   ])('never captures %s as a post-login destination', (path) => {
     setLocation(path)
     captureReturnTo()

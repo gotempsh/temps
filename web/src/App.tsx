@@ -320,6 +320,9 @@ const ForgotPassword = lazy(() =>
 const ResetPassword = lazy(() =>
   import('./pages/ResetPassword').then((m) => ({ default: m.ResetPassword }))
 )
+const VerifyEmail = lazy(() =>
+  import('./pages/VerifyEmail').then((m) => ({ default: m.VerifyEmail }))
+)
 const RequiredPasswordChange = lazy(() =>
   import('./pages/RequiredPasswordChange').then((m) => ({
     default: m.RequiredPasswordChange,
@@ -1145,6 +1148,10 @@ const AppContent = () => {
                   path="/auth/reset-password"
                   element={<ResetPassword />}
                 />
+                {/* Target of the email-verification link
+                    ({base_url}/auth/verify?token=...) — see
+                    send_verification_email in temps-auth. */}
+                <Route path="/auth/verify" element={<VerifyEmail />} />
                 <Route
                   path="/auth/change-password"
                   element={<RequiredPasswordChange />}

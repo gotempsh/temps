@@ -25,6 +25,7 @@ const AUTH_PATHS = new Set([
   '/login',
   '/forgot-password',
   '/auth/reset-password',
+  '/auth/verify',
 ])
 
 function isAuthPath(path: string): boolean {

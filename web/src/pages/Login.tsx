@@ -40,6 +40,8 @@ const OIDC_ERROR_MESSAGES: Record<string, string> = {
     'Your identity provider did not return an email address. Grant the "email" scope and try again.',
   email_not_verified:
     'Your identity provider has not confirmed your email. Verify it at the IdP, then try again.',
+  local_email_not_verified:
+    "An account with this email already exists, but its address hasn't been verified. Ask an administrator to verify it, then sign in again.",
   user_not_provisioned:
     'No Temps account exists for this email. Ask an administrator to create one.',
   provider_disabled: 'This SSO provider is currently disabled.',

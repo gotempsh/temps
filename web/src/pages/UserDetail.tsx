@@ -7,6 +7,10 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AuditLogItemRow } from '@/components/audit/AuditLogItem'
 import {
+  MarkEmailVerifiedButton,
+  ResendVerificationEmail,
+} from '@/components/users/EmailVerificationActions'
+import {
   ResetPasswordDialog,
   ResetPasswordTarget,
 } from '@/components/users/ResetPasswordDialog'
@@ -324,35 +328,48 @@ export function UserDetail() {
                     </div>
                   )}
               </div>
-              <div className="ml-auto shrink-0">
+              <div className="ml-auto flex shrink-0 flex-wrap items-center justify-end gap-2">
                 {currentUser?.id === target.user.id ? (
-                  <Button variant="outline" size="sm" asChild>
-                    <Link to="/account">
-                      <KeyRound className="mr-2 h-4 w-4" />
-                      Change your password
-                    </Link>
-                  </Button>
+                  <>
+                    {!target.user.email_verified && <ResendVerificationEmail />}
+                    <Button variant="outline" size="sm" asChild>
+                      <Link to="/account">
+                        <KeyRound className="mr-2 h-4 w-4" />
+                        Change your password
+                      </Link>
+                    </Button>
+                  </>
                 ) : (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    disabled={!!target.user.deleted_at}
-                    title={
-                      target.user.deleted_at
-                        ? 'Restore this user before resetting their password'
-                        : undefined
-                    }
-                    onClick={() =>
-                      setResetTarget({
-                        id: target.user.id,
-                        name: target.user.name || target.user.username || '',
-                        email: target.user.email || '',
-                      })
-                    }
-                  >
-                    <KeyRound className="mr-2 h-4 w-4" />
-                    Reset password
-                  </Button>
+                  <>
+                    {!target.user.email_verified && (
+                      <MarkEmailVerifiedButton
+                        userId={target.user.id}
+                        email={target.user.email}
+                        disabled={!!target.user.deleted_at}
+                        disabledReason="Restore this user before verifying their email"
+                      />
+                    )}
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={!!target.user.deleted_at}
+                      title={
+                        target.user.deleted_at
+                          ? 'Restore this user before resetting their password'
+                          : undefined
+                      }
+                      onClick={() =>
+                        setResetTarget({
+                          id: target.user.id,
+                          name: target.user.name || target.user.username || '',
+                          email: target.user.email || '',
+                        })
+                      }
+                    >
+                      <KeyRound className="mr-2 h-4 w-4" />
+                      Reset password
+                    </Button>
+                  </>
                 )}
               </div>
             </div>

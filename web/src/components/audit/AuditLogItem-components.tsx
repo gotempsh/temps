@@ -279,6 +279,8 @@ function describe(
       return `Removed role ${role ?? 'unknown'}${username ? ` from ${username}` : ''}`
     case 'ADMIN_PASSWORD_RESET':
       return `Reset the password of ${username ?? 'a user'}`
+    case 'USER_EMAIL_MARKED_VERIFIED':
+      return `Marked the email of ${username ?? 'a user'} as verified`
 
     // MFA
     case 'MFA_SETUP_STARTED':
@@ -397,6 +399,8 @@ function describe(
       return 'Reset password'
     case 'EMAIL_VERIFIED':
       return 'Verified email address'
+    case 'EMAIL_VERIFICATION_REQUESTED':
+      return 'Requested an email verification link'
 
     // Projects / environments extras
     case 'DEPLOYMENT_CONFIG_UPDATED':
@@ -735,7 +739,10 @@ export function AuditLogItemRow({
           <TableCell colSpan={6} className="py-3">
             <div className="space-y-1.5 text-sm">
               {Object.entries(data).map(([key, value]) => (
-                <div key={key} className="flex flex-col gap-1 sm:flex-row sm:gap-3">
+                <div
+                  key={key}
+                  className="flex flex-col gap-1 sm:flex-row sm:gap-3"
+                >
                   <span className="font-medium text-muted-foreground sm:w-[160px] sm:shrink-0">
                     {key}
                   </span>

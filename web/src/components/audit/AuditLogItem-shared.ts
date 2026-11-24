@@ -83,6 +83,7 @@ export function categorize(op: string): Category {
     op === 'USER_LOGOUT' ||
     op === 'PASSWORD_RESET' ||
     op === 'EMAIL_VERIFIED' ||
+    op === 'EMAIL_VERIFICATION_REQUESTED' ||
     op === 'PERMISSION_DENIED'
   )
     return 'auth'

@@ -42,12 +42,14 @@ import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerifi
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Check, Circle, Loader2, X } from 'lucide-react'
+import { Check, Circle, Loader2, MailCheck, MailWarning, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
+import { ResendVerificationEmail } from '@/components/users/EmailVerificationActions'
+import { currentUserEmailVerified } from '@/lib/email-verification'
 import { useAuth } from '@/contexts/AuthContext'
 import { cn } from '@/lib/utils'
 import {
@@ -120,6 +122,45 @@ const mfaSetupPasswordSchema = z.object({
 
 type MfaSetupPasswordValues = z.infer<typeof mfaSetupPasswordSchema>
 
+/**
+ * Verification state of the signed-in user's address. SSO sign-in is only
+ * linked onto an account whose email is verified, so an unverified address
+ * says how to fix it right here.
+ */
+function EmailVerificationStatus({ verified }: { verified: boolean }) {
+  if (verified) {
+    return (
+      <div className="flex items-center gap-2">
+        <Badge
+          variant="secondary"
+          className="gap-1 bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+        >
+          <MailCheck aria-hidden="true" className="h-3 w-3" />
+          Email verified
+        </Badge>
+      </div>
+    )
+  }
+  return (
+    <div className="space-y-2">
+      <div className="flex flex-wrap items-center gap-2">
+        <Badge
+          variant="secondary"
+          className="gap-1 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+        >
+          <MailWarning aria-hidden="true" className="h-3 w-3" />
+          Email unverified
+        </Badge>
+        <span className="text-xs text-muted-foreground">
+          Single sign-on can&apos;t be linked to this account until the address
+          is verified.
+        </span>
+      </div>
+      <ResendVerificationEmail />
+    </div>
+  )
+}
+
 export function Account() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
@@ -155,9 +196,20 @@ export function Account() {
     meta: {
       errorTitle: 'Failed to update account',
     },
-    onSuccess: () => {
-      toast.success('Account updated successfully')
+    onSuccess: (data) => {
+      toast.success(
+        'Account updated successfully',
+        data.user.email_verified
+          ? undefined
+          : {
+              description:
+                'Your email address is unverified until you open the verification link or an administrator verifies it.',
+            }
+      )
       refetch()
+      queryClient.invalidateQueries({
+        queryKey: getCurrentUserOptions().queryKey,
+      })
     },
     onError: (error, variables) => {
       // Only email changes are step-up gated server-side, but it's safe to
@@ -356,6 +408,11 @@ export function Account() {
                   </FormItem>
                 )}
               />
+              {user && (
+                <EmailVerificationStatus
+                  verified={currentUserEmailVerified(user)}
+                />
+              )}
               {/* Role — read-only. The user can't change their own role
                   here; that requires an admin via /users. Surfacing it
                   reduces the "what permissions do I have?" question that
@@ -744,9 +801,9 @@ export function Account() {
           <DialogHeader>
             <DialogTitle>Disable Two-Factor Authentication</DialogTitle>
             <DialogDescription>
-              Enter a code from your authenticator app, or one of your
-              recovery codes, to confirm disabling two-factor
-              authentication. This will make your account less secure.
+              Enter a code from your authenticator app, or one of your recovery
+              codes, to confirm disabling two-factor authentication. This will
+              make your account less secure.
             </DialogDescription>
           </DialogHeader>
           <Form {...mfaDisableForm}>
