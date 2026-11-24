@@ -107,6 +107,8 @@ pub const AI_READ_ALLOWLIST: &[&str] = &[
     "get_cron_by_id",
     "get_cron_executions",
     "get_environment_variables",
+    // One variable as the list returns it: the value masked, never plaintext.
+    "get_environment_variable",
     "get_resolved_environment_variables",
     // ── Error tracking ──
     "get_error_dashboard_stats",
