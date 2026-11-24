@@ -666,10 +666,19 @@ impl MonitorService {
             update = update.col_expr(status_monitors::Column::Name, Expr::value(name));
         }
         if let Some(interval) = request.check_interval_seconds {
-            update = update.col_expr(
-                status_monitors::Column::CheckIntervalSeconds,
-                Expr::value(normalize_check_interval_seconds(interval)),
-            );
+            // The pending due time was computed from the old interval: moving
+            // from 1 hour to 30 seconds would otherwise wait out the hour.
+            // NULL makes the monitor due on the next sweep, which then
+            // schedules it from the new interval.
+            update = update
+                .col_expr(
+                    status_monitors::Column::CheckIntervalSeconds,
+                    Expr::value(normalize_check_interval_seconds(interval)),
+                )
+                .col_expr(
+                    status_monitors::Column::NextCheckAt,
+                    Expr::value(Option::<temps_core::UtcDateTime>::None),
+                );
         }
         if let Some(path) = request.check_path {
             // Only a path change invalidates in-flight probe results; a rename
@@ -1754,6 +1763,45 @@ mod tests {
         // 10 seconds is below the floor, so the stored interval is 30.
         assert!(update.contains("Int(Some(30))"), "{update}");
         assert!(!update.contains("check_path"), "{update}");
+        // The due time from the old interval is cleared in the same UPDATE.
+        assert!(update.contains(r#"\"next_check_at\" = $"#), "{update}");
+        assert!(update.contains("ChronoDateTimeUtc(None)"), "{update}");
+    }
+
+    /// A rename alone keeps the monitor's schedule.
+    #[tokio::test]
+    async fn update_monitor_rename_keeps_the_next_check() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![mock_monitor(11, Some("/old"))]])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        service
+            .update_monitor(
+                11,
+                UpdateMonitorRequest {
+                    name: Some("API health".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("rename should update");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        let update = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| format!("{statement:?}"))
+            .find(|statement| statement.contains("UPDATE"))
+            .expect("an UPDATE statement was issued");
+        assert!(!update.contains("next_check_at"), "{update}");
     }
 
     #[tokio::test]
