@@ -114,6 +114,38 @@ pub(crate) async fn find_snapshot(
     }
 }
 
+/// When WAL-G started the base backup a stop sentinel describes. WAL-G
+/// records `StartTime` in its version-2 sentinel; older sentinels omit it, and
+/// Go's zero time means it was never set. Either is `None`: unknown, not early.
+pub(crate) fn sentinel_start_time(
+    bytes: &[u8],
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Started {
+        #[serde(rename = "StartTime")]
+        start_time: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let started: Started = serde_json::from_slice(bytes)?;
+    Ok(started
+        .start_time
+        .filter(|time| chrono::Datelike::year(time) > 1))
+}
+
+/// Read the start time of the base backup whose stop sentinel is
+/// `sentinel_key` in `bucket`. `Ok(None)` when the sentinel does not record it.
+pub(crate) async fn load_snapshot_start_time(
+    client: &S3Client,
+    bucket: &str,
+    sentinel_key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, BackupError> {
+    let bytes = read_sentinel(client, bucket, sentinel_key).await?;
+    sentinel_start_time(&bytes).map_err(|error| BackupError::Failed {
+        reason: format!(
+            "WAL-G stop-sentinel s3://{bucket}/{sentinel_key} is not valid JSON: {error}"
+        ),
+    })
+}
+
 pub(crate) async fn read_sentinel(
     client: &S3Client,
     bucket: &str,
@@ -432,6 +464,51 @@ mod tests {
         assert_eq!(
             path_receiver.await.expect("captured S3 request path"),
             "/backups/tenant/postgres/service/walg/basebackups_005/base_0001_backup_stop_sentinel.json"
+        );
+    }
+
+    #[test]
+    fn sentinel_start_time_is_read_and_unknown_when_absent_or_unset() {
+        let v2 = br#"{"StartTime":"2026-11-22T03:50:53.123456Z","UserData":{}}"#;
+        assert_eq!(
+            sentinel_start_time(v2).expect("valid sentinel"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-22T03:50:53.123456Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(
+            sentinel_start_time(br#"{"UserData":{}}"#).expect("valid"),
+            None
+        );
+        assert_eq!(
+            sentinel_start_time(br#"{"StartTime":"0001-01-01T00:00:00Z"}"#).expect("valid"),
+            None
+        );
+        assert!(sentinel_start_time(b"not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_start_time_reads_the_selected_sentinel() {
+        let body = br#"{"StartTime":"2026-11-22T03:50:53Z","CompressedSize":1}"#.to_vec();
+        let Some((client, path_receiver)) = spawn_s3_stub(body).await else {
+            return;
+        };
+        let started = load_snapshot_start_time(
+            &client,
+            "backups-bucket",
+            "service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json",
+        )
+        .await
+        .expect("sentinel should be read");
+        assert_eq!(
+            started.map(|time| time.to_rfc3339()),
+            Some("2026-11-22T03:50:53+00:00".to_string())
+        );
+        assert_eq!(
+            path_receiver.await.expect("captured S3 request path"),
+            "/backups-bucket/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json"
         );
     }
 

@@ -976,7 +976,10 @@ impl RestoreService {
                 }
             } else if strategy == "walg_restore" {
                 warnings.push(
-                    "This physical PostgreSQL backup contains the original roles and passwords. Configure the destination service with the original database name, username and password before restoring. Temps uses that login to verify recovery and rolls back an in-place restore if verification fails.".into(),
+                    physical_postgres_login_warning(
+                        target.topology == "cluster" && target.service_type == "postgres",
+                    )
+                    .into(),
                 );
             } else {
                 warnings.push(
@@ -1299,14 +1302,9 @@ impl RestoreService {
                         message: "backup_location cannot be empty".into(),
                     });
                 }
-                // Orphan restores (backup discovered by S3 scan, produced
-                // by another Temps instance) have no DB row and thus no
-                // known `started_at` to validate a PITR target against —
-                // we can't range-check what we don't know. The engine
-                // (Postgres, via `restore_pitr`) still protects against a
-                // target the WAL can't reach: it FATALs out of recovery
-                // rather than promoting, which the container health
-                // check surfaces as a failed restore run.
+                // A backup found in S3 has no row here, so no recorded
+                // start. A PostgreSQL time target is checked below against
+                // the start the selected WAL-G snapshot records instead.
                 (
                     None,
                     location.clone(),
@@ -1385,7 +1383,24 @@ impl RestoreService {
                         message: "new_service_name is required when to_new_service=true".into(),
                     });
                 }
-                validate_pitr_recovery_target(recovery_target, backup_started_at)?;
+                if resolved_backup_id.is_none()
+                    && target.service_type.eq_ignore_ascii_case("postgres")
+                {
+                    let snapshot_started_at =
+                        if matches!(recovery_target, RecoveryTarget::Time { .. }) {
+                            self.untracked_snapshot_start(&backup_location, s3_source_id)
+                                .await?
+                        } else {
+                            None
+                        };
+                    validate_untracked_pitr_target(
+                        recovery_target,
+                        snapshot_started_at,
+                        &backup_location,
+                    )?;
+                } else {
+                    validate_pitr_recovery_target(recovery_target, backup_started_at)?;
+                }
             }
         }
 
@@ -1823,12 +1838,9 @@ fn engines_compatible(a: &str, b: &str) -> bool {
 /// generically-worded, failure — not silent corruption — so it's
 /// intentionally left alone here.
 ///
-/// `backup_started_at` is `None` for orphan restores (backup discovered by
-/// S3 scan, produced by another Temps instance) — there's no DB row and
-/// thus no known start time to validate against, so we can't range-check
-/// what we don't know; those still fall back on Postgres's own FATAL/crash
-/// loop for a too-early target too (untested here, but the same "PG stops
-/// at the earliest reachable point without erroring" behavior applies).
+/// `backup_started_at` is `None` when the start is unknown; the range check
+/// is then skipped. PostgreSQL backups this server does not track go through
+/// [`validate_untracked_pitr_target`], which refuses a time target instead.
 fn validate_pitr_recovery_target(
     target: &RecoveryTarget,
     backup_started_at: Option<chrono::DateTime<Utc>>,
@@ -1870,6 +1882,52 @@ fn validate_pitr_recovery_target(
 /// That predicate must be the layout-agnostic one: testing only the legacy
 /// `base.mbstream.gz` object reintroduces the same class of bug, because a
 /// MariaDB WAL-G repository is a physical base the engine can and does replay.
+/// What an in-place physical PostgreSQL restore of a backup whose origin this
+/// server no longer tracks needs from the operator, and what happens if it
+/// fails. A single server keeps its original data until the restored one
+/// passes verification and puts it back otherwise; a cluster restore removes
+/// every member's data before seeding the primary, so nothing is put back.
+fn physical_postgres_login_warning(is_cluster: bool) -> &'static str {
+    if is_cluster {
+        "This physical PostgreSQL backup contains the original roles and passwords. \
+         Configure the destination service with the original database name, username and \
+         password before restoring. An in-place cluster restore removes every member's data \
+         before the backup is seeded and cannot put it back if a later step fails: take a \
+         fresh backup first, or restore into a new service."
+    } else {
+        "This physical PostgreSQL backup contains the original roles and passwords. \
+         Configure the destination service with the original database name, username and \
+         password before restoring. Temps uses that login to verify recovery and puts the \
+         original data back if verification fails."
+    }
+}
+
+/// Check a point-in-time target for a PostgreSQL backup this server does not
+/// track, against the start time its selected WAL-G snapshot records.
+///
+/// PostgreSQL given a target earlier than its base backup does not fail: it
+/// stops at the earliest consistent point and reports success, so the run
+/// would complete without honouring the requested time. A time target whose
+/// snapshot start is unknown is therefore refused, not accepted unchecked.
+/// Transaction, LSN and named targets are not affected.
+fn validate_untracked_pitr_target(
+    target: &RecoveryTarget,
+    snapshot_started_at: Option<chrono::DateTime<Utc>>,
+    location: &str,
+) -> Result<(), RestoreError> {
+    if matches!(target, RecoveryTarget::Time { .. }) && snapshot_started_at.is_none() {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "A point-in-time restore to a time needs the start time of the selected \
+                 backup, and {location} does not record one. Select an individual WAL-G \
+                 snapshot from the list, or recover to a transaction ID, LSN or named \
+                 restore point instead."
+            ),
+        });
+    }
+    validate_pitr_recovery_target(target, snapshot_started_at)
+}
+
 fn validate_pitr_backup_location(
     target_service_type: &str,
     backup_location: &str,
@@ -5100,6 +5158,47 @@ fn needs_walg_identity_lookup(backup: &temps_entities::backups::Model, engine: &
     engine == "postgres" && backup.s3_location.trim_end_matches('/').ends_with("/walg")
 }
 
+impl RestoreService {
+    /// The start time recorded by the WAL-G snapshot `location` selects in
+    /// S3 source `s3_source_id`. `Ok(None)` when `location` names no single
+    /// snapshot (a repository root restores the latest) or the snapshot's
+    /// sentinel does not record a start.
+    async fn untracked_snapshot_start(
+        &self,
+        location: &str,
+        s3_source_id: i32,
+    ) -> Result<Option<chrono::DateTime<Utc>>, RestoreError> {
+        if temps_providers::externalsvc::postgres::walg_snapshot(location).is_none() {
+            return Ok(None);
+        }
+        let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(RestoreError::S3SourceNotFound { s3_source_id })?;
+        let key = location
+            .strip_prefix(&format!("s3://{}/", source.bucket_name))
+            .ok_or_else(|| RestoreError::Validation {
+                message: format!(
+                    "Backup {location} is outside S3 source {s3_source_id}. Select a snapshot from the correct S3 source."
+                ),
+            })?;
+        let lookup_error = |error| RestoreError::SnapshotLookupFailed {
+            backup_id: location.to_string(),
+            s3_source_id,
+            source: error,
+        };
+        let client = crate::engines::v2_common::build_s3_client(
+            &source,
+            &self.encryption_service,
+            "temps-backup",
+        )
+        .map_err(lookup_error)?;
+        crate::engines::walg_size::load_snapshot_start_time(&client, &source.bucket_name, key)
+            .await
+            .map_err(lookup_error)
+    }
+}
+
 async fn resolve_tracked_walg_snapshot(
     backup: &temps_entities::backups::Model,
     source: &temps_entities::s3_sources::Model,
@@ -5350,6 +5449,51 @@ mod tests {
         foreign
             .require_confirmation(7, &selector, &pitr(true), false)
             .expect("PITR into a new service has no data to overwrite");
+    }
+
+    #[test]
+    fn untracked_postgres_time_targets_need_the_snapshot_start() {
+        let location =
+            "s3://backups-bucket/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        let started = chrono::DateTime::parse_from_rfc3339("2026-11-22T03:50:53Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let time = |offset_minutes: i64| RecoveryTarget::Time {
+            time: started + chrono::Duration::minutes(offset_minutes),
+        };
+
+        let unknown = validate_untracked_pitr_target(&time(10), None, location)
+            .expect_err("a time target without a known start is refused");
+        assert!(
+            matches!(&unknown, RestoreError::Validation { message } if message.contains(location)),
+            "{unknown:?}"
+        );
+        assert!(
+            validate_untracked_pitr_target(&time(-1), Some(started), location).is_err(),
+            "a target before the snapshot started is refused"
+        );
+        assert!(validate_untracked_pitr_target(&time(0), Some(started), location).is_ok());
+        assert!(validate_untracked_pitr_target(&time(10), Some(started), location).is_ok());
+        assert!(
+            validate_untracked_pitr_target(
+                &RecoveryTarget::Lsn {
+                    lsn: "0/3000060".into()
+                },
+                None,
+                location
+            )
+            .is_ok(),
+            "non-time targets do not depend on the start"
+        );
+    }
+
+    #[test]
+    fn physical_restore_warning_promises_rollback_only_where_it_exists() {
+        let single = physical_postgres_login_warning(false);
+        assert!(single.contains("puts the original data back"));
+        let cluster = physical_postgres_login_warning(true);
+        assert!(cluster.contains("cannot put it back"), "{cluster}");
+        assert!(!cluster.contains("puts the original data back"));
     }
 
     #[test]
