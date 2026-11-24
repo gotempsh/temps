@@ -350,7 +350,7 @@ describe('capability and source errors (#1238)', () => {
     expect(markup).toContain(
       'Also search the S3 bucket for backups made by other servers'
     )
-    expect(markup).toContain('From another server')
+    expect(markup).toContain('Found in S3')
     expect(markup).toContain('Could not read WAL-G metadata')
   })
 

@@ -1157,7 +1157,7 @@ export function ServiceRestore() {
                           Tracked
                         </Badge>
                       ) : (
-                        <OrphanBackupBadge label="From another server" />
+                        <OrphanBackupBadge label="Found in S3" />
                       )
                     return (
                       <TableRow
