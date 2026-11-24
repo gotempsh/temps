@@ -15,7 +15,6 @@ use sea_orm::{
     ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
     TransactionTrait,
 };
-#[cfg(feature = "docker-tests")]
 use serde_json::Value as JsonValue;
 use std::collections::HashMap;
 #[cfg(feature = "docker-tests")]
@@ -2495,4 +2494,51 @@ fn a_refused_parameter_is_reported_under_the_new_services_id() {
         ),
         "{failed:?}"
     );
+}
+
+/// Read-modify-write: the parameters a client just read, sent back with one
+/// real change, must validate. Unchanged read-only values are dropped; a
+/// changed one is kept so the update still rejects it.
+#[test]
+fn unchanged_read_only_parameters_are_dropped_before_validation() {
+    let strategy = parameter_strategies::get_strategy("postgres").expect("postgres strategy");
+    let stored: HashMap<String, JsonValue> = HashMap::from([
+        ("database".to_string(), JsonValue::from("app")),
+        ("username".to_string(), JsonValue::from("app_user")),
+        ("password".to_string(), JsonValue::from("s3cret-value")),
+        ("host".to_string(), JsonValue::from("localhost")),
+        ("port".to_string(), JsonValue::from("5432")),
+    ]);
+
+    let mut read_back: HashMap<String, JsonValue> = stored.clone();
+    read_back.insert("port".to_string(), JsonValue::from(6543));
+    assert!(
+        strategy.validate_for_update(&read_back).is_err(),
+        "without dropping, the read-only keys fail the whole update"
+    );
+    drop_unchanged_fixed_parameters(&mut read_back, &stored, &strategy.updateable_keys());
+    assert_eq!(
+        read_back,
+        HashMap::from([("port".to_string(), JsonValue::from(6543))])
+    );
+    assert!(strategy.validate_for_update(&read_back).is_ok());
+
+    // A number sent for a value stored as a string is the same value.
+    let mut same_port_as_number = HashMap::from([
+        ("host".to_string(), JsonValue::from("localhost")),
+        ("port".to_string(), JsonValue::from(5432)),
+    ]);
+    drop_unchanged_fixed_parameters(
+        &mut same_port_as_number,
+        &stored,
+        &strategy.updateable_keys(),
+    );
+    assert_eq!(same_port_as_number.len(), 1, "{same_port_as_number:?}");
+
+    // A real change to a read-only value is kept and still rejected.
+    let mut changed_password =
+        HashMap::from([("password".to_string(), JsonValue::from("another-value"))]);
+    drop_unchanged_fixed_parameters(&mut changed_password, &stored, &strategy.updateable_keys());
+    assert!(changed_password.contains_key("password"));
+    assert!(strategy.validate_for_update(&changed_password).is_err());
 }
