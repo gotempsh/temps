@@ -45,6 +45,24 @@ pub struct HarnessUpdateQuery {
     /// Look inside the workspace again instead of returning the cached check.
     #[serde(default)]
     pub refresh: bool,
+    /// Return only what was last read, never looking inside the workspace
+    /// (which could create or wake it). Not checked yet: every version field
+    /// and `checked_at` are null. Ignored when `refresh` is set.
+    #[serde(default)]
+    pub cached_only: bool,
+}
+
+/// What the cached-only read returns before the workspace was ever read.
+fn not_checked_yet(provider_id: &str) -> temps_ai::HarnessUpdateStatus {
+    temps_ai::HarnessUpdateStatus {
+        provider_id: provider_id.to_string(),
+        installed_version: None,
+        latest_version: None,
+        update_available: false,
+        updating: false,
+        checked_at: None,
+        detail: None,
+    }
 }
 
 fn authorize(auth: &temps_authz::AuthContext, provider_id: &str) -> Result<(), Problem> {
@@ -118,10 +136,19 @@ pub async fn get_ai_provider_harness_update(
     Query(query): Query<HarnessUpdateQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     authorize(&auth, &provider_id)?;
-    let status = service(&app_state)?
-        .workspace_harness_update_status(&provider_id, auth.user_id(), query.refresh)
-        .await
-        .map_err(|error| update_problem(&provider_id, &error))?;
+    let ai_service = service(&app_state)?;
+    let status = if query.cached_only && !query.refresh {
+        ai_service
+            .cached_workspace_harness_update_status(&provider_id, auth.user_id())
+            .await
+            .map_err(|error| update_problem(&provider_id, &error))?
+            .unwrap_or_else(|| not_checked_yet(&provider_id))
+    } else {
+        ai_service
+            .workspace_harness_update_status(&provider_id, auth.user_id(), query.refresh)
+            .await
+            .map_err(|error| update_problem(&provider_id, &error))?
+    };
     Ok(([(header::CACHE_CONTROL, "no-store")], Json(status)))
 }
 

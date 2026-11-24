@@ -139,7 +139,7 @@ const SAMPLE: &str = r#"{
         "cost": { "input": 4, "output": 20, "cache_read": 0.4, "cache_write": 5,
                   "context_over_200k": { "input": 8, "output": 30 } }
       },
-      "example-retired": { "name": "Retired", "status": "deprecated",
+      "example-retired": { "name": "Retired", "status": "deprecated", "tool_call": false,
                             "cost": { "input": 1, "output": 2 } },
       "example-negative": { "cost": { "input": -1, "output": 2 } },
       "example-string-price": { "cost": { "input": "1.00", "output": 2 } },
@@ -188,16 +188,38 @@ fn a_models_dev_document_is_read_for_supported_providers_only() {
     assert_eq!(next.cache_write_per_million, Some(5.0));
     assert_eq!(next.context_window, Some(1_000_000));
     assert_eq!(next.max_output_tokens, Some(128_000));
-    assert!(next.supports_tools && next.supports_vision && next.supports_reasoning);
+    assert_eq!(
+        (
+            next.supports_tools,
+            next.supports_vision,
+            next.supports_reasoning
+        ),
+        (Some(true), Some(true), Some(true))
+    );
     assert_eq!(next.release_date.as_deref(), Some("2026-12-01"));
     assert!(next.price().is_some());
 
     let retired = &parsed.models[1];
     assert!(retired.deprecated);
+    // A stated "no" is kept; a field the catalog leaves out is unknown, not
+    // "no".
+    assert_eq!(
+        (
+            retired.supports_tools,
+            retired.supports_vision,
+            retired.supports_reasoning
+        ),
+        (Some(false), None, None)
+    );
 
     let gemini = &parsed.models[2];
     assert_eq!(gemini.display_name, "example-gemini-next");
-    assert!(gemini.supports_vision);
+    assert_eq!(
+        gemini.supports_vision,
+        Some(true),
+        "image input means vision"
+    );
+    assert_eq!(gemini.supports_tools, None);
     // Out-of-range limits are dropped, not stored.
     assert_eq!(gemini.context_window, None);
     assert_eq!(gemini.max_output_tokens, None);
@@ -482,9 +504,9 @@ fn model(provider: &str, id: &str, price: Option<(f64, f64)>) -> CatalogModel {
         cache_write_per_million: None,
         context_window: Some(200_000),
         max_output_tokens: None,
-        supports_tools: true,
-        supports_vision: false,
-        supports_reasoning: false,
+        supports_tools: Some(true),
+        supports_vision: Some(false),
+        supports_reasoning: None,
         deprecated: false,
         release_date: Some("2026-12-01".into()),
     }
@@ -842,4 +864,59 @@ async fn a_model_disabled_mid_scan_does_not_hide_a_later_unpriced_one() {
         .unwrap();
     assert_eq!(report.total, 1);
     assert_eq!(report.models[0].model_id, "vendor/c-unknown");
+}
+
+#[tokio::test]
+async fn the_startup_load_waits_for_a_refresh_in_flight() {
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let service = Arc::new(service_on(test_db.connection_arc()));
+    // A refresh holds the lock from before its SELECT until its prices are
+    // installed; the startup load must not read and install an older
+    // snapshot in between.
+    let refresh = service.refresh_lock.lock().await;
+    let load = tokio::spawn({
+        let service = service.clone();
+        async move { service.load_stored().await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!load.is_finished(), "the startup load ran during a refresh");
+    drop(refresh);
+    tokio::time::timeout(std::time::Duration::from_secs(10), load)
+        .await
+        .expect("the load finishes once the refresh ends")
+        .expect("task")
+        .expect("load");
+}
+
+#[tokio::test]
+async fn discovery_pages_through_active_key_ids_only() {
+    use sea_orm::ConnectionTrait;
+    let Some(test_db) = test_database().await else {
+        return;
+    };
+    let db = test_db.connection_arc();
+    db.execute_unprepared(
+        "INSERT INTO ai_provider_keys (id, provider, display_name, api_key_encrypted, is_active) VALUES \
+         (911, 'openai', 'First', 'enc', true), \
+         (912, 'openai', 'Disabled', 'enc', false), \
+         (913, 'anthropic', 'Second', 'enc', true), \
+         (914, 'xai', 'Third', 'enc', true)",
+    )
+    .await
+    .unwrap();
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        )
+        .unwrap(),
+    );
+    let keys = ProviderKeyService::new(db, encryption);
+    assert_eq!(
+        keys.active_key_ids_after(910, 2).await.unwrap(),
+        vec![911, 913]
+    );
+    assert_eq!(keys.active_key_ids_after(913, 2).await.unwrap(), vec![914]);
+    assert!(keys.active_key_ids_after(914, 2).await.unwrap().is_empty());
 }

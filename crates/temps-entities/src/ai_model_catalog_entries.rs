@@ -27,9 +27,10 @@ pub struct Model {
     pub cache_write_per_million: Option<f64>,
     pub context_window: Option<i64>,
     pub max_output_tokens: Option<i64>,
-    pub supports_tools: bool,
-    pub supports_vision: bool,
-    pub supports_reasoning: bool,
+    /// `null` when the catalog does not say.
+    pub supports_tools: Option<bool>,
+    pub supports_vision: Option<bool>,
+    pub supports_reasoning: Option<bool>,
     pub deprecated: bool,
     /// Release date as the catalog states it (`YYYY-MM-DD` or `YYYY-MM`).
     pub release_date: Option<String>,

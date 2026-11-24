@@ -10768,3 +10768,106 @@ async fn test_ai_model_catalog_tables_default_bound_and_reverse() -> anyhow::Res
     }
     Ok(())
 }
+
+/// A catalog entry's capabilities become nullable ("the catalog does not
+/// say"): existing values are kept, an entry inserted without them is NULL,
+/// and `down` stores unknown as FALSE and restores NOT NULL.
+#[tokio::test]
+async fn test_ai_model_catalog_capabilities_become_unknown_and_reverse() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261124_000001_ai_model_catalog_unknown_capabilities";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!(
+                    "Skipping AI model catalog capability migration test: Docker unavailable"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, supports_tools, source_url, fetched_at) \
+         VALUES ('openai', 'stated-model', 'Stated', TRUE, 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, source_url, fetched_at) \
+         VALUES ('openai', 'silent-model', 'Silent', 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+    let read = |model: &'static str| {
+        let db = &db;
+        async move {
+            db.query_one(sea_orm::Statement::from_sql_and_values(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT supports_tools, supports_vision, supports_reasoning \
+                 FROM ai_model_catalog_entries WHERE model_id = $1",
+                [model.into()],
+            ))
+            .await
+            .map(|row| {
+                let row = row.expect("entry");
+                (
+                    row.try_get::<Option<bool>>("", "supports_tools")
+                        .expect("tools"),
+                    row.try_get::<Option<bool>>("", "supports_vision")
+                        .expect("vision"),
+                    row.try_get::<Option<bool>>("", "supports_reasoning")
+                        .expect("reasoning"),
+                )
+            })
+        }
+    };
+    assert_eq!(
+        read("stated-model").await?,
+        (Some(true), Some(false), Some(false)),
+        "existing values are kept"
+    );
+    assert_eq!(read("silent-model").await?, (None, None, None));
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert_eq!(
+        read("silent-model").await?,
+        (Some(false), Some(false), Some(false))
+    );
+    assert!(
+        db.execute_unprepared(
+            "UPDATE ai_model_catalog_entries SET supports_tools = NULL WHERE model_id = 'stated-model'"
+        )
+        .await
+        .is_err(),
+        "down restores NOT NULL"
+    );
+    Ok(())
+}

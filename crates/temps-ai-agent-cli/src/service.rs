@@ -271,11 +271,14 @@ fn recent_principals(turns: &RecentTurns, within: Duration, now: Instant) -> Vec
 ///
 /// The update runs in a detached task that owns this guard, so a client that
 /// disconnects mid-update can neither strand the flag nor cancel the install.
-/// Dropping also discards the cached check: whatever finished (or failed)
-/// changed what is installed, so the next read looks inside the workspace again.
+/// Dropping also discards the cached check, unless the version was read
+/// after the install finished (`keep_checked_status`): a failed or
+/// interrupted update may have changed what is installed, so the next read
+/// looks inside the workspace again.
 struct HarnessUpdateGuard {
     states: HarnessUpdates,
     principal_id: i32,
+    keep_checked_status: bool,
 }
 
 impl Drop for HarnessUpdateGuard {
@@ -286,8 +289,10 @@ impl Drop for HarnessUpdateGuard {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(state) = states.get_mut(&self.principal_id) {
             state.updating = false;
-            state.status = None;
-            state.checked_at = None;
+            if !self.keep_checked_status {
+                state.status = None;
+                state.checked_at = None;
+            }
         }
     }
 }
@@ -2129,7 +2134,7 @@ impl AgentCliAiService {
             };
             (outcome, slot, guard)
         });
-        let (outcome, _slot, _guard) = task.await.map_err(|error| AiError::Provider {
+        let (outcome, _slot, mut guard) = task.await.map_err(|error| AiError::Provider {
             purpose: purpose.to_string(),
             reason: format!("the update task ended unexpectedly: {error}"),
         })?;
@@ -2162,7 +2167,10 @@ impl AgentCliAiService {
         // New models only appear after the next discovery, so drop the cached
         // catalog; the caller refreshes models right after this returns.
         self.workspace_models.lock().await.remove(&principal_id);
-        self.check_workspace_harness(principal_id, package).await
+        let status = self.check_workspace_harness(principal_id, package).await;
+        // Read after the install finished: it describes what is installed now.
+        guard.keep_checked_status = status.is_ok();
+        status
     }
 
     /// Read the installed and latest versions inside the workspace and cache
@@ -5397,6 +5405,43 @@ impl AiService for AgentCliAiService {
         self.check_workspace_harness(principal_id, package).await
     }
 
+    async fn cached_workspace_harness_update_status(
+        &self,
+        provider: &str,
+        principal_id: i32,
+    ) -> Result<Option<temps_ai::HarnessUpdateStatus>, AiError> {
+        use crate::harness_update as hu;
+
+        if provider != self.provider.name() || hu::harness_package(provider).is_none() {
+            return Err(AiError::Provider {
+                purpose: "provider.harness.update".into(),
+                reason: format!("harness updates are unavailable for '{provider}'"),
+            });
+        }
+        let states = self
+            .harness_updates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(states.get(&principal_id).and_then(|state| {
+            match (state.status.as_ref(), state.updating) {
+                (Some(status), updating) => Some(temps_ai::HarnessUpdateStatus {
+                    updating,
+                    ..status.clone()
+                }),
+                (None, true) => Some(temps_ai::HarnessUpdateStatus {
+                    provider_id: provider.to_string(),
+                    installed_version: None,
+                    latest_version: None,
+                    update_available: false,
+                    updating: true,
+                    checked_at: None,
+                    detail: None,
+                }),
+                (None, false) => None,
+            }
+        }))
+    }
+
     async fn update_workspace_harness(
         &self,
         provider: &str,
@@ -5428,6 +5473,7 @@ impl AiService for AgentCliAiService {
             HarnessUpdateGuard {
                 states: self.harness_updates.clone(),
                 principal_id,
+                keep_checked_status: false,
             }
         };
         self.run_workspace_harness_update(principal_id, package, guard)
@@ -8038,15 +8084,43 @@ mod tests {
         probe_exit_code: i32,
         probe_fails_to_run: bool,
     ) -> (Result<temps_ai::HarnessUpdateStatus, AiError>, usize, usize) {
+        let harness = harness_update_service(probe_exit_code, probe_fails_to_run);
+        let result = harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await;
+        (
+            result,
+            harness.user_updates.load(Ordering::SeqCst),
+            harness.root_updates.load(Ordering::SeqCst),
+        )
+    }
+
+    struct HarnessUpdateHarness {
+        service: AgentCliAiService,
+        user_updates: Arc<AtomicUsize>,
+        root_updates: Arc<AtomicUsize>,
+        /// How many times the workspace was resolved (created or woken).
+        resolutions: Arc<AtomicUsize>,
+        _scratch: tempfile::TempDir,
+    }
+
+    fn harness_update_service(
+        probe_exit_code: i32,
+        probe_fails_to_run: bool,
+    ) -> HarnessUpdateHarness {
         let scratch = tempfile::tempdir().expect("scratch directory");
         let workspace_root = scratch.path().join("ai-applications");
         let workspace_path = workspace_root.join("global-user-42");
         std::fs::create_dir_all(&workspace_path).expect("managed workspace path");
         let handle = test_sandbox_handle();
         let resolver = SandboxWorkspaceResolverSlot::new();
+        let resolutions = Arc::new(AtomicUsize::new(0));
+        let resolved = resolutions.clone();
         assert!(resolver.set(Arc::new(move |principal_id| {
             let handle = handle.clone();
             let workspace_path = workspace_path.clone();
+            resolved.fetch_add(1, Ordering::SeqCst);
             Box::pin(async move {
                 assert_eq!(principal_id, 42);
                 Ok(ResolvedSandboxWorkspace {
@@ -8084,12 +8158,57 @@ mod tests {
             Arc::new(SandboxModelRelayService::new().expect("model relay")),
             resolver,
         );
-        let result = service.update_workspace_harness("claude_cli", 42).await;
-        (
-            result,
-            user_updates.load(Ordering::SeqCst),
-            root_updates.load(Ordering::SeqCst),
-        )
+        HarnessUpdateHarness {
+            service,
+            user_updates,
+            root_updates,
+            resolutions,
+            _scratch: scratch,
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cached_harness_status_never_creates_or_wakes_the_workspace() {
+        let harness = harness_update_service(0, false);
+
+        let before = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider");
+        assert!(before.is_none(), "nothing has been read yet: {before:?}");
+        assert_eq!(
+            harness.resolutions.load(Ordering::SeqCst),
+            0,
+            "a cached read must not resolve (create or start) the workspace"
+        );
+
+        harness
+            .service
+            .update_workspace_harness("claude_cli", 42)
+            .await
+            .expect("update succeeds");
+        let resolved_by_update = harness.resolutions.load(Ordering::SeqCst);
+        assert!(resolved_by_update > 0);
+
+        let after = harness
+            .service
+            .cached_workspace_harness_update_status("claude_cli", 42)
+            .await
+            .expect("a supported provider")
+            .expect("the update's own check is cached");
+        assert_eq!(after.installed_version.as_deref(), Some("2.1.296"));
+        assert!(!after.updating);
+        assert_eq!(
+            harness.resolutions.load(Ordering::SeqCst),
+            resolved_by_update,
+            "reading the cache again must not touch the workspace"
+        );
+        assert!(harness
+            .service
+            .cached_workspace_harness_update_status("codex_cli", 42)
+            .await
+            .is_err());
     }
 
     #[tokio::test]
@@ -10486,6 +10605,7 @@ mod tests {
         drop(HarnessUpdateGuard {
             states: states.clone(),
             principal_id: 7,
+            keep_checked_status: false,
         });
 
         let states = states.lock().expect("lock");

@@ -77,12 +77,16 @@ pub fn harness_package(provider_id: &str) -> Option<HarnessPackage> {
         .copied()
 }
 
-/// Shell prelude that resolves the binary that actually runs and npm's
-/// global prefix. Exits 3 when npm cannot report a prefix and 4 when the
-/// binary is not on `PATH`.
+/// Shell prelude that resolves the binary that actually runs and decides
+/// which installer owns it, in `$where`: `npm` for a copy inside npm's
+/// global prefix, `home` for one under the sandbox user's home, `other`
+/// otherwise. Exits 4 when the binary is not on `PATH`. npm is asked for its
+/// prefix only after that, and a missing or failing npm only means no copy
+/// is npm's: an image that installed every CLI with its vendor's installer
+/// may ship without npm at all.
 fn locate(package: HarnessPackage) -> String {
     format!(
-        r#"prefix="$(npm config get prefix)" || exit 3; [ -n "$prefix" ] || exit 3; bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4;"#,
+        r#"bin="$(command -v {binary})" || exit 4; bin="$(readlink -f "$bin")" || exit 4; prefix="$(npm config get prefix 2>/dev/null)" || prefix=""; where=other; if [ -n "$prefix" ]; then case "$bin" in "$prefix"/*) where=npm;; esac; fi; if [ "$where" = other ] && [ -n "$HOME" ]; then case "$bin" in "$HOME"/*) where=home;; esac; fi;"#,
         binary = package.binary
     )
 }
@@ -156,7 +160,7 @@ pub(crate) fn install_writable_probe_command(package: HarnessPackage) -> Vec<Str
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                r#"{locate} case "$bin" in "$prefix"/*) ;; "$HOME"/*) exit {PROBE_WRITABLE};; *) exit 5;; esac; if test -w "$prefix/lib/node_modules"; then exit {PROBE_WRITABLE}; else exit {PROBE_NOT_WRITABLE}; fi"#,
+                r#"{locate} case "$where" in npm) if test -w "$prefix/lib/node_modules"; then exit {PROBE_WRITABLE}; else exit {PROBE_NOT_WRITABLE}; fi;; home) exit {PROBE_WRITABLE};; *) exit 5;; esac"#,
                 locate = locate(package)
             ),
         ],
@@ -185,7 +189,7 @@ pub(crate) fn update_command(package: HarnessPackage) -> Vec<String> {
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                r#"{locate} case "$bin" in "$prefix"/*) exec npm install -g {npm_package}@latest --no-fund --no-audit --loglevel=error;; "$HOME"/*) {home_update};; *) echo "{binary} at $bin was not installed by npm or under the home directory; update it where it was installed" >&2; exit 5;; esac"#,
+                r#"{locate} case "$where" in npm) exec npm install -g {npm_package}@latest --no-fund --no-audit --loglevel=error;; home) {home_update};; *) echo "{binary} at $bin was not installed by npm or under the home directory; update it where it was installed" >&2; exit 5;; esac"#,
                 locate = locate(package),
                 npm_package = package.npm_package,
                 home_update = package.home_update,
@@ -292,14 +296,14 @@ mod tests {
             // npm only for a copy in npm's prefix...
             assert!(
                 script.contains(&format!(
-                    r#""$prefix"/*) exec npm install -g {}@latest"#,
+                    r#"npm) exec npm install -g {}@latest"#,
                     package.npm_package
                 )),
                 "{script}"
             );
             // ...the vendor updater for one under the home directory...
             assert!(
-                script.contains(&format!(r#""$HOME"/*) {};;"#, package.home_update)),
+                script.contains(&format!(r#"home) {};;"#, package.home_update)),
                 "{script}"
             );
             // ...and nothing for one installed anywhere else.
@@ -317,12 +321,11 @@ mod tests {
         let probe = install_writable_probe_command(package);
         assert_eq!(&probe[..5], ["timeout", "-k", "10", "10", "sh"]);
         assert_eq!(probe[5], "-c");
-        // Nothing request-derived may reach the script, and a failing `npm`
-        // must end the probe before the writability test can run.
-        assert!(probe[6].starts_with(r#"prefix="$(npm config get prefix)" || exit 3;"#));
-        assert!(probe[6].contains(r#"command -v opencode"#));
+        // Nothing request-derived may reach the script; the binary is
+        // resolved before npm is asked anything.
+        assert!(probe[6].starts_with(r#"bin="$(command -v opencode)" || exit 4;"#));
         // A home-directory install belongs to the sandbox user.
-        assert!(probe[6].contains(r#""$HOME"/*) exit 0;;"#));
+        assert!(probe[6].contains(r#"home) exit 0;;"#));
         assert!(probe[6].contains(r#"test -w "$prefix/lib/node_modules""#));
         assert_eq!(probe.len(), 7);
     }
@@ -380,5 +383,92 @@ mod tests {
         assert!(!is_newer("2.1.263-beta.1", "2.1.263"));
         assert!(!is_newer("unknown", "2.1.263"));
         assert!(!is_newer("2.1.263", "unknown"));
+    }
+
+    /// Runs a probe or update script with `PATH` holding only a fake
+    /// `binary` under a temporary home (plus `readlink`), and npm only when
+    /// `npm_prefix` is given. Returns the exit status and what the fakes
+    /// recorded.
+    #[cfg(unix)]
+    fn run_script(script: &str, binary: &str, npm_prefix: Option<&str>) -> (i32, String) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        // Resolved, as a sandbox's home is: `readlink -f` resolves the binary.
+        let root = std::fs::canonicalize(scratch.path()).expect("canonical scratch");
+        let home = root.join("home");
+        let tools = root.join("tools");
+        let home_bin = home.join(".local/bin");
+        std::fs::create_dir_all(&home_bin).expect("home bin");
+        std::fs::create_dir_all(&tools).expect("tools");
+        let log = root.join("log");
+        let write_tool = |path: &std::path::Path, body: &str| {
+            std::fs::write(path, format!("#!/bin/sh\n{body}\n")).expect("tool");
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        };
+        write_tool(
+            &home_bin.join(binary),
+            &format!(r#"echo "{binary} $*" >> "{}""#, log.display()),
+        );
+        std::os::unix::fs::symlink(home_bin.join(binary), tools.join(binary)).expect("link");
+        let readlink = ["/usr/bin/readlink", "/bin/readlink"]
+            .into_iter()
+            .find(|path| std::path::Path::new(path).exists())
+            .expect("readlink");
+        std::os::unix::fs::symlink(readlink, tools.join("readlink")).expect("readlink");
+        if let Some(prefix) = npm_prefix {
+            write_tool(
+                &tools.join("npm"),
+                &format!(
+                    r#"if [ "$1" = config ]; then echo "{prefix}"; else echo "npm $*" >> "{}"; fi"#,
+                    log.display()
+                ),
+            );
+        }
+        let output = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(script)
+            .env_clear()
+            .env("PATH", &tools)
+            .env("HOME", &home)
+            .output()
+            .expect("sh runs");
+        let recorded = std::fs::read_to_string(&log).unwrap_or_default();
+        (output.status.code().unwrap_or(-1), recorded)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_home_installed_cli_updates_even_without_npm() {
+        for package in harness_packages() {
+            let probe = &install_writable_probe_command(*package)[6];
+            let (status, _) = run_script(probe, package.binary, None);
+            assert_eq!(
+                install_owner_from_probe(status),
+                Some(InstallOwner::SandboxUser),
+                "{}: a copy under the home directory is the sandbox user's, npm or not",
+                package.binary
+            );
+        }
+        let claude = harness_package("claude_cli").expect("claude");
+        let (status, recorded) = run_script(&update_command(claude)[6], "claude", None);
+        assert_eq!(status, 0, "{recorded}");
+        assert_eq!(recorded.trim(), "claude update", "the vendor updater ran");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn npm_updates_only_a_copy_inside_its_own_prefix() {
+        let claude = harness_package("claude_cli").expect("claude");
+        // npm is present, but its prefix is elsewhere: the home copy is the
+        // vendor installer's, and npm must not add a second one.
+        let (status, recorded) = run_script(
+            &update_command(claude)[6],
+            "claude",
+            Some("/opt/npm-global"),
+        );
+        assert_eq!(status, 0, "{recorded}");
+        assert_eq!(recorded.trim(), "claude update");
+        assert!(!recorded.contains("npm install"), "{recorded}");
     }
 }

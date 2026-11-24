@@ -1007,13 +1007,14 @@ async fn update_provider_key(
 
     // A replacement key is verified like a new one, against the endpoint and
     // model it will be used with, before it overwrites a working key.
+    let mut default_model_update: Option<Option<String>> = request.default_model.clone();
     if let Some(api_key) = request.api_key.as_ref() {
         let (base_url, default_model) = replacement_check_target(&before, &request);
         let check_trust = match request.trust_private_address {
             Some(trust) => requested_key_trust(&auth, trust, base_url)?,
             None => KeyTrust::from_stored(before.trusted_private_address.as_deref()),
         };
-        app_state
+        let verified_model = app_state
             .gateway_service
             .test_provider(
                 &before.provider,
@@ -1033,6 +1034,12 @@ async fn update_provider_key(
                     ),
                 },
             })?;
+        default_model_update = default_after_replacement(
+            &before.provider,
+            default_model_update,
+            default_model,
+            verified_model,
+        );
     }
 
     let key = app_state
@@ -1043,7 +1050,7 @@ async fn update_provider_key(
                 display_name: request.display_name.as_deref(),
                 api_key: request.api_key.as_ref().map(SecretString::expose),
                 base_url: request.base_url.as_ref().map(|o| o.as_deref()),
-                default_model: request.default_model.as_ref().map(|o| o.as_deref()),
+                default_model: default_model_update.as_ref().map(|o| o.as_deref()),
                 is_active: request.is_active,
                 trust,
                 capabilities: request.capabilities,
@@ -1057,7 +1064,7 @@ async fn update_provider_key(
         ("display_name", request.display_name.is_some()),
         ("api_key", request.api_key.is_some()),
         ("base_url", request.base_url.is_some()),
-        ("default_model", request.default_model.is_some()),
+        ("default_model", default_model_update.is_some()),
         ("is_active", request.is_active.is_some()),
         (
             "trusted_private_address",
@@ -1360,8 +1367,71 @@ fn default_after_verification(
     })
 }
 
+/// The default-model change to save with a replacement credential.
+///
+/// `effective` is the default the replacement was verified with (the
+/// requested one, else the key's current one). When there was none, the
+/// credential was verified on the provider's low-cost models; if only an
+/// older one answered, it becomes the default, as for a new key, so internal
+/// requests do not go on picking the model the new credential refused.
+fn default_after_replacement(
+    provider: &str,
+    requested: Option<Option<String>>,
+    effective: Option<&str>,
+    verified: String,
+) -> Option<Option<String>> {
+    if effective.is_some() {
+        return requested;
+    }
+    match default_after_verification(provider, None, verified) {
+        Some(fallback) => Some(Some(fallback)),
+        None => requested,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_replacement_verified_on_a_fallback_model_pins_it() {
+        // Unpinned key; the new credential refused gpt-6-luna and
+        // gpt-5-nano answered.
+        assert_eq!(
+            super::default_after_replacement("openai", None, None, "gpt-5-nano".into()),
+            Some(Some("gpt-5-nano".to_string()))
+        );
+        // Verified on the current low-cost default: nothing to pin.
+        assert_eq!(
+            super::default_after_replacement("openai", None, None, "gpt-6-luna".into()),
+            None
+        );
+        // A default the key already has (or the request sets) was the model
+        // verified; it is left as requested.
+        assert_eq!(
+            super::default_after_replacement(
+                "openai",
+                None,
+                Some("gpt-5.6-sol"),
+                "gpt-5.6-sol".into()
+            ),
+            None
+        );
+        assert_eq!(
+            super::default_after_replacement(
+                "openai",
+                Some(Some("gpt-5.6-sol".into())),
+                Some("gpt-5.6-sol"),
+                "gpt-5.6-sol".into()
+            ),
+            Some(Some("gpt-5.6-sol".to_string()))
+        );
+        // Clearing the default with a credential that only serves an older
+        // model pins that model rather than leaving a default it refuses.
+        assert_eq!(
+            super::default_after_replacement("openai", Some(None), None, "gpt-5-nano".into()),
+            Some(Some("gpt-5-nano".to_string()))
+        );
+    }
+
     #[test]
     fn a_key_verified_on_a_fallback_model_defaults_to_it() {
         // Verified on the current low-cost model: no default is pinned.

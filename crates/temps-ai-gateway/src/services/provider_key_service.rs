@@ -3,7 +3,7 @@
 
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, Set,
+    QueryOrder, QuerySelect, Set,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
@@ -178,6 +178,27 @@ impl ProviderKeyService {
             .await?;
 
         Ok(keys)
+    }
+
+    /// Up to `limit` active key IDs greater than `after_id`, ascending: a
+    /// background pass pages through them by ID instead of holding every
+    /// key's row (credentials included) for its whole run.
+    pub async fn active_key_ids_after(
+        &self,
+        after_id: i32,
+        limit: u64,
+    ) -> Result<Vec<i32>, AiGatewayError> {
+        let ids = ai_provider_keys::Entity::find()
+            .select_only()
+            .column(ai_provider_keys::Column::Id)
+            .filter(ai_provider_keys::Column::IsActive.eq(true))
+            .filter(ai_provider_keys::Column::Id.gt(after_id))
+            .order_by_asc(ai_provider_keys::Column::Id)
+            .limit(limit)
+            .into_tuple::<i32>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(ids)
     }
 
     pub async fn get_by_id(&self, id: i32) -> Result<ai_provider_keys::Model, AiGatewayError> {
