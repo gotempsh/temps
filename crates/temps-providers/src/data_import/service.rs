@@ -1994,7 +1994,7 @@ mod tests {
         let now = Utc::now();
         restore_runs::Model {
             id,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: service_id,
             target_service_id: None,
             target_service_name: None,

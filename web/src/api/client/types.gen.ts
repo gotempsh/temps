@@ -32384,7 +32384,7 @@ export type RestoreRunView = {
      * it. Always present; its fields are `None` where they are unknown.
      */
     source_backup: RestoreRunSourceBackup;
-    source_backup_id: number;
+    source_backup_id?: number | null;
     source_service_id: number;
     started_at?: string | null;
     status: string;
@@ -36864,6 +36864,10 @@ export type SourceBackupIndexResponse = {
      * When the index was last updated
      */
     last_updated: string;
+    /**
+     * Errors encountered during the optional bucket scan.
+     */
+    scan_errors: Array<string>;
 };
 
 /**

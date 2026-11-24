@@ -47,6 +47,6 @@ pub mod ring_buffer;
 pub mod s3_mirror;
 pub mod sidecar;
 pub mod v2_common;
-mod walg_size;
+pub(crate) mod walg_size;
 pub mod worker_agent;
 pub mod workload_job;

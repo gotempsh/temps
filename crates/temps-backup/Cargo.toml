@@ -55,7 +55,6 @@ cron = { workspace = true }
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }
-tokio-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 url = { workspace = true }

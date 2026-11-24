@@ -17,6 +17,7 @@ import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { flagsScenarioCommand } from './commands/flags-scenario.ts'
 import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
+import { postgresCrossServerRecoveryScenario } from './commands/postgres-cross-server-recovery-scenario.ts'
 import { pitrScenarioCommand } from './commands/pitr-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
@@ -60,6 +61,11 @@ function connection(): { url?: string; apiKey?: string } {
   const o = program.opts<{ url?: string; apiKey?: string }>()
   return { url: o.url, apiKey: o.apiKey }
 }
+
+program
+  .command('postgres-cross-server-recovery-scenario')
+  .description('Recover an older PostgreSQL snapshot across two disposable Temps servers sharing MinIO (requires TEMPS_BIN and Docker)')
+  .action(postgresCrossServerRecoveryScenario)
 
 program
   .command('ping')

@@ -68497,7 +68497,10 @@
           },
           "source_backup_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "source_service_id": {
             "format": "int32",
@@ -68528,7 +68531,6 @@
         },
         "required": [
           "id",
-          "source_backup_id",
           "source_service_id",
           "mode",
           "status",
@@ -78631,9 +78633,17 @@
             "description": "When the index was last updated",
             "example": "2024-01-15T14:30:00.123Z",
             "type": "string"
+          },
+          "scan_errors": {
+            "description": "Errors encountered during the optional bucket scan.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           }
         },
         "required": [
+          "scan_errors",
           "backups",
           "last_updated"
         ],

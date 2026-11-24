@@ -88,6 +88,7 @@ pub fn validate_recovery_target(target: &RecoveryTarget) -> Result<(), String> {
 
 /// A WAL-G repository in the source's bucket: `s3://<bucket>/…/walg`.
 fn validate_walg_prefix(prefix: &str, bucket: &str) -> Result<(), String> {
+    let prefix = super::postgres::walg_snapshot(prefix).map_or(prefix, |(root, _)| root);
     let path = prefix
         .strip_prefix("s3://")
         .and_then(|rest| rest.strip_prefix(bucket))
@@ -230,6 +231,18 @@ pub async fn walg_restore_on_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepts_discovered_snapshot_in_the_scoped_repository() {
+        let key =
+            "s3://backups-bucket/service-a/walg/basebackups_005/base_001_backup_stop_sentinel.json";
+        assert!(validate_walg_prefix(key, "backups-bucket").is_ok());
+        assert!(validate_walg_prefix(key, "other-bucket").is_err());
+        assert_eq!(
+            super::super::postgres::walg_snapshot(key),
+            Some(("s3://backups-bucket/service-a/walg", "base_001"))
+        );
+    }
 
     #[test]
     fn only_targets_postgresql_reads_as_one_setting_are_accepted() {

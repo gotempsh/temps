@@ -18,7 +18,7 @@ pub struct Model {
     pub id: i32,
     /// FK to `backups(id)`. RESTRICT on delete so you can't delete a backup
     /// that is (or was) the source of a restore history entry.
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     /// The service whose backup is being restored. For `in_place`, this is
     /// also the target. For `new_service`/`pitr`, this is the template.
     pub source_service_id: i32,
@@ -176,7 +176,7 @@ mod tests {
     fn run() -> Model {
         Model {
             id: 7,
-            source_backup_id: 3,
+            source_backup_id: Some(3),
             source_service_id: 4,
             target_service_id: None,
             target_service_name: None,

@@ -236,7 +236,14 @@ impl BackupEngine for PostgresClusterEngine {
             })),
         )
         .await?;
-        v2_common::record_walg_identity(deps.db.as_ref(), backup_id, &backup_uuid).await?;
+        let snapshot = super::walg_size::pushed_snapshot_name(&outcome.stdout, &outcome.stderr)?;
+        v2_common::record_snapshot_identity(
+            deps.db.as_ref(),
+            backup_id,
+            &backup_uuid,
+            Some(snapshot),
+        )
+        .await?;
 
         info!(
             backup_id,
