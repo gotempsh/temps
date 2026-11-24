@@ -755,6 +755,13 @@ impl HealthCheckService {
             .filter(
                 status_monitors::Column::CheckIntervalSeconds.eq(monitor.check_interval_seconds),
             )
+            // `updated_at` too: an edit that is undone before the claim (an
+            // interval changed and changed back) restores the interval and the
+            // NULL due time, but not `updated_at`. The result writers compare
+            // `updated_at` with this snapshot and would discard the probe, so
+            // a claim on it would only push the next check a whole interval
+            // out. On a mismatch the row stays due for the next sweep.
+            .filter(status_monitors::Column::UpdatedAt.eq(monitor.updated_at))
             .filter(observed)
             .exec(db)
             .await
@@ -4180,6 +4187,60 @@ mod tests {
         assert!(
             (25..=40).contains(&delta),
             "stamped from the new 30s interval, got {delta}s"
+        );
+
+        // An edit undone before the claim (30 -> 3600 -> 30, each write
+        // bumping `updated_at` as `MonitorService::update_monitor` does)
+        // restores the interval and the NULL due time. The claim from the
+        // snapshot before the edits must still be refused.
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::NextCheckAt,
+                Expr::value(Option::<temps_core::UtcDateTime>::None),
+            )
+            .filter(status_monitors::Column::Id.eq(observed.id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        let snapshot = status_monitors::Entity::find_by_id(observed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        for interval in [3600, 30] {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            status_monitors::Entity::update_many()
+                .col_expr(
+                    status_monitors::Column::CheckIntervalSeconds,
+                    Expr::value(interval),
+                )
+                .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()))
+                .col_expr(
+                    status_monitors::Column::NextCheckAt,
+                    Expr::value(Option::<temps_core::UtcDateTime>::None),
+                )
+                .filter(status_monitors::Column::Id.eq(observed.id))
+                .exec(db.as_ref())
+                .await
+                .unwrap();
+        }
+        assert!(
+            !HealthCheckService::claim_due_monitor(db.as_ref(), &snapshot).await,
+            "a claim from before an undone edit must not win"
+        );
+        let current = status_monitors::Entity::find_by_id(observed.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("monitor still exists");
+        assert_eq!(
+            current.check_interval_seconds,
+            snapshot.check_interval_seconds
+        );
+        assert!(current.next_check_at.is_none(), "the monitor stays due");
+        assert!(
+            HealthCheckService::claim_due_monitor(db.as_ref(), &current).await,
+            "the next sweep claims it"
         );
     }
 
