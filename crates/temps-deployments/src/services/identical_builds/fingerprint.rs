@@ -20,9 +20,13 @@
 //!   every value counts.
 //! - Docker's predefined proxy arguments and the values that shape the
 //!   generated `.npmrc` count whatever the Dockerfile declares.
-//! - `BUILDKIT_*` arguments are BuildKit settings, not values the image can
-//!   contain (the cache-mount namespace is one per project and environment);
-//!   they are left out, as the custom-Dockerfile secret planner does.
+//! - `BUILDKIT_*` arguments are BuildKit's own options (the frontend, the
+//!   hostname `RUN` steps see, whether the context keeps `.git`, ...), read
+//!   whatever the Dockerfile declares, so they count. The exceptions are the
+//!   ones that only steer caching ([`CACHE_ONLY_SETTINGS`]): the cache-mount
+//!   namespace is one per project and environment, so counting it would make
+//!   every cross-project match impossible. Those count only when the
+//!   Dockerfile declares them with `ARG` (and so can put them in the image).
 //!
 //! Values never leave this module: the result is a keyed hash (HMAC with a
 //! subkey of the install's encryption key, see [`identify`]), so the stored
@@ -223,24 +227,31 @@ fn normalized_path(path: &str) -> String {
     }
 }
 
-fn is_buildkit_setting(name: &str) -> bool {
+fn is_buildkit_option(name: &str) -> bool {
     name.to_ascii_uppercase().starts_with("BUILDKIT_")
 }
 
-/// Picks the frontend that parses the Dockerfile, so it decides the image
-/// whether or not the Dockerfile declares it.
-const FRONTEND_SETTING: &str = "BUILDKIT_SYNTAX";
+/// BuildKit options that only steer caching, never what the image contains:
+/// the cache-mount namespace (one per project and environment) and inline
+/// cache metadata. Every other `BUILDKIT_*` option can change the image.
+const CACHE_ONLY_SETTINGS: &[&str] = &["BUILDKIT_CACHE_MOUNT_NS", "BUILDKIT_INLINE_CACHE"];
+
+fn is_cache_only_setting(name: &str) -> bool {
+    CACHE_ONLY_SETTINGS
+        .iter()
+        .any(|setting| name.eq_ignore_ascii_case(setting))
+}
 
 /// Which build-time values the build can read.
 enum Readable {
-    /// A generated Dockerfile: every value except BuildKit settings, which no
-    /// generated Dockerfile declares.
+    /// A generated Dockerfile: every value except the cache-only settings,
+    /// which no generated Dockerfile declares.
     Generated,
     /// A repository Dockerfile that could not be analysed: every value.
     Unknown,
     /// A repository Dockerfile: the names it reads (`readable`), and among
     /// them those it declares with `ARG` (`declared`), which count even when
-    /// they are BuildKit settings.
+    /// they are cache-only settings.
     Names {
         readable: BTreeSet<String>,
         declared: BTreeSet<String>,
@@ -266,20 +277,21 @@ impl Readable {
 
     fn decides_the_image(&self, name: &str) -> bool {
         // A generated `.npmrc` carries these whatever the Dockerfile
-        // declares, and the proxy arguments are read without one.
+        // declares, the proxy arguments are read without one, and BuildKit
+        // reads its own options itself.
         if GENERATED_FILE_ARGS.contains(&name)
             || PREDEFINED_ARGS.contains(&name)
-            || name.eq_ignore_ascii_case(FRONTEND_SETTING)
+            || (is_buildkit_option(name) && !is_cache_only_setting(name))
         {
             return true;
         }
         match self {
             Readable::Unknown => true,
-            // A BuildKit setting nothing declares (the per-project cache
-            // namespace, inline cache) only changes how BuildKit builds.
-            Readable::Generated => !is_buildkit_setting(name),
+            // A cache-only setting nothing declares changes how BuildKit
+            // builds, not what it builds.
+            Readable::Generated => !is_cache_only_setting(name),
             Readable::Names { readable, declared } => {
-                if is_buildkit_setting(name) {
+                if is_cache_only_setting(name) {
                     declared.contains(name)
                 } else {
                     readable.contains(name)
@@ -594,15 +606,42 @@ mod tests {
     }
 
     #[test]
-    fn the_dockerfile_frontend_is_an_image_input_even_undeclared() {
-        for dockerfile in [None, Some("FROM alpine\nRUN true\n")] {
-            let a = owned(dockerfile, &[("BUILDKIT_SYNTAX", "docker/dockerfile:1.7")]);
-            let b = owned(dockerfile, &[("BUILDKIT_SYNTAX", "docker/dockerfile:1.9")]);
-            assert_ne!(
-                a.identify().fingerprint,
-                b.identify().fingerprint,
-                "{dockerfile:?}"
-            );
+    fn buildkit_options_are_image_inputs_even_undeclared() {
+        for (name, one, other) in [
+            (
+                "BUILDKIT_SYNTAX",
+                "docker/dockerfile:1.7",
+                "docker/dockerfile:1.9",
+            ),
+            ("BUILDKIT_SANDBOX_HOSTNAME", "build-a", "build-b"),
+            ("BUILDKIT_CONTEXT_KEEP_GIT_DIR", "1", "0"),
+            ("buildkit_multi_platform", "1", "0"),
+        ] {
+            for dockerfile in [None, Some("FROM alpine\nRUN hostname > /host\n")] {
+                let a = owned(dockerfile, &[(name, one)]);
+                let b = owned(dockerfile, &[(name, other)]);
+                assert_ne!(
+                    a.identify().fingerprint,
+                    b.identify().fingerprint,
+                    "{name} with {dockerfile:?}"
+                );
+                // Set in one build only is a difference too.
+                assert_ne!(
+                    a.identify().fingerprint,
+                    owned(dockerfile, &[]).identify().fingerprint,
+                    "{name} with {dockerfile:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn inline_cache_metadata_is_not_an_image_input() {
+        let dockerfile = "FROM alpine\nRUN true\n";
+        for source in [None, Some(dockerfile)] {
+            let with = owned(source, &[("BUILDKIT_INLINE_CACHE", "1")]);
+            let without = owned(source, &[]);
+            assert_eq!(with.identify().fingerprint, without.identify().fingerprint);
         }
     }
 

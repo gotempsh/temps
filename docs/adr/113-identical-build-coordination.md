@@ -89,14 +89,18 @@ project's image:
   value counts;
 - Docker's predefined proxy arguments and `NPM_TOKEN`/`NPM_RC` (which become a
   generated `.npmrc` in the context) always count;
-- `BUILDKIT_*` arguments are BuildKit settings, and count only when they can
-  change the image: `BUILDKIT_SYNTAX` always (it picks the frontend that
-  parses the Dockerfile), any other one when the repository Dockerfile
-  declares it with `ARG`, and all of them when the Dockerfile cannot be
-  analysed. The cache-mount namespace is one per project and environment, so
-  counting it when nothing reads it would make every cross-project match
-  impossible; an unanalysable Dockerfile therefore never shares across
-  projects, which errs toward building.
+- `BUILDKIT_*` arguments are BuildKit's own options, which BuildKit reads
+  whether or not the Dockerfile declares them, and many change the image
+  (`BUILDKIT_SYNTAX` picks the frontend, `BUILDKIT_SANDBOX_HOSTNAME` is the
+  hostname `RUN` steps see, `BUILDKIT_CONTEXT_KEEP_GIT_DIR` keeps `.git` in
+  the context). Every one counts except those that only steer caching:
+  `BUILDKIT_CACHE_MOUNT_NS` and `BUILDKIT_INLINE_CACHE`, which count only when
+  the repository Dockerfile declares them with `ARG` or cannot be analysed.
+  The list is of exclusions, not inclusions, so an option BuildKit adds later
+  counts until it is shown to be cache-only. The cache-mount namespace is one
+  per project and environment, so counting it when nothing reads it would
+  make every cross-project match impossible; an unanalysable Dockerfile
+  therefore never shares across projects, which errs toward building.
 
 Values never leave the planner's sealed envelope in clear: only the keyed
 hash is stored, so a stored fingerprint cannot be brute-forced back into a
