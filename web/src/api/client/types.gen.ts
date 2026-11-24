@@ -22109,7 +22109,7 @@ export type LiveVisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -35641,7 +35641,7 @@ export type SessionReplayWithVisitorDto = {
     visitor_country_code?: string | null;
     visitor_crawler_name?: string | null;
     visitor_custom_data?: unknown;
-    visitor_environment_id: number;
+    visitor_environment_id?: number | null;
     visitor_first_seen: string;
     visitor_id: number;
     visitor_is_crawler: boolean;
@@ -42655,7 +42655,7 @@ export type VisitorDetails = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42770,7 +42770,7 @@ export type VisitorInfo = {
      */
     current_page?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */
@@ -42926,7 +42926,7 @@ export type VisitorWithGeolocation = {
     country_code?: string | null;
     crawler_name?: string | null;
     custom_data?: unknown;
-    environment_id: number;
+    environment_id?: number | null;
     /**
      * Marketing channel from the first visit (e.g. "Organic Search", "Direct")
      */

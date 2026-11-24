@@ -47482,7 +47482,10 @@
           "custom_data": {},
           "environment_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_channel": {
             "description": "Marketing channel from the first visit (e.g. \"Organic Search\", \"Direct\")",
@@ -47585,7 +47588,6 @@
           "id",
           "visitor_id",
           "project_id",
-          "environment_id",
           "first_seen",
           "last_seen",
           "is_crawler"
@@ -76152,7 +76154,10 @@
           "visitor_custom_data": {},
           "visitor_environment_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "visitor_first_seen": {
             "type": "string"
@@ -76187,7 +76192,6 @@
           "visitor_id",
           "visitor_uuid",
           "visitor_project_id",
-          "visitor_environment_id",
           "visitor_first_seen",
           "visitor_last_seen",
           "visitor_is_crawler"
@@ -91139,7 +91143,10 @@
           "custom_data": {},
           "environment_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_channel": {
             "description": "Marketing channel from the first visit (e.g. \"Organic Search\", \"Direct\")",
@@ -91267,7 +91274,6 @@
           "id",
           "visitor_id",
           "project_id",
-          "environment_id",
           "first_seen",
           "last_seen",
           "is_crawler"
@@ -91449,7 +91455,10 @@
           "custom_data": {},
           "environment_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_channel": {
             "description": "Marketing channel from the first visit (e.g. \"Organic Search\", \"Direct\")",
@@ -91579,7 +91588,6 @@
           "id",
           "visitor_id",
           "project_id",
-          "environment_id",
           "first_seen",
           "last_seen",
           "is_crawler"
@@ -91921,7 +91929,10 @@
           "custom_data": {},
           "environment_id": {
             "format": "int32",
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "first_channel": {
             "description": "Marketing channel from the first visit (e.g. \"Organic Search\", \"Direct\")",
@@ -92017,7 +92028,6 @@
           "id",
           "visitor_id",
           "project_id",
-          "environment_id",
           "first_seen",
           "last_seen",
           "is_crawler"
