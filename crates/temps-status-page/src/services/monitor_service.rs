@@ -642,18 +642,47 @@ impl MonitorService {
         monitor_id: i32,
         request: UpdateMonitorRequest,
     ) -> Result<MonitorResponse, StatusPageError> {
-        validate_check_path(&request.check_path)?;
+        if request.name.is_none()
+            && request.check_interval_seconds.is_none()
+            && request.check_path.is_none()
+        {
+            return Err(StatusPageError::Validation(format!(
+                "nothing to update on monitor {monitor_id}: send at least one of \
+                 name, check_interval_seconds or check_path"
+            )));
+        }
+        let name = request
+            .name
+            .as_deref()
+            .map(super::types::validate_monitor_name)
+            .transpose()?;
+        if let Some(path) = request.check_path.as_deref() {
+            validate_check_path(path)?;
+        }
 
-        let result = status_monitors::Entity::update_many()
-            .col_expr(
-                status_monitors::Column::CheckPath,
-                Expr::value(Some(request.check_path)),
-            )
-            .col_expr(
-                status_monitors::Column::CheckPathRevision,
-                Expr::col(status_monitors::Column::CheckPathRevision).add(1_i64),
-            )
-            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()))
+        let mut update = status_monitors::Entity::update_many()
+            .col_expr(status_monitors::Column::UpdatedAt, Expr::value(Utc::now()));
+        if let Some(name) = name {
+            update = update.col_expr(status_monitors::Column::Name, Expr::value(name));
+        }
+        if let Some(interval) = request.check_interval_seconds {
+            update = update.col_expr(
+                status_monitors::Column::CheckIntervalSeconds,
+                Expr::value(normalize_check_interval_seconds(interval)),
+            );
+        }
+        if let Some(path) = request.check_path {
+            // Only a path change invalidates in-flight probe results; a rename
+            // or a new interval must not discard them.
+            update = update
+                .col_expr(status_monitors::Column::CheckPath, Expr::value(Some(path)))
+                .col_expr(
+                    status_monitors::Column::CheckPathRevision,
+                    Expr::col(status_monitors::Column::CheckPathRevision).add(1_i64),
+                );
+        }
+
+        let result = update
             .filter(status_monitors::Column::Id.eq(monitor_id))
             .exec(self.db.as_ref())
             .await?;
@@ -1651,7 +1680,8 @@ mod tests {
             .update_monitor(
                 11,
                 UpdateMonitorRequest {
-                    check_path: "/ready".to_string(),
+                    check_path: Some("/ready".to_string()),
+                    ..Default::default()
                 },
             )
             .await
@@ -1675,6 +1705,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_monitor_renames_and_reschedules_without_touching_the_path() {
+        let mut after = mock_monitor(11, Some("/old"));
+        after.name = "API health".to_string();
+        after.check_interval_seconds = 30;
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .append_query_results([vec![after]])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let updated = service
+            .update_monitor(
+                11,
+                UpdateMonitorRequest {
+                    name: Some("  API health ".to_string()),
+                    check_interval_seconds: Some(10),
+                    check_path: None,
+                },
+            )
+            .await
+            .expect("rename and interval change should update");
+
+        assert_eq!(updated.name, "API health");
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        let update = db
+            .into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .map(|statement| format!("{statement:?}"))
+            .find(|statement| statement.contains("UPDATE"))
+            .expect("an UPDATE statement was issued");
+        assert!(update.contains(r#"\"name\" = $"#), "{update}");
+        assert!(
+            update.contains(r#"String(Some("API health"))"#),
+            "name is trimmed: {update}"
+        );
+        assert!(
+            update.contains(r#"\"check_interval_seconds\" = $"#),
+            "{update}"
+        );
+        // 10 seconds is below the floor, so the stored interval is 30.
+        assert!(update.contains("Int(Some(30))"), "{update}");
+        assert!(!update.contains("check_path"), "{update}");
+    }
+
+    #[tokio::test]
+    async fn update_monitor_rejects_an_empty_body_or_a_blank_or_long_name() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let empty = service
+            .update_monitor(11, UpdateMonitorRequest::default())
+            .await;
+        match empty {
+            Err(StatusPageError::Validation(message)) => {
+                assert!(message.contains("monitor 11"), "{message}");
+                assert!(message.contains("check_interval_seconds"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+
+        for name in ["   ".to_string(), "x".repeat(256)] {
+            let result = service
+                .update_monitor(
+                    11,
+                    UpdateMonitorRequest {
+                        name: Some(name),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(matches!(result, Err(StatusPageError::Validation(_))));
+        }
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        assert!(db.into_transaction_log().is_empty());
+    }
+
+    #[tokio::test]
+    async fn update_monitor_body_with_only_unknown_fields_is_rejected_not_ignored() {
+        // A misspelt field (`check_interval`) used to be accepted and silently
+        // change nothing; with no recognised field the request is now a 400.
+        let request: UpdateMonitorRequest =
+            serde_json::from_str(r#"{"check_interval": 60}"#).expect("body parses");
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service.update_monitor(11, request).await;
+
+        assert!(matches!(result, Err(StatusPageError::Validation(_))));
+    }
+
+    #[tokio::test]
     async fn update_monitor_returns_not_found_for_missing_id() {
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
@@ -1690,7 +1824,8 @@ mod tests {
             .update_monitor(
                 404,
                 UpdateMonitorRequest {
-                    check_path: "/ready".to_string(),
+                    check_path: Some("/ready".to_string()),
+                    ..Default::default()
                 },
             )
             .await;
@@ -1709,7 +1844,8 @@ mod tests {
             .update_monitor(
                 11,
                 UpdateMonitorRequest {
-                    check_path: "https://example.test/ready".to_string(),
+                    check_path: Some("https://example.test/ready".to_string()),
+                    ..Default::default()
                 },
             )
             .await;
@@ -1733,7 +1869,8 @@ mod tests {
             .update_monitor(
                 11,
                 UpdateMonitorRequest {
-                    check_path: "/ready".to_string(),
+                    check_path: Some("/ready".to_string()),
+                    ..Default::default()
                 },
             )
             .await;

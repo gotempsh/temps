@@ -91,6 +91,7 @@ pub struct CreateStatusPageRequest {
     pub description: Option<String>,
     /// Monitors to show, in display order; at least one. They may come from
     /// several projects: the page is authorized against all of them.
+    #[schema(min_items = 1)]
     pub monitors: Vec<StatusPageMonitorInput>,
     /// Look of the public page. Omitted fields take their defaults.
     #[serde(default)]
@@ -168,6 +169,7 @@ pub struct UpdateStatusPageRequest {
     /// Replaces the whole monitor selection when present, in display order;
     /// it cannot be empty.
     #[serde(default)]
+    #[schema(min_items = 1)]
     pub monitors: Option<Vec<StatusPageMonitorInput>>,
     /// Changes to the page's look; omitted fields keep their value.
     #[serde(default)]
@@ -231,6 +233,16 @@ pub struct StatusPageResponse {
     /// Unguessable token in the public URL.
     pub slug: String,
     pub is_published: bool,
+    /// Path of the public HTML page (`/api/status/{slug}`), on any address
+    /// this install's public listener is reachable at. Always present, so a
+    /// client can build the link itself when `public_url` is `None` because
+    /// no public URL is configured.
+    #[schema(example = "/api/status/3f9c1a7e2b")]
+    pub public_path: String,
+    /// Path of the machine-readable form (`/api/status/{slug}/summary.json`);
+    /// always present, like `public_path`.
+    #[schema(example = "/api/status/3f9c1a7e2b/summary.json")]
+    pub public_json_path: String,
     /// Public HTML page. Serves 404 while the page is unpublished. `None`
     /// when this install has no public address to build it from; see
     /// `public_url_status` for why and where to fix it. Temps never invents a
