@@ -68,7 +68,7 @@ pub enum NotificationProviderRevealError {
     },
 }
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum NotificationProviderConfigMergeError {
     #[error("Masked notification provider value at '{path}' has no existing value to preserve")]
     UnmatchedMaskedValue { path: String },
@@ -76,6 +76,14 @@ pub enum NotificationProviderConfigMergeError {
         "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
     )]
     AmbiguousMaskedArray { path: String },
+    /// A masked (`***`) secret was kept while the destination it is sent to
+    /// changed. Restoring the stored secret would deliver it to the new
+    /// destination, letting anyone who can edit a provider read a credential
+    /// they are not allowed to reveal.
+    #[error(
+        "Changing '{field}' of notification provider {provider_id} also requires re-entering its credentials: the stored secrets are only kept while the destination stays the same"
+    )]
+    MaskedSecretWithChangedDestination { provider_id: i32, field: String },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -135,6 +143,31 @@ fn normalize_config_key(name: &str) -> String {
             character.is_ascii_lowercase() || character.is_ascii_digit();
     }
     normalized
+}
+
+/// Whether a configuration key decides *where* a provider sends its
+/// credentials (an address, port or TLS setting). A stored secret may only be
+/// carried over by a masked `***` edit while every one of these is unchanged.
+fn is_destination_config_key(name: &str) -> bool {
+    let normalized = normalize_config_key(name);
+    normalized == "url"
+        || normalized.ends_with("_url")
+        || [
+            "host",
+            "hostname",
+            "port",
+            "endpoint",
+            "server",
+            "domain",
+            "region",
+            "account_id",
+        ]
+        .iter()
+        .any(|suffix| normalized == *suffix || normalized.ends_with(&format!("_{suffix}")))
+        || normalized.starts_with("tls")
+        || normalized.contains("starttls")
+        || normalized.contains("invalid_cert")
+        || normalized.contains("insecure")
 }
 
 fn is_sensitive_config_key(name: &str) -> bool {
@@ -2359,6 +2392,49 @@ impl NotificationService {
         }
     }
 
+    /// The first top-level destination field (see
+    /// [`is_destination_config_key`]) whose value differs between the stored
+    /// configuration and the edited one, if any.
+    fn changed_destination_field(
+        existing: &serde_json::Value,
+        replacement: &serde_json::Value,
+    ) -> Option<String> {
+        let existing = existing.as_object();
+        let replacement = replacement.as_object()?;
+        let mut keys: Vec<&String> = replacement
+            .keys()
+            .filter(|key| is_destination_config_key(key))
+            .collect();
+        keys.sort();
+        keys.into_iter()
+            .find(|key| {
+                existing.and_then(|object| object.get(key.as_str())) != replacement.get(key.as_str())
+            })
+            .cloned()
+    }
+
+    /// Merge `***` placeholders in an edited configuration with the stored
+    /// values, refusing to carry a stored secret over to a new destination.
+    fn merge_masked_values_for_provider(
+        provider_id: i32,
+        existing: &serde_json::Value,
+        replacement: &mut serde_json::Value,
+    ) -> std::result::Result<(), NotificationProviderConfigMergeError> {
+        let restores_secret = Self::contains_masked_value(replacement);
+        Self::merge_masked_values(existing, replacement, "")?;
+        if restores_secret {
+            if let Some(field) = Self::changed_destination_field(existing, replacement) {
+                return Err(
+                    NotificationProviderConfigMergeError::MaskedSecretWithChangedDestination {
+                        provider_id,
+                        field,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn merge_masked_values(
         existing: &serde_json::Value,
         replacement: &mut serde_json::Value,
@@ -2604,7 +2680,11 @@ impl NotificationService {
             }
             if let Some(mut new_config) = update.config {
                 let decrypted_existing = self.decrypt_provider_config_raw(&existing_config)?;
-                Self::merge_masked_values(&decrypted_existing, &mut new_config, "")?;
+                Self::merge_masked_values_for_provider(
+                    provider_id,
+                    &decrypted_existing,
+                    &mut new_config,
+                )?;
                 let config_json = serde_json::to_string(&new_config)?;
                 // Encrypt the config before storing
                 let encrypted_config = self
@@ -5141,6 +5221,126 @@ mod tests {
         assert_eq!(config["headers"]["Authorization"], "***");
         assert_eq!(config["headers"]["X-Webhook-Secret"], "***");
         assert_eq!(config["smtp_host"], "smtp.example.com");
+    }
+
+    #[test]
+    fn masked_smtp_password_cannot_follow_a_new_smtp_host() {
+        // A user who may edit providers but not reveal secrets points the
+        // provider at their own SMTP server and keeps the password masked.
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "username": "alerts",
+            "password": "smtp-secret",
+        });
+        let mut replacement = serde_json::json!({
+            "smtp_host": "smtp.attacker.example",
+            "smtp_port": 587,
+            "username": "alerts",
+            "password": "***",
+        });
+
+        let error =
+            NotificationService::merge_masked_values_for_provider(12, &existing, &mut replacement)
+                .expect_err("a stored password must not follow a new host");
+
+        assert_eq!(
+            error,
+            NotificationProviderConfigMergeError::MaskedSecretWithChangedDestination {
+                provider_id: 12,
+                field: "smtp_host".to_string(),
+            }
+        );
+        assert!(error.to_string().contains("notification provider 12"));
+    }
+
+    #[test]
+    fn masked_webhook_header_cannot_follow_a_new_url() {
+        let existing = serde_json::json!({
+            "url": "https://hooks.example.com/notify",
+            "method": "POST",
+            "headers": {"Authorization": "Bearer secret"},
+        });
+        let mut replacement = serde_json::json!({
+            "url": "https://collector.attacker.example/",
+            "method": "POST",
+            "headers": {"Authorization": "***"},
+        });
+
+        let error =
+            NotificationService::merge_masked_values_for_provider(3, &existing, &mut replacement)
+                .expect_err("a stored header must not follow a new URL");
+
+        assert!(matches!(
+            error,
+            NotificationProviderConfigMergeError::MaskedSecretWithChangedDestination { ref field, .. }
+                if field == "url"
+        ));
+    }
+
+    #[test]
+    fn masked_secret_cannot_follow_a_tls_downgrade() {
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "password": "smtp-secret",
+            "tls_mode": "starttls",
+            "accept_invalid_certs": false,
+        });
+        let mut replacement = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "password": "***",
+            "tls_mode": "starttls",
+            "accept_invalid_certs": true,
+        });
+
+        let error =
+            NotificationService::merge_masked_values_for_provider(5, &existing, &mut replacement)
+                .expect_err("accepting invalid certificates exposes the stored password");
+
+        assert!(matches!(
+            error,
+            NotificationProviderConfigMergeError::MaskedSecretWithChangedDestination { ref field, .. }
+                if field == "accept_invalid_certs"
+        ));
+    }
+
+    #[test]
+    fn masked_secret_is_kept_when_destination_is_unchanged() {
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "password": "smtp-secret",
+            "from_name": "Alerts",
+        });
+        let mut replacement = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "smtp_port": 587,
+            "password": "***",
+            "from_name": "Production alerts",
+        });
+
+        NotificationService::merge_masked_values_for_provider(1, &existing, &mut replacement)
+            .expect("renaming the sender keeps the stored password");
+
+        assert_eq!(replacement["password"], "smtp-secret");
+        assert_eq!(replacement["from_name"], "Production alerts");
+    }
+
+    #[test]
+    fn new_destination_with_new_secret_is_accepted() {
+        let existing = serde_json::json!({
+            "smtp_host": "smtp.example.com",
+            "password": "smtp-secret",
+        });
+        let mut replacement = serde_json::json!({
+            "smtp_host": "smtp.other.example",
+            "password": "new-secret",
+        });
+
+        NotificationService::merge_masked_values_for_provider(1, &existing, &mut replacement)
+            .expect("re-entering the secret allows moving the provider");
+
+        assert_eq!(replacement["password"], "new-secret");
     }
 
     #[test]
