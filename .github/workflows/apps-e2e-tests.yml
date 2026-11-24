@@ -106,6 +106,10 @@ jobs:
           bun install --frozen-lockfile
           bun run typecheck
 
+      - name: Recover an S3-only PostgreSQL snapshot on a second Temps server
+        if: matrix.shard == 'recovery'
+        run: python3 apps/temps-e2e/tests/postgres_cross_server_recovery.py
+
       - name: Start registry and external-service fixtures
         run: |
           docker run -d --name temps-e2e-registry -p 5111:5000 registry:2
