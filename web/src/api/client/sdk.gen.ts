@@ -10754,7 +10754,11 @@ export const deleteEnvironmentVariable = <ThrowOnError extends boolean = false>(
  * `GET /projects/{project_id}/env-vars/{key}/value?var_id={var_id}`, which
  * needs the reveal permission and is audit-logged.
  */
-export const getEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariableData, ThrowOnError>): RequestResult<GetEnvironmentVariableResponses, GetEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariableResponses, GetEnvironmentVariableErrors, ThrowOnError>({ url: '/projects/{project_id}/env-vars/{var_id}', ...options });
+export const getEnvironmentVariable = <ThrowOnError extends boolean = false>(options: Options<GetEnvironmentVariableData, ThrowOnError>): RequestResult<GetEnvironmentVariableResponses, GetEnvironmentVariableErrors, ThrowOnError> => (options.client ?? client).get<GetEnvironmentVariableResponses, GetEnvironmentVariableErrors, ThrowOnError>({
+    security: [{ scheme: 'bearer', type: 'http' }],
+    url: '/projects/{project_id}/env-vars/{var_id}',
+    ...options
+});
 
 /**
  * Update an environment variable

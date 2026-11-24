@@ -707,7 +707,8 @@ fn masked_variable_response(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("var_id" = i32, Path, description = "Environment variable ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_variable(
     State(state): State<Arc<AppState>>,

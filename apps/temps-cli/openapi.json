@@ -164503,6 +164503,11 @@
             "description": "Internal server error"
           }
         },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
         "summary": "Get one environment variable of a project by its ID",
         "tags": [
           "Projects"
