@@ -13,7 +13,6 @@ import {
   getS3SourceQueryKey,
   listBackupSchedulesOptions,
   listBackupSchedulesQueryKey,
-  listSourceBackupsOptions,
   listSourceBackupsQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -50,10 +49,8 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import {
-  listSourceBackupsWithScan,
-  testS3SourceConnection,
-} from '@/lib/s3-sources'
+import { testS3SourceConnection } from '@/lib/s3-sources'
+import { restoreSourceBackupsQuery } from './service-restore/restore-queries'
 import { runScheduleNow } from '@/lib/schedule-runs'
 import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
 import { cn, isPitrCapableFormat } from '@/lib/utils'
@@ -190,17 +187,19 @@ export function S3SourceDetail() {
     enabled: !!sourceId,
   })
 
+  const [scannedSourceId, setScannedSourceId] = useState<number>()
+  const includeScan = sourceId !== undefined && scannedSourceId === sourceId
   const { data: backupIndex, isLoading: isLoadingBackups } = useQuery({
-    ...listSourceBackupsOptions({
-      path: { id: sourceId! },
-    }),
+    ...restoreSourceBackupsQuery(sourceId!, includeScan),
     enabled: !!sourceId,
-    refetchOnWindowFocus: refetchOnFocusWhenStale,
+    refetchOnWindowFocus: includeScan ? false : refetchOnFocusWhenStale,
     // A backup started by a schedule, the CLI or another operator must show
     // up in Recent Backups. The listing returns the whole history, so it is
     // only polled slowly; running backups are followed per record below.
     refetchInterval: (query) =>
-      sourceBackupsRefetchInterval(query.state.data?.backups),
+      includeScan
+        ? false
+        : sourceBackupsRefetchInterval(query.state.data?.backups),
   })
 
   // Follow each running backup on its own record (O(running)) instead of
@@ -285,9 +284,9 @@ export function S3SourceDetail() {
   useEffect(() => {
     if (!settledRunningBackups || !sourceId) return
     void queryClient.invalidateQueries({
-      queryKey: listSourceBackupsOptions({ path: { id: sourceId } }).queryKey,
+      queryKey: restoreSourceBackupsQuery(sourceId, includeScan).queryKey,
     })
-  }, [settledRunningBackups, sourceId, queryClient])
+  }, [settledRunningBackups, sourceId, queryClient, includeScan])
 
   // "Discover orphan backups" — explicit opt-in S3 scan. Slow on some
   // endpoints (5-30 s on OVH); only triggered by user action.
@@ -296,22 +295,26 @@ export function S3SourceDetail() {
       if (!sourceId) {
         return Promise.reject(new Error('S3 source id is unknown'))
       }
-      return listSourceBackupsWithScan(sourceId)
+      return queryClient.fetchQuery({
+        ...restoreSourceBackupsQuery(sourceId, true),
+        staleTime: 0,
+      })
     },
     onSuccess: (result) => {
       const scanned = result.backups.filter(
-        (b) => (b as { source?: string }).source === 's3_scan'
+        (b) => b.source === 's3_scan'
       ).length
-      toast.success(
-        scanned > 0
-          ? `Found ${scanned} additional backup${scanned === 1 ? '' : 's'} in S3`
-          : 'No additional backups found in S3'
-      )
-      // Refresh the normal listing so newly discovered entries appear.
-      void queryClient.invalidateQueries({
-        queryKey: listSourceBackupsOptions({ path: { id: sourceId! } })
-          .queryKey,
-      })
+      if (result.scan_errors.length > 0) {
+        toast.error('S3 scan failed', {
+          description: result.scan_errors.join('; '),
+        })
+      } else
+        toast.success(
+          scanned > 0
+            ? `Found ${scanned} additional backup${scanned === 1 ? '' : 's'} in S3`
+            : 'No additional backups found in S3'
+        )
+      setScannedSourceId(sourceId)
     },
     onError: (err: unknown) => {
       const message = err instanceof Error ? err.message : 'Unknown error'

@@ -107,19 +107,51 @@ impl From<RestoreError> for Problem {
                     .with_title("Restore Options Unavailable")
                     .with_detail(error.to_string())
             }
-            internal_error @ (RestoreError::Database(_)
-            | RestoreError::Encryption { .. }
-            | RestoreError::ExternalService { .. }
-            | RestoreError::WorkerCrashed { .. }
-            | RestoreError::StagedRestoreStillRunning { .. }
-            | RestoreError::Internal { .. }) => {
-                error!(error = %internal_error, "restore request failed internally");
+            RestoreError::RecordRunFailed {
+                service_id,
+                ref backup,
+                s3_source_id,
+                ref source,
+            } => {
+                error!(service_id, s3_source_id, error = %source, "failed to record restore run");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Server Error")
-                    .with_detail("The restore operation could not be completed")
+                    .with_title("Could not record restore run")
+                    .with_detail(format!("The database rejected the restore run for service {service_id} and backup {backup} on S3 source {s3_source_id}. Check server logs for the database error."))
             }
+            RestoreError::Database(_) => {
+                error!(error = %error, "restore database operation failed");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Restore database operation failed")
+                    .with_detail(
+                        "The database could not complete the restore operation; check server logs.",
+                    )
+            }
+            RestoreError::WalgRepositoryUnavailable { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("WAL-G repository unavailable")
+                .with_detail(error.to_string()),
+            RestoreError::RestoreSourceCredentials { .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("S3 credentials unavailable")
+                .with_detail(error.to_string()),
+            RestoreError::WorkerCrashed { restore_run_id, ref phase, .. } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Restore worker stopped")
+                .with_detail(format!("Restore worker for run {restore_run_id} stopped during {phase}.")),
+            RestoreError::StagedRestoreStillRunning { restore_run_id, .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Restore download still active")
+                .with_detail(format!("The staged download for restore run {restore_run_id} could not be confirmed stopped.")),
+            RestoreError::Encryption { .. } => restore_internal_problem("Could not read or protect restore settings", &error),
+            RestoreError::ExternalService { .. } => restore_internal_problem("Database service restore failed", &error),
+            RestoreError::Internal { .. } => restore_internal_problem("Restore worker state is inconsistent", &error),
         }
     }
+}
+
+fn restore_internal_problem(title: &'static str, error: &RestoreError) -> Problem {
+    error!(error = %error, "restore request failed internally");
+    problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+        .with_title(title)
+        .with_detail(format!(
+            "{title}. Check the restore run and server logs for details."
+        ))
 }
 
 #[derive(OpenApi)]
@@ -300,13 +332,10 @@ async fn filter_accessible_restore_runs(
         return Ok(runs);
     }
 
-    let positive_backup_ids: Vec<i32> = runs
-        .iter()
-        .filter_map(|run| (run.source_backup_id > 0).then_some(run.source_backup_id))
-        .collect();
+    let tracked_backup_ids: Vec<i32> = runs.iter().filter_map(|run| run.source_backup_id).collect();
     let producer_mappings = app_state
         .restore_service
-        .backup_source_services_for_backups(&positive_backup_ids)
+        .backup_source_services_for_backups(&tracked_backup_ids)
         .await
         .map_err(Problem::from)?;
     let producers_by_backup: BTreeMap<i32, Vec<i32>> = producer_mappings
@@ -342,8 +371,8 @@ async fn filter_accessible_restore_runs(
     Ok(runs
         .into_iter()
         .filter(|run| {
-            let source_allowed = if run.source_backup_id > 0 {
-                match producers_by_backup.get(&run.source_backup_id) {
+            let source_allowed = if let Some(backup_id) = run.source_backup_id {
+                match producers_by_backup.get(&backup_id) {
                     Some(producer_service_ids) if !producer_service_ids.is_empty() => {
                         producer_service_ids
                             .iter()
@@ -571,7 +600,7 @@ async fn start_restore(
         source_service_id: id,
         source_service_name: target_service.name,
         service_type: target_service.service_type,
-        source_backup_id: request.backup_id.unwrap_or(0),
+        source_backup_id: request.backup_id,
         mode: mode_str,
         target_service_name: target_name,
         backup_origin_service_ids: origin_binding.origin_service_ids.clone(),
@@ -629,7 +658,7 @@ async fn require_restore_run_read_access(
     run: &RestoreRunView,
     operation: &str,
 ) -> Result<(), Problem> {
-    if run.source_backup_id <= 0 {
+    if run.source_backup_id.is_none() {
         require_ownerless_restore_admin(
             app_state,
             auth,
@@ -643,10 +672,10 @@ async fn require_restore_run_read_access(
             related_service_ids.push(target_service_id);
         }
     }
-    if run.source_backup_id > 0 {
+    if let Some(backup_id) = run.source_backup_id {
         let producer_service_ids = app_state
             .restore_service
-            .backup_source_service_ids(run.source_backup_id)
+            .backup_source_service_ids(backup_id)
             .await
             .map_err(Problem::from)?;
         if producer_service_ids.is_empty()
@@ -701,7 +730,7 @@ async fn cancel_restore_run(
         .get_restore_run(id)
         .await
         .map_err(Problem::from)?;
-    if run.source_backup_id <= 0 {
+    if run.source_backup_id.is_none() {
         require_ownerless_restore_admin(&app_state, &auth, "cancel a raw-location restore run")?;
     }
     require_restore_run_read_access(&app_state, &auth, &run, "cancel a restore run").await?;
@@ -1109,6 +1138,58 @@ mod tests {
             .unwrap_or_default();
         assert!(detail.contains("run 42"), "{detail}");
         assert!(detail.contains("Service 7"), "{detail}");
+    }
+
+    #[test]
+    fn record_run_failure_names_the_target_without_exposing_database_details() {
+        let problem: Problem = RestoreError::RecordRunFailed {
+            service_id: 7,
+            backup: "service-a/backup.sql.gz".into(),
+            s3_source_id: 4,
+            source: sea_orm::DbErr::Custom("private database detail".into()),
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("service 7"));
+        assert!(!detail.contains("private database detail"));
+    }
+
+    #[test]
+    fn source_settings_and_repository_problems_identify_the_restore() {
+        for (error, status, detail) in [
+            (
+                RestoreError::RestoreSourceCredentials {
+                    field: "access key",
+                    s3_source_id: 4,
+                    run_id: 3,
+                    service_id: 7,
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "access key",
+            ),
+            (
+                RestoreError::WalgRepositoryUnavailable {
+                    location: "service-a/walg".into(),
+                    s3_source_id: 4,
+                    run_id: 3,
+                    service_id: 7,
+                },
+                StatusCode::BAD_REQUEST,
+                "service-a/walg",
+            ),
+        ] {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, status);
+            let message = problem.body["detail"].as_str().unwrap_or_default();
+            for expected in ["S3 source 4", "restore run 3", "service 7", detail] {
+                assert!(message.contains(expected), "{message}");
+            }
+        }
     }
 
     #[test]

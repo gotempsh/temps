@@ -324,16 +324,17 @@ pub(super) async fn run(
         })?;
     // The worker can read the backup's WAL-G repository (its base backups
     // and the WAL recovery replays) and nothing else (ADR-102).
-    let Some(repository) = temps_providers::worker_s3_scope::s3_url_prefix(
-        &backup.s3_location,
-        &s3_source.bucket_name,
-    )
-    .filter(|prefix| !prefix.is_empty()) else {
-        return Err(RestoreError::Validation {
-            message: format!(
-                "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
-                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
-            ),
+    let root = temps_providers::externalsvc::postgres::walg_snapshot(&backup.s3_location)
+        .map_or(backup.s3_location.as_str(), |(root, _)| root);
+    let Some(repository) =
+        temps_providers::worker_s3_scope::s3_url_prefix(root, &s3_source.bucket_name)
+            .filter(|prefix| !prefix.is_empty())
+    else {
+        return Err(RestoreError::WalgRepositoryUnavailable {
+            location: backup.s3_location.clone(),
+            s3_source_id: s3_source.id,
+            run_id,
+            service_id: target.id,
         });
     };
     let mint = || async {

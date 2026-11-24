@@ -14,6 +14,7 @@ import {
   restoreRunQuery,
   restoreServiceQuery,
   restoreSourcesQuery,
+  restoreSourceBackupsQuery,
   serviceRestoreRunsQuery,
 } from './service-restore/restore-queries'
 import { toQueryError } from './service-restore/restore-state'
@@ -30,6 +31,7 @@ interface PageSeeds {
   service?: Seed
   capabilities?: Seed
   sources?: Seed
+  scannedBackups?: Seed
   ownBackups?: Seed
   runs?: Seed
   run?: {
@@ -127,6 +129,11 @@ function renderPage(seeds: PageSeeds = {}) {
     client,
     restoreSourcesQuery().queryKey,
     seeds.sources ?? { data: sourceData }
+  )
+  seed(
+    client,
+    restoreSourceBackupsQuery(1, true).queryKey,
+    seeds.scannedBackups
   )
   seed(client, restoreOwnBackupsQuery(SERVICE_ID).queryKey, seeds.ownBackups)
   seed(
@@ -271,6 +278,36 @@ describe('capability and source errors (#1238)', () => {
     })
     expect(markup).toContain('This database has no backups yet.')
     expect(markup).not.toContain('Could not load storage sources')
+  })
+
+  test('a link to an S3-only backup shows its origin and any scan errors', () => {
+    const markup = renderPage({
+      url: `/storage/${SERVICE_ID}/restore?source=1&location=service-a/backup.sql.gz`,
+      scannedBackups: {
+        data: {
+          backups: [
+            {
+              source: 's3_scan',
+              id: 0,
+              backup_id: '',
+              engine: 'postgres',
+              name: 'service-a',
+              origin_service_name: 'service-a',
+              location: 'service-a/backup.sql.gz',
+              format: 'pg_dump',
+              state: 'completed',
+              created_at: '2026-01-02T03:00:00Z',
+            },
+          ],
+          scan_errors: ['Could not read WAL-G metadata'],
+        },
+      },
+    })
+    expect(markup).toContain(
+      'Also search the S3 bucket for backups made by other servers'
+    )
+    expect(markup).toContain('From another server')
+    expect(markup).toContain('Could not read WAL-G metadata')
   })
 
   test('a genuinely empty source list onboards', () => {

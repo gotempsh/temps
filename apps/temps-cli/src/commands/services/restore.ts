@@ -417,7 +417,7 @@ async function showRunAction(options: RestoreRunShowOptions): Promise<void> {
   keyValue('Mode', run.mode)
   keyValue('Status', run.status)
   keyValue('Phase', run.phase)
-  keyValue('Source backup ID', String(run.source_backup_id))
+  keyValue('Source backup ID', run.source_backup_id == null ? 'S3 only' : String(run.source_backup_id))
   keyValue('Source service ID', String(run.source_service_id))
   if (run.target_service_id != null) {
     keyValue(

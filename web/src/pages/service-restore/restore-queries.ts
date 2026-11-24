@@ -81,14 +81,21 @@ export function restoreSourcesQuery() {
   })
 }
 
-export function restoreSourceBackupsQuery(sourceId: number) {
-  const options = { path: { id: sourceId } }
+export function restoreSourceBackupsQuery(
+  sourceId: number,
+  includeScan = false
+) {
+  const options = {
+    path: { id: sourceId },
+    query: { include_s3_scan: includeScan },
+  }
   return queryOptions({
     queryKey: listSourceBackupsQueryKey(options),
     queryFn: ({ signal }) =>
       requireData(
         listSourceBackups({ ...options, signal, throwOnError: false })
       ),
+    staleTime: includeScan ? 60_000 : 0,
     retry: (count, error) => shouldRetryRead(count, error),
   })
 }

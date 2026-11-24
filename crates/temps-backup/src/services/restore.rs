@@ -29,6 +29,15 @@ pub enum RestoreError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to record restore for service {service_id}, backup {backup} on S3 source {s3_source_id}: {source}")]
+    RecordRunFailed {
+        service_id: i32,
+        backup: String,
+        s3_source_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("Backup {backup_id} not found")]
     BackupNotFound { backup_id: i32 },
 
@@ -148,6 +157,22 @@ pub enum RestoreError {
         restore_run_id: i32,
         phase: String,
         reason: String,
+    },
+
+    #[error("Cannot decrypt the {field} of S3 source {s3_source_id} for restore run {run_id} on service {service_id}. Re-enter the source credentials on this server.")]
+    RestoreSourceCredentials {
+        field: &'static str,
+        s3_source_id: i32,
+        run_id: i32,
+        service_id: i32,
+    },
+
+    #[error("Backup {location} has no valid WAL-G repository in S3 source {s3_source_id} for restore run {run_id} on service {service_id}")]
+    WalgRepositoryUnavailable {
+        location: String,
+        s3_source_id: i32,
+        run_id: i32,
+        service_id: i32,
     },
 
     #[error("Encryption error: {reason}")]
@@ -370,7 +395,7 @@ impl RestoreRequestMode {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RestoreRunView {
     pub id: i32,
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub source_service_id: i32,
     pub target_service_id: Option<i32>,
     pub target_service_name: Option<String>,
@@ -417,7 +442,7 @@ impl RestoreRunSourceBackup {
     fn from_run(run: &temps_entities::restore_runs::Model) -> Self {
         let token = run.resume_token.as_ref();
         Self {
-            id: (run.source_backup_id > 0).then_some(run.source_backup_id),
+            id: run.source_backup_id,
             backup_id: None,
             s3_source_id: token
                 .and_then(|t| t.get("s3_source_id"))
@@ -888,21 +913,22 @@ impl RestoreService {
                     | "mongodump_restore"
             )
         {
-            let origin_still_known = backup_row
-                .as_ref()
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
-                .is_some()
-                || temps_entities::external_service_backups::Entity::find()
-                    .filter(
-                        temps_entities::external_service_backups::Column::BackupId
-                            .eq(backup_row.as_ref().map(|b| b.id).unwrap_or(0)),
-                    )
-                    .one(self.db.as_ref())
-                    .await
+            let origin_still_known = if let Some(backup) = &backup_row {
+                serde_json::from_str::<serde_json::Value>(&backup.metadata)
                     .ok()
-                    .flatten()
-                    .is_some();
+                    .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
+                    .is_some()
+                    || temps_entities::external_service_backups::Entity::find()
+                        .filter(
+                            temps_entities::external_service_backups::Column::BackupId
+                                .eq(backup.id),
+                        )
+                        .one(self.db.as_ref())
+                        .await?
+                        .is_some()
+            } else {
+                false
+            };
 
             if origin_still_known {
                 if let Some(origin) = origin_service_name.as_ref() {
@@ -913,6 +939,10 @@ impl RestoreService {
                         ));
                     }
                 }
+            } else if strategy == "walg_restore" {
+                warnings.push(
+                    "This physical PostgreSQL backup contains the original roles and passwords. Configure the destination service with the original database name, username and password before restoring. Temps uses that login to verify recovery and rolls back an in-place restore if verification fails.".into(),
+                );
             } else {
                 warnings.push(
                     "Password change (origin unknown): after restore, the database will expect the password from the original backup's service, which this Temps no longer tracks. You may need to reset the password manually via `ALTER USER` after the restore completes."
@@ -1353,8 +1383,7 @@ impl RestoreService {
         };
 
         // Persist the backup selector + target service. For orphan backups
-        // (no DB id) we use id=0 as a sentinel since the column is
-        // non-null; the worker keys off resume_token to find the location.
+        // (no DB id), the worker uses resume_token to find the location.
         let resume_token = serde_json::json!({
             "backup_location": backup_location,
             "engine_hint": backup_engine_hint,
@@ -1367,7 +1396,7 @@ impl RestoreService {
         let log_id = uuid::Uuid::new_v4().to_string();
         let run_active = temps_entities::restore_runs::ActiveModel {
             id: NotSet,
-            source_backup_id: Set(resolved_backup_id.unwrap_or(0)),
+            source_backup_id: NotSet,
             // `source_service_id` historically meant "service we're
             // operating on". Orchestration now always points at the
             // TARGET — the worker re-discovers the backup from the
@@ -1400,7 +1429,18 @@ impl RestoreService {
             target_service_id,
             mode.is_destructive(),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            RestoreError::Database(source) => RestoreError::RecordRunFailed {
+                service_id: target_service_id,
+                backup: resolved_backup_id
+                    .map(|id| id.to_string())
+                    .unwrap_or(backup_location),
+                s3_source_id,
+                source,
+            },
+            other => other,
+        })?;
 
         // Spawn the worker — it owns Arc clones and updates the row as it goes.
         let run_id = run.id;
@@ -1676,11 +1716,7 @@ async fn views_with_source_backups(
     db: &DatabaseConnection,
     runs: Vec<temps_entities::restore_runs::Model>,
 ) -> Result<Vec<RestoreRunView>, RestoreError> {
-    let backup_ids: BTreeSet<i32> = runs
-        .iter()
-        .map(|run| run.source_backup_id)
-        .filter(|id| *id > 0)
-        .collect();
+    let backup_ids: BTreeSet<i32> = runs.iter().filter_map(|run| run.source_backup_id).collect();
     let backups: BTreeMap<i32, temps_entities::backups::Model> = if backup_ids.is_empty() {
         BTreeMap::new()
     } else {
@@ -1695,8 +1731,9 @@ async fn views_with_source_backups(
     Ok(runs
         .into_iter()
         .map(|run| {
-            let source_backup = backups
-                .get(&run.source_backup_id)
+            let source_backup = run
+                .source_backup_id
+                .and_then(|id| backups.get(&id))
                 .map(RestoreRunSourceBackup::from_backup);
             let mut view = RestoreRunView::from(run);
             if let Some(source_backup) = source_backup {
@@ -2420,14 +2457,12 @@ fn restore_outcome_event(
 }
 
 /// The backup `run` restores: its row, or for an orphan-backup restore
-/// (`source_backup_id == 0`) one synthesised from its `resume_token`.
+/// (`source_backup_id` is null) one synthesised from its `resume_token`.
 async fn run_backup_model(
     db: &DatabaseConnection,
     run: &temps_entities::restore_runs::Model,
 ) -> Result<temps_entities::backups::Model, RestoreError> {
-    // Resolve backup identity. `source_backup_id == 0` is the sentinel
-    // for orphan-backup restores, where everything we need lives in
-    // `resume_token` (backup_location + s3_source_id + engine_hint).
+    // Orphan runs carry their location, S3 source and engine in the resume token.
     let resume: serde_json::Value = run
         .resume_token
         .clone()
@@ -2442,13 +2477,11 @@ async fn run_backup_model(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    Ok(if run.source_backup_id > 0 {
-        temps_entities::backups::Entity::find_by_id(run.source_backup_id)
+    Ok(if let Some(backup_id) = run.source_backup_id {
+        temps_entities::backups::Entity::find_by_id(backup_id)
             .one(db)
             .await?
-            .ok_or(RestoreError::BackupNotFound {
-                backup_id: run.source_backup_id,
-            })?
+            .ok_or(RestoreError::BackupNotFound { backup_id })?
     } else {
         // Orphan: synthesize a `backups::Model` for the trait context.
         // The trait only reads `s3_location` + `s3_source_id` off it;
@@ -2787,25 +2820,21 @@ async fn run_restore_inner(
         })?;
 
     // Decrypt S3 credentials once.
-    let decrypted_access_key =
-        enc.decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt access key: {}", e),
-            })?;
-    let decrypted_secret_key =
-        enc.decrypt_string(&s3_source.secret_key)
-            .map_err(|e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt secret key: {}", e),
-            })?;
-
-    // `None` for every long-lived operator-configured credential, so nothing
-    // about those restores changes.
+    let credential_error = |field| RestoreError::RestoreSourceCredentials {
+        field,
+        s3_source_id: s3_source.id,
+        run_id,
+        service_id: target_service.id,
+    };
+    let decrypted_access_key = enc
+        .decrypt_string(&s3_source.access_key_id)
+        .map_err(|_| credential_error("access key"))?;
+    let decrypted_secret_key = enc
+        .decrypt_string(&s3_source.secret_key)
+        .map_err(|_| credential_error("secret key"))?;
     let decrypted_session_token =
-        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source).map_err(
-            |e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt session token: {}", e),
-            },
-        )?;
+        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source)
+            .map_err(|_| credential_error("session token"))?;
 
     let s3_credentials = S3Credentials {
         access_key_id: decrypted_access_key.clone(),
@@ -3535,7 +3564,7 @@ fn ensure_backup_restorable(backup: &temps_entities::backups::Model) -> Result<(
 /// The checks and insert of [`insert_restore_run`], inside its transaction.
 async fn lock_and_insert_restore_run(
     transaction: &sea_orm::DatabaseTransaction,
-    run_active: temps_entities::restore_runs::ActiveModel,
+    mut run_active: temps_entities::restore_runs::ActiveModel,
     resolved_backup_id: Option<i32>,
     target_service_id: i32,
     destructive: bool,
@@ -3589,6 +3618,7 @@ async fn lock_and_insert_restore_run(
             });
         }
     }
+    run_active.source_backup_id = Set(resolved_backup_id);
     Ok(run_active.insert(transaction).await?)
 }
 
@@ -4975,8 +5005,7 @@ fn build_object_store_steps(
 }
 
 /// Probe an S3 source for a backup belonging to `<engine>/<origin_service>/`.
-/// Prefers a WAL-G prefix (cheap continuous-archive restore) and falls
-/// back to the newest dump-style object. Returns `Ok(None)` when nothing
+/// Looks for a matching WAL-G snapshot or an object under the backup UUID. Returns `Ok(None)` when nothing
 /// plausible is found; `Err` only on unexpected S3 failures.
 ///
 /// This is the repair path for `backups` rows whose `s3_location` was
@@ -5004,29 +5033,34 @@ async fn resolve_backup_location_from_s3(
         )
     };
 
-    // 1) WAL-G: look for `<service_prefix>walg/basebackups_005/*_backup_stop_sentinel.json`.
-    //    Presence means a complete WAL-G backup exists; the restore path
-    //    is the `walg/` prefix, not the sentinel itself.
-    let walg_prefix = format!("{}walg/", service_prefix);
-    let basebackups = format!("{}basebackups_005/", walg_prefix);
-    let resp = s3_client
+    // A PostgreSQL repository can contain backups made by several servers.
+    // A missing location is repairable only when a sentinel identifies this row.
+    let walg_prefix = format!("{service_prefix}walg");
+    let mut pages = s3_client
         .list_objects_v2()
         .bucket(bucket)
-        .prefix(&basebackups)
-        .max_keys(10)
-        .send()
-        .await?;
-    let has_walg = resp.contents().iter().any(|o| {
-        o.key()
-            .map(|k| k.ends_with("_backup_stop_sentinel.json"))
-            .unwrap_or(false)
-    });
-    if has_walg {
-        return Ok(Some(format!(
-            "s3://{}/{}",
-            bucket,
-            walg_prefix.trim_end_matches('/')
-        )));
+        .prefix(format!("{walg_prefix}/basebackups_005/"))
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page?;
+        for key in page
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .filter(|key| key.ends_with("_backup_stop_sentinel.json"))
+        {
+            if engine != "postgres" {
+                return Ok(Some(format!("s3://{bucket}/{walg_prefix}")));
+            }
+            let bytes = crate::engines::walg_size::read_sentinel(s3_client, bucket, key).await?;
+            if crate::engines::walg_size::sentinel_backup_id(&bytes)?.as_deref()
+                == Some(backup_uuid)
+            {
+                return Ok(Some(format!("s3://{bucket}/{key}")));
+            }
+        }
     }
 
     // 2) pg_dump / rdb / mongodump / mariadb — every non-WAL-G engine writes
@@ -6104,7 +6138,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut model = temps_entities::restore_runs::Model {
             id: 9,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 2,
             target_service_id: None,
             target_service_name: None,
@@ -6144,7 +6178,7 @@ mod tests {
         let now = chrono::Utc::now();
         let model = temps_entities::restore_runs::Model {
             id: 42,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 2,
             target_service_id: None,
             target_service_name: Some("clone".into()),
@@ -6204,17 +6238,17 @@ mod tests {
     async fn run_views_name_their_source_backup_in_one_query() {
         let tracked = temps_entities::restore_runs::Model {
             id: 1,
-            source_backup_id: 5,
+            source_backup_id: Some(5),
             ..crashed_run_row()
         };
         let deleted = temps_entities::restore_runs::Model {
             id: 2,
-            source_backup_id: 6,
+            source_backup_id: Some(6),
             ..crashed_run_row()
         };
         let raw = temps_entities::restore_runs::Model {
             id: 3,
-            source_backup_id: 0,
+            source_backup_id: None,
             resume_token: Some(serde_json::json!({
                 "backup_location": "s3://bucket/base_000000010000000000000002",
                 "engine_hint": "postgres",
@@ -6256,7 +6290,7 @@ mod tests {
     async fn run_views_skip_the_backup_lookup_for_raw_location_restores() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let raw = temps_entities::restore_runs::Model {
-            source_backup_id: 0,
+            source_backup_id: None,
             ..crashed_run_row()
         };
         let views = views_with_source_backups(&db, vec![raw])
@@ -6307,7 +6341,7 @@ mod tests {
         let now = Utc::now();
         let cancelled = temps_entities::restore_runs::Model {
             id: 7,
-            source_backup_id: 3,
+            source_backup_id: Some(3),
             source_service_id: 11,
             target_service_id: Some(11),
             target_service_name: None,
@@ -6896,10 +6930,11 @@ mod tests {
     /// resolves to its own artifact rather than the newer one winning.
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
+    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // ---- Arrange: real RustFS + real objects at real key shapes --------
         let Some((port, _s3_guard)) = boot_location_test_s3().await else {
-            return;
+            return Ok(());
         };
         let bucket = "restore-location-test";
         let s3_source = location_test_s3_source(port, bucket);
@@ -6915,7 +6950,33 @@ mod tests {
         });
         if let Err(e) = s3_client.create_bucket().bucket(bucket).send().await {
             eprintln!("Could not create RustFS bucket, skipping: {e}");
-            return;
+            return Ok(());
+        }
+
+        // Two servers may write base backups below the same service name.
+        let base_key = "external_services/postgres/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                br#"{"UserData":{"temps_backup_id":"backup-a"}}"#,
+            ))
+            .send()
+            .await?;
+        for (backup_id, expected) in [
+            ("backup-a", Some(format!("s3://{bucket}/{base_key}"))),
+            ("backup-b", None),
+        ] {
+            let repaired = resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                "postgres",
+                "service-a",
+                backup_id,
+            )
+            .await?;
+            assert_eq!(repaired, expected);
         }
 
         let physical_service = "orders-physical";
@@ -6946,7 +7007,7 @@ mod tests {
                 .await
             {
                 eprintln!("Could not seed object {key}, skipping: {e}");
-                return;
+                return Ok(());
             }
         }
 
@@ -7027,7 +7088,7 @@ mod tests {
             .await
         {
             eprintln!("Could not seed object {older_physical_key}, skipping: {e}");
-            return;
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Err(e) = s3_client
@@ -7039,7 +7100,7 @@ mod tests {
             .await
         {
             eprintln!("Could not seed object {newer_logical_key}, skipping: {e}");
-            return;
+            return Ok(());
         }
 
         let resolved_for_older = resolve_backup_location_from_s3(
@@ -7074,6 +7135,7 @@ mod tests {
             resolved_for_newer, newer_logical_key,
             "resolving the newer logical backup's own uuid must return its own artifact"
         );
+        Ok(())
     }
 
     // ---- Active-run guard and interrupted-run reconciliation (real Postgres)
@@ -7135,7 +7197,7 @@ mod tests {
     ) -> temps_entities::restore_runs::ActiveModel {
         temps_entities::restore_runs::ActiveModel {
             id: NotSet,
-            source_backup_id: Set(backup_id),
+            source_backup_id: Set(Some(backup_id)),
             source_service_id: Set(service_id),
             target_service_id: Set(None),
             target_service_name: Set(target_service_name.map(String::from)),
@@ -7516,6 +7578,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn orphan_run_inserts_null_backup_id() -> Result<(), RestoreError> {
+        let mut row = crashed_run_row();
+        row.source_backup_id = None;
+        row.resume_token = Some(
+            serde_json::json!({"s3_source_id": 4, "backup_location": "service-a/backup.sql.gz"}),
+        );
+        let mut active: temps_entities::restore_runs::ActiveModel = row.clone().into();
+        active.source_backup_id = NotSet;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![crashed_run_service()]])
+            .append_query_results([vec![row]])
+            .into_connection();
+        let run = insert_restore_run(&db, active, None, 3, false).await?;
+        assert_eq!(run.source_backup_id, None);
+        let statements = db.into_transaction_log();
+        assert!(statements[0].statements().iter().any(|statement| {
+            statement.sql.contains("INSERT INTO \"restore_runs\"")
+                && statement.values.as_ref().is_some_and(|values| {
+                    values
+                        .0
+                        .iter()
+                        .any(|value| matches!(value, sea_orm::Value::Int(None)))
+                })
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn clone_name_admission_refuses_a_registered_service_before_inserting_run() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_exec_results([sea_orm::MockExecResult {
@@ -7578,7 +7668,7 @@ mod tests {
     fn crashed_run_row() -> temps_entities::restore_runs::Model {
         temps_entities::restore_runs::Model {
             id: 11,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 3,
             target_service_id: None,
             target_service_name: None,

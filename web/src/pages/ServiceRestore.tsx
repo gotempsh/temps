@@ -313,6 +313,7 @@ export function ServiceRestore() {
   const [pitrToNewService, setPitrToNewService] = useState(false)
   const [confirmText, setConfirmText] = useState('')
   const [search, setSearch] = useState('')
+  const [includeScan, setIncludeScan] = useState(!!selection.backupLocation)
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
   const effectiveSourceId = selectedSourceId ?? defaultSource?.id
   const effectiveNewServiceName =
@@ -337,7 +338,7 @@ export function ServiceRestore() {
 
   // ----- Backups list ------------------------------------------------------
   const sourceBackupsQuery = useQuery({
-    ...restoreSourceBackupsQuery(effectiveSourceId ?? 0),
+    ...restoreSourceBackupsQuery(effectiveSourceId ?? 0, includeScan),
     enabled: effectiveSourceId !== undefined && !sourcesRefused,
   })
   // A role that may not read storage sources can still list and restore this
@@ -904,6 +905,25 @@ export function ServiceRestore() {
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
+          {!sourcesRefused && (
+            <div className="flex items-center gap-2">
+              <Checkbox
+                id="include-s3-scan"
+                checked={includeScan}
+                onCheckedChange={(checked) => setIncludeScan(checked === true)}
+              />
+              <Label htmlFor="include-s3-scan">
+                Also search the S3 bucket for backups made by other servers
+              </Label>
+            </div>
+          )}
+          {includeScan &&
+            sourceBackupsQuery.data?.scan_errors?.map((message) => (
+              <Alert key={message} variant="destructive">
+                <AlertTitle>S3 scan failed</AlertTitle>
+                <AlertDescription>{message}</AlertDescription>
+              </Alert>
+            ))}
           <div className="flex items-center gap-2">
             <div className="relative flex-1 max-w-md">
               <Search className="h-3.5 w-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground" />
@@ -1045,7 +1065,9 @@ export function ServiceRestore() {
                         </TableCell>
                         <TableCell>
                           <Badge variant="outline" className="text-xs">
-                            {b.source === 'db' ? 'Tracked' : 'S3 only'}
+                            {b.source === 'db'
+                              ? 'Tracked'
+                              : 'From another server'}
                           </Badge>
                         </TableCell>
                         <TableCell>

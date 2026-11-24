@@ -46,10 +46,32 @@ pub(crate) async fn load_backup_size_bytes(
         walg_key_prefix, backup_name
     );
 
+    let body = read_sentinel(client, bucket, &sentinel_key).await?;
+    size_from_sentinel(&body, backup_uuid, &format!("s3://{bucket}/{sentinel_key}"))
+}
+
+/// Legacy or externally written WAL-G snapshots may carry arbitrary user data.
+pub(crate) fn sentinel_backup_id(bytes: &[u8]) -> Result<Option<String>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Marker {
+        #[serde(rename = "UserData")]
+        user_data: Option<serde_json::Value>,
+    }
+    let marker: Marker = serde_json::from_slice(bytes)?;
+    Ok(marker
+        .user_data
+        .and_then(|data| data.get("temps_backup_id")?.as_str().map(str::to_owned)))
+}
+
+pub(crate) async fn read_sentinel(
+    client: &S3Client,
+    bucket: &str,
+    sentinel_key: &str,
+) -> Result<Vec<u8>, BackupError> {
     let response = client
         .get_object()
         .bucket(bucket)
-        .key(&sentinel_key)
+        .key(sentinel_key)
         .send()
         .await
         .map_err(|error| BackupError::Failed {
@@ -94,7 +116,7 @@ pub(crate) async fn load_backup_size_bytes(
             ),
         });
     }
-    size_from_sentinel(&body, backup_uuid, &format!("s3://{bucket}/{sentinel_key}"))
+    Ok(body)
 }
 
 fn size_from_sentinel(

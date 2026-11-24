@@ -110,7 +110,7 @@ pub struct RestoreRunAudit {
     pub source_service_id: i32,
     pub source_service_name: String,
     pub service_type: String,
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     pub target_service_name: Option<String>,
     /// Services recorded as having produced the backup (empty when unknown).
@@ -132,7 +132,7 @@ pub struct RestoreRunCancelledAudit {
     pub service_name: String,
     pub service_type: String,
     /// `0` for a restore from a raw S3 location.
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     /// Name of the service a new-service restore would have created.
     pub target_service_name: Option<String>,

@@ -1349,7 +1349,7 @@ mod tests {
                 self.db.as_ref(),
                 temps_entities::restore_runs::ActiveModel {
                     id: NotSet,
-                    source_backup_id: Set(self.backup_id),
+                    source_backup_id: Set(Some(self.backup_id)),
                     source_service_id: Set(self.service_id),
                     target_service_id: Set(None),
                     target_service_name: Set(None),
@@ -1702,7 +1702,7 @@ mod tests {
 
     /// A restore run as the previous process left it, without a database.
     fn run_model(
-        source_backup_id: i32,
+        source_backup_id: Option<i32>,
         phase: &str,
         new_service: Option<&str>,
     ) -> temps_entities::restore_runs::Model {
@@ -1771,7 +1771,7 @@ mod tests {
                 "{service_type}: {refused}"
             );
         }
-        let run = run_model(5, "provision", Some("orders-copy"));
+        let run = run_model(Some(5), "provision", Some("orders-copy"));
         assert!(
             ResumedWorkerRestore::of(
                 &DatabaseConnection::Disconnected,
@@ -1791,7 +1791,7 @@ mod tests {
     #[tokio::test]
     async fn a_worker_restore_that_cannot_be_classified_is_held_until_released() {
         // An orphan-location run whose resume token lost its S3 source.
-        let run = run_model(0, "restore", None);
+        let run = run_model(None, "restore", None);
         let resumed = ResumedWorkerRestore::of(
             &DatabaseConnection::Disconnected,
             &run,

@@ -648,6 +648,10 @@ impl PostgresService {
             walg_s3_prefix, container_name
         );
 
+        let (walg_s3_prefix, snapshot_name) = match walg_snapshot(walg_s3_prefix) {
+            Some((root, name)) => (root, Some(name)),
+            None => (walg_s3_prefix, None),
+        };
         // Build WAL-G environment variables
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -675,6 +679,9 @@ impl PostgresService {
         if s3_credentials.uses_path_style() {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
+        if let Some(name) = snapshot_name {
+            walg_env.push(format!("WALG_FETCH_SNAPSHOT={name}"));
+        }
         if let Some(target_user_data) = target_user_data {
             walg_env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
         }
@@ -692,7 +699,9 @@ impl PostgresService {
         // paths on that volume — not the original container's writable layer.
         info!("Fetching WAL-G backup to temporary directory on shared volume");
         let restore_temp = WALG_RESTORE_TEMP;
-        let fetch_target = if target_user_data.is_some() {
+        let fetch_target = if snapshot_name.is_some() {
+            "\"$WALG_FETCH_SNAPSHOT\""
+        } else if target_user_data.is_some() {
             "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
         } else {
             "LATEST"

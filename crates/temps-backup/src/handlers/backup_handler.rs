@@ -827,6 +827,8 @@ pub struct BackupResponse {
 /// Response type for source backup index
 #[derive(Serialize, ToSchema)]
 pub struct SourceBackupIndexResponse {
+    /// Errors encountered during the optional bucket scan.
+    pub scan_errors: Vec<String>,
     /// List of backups in the source
     pub backups: Vec<SourceBackupEntry>,
     /// When the index was last updated
@@ -992,48 +994,6 @@ impl From<temps_entities::backups::Model> for BackupResponse {
     }
 }
 
-#[derive(Deserialize)]
-struct S3BackupIndex {
-    backups: Vec<S3BackupEntry>,
-    last_updated: String,
-}
-
-#[derive(Deserialize)]
-struct S3BackupEntry {
-    #[serde(default)]
-    id: i32,
-    #[serde(default)]
-    backup_id: String,
-    name: String,
-    #[serde(rename = "type")]
-    backup_type: String,
-    created_at: String,
-    #[serde(default)]
-    expires_at: Option<String>,
-    #[serde(default)]
-    size_bytes: Option<i64>,
-    #[serde(default)]
-    location: String,
-    #[serde(default)]
-    metadata_location: String,
-    // Newly surfaced fields — older cached JSON may not include them, so
-    // `#[serde(default)]` keeps backwards compat with any legacy index.json.
-    #[serde(default)]
-    engine: Option<String>,
-    #[serde(default)]
-    origin_service_name: Option<String>,
-    #[serde(default)]
-    format: Option<String>,
-    #[serde(default = "default_backup_source")]
-    source: String,
-    #[serde(default)]
-    state: String,
-}
-
-fn default_backup_source() -> String {
-    "db".to_string()
-}
-
 /// Query parameters for the S3-source backup listing.
 #[derive(serde::Deserialize, utoipa::IntoParams)]
 struct ListSourceBackupsParams {
@@ -1076,13 +1036,8 @@ async fn list_source_backups(
         .await
         .map_err(Problem::from)?;
 
-    let s3_index: S3BackupIndex = serde_json::from_value(index).map_err(|e| {
-        error!("Failed to parse backup index: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
     let response = SourceBackupIndexResponse {
-        backups: s3_index
+        backups: index
             .backups
             .into_iter()
             .map(|entry| SourceBackupEntry {
@@ -1102,7 +1057,8 @@ async fn list_source_backups(
                 state: entry.state,
             })
             .collect(),
-        last_updated: s3_index.last_updated,
+        last_updated: index.last_updated,
+        scan_errors: index.scan_errors,
     };
     Ok(Json(response))
 }
