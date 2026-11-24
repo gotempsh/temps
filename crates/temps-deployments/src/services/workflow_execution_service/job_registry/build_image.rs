@@ -179,11 +179,71 @@ impl FromJobRecord for BuildImageJob {
             needs_npm_credentials,
             inlined_build_variables: &inlined_build_variables,
         };
-        let (builder, image_builder) = choose_image_builder(&choice, builder).await?;
+        let (mut builder, image_builder) = choose_image_builder(&choice, builder).await?;
+        if let Some(settings) = identical_build_settings(record, &deployment).await {
+            builder = builder.identical_builds(settings);
+        }
         let job = builder.build(image_builder)?;
 
         Ok(job)
     }
+}
+
+/// How the build coordinates with identical builds (ADR 114), or `None` when
+/// the project builds in parallel, or when what coordination needs cannot be
+/// read: the build then runs on its own, as every build did before.
+async fn identical_build_settings(
+    record: &JobRecord<'_>,
+    deployment: &deployments::Model,
+) -> Option<crate::jobs::IdenticalBuildSettings> {
+    let JobRecord {
+        service, project, ..
+    } = *record;
+    if !project.identical_build_mode.coordinates() {
+        return None;
+    }
+    let Some(encryption) = service.encryption_service.get() else {
+        warn!(
+            deployment_id = deployment.id,
+            project_id = project.id,
+            "No encryption service to key build fingerprints; building without identical build coordination"
+        );
+        return None;
+    };
+    let access_boundary = match crate::services::identical_builds::access_boundary(
+        service.db.as_ref(),
+        project.id,
+    )
+    .await
+    {
+        Ok(boundary) => boundary,
+        Err(error) => {
+            warn!(
+                deployment_id = deployment.id,
+                project_id = project.id,
+                %error,
+                "Could not read the project's team access; building without identical build coordination"
+            );
+            return None;
+        }
+    };
+    Some(crate::jobs::IdenticalBuildSettings {
+        coordinator: crate::services::identical_builds::IdenticalBuildCoordinator::new(
+            service.db.clone(),
+        ),
+        key: encryption.clone(),
+        mode: project.identical_build_mode,
+        scope: project.identical_build_scope,
+        project_id: project.id,
+        source: crate::services::identical_builds::SourceIdentity {
+            git_provider_connection_id: project.git_provider_connection_id,
+            git_url: project.git_url.clone(),
+            repo_owner: project.repo_owner.clone(),
+            repo_name: project.repo_name.clone(),
+            pull_only_root_directory: project.pull_only_root_directory,
+        },
+        access_boundary,
+    })
 }
 
 /// What deciding who builds the image depends on.
