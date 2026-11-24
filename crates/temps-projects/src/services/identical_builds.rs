@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! How a project's builds coordinate with identical builds (ADR 113):
+//! How a project's builds coordinate with identical builds (ADR 114):
 //! `projects.identical_build_mode` and `projects.identical_build_scope`, and
 //! what coordination did for the project lately.
 //!

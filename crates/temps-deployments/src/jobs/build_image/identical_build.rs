@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The build job's side of identical build coordination (ADR 113).
+//! The build job's side of identical build coordination (ADR 114).
 //!
 //! For a project whose `identical_build_mode` is `queue` or `share`, the
 //! build job identifies its build ([`identify`]), then asks the coordinator

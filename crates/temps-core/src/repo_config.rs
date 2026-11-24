@@ -450,7 +450,7 @@ pub struct AgentYamlConfig {
     /// Legacy alias for `model`. `None` means "use the platform default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// Preferred model identifier for the CLI (e.g. "sonnet", "opus", "gpt-5-codex").
+    /// Preferred model identifier for the CLI (e.g. "sonnet", "opus", "gpt-6.2-sol").
     /// NULL means: let the CLI pick its default. This is independent from `provider` —
     /// the provider decides which CLI runs; `ai_model` picks the model inside that CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -699,7 +699,7 @@ pub struct WorkflowYamlConfig {
     /// AI provider override. `None` means "use the platform default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// Preferred model for the CLI (e.g. "sonnet", "gpt-5-codex"). `None` = CLI default.
+    /// Preferred model for the CLI (e.g. "sonnet", "gpt-6.2-sol"). `None` = CLI default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_model: Option<String>,
     #[serde(default = "default_max_turns")]

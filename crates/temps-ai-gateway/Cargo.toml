@@ -42,6 +42,7 @@ async-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
 moka = { workspace = true }
+arc-swap = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
@@ -53,6 +54,7 @@ tokio = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
 http-body-util = { workspace = true }
+tower = { workspace = true }
 http = { workspace = true }
 wiremock = { workspace = true }
 tempfile.workspace = true

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The identity of an image build (ADR 113).
+//! The identity of an image build (ADR 114).
 //!
 //! Two builds are identical only when everything that decides the image
 //! matches: the repository and how it is fetched, the commit, the build
@@ -637,7 +637,7 @@ mod tests {
 
     #[test]
     fn cache_mount_contents_are_not_image_inputs() {
-        // ADR 113 D2: BuildKit keys a step's layers without its cache
+        // ADR 114 D2: BuildKit keys a step's layers without its cache
         // mounts' contents, and so does reuse. Each project reads its own
         // namespace; an identical build still shares.
         let dockerfile = "FROM node:22\nRUN --mount=type=cache,target=/root/.npm npm ci\n";

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! How a project's builds coordinate with identical builds (ADR 113).
+//! How a project's builds coordinate with identical builds (ADR 114).
 //!
 //! Several projects, or several environments of one project, often build the
 //! same image: same repository, same commit, same build context and

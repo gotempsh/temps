@@ -1021,7 +1021,7 @@ pub struct BuildImageJob {
     /// itself: the way back to the control plane. `None` for every other
     /// build.
     offload_fallback: Option<OffloadFallback>,
-    /// How this build coordinates with identical builds (ADR 113); `None`
+    /// How this build coordinates with identical builds (ADR 114); `None`
     /// for a project in `parallel` mode, which builds on its own.
     identical_builds: Option<IdenticalBuildSettings>,
 }
@@ -1151,7 +1151,7 @@ impl BuildImageJob {
         }
     }
 
-    /// Coordinate this build with identical builds (ADR 113).
+    /// Coordinate this build with identical builds (ADR 114).
     pub fn with_identical_builds(mut self, settings: Option<IdenticalBuildSettings>) -> Self {
         self.identical_builds = settings;
         self
@@ -3405,7 +3405,7 @@ impl BuildImageJobBuilder {
     }
 
     /// Coordinate the build with identical builds of other deployments
-    /// (ADR 113). Omit it for a project in `parallel` mode.
+    /// (ADR 114). Omit it for a project in `parallel` mode.
     pub fn identical_builds(mut self, settings: IdenticalBuildSettings) -> Self {
         self.identical_builds = Some(settings);
         self

@@ -222,6 +222,51 @@ struct HarnessUpdateState {
 
 type HarnessUpdates = Arc<std::sync::Mutex<HashMap<i32, HarnessUpdateState>>>;
 
+/// When each principal last started a sandboxed turn, for automatic CLI
+/// updates. Bounded: entries older than [`RECENT_TURN_RETENTION`] are dropped
+/// once the map reaches [`RECENT_TURN_CAPACITY`], and a full map of fresh
+/// entries stops recording new principals until some expire.
+type RecentTurns = Arc<std::sync::Mutex<HashMap<i32, Instant>>>;
+const RECENT_TURN_CAPACITY: usize = 4096;
+const RECENT_TURN_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Whether `workspace` is `principal_id`'s persistent global workspace (its
+/// work directory is `global-user-{principal_id}`), the one automatic CLI
+/// updates act on. Application sandboxes have their own directories.
+fn is_global_workspace(workspace: &temps_ai::HarnessWorkspace, principal_id: i32) -> bool {
+    workspace
+        .host_work_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == format!("global-user-{principal_id}"))
+}
+
+fn record_recent_turn(turns: &RecentTurns, principal_id: i32, now: Instant) {
+    let mut turns = turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if turns.len() >= RECENT_TURN_CAPACITY && !turns.contains_key(&principal_id) {
+        turns.retain(|_, at| now.saturating_duration_since(*at) < RECENT_TURN_RETENTION);
+        if turns.len() >= RECENT_TURN_CAPACITY {
+            return;
+        }
+    }
+    turns.insert(principal_id, now);
+}
+
+fn recent_principals(turns: &RecentTurns, within: Duration, now: Instant) -> Vec<i32> {
+    let turns = turns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut recent: Vec<(i32, Instant)> = turns
+        .iter()
+        .filter(|(_, at)| now.saturating_duration_since(**at) <= within)
+        .map(|(principal, at)| (*principal, *at))
+        .collect();
+    recent.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    recent.into_iter().map(|(principal, _)| principal).collect()
+}
+
 /// Marks a workspace's harness as "updating" and clears the mark when dropped.
 ///
 /// The update runs in a detached task that owns this guard, so a client that
@@ -1023,6 +1068,8 @@ pub struct AgentCliAiService {
     /// Last known harness version status per principal's workspace, and
     /// whether an update is running (see `harness_update`).
     harness_updates: HarnessUpdates,
+    /// When each principal last started a sandboxed turn (automatic updates).
+    recent_turns: RecentTurns,
     /// Credential replacement takes the write side; discoveries hold the read
     /// side. This keeps invalidation a hard freshness boundary while allowing
     /// different principals to refresh concurrently.
@@ -1427,6 +1474,7 @@ impl AgentCliAiService {
             workspace_models: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             workspace_model_refreshes: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             harness_updates: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            recent_turns: Arc::new(std::sync::Mutex::new(HashMap::new())),
             workspace_model_refresh_barrier: Arc::new(tokio::sync::RwLock::new(())),
             host_model_refresh: Arc::new(tokio::sync::Mutex::new(HostModelRefreshState::default())),
         }
@@ -2025,7 +2073,7 @@ impl AgentCliAiService {
             hu::VERSION_COMMAND_TIMEOUT,
             sandbox_provider.exec(
                 &handle,
-                hu::install_writable_probe_command(),
+                hu::install_writable_probe_command(package),
                 HashMap::new(),
                 None,
             ),
@@ -2637,6 +2685,12 @@ impl AgentCliAiService {
                     reason: "another harness turn is already running in this application sandbox"
                         .into(),
                 })?;
+        // Automatic CLI updates check and update the principal's global
+        // workspace only, so only an accepted turn there marks it active. A
+        // turn in an application sandbox must not wake the global one.
+        if is_global_workspace(&workspace, principal_id) {
+            record_recent_turn(&self.recent_turns, principal_id, Instant::now());
+        }
         let handle = self
             .get_or_create_sandbox(&workspace, request.project_id)
             .await?;
@@ -5384,6 +5438,13 @@ impl AiService for AgentCliAiService {
             })
     }
 
+    async fn recent_workspace_principals(&self, provider: &str, within: Duration) -> Vec<i32> {
+        if provider != self.provider.name() {
+            return Vec::new();
+        }
+        recent_principals(&self.recent_turns, within, Instant::now())
+    }
+
     async fn invalidate_capabilities_for(&self, _provider: Option<&str>) {
         // Credential replacement is a hard freshness boundary. Wait for an
         // old-credential discovery already in flight, then clear anything it
@@ -7146,6 +7207,54 @@ mod tests {
         assert!(service.cached_sandbox_handle("app-one").is_none());
     }
 
+    #[test]
+    fn only_the_principals_own_global_workspace_counts_as_recent_activity() {
+        let workspace = |dir: &str| temps_ai::HarnessWorkspace {
+            sandbox_label: "0a1b2c".into(),
+            host_work_dir: PathBuf::from(format!("/managed/{dir}")),
+        };
+        assert!(is_global_workspace(&workspace("global-user-42"), 42));
+        assert!(!is_global_workspace(&workspace("global-user-42"), 4));
+        assert!(!is_global_workspace(&workspace("global-user-420"), 42));
+        assert!(!is_global_workspace(&workspace("app_0a1b2c3d"), 42));
+    }
+
+    #[test]
+    fn recent_turns_are_bounded_and_listed_most_recent_first() {
+        let turns: RecentTurns = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let start = Instant::now();
+        record_recent_turn(&turns, 1, start);
+        record_recent_turn(&turns, 2, start + Duration::from_secs(60));
+        record_recent_turn(&turns, 3, start + Duration::from_secs(120));
+        let now = start + Duration::from_secs(180);
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(3600), now),
+            vec![3, 2, 1]
+        );
+        // Only turns within the window count (2 started 120s ago, 1 180s ago).
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(130), now),
+            vec![3, 2]
+        );
+        // A new turn moves a principal to the front.
+        record_recent_turn(&turns, 1, now);
+        assert_eq!(
+            recent_principals(&turns, Duration::from_secs(10), now),
+            vec![1]
+        );
+
+        // A full map drops stale entries to make room, and records nothing
+        // more while every entry is fresh.
+        let full: RecentTurns = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        for principal in 0..RECENT_TURN_CAPACITY as i32 {
+            record_recent_turn(&full, principal, start);
+        }
+        record_recent_turn(&full, -1, start);
+        assert!(!full.lock().unwrap().contains_key(&-1));
+        record_recent_turn(&full, -1, start + RECENT_TURN_RETENTION);
+        assert_eq!(full.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn sandbox_slot_serializes_conversations_in_one_application() {
         let provider: Arc<dyn AiCliProvider> = Arc::new(MockProvider {
@@ -7794,7 +7903,10 @@ mod tests {
         }
 
         fn is_update(command: &[String]) -> bool {
-            command.windows(2).any(|pair| pair == ["npm", "install"])
+            // The update is one `sh -c` script that picks the installer.
+            command
+                .iter()
+                .any(|argument| argument.contains("exec npm install -g"))
         }
     }
 

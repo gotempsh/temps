@@ -51,7 +51,8 @@ pub struct Model {
 }
 
 /// SQL condition for a row that used tokens but whose cost no known price
-/// gave: `price_known` is false (a self-hosted model no price list covers),
+/// gave: `price_known` is false (a self-hosted model no price list covers,
+/// or a vendor model no price covers, whose cost is the worst-case ceiling),
 /// or, for a row older than the column, its cost is not positive. A model
 /// with a published price of zero is priced. Every report that counts
 /// unpriced requests uses this, so they agree. It is never NULL (`IS FALSE`,

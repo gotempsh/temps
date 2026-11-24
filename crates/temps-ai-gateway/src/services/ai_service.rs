@@ -210,21 +210,12 @@ impl GatewayAiService {
                 .all(self.db.as_ref())
                 .await
                 .ok()?;
-            if catalog_models.is_empty() {
-                if let Some(model) = default_model_for_provider(&key.provider) {
-                    return Some(model);
-                }
-            }
-            if let Some(preferred) = default_model_for_provider(&key.provider) {
-                if catalog_models
-                    .iter()
-                    .any(|model| model.model_id == preferred)
-                {
-                    return Some(preferred);
-                }
-            }
-            if let Some(model) = catalog_models.into_iter().next() {
-                return Some(model.model_id);
+            let catalog_ids: Vec<String> = catalog_models
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect();
+            if let Some(model) = catalog_default_model(&key.provider, &catalog_ids) {
+                return Some(model);
             }
         }
         self.gateway
@@ -325,15 +316,30 @@ fn completion_error(purpose: &str, model: &str, error: AiGatewayError) -> AiErro
 /// names one. Self-hosted keys have none: their default is the model the
 /// administrator picked from the server's own listing.
 fn default_model_for_provider(provider: &str) -> Option<String> {
-    let model = match provider {
-        "openai" => "gpt-5-nano",
-        "anthropic" => "claude-haiku-4-5",
-        "gemini" => "gemini-3.5-flash-lite",
-        "xai" => "grok-4.5",
-        "openrouter" => "openai/gpt-4o-mini",
-        _ => return None,
-    };
-    Some(model.to_string())
+    crate::providers::low_cost_default_model(provider).map(str::to_string)
+}
+
+/// The internal-call model for a key with no pin, given its enabled and
+/// available catalog sorted by id: the first low-cost model the key serves,
+/// else its first chat model, else its first model at all (the id heuristic
+/// must never leave a key that serves something with no model). An empty
+/// catalog (never refreshed) falls back to the provider's current low-cost
+/// model.
+fn catalog_default_model(provider: &str, catalog_ids: &[String]) -> Option<String> {
+    if catalog_ids.is_empty() {
+        return default_model_for_provider(provider);
+    }
+    crate::providers::low_cost_models(provider)
+        .iter()
+        .find(|preferred| catalog_ids.iter().any(|id| id == *preferred))
+        .map(|preferred| (*preferred).to_string())
+        .or_else(|| {
+            catalog_ids
+                .iter()
+                .find(|id| crate::providers::is_chat_model_id(id))
+                .cloned()
+        })
+        .or_else(|| catalog_ids.first().cloned())
 }
 
 /// First model id from an `allowed_models` JSON array (`["a","b"]` -> "a").
@@ -1585,7 +1591,7 @@ mod tests {
             .into_connection();
         let svc = service_over(db);
         let model = svc.resolve_model(None, Some("")).await;
-        assert_eq!(model, Some("claude-haiku-4-5".to_string()));
+        assert_eq!(model, Some("claude-haiku-5-5".to_string()));
     }
 
     #[tokio::test]
@@ -1646,11 +1652,11 @@ mod tests {
     async fn test_resolve_model_default_for_first_active_key() {
         // No allow-list -> default model for the first active provider key.
         for (provider, expected) in [
-            ("openai", "gpt-5-nano"),
-            ("anthropic", "claude-haiku-4-5"),
+            ("openai", "gpt-6-luna"),
+            ("anthropic", "claude-haiku-5-5"),
             ("gemini", "gemini-3.5-flash-lite"),
-            ("xai", "grok-4.5"),
-            ("openrouter", "openai/gpt-4o-mini"),
+            ("xai", "grok-4.7"),
+            ("openrouter", "openai/gpt-6-luna"),
         ] {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
@@ -1708,7 +1714,7 @@ mod tests {
         let svc = service_over(db);
         assert_eq!(
             svc.resolve_model(None, None).await,
-            Some("gpt-5-nano".to_string())
+            Some("gpt-6-luna".to_string())
         );
     }
 
@@ -1760,18 +1766,18 @@ mod tests {
             .into_connection();
         let svc = service_over(db);
         let model = svc.resolve_model(None, None).await;
-        assert_eq!(model, Some("gpt-5-nano".to_string()));
+        assert_eq!(model, Some("gpt-6-luna".to_string()));
     }
 
     #[test]
     fn test_default_model_for_provider_mapping() {
         assert_eq!(
             default_model_for_provider("openai"),
-            Some("gpt-5-nano".to_string())
+            Some("gpt-6-luna".to_string())
         );
         assert_eq!(
             default_model_for_provider("anthropic"),
-            Some("claude-haiku-4-5".to_string())
+            Some("claude-haiku-5-5".to_string())
         );
         assert_eq!(
             default_model_for_provider("gemini"),
@@ -1779,15 +1785,66 @@ mod tests {
         );
         assert_eq!(
             default_model_for_provider("xai"),
-            Some("grok-4.5".to_string())
+            Some("grok-4.7".to_string())
         );
         assert_eq!(
             default_model_for_provider("openrouter"),
-            Some("openai/gpt-4o-mini".to_string())
+            Some("openai/gpt-6-luna".to_string())
         );
         // Unknown / custom providers have no built-in default.
         assert_eq!(default_model_for_provider("custom"), None);
         assert_eq!(default_model_for_provider(""), None);
+    }
+
+    #[test]
+    fn catalog_default_keeps_an_earlier_low_cost_model_and_never_picks_a_non_chat_one() {
+        let ids = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
+        // A key that cannot serve the current low-cost model keeps the one it
+        // used before, not the alphabetically first id (an image model).
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3", "gpt-5-nano"])),
+            Some("gpt-5-nano".to_string())
+        );
+        // The current low-cost model wins when the key serves it.
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3", "gpt-5-nano", "gpt-6-luna"])),
+            Some("gpt-6-luna".to_string())
+        );
+        // No low-cost model at all: the first chat model, skipping image,
+        // speech and embedding ids.
+        assert_eq!(
+            catalog_default_model(
+                "openai",
+                &ids(&[
+                    "dall-e-3",
+                    "gpt-image-2",
+                    "tts-1",
+                    "whisper-1",
+                    "gpt-6.2-sol"
+                ])
+            ),
+            Some("gpt-6.2-sol".to_string())
+        );
+        assert_eq!(
+            catalog_default_model("anthropic", &ids(&["claude-haiku-4-5", "claude-opus-5"])),
+            Some("claude-haiku-4-5".to_string())
+        );
+        // Never refreshed: the provider's current low-cost model.
+        assert_eq!(
+            catalog_default_model("openai", &[]),
+            Some("gpt-6-luna".to_string())
+        );
+        // An audio-capable chat model is a chat model.
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3", "gpt-audio", "tts-1"])),
+            Some("gpt-audio".to_string())
+        );
+        // A key whose ids all look non-chat still gets its first model, as
+        // before, rather than none.
+        assert_eq!(
+            catalog_default_model("openai", &ids(&["dall-e-3"])),
+            Some("dall-e-3".to_string())
+        );
     }
 
     #[test]

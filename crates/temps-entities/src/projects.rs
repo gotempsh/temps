@@ -296,14 +296,14 @@ pub struct Model {
     #[sea_orm(default_value = "{}")]
     #[serde(default)]
     pub allowed_capabilities: Vec<String>,
-    /// ADR 113: what this project's builds do when an identical build is
+    /// ADR 114: what this project's builds do when an identical build is
     /// already running. `parallel` (the default for every existing and new
     /// project) builds every time, as before. Changed only by
     /// `PUT /projects/{id}/identical-builds`, which is audited.
     #[sea_orm(default_value = "parallel")]
     #[serde(default)]
     pub identical_build_mode: IdenticalBuildMode,
-    /// ADR 113: which builds count as identical for queueing: every build of
+    /// ADR 114: which builds count as identical for queueing: every build of
     /// the same repository and path (the default) or only builds with the
     /// same full fingerprint. Image reuse always requires the full fingerprint.
     #[sea_orm(default_value = "source")]

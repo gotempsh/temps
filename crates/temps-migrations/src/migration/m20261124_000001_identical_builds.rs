@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! Coordinating identical builds (ADR 113).
+//! Coordinating identical builds (ADR 114).
 //!
 //! `projects.identical_build_mode` and `projects.identical_build_scope` say
 //! what a project's builds do when an identical build is already running.

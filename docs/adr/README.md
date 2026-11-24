@@ -131,7 +131,8 @@ the number of the ADR they belong to; they do not take a number of their own.
 | [110](./110-product-analytics-gaps-against-posthog.md) | What product analytics is missing to match PostHog | Accepted | amends [034](./034-feature-flags.md) |
 | [111](./111-error-tracking-gaps-against-sentry.md) | What error tracking and performance are missing to match Sentry | Proposed |  |
 | [112](./112-project-focused-console.md) | A project-focused console | Proposed |  |
-| [113](./113-identical-build-coordination.md) | Coordinating identical builds | Accepted |  |
+| [113](./113-runtime-model-catalog-and-coding-agent-updates.md) | New models and coding-agent releases without a Temps release | Accepted |  |
+| [114](./114-identical-build-coordination.md) | Coordinating identical builds | Accepted |  |
 
 ## Supporting documents
 

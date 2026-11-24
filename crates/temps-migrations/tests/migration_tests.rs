@@ -10652,3 +10652,119 @@ async fn test_visitor_activity_cooldown_is_nullable_and_reversible() -> anyhow::
     assert_eq!(kept.try_get::<i32>("", "count")?, 1);
     Ok(())
 }
+
+/// The runtime model catalog tables (ADR 113) are new, so an upgrade changes
+/// no existing row. A settings row takes the documented defaults, only one
+/// settings row can exist, the interval is bounded and a model is stored
+/// once per provider. `down` drops the three tables.
+#[tokio::test]
+async fn test_ai_model_catalog_tables_default_bound_and_reverse() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261123_000001_ai_model_catalog";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping AI model catalog migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for table in [
+        "ai_model_catalog_settings",
+        "ai_model_catalog_entries",
+        "ai_agent_cli_settings",
+    ] {
+        assert!(
+            !table_exists(&db, table).await?,
+            "{table} before the migration"
+        );
+    }
+
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared("INSERT INTO ai_model_catalog_settings (id) VALUES (1)")
+        .await?;
+    db.execute_unprepared("INSERT INTO ai_agent_cli_settings (id) VALUES (1)")
+        .await?;
+    let defaults = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT s.source_url IS NULL AS default_source, s.auto_refresh, \
+                    s.refresh_interval_hours, s.discover_provider_models, s.entry_count, \
+                    a.auto_update \
+             FROM ai_model_catalog_settings s, ai_agent_cli_settings a"
+                .to_string(),
+        ))
+        .await?
+        .expect("defaults row");
+    assert!(defaults.try_get::<bool>("", "default_source")?);
+    assert!(defaults.try_get::<bool>("", "auto_refresh")?);
+    assert_eq!(defaults.try_get::<i32>("", "refresh_interval_hours")?, 24);
+    assert!(defaults.try_get::<bool>("", "discover_provider_models")?);
+    assert_eq!(defaults.try_get::<i32>("", "entry_count")?, 0);
+    assert!(!defaults.try_get::<bool>("", "auto_update")?);
+
+    for rejected in [
+        "INSERT INTO ai_model_catalog_settings (id) VALUES (2)",
+        "INSERT INTO ai_agent_cli_settings (id) VALUES (2)",
+        "UPDATE ai_model_catalog_settings SET refresh_interval_hours = 0",
+        "UPDATE ai_model_catalog_settings SET refresh_interval_hours = 169",
+    ] {
+        assert!(
+            db.execute_unprepared(rejected).await.is_err(),
+            "{rejected} must be rejected"
+        );
+    }
+
+    let entry = "INSERT INTO ai_model_catalog_entries \
+                 (provider, model_id, display_name, input_per_million, output_per_million, \
+                  source_url, fetched_at) \
+                 VALUES ('openai', 'example-model', 'Example', 1.0, 2.0, \
+                         'https://catalog.example.com/api.json', now())";
+    db.execute_unprepared(entry).await?;
+    assert!(
+        db.execute_unprepared(entry).await.is_err(),
+        "a model is stored once per provider"
+    );
+    db.execute_unprepared(
+        "INSERT INTO ai_model_catalog_entries \
+         (provider, model_id, display_name, source_url, fetched_at) \
+         VALUES ('openrouter', 'example-model', 'Example', 'https://catalog.example.com/api.json', now())",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    for table in [
+        "ai_model_catalog_settings",
+        "ai_model_catalog_entries",
+        "ai_agent_cli_settings",
+    ] {
+        assert!(!table_exists(&db, table).await?, "{table} after down");
+    }
+    Ok(())
+}

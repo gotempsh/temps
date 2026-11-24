@@ -539,6 +539,11 @@ const AiGatewayUsagePage = lazy(() =>
     default: m.AiGatewayUsagePage,
   }))
 )
+const AiGatewayModelsPage = lazy(() =>
+  import('./pages/AiGatewayModelsPage').then((m) => ({
+    default: m.AiGatewayModelsPage,
+  }))
+)
 const AiGatewayActivityPage = lazy(() =>
   import('./pages/AiGatewayActivityPage').then((m) => ({
     default: m.AiGatewayActivityPage,
@@ -1165,6 +1170,10 @@ const FullAppRoutes = () => {
                         <Route
                           path="/ai-gateway/limits"
                           element={<AiGatewayLimitsPage />}
+                        />
+                        <Route
+                          path="/ai-gateway/models"
+                          element={<AiGatewayModelsPage />}
                         />
                         <Route
                           path="/ai-gateway/activity"

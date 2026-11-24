@@ -3,7 +3,7 @@
 
 //! `GET`/`PUT /projects/{id}/identical-builds`: what a project's builds do
 //! when an identical build (same repository, commit, build path and
-//! build-time values) is already running (ADR 113).
+//! build-time values) is already running (ADR 114).
 //!
 //! Reading needs `projects:read` on the project; changing it needs
 //! `projects:write` on the project. Every change is audited with the old and

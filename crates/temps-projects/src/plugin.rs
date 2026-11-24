@@ -97,7 +97,7 @@ impl TempsPlugin for ProjectsPlugin {
             );
             context.register_service(container_security_service);
 
-            // How a project's builds coordinate with identical builds (ADR 113)
+            // How a project's builds coordinate with identical builds (ADR 114)
             let identical_build_settings_service = Arc::new(
                 crate::services::identical_builds::IdenticalBuildSettingsService::new(db.clone()),
             );

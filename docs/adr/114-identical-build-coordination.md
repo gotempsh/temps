@@ -3,7 +3,7 @@ SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 SPDX-License-Identifier: MIT OR Apache-2.0
 -->
 
-# ADR-113: Coordinating identical builds
+# ADR-114: Coordinating identical builds
 
 **Status:** Accepted — 2026-11-23
 

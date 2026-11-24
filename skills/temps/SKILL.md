@@ -105,10 +105,10 @@ Do not read a monolithic CLI manual. Open
 command-group file, and confirm uncertain syntax with runtime help:
 
 ```bash
-bunx @temps-sdk/cli@latest <group> <command> --help
+bunx @temps-sdk/cli@beta <group> <command> --help
 ```
 
-Use `npx @temps-sdk/cli@latest` only when Bun is unavailable. Keep the channel tag shown here and never assume a global `temps` binary exists.
+Use `npx @temps-sdk/cli@beta` only when Bun is unavailable. Keep the channel tag shown here and never assume a global `temps` binary exists.
 
 For Performance Insights, confirm `analytics performance --help` exists in the
 selected runtime before querying. If the current version predates that

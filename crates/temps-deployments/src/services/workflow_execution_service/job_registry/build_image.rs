@@ -189,7 +189,7 @@ impl FromJobRecord for BuildImageJob {
     }
 }
 
-/// How the build coordinates with identical builds (ADR 113), or `None` when
+/// How the build coordinates with identical builds (ADR 114), or `None` when
 /// the project builds in parallel, or when what coordination needs cannot be
 /// read: the build then runs on its own, as every build did before.
 async fn identical_build_settings(

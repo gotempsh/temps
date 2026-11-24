@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One coordinated image build (ADR 113).
+//! One coordinated image build (ADR 114).
 //!
 //! A row exists for every build of a project whose
 //! `identical_build_mode` is not `parallel`. Builds of one group
