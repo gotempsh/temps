@@ -108,7 +108,8 @@ jobs:
 
       - name: Recover an S3-only PostgreSQL snapshot on a second Temps server
         if: matrix.shard == 'recovery'
-        run: python3 apps/temps-e2e/tests/postgres_cross_server_recovery.py
+        working-directory: apps/temps-e2e
+        run: bun run e2e postgres-cross-server-recovery-scenario
 
       - name: Start registry and external-service fixtures
         run: |
@@ -142,7 +143,7 @@ jobs:
       - name: Test recovery scenario contracts
         if: matrix.shard == 'recovery'
         working-directory: apps/temps-e2e
-        run: bun test src/lib/mariadb-image.test.ts src/lib/mongosh.test.ts
+        run: bun test src/commands/postgres-cross-server-recovery-scenario.test.ts src/lib/mariadb-image.test.ts src/lib/mongosh.test.ts
 
       - name: Prepare Temps instance
         # Authenticate public GitHub API requests made by the git-deploy

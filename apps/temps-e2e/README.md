@@ -853,6 +853,10 @@ every single backup. Confirmed live 3x, including that the second and third
 backups on the same service skip the archiving setup entirely (faster
 restore, no extra container recreate).
 
+### `postgres-cross-server-recovery-scenario`
+
+From `apps/temps-e2e`, run `TEMPS_BIN=/path/to/temps bun run e2e postgres-cross-server-recovery-scenario`. With Docker available, the scenario starts two disposable Temps servers with independent catalogs and one MinIO bucket. It writes 500 MiB to PostgreSQL, takes two WAL-G backups, and restores the older snapshot on the second server. It checks the row count, byte count, checksum, and absence of a table created between backups. The recovery CI shard runs the same command.
+
 ### `pitr-scenario` steps
 
 1. provision a real standalone postgres service, link it to a project,
