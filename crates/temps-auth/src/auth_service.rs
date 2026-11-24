@@ -1176,7 +1176,22 @@ impl AuthService {
                     user_update.password_reset_expires = Set(None);
                     user_update.must_change_password = Set(false);
                     user_update.updated_at = Set(Utc::now());
-                    user_update.update(transaction).await.map_err(Into::into)
+                    let updated = user_update.update(transaction).await?;
+
+                    // A reset is what someone does when they believe the
+                    // password is known to someone else. Any session opened
+                    // with the old password (or stolen from this account)
+                    // must end with it, in the same transaction, so a
+                    // hijacked session cannot outlive the reset.
+                    let revoked = temps_entities::sessions::Entity::delete_many()
+                        .filter(temps_entities::sessions::Column::UserId.eq(updated.id))
+                        .exec(transaction)
+                        .await?;
+                    info!(
+                        "Password reset for user {} revoked {} existing session(s)",
+                        updated.id, revoked.rows_affected
+                    );
+                    Ok(updated)
                 })
             })
             .await
@@ -2502,6 +2517,57 @@ mod tests {
             password: "newSecurePassword123!".to_string(),
         };
         auth_service.login(login).await.unwrap();
+    }
+
+    /// A password reset is how a user recovers from a leaked password, so a
+    /// session opened before the reset (possibly by whoever holds the old
+    /// password) must not survive it.
+    #[tokio::test]
+    async fn email_password_reset_revokes_existing_sessions() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "reset-revokes@example.com", "OldPassword123!").await;
+        let other_user =
+            create_test_user(&db.db, "bystander@example.com", "Bystander123!").await;
+
+        let hijacked_session = auth_service.create_session(user.id).await.unwrap();
+        let bystander_session = auth_service.create_session(other_user.id).await.unwrap();
+
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(
+            PasswordTokenPurpose::EmailReset.stored_value(&reset_token),
+        ));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        auth_service
+            .reset_password(ResetPasswordRequest {
+                token: reset_token,
+                new_password: "BrandNewPassword123!".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            auth_service
+                .verify_session_details(&hijacked_session)
+                .await
+                .is_err(),
+            "a session opened before the reset must be revoked"
+        );
+        let remaining = sessions::Entity::find()
+            .filter(sessions::Column::UserId.eq(user.id))
+            .count(db.db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(remaining, 0);
+        assert!(
+            auth_service
+                .verify_session_details(&bystander_session)
+                .await
+                .is_ok(),
+            "another user's session must be untouched"
+        );
     }
 
     /// Issue #1078: a user who lost their password (no email provider
