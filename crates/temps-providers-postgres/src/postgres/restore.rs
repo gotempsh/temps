@@ -702,12 +702,8 @@ impl PostgresService {
         if s3_credentials.uses_path_style() {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
-        if let Some(name) = snapshot_name {
-            walg_env.push(format!("WALG_FETCH_SNAPSHOT={name}"));
-        }
-        if let Some(target_user_data) = target_user_data {
-            walg_env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
-        }
+        let selector = WalgFetchSelector::new(snapshot_name, target_user_data);
+        walg_env.extend(selector.env_entry());
 
         use bollard::exec::StartExecOptions;
         let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
@@ -722,14 +718,8 @@ impl PostgresService {
         // paths on that volume — not the original container's writable layer.
         info!("Fetching WAL-G backup to temporary directory on shared volume");
         let restore_temp = WALG_RESTORE_TEMP;
-        let fetch_target = if snapshot_name.is_some() {
-            "\"$WALG_FETCH_SNAPSHOT\""
-        } else if target_user_data.is_some() {
-            "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
-        } else {
-            "LATEST"
-        };
-        let fetch_cmd_str = Self::walg_fetch_command(restore_temp, fetch_target);
+        let fetch_target = selector.fetch_argument();
+        let fetch_cmd_str = Self::walg_fetch_command(restore_temp, &fetch_target);
         let fetch_cmd = vec!["sh", "-c", &fetch_cmd_str];
 
         let exec = self
@@ -1336,6 +1326,80 @@ mod tests {
         assert!(
             command.ends_with("exit $rc; }"),
             "keeps the fetch exit code: {command}"
+        );
+    }
+
+    /// Runs the real fetch command for `selector` against a stand-in `wal-g`
+    /// that applies WAL-G's own argument check: a backup name together with
+    /// target user data (by flag or by its `WALG_FETCH_TARGET_USER_DATA`
+    /// setting) is refused. Returns the stand-in's exit code.
+    #[cfg(unix)]
+    fn run_fetch_against_walg_argument_check(selector: WalgFetchSelector<'_>) -> Option<i32> {
+        let dir = std::env::temp_dir().join(format!(
+            "walg-select-{}-{}",
+            std::process::id(),
+            selector.fetch_argument().len()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let stand_in = dir.join("wal-g");
+        std::fs::write(
+            &stand_in,
+            "#!/bin/sh\n\
+             shift 2\n\
+             name=''; user_data=\"$WALG_FETCH_TARGET_USER_DATA\"\n\
+             while [ $# -gt 0 ]; do case \"$1\" in \
+             --target-user-data) user_data=\"$2\"; shift 2;; \
+             *) name=\"$1\"; shift;; esac; done\n\
+             if [ -n \"$name\" ] && [ -n \"$user_data\" ]; then exit 1; fi\n\
+             if [ -z \"$name\" ] && [ -z \"$user_data\" ]; then exit 2; fi\n\
+             exit 0\n",
+        )
+        .expect("write stand-in");
+        let command = PostgresService::walg_fetch_command(
+            &dir.join("t").display().to_string(),
+            &selector.fetch_argument(),
+        )
+        .replace(
+            "wal-g backup-fetch",
+            &format!("sh {} backup-fetch", stand_in.display()),
+        )
+        .replace(
+            "/tmp/walg_restore.log",
+            &dir.join("log").display().to_string(),
+        )
+        .replace(WALG_FETCH_PID_FILE, &dir.join("pid").display().to_string());
+        let mut process = std::process::Command::new("sh");
+        process
+            .arg("-c")
+            .arg(&command)
+            .env_remove("WALG_FETCH_TARGET_USER_DATA");
+        if let Some(entry) = selector.env_entry() {
+            let (name, value) = entry.split_once('=').expect("NAME=value");
+            process.env(name, value);
+        }
+        let status = process.status().expect("run fetch command");
+        let _ = std::fs::remove_dir_all(&dir);
+        status.code()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tracked_snapshot_fetches_by_name_without_also_selecting_user_data() {
+        // A tracked backup knows both its exact base name and its user data.
+        // WAL-G reads `WALG_FETCH_TARGET_USER_DATA` as its own setting and
+        // refuses a fetch that also names a backup, so exactly one is passed.
+        let both = WalgFetchSelector::new(Some("base_0001"), Some(r#"{"backup_uuid":"u-1"}"#));
+        assert_eq!(both, WalgFetchSelector::Snapshot("base_0001"));
+        assert_eq!(both.env_entry(), None);
+        assert_eq!(run_fetch_against_walg_argument_check(both), Some(0));
+
+        let by_user_data = WalgFetchSelector::new(None, Some(r#"{"backup_uuid":"u-1"}"#));
+        assert_eq!(run_fetch_against_walg_argument_check(by_user_data), Some(0));
+        assert!(!FETCH_TARGET_USER_DATA_ENV.starts_with("WALG_"));
+
+        assert_eq!(
+            run_fetch_against_walg_argument_check(WalgFetchSelector::new(None, None)),
+            Some(0)
         );
     }
 
