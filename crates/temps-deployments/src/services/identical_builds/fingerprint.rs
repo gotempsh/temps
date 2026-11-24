@@ -227,16 +227,64 @@ fn is_buildkit_setting(name: &str) -> bool {
     name.to_ascii_uppercase().starts_with("BUILDKIT_")
 }
 
-/// The names whose values the build can read. `None`: all of them.
-fn readable_names(dockerfile: DockerfileSource<'_>) -> Option<BTreeSet<String>> {
-    match dockerfile {
-        DockerfileSource::Generated => None,
-        DockerfileSource::Repository { contents } => {
-            let mut names = dockerfile_build_arg_names(contents)?;
-            names.extend(dockerfile_secret_mount_ids(contents));
-            names.extend(PREDEFINED_ARGS.iter().map(|name| name.to_string()));
-            names.extend(GENERATED_FILE_ARGS.iter().map(|name| name.to_string()));
-            Some(names)
+/// Picks the frontend that parses the Dockerfile, so it decides the image
+/// whether or not the Dockerfile declares it.
+const FRONTEND_SETTING: &str = "BUILDKIT_SYNTAX";
+
+/// Which build-time values the build can read.
+enum Readable {
+    /// A generated Dockerfile: every value except BuildKit settings, which no
+    /// generated Dockerfile declares.
+    Generated,
+    /// A repository Dockerfile that could not be analysed: every value.
+    Unknown,
+    /// A repository Dockerfile: the names it reads (`readable`), and among
+    /// them those it declares with `ARG` (`declared`), which count even when
+    /// they are BuildKit settings.
+    Names {
+        readable: BTreeSet<String>,
+        declared: BTreeSet<String>,
+    },
+}
+
+impl Readable {
+    fn of(dockerfile: DockerfileSource<'_>) -> Self {
+        match dockerfile {
+            DockerfileSource::Generated => Readable::Generated,
+            DockerfileSource::Repository { contents } => {
+                let Some(declared) = dockerfile_build_arg_names(contents) else {
+                    return Readable::Unknown;
+                };
+                let mut readable = declared.clone();
+                readable.extend(dockerfile_secret_mount_ids(contents));
+                readable.extend(PREDEFINED_ARGS.iter().map(|name| name.to_string()));
+                readable.extend(GENERATED_FILE_ARGS.iter().map(|name| name.to_string()));
+                Readable::Names { readable, declared }
+            }
+        }
+    }
+
+    fn decides_the_image(&self, name: &str) -> bool {
+        // A generated `.npmrc` carries these whatever the Dockerfile
+        // declares, and the proxy arguments are read without one.
+        if GENERATED_FILE_ARGS.contains(&name)
+            || PREDEFINED_ARGS.contains(&name)
+            || name.eq_ignore_ascii_case(FRONTEND_SETTING)
+        {
+            return true;
+        }
+        match self {
+            Readable::Unknown => true,
+            // A BuildKit setting nothing declares (the per-project cache
+            // namespace, inline cache) only changes how BuildKit builds.
+            Readable::Generated => !is_buildkit_setting(name),
+            Readable::Names { readable, declared } => {
+                if is_buildkit_setting(name) {
+                    declared.contains(name)
+                } else {
+                    readable.contains(name)
+                }
+            }
         }
     }
 }
@@ -244,18 +292,11 @@ fn readable_names(dockerfile: DockerfileSource<'_>) -> Option<BTreeSet<String>> 
 /// The build-time values that decide the image, sorted by name.
 fn considered_values<'a>(
     args: &'a [(String, String)],
-    readable: Option<&BTreeSet<String>>,
+    readable: &Readable,
 ) -> Vec<(&'a str, &'a str)> {
     let mut values: Vec<(&str, &str)> = args
         .iter()
-        .filter(|(name, _)| {
-            // A generated `.npmrc` carries these whatever the Dockerfile
-            // declares, and the proxy arguments are read without one.
-            GENERATED_FILE_ARGS.contains(&name.as_str())
-                || PREDEFINED_ARGS.contains(&name.as_str())
-                || (!is_buildkit_setting(name)
-                    && readable.is_none_or(|names| names.contains(name.as_str())))
-        })
+        .filter(|(name, _)| readable.decides_the_image(name))
         .map(|(name, value)| (name.as_str(), value.as_str()))
         .collect();
     values.sort();
@@ -299,9 +340,9 @@ pub fn identify(
         canonical.finish(key)
     };
 
-    let readable = readable_names(inputs.dockerfile);
-    let build_args = considered_values(inputs.build_args, readable.as_ref());
-    let buildkit_args = considered_values(inputs.buildkit_build_args, readable.as_ref());
+    let readable = Readable::of(inputs.dockerfile);
+    let build_args = considered_values(inputs.build_args, &readable);
+    let buildkit_args = considered_values(inputs.buildkit_build_args, &readable);
 
     let mut canonical = Canonical::new("build");
     canonical.field("connection", connection.as_bytes());
@@ -530,6 +571,53 @@ mod tests {
         let a = owned(None, &[("BUILDKIT_CACHE_MOUNT_NS", "project-1")]);
         let b = owned(None, &[("BUILDKIT_CACHE_MOUNT_NS", "project-2")]);
         assert_eq!(a.identify().fingerprint, b.identify().fingerprint);
+        let dockerfile = "FROM alpine\nARG REVISION\nRUN echo $REVISION\n";
+        let a = owned(
+            Some(dockerfile),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-1")],
+        );
+        let b = owned(
+            Some(dockerfile),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-2")],
+        );
+        assert_eq!(a.identify().fingerprint, b.identify().fingerprint);
+    }
+
+    #[test]
+    fn a_buildkit_argument_the_dockerfile_declares_is_an_image_input() {
+        let dockerfile =
+            "FROM alpine\nARG BUILDKIT_CHANNEL\nRUN echo $BUILDKIT_CHANNEL > /channel\n";
+        let blue = owned(Some(dockerfile), &[("BUILDKIT_CHANNEL", "blue")]);
+        let red = owned(Some(dockerfile), &[("BUILDKIT_CHANNEL", "red")]);
+        assert_ne!(blue.identify().fingerprint, red.identify().fingerprint);
+        assert_eq!(blue.identify().considered_values, 1);
+    }
+
+    #[test]
+    fn the_dockerfile_frontend_is_an_image_input_even_undeclared() {
+        for dockerfile in [None, Some("FROM alpine\nRUN true\n")] {
+            let a = owned(dockerfile, &[("BUILDKIT_SYNTAX", "docker/dockerfile:1.7")]);
+            let b = owned(dockerfile, &[("BUILDKIT_SYNTAX", "docker/dockerfile:1.9")]);
+            assert_ne!(
+                a.identify().fingerprint,
+                b.identify().fingerprint,
+                "{dockerfile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanalysable_dockerfile_counts_buildkit_settings_too() {
+        let unreadable = "FROM alpine\nARG $DYNAMIC\n";
+        let a = owned(
+            Some(unreadable),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-1")],
+        );
+        let b = owned(
+            Some(unreadable),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-2")],
+        );
+        assert_ne!(a.identify().fingerprint, b.identify().fingerprint);
     }
 
     #[test]
