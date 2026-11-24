@@ -210,7 +210,9 @@ async fn scan_s3_for_orphan_backups(
                                     } else {
                                         fill_tracked_location(entry, &location, "walg");
                                     }
-                                    continue;
+                                    if entry.location == location {
+                                        continue;
+                                    }
                                 }
                             }
                             Err(reason) => {
@@ -258,8 +260,11 @@ async fn scan_s3_for_orphan_backups(
                 let format = classify_backup_format(&key, Some(&engine))
                     .unwrap_or_else(|| "unknown".to_string());
                 if let Some(index) = key.rsplit('/').nth(1).and_then(|id| by_id.get(id)) {
-                    fill_tracked_location(&mut entries[*index], &key, &format);
-                    continue;
+                    let entry = &mut entries[*index];
+                    fill_tracked_location(entry, &key, &format);
+                    if entry.location == key {
+                        continue;
+                    }
                 }
                 entries.push(SourceBackupIndexEntry {
                     id: 0,
@@ -1292,6 +1297,7 @@ mod tests {
                 for (name, uid) in [
                     ("base_0001", "local-backup"),
                     ("base_0002", "foreign-backup"),
+                    ("base_0003", "local-backup"),
                 ] {
                     let sentinel = format!("external_services/postgres/service-a/walg/basebackups_005/{name}_backup_stop_sentinel.json");
                     s3.put_object()
@@ -1324,7 +1330,11 @@ mod tests {
         let tracked_id = plain.backups[0].id;
         let scanned = backups_b.list_source_backups(source_id, true).await?;
         assert!(scanned.scan_errors.is_empty(), "{:?}", scanned.scan_errors);
-        assert_eq!(scanned.backups.len(), 4);
+        assert_eq!(scanned.backups.len(), 5);
+        assert!(scanned.backups.iter().any(|entry| entry.source == "s3_scan"
+            && entry
+                .location
+                .ends_with("base_0003_backup_stop_sentinel.json")));
         assert!(scanned.backups.iter().any(|entry| entry
             .location
             .ends_with("base_0002_backup_stop_sentinel.json")));

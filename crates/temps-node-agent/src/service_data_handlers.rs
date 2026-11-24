@@ -1901,10 +1901,14 @@ mod tests {
 
         let runtime = Arc::new(crate::test_engines::StubRuntime::default());
         let state = agent_state(runtime.clone(), plugin_builder());
+        let snapshot =
+            "s3://backups/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        let mut body = walg_restore_body();
+        body["walg_prefix"] = serde_json::json!(snapshot);
         let (status, json) = post_json(
             app(state.clone()),
             "/agent/services/postgres/walg-restore",
-            walg_restore_body(),
+            body,
         )
         .await;
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
@@ -1918,6 +1922,7 @@ mod tests {
             panic!("the engine runs once: {}", asked.len());
         };
         assert_eq!(request.service_id, 8);
+        assert_eq!(request.walg_prefix, snapshot);
         assert!(matches!(
             &request.recovery_target,
             Some(temps_service_protocol::RecoveryTarget::Time { time })

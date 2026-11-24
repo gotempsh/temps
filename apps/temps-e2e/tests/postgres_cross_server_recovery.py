@@ -105,15 +105,19 @@ class Server:
 
 
 class PostgresCrossServerRecovery(unittest.TestCase):
-    def container(self, port, image, env):
+    def container(self, port, image, env, *command):
         args = [arg for key in env for arg in ("-e", key)]
         cid = docker(
             "run",
             "-d",
+            # WAL-G reaches MinIO by this DNS name from the database container.
+            "--name",
+            f"recovery-{self.run_id}-{port}",
             "-p",
             f"127.0.0.1::{port}",
             *args,
             image,
+            *command,
             env={**os.environ, **env},
         )
         self.addCleanup(docker, "rm", "-fv", cid)
@@ -134,8 +138,10 @@ class PostgresCrossServerRecovery(unittest.TestCase):
         )
         self.store, address = self.container(
             9000,
-            "rustfs/rustfs:1.0.0@sha256:8cc9801755448b71a786705ce76692c77e14936cccd87cf2fc31842e58f4d1ff",
-            {"RUSTFS_ACCESS_KEY": "test-access", "RUSTFS_SECRET_KEY": self.password},
+            "cgr.dev/chainguard/minio@sha256:f2e56aceb4d38ad9b05c901270946e2353b19f86ba4396f25cf75b15b455b38c",
+            {"MINIO_ROOT_USER": "test-access", "MINIO_ROOT_PASSWORD": self.password},
+            "server",
+            "/tmp/backups",
         )
         self.source = {
             "name": "shared",
