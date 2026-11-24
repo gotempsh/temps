@@ -46,6 +46,8 @@ pub mod gate_sessions;
 pub mod agent_run_logs;
 pub mod agent_runs;
 pub mod agent_secrets;
+pub mod identical_build_mode;
+pub mod identical_builds;
 pub mod image_ownership_identity;
 pub mod project_agents;
 pub mod project_autofix_settings;

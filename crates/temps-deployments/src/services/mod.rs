@@ -22,6 +22,8 @@ pub use temps_nodes::services::node_ssh_enrollment;
 pub use temps_nodes::services::wireguard_mesh;
 pub use temps_nodes::services::worker_metrics_collector;
 
+pub mod identical_builds;
+
 pub mod job_processor;
 pub use job_processor::*;
 

@@ -251,6 +251,21 @@ export const PROJECT_SETTINGS_INDEX: readonly ProjectSettingEntry[] = [
     preset: 'dockerfile',
   },
   {
+    anchor: settingAnchor('identical-builds'),
+    title: 'Identical builds',
+    page: DELIVERY,
+    section: 'build',
+    keywords: [
+      'build once',
+      'share image',
+      'reuse image',
+      'queue builds',
+      'concurrent builds',
+      'same commit',
+      'duplicate builds',
+    ],
+  },
+  {
     anchor: settingAnchor('resource-limits'),
     title: 'Default CPU and memory',
     page: DELIVERY,
