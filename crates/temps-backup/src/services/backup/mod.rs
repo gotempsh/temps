@@ -106,6 +106,7 @@ use retention::{retention_cutoff, retention_expiry, validate_retention_period};
 pub use retention::{
     RetentionCleanupFailure, RetentionCleanupReport, MAX_RETENTION_DAYS_FOR_SQL_ARITHMETIC,
 };
+pub use s3_sources::{PromotedDefaultSource, S3SourceDeletion};
 use schedules::exclude_source_backing_services;
 pub use types::{
     BackupAlertEntry, BackupTriggerParams, ChildBackupEntry, EnqueuedJob, ScheduleRunContext,
