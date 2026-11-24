@@ -89,10 +89,14 @@ project's image:
   value counts;
 - Docker's predefined proxy arguments and `NPM_TOKEN`/`NPM_RC` (which become a
   generated `.npmrc` in the context) always count;
-- `BUILDKIT_*` arguments are BuildKit settings, not image inputs. The
-  cache-mount namespace is one per project and environment, so counting it
-  would make every cross-project match impossible; it is left out, as the
-  existing custom-Dockerfile secret planner does.
+- `BUILDKIT_*` arguments are BuildKit settings, and count only when they can
+  change the image: `BUILDKIT_SYNTAX` always (it picks the frontend that
+  parses the Dockerfile), any other one when the repository Dockerfile
+  declares it with `ARG`, and all of them when the Dockerfile cannot be
+  analysed. The cache-mount namespace is one per project and environment, so
+  counting it when nothing reads it would make every cross-project match
+  impossible; an unanalysable Dockerfile therefore never shares across
+  projects, which errs toward building.
 
 Values never leave the planner's sealed envelope in clear: only the keyed
 hash is stored, so a stored fingerprint cannot be brute-forced back into a
@@ -119,6 +123,10 @@ heartbeat, and for a succeeded share build the image it produced.
   waits"; two processes racing for the same group cannot both win, the loser
   hits the index and keeps waiting. No advisory lock is held for the length of
   a build and no pool connection is pinned.
+- **Reuse is checked again after the claim**: a share build that wins its
+  group looks for a reusable image once more before building, because the
+  build it waited for can succeed between its last check and its claim. If
+  one is found it records the reuse, which releases the group.
 - **Line order**: oldest waiting row first; a waiting row whose heartbeat is
   stale (its process died) loses its place.
 - **Waiting holds nothing**: the wait happens in the build job before the

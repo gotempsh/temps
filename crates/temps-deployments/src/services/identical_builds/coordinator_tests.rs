@@ -830,3 +830,75 @@ async fn a_control_plane_image_that_is_gone_is_not_reused() {
         AdmissionEvent::ReuseUnavailable { reason, .. } if reason.contains("a:latest")
     )));
 }
+
+/// Reports `pruned_tag` gone, and finishes `leader` while doing so: the
+/// leader succeeds after the follower's reuse check found nothing and
+/// before it claims the group.
+struct LeaderFinishesDuringTheCheck {
+    pruned_tag: &'static str,
+    leader: tokio::sync::Mutex<Option<BuildLease>>,
+    leader_image: SharedImage,
+}
+
+#[async_trait::async_trait]
+impl AdmissionObserver for LeaderFinishesDuringTheCheck {
+    async fn observe(&self, _event: AdmissionEvent) {}
+
+    async fn control_plane_image_missing(&self, image: &SharedImage) -> Option<String> {
+        if image.image_tag != self.pruned_tag {
+            return None;
+        }
+        if let Some(lease) = self.leader.lock().await.take() {
+            lease.succeed(Some(&self.leader_image)).await.unwrap();
+        }
+        Some(format!(
+            "the control plane no longer holds '{}'",
+            image.image_tag
+        ))
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_leader_that_succeeds_just_before_the_claim_is_still_reused() {
+    let Some(f) = fixture().await else { return };
+    let (a, b, c) = (
+        f.project("a").await,
+        f.project("b").await,
+        f.project("c").await,
+    );
+    let mut leader = f.ticket(b, IdenticalBuildMode::Share, "fp-1").await;
+    leader.scope = IdenticalBuildScope::Fingerprint;
+    let lease = f.build(&leader).await;
+    // An identical image built meanwhile in another group, whose copy the
+    // observer reports gone.
+    let mut older = f.ticket(a, IdenticalBuildMode::Share, "fp-1").await;
+    older.scope = IdenticalBuildScope::Source;
+    f.build(&older)
+        .await
+        .succeed(Some(&image("older:latest")))
+        .await
+        .unwrap();
+
+    let mut follower = f.ticket(c, IdenticalBuildMode::Share, "fp-1").await;
+    follower.scope = IdenticalBuildScope::Fingerprint;
+    let observer = LeaderFinishesDuringTheCheck {
+        pruned_tag: "older:latest",
+        leader: tokio::sync::Mutex::new(Some(lease)),
+        leader_image: image("leader:latest"),
+    };
+    let admission = f.coordinator.admit(&follower, &observer).await.unwrap();
+    match admission {
+        Admission::Reuse(reused) => {
+            assert_eq!(reused.deployment_id, leader.deployment_id);
+            assert_eq!(reused.image.image_tag, "leader:latest");
+        }
+        other => panic!("the follower should reuse the leader's image, got {other:?}"),
+    }
+    let (state, source, _) = f.state(follower.deployment_id).await;
+    assert_eq!(state, "reused");
+    assert!(source.is_some());
+    // The follower released the group it briefly held.
+    let mut next = f.ticket(a, IdenticalBuildMode::Queue, "fp-1").await;
+    next.scope = IdenticalBuildScope::Fingerprint;
+    f.build(&next).await.succeed(None).await.unwrap();
+}

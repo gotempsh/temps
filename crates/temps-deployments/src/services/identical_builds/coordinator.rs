@@ -349,6 +349,12 @@ impl BuildLease {
         self.build_id
     }
 
+    /// The row was already recorded `reused`: stop the heartbeat without
+    /// marking it cancelled.
+    fn release_after_reuse(mut self) {
+        self.finished = true;
+    }
+
     /// The build succeeded. `image` is offered to identical share builds; a
     /// queue build passes `None`.
     pub async fn succeed(mut self, image: Option<&SharedImage>) -> Result<(), IdenticalBuildError> {
@@ -519,10 +525,30 @@ impl IdenticalBuildCoordinator {
             self.reap_stale(&queue_key, ticket.deployment_id).await?;
             if self.try_claim(build_id, &queue_key, ticket).await? {
                 guard.disarm();
+                // Holding the group now (the lease releases it on any error
+                // below). The build this one waited for may have succeeded
+                // between the reuse check above and the claim: look once
+                // more, or this would build an image it could reuse.
+                let lease = self.lease(build_id, ticket, queue_key);
+                if ticket.mode.shares_images() {
+                    if let Some(reused) = self
+                        .find_reachable_reusable(ticket, observer, &mut unreachable)
+                        .await?
+                    {
+                        self.mark_reused(build_id, ticket, &reused).await?;
+                        lease.release_after_reuse();
+                        info!(
+                            deployment_id = ticket.deployment_id,
+                            source_deployment_id = reused.deployment_id,
+                            "Reusing the image of an identical build that finished as this one claimed its group"
+                        );
+                        return Ok(Admission::Reuse(Box::new(reused)));
+                    }
+                }
                 if let Some(leader) = followed.take() {
                     self.report_end(&leader, observer, ticket).await?;
                 }
-                return Ok(Admission::Build(self.lease(build_id, ticket, queue_key)));
+                return Ok(Admission::Build(lease));
             }
 
             let leader = self.current_leader(&queue_key, ticket).await?;
