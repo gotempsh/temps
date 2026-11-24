@@ -636,6 +636,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_mount_contents_are_not_image_inputs() {
+        // ADR 113 D2: BuildKit keys a step's layers without its cache
+        // mounts' contents, and so does reuse. Each project reads its own
+        // namespace; an identical build still shares.
+        let dockerfile = "FROM node:22\nRUN --mount=type=cache,target=/root/.npm npm ci\n";
+        let a = owned(
+            Some(dockerfile),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-1")],
+        );
+        let b = owned(
+            Some(dockerfile),
+            &[("BUILDKIT_CACHE_MOUNT_NS", "project-2")],
+        );
+        assert_eq!(a.identify().fingerprint, b.identify().fingerprint);
+    }
+
+    #[test]
     fn inline_cache_metadata_is_not_an_image_input() {
         let dockerfile = "FROM alpine\nRUN true\n";
         for source in [None, Some(dockerfile)] {

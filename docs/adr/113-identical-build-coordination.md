@@ -101,6 +101,24 @@ project's image:
   per project and environment, so counting it when nothing reads it would
   make every cross-project match impossible; an unanalysable Dockerfile
   therefore never shares across projects, which errs toward building.
+- **Cache-mount contents are not image inputs**, including when a Dockerfile
+  uses `RUN --mount=type=cache` (BuildKit applies the namespace to each such
+  mount, so projects read different caches). This is a deliberate choice, not
+  something the fingerprint detects:
+  - BuildKit makes the same assumption: a step's layer cache key never
+    includes what its cache mounts held, so one project's own builds already
+    reuse layers whatever the cache contained. Reuse here is that assumption
+    one level up.
+  - Counting the namespace whenever a Dockerfile has a cache mount would end
+    sharing across projects and environments for most current Dockerfiles
+    (package-manager caches), the case this feature exists for.
+  - What a follower deploys is the leader's build output, including anything
+    that build's cache contributed. Share mode already requires both projects
+    to opt in with the same access boundary (D4), so this is the trust it
+    asks for. A Dockerfile that copies cache contents into the image
+    (`RUN --mount=type=cache,target=/c cp -r /c /app`) depends on build
+    history even within one project; such a project should use `queue`,
+    which never reuses an image.
 
 Values never leave the planner's sealed envelope in clear: only the keyed
 hash is stored, so a stored fingerprint cannot be brute-forced back into a
