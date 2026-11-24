@@ -17,7 +17,6 @@
 //! `OidcService::resolve_user`).
 
 use axum::http::StatusCode;
-use sha2::{Digest, Sha256};
 use temps_core::problemdetails::Problem;
 use thiserror::Error;
 
@@ -36,7 +35,7 @@ pub(crate) const RESEND_COOLDOWN_SECONDS: i64 = 60;
 /// is a random UUID with 122 bits of entropy, so an unsalted fast hash is
 /// sufficient: there is nothing to brute-force.
 pub(crate) fn hash_verification_token(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
+    temps_core::crypto::sha256_hex(token)
 }
 
 #[derive(Debug, Error)]
