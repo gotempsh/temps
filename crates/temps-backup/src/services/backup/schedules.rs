@@ -118,7 +118,7 @@ impl BackupService {
         request: CreateBackupScheduleRequest,
         authority: BackupScheduleAuthority,
     ) -> Result<BackupSchedule, BackupError> {
-        use sea_orm::{ActiveModelTrait, EntityTrait, Set};
+        use sea_orm::{ActiveModelTrait, EntityTrait, QuerySelect, Set};
 
         let target_all = request.target_all_services.unwrap_or(true);
         let include_control_plane = request.include_control_plane.unwrap_or(true);
@@ -172,6 +172,29 @@ impl BackupService {
         // A scheduler tick can therefore never observe an enabled specific-
         // target schedule before its databases have been attached.
         let txn = self.db.begin().await?;
+        // Hold the source until the schedule commits. Deleting a source locks
+        // its row FOR UPDATE, so a delete that is under way finishes first and
+        // the source is read as gone, and one that starts later waits and then
+        // sees this schedule and refuses. Without the hold, the insert failed
+        // on the foreign key with a database error.
+        if temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .lock_shared()
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            return Err(match request.s3_source_id {
+                Some(_) => BackupError::NotFound {
+                    resource: "S3Source".to_string(),
+                    detail: format!("S3 source {s3_source_id} not found"),
+                },
+                None => BackupError::Validation(format!(
+                    "The default S3 source {s3_source_id} was deleted while backup schedule \
+                     '{}' was being created; retry to use the current default",
+                    request.name
+                )),
+            });
+        }
         let now = chrono::Utc::now();
         let tags_json = serde_json::to_string(&request.tags)?;
         let new_schedule = temps_entities::backup_schedules::ActiveModel {

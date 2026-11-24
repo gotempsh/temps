@@ -361,9 +361,14 @@ impl BackupService {
             .exec(&txn)
             .await?;
 
+        // Read back in the same transaction: after the commit, a concurrent
+        // delete or set-default could already have changed the row.
+        let updated = temps_entities::s3_sources::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .ok_or_else(|| s3_source_not_found(id))?;
         txn.commit().await?;
 
-        let updated = self.get_s3_source(id).await?;
         info!("S3 source {} is now the default", updated.name);
         Ok(updated)
     }

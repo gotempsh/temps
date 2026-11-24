@@ -1109,15 +1109,61 @@ async fn test_update_s3_source_tls_on_an_aws_source_is_ignored() {
 /// A real database: the default-assignment race and the single-default
 /// index only exist in PostgreSQL, not in the mock.
 async fn real_database_service() -> Option<(temps_test_utils::TestDatabase, BackupService)> {
-    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
-        Ok(test_db) => test_db,
-        Err(error) => {
-            println!("TestDatabase unavailable, skipping: {error}");
-            return None;
-        }
-    };
+    // Skip only when there is no Docker. A database that is reachable but
+    // fails to set up is a failure, not a reason to pass without asserting.
+    if !temps_test_utils::docker_available().await {
+        println!("Docker not available, skipping");
+        return None;
+    }
+    let test_db = temps_test_utils::TestDatabase::with_migrations()
+        .await
+        .expect("test database with migrations");
     let service = make_scope_test_service(test_db.db.clone());
     Some((test_db, service))
+}
+
+/// The backend pid serving `txn`.
+async fn backend_pid(txn: &sea_orm::DatabaseTransaction) -> i32 {
+    use sea_orm::{ConnectionTrait, Statement};
+    txn.query_one(Statement::from_string(
+        DatabaseBackend::Postgres,
+        "SELECT pg_backend_pid() AS pid",
+    ))
+    .await
+    .expect("backend pid")
+    .expect("a row")
+    .try_get::<i32>("", "pid")
+    .expect("pid column")
+}
+
+/// Wait until some other backend is blocked waiting on a lock `blocker`
+/// holds, so a race test commits the competing transaction only once the
+/// operation under test is provably waiting on it. Bounded: panics after 10s.
+async fn wait_until_blocked_by(db: &sea_orm::DatabaseConnection, blocker: i32) {
+    use sea_orm::{ConnectionTrait, Statement};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let blocked = db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT count(*)::int AS blocked FROM pg_stat_activity \
+                 WHERE $1 = ANY(pg_blocking_pids(pid))",
+                [blocker.into()],
+            ))
+            .await
+            .expect("pg_stat_activity")
+            .expect("a row")
+            .try_get::<i32>("", "blocked")
+            .expect("blocked column");
+        if blocked > 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "nothing blocked on backend {blocker} within 10s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 fn source_request(name: &str) -> CreateS3SourceRequest {
@@ -1328,6 +1374,7 @@ async fn a_backup_committed_during_delete_stops_the_delete() {
     .expect("user");
 
     let insert = test_db.db.begin().await.expect("insert transaction");
+    let insert_pid = backend_pid(&insert).await;
     let backup = temps_entities::backups::ActiveModel {
         name: Set("nightly".to_string()),
         backup_id: Set("4d1c2b3a-5e6f-4a7b-8c9d-0e1f2a3b4c5d".to_string()),
@@ -1351,8 +1398,9 @@ async fn a_backup_committed_during_delete_stops_the_delete() {
         let id = source.id;
         tokio::spawn(async move { service.delete_s3_source(id).await })
     };
-    // Let the delete reach the source row lock while the insert is open.
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The delete must be waiting on the open insert (its key-share lock on
+    // the source row) before the insert commits.
+    wait_until_blocked_by(test_db.db.as_ref(), insert_pid).await;
     insert.commit().await.expect("backup commits");
 
     let result = deleting.await.expect("delete task");
@@ -1392,6 +1440,7 @@ async fn set_default_on_a_source_deleted_meanwhile_keeps_the_current_default() {
 
     // A delete of `target` that promotes `other`, held open under the lock.
     let delete = test_db.db.begin().await.expect("delete transaction");
+    let delete_pid = backend_pid(&delete).await;
     delete
         .execute(Statement::from_string(
             DatabaseBackend::Postgres,
@@ -1418,7 +1467,8 @@ async fn set_default_on_a_source_deleted_meanwhile_keeps_the_current_default() {
         let id = target.id;
         tokio::spawn(async move { service.set_default_s3_source(id).await })
     };
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    // The setter must be waiting on the advisory lock the delete holds.
+    wait_until_blocked_by(test_db.db.as_ref(), delete_pid).await;
     delete.commit().await.expect("delete commits");
 
     let result = setting.await.expect("set-default task");
@@ -1432,5 +1482,72 @@ async fn set_default_on_a_source_deleted_meanwhile_keeps_the_current_default() {
         default_source_ids(test_db.db.as_ref()).await,
         vec![other.id],
         "the promoted default must survive"
+    );
+}
+
+/// A schedule created without `s3_source_id` while its resolved default
+/// source is being deleted used to fail on the foreign key with a database
+/// error. It now holds the source for its transaction, sees it gone once the
+/// delete commits, and says so.
+#[tokio::test]
+async fn a_schedule_on_a_default_source_deleted_meanwhile_is_a_validation_error() {
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let service = Arc::new(service);
+    let source = service
+        .persist_verified_s3_source(source_request("doomed-default"))
+        .await
+        .expect("default source");
+
+    let delete = test_db.db.begin().await.expect("delete transaction");
+    let delete_pid = backend_pid(&delete).await;
+    s3_sources::Entity::delete_by_id(source.id)
+        .exec(&delete)
+        .await
+        .expect("delete source (uncommitted)");
+
+    let creating = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .create_backup_schedule(
+                    crate::handlers::backup_handler::CreateBackupScheduleRequest {
+                        name: "nightly".to_string(),
+                        backup_type: "full".to_string(),
+                        retention_period: 7,
+                        s3_source_id: None,
+                        schedule_expression: "0 0 3 * * *".to_string(),
+                        enabled: true,
+                        description: None,
+                        tags: vec![],
+                        max_runtime_secs: None,
+                        target_all_services: None,
+                        include_control_plane: None,
+                        service_ids: vec![],
+                    },
+                    temps_core::BackupScheduleAuthority::InstanceAdmin,
+                )
+                .await
+        })
+    };
+    wait_until_blocked_by(test_db.db.as_ref(), delete_pid).await;
+    delete.commit().await.expect("delete commits");
+
+    let result = creating.await.expect("create task");
+    assert!(
+        matches!(
+            result,
+            Err(BackupError::Validation(ref message))
+                if message.contains(&source.id.to_string()) && message.contains("retry")
+        ),
+        "expected a validation error naming the deleted default, got {result:?}"
+    );
+    assert_eq!(
+        temps_entities::backup_schedules::Entity::find()
+            .count(test_db.db.as_ref())
+            .await
+            .expect("schedule count"),
+        0
     );
 }
