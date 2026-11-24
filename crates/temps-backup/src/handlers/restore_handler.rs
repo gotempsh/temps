@@ -371,18 +371,13 @@ async fn filter_accessible_restore_runs(
     Ok(runs
         .into_iter()
         .filter(|run| {
-            let source_allowed = if let Some(backup_id) = run.source_backup_id {
-                match producers_by_backup.get(&backup_id) {
-                    Some(producer_service_ids) if !producer_service_ids.is_empty() => {
-                        producer_service_ids
-                            .iter()
-                            .all(|service_id| accessible_services.contains(service_id))
-                    }
-                    Some(_) | None => caller_is_admin,
-                }
-            } else {
-                caller_is_admin || !project_aware
-            };
+            let source_allowed = restore_source_visible(
+                run.source_backup_id,
+                &producers_by_backup,
+                &accessible_services,
+                caller_is_admin,
+                project_aware,
+            );
             let target_allowed = run.target_service_id.is_none_or(|target_service_id| {
                 target_service_id == run.source_service_id
                     || accessible_services.contains(&target_service_id)
@@ -390,6 +385,22 @@ async fn filter_accessible_restore_runs(
             source_allowed && target_allowed
         })
         .collect())
+}
+
+fn restore_source_visible(
+    backup_id: Option<i32>,
+    producers: &BTreeMap<i32, Vec<i32>>,
+    accessible_services: &BTreeSet<i32>,
+    caller_is_admin: bool,
+    project_aware: bool,
+) -> bool {
+    let Some(id) = backup_id else {
+        return caller_is_admin || !project_aware;
+    };
+    match producers.get(&id) {
+        Some(ids) if !ids.is_empty() => ids.iter().all(|id| accessible_services.contains(id)),
+        _ => caller_is_admin,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -730,9 +741,6 @@ async fn cancel_restore_run(
         .get_restore_run(id)
         .await
         .map_err(Problem::from)?;
-    if run.source_backup_id.is_none() {
-        require_ownerless_restore_admin(&app_state, &auth, "cancel a raw-location restore run")?;
-    }
     require_restore_run_read_access(&app_state, &auth, &run, "cancel a restore run").await?;
 
     // Stopping a restore takes the same entitlement as starting one onto the
@@ -980,6 +988,42 @@ mod tests {
     use super::*;
     use crate::handlers::authz::deployment_token_may_access;
     use axum::http::StatusCode;
+
+    #[test]
+    fn restore_history_checks_nullable_source_and_all_producers() {
+        let producers = BTreeMap::from([(7, vec![2, 3])]);
+        let services = BTreeSet::from([2, 3]);
+        assert!(!restore_source_visible(
+            None, &producers, &services, false, true
+        ));
+        assert!(restore_source_visible(
+            None, &producers, &services, true, true
+        ));
+        assert!(restore_source_visible(
+            None, &producers, &services, false, false
+        ));
+        assert!(restore_source_visible(
+            Some(7),
+            &producers,
+            &services,
+            false,
+            true
+        ));
+        assert!(!restore_source_visible(
+            Some(7),
+            &producers,
+            &BTreeSet::from([2]),
+            false,
+            true
+        ));
+        assert!(!restore_source_visible(
+            Some(8),
+            &producers,
+            &services,
+            false,
+            true
+        ));
+    }
 
     /// A deployment token is minted for one project; a restore that touches a
     /// service outside it must be refused even before any plugin-provided
