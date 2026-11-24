@@ -2445,35 +2445,22 @@ async fn run_restore_worker(
     // The worker is done with its cancellation token.
     drop(registration);
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
-    match (&result, &persisted) {
-        (Ok(_), Ok(())) => info!("Restore run {} completed successfully", run_id),
-        (Err(RestoreError::Cancelled { message, .. }), Ok(())) => {
-            info!("Restore run {} cancelled: {}", run_id, message)
+    let outcome = match persisted {
+        Ok(disposition) => disposition.worker_outcome(run_id, result),
+        Err(error) => {
+            error!(run_id, %error, "Could not persist the restore outcome; startup reconciliation will retry");
+            Some(Err(error))
         }
-        (Err(e), Ok(())) => error!("Restore run {} failed: {}", run_id, e),
-        (_, Err(e)) => error!(
-            "Restore run {} finished but its terminal state could not be recorded: {}. \
-             It stays active until the next restart reconciles it as interrupted.",
-            run_id, e
-        ),
-    }
-
-    // A cancellation is the operator's decision, not a restore failure, so
-    // it is not reported as one.
-    if matches!(result, Err(RestoreError::Cancelled { .. })) && persisted.is_ok() {
-        return Ok(());
-    }
-
-    // Reported only once the run's final state is persisted: a restore whose
-    // completion could not be recorded is not a success.
-    let outcome = match (&result, &persisted) {
-        (Err(e), _) | (Ok(_), Err(e)) => Err(e.to_string()),
-        (Ok(_), Ok(())) => Ok(()),
     };
-    telemetry.report(restore_outcome_event(mode_label, elapsed, outcome));
-
-    persisted?;
-    result.map(|_| ())
+    let Some(outcome) = outcome else {
+        return Ok(());
+    };
+    telemetry.report(restore_outcome_event(
+        mode_label,
+        elapsed,
+        outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
+    ));
+    outcome
 }
 
 /// Anonymous restore outcome: the restore mode, a duration band and, on
@@ -3770,6 +3757,40 @@ impl TerminalWriteRetry {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalDisposition {
+    WorkerResult,
+    Cancelled,
+    AlreadySettled,
+}
+
+impl TerminalDisposition {
+    /// Only the worker that recorded an outcome reports it to telemetry.
+    fn worker_outcome(
+        self,
+        run_id: i32,
+        result: Result<Option<i32>, RestoreError>,
+    ) -> Option<Result<(), RestoreError>> {
+        match self {
+            Self::Cancelled => {
+                info!(run_id, "Restore cancelled");
+                None
+            }
+            Self::AlreadySettled => {
+                warn!(run_id, "Restore was already settled");
+                None
+            }
+            Self::WorkerResult => {
+                match &result {
+                    Ok(_) => info!(run_id, "Restore completed"),
+                    Err(error) => error!(run_id, %error, "Restore failed"),
+                }
+                Some(result.map(|_| ()))
+            }
+        }
+    }
+}
+
 /// Record a run's terminal outcome. Only an active (`pending`/`running`) row
 /// is updated, so a run already reconciled as `interrupted` is never
 /// overwritten with an outcome nobody observed end to end.
@@ -3778,8 +3799,11 @@ async fn persist_terminal_state(
     run_id: i32,
     result: &Result<Option<i32>, RestoreError>,
     retry: TerminalWriteRetry,
-) -> Result<(), RestoreError> {
-    use sea_orm::sea_query::Expr;
+) -> Result<TerminalDisposition, RestoreError> {
+    use sea_orm::{
+        sea_query::{Expr, Query},
+        ConnectionTrait, QueryTrait,
+    };
     use temps_entities::restore_runs::{Column, Entity};
 
     let now = Utc::now();
@@ -3823,23 +3847,24 @@ async fn persist_terminal_state(
                 .into(),
             ),
     };
-    let update = update
+    let mut update = update
         .filter(Column::Id.eq(run_id))
-        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES));
-
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .into_query();
+    update.returning(Query::returning().column(Column::Status));
+    let statement = db.get_database_backend().build(&update);
     let mut delay = retry.base_delay;
     let mut attempt = 1;
     loop {
-        match update.clone().exec(db).await {
-            Ok(outcome) => {
-                if outcome.rows_affected == 0 {
-                    warn!(
-                        "Restore run {} was no longer active when its outcome was recorded; \
-                         leaving its stored status unchanged",
-                        run_id
-                    );
-                }
-                return Ok(());
+        match db.query_one(statement.clone()).await {
+            Ok(None) => return Ok(TerminalDisposition::AlreadySettled),
+            Ok(Some(row)) => {
+                let status: String = row.try_get("", "status")?;
+                return Ok(if status == "cancelled" {
+                    TerminalDisposition::Cancelled
+                } else {
+                    TerminalDisposition::WorkerResult
+                });
             }
             Err(e) if attempt < retry.attempts => {
                 warn!(
@@ -7689,7 +7714,7 @@ mod tests {
         let mut cancelled = new_run(service.id, backup.id, user.id, "in_place", None);
         cancelled.cancel_requested_at = Set(Some(Utc::now()));
         let cancelled = cancelled.insert(db.as_ref()).await?;
-        persist_terminal_state(
+        let disposition = persist_terminal_state(
             db.as_ref(),
             cancelled.id,
             &Err(RestoreError::Validation {
@@ -7698,6 +7723,7 @@ mod tests {
             TERMINAL_WRITE_RETRY,
         )
         .await?;
+        assert_eq!(disposition, TerminalDisposition::Cancelled);
         let terminal = load_run_for_update(db.as_ref(), cancelled.id).await?;
         assert_eq!(terminal.status, "cancelled");
         assert_eq!(terminal.phase, cancelled.phase);
@@ -7711,26 +7737,27 @@ mod tests {
     #[tokio::test]
     async fn terminal_write_is_retried_then_reported() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors(vec![
+            .append_query_errors(vec![
                 sea_orm::DbErr::Custom("connection reset".into()),
                 sea_orm::DbErr::Custom("connection reset".into()),
             ])
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
+            .append_query_results([[BTreeMap::from([(
+                "status",
+                sea_orm::Value::from("completed"),
+            )])]])
             .into_connection();
         let fast = TerminalWriteRetry {
             attempts: 3,
             base_delay: std::time::Duration::from_millis(1),
             max_delay: std::time::Duration::from_millis(2),
         };
-        persist_terminal_state(&db, 9, &Ok(None), fast)
+        let disposition = persist_terminal_state(&db, 9, &Ok(None), fast)
             .await
             .expect("third attempt succeeds");
+        assert_eq!(disposition, TerminalDisposition::WorkerResult);
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors(vec![
+            .append_query_errors(vec![
                 sea_orm::DbErr::Custom("down".into()),
                 sea_orm::DbErr::Custom("down".into()),
             ])
@@ -7743,6 +7770,32 @@ mod tests {
             .await
             .expect_err("gives up after the configured attempts");
         assert!(matches!(err, RestoreError::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lookup_failure_reports_only_the_outcome_recorded_by_this_worker(
+    ) -> Result<(), RestoreError> {
+        for status in [Some("cancelled"), Some("failed"), None] {
+            let rows: Vec<_> = status
+                .into_iter()
+                .map(|s| BTreeMap::from([("status", sea_orm::Value::from(s))]))
+                .collect();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows])
+                .into_connection();
+            let lookup = Err(RestoreError::BackupNotFound { backup_id: 42 });
+            let disposition = persist_terminal_state(&db, 9, &lookup, TERMINAL_WRITE_RETRY).await?;
+            let outcome = disposition.worker_outcome(9, lookup);
+            if status == Some("failed") {
+                assert!(matches!(
+                    outcome,
+                    Some(Err(RestoreError::BackupNotFound { backup_id: 42 }))
+                ));
+            } else {
+                assert!(outcome.is_none());
+            }
+        }
+        Ok(())
     }
 
     /// Fence double for the crash path; `fail` simulates an unreachable daemon.

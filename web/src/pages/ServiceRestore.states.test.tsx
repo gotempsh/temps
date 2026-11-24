@@ -165,7 +165,10 @@ function restorePage(seeds: PageSeeds) {
         ]}
       >
         {seeds.navigationHref && (
-          <Link to={seeds.navigationHref}>Open snapshot</Link>
+          <>
+            <Link to={seeds.navigationHref}>Open snapshot</Link>
+            {seeds.url && <Link to={seeds.url}>Return to snapshot</Link>}
+          </>
         )}
         <BreadcrumbProvider>
           <Routes>
@@ -548,7 +551,7 @@ describe('run tracking (#1237)', () => {
 describe('imported backup interaction', () => {
   installBrowserWindow()
 
-  test('a partial refresh keeps the selected orphan until a complete scan removes it', async () => {
+  test('partial scans retain the selected orphan across storage source changes until a complete scan removes it', async () => {
     let partial = true
     const api = mockApi({
       'GET /backups/s3-sources/1/backups': () =>
@@ -561,13 +564,28 @@ describe('imported backup interaction', () => {
     const { page, client } = restorePage({
       url: `/storage/${SERVICE_ID}/restore?source=1&location=${encodeURIComponent(locations[0])}`,
       scannedBackups: scannedRows([locations[0]]),
+      sources: {
+        data: [...sourceData, { ...sourceData[0], id: 2, is_default: false }],
+      },
+      navigationHref: `?source=2&location=${encodeURIComponent(locations[1])}`,
     })
+    seed(
+      client,
+      restoreSourceBackupsQuery(2, true).queryKey,
+      scannedRows([locations[1]])
+    )
     const view = render(page)
     try {
       await view.findByText(`Selected: ${locations[0]}`)
       fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
       await view.findByText('Previously discovered')
       expect(view.getByText(`Selected: ${locations[0]}`)).toBeTruthy()
+      fireEvent.click(view.getByRole('link', { name: 'Open snapshot' }))
+      await view.findByText(`Selected: ${locations[1]}`)
+      expect(view.queryByText('Previously discovered')).toBeNull()
+      fireEvent.click(view.getByRole('link', { name: 'Return to snapshot' }))
+      await view.findByText(`Selected: ${locations[0]}`)
+      expect(view.getByText('Previously discovered')).toBeTruthy()
       partial = false
       fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
       await view.findByText('The linked backup is not on this source')

@@ -1526,6 +1526,8 @@ jobs:
               (package(temps-providers*) and kind(=lib) and test(backup_and_restore_to_s3)) or
               (package(temps-backup) and (binary(workload_job_proof) or
                (kind(=lib) and (test(resolve_backup_location_from_s3_finds_mariadb) or
+                test(catalog_readiness_failure_restores_the_live_database) or
+                test(staged_catalog_recovers_an_older_base_without_the_live_wal) or
                 test(bundled_database_stops_retaining_wal_after_the_reconcile)))))
             extra_args: --no-capture
             test_threads: "1"

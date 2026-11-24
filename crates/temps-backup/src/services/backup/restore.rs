@@ -673,11 +673,26 @@ stage=$1
 snapshot=$2
 test -d "$stage"
 # The staged postmaster uses a private socket and never archives into the source.
-sock=$(mktemp -d)
+sock=$(mktemp -d "${TMPDIR:-/tmp}/pg.XXXXXXXX")
 cleanup() {
-    if [ "$started" = yes ] && [ -s "$stage/postmaster.pid" ]; then pg_ctl -D "$stage" -m immediate -w stop; fi
-    rm -rf "$sock"
+    status=$?
+    trap - EXIT
+    set +e
+    if [ "$started" = yes ] && [ -s "$stage/postmaster.pid" ]; then
+        if ! pg_ctl -D "$stage" -m immediate -t 60 -w stop; then
+            echo "Could not stop staged PostgreSQL. Inspect $stage and $sock/postgres.log before cleanup." >&2
+            exit "$status"
+        fi
+    fi
+    if [ "$status" -ne 0 ] && [ -s "$sock/postgres.log" ] &&
+        (umask 077 && tail -c 4096 "$sock/postgres.log" > "$sock/startup-error.log"); then
+        echo "Read $sock/startup-error.log in the catalog container for the PostgreSQL recovery diagnostic." >&2
+        rm -f "$sock/postgres.log" "$sock/restore-spec.json"
+    else
+        rm -rf "$sock"
+    fi
     if [ "$prepared" = no ]; then find "$stage" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; fi
+    exit "$status"
 }
 prepared=no
 started=no
@@ -880,9 +895,22 @@ async fn recover_catalog(
         }
     };
     let start = || docker.start_container(container, None::<StartContainerOptions>);
-    stop()
-        .await
-        .map_err(|e| failure("stop the catalog", e.to_string()))?;
+    if let Err(stop_error) = stop().await {
+        // The daemon may have stopped PostgreSQL before losing its reply.
+        // No directories have been swapped. Confirm the original is serving.
+        if let Err(error) =
+            ensure_original_catalog_ready(docker, container, database_url, readiness_timeout).await
+        {
+            return Err(failure("stop the catalog", format!("{stop_error}. {error}. Inspect the catalog container and its original data at {pgdata}; the staged copy is at {stage}.")));
+        }
+        if let Err(error) = cleanup_stage().await {
+            warn!(container, %stage, %error, "Original catalog is ready; could not remove the unused staged catalog");
+        }
+        return Err(failure(
+            "stop the catalog",
+            format!("{stop_error}. The original catalog is ready. Retry the restore."),
+        ));
+    }
     let installed = async {
         helper_exec(INSTALL_CATALOG)
             .await
@@ -917,6 +945,44 @@ async fn recover_catalog(
         warn!(container, %original, %error, "Restored catalog is ready; could not remove the previous catalog");
     }
     Ok(())
+}
+
+async fn ensure_original_catalog_ready(
+    docker: &bollard::Docker,
+    container: &str,
+    database_url: &str,
+    timeout: std::time::Duration,
+) -> Result<(), BackupError> {
+    use bollard::query_parameters::{InspectContainerOptions, StartContainerOptions};
+    let state = docker
+        .inspect_container(container, None::<InspectContainerOptions>)
+        .await
+        .map_err(|error| {
+            BackupError::ExternalService(format!(
+                "Could not inspect original catalog {container}: {error}"
+            ))
+        })?;
+    match state.state.and_then(|state| state.running) {
+        Some(false) => {
+            docker
+                .start_container(container, None::<StartContainerOptions>)
+                .await
+                .map_err(|error| {
+                    BackupError::ExternalService(format!(
+                        "Could not restart original catalog {container}: {error}"
+                    ))
+                })?;
+        }
+        Some(true) => {}
+        None => {
+            return Err(BackupError::ExternalService(format!(
+                "Docker did not report whether original catalog {container} is running"
+            )))
+        }
+    }
+    wait_for_catalog(database_url, timeout).await.map_err(|_| {
+        BackupError::ExternalService(format!("Original catalog {container} did not become ready"))
+    })
 }
 
 async fn wait_for_catalog(
@@ -965,6 +1031,52 @@ mod tests {
         assert!(
             validate_catalog_tablespaces(br#"{"Spec":{"tablespaces":[]}}"#, "base_001").is_ok()
         );
+    }
+
+    #[test]
+    fn staged_start_failure_preserves_bounded_private_diagnostic() -> std::io::Result<()> {
+        use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+        let root = tempfile::tempdir()?;
+        let stage = root.path().join("stage");
+        let tmp = root.path().join("tmp");
+        fs::create_dir(&stage)?;
+        fs::create_dir(&tmp)?;
+        for (name, script) in [
+            ("wal-g", "exit 0"),
+            (
+                "pg_ctl",
+                r#"while [ "$1" != "-l" ]; do shift; done
+dd if=/dev/zero bs=8192 count=1 > "$2" 2>/dev/null
+echo "missing segment" >> "$2"
+exit 42"#,
+            ),
+        ] {
+            let path = root.path().join(name);
+            fs::write(&path, format!("#!/bin/sh\n{script}\n"))?;
+            fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        }
+        let output = Command::new("sh")
+            .args(["-ec", RECOVER_STAGED, "recover"])
+            .arg(&stage)
+            .arg("base_001")
+            .env("TMPDIR", &tmp)
+            .env("PATH", format!("{}:/usr/bin:/bin", root.path().display()))
+            .output()?;
+        assert_eq!(output.status.code(), Some(42));
+        let message = String::from_utf8_lossy(&output.stderr);
+        let files = fs::read_dir(&tmp)?.collect::<std::io::Result<Vec<_>>>()?;
+        assert_eq!(files.len(), 1);
+        let dir = files[0].path();
+        let log = dir.join("startup-error.log");
+        assert!(message.contains(&*log.to_string_lossy()));
+        assert!(!message.contains("missing segment"));
+        let bytes = fs::read(&log)?;
+        assert_eq!(bytes.len(), 4096);
+        assert!(bytes.ends_with(b"missing segment\n"));
+        assert_eq!(fs::metadata(log)?.permissions().mode() & 0o077, 0);
+        assert!(!dir.join("postgres.log").exists());
+        assert_eq!(fs::read_dir(stage)?.count(), 0);
+        Ok(())
     }
 
     #[test]
@@ -1048,6 +1160,16 @@ createdb after_backup"#
         .await?;
         let name = crate::engines::walg_size::pushed_snapshot_name(&setup.output, "")?;
         let original_only = format!("postgres://postgres:{password}@127.0.0.1:{port}/after_backup");
+        // Simulate a completed stop whose acknowledgement was lost. Verify
+        // restarting serves the original database created after the backup.
+        database.stop().await?;
+        ensure_original_catalog_ready(
+            &docker,
+            database.id(),
+            &original_only,
+            Duration::from_secs(30),
+        )
+        .await?;
         let error = recover_catalog(
             &docker,
             database.id(),

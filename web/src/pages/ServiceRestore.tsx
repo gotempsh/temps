@@ -367,30 +367,33 @@ export function ServiceRestore() {
     includeScan && !sourcesRefused && !sourceBackupsQuery.isPlaceholderData
       ? sourceBackupsQuery.data
       : undefined
-  const [lastScan, setLastScan] = useState<{
-    sourceId?: number
-    result: typeof scanResult
-    discovery: SourceDiscovery
-  }>()
+  const [scansBySource, setScansBySource] = useState(
+    () =>
+      new Map<
+        number,
+        {
+          result: NonNullable<typeof scanResult>
+          discovery: SourceDiscovery
+        }
+      >()
+  )
+  const lastScan =
+    effectiveSourceId === undefined
+      ? undefined
+      : scansBySource.get(effectiveSourceId)
   if (
+    effectiveSourceId !== undefined &&
     scanResult &&
-    (lastScan?.result !== scanResult || lastScan.sourceId !== effectiveSourceId)
+    lastScan?.result !== scanResult
   ) {
-    setLastScan({
-      sourceId: effectiveSourceId,
-      result: scanResult,
-      discovery: mergeDiscovery(
-        lastScan?.sourceId === effectiveSourceId
-          ? lastScan?.discovery
-          : undefined,
-        scanResult
-      ),
-    })
+    setScansBySource(
+      new Map(scansBySource).set(effectiveSourceId, {
+        result: scanResult,
+        discovery: mergeDiscovery(lastScan?.discovery, scanResult),
+      })
+    )
   }
-  const discovery =
-    scanResult && lastScan?.sourceId === effectiveSourceId
-      ? lastScan?.discovery
-      : undefined
+  const discovery = scanResult ? lastScan?.discovery : undefined
   // A role that may not read storage sources can still list and restore this
   // database's own backups, so the page falls back to them instead of
   // stopping at "ask an administrator".

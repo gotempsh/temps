@@ -927,17 +927,10 @@ impl super::super::restore_reconcile::WorkerRestoreResume for ManagerWorkerResto
                 }
             };
             match persist_terminal_state(db.as_ref(), run_id, &result, TERMINAL_WRITE_RETRY).await {
-                Ok(()) => match &result {
-                    Ok(_) => info!("Restore run {run_id} resumed after a restart and completed"),
-                    Err(RestoreError::Cancelled { message, .. }) => {
-                        info!(
-                            "Restore run {run_id} resumed after a restart and released: {message}"
-                        )
-                    }
-                    Err(e) => {
-                        error!("Restore run {run_id} resumed after a restart and failed: {e}")
-                    }
-                },
+                Ok(disposition) => {
+                    // Resumed workers use the same persisted outcome for their log.
+                    let _ = disposition.worker_outcome(run_id, result);
+                }
                 Err(e) => error!(
                     "Restore run {run_id} resumed after a restart and settled, but its terminal \
                      state could not be recorded: {e}. It is resumed again at the next restart"
