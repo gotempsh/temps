@@ -2415,13 +2415,12 @@ async fn a_failed_scoped_token_mint_keeps_the_providers_error_from_the_caller() 
     connection.installation_id = Some("installation-detail-77".into());
     let data_root = unique_data_root("project-scoped-mint-fails");
     let db = MockDatabase::new(DatabaseBackend::Postgres)
-        // The connection and its provider for authorization, then the
-        // mint's connection, provider and provider service.
+        // The connection and its provider for authorization, the mint's
+        // provider service, then the unchanged connection after the mint.
         .append_query_results([vec![connection.clone()]])
         .append_query_results([vec![provider.clone()]])
-        .append_query_results([vec![connection]])
-        .append_query_results([vec![provider.clone()]])
         .append_query_results([vec![provider]])
+        .append_query_results([vec![connection]])
         .into_connection();
 
     let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
@@ -2438,6 +2437,99 @@ async fn a_failed_scoped_token_mint_keeps_the_providers_error_from_the_caller() 
     );
     assert!(!detail.contains("installation-detail-77"), "{detail}");
     assert!(!detail.contains("Invalid installation_id"), "{detail}");
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// The GitHub App installation behind a project's connection, as the seed
+/// reads it before minting (it cannot mint offline: the installation id is
+/// refused before any request).
+fn installation_connection() -> temps_entities::git_provider_connections::Model {
+    let mut connection = git_connection(None, "stale-installation-token");
+    connection.installation_id = Some("installation-detail-77".into());
+    connection
+}
+
+/// A PAT replaced the installation while the read-only token was minted: the
+/// seed drops whatever the mint produced and clones with the replacement.
+#[tokio::test]
+async fn a_seed_uses_the_replacement_pat_when_the_grant_changes_during_the_mint() {
+    let mut server = mockito::Server::new_async().await;
+    let token_check = server
+        .mock("GET", "/rate_limit")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let authorized = installation_connection();
+    let mut replaced = git_connection(None, "replacement-pat");
+    replaced.credential_generation = authorized.credential_generation + 1;
+    let data_root = unique_data_root("project-grant-replaced-during-mint");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        // First read: the installation, its provider, the mint's provider
+        // service, then the row the PAT replacement left.
+        .append_query_results([vec![authorized]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![replaced.clone()]])
+        // Second read: the replacement and its provider, then
+        // get_connection_token's connection and provider.
+        .append_query_results([vec![replaced.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![replaced]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let (username, password) = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect("the replacement's credentials");
+
+    assert_eq!(username, "x-access-token");
+    assert_eq!(password, "replacement-pat");
+    token_check.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// A grant that changes on every read is not chased forever, and no token
+/// from any of the mints reaches the clone.
+#[tokio::test]
+async fn a_seed_gives_up_when_the_grant_keeps_changing_during_the_mint() {
+    let server = mockito::Server::new_async().await;
+    let provider = github_provider_at(&server.url());
+    let first = installation_connection();
+    let mut second = installation_connection();
+    second.credential_generation = first.credential_generation + 1;
+    let mut third = installation_connection();
+    third.credential_generation = first.credential_generation + 2;
+    let data_root = unique_data_root("project-grant-keeps-changing");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![first]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![second.clone()]])
+        // The provider service is cached from the first mint.
+        .append_query_results([vec![second]])
+        .append_query_results([vec![provider]])
+        .append_query_results([vec![third]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let err = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect_err("a grant that never settles");
+
+    let detail = err.caller_detail();
+    assert!(
+        detail.contains("git connection 3 changed its credentials 2 times"),
+        "{detail}"
+    );
+    assert!(!detail.contains("stale-installation-token"), "{detail}");
     let _ = std::fs::remove_dir_all(&data_root);
 }
 

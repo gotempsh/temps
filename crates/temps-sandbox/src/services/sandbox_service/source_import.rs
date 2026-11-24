@@ -523,6 +523,18 @@ pub(super) enum SeedConnectionAuthority {
     ProjectRepository,
 }
 
+/// How many times a seed reads a git connection whose grant keeps changing
+/// while its read-only token is minted, before giving up.
+const CONNECTION_GRANT_ATTEMPTS: u32 = 2;
+
+/// The credential selected from one read of a git connection.
+pub(super) enum ConnectionCreds {
+    /// HTTP-Basic (username, password) for the clone.
+    Resolved((String, String)),
+    /// The grant was replaced while the token was minted: read it again.
+    GrantReplaced,
+}
+
 fn connection_not_owned(connection_id: i32) -> SandboxError {
     SandboxError::Validation {
         message: format!("Git connection {connection_id} is not owned by the requesting user"),
@@ -782,6 +794,11 @@ impl SandboxService {
     /// whether the caller may use the connection: one user can't clone repos
     /// using another user's token, except a project's own repository through
     /// that project's connection.
+    ///
+    /// If the connection's grant is replaced while the read-only token is
+    /// minted (a PAT replacing the GitHub App installation, a
+    /// reauthorization), the token is dropped and the connection is read,
+    /// authorized and resolved once more from its current row.
     pub(super) async fn resolve_connection_creds(
         &self,
         user_id: i32,
@@ -789,6 +806,43 @@ impl SandboxService {
         clone_url: &str,
         project_repository: Option<&ProjectRepositoryGrant>,
     ) -> Result<(String, String), SandboxError> {
+        for attempt in 1..=CONNECTION_GRANT_ATTEMPTS {
+            match self
+                .resolve_connection_creds_once(
+                    user_id,
+                    connection_id,
+                    clone_url,
+                    project_repository,
+                )
+                .await?
+            {
+                ConnectionCreds::Resolved(creds) => return Ok(creds),
+                ConnectionCreds::GrantReplaced => tracing::warn!(
+                    connection_id,
+                    attempt,
+                    "git connection grant changed while a read-only seed token was minted; \
+                     resolving its current credentials"
+                ),
+            }
+        }
+        Err(SandboxError::ExecFailed {
+            sandbox_id: format!("connection#{}", connection_id),
+            reason: format!(
+                "git connection {} changed its credentials {} times while a read-only token \
+                 was minted; retry once the connection settles",
+                connection_id, CONNECTION_GRANT_ATTEMPTS
+            ),
+        })
+    }
+
+    /// One read of the connection: authorize it and select its credential.
+    async fn resolve_connection_creds_once(
+        &self,
+        user_id: i32,
+        connection_id: i32,
+        clone_url: &str,
+        project_repository: Option<&ProjectRepositoryGrant>,
+    ) -> Result<ConnectionCreds, SandboxError> {
         let connection = self
             .git_provider_manager
             .get_connection(connection_id)
@@ -840,42 +894,53 @@ impl SandboxService {
             (&authority, project_repository)
         {
             if connection.installation_id.is_some() {
-                let scoped = self
+                // Minted for the grant just authorized: if the row changed
+                // meanwhile the token is dropped, never used.
+                let minted = self
                     .git_provider_manager
-                    .mint_scoped_repo_token_for_connection(
-                        connection_id,
+                    .mint_scoped_repo_token_for_grant(
+                        &connection,
                         &grant.repo_owner,
                         &grant.repo_name,
                         temps_git::ScopedTokenOp::Fetch,
                     )
-                    .await
-                    .map_err(|error| {
-                        // The connection may be an organization's, which the
-                        // caller does not own: the provider's error stays in
-                        // the server log, the caller is told which repository.
-                        tracing::warn!(
-                            project_id = grant.project_id,
-                            connection_id,
-                            repository = %format!("{}/{}", grant.repo_owner, grant.repo_name),
-                            reason = %error,
-                            "could not mint a read-only token for a project sandbox seed"
-                        );
-                        SandboxError::ExecFailed {
-                            sandbox_id: format!("connection#{}", connection_id),
-                            reason: format!(
-                                "could not mint a read-only token for {}/{} through git \
+                    .await;
+                if let Err(
+                    temps_git::services::git_provider_manager::GitProviderManagerError::ConnectionGrantReplaced { .. },
+                ) = minted
+                {
+                    return Ok(ConnectionCreds::GrantReplaced);
+                }
+                let scoped = minted.map_err(|error| {
+                    // The connection may be an organization's, which the
+                    // caller does not own: the provider's error stays in
+                    // the server log, the caller is told which repository.
+                    tracing::warn!(
+                        project_id = grant.project_id,
+                        connection_id,
+                        repository = %format!("{}/{}", grant.repo_owner, grant.repo_name),
+                        reason = %error,
+                        "could not mint a read-only token for a project sandbox seed"
+                    );
+                    SandboxError::ExecFailed {
+                        sandbox_id: format!("connection#{}", connection_id),
+                        reason: format!(
+                            "could not mint a read-only token for {}/{} through git \
                                  connection {}; check that the connection's GitHub App \
                                  installation still has access to the repository",
-                                grant.repo_owner, grant.repo_name, connection_id
-                            ),
-                        }
-                    })?;
+                            grant.repo_owner, grant.repo_name, connection_id
+                        ),
+                    }
+                })?;
                 tracing::info!(
                     project_id = grant.project_id,
                     connection_id,
                     "seeding a project sandbox with a repository-scoped read-only token"
                 );
-                return Ok((scoped.username, scoped.password));
+                return Ok(ConnectionCreds::Resolved((
+                    scoped.username,
+                    scoped.password,
+                )));
             }
             tracing::info!(
                 project_id = grant.project_id,
@@ -893,7 +958,10 @@ impl SandboxService {
                 reason: format!("resolve git token: {}", e),
             })?;
 
-        Ok(connection_clone_credentials(&provider.provider_type, token))
+        Ok(ConnectionCreds::Resolved(connection_clone_credentials(
+            &provider.provider_type,
+            token,
+        )))
     }
 
     /// Run the actual `git clone` inside the sandbox. Credentials (if any)
