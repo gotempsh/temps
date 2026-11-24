@@ -918,13 +918,15 @@ async fn provider_catalog_dto(
     dto.login_supported = login_supported;
     dto.login_unavailable_reason = login_unavailable_reason;
     if let Some(snapshot) = workspace_snapshot {
-        dto.models = snapshot
-            .capabilities
-            .models
+        let mut runtime_models = snapshot.capabilities.models;
+        if snapshot.model_source == temps_ai::ModelCatalogSource::Bootstrap {
+            keep_saved_default(&mut runtime_models, dto.default_model.as_deref());
+        }
+        dto.models = runtime_models
             .iter()
             .map(|model| model.id.clone())
             .collect();
-        dto.runtime_models = snapshot.capabilities.models;
+        dto.runtime_models = runtime_models;
         dto.default_runtime_model_id = dto
             .default_model
             .clone()
@@ -1005,10 +1007,9 @@ fn provider_catalog_dto_from_runtime(
         ))
     };
     let (runtime_models, model_source) = if discovered_models.is_empty() {
-        (
-            bootstrap_runtime_models(entry.models),
-            temps_ai::ModelCatalogSource::Bootstrap,
-        )
+        let mut models = bootstrap_runtime_models(entry.models);
+        keep_saved_default(&mut models, provider_cfg.default_model.as_deref());
+        (models, temps_ai::ModelCatalogSource::Bootstrap)
     } else {
         (
             discovered_models
@@ -2065,6 +2066,19 @@ fn runtime_model_capability(
     }
 }
 
+/// Without discovery the model list is the bundled guess, and a release that
+/// refreshes it must not take away a default the operator saved: it was
+/// accepted when saved and stays listed, first, until discovery says
+/// otherwise.
+fn keep_saved_default(models: &mut Vec<temps_ai::ModelCapability>, saved: Option<&str>) {
+    let Some(saved) = saved.map(str::trim).filter(|saved| !saved.is_empty()) else {
+        return;
+    };
+    if !models.iter().any(|model| model.id == saved) {
+        models.splice(0..0, bootstrap_runtime_models(&[saved]));
+    }
+}
+
 fn bootstrap_runtime_models(models: &[&str]) -> Vec<temps_ai::ModelCapability> {
     models
         .iter()
@@ -2677,6 +2691,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn a_bootstrap_workspace_snapshot_keeps_the_saved_default() {
+        crate::ai_cli::invalidate_status_cache().await;
+        let codex =
+            crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
+        let saved = "vendor-model-saved-before-upgrade";
+        let provider_config = temps_config::ProviderConfig {
+            auth_type: "api_key".to_string(),
+            credentials_encrypted: Some("encrypted-key".to_string()),
+            default_model: Some(saved.to_string()),
+            ..Default::default()
+        };
+        let snapshot = |source| temps_ai::ProviderCapabilitiesSnapshot {
+            capabilities: crate::ai_cli::provider_capabilities_from_models("codex_cli", Vec::new())
+                .expect("Codex capability contract"),
+            model_source: source,
+            models_refreshed_at: None,
+        };
+
+        // A cold workspace cache answers with the bundled list, which no
+        // longer has the saved model: it stays listed and selected.
+        let dto = provider_catalog_dto(
+            codex,
+            provider_config.clone(),
+            Some(snapshot(temps_ai::ModelCatalogSource::Bootstrap)),
+            None,
+        )
+        .await;
+        assert_eq!(dto.models.first().map(String::as_str), Some(saved));
+        assert_eq!(dto.runtime_models.len(), codex.models.len() + 1);
+        assert_eq!(dto.default_runtime_model_id.as_deref(), Some(saved));
+
+        // A real inventory is authoritative: a model it lacks is not added.
+        let dto = provider_catalog_dto(
+            codex,
+            provider_config,
+            Some(snapshot(temps_ai::ModelCatalogSource::Live)),
+            None,
+        )
+        .await;
+        assert!(!dto.models.iter().any(|model| model == saved));
+        assert_eq!(
+            dto.default_runtime_model_id.as_deref(),
+            Some(codex.models[0])
+        );
+    }
+
     #[test]
     fn workspace_capable_providers_discover_models_only_with_a_saved_credential() {
         let claude =
@@ -2852,6 +2913,53 @@ mod tests {
         );
         assert!(codex_configured.workspace_ready);
         assert!(codex_configured.workspace_readiness_hint.is_none());
+    }
+
+    #[test]
+    fn bootstrap_catalog_keeps_a_saved_default_it_no_longer_lists() {
+        let codex =
+            crate::ai_cli::catalog::find_provider("codex_cli").expect("Codex catalog entry");
+        let saved = "vendor-model-saved-before-upgrade";
+        assert!(!codex.models.contains(&saved));
+        let dto = |default_model: Option<&str>| {
+            provider_catalog_dto_from_runtime(
+                codex,
+                temps_config::ProviderConfig {
+                    default_model: default_model.map(str::to_string),
+                    ..Default::default()
+                },
+                true,
+                Some("api_key".to_string()),
+                false,
+                None,
+                None,
+                None,
+                Vec::new(),
+                temps_ai::ModelCatalogSource::Bootstrap,
+                None,
+                None,
+            )
+        };
+
+        let kept = dto(Some(saved));
+        assert_eq!(kept.default_runtime_model_id.as_deref(), Some(saved));
+        assert_eq!(kept.models.first().map(String::as_str), Some(saved));
+        assert_eq!(kept.models.len(), codex.models.len() + 1);
+
+        // A saved default the list already has is not duplicated, and no
+        // saved default keeps the list's own first entry.
+        let listed = dto(Some(codex.models[1]));
+        assert_eq!(listed.models.len(), codex.models.len());
+        assert_eq!(
+            listed.default_runtime_model_id.as_deref(),
+            Some(codex.models[1])
+        );
+        let unset = dto(None);
+        assert_eq!(unset.models.len(), codex.models.len());
+        assert_eq!(
+            unset.default_runtime_model_id.as_deref(),
+            Some(codex.models[0])
+        );
     }
 
     fn compatible_document(verified_model: Option<&str>) -> String {

@@ -25,6 +25,7 @@ import {
   BarChart3,
   ChevronsUpDown,
   Check,
+  Boxes,
   Gauge,
   LogOut,
   Monitor,
@@ -110,6 +111,12 @@ const aiNavItems: PlatformNavItem[] = [
     title: 'Usage',
     url: '/ai-gateway/usage',
     icon: BarChart3,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Models',
+    url: '/ai-gateway/models',
+    icon: Boxes,
     featureKey: 'ai-gateway',
   },
   {

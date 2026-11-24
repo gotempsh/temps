@@ -22,6 +22,7 @@ import { cn } from '@/lib/utils'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { Check, ChevronsUpDown, Loader2, TriangleAlert } from 'lucide-react'
 import { useMemo, useState } from 'react'
+import { Link } from 'react-router'
 import { AiProviderIcon } from '@/lib/ai-providers'
 import { assistantKeyLabel, type AssistantKey } from './assistant-keys'
 import {
@@ -156,8 +157,16 @@ export function AssistantModelList({
         aria-label="Models"
       >
         {visible.length === 0 ? (
-          <li className="px-2 py-3 text-sm text-muted-foreground">
-            No model matches “{query.trim()}”.
+          <li className="space-y-1 px-2 py-3 text-sm text-muted-foreground">
+            <p>No model matches “{query.trim()}”.</p>
+            <p>
+              A newly released model appears here once this key’s models are
+              refreshed in{' '}
+              <Link to="/ai-gateway" className="underline">
+                AI Gateway
+              </Link>
+              .
+            </p>
           </li>
         ) : (
           <>
@@ -176,6 +185,7 @@ export function AssistantModelList({
   )
 }
 
+/** Use a model id the list does not hold, exactly as typed. */
 function ModelGroupHeading({ children }: { children: string }) {
   return (
     <li

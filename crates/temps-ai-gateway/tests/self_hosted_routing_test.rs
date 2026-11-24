@@ -727,3 +727,74 @@ async fn byok_base_url_over_plain_http_to_a_public_host_is_refused() {
         .expect_err("plaintext BYOK to a public host");
     assert!(invalid_url_reason(error).contains("plain http://"));
 }
+
+// ----------------------------------------------------------------------------
+// Vendor key verification falls back to an earlier low-cost model
+// ----------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_vendor_key_restricted_to_an_older_cheap_model_still_verifies() {
+    // The key's project serves gpt-5-nano but not the current low-cost
+    // models: each refusal (404) moves on to the next, and the first one the
+    // key serves verifies it.
+    let server = MockRecordingServer::start(&["gpt-5-nano"], true).await;
+    let key_trust = KeyTrust::for_base_url(&server.base_url).unwrap();
+    gateway_without_database()
+        .test_provider(
+            "openai",
+            "sk-restricted",
+            Some(&server.base_url),
+            None,
+            Some(key_trust),
+        )
+        .await
+        .expect("a key that serves an earlier low-cost model verifies");
+    let tried: Vec<String> = server
+        .inference_requests()
+        .into_iter()
+        .filter_map(|request| request.model)
+        .collect();
+    assert_eq!(tried, ["gpt-6-luna", "gpt-5.6-luna", "gpt-5-nano"]);
+}
+
+#[tokio::test]
+async fn an_invalid_vendor_key_is_not_retried_with_other_models() {
+    let server = MockRecordingServer::start(&["gpt-5-nano"], true).await;
+    let key_trust = KeyTrust::for_base_url(&server.base_url).unwrap();
+    let error = gateway_without_database()
+        .test_provider("openai", "", Some(&server.base_url), None, Some(key_trust))
+        .await
+        .expect_err("a rejected key fails verification");
+    assert!(
+        matches!(error, AiGatewayError::UpstreamError { status: 401, .. }),
+        "{error:?}"
+    );
+    assert_eq!(server.inference_requests().len(), 1);
+}
+
+#[tokio::test]
+async fn a_key_that_serves_no_low_cost_model_reports_the_current_default() {
+    let server = MockRecordingServer::start(&["some-other-model"], true).await;
+    let key_trust = KeyTrust::for_base_url(&server.base_url).unwrap();
+    let error = gateway_without_database()
+        .test_provider(
+            "openai",
+            "sk-restricted",
+            Some(&server.base_url),
+            None,
+            Some(key_trust),
+        )
+        .await
+        .expect_err("no candidate is served");
+    match error {
+        AiGatewayError::UpstreamError { model, status, .. } => {
+            assert_eq!(status, 404);
+            assert_eq!(model, "gpt-6-luna");
+        }
+        other => panic!("expected the first refusal, got {other:?}"),
+    }
+    assert_eq!(
+        server.inference_requests().len(),
+        temps_ai_gateway::providers::low_cost_models("openai").len()
+    );
+}

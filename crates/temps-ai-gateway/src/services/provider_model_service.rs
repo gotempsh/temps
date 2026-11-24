@@ -90,6 +90,18 @@ impl ProviderModelService {
         if models.is_empty() {
             return Ok(());
         }
+        // A key whose catalog was ever discovered has a real inventory: the
+        // bootstrap list is only a guess at what an unknown key serves, and
+        // inserting it would offer, and pick as defaults, models that key may
+        // not be entitled to until the next refresh succeeds.
+        let discovered = ai_provider_models::Entity::find()
+            .filter(ai_provider_models::Column::ProviderKeyId.eq(key.id))
+            .filter(ai_provider_models::Column::Source.eq(MODEL_SOURCE_DISCOVERED))
+            .one(self.db.as_ref())
+            .await?;
+        if discovered.is_some() {
+            return Ok(());
+        }
         let rows = models
             .into_iter()
             .map(|model| ai_provider_models::ActiveModel {
@@ -495,6 +507,64 @@ mod tests {
             service.add_manual(2, "claude-haiku-4-5", None).await,
             Err(AiGatewayError::Validation { .. })
         ));
+    }
+
+    fn insert_statements(db: DatabaseConnection) -> usize {
+        db.into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.starts_with("INSERT"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seeding_skips_a_key_with_a_discovered_catalog() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![model("gpt-5-nano", true, true)]])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db.clone(), keys, gateway);
+
+        service
+            .seed_bootstrap(&provider_key(7))
+            .await
+            .expect("skipping the seed is not an error");
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the test holds the only connection");
+        assert_eq!(insert_statements(db), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seeding_fills_a_key_without_a_discovered_catalog() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_provider_models::Model>::new()])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db.clone(), keys, gateway);
+
+        service
+            .seed_bootstrap(&provider_key(7))
+            .await
+            .expect("a key without a discovered catalog is seeded");
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the test holds the only connection");
+        assert_eq!(insert_statements(db), 1);
     }
 
     #[tokio::test]

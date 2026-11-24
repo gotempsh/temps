@@ -238,18 +238,17 @@ pub const PROVIDER_CATALOG: &[ProviderCatalogEntry] = &[
                 seed_path_rel: "",
             },
         ],
-        // Bootstrap fallback when account-aware app-server discovery fails.
+        // Bootstrap fallback when account-aware app-server discovery fails:
+        // Codex's recommended models, everyday default first. Live discovery
+        // stays the source of truth, so a newer Codex offers newer models
+        // without a Temps change.
         models: &[
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-            "gpt-5.4",
-            "gpt-5.4-codex",
-            "gpt-5.4-codex-max",
-            "gpt-5.2",
-            "gpt-5.1-codex",
-            "gpt-5.1-codex-mini",
-            "gpt-5-codex",
+            "gpt-6.2-sol",
+            "gpt-6.2-astra",
+            "gpt-6.1-sol",
+            "gpt-6.1-terra",
+            "gpt-6-astra",
+            "gpt-6-luna",
         ],
         permission_modes: &[
             ProviderOption {

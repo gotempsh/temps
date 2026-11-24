@@ -4,6 +4,7 @@
 pub mod acme_accounts;
 pub mod acme_orders;
 pub mod address_tailnet_principals;
+pub mod ai_agent_cli_settings;
 pub mod ai_application_git_bindings;
 pub mod ai_application_projects;
 pub mod ai_application_workspaces;
@@ -17,6 +18,8 @@ pub mod ai_gateway_config;
 pub mod ai_gateway_objects;
 pub mod ai_goals;
 pub mod ai_messages;
+pub mod ai_model_catalog_entries;
+pub mod ai_model_catalog_settings;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
 pub mod ai_provider_models;
