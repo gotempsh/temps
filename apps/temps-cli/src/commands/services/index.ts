@@ -1380,16 +1380,7 @@ async function envAction(options: EnvOptions): Promise<void> {
     if (error) {
       throw new Error(getErrorMessage(error))
     }
-    // API returns HashMap<String, String> but OpenAPI spec says Vec<EnvironmentVariableInfo>
-    // Handle both formats for compatibility
-    if (data && !Array.isArray(data)) {
-      return Object.entries(data as Record<string, string>).map(([name, value]) => ({
-        name,
-        value: String(value),
-        sensitive: /password|secret|token|key/i.test(name),
-      }))
-    }
-    return data ?? []
+    return serviceEnvironmentEntries(data)
   })
 
   if (options.json) {
@@ -1495,15 +1486,16 @@ async function connectAction(name: string, options: { project?: string; json?: b
     return data
   })
 
-  // Try to get environment variables if linked to a project
-  let envVars: Array<{ name: string; value: string; sensitive?: boolean }> = []
+  // Try to get environment variables if linked to a project. The endpoint
+  // returns a map of variable name to its masked value.
+  let envVars: ServiceEnvironmentEntry[] = []
   if (options.project) {
     const project = await resolveProjectId(options.project)
     const { data: vars } = await getServiceEnvironmentVariables({
       client,
       path: { id: service.id, project_id: project.id },
     })
-    envVars = vars ?? []
+    envVars = serviceEnvironmentEntries(vars)
   }
 
   if (options.json) {
@@ -1558,6 +1550,26 @@ interface ServiceLogsOptions {
 /** Parse a relative duration string ("15m", "1h", "24h", "7d") into the
  *  equivalent Date in the past, or return null if it is not a recognised
  *  relative format (assumed to be an ISO 8601 string instead). */
+export interface ServiceEnvironmentEntry {
+  name: string
+  value: string
+  sensitive: boolean
+}
+
+/** Turn the service environment response, a map of variable name to its
+ *  masked value, into display rows sorted by name. */
+export function serviceEnvironmentEntries(
+  data: Record<string, string> | undefined,
+): ServiceEnvironmentEntry[] {
+  return Object.entries(data ?? {})
+    .map(([name, value]) => ({
+      name,
+      value,
+      sensitive: /password|secret|token|key/i.test(name),
+    }))
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
 export function parseFromFlag(value: string): Date | null {
   const match = value.match(/^(\d+)(m|h|d)$/)
   if (!match || !match[1] || !match[2]) return null
