@@ -2526,8 +2526,7 @@ mod tests {
     async fn email_password_reset_revokes_existing_sessions() {
         let (db, auth_service, _) = setup_test_env().await;
         let user = create_test_user(&db.db, "reset-revokes@example.com", "OldPassword123!").await;
-        let other_user =
-            create_test_user(&db.db, "bystander@example.com", "Bystander123!").await;
+        let other_user = create_test_user(&db.db, "bystander@example.com", "Bystander123!").await;
 
         let hijacked_session = auth_service.create_session(user.id).await.unwrap();
         let bystander_session = auth_service.create_session(other_user.id).await.unwrap();

@@ -52,9 +52,13 @@ pub(crate) enum ManifestBindingError {
         "no GitHub App setup was started from this browser; start it again from Git Providers in the Temps console"
     )]
     MissingCookie,
-    #[error("the GitHub App setup cookie could not be read; start the setup again from Git Providers")]
+    #[error(
+        "the GitHub App setup cookie could not be read; start the setup again from Git Providers"
+    )]
     Unreadable,
-    #[error("the GitHub App setup started more than 15 minutes ago; start it again from Git Providers")]
+    #[error(
+        "the GitHub App setup started more than 15 minutes ago; start it again from Git Providers"
+    )]
     Expired,
     #[error("the GitHub App setup state does not match the one this browser started; start the setup again from Git Providers")]
     StateMismatch,

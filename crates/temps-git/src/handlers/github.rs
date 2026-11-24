@@ -21,8 +21,8 @@ use super::github_manifest_binding::{
 use super::types::GitAppState as AppState;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::{new as problem_new, Problem};
-use temps_core::RequestMetadata;
 use temps_core::telemetry::{OperationFailureCode, TelemetryEvent, TelemetryEventKind};
+use temps_core::RequestMetadata;
 // use crate::services::audit_service::{AuditContext, PipelineTriggeredAudit};
 // use crate::services::project::crud::ProjectCrud;
 // use crate::services::project::pipelines::ProjectPipelines;
@@ -128,7 +128,10 @@ async fn start_github_app_manifest(
         chrono::Utc::now().timestamp(),
     )
     .map_err(|reason| {
-        error!(user_id, "Failed to start GitHub App manifest flow: {}", reason);
+        error!(
+            user_id,
+            "Failed to start GitHub App manifest flow: {}", reason
+        );
         problem_new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("GitHub App Setup Failed")
             .with_detail(format!(
@@ -901,7 +904,6 @@ async fn github_app_auth_callback(
 
         return Ok((response_headers, Redirect::to(&redirect_url)));
     }
-
 
     // For auth-only flow (no installation_id yet), redirect and wait for webhook
     info!("OAuth authorization code received without installation_id - waiting for installation webhook");

@@ -2408,7 +2408,8 @@ impl NotificationService {
         keys.sort();
         keys.into_iter()
             .find(|key| {
-                existing.and_then(|object| object.get(key.as_str())) != replacement.get(key.as_str())
+                existing.and_then(|object| object.get(key.as_str()))
+                    != replacement.get(key.as_str())
             })
             .cloned()
     }
