@@ -87,16 +87,10 @@ test('group lifecycle through the console', async ({ page }) => {
   created.push(await createService(page, SVC_API))
 
   try {
-    // ---- services rename notice -------------------------------------
+    // ---- projects list ------------------------------------------------
     await page.goto('/projects')
-    const notice = page.getByText('Your apps are now called Services.')
-    await expect(notice).toBeVisible()
-    await shot(page, '01-projects-notice')
-    await page.getByRole('button', { name: 'Dismiss this notice' }).click()
-    await expect(notice).toHaveCount(0)
-    await page.reload()
     await expect(page.getByRole('heading', { name: 'Projects', level: 1 })).toBeVisible()
-    await expect(notice).toHaveCount(0)
+    await shot(page, '01-projects')
 
     // ---- create dialog: validation + no stale state --------------------
     await page.getByRole('button', { name: 'New project' }).first().click()
