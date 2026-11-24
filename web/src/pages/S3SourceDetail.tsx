@@ -50,6 +50,7 @@ import {
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { testS3SourceConnection } from '@/lib/s3-sources'
+import { OrphanBackupBadge } from './service-restore/OrphanBackupBadge'
 import { restoreSourceBackupsQuery } from './service-restore/restore-queries'
 import { runScheduleNow } from '@/lib/schedule-runs'
 import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
@@ -110,6 +111,24 @@ import {
   refetchOnFocusWhenStale,
   sourceBackupsRefetchInterval,
 } from '@/lib/live-refetch'
+
+function BackupRow({
+  href,
+  children,
+}: {
+  href?: string
+  children: React.ReactNode
+}) {
+  if (!href) return <div>{children}</div>
+  return (
+    <Link
+      to={href}
+      className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+    >
+      {children}
+    </Link>
+  )
+}
 
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
@@ -851,10 +870,13 @@ export function S3SourceDetail() {
                     const FallbackIcon = iconForServiceType(backup.engine)
 
                     return (
-                      <Link
-                        key={`${backup.source}-${backup.backup_id || backup.location}`}
-                        to={`/backups/s3-sources/${id}/backups/${backup.backup_id}`}
-                        className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+                      <BackupRow
+                        key={`${backup.source}-${backup.backup_id || backup.location}-${backup.created_at}`}
+                        href={
+                          isOrphan
+                            ? undefined
+                            : `/backups/s3-sources/${id}/backups/${backup.backup_id}`
+                        }
                       >
                         <div className="flex flex-col gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between sm:p-4">
                           {/* Left: name + meta */}
@@ -893,11 +915,7 @@ export function S3SourceDetail() {
                                     PITR
                                   </Badge>
                                 ) : null}
-                                {isOrphan ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    orphan
-                                  </Badge>
-                                ) : null}
+                                {isOrphan ? <OrphanBackupBadge /> : null}
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                                 <span className="font-mono">
@@ -961,7 +979,7 @@ export function S3SourceDetail() {
                             )}
                           </div>
                         </div>
-                      </Link>
+                      </BackupRow>
                     )
                   })}
                 </div>

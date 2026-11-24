@@ -113,6 +113,7 @@ import {
   phaseLabel,
   pickActiveRun,
   restoreGate,
+  restoreRequestFailure,
   runPollInterval,
   sectionLoadErrorCopy,
   sectionState,
@@ -125,10 +126,13 @@ import {
 import {
   hasBackupSelection,
   isSelectedBackup,
+  needsSnapshotKey,
+  backupRadioValue,
   parseRestoreSelection,
   patchRestoreSelection,
   type RestoreSelectionPatch,
 } from './service-restore/restore-selection'
+import { OrphanBackupBadge } from './service-restore/OrphanBackupBadge'
 import { cancelRefusal } from './service-restore/run-context'
 
 type Mode = 'in_place' | 'new_service' | 'pitr'
@@ -312,6 +316,11 @@ export function ServiceRestore() {
   const [pitrTargetTime, setPitrTargetTime] = useState('')
   const [pitrToNewService, setPitrToNewService] = useState(false)
   const [confirmText, setConfirmText] = useState('')
+  const [startFailure, setStartFailure] = useState<{
+    key: string
+    message: string
+  }>()
+  const [previewAttempt, setPreviewAttempt] = useState(0)
   const [search, setSearch] = useState('')
   const [includeScan, setIncludeScan] = useState(!!selection.backupLocation)
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
@@ -375,6 +384,9 @@ export function ServiceRestore() {
   // backup of another engine is never selected, even by a crafted link.
   // `find` returns the list's own entry, so its identity is stable.
   const targetEngine = (service?.service_type ?? '').toLowerCase()
+  const hasLegacySnapshots = allBackups.some(
+    (b) => needsSnapshotKey(b) && enginesCompatible(b.engine, targetEngine)
+  )
   const selectedBackup = allBackups.find(
     (b) =>
       isSelectedBackup(b, selection) &&
@@ -383,7 +395,10 @@ export function ServiceRestore() {
   const selectionMissing =
     hasBackupSelection(selection) &&
     backupsSection.kind === 'ready' &&
-    !selectedBackup
+    !selectedBackup &&
+    !allBackups.some(
+      (b) => needsSnapshotKey(b) && b.location === selection.backupLocation
+    )
 
   // Filter rule: the backup row's `engine` must be in the same engine family
   // as the target service. Today the only multi-engine family is the
@@ -468,6 +483,10 @@ export function ServiceRestore() {
   const startMutation = useMutation({
     ...startRestoreMutation(),
     retry: false,
+    onMutate: () => {
+      setStartFailure(undefined)
+      return { key: planRequestKey }
+    },
     meta: { errorTitle: 'Failed to start restore' },
     onSuccess: (run) => {
       const r = run as RestoreRunView
@@ -479,7 +498,7 @@ export function ServiceRestore() {
         description: `Run ${r.id} (phase: ${phaseLabel(r.phase)}).`,
       })
     },
-    onError: (error, variables) => {
+    onError: (error, variables, context) => {
       if (
         handleSensitiveActionError(error, () => startMutation.mutate(variables))
       ) {
@@ -504,10 +523,15 @@ export function ServiceRestore() {
         })
         return
       }
-      const problem = error as { detail?: string; message?: string }
-      toast.error('Failed to start restore', {
-        description: problem.detail || problem.message || 'Unknown error',
-      })
+      const message = restoreRequestFailure(
+        error,
+        'start',
+        !!variables.body?.backup_location
+      )
+      setShowDestructiveConfirm(false)
+      if (context) setStartFailure({ key: context.key, message })
+      toast.error('Could not start restore', { description: message })
+      void activeRunsQuery.refetch()
     },
   })
 
@@ -621,6 +645,7 @@ export function ServiceRestore() {
   }, [
     selectedBackup?.id,
     selectedBackup?.location,
+    previewAttempt,
     effectiveSourceId,
     mode,
     effectiveNewServiceName,
@@ -631,7 +656,7 @@ export function ServiceRestore() {
 
   const plan =
     plannedRestore?.key === planRequestKey ? plannedRestore.plan : undefined
-  const planError = planMutation.error as Error | null
+  const planError = planMutation.error
   const planHasBlockingErrors = !!plan && plan.errors.length > 0
   // The server decides cross-service by service identity (the backup's
   // recorded producer ids). Only a completed plan for these exact inputs
@@ -962,6 +987,16 @@ export function ServiceRestore() {
             />
           ) : null}
 
+          {hasLegacySnapshots && (
+            <Alert>
+              <AlertTitle>Some WAL-G backups need a new scan</AlertTitle>
+              <AlertDescription>
+                These entries identify only a shared repository. Update the
+                destination Temps server and refresh this list to select an
+                individual snapshot.
+              </AlertDescription>
+            </Alert>
+          )}
           {!canListBackups ? (
             <div className="text-sm text-muted-foreground py-8 text-center border rounded-md">
               {sourcesView.kind === 'ready'
@@ -1009,7 +1044,18 @@ export function ServiceRestore() {
               ) : null}
             </div>
           ) : (
-            <div className="border rounded-md">
+            <RadioGroup
+              aria-label="Backup to restore"
+              className="border rounded-md"
+              value={selectedBackup ? backupRadioValue(selectedBackup) : ''}
+              onValueChange={(value) => {
+                const backup = paginatedBackups.find(
+                  (b) => backupRadioValue(b) === value && !needsSnapshotKey(b)
+                )
+                if (backup)
+                  updateSelection({ sourceId: effectiveSourceId, backup })
+              }}
+            >
               <Table>
                 <TableHeader>
                   <TableRow>
@@ -1024,32 +1070,28 @@ export function ServiceRestore() {
                 </TableHeader>
                 <TableBody>
                   {paginatedBackups.map((b) => {
-                    const isSel =
-                      selectedBackup &&
-                      selectedBackup.location === b.location &&
-                      selectedBackup.id === b.id
+                    const isSel = selectedBackup === b
+                    const unavailable = needsSnapshotKey(b)
+                    const value = backupRadioValue(b)
                     return (
                       <TableRow
-                        key={`${b.source}-${b.id}-${b.location}`}
-                        className={`cursor-pointer ${isSel ? 'bg-accent' : ''}`}
-                        onClick={() =>
-                          // Pin the source too: with only the backup in the
-                          // URL, a saved link would follow a later change of
-                          // the default source and no longer find it.
-                          updateSelection({
-                            sourceId: effectiveSourceId,
-                            backup: b,
-                          })
-                        }
+                        key={unavailable ? `${value}-${b.created_at}` : value}
+                        className={`${unavailable ? '' : 'cursor-pointer'} ${isSel ? 'bg-accent' : ''}`}
+                        onClick={() => {
+                          if (!unavailable)
+                            updateSelection({
+                              sourceId: effectiveSourceId,
+                              backup: b,
+                            })
+                        }}
                       >
                         <TableCell>
-                          <RadioGroup value={isSel ? 'on' : ''}>
-                            <RadioGroupItem
-                              value="on"
-                              checked={!!isSel}
-                              aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
-                            />
-                          </RadioGroup>
+                          <RadioGroupItem
+                            value={value}
+                            disabled={unavailable}
+                            onClick={(event) => event.stopPropagation()}
+                            aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
+                          />
                         </TableCell>
                         <TableCell className="font-mono text-xs whitespace-nowrap">
                           {b.created_at
@@ -1064,11 +1106,13 @@ export function ServiceRestore() {
                           {b.size_bytes ? formatBytes(b.size_bytes) : '—'}
                         </TableCell>
                         <TableCell>
-                          <Badge variant="outline" className="text-xs">
-                            {b.source === 'db'
-                              ? 'Tracked'
-                              : 'From another server'}
-                          </Badge>
+                          {b.source === 'db' ? (
+                            <Badge variant="outline" className="text-xs">
+                              Tracked
+                            </Badge>
+                          ) : (
+                            <OrphanBackupBadge label="From another server" />
+                          )}
                         </TableCell>
                         <TableCell>
                           <Badge
@@ -1085,7 +1129,7 @@ export function ServiceRestore() {
                   })}
                 </TableBody>
               </Table>
-            </div>
+            </RadioGroup>
           )}
 
           {canListBackups &&
@@ -1292,9 +1336,22 @@ export function ServiceRestore() {
                 className="max-w-md"
               />
               <p className="text-xs text-muted-foreground">
-                Suggested: {capabilities?.suggested_new_service_name}. The new
-                service uses the same image and credentials as{' '}
-                <strong>{service.name}</strong>.
+                {isOrphan &&
+                selectedBackup?.engine === 'postgres' &&
+                selectedBackup.format === 'walg' ? (
+                  <>
+                    The new service inherits its connection settings from{' '}
+                    <strong>{service.name}</strong>. For this physical backup,
+                    those settings must match the database name, username and
+                    password from the source server.
+                  </>
+                ) : (
+                  <>
+                    Suggested: {capabilities?.suggested_new_service_name}. The
+                    new service uses the same image and credentials as{' '}
+                    <strong>{service.name}</strong>.
+                  </>
+                )}
               </p>
             </div>
           ) : null}
@@ -1393,9 +1450,18 @@ export function ServiceRestore() {
             ) : planError ? (
               <Alert variant="destructive">
                 <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Could not preview restore</AlertTitle>
                 <AlertDescription>
-                  Failed to compute plan: {planError.message}
+                  {restoreRequestFailure(planError, 'plan', isOrphan)}
                 </AlertDescription>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="outline"
+                  onClick={() => setPreviewAttempt((n) => n + 1)}
+                >
+                  Retry preview
+                </Button>
               </Alert>
             ) : plan ? (
               <>
@@ -1465,6 +1531,13 @@ export function ServiceRestore() {
         </Card>
       ) : null}
 
+      {startFailure?.key === planRequestKey && (
+        <Alert variant="destructive">
+          <AlertCircle className="h-4 w-4" />
+          <AlertTitle>Could not start restore</AlertTitle>
+          <AlertDescription>{startFailure.message}</AlertDescription>
+        </Alert>
+      )}
       {/* Action bar */}
       {!gate.enabled && gate.reason ? (
         gate.retry === 'active_runs' ? (

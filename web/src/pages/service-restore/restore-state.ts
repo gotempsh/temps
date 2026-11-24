@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { readFailureServerDetail } from '@/lib/read-failure'
 import type { RestoreRunView } from '@/api/client/types.gen'
 import { withHttpStatus } from '@/components/nodes/node-eviction'
 
@@ -577,4 +578,21 @@ export function completionToast(
         description: run.error_message ?? interruptedFallbackMessage(run.phase),
       }
   }
+}
+
+export function restoreRequestFailure(
+  error: unknown,
+  operation: 'plan' | 'start',
+  orphan: boolean
+): string {
+  const detail = readFailureServerDetail(error)
+  if (detail && detail !== 'The restore operation could not be completed')
+    return detail
+  const guidance =
+    operation === 'start'
+      ? 'Check the restore history for this database before starting another restore.'
+      : 'Check the destination server logs for the restore-plan error, then retry the preview.'
+  return orphan
+    ? `${guidance} Verify that the destination server can read the selected backup from the S3 source.`
+    : guidance
 }

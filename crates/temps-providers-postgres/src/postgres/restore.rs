@@ -91,6 +91,20 @@ where
     }
 }
 
+fn restore_login_guidance(sqlstate: Option<&str>) -> Option<&'static str> {
+    match sqlstate {
+        Some("28P01" | "28000") => Some(concat!(
+            "PostgreSQL rejected the configured login. Check the destination service's username and password. ",
+            "A physical restore requires the login stored in the selected backup."
+        )),
+        Some("3D000") => Some(concat!(
+            "PostgreSQL could not find the configured database name. Check the destination service's database name. ",
+            "For a physical restore, use a database present in the selected backup."
+        )),
+        _ => None,
+    }
+}
+
 impl PostgresService {
     /// Shell script that stops a running WAL-G `backup-fetch` (by the PID it
     /// recorded), escalating to SIGKILL, and only then deletes what a
@@ -298,7 +312,16 @@ impl PostgresService {
             })?
             .map_err(|error| PostgresArchiveVerificationError {
                 service_name: self.name.clone(),
-                reason: format!("could not verify the restored database's readiness: {error}"),
+                reason: restore_login_guidance(
+                    error
+                        .as_database_error()
+                        .and_then(|db| db.code())
+                        .as_deref(),
+                )
+                .map(str::to_owned)
+                .unwrap_or_else(|| {
+                    format!("could not verify the restored database's readiness: {error}")
+                }),
             })
     }
 
@@ -1112,6 +1135,7 @@ pub(super) fn postgres_recovery_target_setting(
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[cfg(feature = "docker-tests")]
     use bollard::Docker;
     #[cfg(feature = "docker-tests")]
@@ -1162,6 +1186,18 @@ mod tests {
         )
         .await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn physical_restore_login_errors_explain_which_source_settings_to_use() {
+        for code in ["28P01", "28000"] {
+            assert!(restore_login_guidance(Some(code))
+                .is_some_and(|reason| reason.contains("username and password")));
+        }
+        assert!(restore_login_guidance(Some("3D000"))
+            .is_some_and(|reason| reason.contains("database name")));
+        assert_eq!(restore_login_guidance(Some("57P03")), None);
+        assert_eq!(restore_login_guidance(None), None);
     }
 
     #[test]
