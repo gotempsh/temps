@@ -1045,7 +1045,10 @@ async fn list_source_backups(
                 backup_id: entry.backup_id,
                 name: entry.name,
                 backup_type: entry.backup_type,
-                created_at: entry.created_at,
+                created_at: entry
+                    .created_at
+                    .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true))
+                    .unwrap_or_default(),
                 expires_at: entry.expires_at,
                 size_bytes: entry.size_bytes,
                 location: entry.location,

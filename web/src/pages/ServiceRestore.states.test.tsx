@@ -7,7 +7,7 @@ import { installBrowserWindow } from '@/test/dom'
 import { jsonResponse, mockApi } from '@/test/fetch-mock'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
-import { MemoryRouter, Route, Routes } from 'react-router'
+import { Link, MemoryRouter, Route, Routes } from 'react-router'
 import type { RestoreRunView } from '@/api/client/types.gen'
 import { BreadcrumbProvider } from '@/contexts/BreadcrumbContext'
 import { ServiceRestore } from './ServiceRestore'
@@ -34,6 +34,8 @@ interface PageSeeds {
   service?: Seed
   capabilities?: Seed
   sources?: Seed
+  navigationHref?: string
+  trackedBackups?: Seed
   scannedBackups?: Seed
   ownBackups?: Seed
   runs?: Seed
@@ -138,6 +140,11 @@ function restorePage(seeds: PageSeeds) {
     restoreSourceBackupsQuery(1, true).queryKey,
     seeds.scannedBackups
   )
+  seed(
+    client,
+    restoreSourceBackupsQuery(1, false).queryKey,
+    seeds.trackedBackups
+  )
   seed(client, restoreOwnBackupsQuery(SERVICE_ID).queryKey, seeds.ownBackups)
   seed(
     client,
@@ -157,6 +164,9 @@ function restorePage(seeds: PageSeeds) {
           },
         ]}
       >
+        {seeds.navigationHref && (
+          <Link to={seeds.navigationHref}>Open snapshot</Link>
+        )}
         <BreadcrumbProvider>
           <Routes>
             <Route path="/storage/:id/restore" element={<ServiceRestore />} />
@@ -537,6 +547,63 @@ describe('run tracking (#1237)', () => {
 
 describe('imported backup interaction', () => {
   installBrowserWindow()
+
+  test('navigating to an orphan link starts a scoped scan and keeps tracked rows visible until it finishes', async () => {
+    let finish: ((response: Response) => void) | undefined
+    const row = {
+      ...scannedRows(locations).data.backups[0],
+      source: 'db',
+      id: 18,
+      backup_id: 'backup-a',
+      origin_service_name: 'tracked-service',
+    }
+    const tracked = {
+      backups: [row],
+      scan_errors: [],
+      last_updated: row.created_at,
+    }
+    const api = mockApi({
+      'GET /backups/s3-sources/1/backups': (request) =>
+        new URL(request.url).searchParams.get('include_s3_scan') === 'true'
+          ? new Promise<Response>((resolve) => {
+              finish = resolve
+            })
+          : jsonResponse(tracked),
+    })
+    const { page, client } = restorePage({
+      trackedBackups: { data: tracked },
+      navigationHref: `?source=1&location=${encodeURIComponent(locations[1])}`,
+    })
+    const view = render(page)
+    try {
+      const checkbox = view.getByLabelText(
+        'Also search the S3 bucket for backups made by other servers'
+      )
+      expect(checkbox.getAttribute('aria-checked')).toBe('false')
+      fireEvent.click(view.getByRole('link', { name: 'Open snapshot' }))
+      await view.findByText('Searching the S3 bucket…')
+      expect(checkbox.getAttribute('aria-checked')).toBe('true')
+      expect(view.getByText('tracked-service')).toBeTruthy()
+      expect(
+        view.queryByText('The linked backup is not on this source')
+      ).toBeNull()
+      if (!finish) throw new Error('Expected a pending bucket scan')
+      finish(
+        jsonResponse({
+          ...tracked,
+          backups: [row, ...scannedRows([locations[1]]).data.backups],
+        })
+      )
+      await view.findByText(`Selected: ${locations[1]}`)
+      fireEvent.click(checkbox)
+      expect(checkbox.getAttribute('aria-checked')).toBe('false')
+      expect(view.queryByText(`Selected: ${locations[1]}`)).toBeNull()
+    } finally {
+      view.unmount()
+      client.clear()
+      api.restore()
+    }
+  })
 
   test('previews and starts only the selected snapshot, and keeps failure details on screen', async () => {
     const previews: string[] = []

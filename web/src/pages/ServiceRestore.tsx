@@ -322,7 +322,8 @@ export function ServiceRestore() {
   }>()
   const [previewAttempt, setPreviewAttempt] = useState(0)
   const [search, setSearch] = useState('')
-  const [includeScan, setIncludeScan] = useState(!!selection.backupLocation)
+  const [scanRequested, setScanRequested] = useState(false)
+  const includeScan = scanRequested || !!selection.backupLocation
   const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
   const effectiveSourceId = selectedSourceId ?? defaultSource?.id
   const effectiveNewServiceName =
@@ -348,6 +349,13 @@ export function ServiceRestore() {
   // ----- Backups list ------------------------------------------------------
   const sourceBackupsQuery = useQuery({
     ...restoreSourceBackupsQuery(effectiveSourceId ?? 0, includeScan),
+    placeholderData:
+      includeScan && effectiveSourceId !== undefined
+        ? () =>
+            queryClient.getQueryData(
+              restoreSourceBackupsQuery(effectiveSourceId, false).queryKey
+            )
+        : undefined,
     enabled: effectiveSourceId !== undefined && !sourcesRefused,
   })
   // A role that may not read storage sources can still list and restore this
@@ -395,6 +403,11 @@ export function ServiceRestore() {
   const selectionMissing =
     hasBackupSelection(selection) &&
     backupsSection.kind === 'ready' &&
+    !(
+      selection.backupLocation &&
+      (sourceBackupsQuery.isFetching ||
+        sourceBackupsQuery.data?.scan_errors?.length)
+    ) &&
     !selectedBackup &&
     !allBackups.some(
       (b) => needsSnapshotKey(b) && b.location === selection.backupLocation
@@ -935,12 +948,21 @@ export function ServiceRestore() {
               <Checkbox
                 id="include-s3-scan"
                 checked={includeScan}
-                onCheckedChange={(checked) => setIncludeScan(checked === true)}
+                onCheckedChange={(checked) => {
+                  setScanRequested(checked === true)
+                  if (checked !== true && selection.backupLocation)
+                    updateSelection({ backup: null })
+                }}
               />
               <Label htmlFor="include-s3-scan">
                 Also search the S3 bucket for backups made by other servers
               </Label>
             </div>
+          )}
+          {includeScan && sourceBackupsQuery.isFetching && (
+            <p role="status" className="text-sm text-muted-foreground">
+              Searching the S3 bucket…
+            </p>
           )}
           {includeScan &&
             sourceBackupsQuery.data?.scan_errors?.map((message) => (

@@ -546,7 +546,40 @@ impl BackupService {
             message: format!("Failed to decrypt S3 session token: {}", e),
         })?;
 
-        let walg_s3_prefix = &backup.s3_location;
+        // A repository is shared across snapshots. Older rows need their UUID
+        // matched before any restore command can touch the database.
+        let location = if temps_providers::externalsvc::postgres::walg_snapshot(&backup.s3_location)
+            .is_some()
+        {
+            backup.s3_location.clone()
+        } else {
+            let prefix = backup
+                .s3_location
+                .strip_prefix(&format!("s3://{}/", s3_source.bucket_name))
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "Backup {} is outside S3 source {}",
+                        backup.backup_id, s3_source.id
+                    ))
+                })?;
+            let client = self.create_s3_client(s3_source).await?;
+            crate::engines::walg_size::find_snapshot(
+                &client, &s3_source.bucket_name, prefix, &backup.backup_id,
+            ).await.map_err(|error| BackupError::S3(error.to_string()))?
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "No WAL-G snapshot in {} identifies control-plane backup {}. Use the exact base backup name for manual recovery.",
+                        backup.s3_location, backup.backup_id
+                    ))
+                })?
+        };
+        let (walg_s3_prefix, snapshot) =
+            temps_providers::externalsvc::postgres::walg_snapshot(&location).ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Invalid WAL-G snapshot for backup {}: {location}",
+                    backup.backup_id
+                ))
+            })?;
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
             format!("AWS_ACCESS_KEY_ID={}", decrypted_access_key),
@@ -602,7 +635,7 @@ impl BackupService {
             restore_temp, container_id
         );
         let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} LATEST > /tmp/walg_restore.log 2>&1",
+            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} {snapshot} > /tmp/walg_restore.log 2>&1",
             restore_temp = escaped_restore_temp,
         );
 

@@ -126,6 +126,12 @@ impl From<RestoreError> for Problem {
                         "The database could not complete the restore operation; check server logs.",
                     )
             }
+            RestoreError::SnapshotLookupFailed { ref backup_id, s3_source_id, ref source } => {
+                error!(backup_id, s3_source_id, error = %source, "WAL-G snapshot lookup failed");
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("Could not locate the selected WAL-G backup")
+                    .with_detail(error.to_string())
+            }
             RestoreError::WalgRepositoryUnavailable { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("WAL-G repository unavailable")
                 .with_detail(error.to_string()),
@@ -1201,6 +1207,22 @@ mod tests {
             .unwrap_or_default();
         assert!(detail.contains("service 7"));
         assert!(!detail.contains("private database detail"));
+    }
+
+    #[test]
+    fn snapshot_lookup_failure_identifies_backup_and_source_without_exposing_provider_details() {
+        let problem: Problem = RestoreError::SnapshotLookupFailed {
+            backup_id: "backup-a".into(),
+            s3_source_id: 4,
+            source: crate::execution::engine_v2::BackupError::Failed {
+                reason: "provider diagnostic".into(),
+            },
+        }
+        .into();
+        assert_eq!(problem.status_code, StatusCode::BAD_GATEWAY);
+        let message = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(message.contains("backup-a") && message.contains("S3 source 4"));
+        assert!(!message.contains("provider diagnostic"));
     }
 
     #[test]

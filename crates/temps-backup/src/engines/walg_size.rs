@@ -63,6 +63,55 @@ pub(crate) fn sentinel_backup_id(bytes: &[u8]) -> Result<Option<String>, serde_j
         .and_then(|data| data.get("temps_backup_id")?.as_str().map(str::to_owned)))
 }
 
+/// Only an exact UUID in a valid stop sentinel can identify a tracked snapshot.
+pub(crate) async fn find_snapshot(
+    client: &S3Client,
+    bucket: &str,
+    repository_key: &str,
+    backup_id: &str,
+) -> Result<Option<String>, BackupError> {
+    let prefix = format!("{}/basebackups_005/", repository_key.trim_end_matches('/'));
+    let mut pages = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&prefix)
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    let mut unreadable = None;
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|error| BackupError::Failed {
+            reason: format!("Could not list {prefix} for backup {backup_id}: {error}"),
+        })?;
+        for key in page
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .filter(|key| temps_providers::externalsvc::postgres::walg_snapshot(key).is_some())
+        {
+            let bytes = match read_sentinel(client, bucket, key).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(key, backup_id, %error, "Skipping unreadable WAL-G stop sentinel");
+                    unreadable.get_or_insert(error);
+                    continue;
+                }
+            };
+            match sentinel_backup_id(&bytes) {
+                Ok(Some(id)) if id == backup_id => return Ok(Some(format!("s3://{bucket}/{key}"))),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(key, backup_id, %error, "Skipping malformed WAL-G stop sentinel")
+                }
+            }
+        }
+    }
+    match unreadable {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
 pub(crate) async fn read_sentinel(
     client: &S3Client,
     bucket: &str,

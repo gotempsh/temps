@@ -167,6 +167,14 @@ pub enum RestoreError {
         service_id: i32,
     },
 
+    #[error("Could not read the WAL-G snapshot identity for backup {backup_id} on S3 source {s3_source_id}. Check the source credentials and read access to the repository.")]
+    SnapshotLookupFailed {
+        backup_id: String,
+        s3_source_id: i32,
+        #[source]
+        source: crate::execution::engine_v2::BackupError,
+    },
+
     #[error("Backup {location} has no valid WAL-G repository in S3 source {s3_source_id} for restore run {run_id} on service {service_id}")]
     WalgRepositoryUnavailable {
         location: String,
@@ -748,6 +756,17 @@ impl RestoreService {
         // plan matches reality.
         let mut resolved_location = backup_location.clone();
         let mut location_was_resolved = false;
+        if let Some(row) = &backup_row {
+            if needs_walg_identity_lookup(row, &target.service_type)? {
+                let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(RestoreError::S3SourceNotFound { s3_source_id })?;
+                resolved_location =
+                    resolve_tracked_walg_snapshot(row, &source, &self.encryption_service).await?;
+                location_was_resolved = true;
+            }
+        }
         if resolved_location.is_empty() {
             let origin_and_uuid = backup_row.as_ref().and_then(|b| {
                 serde_json::from_str::<serde_json::Value>(&b.metadata)
@@ -2549,6 +2568,13 @@ async fn run_restore_inner(
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: run.source_service_id,
             })?;
+
+    if run.source_backup_id.is_some()
+        && needs_walg_identity_lookup(&backup_model, &target_service.service_type)?
+    {
+        backup_model.s3_location =
+            resolve_tracked_walg_snapshot(&backup_model, &s3_source, &enc).await?;
+    }
 
     // A restore into a service on a worker node writes there: a PostgreSQL
     // WAL-G, MariaDB, MongoDB or Redis restore is the control plane's own
@@ -4448,7 +4474,7 @@ fn build_postgres_steps(
             RestoreRequestMode::InPlace => {
                 *destructive = true;
                 steps.push(format!(
-                    "Fetch WAL-G base backup into {}'s shared volume (wal-g backup-fetch LATEST)",
+                    "Fetch the selected WAL-G base backup into {}'s shared volume",
                     container_name
                 ));
                 steps.push(
@@ -5004,6 +5030,49 @@ fn build_object_store_steps(
     let _ = strategy;
 }
 
+// Repository-only rows predating versioned WAL-G selectors still need to
+// resolve their own snapshot, before dispatch to a local or remote worker.
+fn needs_walg_identity_lookup(
+    backup: &temps_entities::backups::Model,
+    engine: &str,
+) -> Result<bool, RestoreError> {
+    Ok(engine == "postgres"
+        && backup.s3_location.trim_end_matches('/').ends_with("/walg")
+        && selected_walg_target_user_data(backup)?.is_none())
+}
+
+async fn resolve_tracked_walg_snapshot(
+    backup: &temps_entities::backups::Model,
+    source: &temps_entities::s3_sources::Model,
+    enc: &Arc<temps_core::EncryptionService>,
+) -> Result<String, RestoreError> {
+    let key = backup
+        .s3_location
+        .strip_prefix(&format!("s3://{}/", source.bucket_name))
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "Backup {} is outside S3 source {}. Select a snapshot from the correct S3 source.",
+                backup.backup_id, source.id
+            ),
+        })?;
+    let lookup_error = |error| RestoreError::SnapshotLookupFailed {
+        backup_id: backup.backup_id.clone(),
+        s3_source_id: source.id,
+        source: error,
+    };
+    let client = crate::engines::v2_common::build_s3_client(source, enc, "temps-backup")
+        .map_err(lookup_error)?;
+    crate::engines::walg_size::find_snapshot(&client, &source.bucket_name, key, &backup.backup_id)
+        .await
+        .map_err(lookup_error)?
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "No WAL-G snapshot in {} identifies backup {}. Search the S3 bucket and select the individual snapshot to restore.",
+                backup.s3_location, backup.backup_id
+            ),
+        })
+}
+
 /// Probe an S3 source for a backup belonging to `<engine>/<origin_service>/`.
 /// Looks for a matching WAL-G snapshot or an object under the backup UUID. Returns `Ok(None)` when nothing
 /// plausible is found; `Err` only on unexpected S3 failures.
@@ -5036,29 +5105,29 @@ async fn resolve_backup_location_from_s3(
     // A PostgreSQL repository can contain backups made by several servers.
     // A missing location is repairable only when a sentinel identifies this row.
     let walg_prefix = format!("{service_prefix}walg");
-    let mut pages = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(format!("{walg_prefix}/basebackups_005/"))
-        .delimiter("/")
-        .into_paginator()
-        .send();
-    while let Some(page) = pages.next().await {
-        let page = page?;
-        for key in page
-            .contents()
-            .iter()
-            .filter_map(|object| object.key())
-            .filter(|key| key.ends_with("_backup_stop_sentinel.json"))
+    if engine == "postgres" {
+        if let Some(location) =
+            crate::engines::walg_size::find_snapshot(s3_client, bucket, &walg_prefix, backup_uuid)
+                .await?
         {
-            if engine != "postgres" {
-                return Ok(Some(format!("s3://{bucket}/{walg_prefix}")));
-            }
-            let bytes = crate::engines::walg_size::read_sentinel(s3_client, bucket, key).await?;
-            if crate::engines::walg_size::sentinel_backup_id(&bytes)?.as_deref()
-                == Some(backup_uuid)
+            return Ok(Some(location));
+        }
+    } else {
+        let mut pages = s3_client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(format!("{walg_prefix}/basebackups_005/"))
+            .delimiter("/")
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            if page?
+                .contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .any(|key| key.ends_with("_backup_stop_sentinel.json"))
             {
-                return Ok(Some(format!("s3://{bucket}/{key}")));
+                return Ok(Some(format!("s3://{bucket}/{walg_prefix}")));
             }
         }
     }
@@ -6955,6 +7024,13 @@ mod tests {
 
         // Two servers may write base backups below the same service name.
         let base_key = "external_services/postgres/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key.replace("base_0001", "base_0000"))
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"{invalid"))
+            .send()
+            .await?;
         s3_client
             .put_object()
             .bucket(bucket)

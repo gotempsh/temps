@@ -21,7 +21,7 @@ pub struct SourceBackupIndexEntry {
     pub name: String,
     #[serde(rename = "type")]
     pub backup_type: String,
-    pub created_at: String,
+    pub created_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub expires_at: Option<String>,
     pub size_bytes: Option<i64>,
@@ -131,13 +131,13 @@ impl ScanListError {
 ///   (WAL-G marker objects)
 async fn scan_s3_for_orphan_backups(
     s3_client: &aws_sdk_s3::Client,
-    s3_source: &temps_entities::s3_sources::Model,
+    bucket: &str,
+    bucket_path: &str,
     seen_locations: &std::collections::HashSet<String>,
     entries: &mut Vec<SourceBackupIndexEntry>,
     scan_errors: &mut Vec<String>,
 ) -> Result<(), ScanListError> {
-    let bucket = &s3_source.bucket_name;
-    let prefix = build_s3_key(&s3_source.bucket_path, "external_services/");
+    let prefix = build_s3_key(bucket_path, "external_services/");
 
     // First-level list: `external_services/<engine>/`. We use delimiter
     // '/' so we only get the top-level engine directories (CommonPrefixes).
@@ -148,24 +148,51 @@ async fn scan_s3_for_orphan_backups(
         .enumerate()
         .map(|(index, entry)| (entry.backup_id.clone(), index))
         .collect();
-    let missing_locations = entries.iter().any(|entry| entry.location.is_empty());
+    // A service name limits where to look. Only the UUID inside the sentinel
+    // establishes identity, even when two servers use the same service name.
+    let candidates: std::collections::HashSet<_> = entries
+        .iter()
+        .filter(|entry| {
+            entry.location.is_empty() && entry.engine.as_deref().is_none_or(|e| e == "postgres")
+        })
+        .map(|entry| entry.origin_service_name.clone())
+        .collect();
+    // Legacy rows without a producer name cannot narrow the search. Bound the
+    // additional GetObject requests across the whole bucket in that case.
+    const MAX_UNSCOPED_SENTINELS: usize = 32;
+    let mut unknown_budget = if candidates.contains(&None) {
+        MAX_UNSCOPED_SENTINELS
+    } else {
+        0
+    };
 
     for engine_prefix in engine_prefixes {
         let engine = extract_trailing_segment(&engine_prefix);
         // Second-level list: `external_services/<engine>/<service>/`
-        let service_prefixes = list_common_prefixes(s3_client, bucket, &engine_prefix).await?;
+        let service_prefixes = partial_listing(
+            list_common_prefixes(s3_client, bucket, &engine_prefix).await,
+            scan_errors,
+        );
 
         for service_prefix in service_prefixes {
             let service_name = extract_trailing_segment(&service_prefix);
 
             // Look for a WAL-G backup under `<service_prefix>walg/`.
             let walg_prefix = format!("{}walg/", service_prefix);
-            let walg_sentinels = list_walg_sentinels(s3_client, bucket, &walg_prefix).await?;
+            let walg_sentinels = partial_listing(
+                list_walg_sentinels(s3_client, bucket, &walg_prefix).await,
+                scan_errors,
+            );
+            let repository = format!("s3://{}/{}", bucket, walg_prefix.trim_end_matches('/'));
+            let known_candidate = candidates.contains(&Some(service_name.clone()))
+                || seen_locations.contains(&repository);
             for (sentinel, last_modified, _) in walg_sentinels {
-                let repository = format!("s3://{}/{}", bucket, walg_prefix.trim_end_matches('/'));
                 let location = if engine == "postgres" {
                     let location = format!("s3://{bucket}/{sentinel}");
-                    if missing_locations || seen_locations.contains(&repository) {
+                    if seen_locations.contains(&location) {
+                        continue;
+                    }
+                    if should_read_identity(known_candidate, &mut unknown_budget) {
                         let identity =
                             crate::engines::walg_size::read_sentinel(s3_client, bucket, &sentinel)
                                 .await
@@ -177,7 +204,12 @@ async fn scan_s3_for_orphan_backups(
                         match identity {
                             Ok(id) => {
                                 if let Some(index) = id.as_ref().and_then(|id| by_id.get(id)) {
-                                    fill_tracked_location(&mut entries[*index], &location, "walg");
+                                    let entry = &mut entries[*index];
+                                    if entry.location.trim_end_matches('/') == repository {
+                                        entry.location.clone_from(&location);
+                                    } else {
+                                        fill_tracked_location(entry, &location, "walg");
+                                    }
                                     continue;
                                 }
                             }
@@ -191,7 +223,7 @@ async fn scan_s3_for_orphan_backups(
                     if seen_locations.contains(&repository) {
                         continue;
                     }
-                    repository
+                    repository.clone()
                 };
                 if seen_locations.contains(&location) {
                     continue;
@@ -215,7 +247,10 @@ async fn scan_s3_for_orphan_backups(
             }
 
             // Look for pg_dump-style objects under the service prefix.
-            let dumps = list_dump_objects(s3_client, bucket, &service_prefix).await?;
+            let dumps = partial_listing(
+                list_dump_objects(s3_client, bucket, &service_prefix).await,
+                scan_errors,
+            );
             for (key, last_modified, size) in dumps {
                 if seen_locations.contains(&key) {
                     continue;
@@ -247,6 +282,24 @@ async fn scan_s3_for_orphan_backups(
     }
 
     Ok(())
+}
+
+fn should_read_identity(known_candidate: bool, unknown_budget: &mut usize) -> bool {
+    if known_candidate {
+        return true;
+    }
+    if *unknown_budget == 0 {
+        return false;
+    }
+    *unknown_budget -= 1;
+    true
+}
+
+fn partial_listing<T>(result: Result<Vec<T>, ScanListError>, errors: &mut Vec<String>) -> Vec<T> {
+    result.unwrap_or_else(|error| {
+        errors.push(error.to_string());
+        Vec::new()
+    })
 }
 
 fn fill_tracked_location(entry: &mut SourceBackupIndexEntry, location: &str, format: &str) {
@@ -295,6 +348,8 @@ async fn list_common_prefixes(
     Ok(out)
 }
 
+type ScannedObject = (String, Option<DateTime<Utc>>, Option<i64>);
+
 /// Find WAL-G backup-stop-sentinel objects under a walg prefix and return
 /// (key, last_modified_rfc3339, size_bytes) for each. WAL-G names them
 /// `base_<timestamp>_backup_stop_sentinel.json`. The presence of the
@@ -303,7 +358,7 @@ async fn list_walg_sentinels(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     walg_prefix: &str,
-) -> Result<Vec<(String, String, Option<i64>)>, ScanListError> {
+) -> Result<Vec<ScannedObject>, ScanListError> {
     let basebackups_prefix = format!("{}basebackups_005/", walg_prefix);
     let mut out = Vec::new();
     let mut continuation: Option<String> = None;
@@ -328,13 +383,9 @@ async fn list_walg_sentinels(
             if !key.ends_with("_backup_stop_sentinel.json") {
                 continue;
             }
-            let lm = obj
-                .last_modified()
-                .and_then(|d| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(d.secs(), d.subsec_nanos())
-                        .map(|c| c.to_rfc3339())
-                })
-                .unwrap_or_default();
+            let lm = obj.last_modified().and_then(|d| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(d.secs(), d.subsec_nanos())
+            });
             let size = obj.size();
             out.push((key, lm, size));
         }
@@ -361,7 +412,7 @@ async fn list_dump_objects(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
     service_prefix: &str,
-) -> Result<Vec<(String, String, Option<i64>)>, ScanListError> {
+) -> Result<Vec<ScannedObject>, ScanListError> {
     let mut out = Vec::new();
     let mut continuation: Option<String> = None;
     loop {
@@ -396,13 +447,9 @@ async fn list_dump_objects(
             {
                 continue;
             }
-            let lm = obj
-                .last_modified()
-                .and_then(|d| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(d.secs(), d.subsec_nanos())
-                        .map(|c| c.to_rfc3339())
-                })
-                .unwrap_or_default();
+            let lm = obj.last_modified().and_then(|d| {
+                chrono::DateTime::<chrono::Utc>::from_timestamp(d.secs(), d.subsec_nanos())
+            });
             let size = obj.size();
             out.push((key, lm, size));
         }
@@ -863,9 +910,7 @@ impl BackupService {
                 backup_id: backup.backup_id,
                 name: display_name,
                 backup_type: backup.backup_type,
-                created_at: backup
-                    .started_at
-                    .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
+                created_at: Some(backup.started_at),
                 expires_at: backup
                     .expires_at
                     .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
@@ -898,7 +943,8 @@ impl BackupService {
             if let Ok(s3_client) = self.create_s3_client(&s3_source).await {
                 if let Err(e) = scan_s3_for_orphan_backups(
                     &s3_client,
-                    &s3_source,
+                    &s3_source.bucket_name,
+                    &s3_source.bucket_path,
                     &seen_locations,
                     &mut entries,
                     &mut scan_errors,
@@ -918,11 +964,12 @@ impl BackupService {
         } // end if include_s3_scan
 
         // Final sort: newest first, regardless of source.
-        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        entries.sort_by_key(|entry| std::cmp::Reverse(entry.created_at));
         let last_updated = entries
             .first()
-            .map(|entry| entry.created_at.clone())
-            .unwrap_or_else(|| Utc::now().to_rfc3339());
+            .and_then(|entry| entry.created_at)
+            .unwrap_or_else(Utc::now)
+            .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true);
         Ok(SourceBackupIndex {
             backups: entries,
             last_updated,
@@ -937,6 +984,94 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
+
+    #[test]
+    fn only_unknown_repositories_consume_the_shared_identity_read_budget() {
+        let mut budget = 1;
+        assert!(should_read_identity(true, &mut budget));
+        assert!(should_read_identity(false, &mut budget));
+        assert!(!should_read_identity(false, &mut budget));
+        assert!(should_read_identity(true, &mut budget));
+    }
+
+    #[tokio::test]
+    async fn denied_service_prefix_leaves_sibling_dumps_and_unrelated_snapshots_visible(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use axum::{extract::Query, http::StatusCode, routing::get, Router};
+        use std::collections::HashMap;
+        async fn list(Query(query): Query<HashMap<String, String>>) -> (StatusCode, String) {
+            let prefix = query.get("prefix").map(String::as_str).unwrap_or_default();
+            let contents = match prefix {
+                "external_services/" => "<CommonPrefixes><Prefix>external_services/postgres/</Prefix></CommonPrefixes>",
+                "external_services/postgres/" => concat!(
+                    "<CommonPrefixes><Prefix>external_services/postgres/service-a/</Prefix></CommonPrefixes>",
+                    "<CommonPrefixes><Prefix>external_services/postgres/service-b/</Prefix></CommonPrefixes>"
+                ),
+                "external_services/postgres/service-a/walg/basebackups_005/" =>
+                    return (StatusCode::FORBIDDEN, "<Error><Code>AccessDenied</Code></Error>".to_owned()),
+                "external_services/postgres/service-a/" =>
+                    "<Contents><Key>external_services/postgres/service-a/backup-a/dump.sql.gz</Key></Contents>",
+                "external_services/postgres/service-b/walg/basebackups_005/" =>
+                    "<Contents><Key>external_services/postgres/service-b/walg/basebackups_005/base_002_backup_stop_sentinel.json</Key></Contents>",
+                _ => "",
+            };
+            (
+                StatusCode::OK,
+                format!("<ListBucketResult>{contents}</ListBucketResult>"),
+            )
+        }
+        let app = Router::new().route("/backups-bucket/", get(list));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
+        let endpoint = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move { axum::serve(listener, app).await });
+        let credentials = aws_sdk_s3::config::Credentials::new("test", "test", None, None, "test");
+        let config = crate::engines::v2_common::s3_config_builder(
+            "us-east-1",
+            true,
+            credentials,
+            Some(&endpoint),
+        )
+        .build();
+        let client = aws_sdk_s3::Client::from_conf(config);
+        let mut entries = vec![SourceBackupIndexEntry {
+            id: 1,
+            backup_id: "pending-a".into(),
+            name: "service-a".into(),
+            backup_type: "full".into(),
+            created_at: None,
+            expires_at: None,
+            size_bytes: None,
+            location: String::new(),
+            metadata_location: String::new(),
+            engine: Some("postgres".into()),
+            origin_service_name: Some("service-a".into()),
+            format: None,
+            source: "db".into(),
+            state: "pending".into(),
+        }];
+        let mut errors = Vec::new();
+        let result = scan_s3_for_orphan_backups(
+            &client,
+            "backups-bucket",
+            "",
+            &Default::default(),
+            &mut entries,
+            &mut errors,
+        )
+        .await;
+        server.abort();
+        result?;
+        // An unexpected GetObject against the unrelated repository would add a second error.
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("AccessDenied") && errors[0].contains("service-a/walg"));
+        assert!(entries
+            .iter()
+            .any(|entry| entry.location.ends_with("/backup-a/dump.sql.gz")));
+        assert!(entries.iter().any(|entry| entry
+            .location
+            .ends_with("/base_002_backup_stop_sentinel.json")));
+        Ok(())
+    }
 
     #[test]
     fn classify_pgdump_by_extension() {
@@ -1134,6 +1269,7 @@ mod tests {
             .await?;
             let mut row = make_test_backup_model(1).into_active_model();
             row.id = sea_orm::ActiveValue::NotSet;
+            row.started_at = Set("2026-01-01T12:00:00Z".parse()?);
             row.s3_location = Set(object_key.into());
             row.backup_id = Set(Uuid::new_v4().to_string());
             row.s3_source_id = Set(source.id);
@@ -1173,6 +1309,7 @@ mod tests {
                 physical.id = sea_orm::ActiveValue::NotSet;
                 physical.s3_source_id = Set(source.id);
                 physical.created_by = Set(user.id);
+                physical.started_at = Set("2026-01-01T12:00:00.500Z".parse()?);
                 physical.s3_location = Set(repository.clone());
                 physical.backup_id = Set("local-backup".into());
                 physical.reset_all().insert(db).await?;
@@ -1182,15 +1319,22 @@ mod tests {
         let (source_id, user_id) = destination.ok_or("missing destination")?;
         let plain = backups_b.list_source_backups(source_id, false).await?;
         assert_eq!(plain.backups.len(), 2);
+        assert_eq!(plain.backups[0].backup_id, "local-backup");
+        assert_eq!(plain.last_updated, "2026-01-01T12:00:00.500Z");
+        let tracked_id = plain.backups[0].id;
         let scanned = backups_b.list_source_backups(source_id, true).await?;
         assert!(scanned.scan_errors.is_empty(), "{:?}", scanned.scan_errors);
         assert_eq!(scanned.backups.len(), 4);
         assert!(scanned.backups.iter().any(|entry| entry
             .location
             .ends_with("base_0002_backup_stop_sentinel.json")));
-        assert!(!scanned.backups.iter().any(|entry| entry
-            .location
-            .ends_with("base_0001_backup_stop_sentinel.json")));
+        assert!(scanned
+            .backups
+            .iter()
+            .filter(|entry| entry.source == "db")
+            .any(|entry| entry
+                .location
+                .ends_with("base_0001_backup_stop_sentinel.json")));
         let foreign = scanned
             .backups
             .into_iter()
@@ -1231,6 +1375,17 @@ mod tests {
             Arc::new(temps_providers::DnsRegistry::new(b.db.clone())),
         ));
         let restores = RestoreService::new(b.db.clone(), manager, enc);
+        let tracked_plan = restores
+            .plan_restore(
+                target.id,
+                BackupSelector::Id(tracked_id),
+                RestoreRequestMode::InPlace,
+            )
+            .await?;
+        assert!(tracked_plan
+            .source_backup
+            .location
+            .ends_with("/base_0001_backup_stop_sentinel.json"));
         let run = restores
             .start_restore(
                 target.id,

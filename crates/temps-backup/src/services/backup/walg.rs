@@ -143,7 +143,7 @@ impl BackupService {
     pub(super) async fn backup_postgres_walg(
         &self,
         s3_source: &S3Source,
-        _backup_id: &str,
+        backup_id: &str,
     ) -> Result<(String, i64), BackupError> {
         use bollard::exec::{CreateExecOptions, StartExecOptions};
         use bollard::Docker;
@@ -167,11 +167,8 @@ impl BackupService {
         // - wal-g backup-push stores base backups in {prefix}/basebackups_005/
         // - wal-g backup-fetch LATEST finds the right backup + WAL chain
         // - wal-g delete retain works across all backups
-        let walg_s3_prefix = format!(
-            "s3://{}/{}/internal_db/walg",
-            s3_source.bucket_name,
-            s3_source.bucket_path.trim_matches('/'),
-        );
+        let repository_key = build_s3_key(&s3_source.bucket_path, "internal_db/walg");
+        let walg_s3_prefix = format!("s3://{}/{repository_key}", s3_source.bucket_name);
 
         // Decrypt S3 credentials for WAL-G environment variables
         let decrypted_access_key = self
@@ -232,8 +229,6 @@ impl BackupService {
         if s3_source.effective_path_style(true).force_path_style {
             env_vars.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
-
-        let env_refs: Vec<&str> = env_vars.iter().map(|s| s.as_str()).collect();
 
         // Point archive_command at WAL-G before the base backup starts. Until
         // now it may be the placeholder that discards WAL
@@ -305,6 +300,12 @@ impl BackupService {
             // Run wal-g backup-push
             info!("Running wal-g backup-push in container {}", container_id);
 
+            let identity = format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                json!({"temps_backup_id": backup_id})
+            );
+            let mut env_refs: Vec<_> = env_vars.iter().map(String::as_str).collect();
+            env_refs.push(&identity);
             let exec = docker
                 .create_exec(
                     &container_id,
@@ -312,7 +313,7 @@ impl BackupService {
                         cmd: Some(vec!["wal-g", "backup-push", &pgdata]),
                         attach_stdout: Some(false),
                         attach_stderr: Some(false),
-                        env: Some(env_refs.clone()),
+                        env: Some(env_refs),
                         user: Some("postgres"),
                         ..Default::default()
                     },
@@ -378,10 +379,7 @@ impl BackupService {
 
         // Calculate total backup size by listing objects under the WAL-G prefix
         let s3_client = self.create_s3_client(s3_source).await?;
-        let prefix = format!(
-            "{}/internal_db/walg/basebackups_005/",
-            s3_source.bucket_path.trim_matches('/'),
-        );
+        let prefix = format!("{repository_key}/basebackups_005/");
 
         let mut total_size: i64 = 0;
         let mut continuation_token: Option<String> = None;
