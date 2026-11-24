@@ -45,6 +45,7 @@ function renderPage({
     username: 'admin',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role,
   })
   client.setQueryData(
@@ -158,6 +159,7 @@ test('resource scope reaches every audit page and can be explicitly removed', as
     username: 'admin',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role: 'admin',
   })
   client.setQueryData(

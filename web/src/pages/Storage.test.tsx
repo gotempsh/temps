@@ -41,6 +41,7 @@ function renderPage(
               role: 'admin',
               avatar_url: '',
               mfa_enabled: false,
+              email_verified: true,
             },
             isLoading: false,
             error: null,

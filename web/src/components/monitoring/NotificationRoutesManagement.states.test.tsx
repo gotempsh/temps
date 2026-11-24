@@ -55,6 +55,7 @@ function signedIn(role: string): UserResponse {
     username: 'operator',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role,
   }
 }

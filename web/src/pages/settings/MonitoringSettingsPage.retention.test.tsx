@@ -80,6 +80,7 @@ function mount(settings: object = STORED) {
               username: 'example',
               avatar_url: '',
               mfa_enabled: false,
+              email_verified: true,
               role: 'admin',
             },
             isLoading: false,

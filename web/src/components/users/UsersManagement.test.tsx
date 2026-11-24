@@ -36,6 +36,7 @@ function render(
     username: 'example',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role,
   }
   return renderToStaticMarkup(

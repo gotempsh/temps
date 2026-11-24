@@ -24,6 +24,7 @@ function signedInAs(role: string): UserResponse {
     username: 'example',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role,
   }
 }

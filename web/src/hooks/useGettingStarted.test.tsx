@@ -32,6 +32,7 @@ function renderAs(role: string, probe = <Probe />) {
               username: 'example',
               avatar_url: '',
               mfa_enabled: false,
+              email_verified: true,
               role,
             },
             isLoading: false,

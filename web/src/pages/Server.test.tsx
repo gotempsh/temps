@@ -21,6 +21,7 @@ function renderAs(role: string, client: QueryClient) {
               username: 'example',
               avatar_url: '',
               mfa_enabled: false,
+              email_verified: true,
               role,
             },
             isLoading: false,

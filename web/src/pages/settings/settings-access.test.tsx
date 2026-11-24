@@ -61,6 +61,7 @@ function renderAs(role: string, queryClient: QueryClient, page: ReactElement) {
               username: 'example',
               avatar_url: '',
               mfa_enabled: false,
+              email_verified: true,
               role,
             },
             isLoading: false,

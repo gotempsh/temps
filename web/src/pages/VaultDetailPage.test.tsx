@@ -85,6 +85,7 @@ function mount(tab = 'services', write = true, entry?: string) {
     username: 'fixture',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role: write ? 'admin' : 'user',
   })
   client.setQueryData(generalAccessCapabilityOptions().queryKey, {

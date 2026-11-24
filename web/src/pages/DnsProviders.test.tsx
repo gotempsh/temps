@@ -46,6 +46,7 @@ function render(client: QueryClient, role?: string) {
         username: 'example',
         avatar_url: '',
         mfa_enabled: false,
+        email_verified: true,
         role,
       }
     : null

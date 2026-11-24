@@ -32,6 +32,7 @@ const admin: UserResponse = {
   username: 'admin',
   avatar_url: '',
   mfa_enabled: false,
+  email_verified: true,
   role: 'admin',
 }
 

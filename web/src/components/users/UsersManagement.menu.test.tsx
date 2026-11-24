@@ -38,6 +38,7 @@ function page(role: string, listed: typeof listedUser = listedUser) {
     username: 'example',
     avatar_url: '',
     mfa_enabled: false,
+    email_verified: true,
     role,
   }
   return (
