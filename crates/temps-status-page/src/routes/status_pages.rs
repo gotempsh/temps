@@ -1532,6 +1532,13 @@ mod tests {
         assert_eq!(page.public_url, None);
         assert_eq!(page.public_json_url, None);
         assert_eq!(page.public_feed_url, None);
+        // The path is known without a configured host, so a client can
+        // still link the page relative to the address it reached Temps at.
+        assert_eq!(page.public_path, format!("/api/status/{}", page.slug));
+        assert_eq!(
+            page.public_json_path,
+            format!("/api/status/{}/summary.json", page.slug)
+        );
         assert!(!page.public_url_status.configured);
         assert_eq!(
             page.public_url_status.setup_path.as_deref(),
@@ -1539,9 +1546,18 @@ mod tests {
         );
         assert_eq!(page.monitors[0].monitor_name, SELECTED_INTERNAL_NAME);
 
-        // Draft pages are not served.
-        let html_path = format!("/status/{}", page.slug);
-        let json_path = format!("/status/{}/summary.json", page.slug);
+        // Draft pages are not served. The public router is mounted under
+        // `/api`, so these are the advertised paths without that prefix.
+        let html_path = page
+            .public_path
+            .strip_prefix("/api")
+            .expect("public path is under /api")
+            .to_string();
+        let json_path = page
+            .public_json_path
+            .strip_prefix("/api")
+            .expect("public JSON path is under /api")
+            .to_string();
         assert_eq!(fetch(&fx.public, &html_path).await.0, StatusCode::NOT_FOUND);
         assert_eq!(fetch(&fx.public, &json_path).await.0, StatusCode::NOT_FOUND);
 

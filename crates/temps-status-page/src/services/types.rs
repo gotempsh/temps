@@ -242,9 +242,46 @@ pub struct CreateMonitorRequest {
     pub check_path: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
+/// Fields to change on a monitor. Every field is optional, a field left out
+/// keeps its stored value, and at least one must be present. The monitor's ID
+/// and uptime history are kept.
+#[derive(Debug, Default, Serialize, Deserialize, ToSchema)]
 pub struct UpdateMonitorRequest {
-    pub check_path: String,
+    /// Display name; 1 to 255 characters after trimming.
+    #[serde(default)]
+    #[schema(min_length = 1, max_length = 255, example = "API health")]
+    pub name: Option<String>,
+    /// How often to probe, in seconds. **Clamped, not rejected**, exactly
+    /// like on create: values below 30 are stored as 30 and non-positive
+    /// values as 60, and the response reports the stored value.
+    #[serde(default)]
+    #[schema(example = 60)]
+    pub check_interval_seconds: Option<i32>,
+    /// Path probed on the monitored environment; must start with `/`.
+    #[serde(default)]
+    #[schema(example = "/health")]
+    pub check_path: Option<String>,
+}
+
+/// Longest monitor name accepted, matching the `status_monitors.name` column.
+pub const MAX_MONITOR_NAME_LEN: usize = 255;
+
+/// Trim a monitor name and check it is 1 to [`MAX_MONITOR_NAME_LEN`]
+/// characters long.
+pub fn validate_monitor_name(name: &str) -> Result<String, StatusPageError> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(StatusPageError::Validation(
+            "name must not be empty".to_string(),
+        ));
+    }
+    let length = trimmed.chars().count();
+    if length > MAX_MONITOR_NAME_LEN {
+        return Err(StatusPageError::Validation(format!(
+            "name is {length} characters long; the limit is {MAX_MONITOR_NAME_LEN}"
+        )));
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Floor for `status_monitors.check_interval_seconds`.
