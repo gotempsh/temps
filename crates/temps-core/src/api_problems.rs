@@ -78,8 +78,16 @@ pub fn route_not_found_with_hint(method: &Method, path: &str, hint: Option<&str>
 
 /// Fallback handler answering every unmatched request with
 /// [`route_not_found`].
+///
+/// Reports the path the client sent: a router nested under `/api` sees the
+/// path without that prefix, so the original URI wins when axum recorded it.
 pub async fn api_route_not_found(request: Request) -> Response {
-    let mut response = route_not_found(request.method(), request.uri().path()).into_response();
+    let path = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map_or_else(|| request.uri().path(), |original| original.0.path())
+        .to_string();
+    let mut response = route_not_found(request.method(), &path).into_response();
     no_store(&mut response);
     response
 }
@@ -263,6 +271,33 @@ mod tests {
             .expect("body")
             .to_vec();
         (status, headers, body)
+    }
+
+    /// A router nested under `/api` (an external plugin mount) answers an
+    /// unmatched path with the path the client actually sent.
+    #[tokio::test]
+    async fn a_nested_fallback_names_the_full_path() {
+        let nested = Router::new()
+            .route("/x/known", get(|| async { "ok" }))
+            .fallback(api_route_not_found);
+        let response = Router::new()
+            .nest("/api", nested)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/x/unknown")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("router answers");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem");
+        assert_eq!(problem["type"], ROUTE_NOT_FOUND_PROBLEM_TYPE);
+        let detail = problem["detail"].as_str().expect("detail");
+        assert!(detail.contains("GET /api/x/unknown"), "{detail}");
     }
 
     fn json_post(body: &str) -> Request {

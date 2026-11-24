@@ -634,7 +634,7 @@ impl ExternalPluginsService {
             manifests: RwLock::new(Vec::new()),
             event_listener: RwLock::new(None),
             queue,
-            proxy_router: Arc::new(RwLock::new(Router::new())),
+            proxy_router: Arc::new(RwLock::new(Self::empty_proxy_router())),
             lifecycle: Arc::new(tokio::sync::Mutex::new(())),
             ai_recovery: crate::ai_tools::ConsentRecovery::default(),
             registry_state: tokio::sync::Mutex::new(()),
@@ -1210,11 +1210,21 @@ impl ExternalPluginsService {
     }
 
     /// Build a proxy router from a set of manifests.
+    /// The proxy router with no plugin mounted.
+    ///
+    /// It is reached through a catch-all fallback on the API router (see
+    /// `DynamicPluginRouter`), so every API path no other route matches ends
+    /// here: answer those with the route-not-found problem rather than axum's
+    /// empty 404, which a client cannot tell from a missing object.
+    pub(crate) fn empty_proxy_router() -> Router {
+        Router::new().fallback(temps_core::api_problems::api_route_not_found)
+    }
+
     async fn build_proxy_router_from(
         manager: &ExternalPluginManager,
         manifests: &[PluginManifest],
     ) -> Router {
-        let mut router = Router::new();
+        let mut router = Self::empty_proxy_router();
 
         for manifest in manifests {
             if let Some(proxy) = manager.proxy_for(&manifest.name).await {
