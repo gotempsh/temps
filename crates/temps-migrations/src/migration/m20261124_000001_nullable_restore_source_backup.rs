@@ -26,11 +26,26 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .get_connection()
-            .execute_unprepared(
-                "ALTER TABLE restore_runs ALTER COLUMN source_backup_id SET NOT NULL",
-            )
+        let db = manager.get_connection();
+        let untracked = db
+            .query_one(sea_orm::Statement::from_string(
+                manager.get_database_backend(),
+                "SELECT count(*)::BIGINT AS untracked FROM restore_runs WHERE source_backup_id IS NULL",
+            ))
+            .await?
+            .map(|row| row.try_get::<i64>("", "untracked"))
+            .transpose()?
+            .unwrap_or(0);
+        if untracked > 0 {
+            return Err(DbErr::Migration(format!(
+                "cannot roll back m20261124_000001_nullable_restore_source_backup: {untracked} \
+                 restore run(s) restored a backup found in S3 that this server does not track \
+                 (restore_runs.source_backup_id IS NULL), and the previous schema requires every \
+                 restore run to reference a tracked backup. Keep this schema, or delete those runs' \
+                 history first (DELETE FROM restore_runs WHERE source_backup_id IS NULL)"
+            )));
+        }
+        db.execute_unprepared("ALTER TABLE restore_runs ALTER COLUMN source_backup_id SET NOT NULL")
             .await?;
         Ok(())
     }
@@ -74,7 +89,17 @@ mod tests {
             .execute_unprepared("INSERT INTO restore_runs VALUES (13, 99)")
             .await
             .is_err());
-        assert!(Migration.down(&manager).await.is_err());
+        let refused = Migration
+            .down(&manager)
+            .await
+            .expect_err("a restore run of an untracked backup blocks the rollback")
+            .to_string();
+        assert!(
+            refused.contains("2 restore run(s)")
+                && refused.contains("source_backup_id IS NULL")
+                && !refused.contains("violates not-null constraint"),
+            "the rollback must say how many runs block it and why: {refused}"
+        );
         db.execute_unprepared("DELETE FROM restore_runs WHERE source_backup_id IS NULL")
             .await?;
         Migration.down(&manager).await?;
