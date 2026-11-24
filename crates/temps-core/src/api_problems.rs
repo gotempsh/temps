@@ -136,8 +136,11 @@ async fn rewrite_unhandled_response(response: Response, method: &Method, path: &
         // The size hint said it fits; a body that lied cannot be replayed,
         // so answer with what the status alone says.
         Err(_) => {
-            return invalid_request(status, "The request could not be read".to_string(), None)
-                .into_response()
+            return with_original_parts(
+                parts,
+                invalid_request(status, "The request could not be read".to_string(), None)
+                    .into_response(),
+            )
         }
     };
     let text = String::from_utf8_lossy(&bytes);
@@ -148,7 +151,25 @@ async fn rewrite_unhandled_response(response: Response, method: &Method, path: &
         return Response::from_parts(parts, Body::from(bytes));
     }
     let field = rejected_field(&text);
-    invalid_request(status, text.into_owned(), field).into_response()
+    with_original_parts(
+        parts,
+        invalid_request(status, text.into_owned(), field).into_response(),
+    )
+}
+
+/// Put a rewritten body back into the original response: every header an
+/// inner layer set (CORS on an ingest route, `Allow` on a 405, …) and the
+/// extensions stay; only the representation, `Content-Type`,
+/// `Content-Length` and the body, comes from `rewritten`.
+fn with_original_parts(mut parts: axum::http::response::Parts, rewritten: Response) -> Response {
+    let (rewritten_parts, body) = rewritten.into_parts();
+    parts.headers.remove(header::CONTENT_TYPE);
+    parts.headers.remove(header::CONTENT_LENGTH);
+    for (name, value) in &rewritten_parts.headers {
+        parts.headers.insert(name.clone(), value.clone());
+    }
+    parts.status = rewritten_parts.status;
+    Response::from_parts(parts, body)
 }
 
 fn invalid_request(status: StatusCode, detail: String, field: Option<String>) -> Problem {
@@ -170,8 +191,8 @@ fn invalid_request(status: StatusCode, detail: String, field: Option<String>) ->
 /// The router adds the `Allow` header listing the accepted methods after
 /// this middleware runs, so the detail points at it rather than repeating it.
 fn method_not_allowed(response: Response, method: &Method, path: &str) -> Response {
-    let allow = response.headers().get(header::ALLOW).cloned();
-    let mut rewritten = problemdetails::new(StatusCode::METHOD_NOT_ALLOWED)
+    let (parts, _) = response.into_parts();
+    let rewritten = problemdetails::new(StatusCode::METHOD_NOT_ALLOWED)
         .with_type(METHOD_NOT_ALLOWED_PROBLEM_TYPE)
         .with_title("Method Not Allowed")
         .with_detail(format!(
@@ -179,10 +200,7 @@ fn method_not_allowed(response: Response, method: &Method, path: &str) -> Respon
             echoed_path(path)
         ))
         .into_response();
-    if let Some(allow) = allow {
-        rewritten.headers_mut().insert(header::ALLOW, allow);
-    }
-    rewritten
+    with_original_parts(parts, rewritten)
 }
 
 /// The request field a JSON rejection names, when it names one: the path
@@ -271,6 +289,64 @@ mod tests {
             .expect("body")
             .to_vec();
         (status, headers, body)
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    struct InnerMarker;
+
+    /// A rewritten rejection keeps what inner layers put on the response: a
+    /// cross-origin client must still see the CORS header on a 422, a 405
+    /// keeps `Allow`, and extensions survive; only the representation changes.
+    #[tokio::test]
+    async fn rewrites_keep_the_original_headers_and_extensions() {
+        let cors = header::HeaderName::from_static("access-control-allow-origin");
+
+        let mut rejection = (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Failed to deserialize the JSON body into the target type: interval: invalid type",
+        )
+            .into_response();
+        rejection
+            .headers_mut()
+            .insert(cors.clone(), header::HeaderValue::from_static("*"));
+        rejection.extensions_mut().insert(InnerMarker);
+        let rewritten = rewrite_unhandled_response(rejection, &Method::POST, "/api/ingest").await;
+        assert_eq!(rewritten.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(rewritten.headers()[&cors], "*");
+        assert_eq!(
+            rewritten.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        assert_eq!(
+            rewritten.extensions().get::<InnerMarker>(),
+            Some(&InnerMarker)
+        );
+        let body = axum::body::to_bytes(rewritten.into_body(), 64 * 1024)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem");
+        assert_eq!(problem["field"], "interval");
+
+        let mut not_allowed = StatusCode::METHOD_NOT_ALLOWED.into_response();
+        not_allowed
+            .headers_mut()
+            .insert(header::ALLOW, header::HeaderValue::from_static("GET,HEAD"));
+        not_allowed
+            .headers_mut()
+            .insert(cors.clone(), header::HeaderValue::from_static("*"));
+        not_allowed.extensions_mut().insert(InnerMarker);
+        let rewritten = rewrite_unhandled_response(not_allowed, &Method::DELETE, "/api/x").await;
+        assert_eq!(rewritten.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(rewritten.headers()[header::ALLOW], "GET,HEAD");
+        assert_eq!(rewritten.headers()[&cors], "*");
+        assert_eq!(
+            rewritten.headers()[header::CONTENT_TYPE],
+            "application/problem+json"
+        );
+        assert_eq!(
+            rewritten.extensions().get::<InnerMarker>(),
+            Some(&InnerMarker)
+        );
     }
 
     /// A router nested under `/api` (an external plugin mount) answers an
