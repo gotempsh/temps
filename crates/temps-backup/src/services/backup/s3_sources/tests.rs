@@ -39,6 +39,12 @@ async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
     };
     let db = Arc::new(
         MockDatabase::new(DatabaseBackend::Postgres)
+            // The lookup before the transaction, then the row locked inside it.
+            .append_query_results(vec![vec![source.clone()]])
+            .append_exec_results([MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .append_query_results(vec![vec![source]])
             .append_query_results(vec![vec![count_row(0)]])
             .append_query_results(vec![vec![count_row(2)]])
@@ -59,10 +65,19 @@ async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
     ));
     drop(service);
     let db = Arc::try_unwrap(db).expect("service must release the mock database");
-    assert_eq!(
-        db.into_transaction_log().len(),
-        3,
-        "validation must stop after source lookup and the two reference counts, before DELETE"
+    let statements: Vec<String> = db
+        .into_transaction_log()
+        .iter()
+        .flat_map(|transaction| transaction.statements())
+        .map(|statement| statement.sql.clone())
+        .collect();
+    assert!(
+        statements.iter().any(|sql| sql.contains("FOR UPDATE")),
+        "the reference counts run with the source row locked: {statements:#?}"
+    );
+    assert!(
+        !statements.iter().any(|sql| sql.starts_with("DELETE")),
+        "validation must stop before DELETE: {statements:#?}"
     );
 }
 
@@ -1284,4 +1299,138 @@ async fn a_second_default_row_is_reported_as_a_default_conflict() {
     assert!(!is_single_default_violation(&sea_orm::DbErr::Custom(
         "unrelated".to_string()
     )));
+}
+
+/// A backup that commits while its source is being deleted must stop the
+/// delete, not be removed by the `ON DELETE CASCADE` on `backups`. The insert
+/// is held open while the delete runs; the delete waits on the locked source
+/// row, then sees the backup and refuses.
+#[tokio::test]
+async fn a_backup_committed_during_delete_stops_the_delete() {
+    use sea_orm::{ActiveModelTrait, Set, TransactionTrait};
+
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let service = Arc::new(service);
+    let source = service
+        .persist_verified_s3_source(source_request("racing"))
+        .await
+        .expect("source");
+    let creator = temps_entities::users::ActiveModel {
+        name: Set("Backup operator".to_string()),
+        email: Set("backup-operator@example.com".to_string()),
+        email_verified: Set(true),
+        ..Default::default()
+    }
+    .insert(test_db.db.as_ref())
+    .await
+    .expect("user");
+
+    let insert = test_db.db.begin().await.expect("insert transaction");
+    let backup = temps_entities::backups::ActiveModel {
+        name: Set("nightly".to_string()),
+        backup_id: Set("4d1c2b3a-5e6f-4a7b-8c9d-0e1f2a3b4c5d".to_string()),
+        backup_type: Set("full".to_string()),
+        state: Set("completed".to_string()),
+        started_at: Set(Utc::now()),
+        s3_source_id: Set(source.id),
+        s3_location: Set("s3://backups/racing/nightly".to_string()),
+        metadata: Set("{}".to_string()),
+        compression_type: Set("gzip".to_string()),
+        created_by: Set(creator.id),
+        tags: Set("[]".to_string()),
+        ..Default::default()
+    }
+    .insert(&insert)
+    .await
+    .expect("backup insert (uncommitted)");
+
+    let deleting = {
+        let service = service.clone();
+        let id = source.id;
+        tokio::spawn(async move { service.delete_s3_source(id).await })
+    };
+    // Let the delete reach the source row lock while the insert is open.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    insert.commit().await.expect("backup commits");
+
+    let result = deleting.await.expect("delete task");
+    assert!(
+        matches!(result, Err(BackupError::Validation(ref message)) if message.contains("1 backup record")),
+        "the delete must see the committed backup and refuse, got {result:?}"
+    );
+    assert!(
+        temps_entities::backups::Entity::find_by_id(backup.id)
+            .one(test_db.db.as_ref())
+            .await
+            .expect("backup lookup")
+            .is_some(),
+        "the backup must survive"
+    );
+}
+
+/// Making a source the default while it is being deleted must not leave the
+/// install without a default: the target is checked under the lock, after the
+/// delete (which promoted another source) committed.
+#[tokio::test]
+async fn set_default_on_a_source_deleted_meanwhile_keeps_the_current_default() {
+    use sea_orm::{ConnectionTrait, Statement, TransactionTrait};
+
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let service = Arc::new(service);
+    let target = service
+        .persist_verified_s3_source(source_request("target"))
+        .await
+        .expect("target source (default)");
+    let other = service
+        .persist_verified_s3_source(source_request("other"))
+        .await
+        .expect("other source");
+
+    // A delete of `target` that promotes `other`, held open under the lock.
+    let delete = test_db.db.begin().await.expect("delete transaction");
+    delete
+        .execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock(hashtext('temps.s3_sources.default'))",
+        ))
+        .await
+        .expect("lock");
+    s3_sources::Entity::delete_by_id(target.id)
+        .exec(&delete)
+        .await
+        .expect("delete target");
+    s3_sources::Entity::update_many()
+        .col_expr(
+            s3_sources::Column::IsDefault,
+            sea_orm::sea_query::Expr::value(true),
+        )
+        .filter(s3_sources::Column::Id.eq(other.id))
+        .exec(&delete)
+        .await
+        .expect("promote other");
+
+    let setting = {
+        let service = service.clone();
+        let id = target.id;
+        tokio::spawn(async move { service.set_default_s3_source(id).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    delete.commit().await.expect("delete commits");
+
+    let result = setting.await.expect("set-default task");
+    match result {
+        Err(BackupError::NotFound { detail, .. }) => {
+            assert!(detail.contains(&target.id.to_string()), "{detail}")
+        }
+        other => panic!("expected NotFound for the deleted source, got {other:?}"),
+    }
+    assert_eq!(
+        default_source_ids(test_db.db.as_ref()).await,
+        vec![other.id],
+        "the promoted default must survive"
+    );
 }

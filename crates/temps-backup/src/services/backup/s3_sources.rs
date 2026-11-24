@@ -326,11 +326,17 @@ impl BackupService {
         &self,
         id: i32,
     ) -> Result<temps_entities::s3_sources::Model, BackupError> {
-        // Verify target exists
-        self.get_s3_source(id).await?;
-
         let txn = self.db.begin().await?;
         lock_default_source_assignment(&txn).await?;
+        // Checked under the lock: a source deleted in the meantime must not
+        // leave the install with the old default cleared and no new one.
+        if temps_entities::s3_sources::Entity::find_by_id(id)
+            .one(&txn)
+            .await?
+            .is_none()
+        {
+            return Err(s3_source_not_found(id));
+        }
 
         temps_entities::s3_sources::Entity::update_many()
             .col_expr(
@@ -378,15 +384,10 @@ impl BackupService {
         &self,
         id: i32,
     ) -> Result<temps_entities::s3_sources::Model, BackupError> {
-        let source = temps_entities::s3_sources::Entity::find_by_id(id)
+        temps_entities::s3_sources::Entity::find_by_id(id)
             .one(self.db.as_ref())
             .await?
-            .ok_or_else(|| BackupError::NotFound {
-                resource: "S3Source".to_string(),
-                detail: "S3 source not found".to_string(),
-            })?;
-
-        Ok(source)
+            .ok_or_else(|| s3_source_not_found(id))
     }
 
     /// Resolve every managed service that can be identified as the provider
@@ -486,10 +487,24 @@ impl BackupService {
             )));
         }
 
+        // Check, delete and, when it was the default, hand the default on, as
+        // one write under the same lock every default change takes. The
+        // source row is locked first: inserting a backup or a schedule that
+        // references it must take a key-share lock on that row, so none can
+        // commit between the reference checks below and the delete (one that
+        // did would be removed by the `ON DELETE CASCADE` on `backups`).
+        let txn = self.db.begin().await?;
+        lock_default_source_assignment(&txn).await?;
+        let current = temps_entities::s3_sources::Entity::find_by_id(id)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or_else(|| s3_source_not_found(id))?;
+
         // Refuse to delete if any backup schedule still references this source.
         let schedule_count = temps_entities::backup_schedules::Entity::find()
             .filter(temps_entities::backup_schedules::Column::S3SourceId.eq(id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if schedule_count > 0 {
             return Err(BackupError::Validation(format!(
@@ -505,7 +520,7 @@ impl BackupService {
         // of leaking a database foreign-key violation as HTTP 500.
         let backup_count = temps_entities::backups::Entity::find()
             .filter(temps_entities::backups::Column::S3SourceId.eq(id))
-            .count(self.db.as_ref())
+            .count(&txn)
             .await?;
         if backup_count > 0 {
             return Err(BackupError::Validation(format!(
@@ -514,16 +529,9 @@ impl BackupService {
             )));
         }
 
-        // Delete and, when it was the default, hand the default on, as one
-        // write under the same lock every default change takes. `is_default`
-        // is read again inside it: a concurrent set-default may have moved it
-        // since the checks above.
-        let txn = self.db.begin().await?;
-        lock_default_source_assignment(&txn).await?;
-        let was_default = temps_entities::s3_sources::Entity::find_by_id(id)
-            .one(&txn)
-            .await?
-            .is_some_and(|current| current.is_default);
+        // `is_default` as of the lock: a concurrent set-default may have moved
+        // it since the read above.
+        let was_default = current.is_default;
         let result = temps_entities::s3_sources::Entity::delete_by_id(id)
             .exec(&txn)
             .await?;
@@ -813,6 +821,14 @@ const SINGLE_DEFAULT_INDEX: &str = "idx_s3_sources_single_default";
 /// default, delete) for the rest of `txn`. Each of them reads the current
 /// state and then writes based on it; without this, two writers both read
 /// "no default yet" and the second fails on the single-default index.
+/// The error every S3 source lookup returns for an ID that does not exist.
+fn s3_source_not_found(id: i32) -> BackupError {
+    BackupError::NotFound {
+        resource: "S3Source".to_string(),
+        detail: format!("S3 source {id} not found"),
+    }
+}
+
 async fn lock_default_source_assignment(
     txn: &sea_orm::DatabaseTransaction,
 ) -> Result<(), BackupError> {
