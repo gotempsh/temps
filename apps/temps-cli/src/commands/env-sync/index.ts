@@ -155,7 +155,7 @@ async function pull(
   if (unreadable.length > 0) {
     errorOutput(
       `Could not read ${unreadable.length} value(s): ${unreadable.join(', ')}. ` +
-        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'Reading plaintext needs the secrets:read or environments:write permission. Nothing was written — ' +
         `overwriting ${outputFile} with partial values would blank these variables.`
     )
     process.exitCode = 1

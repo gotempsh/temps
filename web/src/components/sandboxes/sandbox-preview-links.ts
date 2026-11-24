@@ -56,16 +56,11 @@ export function toPreviewLinkBody(values: PreviewLinkFormValues): {
 export function previewLinkBlockedReason(options: {
   /** Preview URLs are configured on this install. */
   configured: boolean
-  /** The sandbox runs on a worker node, which has no preview URLs yet. */
-  onWorkerNode: boolean
   hasPassword: boolean
   destroyed: boolean
   running: boolean
 }): string | null {
   if (options.destroyed) return 'This sandbox has been destroyed.'
-  if (options.onWorkerNode) {
-    return 'Preview URLs are not available yet for sandboxes on worker nodes. Create the sandbox on the control plane to share a preview.'
-  }
   if (!options.configured) {
     return 'Preview URLs are not configured on this install, so there is nothing to link to. Configure a preview domain in the platform settings first.'
   }

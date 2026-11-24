@@ -4,7 +4,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
   TERMINAL_INPUT_FRAME_BYTES,
-  TERMINAL_REFUSED_HINT,
   chunkTerminalInput,
   computeTerminalSize,
   openTerminalSession,
@@ -123,14 +122,11 @@ describe('sizes', () => {
 })
 
 describe('terminalUnavailableReason', () => {
-  const base = { status: 'running', node_id: null, node_name: 'control-plane' }
-  test('is null for a running control-plane sandbox', () => {
+  const base = { status: 'running' }
+  test('is null for a running sandbox, wherever it is placed', () => {
     expect(terminalUnavailableReason(base)).toBeNull()
   })
-  test('explains worker-node, stopped and destroyed sandboxes', () => {
-    expect(
-      terminalUnavailableReason({ ...base, node_id: 3, node_name: 'worker-1' })
-    ).toContain('worker-1')
+  test('explains stopped and destroyed sandboxes', () => {
     expect(terminalUnavailableReason({ ...base, status: 'stopped' })).toContain(
       'Resume'
     )
@@ -184,12 +180,12 @@ describe('openTerminalSession', () => {
     expect(socket.sent).toEqual([])
   })
 
-  test('a close before ready is a refusal with the likely causes', () => {
+  test('a close before ready reports an unknown connection failure without guessing', () => {
     const { socket, statuses } = start()
     socket.onclose?.()
     expect(statuses[statuses.length - 1]).toEqual([
       'failed',
-      TERMINAL_REFUSED_HINT,
+      'The terminal connection failed before it was ready. No error details were received. Try reconnecting.',
     ])
   })
 
@@ -217,6 +213,7 @@ describe('openTerminalSession', () => {
     const { socket, statuses } = start()
     socket.open()
     socket.text({ type: 'error', message: 'spawn_failed' })
+    socket.onclose?.()
     expect(statuses[statuses.length - 1]).toEqual(['failed', 'spawn_failed'])
   })
 

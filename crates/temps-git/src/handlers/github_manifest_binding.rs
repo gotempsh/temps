@@ -10,13 +10,15 @@
 //! manifest `code` from an App *they* created on GitHub could hand it to that
 //! endpoint and have Temps register their App as a Git provider.
 //!
-//! So the console first asks for a `state` while signed in. The server seals
-//! `{state, user, expiry}` with [`CookieCrypto`] into an HttpOnly `SameSite=Lax`
-//! cookie (Lax is sent on the top-level redirect back from GitHub) and returns
-//! the `state`. The callback converts the manifest only when the sealed cookie
-//! is present, unexpired, and names the same `state` as the query string. The
-//! cookie cannot be forged without the server key, and a cross-site page
-//! cannot plant it, so an unauthenticated caller can no longer convert a code.
+//! So the console first asks for a `state` while signed in. The server stores
+//! that state (single-use, see `GitProviderManager::issue_github_manifest_state`)
+//! and also seals `{state, user, expiry}` with [`CookieCrypto`] into an HttpOnly
+//! `SameSite=Lax` cookie (Lax is sent on the top-level redirect back from
+//! GitHub). The callback converts the manifest only when the sealed cookie is
+//! present, unexpired, and names the same `state` as the query string, and the
+//! server then consumes the stored state. The cookie cannot be forged without
+//! the server key and a cross-site page cannot plant it, so a state that leaks
+//! (it travels through github.com in a URL) is useless in another browser.
 
 use axum::http::{header, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
@@ -66,36 +68,32 @@ pub(crate) enum ManifestBindingError {
     MissingState,
 }
 
-/// A freshly issued binding: the `state` to give GitHub and the
-/// `Set-Cookie` header that binds it to this browser.
-pub(crate) struct IssuedBinding {
-    pub state: String,
-    pub set_cookie: HeaderValue,
-}
-
-/// Generate a random state and seal it, with `user_id`, into a cookie.
-pub(crate) fn issue_binding(
+/// Seal `state`, with `user_id`, into the `Set-Cookie` header that binds the
+/// manifest flow to this browser.
+pub(crate) fn bind_state(
     crypto: &CookieCrypto,
+    state: &str,
     user_id: i32,
     secure: bool,
     now_unix: i64,
-) -> Result<IssuedBinding, String> {
-    let mut bytes = [0u8; 32];
-    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)
-        .map_err(|error| format!("failed to generate GitHub manifest state: {error}"))?;
-    let state = hex::encode(bytes);
+) -> Result<HeaderValue, String> {
+    if state.is_empty() {
+        return Err(format!(
+            "refusing to bind an empty GitHub manifest state for user {user_id}"
+        ));
+    }
     let binding = ManifestBinding {
-        state: state.clone(),
+        state: state.to_string(),
         user_id,
         expires_at: now_unix + MANIFEST_BINDING_TTL_SECS,
     };
-    let payload = serde_json::to_string(&binding)
-        .map_err(|error| format!("failed to encode GitHub manifest binding: {error}"))?;
-    let sealed = crypto
-        .encrypt(&payload)
-        .map_err(|error| format!("failed to seal GitHub manifest binding: {error}"))?;
-    let set_cookie = cookie_header(&sealed, MANIFEST_BINDING_TTL_SECS, secure)?;
-    Ok(IssuedBinding { state, set_cookie })
+    let payload = serde_json::to_string(&binding).map_err(|error| {
+        format!("failed to encode GitHub manifest binding for user {user_id}: {error}")
+    })?;
+    let sealed = crypto.encrypt(&payload).map_err(|error| {
+        format!("failed to seal GitHub manifest binding for user {user_id}: {error}")
+    })?;
+    cookie_header(&sealed, MANIFEST_BINDING_TTL_SECS, secure)
 }
 
 /// Check the callback's `state` against the sealed cookie in `headers`.
@@ -175,6 +173,22 @@ mod tests {
     }
 
     /// Headers carrying the cookie value from an issued `Set-Cookie`.
+    struct Issued {
+        state: String,
+        set_cookie: HeaderValue,
+    }
+
+    fn issue(crypto: &CookieCrypto, user_id: i32, secure: bool) -> Issued {
+        let state = format!("state-for-user-{user_id}");
+        let set_cookie = bind_state(crypto, &state, user_id, secure, NOW).expect("bind");
+        Issued { state, set_cookie }
+    }
+
+    #[test]
+    fn an_empty_state_is_never_bound() {
+        assert!(bind_state(&crypto(), "", 1, true, NOW).is_err());
+    }
+
     fn headers_from(set_cookie: &HeaderValue) -> HeaderMap {
         let pair = set_cookie
             .to_str()
@@ -191,7 +205,7 @@ mod tests {
     #[test]
     fn issued_binding_verifies_and_returns_the_starting_user() {
         let crypto = crypto();
-        let issued = issue_binding(&crypto, 7, true, NOW).expect("issue");
+        let issued = issue(&crypto, 7, true);
         let headers = headers_from(&issued.set_cookie);
 
         let user = verify_binding(&crypto, &headers, Some(&issued.state), NOW + 60);
@@ -201,7 +215,7 @@ mod tests {
 
     #[test]
     fn secure_cookie_uses_host_prefix_lax_and_httponly() {
-        let issued = issue_binding(&crypto(), 1, true, NOW).expect("issue");
+        let issued = issue(&crypto(), 1, true);
         let text = issued.set_cookie.to_str().expect("ascii");
 
         assert!(text.starts_with("__Host-temps_github_manifest="), "{text}");
@@ -213,7 +227,7 @@ mod tests {
 
     #[test]
     fn insecure_cookie_drops_prefix_and_secure_flag() {
-        let issued = issue_binding(&crypto(), 1, false, NOW).expect("issue");
+        let issued = issue(&crypto(), 1, false);
         let text = issued.set_cookie.to_str().expect("ascii");
 
         assert!(text.starts_with("temps_github_manifest="), "{text}");
@@ -232,7 +246,7 @@ mod tests {
     #[test]
     fn callback_without_state_is_refused() {
         let crypto = crypto();
-        let issued = issue_binding(&crypto, 1, true, NOW).expect("issue");
+        let issued = issue(&crypto, 1, true);
         let headers = headers_from(&issued.set_cookie);
 
         assert_eq!(
@@ -248,7 +262,7 @@ mod tests {
     #[test]
     fn state_mismatch_is_refused() {
         let crypto = crypto();
-        let issued = issue_binding(&crypto, 1, true, NOW).expect("issue");
+        let issued = issue(&crypto, 1, true);
         let headers = headers_from(&issued.set_cookie);
 
         let result = verify_binding(&crypto, &headers, Some("not-the-issued-state"), NOW);
@@ -259,7 +273,7 @@ mod tests {
     #[test]
     fn expired_binding_is_refused() {
         let crypto = crypto();
-        let issued = issue_binding(&crypto, 1, true, NOW).expect("issue");
+        let issued = issue(&crypto, 1, true);
         let headers = headers_from(&issued.set_cookie);
 
         let result = verify_binding(
@@ -274,7 +288,7 @@ mod tests {
 
     #[test]
     fn cookie_sealed_with_another_key_is_refused() {
-        let issued = issue_binding(&crypto(), 1, true, NOW).expect("issue");
+        let issued = issue(&crypto(), 1, true);
         let headers = headers_from(&issued.set_cookie);
         let other = CookieCrypto::from_bytes(&[9u8; 32]);
 
@@ -301,7 +315,7 @@ mod tests {
     #[test]
     fn binding_is_found_among_other_cookies() {
         let crypto = crypto();
-        let issued = issue_binding(&crypto, 3, false, NOW).expect("issue");
+        let issued = issue(&crypto, 3, false);
         let pair = issued
             .set_cookie
             .to_str()

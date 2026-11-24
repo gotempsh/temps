@@ -87,16 +87,10 @@ test('group lifecycle through the console', async ({ page }) => {
   created.push(await createService(page, SVC_API))
 
   try {
-    // ---- services rename notice -------------------------------------
+    // ---- projects list ------------------------------------------------
     await page.goto('/projects')
-    const notice = page.getByText('Your apps are now called Services.')
-    await expect(notice).toBeVisible()
-    await shot(page, '01-projects-notice')
-    await page.getByRole('button', { name: 'Dismiss this notice' }).click()
-    await expect(notice).toHaveCount(0)
-    await page.reload()
     await expect(page.getByRole('heading', { name: 'Projects', level: 1 })).toBeVisible()
-    await expect(notice).toHaveCount(0)
+    await shot(page, '01-projects')
 
     // ---- create dialog: validation + no stale state --------------------
     await page.getByRole('button', { name: 'New project' }).first().click()
@@ -192,13 +186,13 @@ test('group lifecycle through the console', async ({ page }) => {
     await page.goto(`/p/${g1.slug}?tab=settings&section=general`)
     const nameInput = page.locator('#group-settings-name')
     await expect(nameInput).toHaveValue(G1)
-    await expect(page.getByRole('button', { name: 'Save changes' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled()
     await nameInput.fill('')
     await page.locator('#group-settings-description').click()
-    await page.getByRole('button', { name: 'Save changes' }).click()
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
     await shot(page, '11-rename-empty-validation')
     await nameInput.fill(G1_RENAMED)
-    await page.getByRole('button', { name: 'Save changes' }).click()
+    await page.getByRole('button', { name: 'Save', exact: true }).click()
     await expect(page.getByText('Project updated')).toBeVisible()
     await shot(page, '12-renamed')
     gs = await groups(page)

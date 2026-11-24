@@ -18,8 +18,8 @@ use std::{
 };
 use temps_runtime_health::{
     host::{persist, private_directory, private_file, read_record, HostError, ProbeHost},
-    Assignment, ExecutionOwner, InspectFailure, ProbePermit, RuntimeInspector, RuntimeSnapshot,
-    MAX_CONCURRENT_PROBES,
+    Assignment, ExecutionOwner, InspectFailure, ProbeDialer, ProbePermit, RuntimeInspector,
+    RuntimeSnapshot, TcpDialer, MAX_CONCURRENT_PROBES,
 };
 use uuid::Uuid;
 
@@ -34,6 +34,10 @@ struct CreationReceipt {
     ports: Vec<u16>,
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "bootstrap: TEMPS_DATA_DIR (with host lookup of HOME as fallback) locates the data directory and is fixed before the database exists"
+)]
 pub fn data_root() -> PathBuf {
     std::env::var_os("TEMPS_DATA_DIR")
         .map(PathBuf::from)
@@ -44,6 +48,30 @@ pub fn data_root() -> PathBuf {
                 .join(".temps")
         })
         .join("runtime-health")
+}
+
+fn receipt_for_assignment(
+    receipts: &Path,
+    assignment: &Assignment,
+) -> Result<CreationReceipt, InspectFailure> {
+    if !valid_container_id(&assignment.container_id) {
+        return Err(InspectFailure::Unauthorized);
+    }
+    let receipt: CreationReceipt =
+        read_record(&receipts.join(format!("{}.json", assignment.container_id)))
+            .map_err(|_| InspectFailure::Unauthorized)?
+            .ok_or(InspectFailure::Unauthorized)?;
+    if receipt.container_id != assignment.container_id
+        || receipt.project_id != assignment.project_id
+        || receipt.environment_id != assignment.environment_id
+        || receipt.deployment_id != assignment.deployment_id
+        || assignment
+            .container_port
+            .is_some_and(|port| !receipt.ports.contains(&port))
+    {
+        return Err(InspectFailure::Unauthorized);
+    }
+    Ok(receipt)
 }
 
 fn valid_container_id(id: &str) -> bool {
@@ -132,16 +160,26 @@ pub struct DockerProbeInspector {
     receipts: PathBuf,
     locks: PathBuf,
     role_claim: std::sync::Mutex<(Option<ExecutionOwner>, std::sync::Weak<File>)>,
+    /// How probes reach this daemon's published ports from this process.
+    dialer: Arc<dyn ProbeDialer>,
 }
 
 impl DockerProbeInspector {
-    pub async fn new(docker: Arc<Docker>, root: &Path) -> Result<Self, HostError> {
-        Self::with_coordination(
+    /// `dialer` is how this process reaches the daemon's published ports:
+    /// [`TcpDialer`] when it shares their network namespace.
+    pub async fn new(
+        docker: Arc<Docker>,
+        root: &Path,
+        dialer: Arc<dyn ProbeDialer>,
+    ) -> Result<Self, HostError> {
+        let mut inspector = Self::with_coordination(
             docker,
             root,
             crate::runtime_health_coordination::COORDINATION_VOLUME,
         )
-        .await
+        .await?;
+        inspector.dialer = dialer;
+        Ok(inspector)
     }
     async fn with_coordination(
         docker: Arc<Docker>,
@@ -170,31 +208,12 @@ impl DockerProbeInspector {
             receipts,
             locks,
             role_claim: std::sync::Mutex::new((None, std::sync::Weak::new())),
+            dialer: Arc::new(TcpDialer),
         })
     }
 
     fn receipt(&self, assignment: &Assignment) -> Result<CreationReceipt, InspectFailure> {
-        if !valid_container_id(&assignment.container_id) {
-            return Err(InspectFailure::Unauthorized);
-        }
-        let receipt: CreationReceipt = read_record(
-            &self
-                .receipts
-                .join(format!("{}.json", assignment.container_id)),
-        )
-        .map_err(|_| InspectFailure::Unauthorized)?
-        .ok_or(InspectFailure::Unauthorized)?;
-        if receipt.container_id != assignment.container_id
-            || receipt.project_id != assignment.project_id
-            || receipt.environment_id != assignment.environment_id
-            || receipt.deployment_id != assignment.deployment_id
-            || assignment
-                .container_port
-                .is_some_and(|port| !receipt.ports.contains(&port))
-        {
-            return Err(InspectFailure::Unauthorized);
-        }
-        Ok(receipt)
+        receipt_for_assignment(&self.receipts, assignment)
     }
 
     fn lock(&self, name: &str) -> Result<File, InspectFailure> {
@@ -302,12 +321,20 @@ impl RuntimeInspector for DockerProbeInspector {
             endpoint,
         })
     }
+
+    fn dialer(&self) -> &dyn ProbeDialer {
+        self.dialer.as_ref()
+    }
 }
 
+/// Open the probe host for `docker`. `dialer` is how this process reaches
+/// the daemon's published ports: [`TcpDialer`] unless they bind in another
+/// network namespace (a Mac worker's Docker app VM).
 pub async fn open_host(
     docker: Arc<Docker>,
     root: PathBuf,
     agent: bool,
+    dialer: Arc<dyn ProbeDialer>,
 ) -> Result<Arc<ProbeHost>, HostError> {
     private_directory(&root)?;
     let identity_path = root.join("identity.json");
@@ -324,7 +351,7 @@ pub async fn open_host(
             identity
         }
     };
-    let inspector = Arc::new(DockerProbeInspector::new(docker, &root).await?);
+    let inspector = Arc::new(DockerProbeInspector::new(docker, &root, dialer).await?);
     let owner = if agent {
         ExecutionOwner::Agent(identity)
     } else {
@@ -366,6 +393,7 @@ mod tests {
     use super::*;
     use crate::{PortMapping, Protocol, ResourceLimits, RestartPolicy};
     use temps_runtime_health::Probe;
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{
         core::{IntoContainerPort, WaitFor},
         runners::AsyncRunner,
@@ -435,6 +463,7 @@ mod tests {
             restart_policy: RestartPolicy::Never,
             log_path: root_a.path().join("fixture.log"),
             command: None,
+            entrypoint: None,
             log_config: None,
             labels: [
                 ("sh.temps.project_id".into(), "1".into()),
@@ -444,6 +473,7 @@ mod tests {
             .into(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
         record_creation(&docker, root_a.path(), container.id(), &request).await?;
         record_creation(&docker, root_b.path(), container.id(), &request).await?;
@@ -510,6 +540,7 @@ mod tests {
         let second = GenericImage::new("busybox", "1.37")
             .with_entrypoint("sleep")
             .with_cmd(["120"])
+            .with_test_labels()
             .start()
             .await?;
         let mut second_request = request.clone();
@@ -558,5 +589,61 @@ mod tests {
             file.try_lock().is_err(),
             "a live claim must be exclusive across processes"
         );
+    }
+}
+
+#[cfg(test)]
+mod worker_target_tests {
+    use super::*;
+
+    #[test]
+    fn worker_target_requires_a_local_receipt_and_declared_port() {
+        let root = tempfile::tempdir().unwrap();
+        let mut assignment = Assignment {
+            id: Uuid::new_v4(),
+            owner: ExecutionOwner::Agent(Uuid::new_v4()),
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 3,
+            replica_id: 4,
+            placement_generation: 1,
+            revision: Uuid::new_v4(),
+            epoch: 1,
+            container_id: "a".repeat(64),
+            container_port: Some(8080),
+            probe: temps_runtime_health::Probe::Http {
+                path: "/ready".into(),
+                expected_status: 200,
+            },
+            interval_secs: 30,
+            timeout_secs: 5,
+        };
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        let receipt = CreationReceipt {
+            container_id: assignment.container_id.clone(),
+            project_id: 1,
+            environment_id: 2,
+            deployment_id: 3,
+            image_id: "fixture".into(),
+            ports: vec![8080],
+        };
+        std::fs::write(
+            root.path()
+                .join(format!("{}.json", assignment.container_id)),
+            serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        assert!(receipt_for_assignment(root.path(), &assignment).is_ok());
+        assignment.container_port = Some(9090);
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        assignment.container_port = Some(8080);
+        assignment.deployment_id = 5;
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        assignment.deployment_id = 3;
+        assignment.container_id = "http://169.254.169.254/".into();
+        assert!(receipt_for_assignment(root.path(), &assignment).is_err());
+        let mut wire = serde_json::to_value(&assignment).unwrap();
+        wire["host"] = serde_json::json!("127.0.0.1");
+        assert!(serde_json::from_value::<Assignment>(wire).is_err());
     }
 }

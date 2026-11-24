@@ -97,7 +97,7 @@ impl OpenAiCompatProvider {
         let response_body = read_limited_responses_body(response, &request.model).await?;
         let payload =
             serde_json::from_slice::<serde_json::Value>(&response_body).map_err(|error| {
-                AiGatewayError::TranslationError {
+                AiGatewayError::UpstreamMalformedResponse {
                     provider: self.info.id.to_string(),
                     reason: format!("Failed to parse Responses result: {error}"),
                 }
@@ -235,27 +235,20 @@ impl OpenAiCompatProvider {
                 ],
             },
             vec![
-                // Frontier models
+                // Bootstrap fallback only: a key's live catalog (discovered
+                // from /models) replaces this list once it is refreshed.
+                model("gpt-6.2-sol", "openai"),
+                model("gpt-6.2-astra", "openai"),
+                model("gpt-6.1-sol", "openai"),
+                model("gpt-6.1-terra", "openai"),
+                model("gpt-6-luna", "openai"),
+                model("gpt-6-astra", "openai"),
                 model("gpt-5.6-sol", "openai"),
                 model("gpt-5.6-terra", "openai"),
                 model("gpt-5.6-luna", "openai"),
-                model("gpt-5.6", "openai"),
                 model("gpt-5.4", "openai"),
+                model("gpt-5.4-mini", "openai"),
                 model("gpt-5.4-pro", "openai"),
-                model("gpt-5-mini", "openai"),
-                model("gpt-5-nano", "openai"),
-                model("gpt-5", "openai"),
-                model("gpt-4.1", "openai"),
-                model("gpt-4.1-mini", "openai"),
-                model("gpt-4.1-nano", "openai"),
-                // Reasoning models
-                model("o3", "openai"),
-                model("o3-pro", "openai"),
-                model("o4-mini", "openai"),
-                model("o3-mini", "openai"),
-                // Previous generation
-                model("gpt-4o", "openai"),
-                model("gpt-4o-mini", "openai"),
                 // Embeddings
                 model("text-embedding-3-small", "openai"),
                 model("text-embedding-3-large", "openai"),
@@ -276,9 +269,11 @@ impl OpenAiCompatProvider {
                 ],
             },
             vec![
+                model("grok-4.7", "xai"),
+                model("grok-4.6", "xai"),
                 model("grok-4.5", "xai"),
-                model("grok-4.20", "xai"),
-                model("grok-4.20-0309-reasoning", "xai"),
+                model("grok-4.3", "xai"),
+                model("grok-build-0.1", "xai"),
             ],
         )
     }
@@ -304,16 +299,16 @@ impl OpenAiCompatProvider {
                 ],
             },
             vec![
-                model("openai/gpt-5.6", "openai"),
-                model("openai/gpt-4o", "openai"),
-                model("openai/gpt-4o-mini", "openai"),
-                model("anthropic/claude-sonnet-5", "anthropic"),
-                model("anthropic/claude-haiku-4-5", "anthropic"),
-                model("google/gemini-3.5-flash", "google"),
-                model("x-ai/grok-4.5", "x-ai"),
+                model("anthropic/claude-sonnet-5.5", "anthropic"),
+                model("anthropic/claude-opus-5.5", "anthropic"),
+                model("anthropic/claude-haiku-5.5", "anthropic"),
+                model("openai/gpt-6.2-sol", "openai"),
+                model("openai/gpt-6-luna", "openai"),
+                model("google/gemini-4-hydrogen", "google"),
+                model("x-ai/grok-4.7", "x-ai"),
+                model("deepseek/deepseek-v4-pro", "deepseek"),
+                model("deepseek/deepseek-v4.1-flash", "deepseek"),
                 model("meta-llama/llama-3.3-70b-instruct", "meta-llama"),
-                model("deepseek/deepseek-chat", "deepseek"),
-                model("mistralai/mistral-large-2411", "mistralai"),
             ],
         )
     }
@@ -328,7 +323,7 @@ impl OpenAiCompatProvider {
         Self::new(
             ProviderInfo {
                 id: crate::self_hosted::OPENAI_COMPATIBLE,
-                display_name: "Self-hosted (OpenAI-compatible)",
+                display_name: "OpenAI-compatible",
                 default_base_url: "",
                 capabilities: &[
                     ProviderCapability::ChatCompletion,
@@ -394,6 +389,9 @@ impl AiProvider for OpenAiCompatProvider {
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
         }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
+        }
 
         let response = with_bearer(self.client.post(&url), api_key)
             .json(&req)
@@ -413,14 +411,10 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let completion: ChatCompletionResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse response: {}", e),
-                })?;
+        let completion: ChatCompletionResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error(self.info.id, "response", e))?;
 
         Ok(completion)
     }
@@ -444,6 +438,9 @@ impl AiProvider for OpenAiCompatProvider {
 
         if self.info.id == "openai" {
             sanitize_openai_request(&mut req);
+        }
+        if super::prompt_cache::uses_explicit_prompt_cache(self.info.id, &req.model) {
+            super::prompt_cache::mark_cache_breakpoints(&mut req.messages);
         }
 
         // Inject stream_options.include_usage so the final chunk includes token counts
@@ -520,14 +517,9 @@ impl AiProvider for OpenAiCompatProvider {
             });
         }
 
-        let embedding: EmbeddingResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: self.info.id.to_string(),
-                    reason: format!("Failed to parse embedding response: {}", e),
-                })?;
+        let embedding: EmbeddingResponse = response.json().await.map_err(|e| {
+            crate::error::response_body_error(self.info.id, "embedding response", e)
+        })?;
 
         Ok(embedding)
     }
@@ -535,12 +527,18 @@ impl AiProvider for OpenAiCompatProvider {
 
 /// Returns true if the model only accepts OpenAI's default sampling settings.
 ///
-/// GPT-5 family models use the same reasoning controls as the o-series and
+/// GPT-5 and later models use the same reasoning controls as the o-series and
 /// reject custom `temperature` values (including the low temperature used by
 /// structured-output requests).
 fn uses_default_sampling(model: &str) -> bool {
     let m = model.to_lowercase();
-    m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") || m.starts_with("gpt-5")
+    if m.starts_with("o1") || m.starts_with("o3") || m.starts_with("o4") {
+        return true;
+    }
+    m.strip_prefix("gpt-")
+        .and_then(|rest| rest.split(['.', '-']).next())
+        .and_then(|major| major.parse::<u16>().ok())
+        .is_some_and(|major| major >= 5)
 }
 
 /// Sanitize a chat completion request for OpenAI API compatibility.
@@ -739,7 +737,10 @@ mod tests {
         let provider = OpenAiCompatProvider::openai();
         let models = provider.available_models();
         assert!(!models.is_empty());
-        assert!(models.iter().any(|m| m.id == "gpt-4o"));
+        assert!(models.iter().any(|m| m.id == "gpt-6.2-sol"));
+        assert!(models.iter().any(|m| m.id == "gpt-6.2-astra"));
+        // Shut-down models are no longer offered to a key before discovery.
+        assert!(!models.iter().any(|m| m.id == "gpt-4o"));
         assert!(models.iter().all(|m| m.owned_by == "openai"));
     }
 
@@ -916,7 +917,10 @@ mod tests {
         assert!(uses_default_sampling("o1-preview"));
         assert!(uses_default_sampling("gpt-5-nano"));
         assert!(uses_default_sampling("gpt-5.6"));
+        assert!(uses_default_sampling("gpt-6.2-sol"));
+        assert!(uses_default_sampling("gpt-6-luna"));
         assert!(!uses_default_sampling("gpt-4o"));
+        assert!(!uses_default_sampling("gpt-4.1"));
         assert!(!uses_default_sampling("grok-3"));
     }
 

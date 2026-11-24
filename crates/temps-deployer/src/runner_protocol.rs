@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub struct RunnerClaim {
+    // Published as a credential, but a `String` here: the runner serializes
+    // this struct to send it, and `SecretString` serializes as a mask.
+    #[schema(value_type = temps_core::secret_string::SecretString)]
     pub identity_token: String,
 }
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]

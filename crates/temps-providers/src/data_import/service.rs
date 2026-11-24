@@ -377,7 +377,7 @@ impl DataImportService {
             .paginate(self.db.as_ref(), page_size);
         let total = paginator.num_items().await?;
         let items = paginator
-            .fetch_page(page - 1)
+            .fetch_page(temps_core::config::page_index(page))
             .await?
             .into_iter()
             .map(DataImportRun::from)
@@ -1537,7 +1537,7 @@ mod tests {
     async fn a_failed_redis_import_releases_only_the_database_it_created() {
         use crate::data_import::test_support::TestDocker;
         use futures::FutureExt;
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let Some(mut docker) = TestDocker::connect().await else {
             println!("Docker not available, skipping");
@@ -1614,7 +1614,6 @@ mod tests {
             consecutive_health_failures: Set(0),
             metrics_enabled: Set(true),
             default_backup_provisioned: Set(false),
-            ai_data_access: Set(false),
             ..Default::default()
         }
         .insert(db.as_ref())
@@ -1756,7 +1755,7 @@ mod tests {
     /// or join is caught here rather than in production.
     #[tokio::test]
     async fn a_name_a_linked_environment_resolves_to_is_found() {
-        use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -1780,7 +1779,6 @@ mod tests {
                 consecutive_health_failures: Set(0),
                 metrics_enabled: Set(true),
                 default_backup_provisioned: Set(false),
-                ai_data_access: Set(false),
                 ..Default::default()
             }
             .insert(db.as_ref())
@@ -1936,10 +1934,17 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             container_name: None,
-            ai_data_access: false,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         };
         assert!(matches!(
             ensure_running(&service),
@@ -1971,10 +1976,17 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             container_name: None,
-            ai_data_access: false,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 
@@ -1982,7 +1994,7 @@ mod tests {
         let now = Utc::now();
         restore_runs::Model {
             id,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: service_id,
             target_service_id: None,
             target_service_name: None,
@@ -2002,6 +2014,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
     }
 

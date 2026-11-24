@@ -4,7 +4,10 @@
 import { describe, expect, test } from 'bun:test'
 import {
   DEFAULT_SELF_HOSTED_CAPABILITIES,
+  SERVER_DEFAULT_SELF_HOSTED_CAPABILITIES,
   hasIpLiteralHost,
+  isDiscoverableBaseUrl,
+  isPrivateAddressUrl,
   normalizeSelfHostedCapabilities,
   settingsSaveKeyId,
   isPlainHttpUrl,
@@ -64,7 +67,7 @@ describe('self-hosted provider form helpers', () => {
         discoveredModels: null,
         defaultModel: '',
       })
-    ).toContain('Load the models')
+    ).toContain('has not listed the models')
     expect(
       selfHostedSubmitBlocker({
         baseUrl: 'http://10.0.0.5/v1',
@@ -90,19 +93,72 @@ describe('self-hosted provider form helpers', () => {
 
   test('stored capability declarations fall back to server defaults', () => {
     expect(normalizeSelfHostedCapabilities(null)).toEqual(
-      DEFAULT_SELF_HOSTED_CAPABILITIES
+      SERVER_DEFAULT_SELF_HOSTED_CAPABILITIES
     )
     expect(
       normalizeSelfHostedCapabilities({ embeddings: true, streaming: null })
     ).toEqual({
-      ...DEFAULT_SELF_HOSTED_CAPABILITIES,
+      ...SERVER_DEFAULT_SELF_HOSTED_CAPABILITIES,
       embeddings: true,
     })
+  })
+
+  test('a new key declares every capability', () => {
+    expect(Object.values(DEFAULT_SELF_HOSTED_CAPABILITIES)).toEqual([
+      true,
+      true,
+      true,
+      true,
+    ])
+  })
+
+  test('only private endpoints are offered private address trust', () => {
+    for (const url of [
+      'http://10.0.0.5:8000/v1',
+      'http://172.16.4.2/v1',
+      'http://192.168.1.20:11434/v1',
+      'http://127.0.0.1:8080/v1',
+      'http://100.64.0.9/v1',
+      'http://[::1]:8000/v1',
+      'http://[fd12:3456::1]/v1',
+      'http://[::ffff:10.0.0.5]/v1',
+      'http://localhost:11434/v1',
+      'http://ollama:11434/v1',
+      'http://gpu-box.local/v1',
+      'http://llm.internal/v1',
+    ]) {
+      expect(isPrivateAddressUrl(url)).toBe(true)
+    }
+    for (const url of [
+      'https://api.example.com/v1',
+      'https://8.8.8.8/v1',
+      'http://172.32.0.1/v1',
+      'http://[2001:db8::1]/v1',
+      'not a url',
+      '',
+    ]) {
+      expect(isPrivateAddressUrl(url)).toBe(false)
+    }
   })
 
   test('pending settings saves are attributed to their key', () => {
     expect(settingsSaveKeyId({ id: 7, body: {} })).toBe(7)
     expect(settingsSaveKeyId(undefined)).toBeUndefined()
     expect(settingsSaveKeyId({ id: '7' })).toBeUndefined()
+  })
+})
+
+describe('isDiscoverableBaseUrl', () => {
+  test.each([
+    ['https://llm.example.test/v1', true],
+    ['http://10.0.0.5:8000/v1', true],
+    ['  https://llm.example.test  ', true],
+    ['', false],
+    ['https://', false],
+    ['llm.example.test/v1', false],
+    ['ftp://llm.example.test', false],
+    ['https://llm.', false],
+  ])('%p -> %p', (url, expected) => {
+    expect(isDiscoverableBaseUrl(url)).toBe(expected)
   })
 })

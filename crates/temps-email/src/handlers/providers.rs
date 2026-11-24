@@ -12,10 +12,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, forbidden, internal_server_error, not_found},
     problemdetails::Problem,
+    secret_string::SecretString,
     AuditContext, RequestMetadata,
 };
 use tracing::error;
@@ -95,7 +96,7 @@ pub async fn create_email_provider(
             })?;
             ProviderCredentials::Ses(SesCredentials {
                 access_key_id: ses_creds.access_key_id,
-                secret_access_key: ses_creds.secret_access_key,
+                secret_access_key: ses_creds.secret_access_key.into_exposed(),
                 endpoint_url: None, // Custom endpoints not supported via API
             })
         }
@@ -106,7 +107,7 @@ pub async fn create_email_provider(
                     .build()
             })?;
             ProviderCredentials::Scaleway(ScalewayCredentials {
-                api_key: scw_creds.api_key,
+                api_key: scw_creds.api_key.into_exposed(),
                 project_id: scw_creds.project_id,
             })
         }
@@ -130,7 +131,10 @@ pub async fn create_email_provider(
                 host: smtp_creds.host,
                 port: smtp_creds.port,
                 username: smtp_creds.username.filter(|s| !s.is_empty()),
-                password: smtp_creds.password.filter(|s| !s.is_empty()),
+                password: smtp_creds
+                    .password
+                    .map(SecretString::into_exposed)
+                    .filter(|s| !s.is_empty()),
                 encryption: smtp_creds.encryption.into(),
                 accept_invalid_certs: smtp_creds.accept_invalid_certs,
             })
@@ -444,13 +448,13 @@ pub async fn update_email_provider(
         (EmailProviderType::Ses, Some(c), None, None) => {
             Some(ProviderCredentials::Ses(SesCredentials {
                 access_key_id: c.access_key_id,
-                secret_access_key: c.secret_access_key,
+                secret_access_key: c.secret_access_key.into_exposed(),
                 endpoint_url: None,
             }))
         }
         (EmailProviderType::Scaleway, None, Some(c), None) => {
             Some(ProviderCredentials::Scaleway(ScalewayCredentials {
-                api_key: c.api_key,
+                api_key: c.api_key.into_exposed(),
                 project_id: c.project_id,
             }))
         }
@@ -469,7 +473,10 @@ pub async fn update_email_provider(
                 host: c.host,
                 port: c.port,
                 username: c.username.filter(|s| !s.is_empty()),
-                password: c.password.filter(|s| !s.is_empty()),
+                password: c
+                    .password
+                    .map(SecretString::into_exposed)
+                    .filter(|s| !s.is_empty()),
                 encryption: c.encryption.into(),
                 accept_invalid_certs: c.accept_invalid_certs,
             }))

@@ -43,21 +43,35 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use crate::parser::{parse_docker_timestamp, parse_log_line};
-use crate::services::{ChunkWriterService, LogMetadataService};
+use crate::services::collector::write_drop_notice;
+use crate::services::{
+    Admission, ChunkWriterService, IngestBudget, IngestSource, LogMetadataService, STATS_WINDOW,
+};
 use crate::types::{ContainerContext, LogLine, LogStream};
 
 /// Maximum consecutive stream errors before giving up on a remote container.
 /// Mirrors the local collector; at 30 s max backoff this is ~10 minutes.
 const MAX_CONSECUTIVE_ERRORS: u32 = 20;
 
+/// Whether a stream failure starts a run of them. Only that one is a warning:
+/// a replica that stays unreachable (a stopped microVM, a worker that is
+/// down) fails the same way on every retry for up to ten minutes, and the
+/// repeats say nothing the first one did not. Giving up is logged as an error.
+fn first_of_a_run(consecutive_errors: u32) -> bool {
+    consecutive_errors == 1
+}
+
 /// A running remote container the collector should ship logs for.
 #[derive(Debug, Clone)]
 pub struct RemoteContainerInfo {
-    /// Worker node the container runs on.
-    pub node_id: i32,
+    /// Worker node the container runs on. `None` for a container the control
+    /// plane itself runs but cannot read through its own Docker daemon (a
+    /// microVM replica): its lines are tagged like any local container's.
+    pub node_id: Option<i32>,
     /// Human-readable node name (denormalized into each log line for display).
-    pub node_name: String,
-    /// Docker container ID on the remote node.
+    pub node_name: Option<String>,
+    /// Runtime ID of the container (a Docker container ID on a worker node, a
+    /// VM id for a microVM replica).
     pub container_id: String,
     /// Platform project ID.
     pub project_id: i32,
@@ -84,14 +98,28 @@ pub type RemoteLogStream = Pin<Box<dyn Stream<Item = Result<String, RemoteLogSou
 /// Errors from the remote log source (the adapter that talks to worker agents).
 #[derive(Debug, thiserror::Error)]
 pub enum RemoteLogSourceError {
-    #[error("remote log source error for node {node_id}: {reason}")]
-    Source { node_id: i32, reason: String },
+    #[error("remote log source error for {}: {reason}", node_label(*node_id))]
+    Source {
+        node_id: Option<i32>,
+        reason: String,
+    },
 
-    #[error("remote container {container_id} on node {node_id} not found")]
-    NotFound { node_id: i32, container_id: String },
+    #[error("remote container {container_id} on {} not found", node_label(*node_id))]
+    NotFound {
+        node_id: Option<i32>,
+        container_id: String,
+    },
 
     #[error("remote log source database error: {0}")]
     Database(String),
+}
+
+/// "node 3", or "the control plane" for a container with no node.
+fn node_label(node_id: Option<i32>) -> String {
+    match node_id {
+        Some(id) => format!("node {id}"),
+        None => "the control plane".to_string(),
+    }
 }
 
 /// Port for fetching logs from remote worker nodes.
@@ -111,7 +139,7 @@ pub trait RemoteContainerLogSource: Send + Sync {
     /// remote daemon still retains).
     async fn open_log_stream(
         &self,
-        node_id: i32,
+        node_id: Option<i32>,
         container_id: &str,
         since_unix: i64,
     ) -> Result<RemoteLogStream, RemoteLogSourceError>;
@@ -126,6 +154,8 @@ pub struct RemoteLogCollectorService {
     source: Arc<dyn RemoteContainerLogSource>,
     chunk_writer: Arc<ChunkWriterService>,
     metadata_service: Arc<LogMetadataService>,
+    /// The same per-container ingestion budget local containers are held to.
+    ingest_budget: Arc<IngestBudget>,
     /// Shared with the local collector so remote lines also reach the live
     /// SSE tail — the structured `/logs/tail` becomes multi-node complete.
     tail_tx: broadcast::Sender<LogLine>,
@@ -138,12 +168,14 @@ impl RemoteLogCollectorService {
         source: Arc<dyn RemoteContainerLogSource>,
         chunk_writer: Arc<ChunkWriterService>,
         metadata_service: Arc<LogMetadataService>,
+        ingest_budget: Arc<IngestBudget>,
         tail_tx: broadcast::Sender<LogLine>,
     ) -> Self {
         Self {
             source,
             chunk_writer,
             metadata_service,
+            ingest_budget,
             tail_tx,
             active: Mutex::new(HashMap::new()),
         }
@@ -209,11 +241,20 @@ impl RemoteLogCollectorService {
 
         let source = self.source.clone();
         let chunk_writer = self.chunk_writer.clone();
+        let ingest_budget = self.ingest_budget.clone();
         let tail_tx = self.tail_tx.clone();
         let container_id = info.container_id.clone();
 
         let handle = tokio::spawn(async move {
-            Self::stream_remote_container(source, chunk_writer, tail_tx, info, resume_after).await;
+            Self::stream_remote_container(
+                source,
+                chunk_writer,
+                ingest_budget,
+                tail_tx,
+                info,
+                resume_after,
+            )
+            .await;
         });
 
         let mut active = self.active.lock().await;
@@ -239,6 +280,7 @@ impl RemoteLogCollectorService {
     async fn stream_remote_container(
         source: Arc<dyn RemoteContainerLogSource>,
         chunk_writer: Arc<ChunkWriterService>,
+        ingest_budget: Arc<IngestBudget>,
         tail_tx: broadcast::Sender<LogLine>,
         info: RemoteContainerInfo,
         resume_after: i64,
@@ -259,6 +301,12 @@ impl RemoteLogCollectorService {
         let mut consecutive_errors: u32 = 0;
         let mut retry_delay = std::time::Duration::from_secs(1);
         let max_retry_delay = std::time::Duration::from_secs(30);
+        // Kept across reconnects, like the local collector's.
+        let mut limiter = ingest_budget.limiter(IngestSource {
+            ctx: ctx.clone(),
+            node_id: info.node_id,
+            node_name: info.node_name.clone(),
+        });
 
         loop {
             let stream = match source
@@ -267,7 +315,7 @@ impl RemoteLogCollectorService {
             {
                 Ok(s) => s,
                 Err(RemoteLogSourceError::NotFound { .. }) => {
-                    info!(container_id = %info.container_id, node_id = info.node_id,
+                    info!(container_id = %info.container_id, node_id = ?info.node_id,
                         "Remote container gone, stopping log stream");
                     break;
                 }
@@ -278,9 +326,15 @@ impl RemoteLogCollectorService {
                             "Max consecutive errors opening remote stream, giving up");
                         break;
                     }
-                    warn!(container_id = %info.container_id, error = %e,
-                        retry_delay_secs = retry_delay.as_secs(),
-                        "Failed to open remote log stream, retrying");
+                    if first_of_a_run(consecutive_errors) {
+                        warn!(container_id = %info.container_id, error = %e,
+                            retry_delay_secs = retry_delay.as_secs(),
+                            "Failed to open remote log stream, retrying");
+                    } else {
+                        debug!(container_id = %info.container_id, error = %e,
+                            consecutive_errors, retry_delay_secs = retry_delay.as_secs(),
+                            "Failed to open remote log stream again, retrying");
+                    }
                     tokio::time::sleep(retry_delay).await;
                     retry_delay = std::cmp::min(retry_delay * 2, max_retry_delay);
                     continue;
@@ -289,7 +343,19 @@ impl RemoteLogCollectorService {
 
             let mut stream = stream;
             let mut clean_eof = true;
-            while let Some(item) = stream.next().await {
+            loop {
+                // Quiet for a whole stats window: explain what the last one
+                // dropped now rather than with a next line.
+                let item = match tokio::time::timeout(STATS_WINDOW, stream.next()).await {
+                    Ok(Some(item)) => item,
+                    Ok(None) => break,
+                    Err(_) => {
+                        if let Some(notice) = limiter.flush() {
+                            write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+                        }
+                        continue;
+                    }
+                };
                 match item {
                     Ok(raw) => {
                         consecutive_errors = 0;
@@ -301,12 +367,27 @@ impl RemoteLogCollectorService {
                         if ts.timestamp() < last_seen_ts {
                             continue;
                         }
+                        last_seen_ts = ts.timestamp();
+
+                        // Judged by Docker's timestamp on the worker, so a
+                        // replayed backlog is held to the rate it was produced at.
+                        let admission = limiter.admit(msg.len(), ts);
+                        if let Some(notice) = limiter.take_drop_notice() {
+                            write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+                        }
+                        // Over budget: live tail only, and only parsed when
+                        // someone is tailing.
+                        if admission != Admission::Admit && tail_tx.receiver_count() == 0 {
+                            continue;
+                        }
                         let mut line = parse_log_line(msg, ts, LogStream::Stdout, &ctx);
-                        line.node_id = Some(info.node_id);
-                        line.node_name = Some(info.node_name.clone());
-                        last_seen_ts = line.ts.timestamp();
+                        line.node_id = info.node_id;
+                        line.node_name = info.node_name.clone();
 
                         let _ = tail_tx.send(line.clone());
+                        if admission != Admission::Admit {
+                            continue;
+                        }
 
                         // The writer owns sealing (object write + manifest
                         // commit) itself now — nothing left to do here.
@@ -318,9 +399,14 @@ impl RemoteLogCollectorService {
                     Err(e) => {
                         clean_eof = false;
                         consecutive_errors += 1;
-                        warn!(container_id = %info.container_id, error = %e,
-                            consecutive_errors,
-                            "Remote log stream error, will reconnect");
+                        if first_of_a_run(consecutive_errors) {
+                            warn!(container_id = %info.container_id, error = %e,
+                                "Remote log stream error, will reconnect");
+                        } else {
+                            debug!(container_id = %info.container_id, error = %e,
+                                consecutive_errors,
+                                "Remote log stream error again, will reconnect");
+                        }
                         break;
                     }
                 }
@@ -346,12 +432,22 @@ impl RemoteLogCollectorService {
             // lines (the dedup pass in archive_search is the backstop).
             last_seen_ts = last_seen_ts.saturating_add(1);
         }
+        if let Some(notice) = limiter.flush() {
+            write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_first_failure_of_a_run_is_a_warning() {
+        assert!(first_of_a_run(1));
+        assert!(!first_of_a_run(2));
+        assert!(!first_of_a_run(MAX_CONSECUTIVE_ERRORS - 1));
+    }
     use crate::services::ChunkWriterService;
     use crate::storage::{FilesystemStorage, LogStorage};
     use std::sync::Mutex as StdMutex;
@@ -361,6 +457,8 @@ mod tests {
     /// be observed deterministically via `active_count()`.
     struct MockSource {
         containers: StdMutex<Vec<RemoteContainerInfo>>,
+        /// Raw lines each opened stream yields before staying open.
+        lines: Vec<String>,
     }
 
     #[async_trait]
@@ -372,20 +470,22 @@ mod tests {
         }
         async fn open_log_stream(
             &self,
-            _node_id: i32,
+            _node_id: Option<i32>,
             _container_id: &str,
             _since_unix: i64,
         ) -> Result<RemoteLogStream, RemoteLogSourceError> {
-            Ok(Box::pin(futures::stream::pending::<
-                Result<String, RemoteLogSourceError>,
-            >()))
+            let lines: Vec<Result<String, RemoteLogSourceError>> =
+                self.lines.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(
+                futures::stream::iter(lines).chain(futures::stream::pending()),
+            ))
         }
     }
 
     fn info(container_id: &str) -> RemoteContainerInfo {
         RemoteContainerInfo {
-            node_id: 1,
-            node_name: "worker-1".into(),
+            node_id: Some(1),
+            node_name: Some("worker-1".into()),
             container_id: container_id.into(),
             project_id: 42,
             env: "1".into(),
@@ -410,6 +510,18 @@ mod tests {
     }
 
     async fn collector(source: Arc<MockSource>) -> RemoteLogCollectorService {
+        collector_with_budget(
+            source,
+            Arc::new(IngestBudget::new(crate::services::IngestLimits::UNLIMITED)),
+        )
+        .await
+        .0
+    }
+
+    async fn collector_with_budget(
+        source: Arc<MockSource>,
+        ingest_budget: Arc<IngestBudget>,
+    ) -> (RemoteLogCollectorService, Arc<ChunkWriterService>) {
         use sea_orm::{DatabaseBackend, MockDatabase};
         let tmp = tempfile::tempdir().unwrap();
         let storage: Arc<dyn LogStorage> =
@@ -427,13 +539,23 @@ mod tests {
             .into_connection();
         let metadata = Arc::new(LogMetadataService::new(Arc::new(db)));
         let (tail_tx, _) = broadcast::channel(16);
-        RemoteLogCollectorService::new(source, chunk_writer, metadata, tail_tx)
+        (
+            RemoteLogCollectorService::new(
+                source,
+                chunk_writer.clone(),
+                metadata,
+                ingest_budget,
+                tail_tx,
+            ),
+            chunk_writer,
+        )
     }
 
     #[tokio::test]
     async fn test_reconcile_starts_and_stops_streams() {
         let source = Arc::new(MockSource {
             containers: StdMutex::new(vec![info("cnt-a"), info("cnt-b")]),
+            lines: Vec::new(),
         });
         let collector = collector(source.clone()).await;
 
@@ -456,5 +578,177 @@ mod tests {
         assert_eq!(collector.active_count().await, 0);
 
         collector.stop_all().await;
+    }
+
+    // A remote container flooding its log is held to the budget: lines over
+    // it never reach the chunk writer, and the container is listed as
+    // throttled with the node it runs on.
+    #[tokio::test]
+    async fn test_noisy_remote_container_is_held_to_its_budget() {
+        use crate::store::chunk_store::HeadSource;
+
+        let offered = 2_000usize;
+        let source = Arc::new(MockSource {
+            containers: StdMutex::new(vec![info("cnt-noisy")]),
+            lines: (0..offered)
+                .map(|i| format!("2026-10-25T10:00:00.{i:09}Z metric dump line {i}"))
+                .collect(),
+        });
+        let budget = Arc::new(IngestBudget::new(crate::services::IngestLimits {
+            lines_per_sec: 10,
+            bytes_per_sec: 0,
+        }));
+        let (collector, writer) = collector_with_budget(source, budget.clone()).await;
+        collector.reconcile().await.unwrap();
+
+        let mut stored = 0;
+        let mut dropped = 0;
+        for _ in 0..100 {
+            stored = writer
+                .snapshot("cnt-noisy")
+                .await
+                .map(|head| head.len())
+                .unwrap_or(0);
+            dropped = budget
+                .throttled_sources()
+                .first()
+                .map(|t| t.dropped_lines as usize)
+                .unwrap_or(0);
+            if stored + dropped == offered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let throttled = budget.throttled_sources();
+        collector.stop_all().await;
+
+        assert_eq!(
+            stored + dropped,
+            offered,
+            "every offered line is accounted for"
+        );
+        // The lines were produced within 2µs, so a 10 lines/s budget stores
+        // exactly its 100-line burst, however slowly they were delivered.
+        assert_eq!(
+            stored, 100,
+            "stored {stored} of {offered} lines against a 10 lines/s budget"
+        );
+        let entry = throttled.first().expect("the noisy container is listed");
+        assert_eq!(entry.container_id, "cnt-noisy");
+        assert_eq!(entry.node_id, Some(1));
+        assert_eq!(entry.node_name.as_deref(), Some("worker-1"));
+        assert_eq!(entry.project_id, Some(42));
+    }
+
+    // A microVM replica runs on the control plane itself: its source has no
+    // node, and the pipeline must carry that through rather than invent one.
+    #[tokio::test]
+    async fn test_a_control_plane_container_carries_no_node() {
+        let offered = 300usize;
+        let mut local = info("vm-local");
+        local.node_id = None;
+        local.node_name = None;
+        let source = Arc::new(MockSource {
+            containers: StdMutex::new(vec![local]),
+            lines: (0..offered)
+                .map(|i| format!("2026-10-25T10:00:00.{i:09}Z guest line {i}"))
+                .collect(),
+        });
+        let budget = Arc::new(IngestBudget::new(crate::services::IngestLimits {
+            lines_per_sec: 10,
+            bytes_per_sec: 0,
+        }));
+        let (collector, _writer) = collector_with_budget(source, budget.clone()).await;
+        collector.reconcile().await.unwrap();
+
+        let mut throttled = Vec::new();
+        for _ in 0..100 {
+            throttled = budget.throttled_sources();
+            if !throttled.is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        collector.stop_all().await;
+
+        let entry = throttled.first().expect("the container is over budget");
+        assert_eq!(entry.container_id, "vm-local");
+        assert_eq!(entry.node_id, None);
+        assert_eq!(entry.node_name, None);
+    }
+
+    #[test]
+    fn test_errors_name_the_node_or_the_control_plane() {
+        let remote = RemoteLogSourceError::NotFound {
+            node_id: Some(4),
+            container_id: "c1".into(),
+        };
+        assert_eq!(
+            remote.to_string(),
+            "remote container c1 on node 4 not found"
+        );
+        let local = RemoteLogSourceError::Source {
+            node_id: None,
+            reason: "guest unreachable".into(),
+        };
+        assert_eq!(
+            local.to_string(),
+            "remote log source error for the control plane: guest unreachable"
+        );
+    }
+
+    // A worker reconnecting after a restart replays its backlog as fast as
+    // the agent serves it. Lines produced within the budget must all be
+    // kept, however fast they arrive now.
+    #[tokio::test]
+    async fn test_replayed_remote_backlog_within_budget_is_stored_in_full() {
+        use crate::store::chunk_store::HeadSource;
+
+        let offered = 2_000usize;
+        let produced_from = chrono::DateTime::parse_from_rfc3339("2026-10-25T10:00:00Z")
+            .map(|t| t.with_timezone(&chrono::Utc))
+            .expect("valid timestamp");
+        // 50 lines/s for 40s, against a budget of 100 lines/s whose burst
+        // (1,000 lines) is half the backlog.
+        let lines = (0..offered)
+            .map(|i| {
+                let ts = produced_from + chrono::Duration::milliseconds(20 * i as i64);
+                format!(
+                    "{} request handled {i}",
+                    ts.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+                )
+            })
+            .collect();
+        let source = Arc::new(MockSource {
+            containers: StdMutex::new(vec![info("cnt-healthy")]),
+            lines,
+        });
+        let budget = Arc::new(IngestBudget::new(crate::services::IngestLimits {
+            lines_per_sec: 100,
+            bytes_per_sec: 0,
+        }));
+        let (collector, writer) = collector_with_budget(source, budget.clone()).await;
+        collector.reconcile().await.unwrap();
+
+        let mut stored = 0;
+        for _ in 0..100 {
+            stored = writer
+                .snapshot("cnt-healthy")
+                .await
+                .map(|head| head.len())
+                .unwrap_or(0);
+            if stored >= offered {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let throttled = budget.throttled_sources();
+        collector.stop_all().await;
+
+        assert_eq!(
+            stored, offered,
+            "a backlog produced within budget lost lines"
+        );
+        assert!(throttled.is_empty(), "{throttled:?}");
     }
 }

@@ -30,7 +30,7 @@ const CONTROL_PLANE_DNS_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 
 fn spawn_control_plane_dns_probe(
     docker: Arc<temps_core::DockerHandle>,
-    slot: temps_dns::OverlayDnsSlot,
+    slot: temps_node_dns::OverlayDnsSlot,
 ) {
     tokio::spawn(async move {
         let runtime =
@@ -41,7 +41,7 @@ fn spawn_control_plane_dns_probe(
             let gateway = runtime.inspect_app_network_gateway().await;
             let available = match gateway {
                 Some(gateway) => {
-                    temps_dns::probe_control_plane_resolver(std::net::SocketAddr::new(gateway, 53))
+                    temps_node_dns::probe::probe_resolver(std::net::SocketAddr::new(gateway, 53))
                         .await
                 }
                 None => false,
@@ -68,6 +68,7 @@ async fn reconcile_control_plane_overlay(
     db: Arc<sea_orm::DatabaseConnection>,
     docker: Arc<temps_core::DockerHandle>,
     preferred_private_address: Option<&str>,
+    advertised_wg_endpoint: Option<&str>,
     underlay_dev: Option<&str>,
     mesh_key_dir: &std::path::Path,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ControlPlaneOverlayReconcileError> {
@@ -97,6 +98,7 @@ async fn reconcile_control_plane_overlay(
         db.clone(),
         raw_docker.as_ref(),
         private_address,
+        advertised_wg_endpoint,
         underlay_dev,
         Some(mesh_key_dir),
     )
@@ -109,11 +111,13 @@ async fn reconcile_control_plane_overlay(
 async fn reconcile_control_plane_mesh(
     db: Arc<sea_orm::DatabaseConnection>,
     preferred_private_address: Option<&str>,
+    advertised_wg_endpoint: Option<&str>,
     mesh_key_dir: &std::path::Path,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, ControlPlaneOverlayReconcileError> {
     let mesh = temps_network::control_plane::setup_mesh_only(
         db.as_ref(),
         preferred_private_address,
+        advertised_wg_endpoint,
         mesh_key_dir,
     )
     .await?;
@@ -124,6 +128,70 @@ async fn reconcile_control_plane_mesh(
 const TRANSIENT_FAILURE_MESSAGE: &str =
     "a temporary error (database, Docker or kernel not ready); retrying automatically, details \
      in the `temps serve` logs";
+
+/// Shown when the host lacks a tool the mesh needs (`nft`). Retrying cannot
+/// install it, so this is reported once instead of as a "temporary" error.
+const MISSING_HOST_TOOL_MESSAGE: &str =
+    "this server cannot set up the WireGuard mesh: the `nft` firewall tool is not installed here. \
+     Install nftables on the host (or use an image that includes it), then change the cluster \
+     network settings or restart to retry";
+
+/// Shown when the process may not change the firewall or network interfaces.
+const MISSING_HOST_PERMISSION_MESSAGE: &str =
+    "this server cannot set up the WireGuard mesh: it is not permitted to change firewall rules \
+     or network interfaces (CAP_NET_ADMIN is missing). Run it with that capability, or use a \
+     host that supports the mesh, then change the cluster network settings or restart to retry";
+
+/// A setup failure that is a property of the environment, not a passing
+/// condition: a missing firewall tool, or no permission to configure the
+/// network. Retrying with backoff can never fix these, and calling them
+/// "temporary" sends the operator to the wrong place. The message names no
+/// paths or system text; the detail stays in the server log.
+fn host_cannot_run_mesh(error: &ControlPlaneOverlayReconcileError) -> Option<&'static str> {
+    use temps_network::control_plane::ControlPlaneSetupError;
+    use temps_network::NetworkError;
+    let ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+        NetworkError::Nftables { reason, .. } | NetworkError::Iptables { reason, .. },
+    )) = error
+    else {
+        return None;
+    };
+    if reason.starts_with("spawn ") && reason.contains("No such file or directory") {
+        Some(MISSING_HOST_TOOL_MESSAGE)
+    } else if reason.contains("Operation not permitted") || reason.contains("Permission denied") {
+        Some(MISSING_HOST_PERMISSION_MESSAGE)
+    } else {
+        None
+    }
+}
+
+/// The overlay subnet this server routes (its own or a peer's) collides with
+/// a range the host already uses: a Docker network or a host route (ADR 056).
+/// The message names the colliding range, its owner and both fixes. It is
+/// not waited out like a misconfiguration, because the operator can also fix
+/// it on the host (remove the Docker network, move the route) without touching
+/// the cluster settings; so the setup is retried with backoff. A VXLAN
+/// network ID another overlay on this host holds (ADR 062) is the same kind
+/// of failure: its message names the holder and both fixes.
+fn overlay_subnet_collision(error: &ControlPlaneOverlayReconcileError) -> Option<String> {
+    use temps_network::control_plane::ControlPlaneSetupError;
+    use temps_network::NetworkError;
+    match error {
+        ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+            collision @ (NetworkError::HostRouteCollision { .. }
+            | NetworkError::DockerCidrCollision { .. }
+            | NetworkError::VxlanIdInUse { .. }),
+        )) => Some(collision.to_string()),
+        _ => None,
+    }
+}
+
+/// Backoff after `consecutive_errors` failures in a row.
+fn control_plane_overlay_backoff(consecutive_errors: u32) -> Duration {
+    CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+        .saturating_mul(1u32 << consecutive_errors.min(6))
+        .min(CONTROL_PLANE_OVERLAY_MAX_BACKOFF)
+}
 
 /// What the status API may show for a setup failure the operator must fix.
 /// These errors name only the operator's own configuration, except a bad key
@@ -173,6 +241,8 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
     tokio::spawn(async move {
         // Count consecutive transient failures to drive exponential backoff.
         let mut consecutive_errors: u32 = 0;
+        // The last collision logged, so a persisting one is logged once.
+        let mut reported_collision: Option<String> = None;
         loop {
             let sleep_duration = match reconcile().await {
                 // The reconciler runs until the cluster's mesh setting stops
@@ -180,6 +250,11 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
                 // --wireguard` from the CLI); then set up again.
                 Ok(Some(reconciler)) => {
                     consecutive_errors = 0;
+                    if reported_collision.take().is_some() {
+                        tracing::info!(
+                            "control-plane overlay is up; the subnet collision was resolved"
+                        );
+                    }
                     temps_network::control_plane::record_setup_failure(None);
                     match reconciler.await {
                         Ok(()) => std::time::Duration::ZERO,
@@ -193,6 +268,21 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
                 Ok(None) => {
                     consecutive_errors = 0;
                     CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
+                }
+                // The host itself cannot run the mesh (no `nft`, no permission
+                // to configure the network): not transient, so report it once
+                // with the real cause and wait for the operator to act.
+                Err(error) if host_cannot_run_mesh(&error).is_some() => {
+                    let message = host_cannot_run_mesh(&error).unwrap_or_default();
+                    tracing::error!(
+                        error = %error,
+                        "control-plane overlay cannot run on this host; \
+                         retrying once the cluster network settings change"
+                    );
+                    temps_network::control_plane::record_setup_failure(Some(message.to_string()));
+                    wait_for_network_config_change(db.as_ref()).await;
+                    consecutive_errors = 0;
+                    continue;
                 }
                 // Operator-actionable misconfigurations can never succeed on
                 // retry. Log once at error level and stop burning resources.
@@ -229,6 +319,32 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
                     consecutive_errors = 0;
                     continue;
                 }
+                // The overlay subnet collides with a range the host uses:
+                // show the real cause and fixes, retry with backoff (the
+                // operator may fix it on the host), log once per cause.
+                Err(error) if overlay_subnet_collision(&error).is_some() => {
+                    let message = overlay_subnet_collision(&error).unwrap_or_default();
+                    consecutive_errors = consecutive_errors.saturating_add(1);
+                    let delay = control_plane_overlay_backoff(consecutive_errors);
+                    if reported_collision.as_deref() != Some(message.as_str()) {
+                        tracing::error!(
+                            error = %message,
+                            retry_secs = delay.as_secs(),
+                            "control-plane overlay collides with something this host \
+                             already uses; local deployments keep working, cross-node \
+                             networking stays off until it is fixed"
+                        );
+                        reported_collision = Some(message.clone());
+                    } else {
+                        tracing::debug!(
+                            attempt = consecutive_errors,
+                            retry_secs = delay.as_secs(),
+                            "control-plane overlay subnet still collides; retrying"
+                        );
+                    }
+                    temps_network::control_plane::record_setup_failure(Some(message));
+                    delay
+                }
                 // Transient errors (DB hiccup, Docker not yet ready, kernel
                 // module loading): retry with exponential backoff capped at
                 // CONTROL_PLANE_OVERLAY_MAX_BACKOFF.
@@ -239,9 +355,7 @@ fn spawn_control_plane_overlay_setup_watcher<F, Fut>(
                         TRANSIENT_FAILURE_MESSAGE.to_string(),
                     ));
                     consecutive_errors = consecutive_errors.saturating_add(1);
-                    let delay = CONTROL_PLANE_OVERLAY_RETRY_INTERVAL
-                        .saturating_mul(1u32 << consecutive_errors.min(6))
-                        .min(CONTROL_PLANE_OVERLAY_MAX_BACKOFF);
+                    let delay = control_plane_overlay_backoff(consecutive_errors);
                     tracing::warn!(
                         error = %error,
                         attempt = consecutive_errors,
@@ -390,32 +504,30 @@ impl TempsPlugin for DeployerPlugin {
             };
             tracing::debug!("Using buildkit: {}", use_buildkit);
 
-            // Load build limits and cluster-DNS settings. Only the control plane
+            // Load build limits and the multi-node addresses. Only the control plane
             // has a ConfigService registered (workers run DockerRuntime through
             // `temps cli agent` which never reaches this plugin), so this is
             // naturally scoped to control-plane builds. On the rare path where
             // settings can't be read (fresh install before first save, DB
             // hiccup), we log a warning and fall back to safe defaults: legacy
-            // unbounded build behaviour AND cluster DNS disabled — builds must
-            // keep working and we must never accidentally enable the DNS
-            // injection when we can't confirm the operator opted in.
+            // unbounded build behaviour — builds must keep working.
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let (build_limits, cluster_dns_enabled, control_plane_private_address) =
+            let (build_limits, control_plane_private_address, control_plane_wg_endpoint) =
                 match config_service.get_settings().await {
                     Ok(settings) => (
                         Some(settings.build_limits),
-                        settings.cluster_dns.enabled,
                         settings.multi_node.private_address,
+                        // `temps serve --wg-endpoint`, recorded at startup.
+                        settings.multi_node.wg_endpoint,
                     ),
                     Err(e) => {
                         tracing::warn!(
                             "Could not read settings ({}). \
                          Builds will run with the legacy unbounded behaviour \
-                         and cluster DNS resolver will not be started \
                          until settings are saved.",
                             e
                         );
-                        (None, false, None)
+                        (None, None, None)
                     }
                 };
 
@@ -429,13 +541,17 @@ impl TempsPlugin for DeployerPlugin {
             let docker_socket_grant = temps_core::docker_socket_grant::process_grant().clone();
             docker_socket_grant.log_startup("temps serve");
 
-            let mut docker_runtime = DockerRuntime::new_with_handle(
+            let docker_runtime = DockerRuntime::new_with_handle(
                 docker.clone(),
                 use_buildkit,
                 temps_core::NETWORK_NAME.to_string(),
-            )
-            .with_extra_networks(server_config.docker_extra_networks.clone())
-            .with_docker_socket_grant(docker_socket_grant.clone());
+            );
+            // Set before the extra networks, which leave the overlay out of
+            // their list.
+            let mut docker_runtime =
+                join_overlay_when_local(docker_runtime, local_workloads_enabled)
+                    .with_extra_networks(server_config.docker_extra_networks.clone())
+                    .with_docker_socket_grant(docker_socket_grant.clone());
             if let Some(limits) = build_limits {
                 docker_runtime = docker_runtime.with_build_limits(
                     limits.max_concurrent,
@@ -485,12 +601,17 @@ impl TempsPlugin for DeployerPlugin {
                 let mesh_key_dir = temps_network::mesh::key_dir(&server_config.data_dir);
                 if local_workloads_enabled {
                     let docker = docker.clone();
+                    #[allow(
+                        clippy::disallowed_methods,
+                        reason = "legacy runtime env config; follow-up: move to a DB-backed setting (P0.7 follow-up). TEMPS_UNDERLAY_DEV"
+                    )]
                     let underlay_dev = std::env::var("TEMPS_UNDERLAY_DEV").ok();
                     let watcher_db = db.clone();
                     spawn_control_plane_overlay_setup_watcher(db, move || {
                         let db = watcher_db.clone();
                         let docker = docker.clone();
                         let address = control_plane_private_address.clone();
+                        let wg_endpoint = control_plane_wg_endpoint.clone();
                         let underlay_dev = underlay_dev.clone();
                         let mesh_key_dir = mesh_key_dir.clone();
                         async move {
@@ -498,6 +619,7 @@ impl TempsPlugin for DeployerPlugin {
                                 db,
                                 docker,
                                 address.as_deref(),
+                                wg_endpoint.as_deref(),
                                 underlay_dev.as_deref(),
                                 &mesh_key_dir,
                             )
@@ -509,10 +631,16 @@ impl TempsPlugin for DeployerPlugin {
                     spawn_control_plane_overlay_setup_watcher(db, move || {
                         let db = watcher_db.clone();
                         let address = control_plane_private_address.clone();
+                        let wg_endpoint = control_plane_wg_endpoint.clone();
                         let mesh_key_dir = mesh_key_dir.clone();
                         async move {
-                            reconcile_control_plane_mesh(db, address.as_deref(), &mesh_key_dir)
-                                .await
+                            reconcile_control_plane_mesh(
+                                db,
+                                address.as_deref(),
+                                wg_endpoint.as_deref(),
+                                &mesh_key_dir,
+                            )
+                            .await
                         }
                     });
                 }
@@ -550,43 +678,31 @@ impl TempsPlugin for DeployerPlugin {
             // it must never bind :53 itself because split and combined
             // topologies both have exactly one proxy owner.
             //
-            // Gated behind `AppSettings.cluster_dns.enabled` (experimental
-            // beta, **off by default**). The default-off guards against the
-            // DNS-timeout-cascade incident: glibc cycles through all nameserver
-            // lines at ~5 s × 2 attempts each when the injected resolver is
-            // transiently slow for external hostnames, causing 22–27 s TCP
-            // connect delays. When disabled, containers get NO custom
-            // `HostConfig.Dns` and fall back to Docker's embedded DNS
-            // (which forwards to the host's own resolv.conf), exactly as
-            // before ADR-024 was introduced.
-            //
-            if cluster_dns_enabled && local_workloads_enabled {
+            // `AppSettings.cluster_dns.enabled` is not read here: the slot is
+            // filled only while the proxy runs the resolver, which it does only
+            // while the setting is on, and the probe below clears it as soon as
+            // the resolver stops answering. Turning cluster DNS on or off thus
+            // reaches new containers without a restart. While the slot is
+            // empty, containers get no custom `HostConfig.Dns` and keep
+            // Docker's embedded DNS, as before ADR-024. When it is set the
+            // resolver is their only nameserver (`dns_with_fallback` adds
+            // none): it forwards outside names itself, and another
+            // nameserver would bypass internal policy (ADR-096).
+            if local_workloads_enabled {
                 if let Some(slot) =
                     context.get_service::<std::sync::RwLock<Option<std::net::IpAddr>>>()
                 {
                     docker_runtime = docker_runtime.with_overlay_dns_slot(slot.clone());
                     spawn_control_plane_dns_probe(docker.clone(), slot);
-                    tracing::info!(
-                        "cluster DNS enabled; container injection follows the proxy-owned resolver slot"
+                    tracing::debug!(
+                        "container DNS injection follows the proxy-owned cluster resolver slot"
                     );
                 } else {
                     tracing::warn!(
-                        "cluster DNS enabled but no proxy resolver slot is registered; \
-                         containers will keep Docker embedded DNS"
+                        "no proxy resolver slot is registered; containers will keep Docker's \
+                         embedded DNS even when cluster DNS is enabled"
                     );
                 }
-            } else if cluster_dns_enabled {
-                tracing::info!(
-                    "cluster DNS is enabled in settings, but this process runs no local \
-                     containers, so the control-plane resolver is not started here; worker \
-                     nodes run their own"
-                );
-            } else {
-                tracing::info!(
-                    "cluster DNS resolver disabled (experimental beta, off by default — \
-                     set AppSettings.cluster_dns.enabled=true to enable *.temps.local resolution); \
-                     containers will use Docker's embedded DNS"
-                );
             }
 
             let docker_runtime = Arc::new(docker_runtime);
@@ -594,8 +710,15 @@ impl TempsPlugin for DeployerPlugin {
             // Register the concrete service
             context.register_service(docker_runtime.clone());
 
-            // Register as ContainerDeployer trait
-            let container_deployer: Arc<dyn ContainerDeployer> = docker_runtime.clone();
+            // Register as ContainerDeployer trait, wrapped so a replica Docker
+            // cannot see (a microVM) is read through the workload plane once
+            // the deployments plugin attaches its reader. Until then, and for
+            // every ordinary container, it is the Docker runtime itself.
+            let replica_aware = Arc::new(crate::replica_aware::ReplicaAwareDeployer::new(
+                docker_runtime.clone(),
+            ));
+            context.register_service(replica_aware.clone());
+            let container_deployer: Arc<dyn ContainerDeployer> = replica_aware;
             context.register_service(container_deployer);
 
             // Register as ImageBuilder trait
@@ -659,8 +782,146 @@ impl TempsPlugin for DeployerPlugin {
     }
 }
 
+/// Join applications deployed by this process to the overlay, as `temps
+/// agent` does on workers.
+///
+/// Managed services on the control plane already sit on the overlay, and
+/// their `*.temps.local` records point at their overlay address, which
+/// Docker's bridge isolation makes unreachable from the app network alone.
+/// A single-node install has no overlay network, and the runtime skips the
+/// attach. A process that runs no workloads has nothing to attach.
+fn join_overlay_when_local(runtime: DockerRuntime, local_workloads_enabled: bool) -> DockerRuntime {
+    if local_workloads_enabled {
+        runtime.with_current_overlay_network()
+    } else {
+        runtime
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::{join_overlay_when_local, DockerRuntime};
+    use std::sync::Arc;
+
+    fn runtime_without_daemon() -> DockerRuntime {
+        let docker = bollard::Docker::connect_with_local_defaults()
+            .expect("bollard client construction (no connection made)");
+        DockerRuntime::new(Arc::new(docker), false, "temps-app-network".to_string())
+    }
+
+    #[test]
+    fn control_plane_applications_join_the_overlay_when_it_runs_workloads() {
+        let runtime = join_overlay_when_local(runtime_without_daemon(), true);
+        assert_eq!(
+            runtime.overlay_network_name(),
+            Some(temps_network::overlay_name::current().docker_network)
+        );
+    }
+
+    #[test]
+    fn a_process_without_local_workloads_joins_no_overlay() {
+        let runtime = join_overlay_when_local(runtime_without_daemon(), false);
+        assert_eq!(runtime.overlay_network_name(), None);
+    }
+
+    fn nft_failure(op: &'static str, reason: &str) -> ControlPlaneOverlayReconcileError {
+        ControlPlaneOverlayReconcileError::Setup(
+            temps_network::control_plane::ControlPlaneSetupError::Network(
+                temps_network::NetworkError::Nftables {
+                    op,
+                    table: "temps_mesh".into(),
+                    reason: reason.into(),
+                },
+            ),
+        )
+    }
+
+    #[test]
+    fn a_missing_nft_binary_is_reported_as_the_hosts_limit_not_a_temporary_error() {
+        let error = nft_failure(
+            "inspect_mesh_lockdown",
+            "spawn nft: No such file or directory (os error 2)",
+        );
+        assert_eq!(
+            host_cannot_run_mesh(&error),
+            Some(MISSING_HOST_TOOL_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn a_denied_netlink_or_nft_call_is_reported_as_a_missing_permission() {
+        let error = nft_failure("install_baseline", "Error: Operation not permitted");
+        assert_eq!(
+            host_cannot_run_mesh(&error),
+            Some(MISSING_HOST_PERMISSION_MESSAGE)
+        );
+    }
+
+    #[test]
+    fn an_overlay_subnet_collision_is_shown_with_its_cause_and_fix() {
+        use temps_network::control_plane::ControlPlaneSetupError;
+        use temps_network::NetworkError;
+        let route = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+            NetworkError::HostRouteCollision {
+                subnet: "10.202.255.0/24".parse().unwrap(),
+                existing_cidr: "10.0.0.0/8".parse().unwrap(),
+                device: "wg-corp".into(),
+            },
+        ));
+        let shown = overlay_subnet_collision(&route).expect("a collision is actionable");
+        assert!(shown.contains("10.0.0.0/8"), "{shown}");
+        assert!(shown.contains("wg-corp"), "{shown}");
+        assert!(shown.contains("--compute-pool-cidr"), "{shown}");
+        assert_eq!(host_cannot_run_mesh(&route), None);
+
+        let docker = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+            NetworkError::DockerCidrCollision {
+                cidr: "172.20.255.0/24".parse().unwrap(),
+                existing_cidr: "172.20.0.0/16".parse().unwrap(),
+                existing_network: "shop_default".into(),
+                desired_network: "temps0".into(),
+            },
+        ));
+        let shown = overlay_subnet_collision(&docker).expect("a collision is actionable");
+        assert!(shown.contains("shop_default"), "{shown}");
+
+        let id_in_use = ControlPlaneOverlayReconcileError::Setup(ControlPlaneSetupError::Network(
+            NetworkError::VxlanIdInUse {
+                device: "vxlan-temps1".into(),
+                holder: "vxlan-temps0".into(),
+                vni: 42,
+                port: 4789,
+                diagnosis: temps_network::vxlan_holder::describe(
+                    &temps_network::vxlan_holder::HolderFacts::device_only("vxlan-temps0"),
+                    "vxlan-temps1",
+                    42,
+                    4789,
+                ),
+            },
+        ));
+        let shown = overlay_subnet_collision(&id_in_use).expect("an ID in use is actionable");
+        assert!(shown.contains("vxlan-temps0"), "{shown}");
+        assert!(shown.contains("own network ID"), "{shown}");
+
+        let transient = nft_failure("install_baseline", "nft exited with status 1");
+        assert_eq!(overlay_subnet_collision(&transient), None);
+    }
+
+    #[test]
+    fn collision_retries_back_off_to_the_cap() {
+        assert_eq!(control_plane_overlay_backoff(1), Duration::from_secs(10));
+        assert_eq!(control_plane_overlay_backoff(3), Duration::from_secs(40));
+        assert_eq!(
+            control_plane_overlay_backoff(50),
+            CONTROL_PLANE_OVERLAY_MAX_BACKOFF
+        );
+    }
+
+    #[test]
+    fn other_nft_failures_stay_transient() {
+        let error = nft_failure("install_baseline", "nft exited with status 1: syntax error");
+        assert_eq!(host_cannot_run_mesh(&error), None);
+    }
     #[test]
     fn setup_failures_shown_to_readers_carry_no_internal_detail() {
         use super::{operator_failure_message, ControlPlaneOverlayReconcileError};

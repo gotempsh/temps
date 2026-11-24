@@ -50,17 +50,14 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { ActivityRequestState } from './ActivityRequestState'
+import { useActivityGate } from './use-activity-gate'
+import {
+  activityErrorMessage,
+  isActionableFailure,
+} from './activity-request-state'
 
-function errorMessage(error: unknown): string {
-  if (
-    error &&
-    typeof error === 'object' &&
-    'detail' in error &&
-    typeof error.detail === 'string'
-  )
-    return error.detail
-  return 'Could not complete the request. Check the AI provider settings and try again.'
-}
+const errorMessage = activityErrorMessage
 
 export function ActivityReportPage({ project }: { project: ProjectResponse }) {
   const queryClient = useQueryClient()
@@ -76,7 +73,12 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
   const status = useQuery({
     ...options,
     placeholderData: (previous) => previous,
-    refetchInterval: (query) => (query.state.data?.running ? 3000 : 30_000),
+    // Poll while any AI action runs for this project, including one started
+    // from another tab or before a reload, so its end is noticed promptly.
+    refetchInterval: (query) =>
+      query.state.data?.running || query.state.data?.in_progress
+        ? 2000
+        : 30_000,
   })
   const [preview, setPreview] = useState<ActivityPreview | null>(null)
   const [category, setCategory] = useState<string | null>(null)
@@ -94,6 +96,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
   const data = status.data
   const report = preview?.report ?? data?.report
   const running = run.isPending || data?.running
+  const reportGate = useActivityGate(data, 'report', status.dataUpdatedAt)
+  const refreshStatus = () =>
+    queryClient.invalidateQueries({ queryKey: options.queryKey })
   const visitors =
     report?.visitors.filter(
       (visitor) => !category || visitor.categories.includes(category)
@@ -155,9 +160,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
               setPreview(value)
               setCategory(null)
             }}
-            onSaved={() =>
-              queryClient.invalidateQueries({ queryKey: options.queryKey })
-            }
+            statusUpdatedAt={status.dataUpdatedAt}
+            onActionSettled={refreshStatus}
+            onSaved={refreshStatus}
           />
           {(data.settings_revision > 0 ||
             report ||
@@ -192,6 +197,9 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                         !data.settings_revision ||
                         !data.settings.share_activity_with_ai ||
                         !!running ||
+                        // Any action running for the project, or the
+                        // report's cooldown: the server would refuse it.
+                        reportGate.blocked ||
                         status.isFetching ||
                         status.isError ||
                         data.selected_environment_id !==
@@ -206,7 +214,11 @@ export function ActivityReportPage({ project }: { project: ProjectResponse }) {
                       ) : (
                         <Sparkles className="mr-2 h-4 w-4" />
                       )}
-                      {running ? 'Analyzing…' : 'Run now'}
+                      {running
+                        ? 'Analyzing…'
+                        : reportGate.cooldownSecs > 0
+                          ? `Run again in ${reportGate.cooldownSecs}s`
+                          : 'Run now'}
                     </Button>
                   )}
                 </div>
@@ -469,9 +481,13 @@ function ActivitySettingsForm({
   disabled,
   onSaved,
   onPreview,
+  statusUpdatedAt,
+  onActionSettled,
 }: {
   projectId: number
   status: ActivityStatus
+  statusUpdatedAt: number
+  onActionSettled: () => Promise<unknown>
   environments: EnvironmentResponse[]
   environmentLoading: boolean
   environmentError: boolean
@@ -525,8 +541,13 @@ function ActivitySettingsForm({
     if (editing) form.setFocus('application_context')
   }, [editing, form])
   const [hasSetup, setHasSetup] = useState(status.settings_revision > 0)
+  const queryClient = useQueryClient()
+  const previewKey = ['activity-preview', projectId]
+  const previewGate = useActivityGate(status, 'preview', statusUpdatedAt)
   const preview = useMutation({
     ...previewActivityReportMutation(),
+    mutationKey: previewKey,
+    onSettled: onActionSettled,
     onSuccess: (result) => {
       form.reset({
         ...result.settings,
@@ -544,7 +565,9 @@ function ActivitySettingsForm({
       onPreview(result)
       toast.success('Your visitor preview is ready')
     },
-    onError: (error) => toast.error(errorMessage(error)),
+    onError: (error) => {
+      if (isActionableFailure(error)) toast.error(errorMessage(error))
+    },
   })
   const save = useMutation({
     ...saveActivitySettingsMutation(),
@@ -627,6 +650,9 @@ function ActivitySettingsForm({
             form.setValue('source_domain', domain, { shouldDirty: true })
           }}
           configured={status.configured}
+          status={status}
+          statusUpdatedAt={statusUpdatedAt}
+          onActionSettled={onActionSettled}
           aiProvider={status.ai_provider ?? null}
           aiModel={status.ai_model ?? null}
           disabled={busy}
@@ -654,7 +680,14 @@ function ActivitySettingsForm({
         <form
           className="mt-4 space-y-5"
           onSubmit={form.handleSubmit((data) => {
-            if (!canPreview) return
+            // A second submit before the first re-renders must not stack a
+            // second request behind the server's one-at-a-time guard.
+            if (
+              !canPreview ||
+              previewGate.blocked ||
+              queryClient.isMutating({ mutationKey: previewKey }) > 0
+            )
+              return
             onPreview(null)
             preview.mutate({
               path: { project_id: projectId },
@@ -954,14 +987,17 @@ function ActivitySettingsForm({
                 Run automatically every 24 hours
               </label>
             )}
-            {preview.isError && (
-              <Alert variant="destructive">
-                <AlertDescription>
-                  {errorMessage(preview.error)} Your saved setup has not
-                  changed.
-                </AlertDescription>
-              </Alert>
-            )}
+            <ActivityRequestState
+              operation="preview"
+              gate={previewGate}
+              isPending={preview.isPending}
+              error={preview.error}
+              onRetry={
+                preview.variables
+                  ? () => preview.variables && preview.mutate(preview.variables)
+                  : undefined
+              }
+            />
             {!activityLoading && !status.has_recent_activity && (
               <p className="text-sm text-muted-foreground">
                 No visitor activity in the last 24 hours.
@@ -972,7 +1008,9 @@ function ActivitySettingsForm({
                 <Button
                   type="submit"
                   disabled={
-                    !status.configured || !values.share_activity_with_ai
+                    !status.configured ||
+                    !values.share_activity_with_ai ||
+                    previewGate.blocked
                   }
                 >
                   {preview.isPending ? (
@@ -1044,6 +1082,9 @@ function GoalSuggestions({
   sourceDomain,
   onSourceChange,
   configured,
+  status,
+  statusUpdatedAt,
+  onActionSettled,
   aiProvider,
   aiModel,
   disabled,
@@ -1051,6 +1092,9 @@ function GoalSuggestions({
   onResultsChange,
 }: {
   projectId: number
+  status: Pick<ActivityStatus, 'in_progress' | 'cooldowns'>
+  statusUpdatedAt: number
+  onActionSettled: () => Promise<unknown>
   environment?: EnvironmentResponse
   sourceUrl: string | null
   sourceDomain: string | null
@@ -1077,7 +1121,6 @@ function GoalSuggestions({
   const resultsHeading = useRef<HTMLHeadingElement>(null)
   useEffect(() => {
     onResultsChange(step === 'goals')
-    if (step === 'goals') resultsHeading.current?.focus()
   }, [step, onResultsChange])
   const [requestedUrl, setRequestedUrl] = useState<string | null>(null)
   const selectedDomain = domains.data?.find(
@@ -1090,11 +1133,26 @@ function GoalSuggestions({
   useEffect(() => {
     form.setValue('url', resolvedUrl)
   }, [resolvedUrl, form])
+  const queryClient = useQueryClient()
+  const suggestKey = ['activity-website-analysis', projectId]
+  const gate = useActivityGate(status, 'website_analysis', statusUpdatedAt)
   const suggest = useMutation({
     ...suggestActivityGoalsMutation(),
+    mutationKey: suggestKey,
     onSuccess: () => setStep('goals'),
-    onError: (error) => toast.error(errorMessage(error)),
+    onError: (error) => {
+      if (isActionableFailure(error)) toast.error(errorMessage(error))
+    },
+    // The status says whether a cooldown started and when it ends.
+    onSettled: onActionSettled,
   })
+  // The goals render once the step and the suggestions are both in; the
+  // mutation's onSuccess sets the step a render before its data, so focus
+  // follows the rendered heading, not the step.
+  const showingGoals = step === 'goals' && suggest.data != null
+  useEffect(() => {
+    if (showingGoals) resultsHeading.current?.focus()
+  }, [showingGoals])
   return (
     <section aria-label="Website analysis">
       <div className="space-y-4">
@@ -1102,6 +1160,13 @@ function GoalSuggestions({
           hidden={step !== 'website'}
           className="space-y-3"
           onSubmit={form.handleSubmit((data) => {
+            // Both clicks of a fast double-click can pass validation before
+            // the button disables; only the first may send a request.
+            if (
+              gate.blocked ||
+              queryClient.isMutating({ mutationKey: suggestKey }) > 0
+            )
+              return
             setRequestedUrl(data.url)
             suggest.mutate({
               path: { project_id: projectId },
@@ -1198,7 +1263,9 @@ function GoalSuggestions({
             <div className="flex flex-wrap gap-2">
               <Button
                 type="submit"
-                disabled={!configured || !environment || !resolvedUrl}
+                disabled={
+                  !configured || !environment || !resolvedUrl || gate.blocked
+                }
               >
                 {suggest.isPending ? 'Analyzing website…' : 'Analyze website'}
               </Button>
@@ -1215,10 +1282,18 @@ function GoalSuggestions({
             <Skeleton className="h-24 w-full" />
           </div>
         )}
-        {suggest.isError && (
-          <Alert variant="destructive">
-            <AlertDescription>{errorMessage(suggest.error)}</AlertDescription>
-          </Alert>
+        {step === 'website' && (
+          <ActivityRequestState
+            operation="website_analysis"
+            gate={gate}
+            isPending={suggest.isPending}
+            error={suggest.error}
+            onRetry={
+              suggest.variables
+                ? () => suggest.variables && suggest.mutate(suggest.variables)
+                : undefined
+            }
+          />
         )}
         {step === 'selected' && selectedGoal && (
           <div className="flex flex-wrap items-center justify-between gap-3 border-b pb-4">
@@ -1236,7 +1311,7 @@ function GoalSuggestions({
             </Button>
           </div>
         )}
-        {step === 'goals' && suggest.data && (
+        {showingGoals && suggest.data && (
           <div className="space-y-6">
             <div className="space-y-4">
               <Button

@@ -9,6 +9,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import type { OidcProviderResponse } from '@/api/client/types.gen'
 import { problemMessage } from '@/components/settings/oidc-provider-constants'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
@@ -160,27 +161,21 @@ export function AuthSettingsPage() {
   return (
     <div className="space-y-6">
       {verificationDialog}
-      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-        <div>
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Authentication
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            OIDC provider configuration. Add as many providers as you need —
-            each one shows up as its own button on the login screen when
-            enabled.
-          </p>
-        </div>
-        {!providersQuery.isLoading && providers.length > 0 && (
-          <Button asChild>
-            <Link to="/settings/auth/new">
-              <Plus className="mr-2 h-4 w-4" />
-              <span className="hidden sm:inline">Add SSO Provider</span>
-              <span className="sm:hidden">Add</span>
-            </Link>
-          </Button>
-        )}
-      </div>
+      <PageHeader
+        title="Authentication"
+        description="OIDC provider configuration. Add as many providers as you need — each one shows up as its own button on the login screen when enabled."
+        actions={
+          !providersQuery.isLoading && providers.length > 0 ? (
+            <Button asChild>
+              <Link to="/settings/auth/new">
+                <Plus className="mr-2 h-4 w-4" />
+                <span className="hidden sm:inline">Add SSO provider</span>
+                <span className="sm:hidden">Add</span>
+              </Link>
+            </Button>
+          ) : undefined
+        }
+      />
 
       {providersQuery.isError && (
         <ReadFailure
@@ -218,7 +213,7 @@ export function AuthSettingsPage() {
                 IdP.
               </p>
               <Button asChild className="mt-4">
-                <Link to="/settings/auth/new">Add SSO Provider</Link>
+                <Link to="/settings/auth/new">Add SSO provider</Link>
               </Button>
             </div>
           </CardContent>

@@ -16,7 +16,7 @@ tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:nodejs-dev-4 nodejs
 tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:python-dev-4 python
 tools/sandbox-runtime/build-local.sh temps-sandbox-runtime:all-dev-4 all
 tools/sandbox-runtime/smoke.sh temps-sandbox-runtime:nodejs-dev-4
-cargo test -p temps-agents --test runtime_daemon -- --nocapture
+cargo test -p temps-sandbox-providers --test runtime_daemon -- --nocapture
 cargo test --locked --manifest-path tools/sandbox-runtime/Cargo.toml
 python3 tools/sandbox-runtime/test_build_inputs.py
 ```
@@ -25,8 +25,11 @@ Node.js includes Node, Bun and the Claude/Codex/OpenCode CLIs. The CLIs are
 installed under `/opt/temps-cli`, owned by the sandbox user and linked into
 `/usr/local/bin`, so `claude update` and `npm install -g <cli>@latest` work
 without root (`sudo` cannot elevate under `no-new-privileges`). Updates last
-until the container is replaced; **Update runtime** returns to the pinned
-versions. Keep `/usr/local/bin` root-owned: the host root-execs the daemon from
+until the container is replaced; **Update runtime** returns to the versions the
+image bundles. Local and pull-request builds bundle the `ARG *_VERSION` pins in
+the Dockerfile; published images bundle the latest stable npm release of each
+CLI at build time, never older than the pin (`cli_versions.py`), and record it
+in the `sh.temps.cli.*` image labels. Keep `/usr/local/bin` root-owned: the host root-execs the daemon from
 it. Python adds Python, pip and venv. All adds build-essential and Debian's Go/Rust toolchains.
 The latter are distribution versions, not promises of the latest toolchains.
 

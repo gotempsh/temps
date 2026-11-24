@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     body::Body,
     extract::{DefaultBodyLimit, Multipart, Path, State},
@@ -22,7 +21,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::{AuditOperation, RequestMetadata};
 use tracing::{error, info};
@@ -32,7 +31,8 @@ use super::sse_usage::UsageKind;
 use crate::error::AiGatewayError;
 use crate::handlers::gateway::{
     credential_type_str, enforce_project_limits, error_to_response, extract_ai_context,
-    extract_byok, reject_deployment_token_base_url, wrap_stream_with_usage_tracking,
+    extract_byok, log_failed_request, provider_error_to_response, reject_deployment_token_base_url,
+    wrap_stream_with_usage_tracking, FailedRequest,
 };
 use crate::handlers::types::AiGatewayAppState;
 use crate::native_types::*;
@@ -115,49 +115,10 @@ fn owner_of(auth: &AuthContext) -> Owner {
     }
 }
 
-/// Simple browser requests can carry cookies from a sibling application origin.
-/// Bearer-token clients are unaffected; cookie-authenticated uploads and cancels
-/// must originate on the console itself, before any file I/O or provider call.
-fn validate_session_action_origin(
-    auth: &AuthContext,
-    metadata: &RequestMetadata,
-) -> Result<(), (StatusCode, Json<OpenAiErrorResponse>)> {
-    if !matches!(&auth.source, temps_auth::AuthSource::Session { .. })
-        || session_action_origin_is_allowed(&metadata.headers, &metadata.base_url)
-    {
-        return Ok(());
-    }
-    Err((
-        StatusCode::FORBIDDEN,
-        Json(OpenAiErrorResponse::invalid_request(
-            "Cookie-authenticated uploads and batch cancellation require a same-origin Origin header; SDK clients should use a bearer token",
-            "invalid_origin",
-        )),
-    ))
-}
-
-fn session_action_origin_is_allowed(headers: &HeaderMap, base_url: &str) -> bool {
-    if headers
-        .get("sec-fetch-site")
-        .is_some_and(|site| site != "same-origin")
-    {
-        return false;
-    }
-    let Some(origin) = headers.get("origin").and_then(|value| value.to_str().ok()) else {
-        return false;
-    };
-    let (Ok(origin), Ok(expected)) = (reqwest::Url::parse(origin), reqwest::Url::parse(base_url))
-    else {
-        return false;
-    };
-    matches!(origin.scheme(), "http" | "https")
-        && origin.username().is_empty()
-        && origin.password().is_none()
-        && origin.path() == "/"
-        && origin.query().is_none()
-        && origin.fragment().is_none()
-        && origin.origin() == expected.origin()
-}
+// Cookie-authenticated, state-changing requests are refused unless they
+// come from the console's own origin. That is enforced once for the whole
+// console router by `AuthMiddleware` (see `temps_core::same_origin`), so
+// these handlers no longer check it themselves.
 
 /// Preserve provider status and bytes while enforcing the API response MIME contract.
 fn forward(reply: UpstreamReply, credential_type: Option<CredentialType>) -> Response {
@@ -301,9 +262,8 @@ impl AuditOperation for AiGatewayObjectAudit {
         &self.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -450,7 +410,19 @@ async fn create_response(
         Ok(result) => result,
         Err(call_error) => {
             error!(model, error = %call_error, "AI gateway Responses request failed");
-            return Ok(error_to_response(call_error).into_response());
+            log_failed_request(
+                &app_state,
+                FailedRequest {
+                    user_id,
+                    model: &model,
+                    byok: &byok,
+                    start,
+                    is_streaming: request.stream,
+                    ai_context: &ai_context,
+                },
+                &call_error,
+            );
+            return Ok(provider_error_to_response(call_error, &byok));
         }
     };
     let credential_type = served_by.credential_type;
@@ -468,7 +440,11 @@ async fn create_response(
     match outcome {
         ResponsesOutcome::Reply { reply, usage } => {
             let latency_ms = start.elapsed().as_millis() as i32;
-            if let Some(usage) = usage {
+            // A reply with no usage still happened: it's logged with zero tokens.
+            {
+                let (input_tokens, output_tokens) =
+                    usage.map_or((0, 0), |usage| (usage.input_tokens, usage.output_tokens));
+                let status = reply.status.as_u16() as i16;
                 let usage_service = app_state.usage_service.clone();
                 let model = model.clone();
                 tokio::spawn(async move {
@@ -477,13 +453,14 @@ async fn create_response(
                             user_id,
                             provider_id,
                             &model,
-                            usage.input_tokens,
-                            usage.output_tokens,
+                            input_tokens,
+                            output_tokens,
                             latency_ms,
                             0,
-                            200,
+                            status,
                             false,
                             is_byok,
+                            crate::types::PromptTokensDetails::default(),
                             &ai_context,
                         )
                         .await
@@ -577,9 +554,6 @@ async fn upload_file(
     mut multipart: Multipart,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, AiGatewayExecute);
-    if let Err(rejection) = validate_session_action_origin(&auth, &metadata) {
-        return Ok(rejection.into_response());
-    }
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
@@ -955,9 +929,6 @@ async fn cancel_batch(
     Path(batch_id): Path<String>,
 ) -> Result<Response, Problem> {
     permission_guard!(auth, AiGatewayExecute);
-    if let Err(rejection) = validate_session_action_origin(&auth, &metadata) {
-        return Ok(rejection.into_response());
-    }
     let byok = match byok_for(&auth, &headers) {
         Ok(byok) => byok,
         Err(error) => return Ok(error_to_response(error).into_response()),
@@ -1006,54 +977,6 @@ mod tests {
     }
 
     use super::*;
-
-    #[test]
-    fn cookie_actions_reject_sibling_origins_and_require_the_same_scheme_and_port() {
-        let mut headers = HeaderMap::new();
-        let console = "https://console.example:8443";
-        assert!(!session_action_origin_is_allowed(&headers, console));
-        for origin in [
-            "null",
-            "https://app.example:8443",
-            "https://console.example",
-            "http://console.example:8443",
-            "https://user@console.example:8443",
-            "https://console.example:8443/path",
-            "https://console.example:8443?query=value",
-            "https://console.example:8443#fragment",
-        ] {
-            headers.insert("origin", origin.parse().unwrap());
-            assert!(
-                !session_action_origin_is_allowed(&headers, console),
-                "{origin}"
-            );
-        }
-        headers.insert("origin", console.parse().unwrap());
-        assert!(session_action_origin_is_allowed(&headers, console));
-        headers.insert("sec-fetch-site", "same-site".parse().unwrap());
-        assert!(!session_action_origin_is_allowed(&headers, console));
-        headers.insert("sec-fetch-site", "cross-site".parse().unwrap());
-        assert!(!session_action_origin_is_allowed(&headers, console));
-        headers.insert("sec-fetch-site", "same-origin".parse().unwrap());
-        assert!(session_action_origin_is_allowed(&headers, console));
-    }
-
-    #[test]
-    fn token_authenticated_actions_do_not_require_browser_origin_headers() {
-        let auth = AuthContext::new_deployment_token(12, None, None, 3, "app-token".into(), vec![]);
-        let metadata = RequestMetadata {
-            ip_address: "127.0.0.1".into(),
-            user_agent: "SDK".into(),
-            headers: HeaderMap::new(),
-            visitor_id_cookie: None,
-            session_id_cookie: None,
-            base_url: "https://console.example".into(),
-            scheme: "https".into(),
-            host: "console.example".into(),
-            is_secure: true,
-        };
-        assert!(validate_session_action_origin(&auth, &metadata).is_ok());
-    }
 
     #[test]
     fn openapi_registers_every_native_route_and_wire_schema() {

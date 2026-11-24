@@ -29,6 +29,8 @@ List available templates
 
 Create a template: every service (an app, what `projects` manages), the databases it needs, its shared variables and path routes
 
+**Usage:** `templates create <slug> [options]`
+
 **Options:**
 
 | Flag | Description | Default | Required |
@@ -38,8 +40,10 @@ Create a template: every service (an app, what `projects` manages), the database
 | `--standalone` | Create a one-service template without a project (group); the default for one service | - | No |
 | `--name <service=name...>` | Name a created service; a one-service template also takes a bare name | - | No |
 | `--env <[service:]KEY=VALUE...>` | Set a variable; prefix the service when the template cannot tell | - | No |
-| `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored) | - | No |
-| `--database <type=new|type=new:name|type=id...>` | Create or link each database the template needs (default: create) | - | No |
+| `--secret <[service:]KEY=VALUE...>` | Set a secret variable (write-only once stored); the value is visible in shell history, so prefer --secret-file | - | No |
+| `--secret-file <[service:]KEY=PATH...>` | Set a secret variable from a file, byte-for-byte (PATH - reads stdin) | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline from each --secret-file value | - | No |
+| `--database <type=new\|type=new:name\|type=id...>` | Create or link each database the template needs (default: create) | - | No |
 | `--fork-connection <id>` | Starters only: copy the code into a new repository on this git connection | - | No |
 | `--repo-name <name>` | Name of the new repository (with --fork-connection) | - | No |
 | `--repo-owner <owner>` | Account or organization for the new repository | - | No |
@@ -53,6 +57,8 @@ Create a template: every service (an app, what `projects` manages), the database
 ### `templates validate`
 
 Validate a Temps-native template YAML file or directory offline
+
+**Usage:** `templates validate <path> [options]`
 
 **Options:**
 

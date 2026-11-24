@@ -8,11 +8,12 @@ use std::sync::Arc;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use temps_core::templates::TemplateService;
+use temps_presets::templates::TemplateService;
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::services::custom_domains::CustomDomainService;
+use crate::services::data_purge::{ProjectDataPurgeConfig, ProjectDataPurger};
 use crate::services::operations::OperationsService;
 use crate::services::project::ProjectService;
 
@@ -52,6 +53,15 @@ impl TempsPlugin for ProjectsPlugin {
                 context.require_service::<temps_environments::EnvironmentService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
+            // Removes deleted projects' telemetry in the background; the
+            // project delete only records what to purge. Several control
+            // planes may run it: each purge is leased to one worker at a time.
+            Arc::new(ProjectDataPurger::new(
+                db.clone(),
+                ProjectDataPurgeConfig::default(),
+            ))
+            .spawn(queue_service.clone());
+
             // Create ProjectService
             let project_service = Arc::new(ProjectService::new(
                 db.clone(),
@@ -62,7 +72,16 @@ impl TempsPlugin for ProjectsPlugin {
                 environment_service,
                 encryption_service,
             ));
+            if let Some(slot) =
+                context.get_service::<temps_core::environment_address::EnvironmentAddressSlot>()
+            {
+                project_service.set_environment_addresses(slot);
+            }
             context.register_service(project_service);
+
+            // The list other plugins add their project deletion hooks to;
+            // whichever plugin registers first creates it.
+            temps_core::ProjectDeletionHooks::get_or_register(context);
 
             // Create CustomDomainService
             let custom_domain_service = Arc::new(CustomDomainService::new(db.clone()));
@@ -71,6 +90,23 @@ impl TempsPlugin for ProjectsPlugin {
             // Read-only operations feed for the console tray
             let operations_service = Arc::new(OperationsService::new(db.clone()));
             context.register_service(operations_service);
+
+            // Which Linux capabilities a project's containers get back
+            let container_security_service = Arc::new(
+                crate::services::container_security::ContainerSecurityService::new(db.clone()),
+            );
+            context.register_service(container_security_service);
+
+            // How a project's builds coordinate with identical builds (ADR 114)
+            let identical_build_settings_service = Arc::new(
+                crate::services::identical_builds::IdenticalBuildSettingsService::new(db.clone()),
+            );
+            context.register_service(identical_build_settings_service);
+
+            // Where apps send telemetry, for the framework-agnostic setup
+            let ingest_setup_service =
+                Arc::new(crate::services::IngestSetupService::new(db.clone()));
+            context.register_service(ingest_setup_service);
 
             tracing::debug!("Projects plugin services registered successfully");
             Ok(())
@@ -96,6 +132,8 @@ impl TempsPlugin for ProjectsPlugin {
             });
         let project_archive_cleaner =
             context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
+        let project_image_cleaner =
+            context.require_service::<dyn temps_core::ProjectImageCleaner>();
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -115,6 +153,28 @@ impl TempsPlugin for ProjectsPlugin {
         // final policy implementation is guaranteed to be registered.
         let sensitive_action_authorizer =
             context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+        let ingest_setup_state = Arc::new(crate::handlers::ingest_setup::IngestSetupAppState {
+            ingest_setup_service: context.require_service::<crate::services::IngestSetupService>(),
+            config_service: config_service.clone(),
+            project_access_checker: project_access_checker.clone(),
+        });
+        let container_security_state = Arc::new(
+            crate::handlers::container_security::ContainerSecurityAppState {
+                container_security_service: context
+                    .require_service::<crate::services::container_security::ContainerSecurityService>(),
+                audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
+                sensitive_action_authorizer: sensitive_action_authorizer.clone(),
+            },
+        );
+        let identical_builds_state = Arc::new(
+            crate::handlers::identical_builds::IdenticalBuildsAppState {
+                identical_build_settings_service: context
+                    .require_service::<crate::services::identical_builds::IdenticalBuildSettingsService>(),
+                audit_service: audit_service.clone(),
+                project_access_checker: project_access_checker.clone(),
+            },
+        );
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
             external_service_manager,
@@ -126,16 +186,31 @@ impl TempsPlugin for ProjectsPlugin {
             config_service,
             public_hostname_resolver,
             project_archive_cleaner,
+            project_image_cleaner,
             telemetry,
             project_access_checker,
             sensitive_action_authorizer,
-            project_deletion_hook: context.get_service::<dyn temps_core::ProjectDeletionHook>(),
+            // Registered (possibly empty) by `register_services`, so always
+            // present; plugins add their hooks to the same list.
+            project_deletion_hooks: context.require_service::<temps_core::ProjectDeletionHooks>(),
         });
         let routes = crate::handlers::configure_routes()
             .with_state(app_state)
             .merge(
                 crate::handlers::operations::configure_operations_routes()
                     .with_state(operations_state),
+            )
+            .merge(
+                crate::handlers::ingest_setup::configure_ingest_setup_routes()
+                    .with_state(ingest_setup_state),
+            )
+            .merge(
+                crate::handlers::container_security::configure_container_security_routes()
+                    .with_state(container_security_state),
+            )
+            .merge(
+                crate::handlers::identical_builds::configure_identical_builds_routes()
+                    .with_state(identical_builds_state),
             );
         Some(PluginRoutes::new(routes))
     }

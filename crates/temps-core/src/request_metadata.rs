@@ -232,7 +232,20 @@ pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetada
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|connect_info| connect_info.0);
-    let ip_address = crate::resolve_client_ip(headers, peer);
+    let mut ip_address = crate::resolve_client_ip(headers, peer);
+
+    // A request replayed in-process on behalf of the AI assistant has no socket
+    // and no User-Agent. Record the human client that approved it and say, in
+    // the audit-visible user agent, that the assistant performed it. The marker
+    // is an extension, so it cannot be set from the wire.
+    let assistant_call = req
+        .extensions()
+        .get::<crate::ai_tool_call::AiToolCall>()
+        .is_some();
+    let assistant_origin = req.extensions().get::<crate::ai_tool_call::AiToolOrigin>();
+    if let Some(origin) = assistant_origin {
+        ip_address = origin.ip_address.clone();
+    }
 
     let visitor_id_cookie = extract_encrypted_cookie(headers, VISITOR_ID_COOKIE_NAME, crypto);
     // Decrypt the session cookie then normalise from the v2 payload format
@@ -266,11 +279,15 @@ pub fn build_from_request(req: &Request, crypto: &CookieCrypto) -> RequestMetada
 
     RequestMetadata {
         ip_address,
-        user_agent: headers
-            .get("user-agent")
-            .and_then(|h| h.to_str().ok())
-            .unwrap_or("unknown")
-            .to_string(),
+        user_agent: if assistant_call {
+            crate::ai_tool_call::assistant_user_agent(assistant_origin)
+        } else {
+            headers
+                .get("user-agent")
+                .and_then(|h| h.to_str().ok())
+                .unwrap_or("unknown")
+                .to_string()
+        },
         headers: headers.clone(),
         visitor_id_cookie,
         session_id_cookie,
@@ -511,6 +528,44 @@ mod tests {
             .body(Body::empty())
             .unwrap();
         assert_eq!(build_from_request(&req, &crypto).ip_address, "unknown");
+    }
+
+    /// An in-process request replayed for the AI assistant must be recorded as
+    /// such: the approver's address and client are kept and the assistant is
+    /// named, so an audit entry reads as "done from the assistant".
+    #[test]
+    fn assistant_requests_record_the_approver_and_the_assistant_label() {
+        use crate::ai_tool_call::{AiToolCall, AiToolOrigin};
+
+        let crypto = test_crypto();
+        let mut req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AiToolCall);
+        req.extensions_mut().insert(AiToolOrigin {
+            chat_id: None,
+            agent_name: None,
+            ip_address: "203.0.113.7".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+        });
+        let metadata = build_from_request(&req, &crypto);
+        assert_eq!(metadata.ip_address, "203.0.113.7");
+        assert_eq!(metadata.user_agent, "Mozilla/5.0 (via Temps AI assistant)");
+
+        // Marker without an origin still labels the request.
+        let mut req = HttpRequest::builder().uri("/").body(Body::empty()).unwrap();
+        req.extensions_mut().insert(AiToolCall);
+        let metadata = build_from_request(&req, &crypto);
+        assert!(metadata.user_agent.contains("via Temps AI assistant"));
+
+        // Only the in-process marker triggers the label; a wire request is
+        // recorded exactly as sent.
+        let req = HttpRequest::builder()
+            .uri("/")
+            .header("user-agent", "curl/8 (via Temps AI assistant)")
+            .body(Body::empty())
+            .unwrap();
+        let metadata = build_from_request(&req, &crypto);
+        assert_eq!(metadata.user_agent, "curl/8 (via Temps AI assistant)");
+        assert_eq!(metadata.ip_address, "unknown");
     }
 
     #[tokio::test]

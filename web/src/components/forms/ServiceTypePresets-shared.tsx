@@ -3,6 +3,7 @@
 
 import {
   DEFAULT_GARAGE_IMAGE,
+  DEFAULT_REDIS_IMAGE,
   DEFAULT_RUSTFS_IMAGE,
 } from '@/lib/service-images'
 import {
@@ -219,7 +220,7 @@ export function usePostgresPreset(): PresetState {
 // PITR is not implemented for Redis; restore is always LATEST.
 // -----------------------------------------------------------------------------
 
-export const REDIS_MANAGED_IMAGE = 'gotempsh/redis-walg:8-bookworm'
+export const REDIS_MANAGED_IMAGE = DEFAULT_REDIS_IMAGE
 
 export const REDIS_OPTIONS: PresetOption[] = [
   {

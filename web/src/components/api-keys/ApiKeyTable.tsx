@@ -134,6 +134,12 @@ function PermissionsDisplay({ apiKey }: { apiKey: ApiKeyResponse }) {
   )
 }
 
+function scopeLabel(key: ApiKeyResponse) {
+  return key.project_id
+    ? `Project #${key.project_id} · ${key.environment_id ? `Environment #${key.environment_id}` : 'All environments'}`
+    : 'Account-wide'
+}
+
 export function ApiKeyTable({
   apiKeys,
   isLoading,
@@ -176,7 +182,7 @@ export function ApiKeyTable({
             resources
           </p>
         </div>
-        <Button onClick={onCreateClick}>Create Your First API Key</Button>
+        <Button onClick={onCreateClick}>Create your first API key</Button>
       </div>
     )
   }
@@ -185,18 +191,23 @@ export function ApiKeyTable({
     {
       key: 'name',
       header: 'Name',
+      className: 'whitespace-normal [overflow-wrap:anywhere]',
       render: (key) => (
         <button
           onClick={() => onView(key)}
           className="hover:underline cursor-pointer text-left font-medium"
         >
           {key.name}
+          <span className="block @3xl:hidden text-xs font-normal text-muted-foreground">
+            {scopeLabel(key)}
+          </span>
         </button>
       ),
     },
     {
       key: 'key_prefix',
       header: 'Key Prefix',
+      className: 'hidden @5xl:table-cell',
       render: (key) => (
         <code className="text-xs bg-muted px-1 py-0.5 rounded">
           {key.key_prefix}...
@@ -206,7 +217,24 @@ export function ApiKeyTable({
     {
       key: 'permissions',
       header: 'Access Level',
+      className: 'hidden @xl:table-cell',
       render: (key) => <PermissionsDisplay apiKey={key} />,
+    },
+    {
+      key: 'project_id',
+      header: 'Scope',
+      className: 'hidden @3xl:table-cell',
+      render: (key) =>
+        key.project_id ? (
+          <span className="text-xs">
+            Project #{key.project_id}
+            {key.environment_id
+              ? ` · Environment #${key.environment_id}`
+              : ' · All environments'}
+          </span>
+        ) : (
+          'Account-wide'
+        ),
     },
     {
       key: 'status',
@@ -220,11 +248,13 @@ export function ApiKeyTable({
     {
       key: 'created_at',
       header: 'Created',
+      className: 'hidden @7xl:table-cell',
       render: (key) => format(new Date(key.created_at), 'MMM d, yyyy'),
     },
     {
       key: 'last_used_at',
       header: 'Last Used',
+      className: 'hidden @7xl:table-cell',
       render: (key) =>
         key.last_used_at
           ? format(new Date(key.last_used_at), 'MMM d, yyyy HH:mm')
@@ -233,6 +263,7 @@ export function ApiKeyTable({
     {
       key: 'expires_at',
       header: 'Expires',
+      className: 'hidden @5xl:table-cell',
       render: (key) =>
         key.expires_at ? (
           <span

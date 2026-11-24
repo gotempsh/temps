@@ -22,10 +22,11 @@ distributed/HA features without provisioning real servers.
 │                                                   │
 └───────────────────────────────────────────────────┘
 
-Allocator carves /24s from 172.20.0.0/16 → one per worker:
-  worker-1 → 172.20.0.0/24
-  worker-2 → 172.20.1.0/24
-  worker-3 → 172.20.2.0/24
+Allocator carves /24s from 10.202.0.0/16 (the default pool for new
+clusters; ADR 056) → one per worker:
+  worker-1 → 10.202.0.0/24
+  worker-2 → 10.202.1.0/24
+  worker-3 → 10.202.2.0/24
 
 Cross-node container traffic flows over a VXLAN tunnel pinned to the
 underlay IPs above. Within-node traffic uses the unchanged
@@ -166,12 +167,12 @@ After `./dev-cluster up`:
 # Open a shell on worker-1, deploy a container on the per-node bridge,
 # then confirm worker-2 can reach it via the overlay IP.
 ./dev-cluster shell worker-1
-docker run -d --rm --name target --network temps-overlay --ip 172.20.0.50 nginx:alpine
+docker run -d --rm --name target --network temps-overlay --ip 10.202.0.50 nginx:alpine
 exit
 
 ./dev-cluster shell worker-2
-docker run --rm --network temps-overlay --ip 172.20.1.50 alpine sh -c \
-    'apk add -q curl && curl -sf http://172.20.0.50/ | head -c80'
+docker run --rm --network temps-overlay --ip 10.202.1.50 alpine sh -c \
+    'apk add -q curl && curl -sf http://10.202.0.50/ | head -c80'
 # → "<!DOCTYPE html>..." means the overlay is working
 ```
 
@@ -204,23 +205,26 @@ key conflict (clear with `./dev-cluster reset`).
 **`compute_cidr` is NULL on a worker after registering.** The
 auto-allocator ran but failed (most likely pool exhausted). Check
 `./dev-cluster logs control-plane` for the allocator warning. Each
-worker gets a /24 from `172.20.0.0/16`, so there's room for 256 of
+worker gets a /24 from `10.202.0.0/16`, so there's room for 256 of
 them — exhaustion shouldn't happen here.
 
-**"compute pool 172.20.0.0/16 overlaps host route ... on device
-'br-\<hash\>'".** A Docker-allocated bridge inside the node landed on the
-cluster compute pool, so `temps network setup-multi-node` refuses to
-enable the overlay rather than build routes it cannot honour. Docker's
-built-in default address pool is `172.17.0.0/12`, so auto-allocated
-bridges climb 172.18, 172.19, 172.20 ... and collide once a node has a
-few of them (this node creates three at boot). `entrypoint.sh` pins the
-inner daemon (`--bip` plus `--default-address-pool`) so every
-auto-allocated bridge stays inside `10.98.0.0/24` + `10.99.0.0/16`,
-disjoint from the compute pool, from both cluster underlays, and from
-the outer daemon's own `172.16.0.0/12` defaults. On a node that
-entrypoint does not
-manage, either apply the same daemon pins or move the cluster pool with
-`temps network setup-multi-node --compute-pool-cidr <cidr>`.
+**"overlay subnet ... overlaps host route ... on device 'br-\<hash\>'"**
+(or "... overlaps ... used by Docker network ..."). A network the node
+already has covers a subnet the overlay routes there: the node's own /24
+or a peer's. Only those subnets are checked, not the whole pool (ADR 056),
+and the node keeps running its deployments without cross-node
+networking. The console shows the cause on the Worker Nodes page; if the
+node never brought its overlay up, the control plane moves its /24 off
+the colliding range automatically once the agent reports it. Clusters
+created before ADR 056 default to `172.20.0.0/16`, inside Docker's own
+default address pool (`172.17.0.0/12`), where auto-allocated bridges climb
+172.18, 172.19, 172.20 ... `entrypoint.sh` pins the inner daemon (`--bip`
+plus `--default-address-pool`) so every auto-allocated bridge stays inside
+`10.98.0.0/24` + `10.99.0.0/16`, disjoint from the compute pool, from both
+cluster underlays, and from the outer daemon's own `172.16.0.0/12`
+defaults. Elsewhere, move the network on the node, or change the cluster
+pool while no node uses it (Worker Nodes -> Cluster network, or
+`temps network setup-multi-node --compute-pool-cidr <cidr>`).
 
 **Cross-node ping fails.** Run `./dev-cluster status` to see the
 overlay state on every worker. If the bridge or vxlan device is

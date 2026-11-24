@@ -159,7 +159,7 @@ pub async fn run_domain_backfill(
         ProgressStyle::with_template(
             "  {bar:40.cyan/blue} {pos:>10}/{len:<10} {percent:>3}%  ETA {eta_precise}  {msg}",
         )
-        .expect("valid progress template")
+        .map_err(|e| anyhow::anyhow!("invalid progress bar template: {e}"))?
         .progress_chars("█▓░"),
     );
 
@@ -510,6 +510,10 @@ mod proxy_logs {
         response_headers: Option<String>,
         trace_id: Option<String>,
         error_group_id: Option<i32>,
+        shield_verdict: Option<String>,
+        shield_reasons: Option<serde_json::Value>,
+        ja4: Option<String>,
+        ja4_source: Option<String>,
     }
 
     const SELECT: &str = "SELECT \
@@ -519,7 +523,7 @@ mod proxy_logs {
         client_ip, user_agent, referrer, request_id, ip_geolocation_id, browser, browser_version, \
         operating_system, device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
         cache_status, request_headers::text AS request_headers, response_headers::text AS response_headers, \
-        trace_id, error_group_id \
+        trace_id, error_group_id, shield_verdict, shield_reasons, ja4, ja4_source \
         FROM proxy_logs \
         WHERE timestamp >= $1 AND timestamp <= $2 \
           AND (timestamp, id) > ($3, $4) \
@@ -569,6 +573,12 @@ mod proxy_logs {
             // Source timestamp ms as the dedup version — stable across re-runs.
             _version: ms as u64,
             retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
+            shield_verdict: r.shield_verdict.clone().unwrap_or_default(),
+            shield_reasons: temps_proxy::service::proxy_log_service::shield_reasons_from_json(
+                r.shield_reasons.clone(),
+            ),
+            ja4: r.ja4.clone().unwrap_or_default(),
+            ja4_source: r.ja4_source.clone().unwrap_or_default(),
         }
     }
 
@@ -615,7 +625,7 @@ mod proxy_logs {
             }
             inserter.end().await.context("ClickHouse proxy_logs end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.timestamp;
             last_id = last.id;
             copied += rows.len() as u64;
@@ -761,7 +771,7 @@ mod traces {
             }
             inserter.end().await.context("ClickHouse spans end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.start_time;
             last_id = last.id;
             copied += rows.len() as u64;
@@ -1018,7 +1028,7 @@ mod trace_refs {
                 .await
                 .context("ClickHouse cross_project_trace_refs end")?;
 
-            let last = rows.last().expect("non-empty");
+            let Some(last) = rows.last() else { break };
             last_ts = last.first_seen;
             last_trace_id = last.trace_id.clone();
             last_project_id = last.project_id;

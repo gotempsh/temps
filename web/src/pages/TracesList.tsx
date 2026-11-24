@@ -1,18 +1,14 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { useEnvironmentFilter } from '@/components/project-frame/use-environment-filter'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
 import { PageHeader } from '@/components/layout/PageContainer'
 
 import { TimeRangeFilter } from '@/components/ui/time-range-filter'
 
+import { ProjectResponse, SpanStatusCode, TraceSummary } from '@/api/client'
 import {
-  EnvironmentResponse,
-  ProjectResponse,
-  SpanStatusCode,
-  TraceSummary,
-} from '@/api/client'
-import {
-  getEnvironmentsOptions,
   getProjectDeploymentsOptions,
   hasTracesOptions,
   queryTraceSummariesOptions,
@@ -29,6 +25,7 @@ import {
 } from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 import { useAttributeFilter } from '@/hooks/useAttributeFilter'
 import { attributesQueryValue } from '@/lib/attribute-facets'
 import {
@@ -67,6 +64,7 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  Code2,
   FileCode,
   Gauge,
   Loader2,
@@ -76,8 +74,13 @@ import {
   Terminal,
   Workflow,
 } from 'lucide-react'
+import { PlainHttpSetup } from '@/components/project/setup/PlainHttpSetup'
+import {
+  ExternalOtelEnvBlock,
+  ProjectWideOtlpNote,
+} from '@/components/project/setup/TracesSetupParts'
 import { ReactElement, useCallback, useEffect, useMemo, useState } from 'react'
-import { useNavigate, useSearchParams } from 'react-router'
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
@@ -403,29 +406,10 @@ function OtelSetupSection({
 }) {
   const navigate = useNavigate()
   const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
-  const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] =
     useState<string>('nextjs')
-
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
-
-  const effectiveSelectedEnvId =
-    selectedEnvId || (environments?.[0] ? String(environments[0].id) : '')
-
-  const selectedEnv = useMemo(
-    () => environments?.find((e) => String(e.id) === effectiveSelectedEnvId),
-    [environments, effectiveSelectedEnvId]
-  )
-
-  const baseUrl = window.location.origin
-  const otlpEndpoint = selectedEnv
-    ? `${baseUrl}/api/otel/v1/${project.id}/${selectedEnv.id}/0`
-    : `${baseUrl}/api/otel/v1/${project.id}/0/0`
+  // The framework-agnostic option: any OpenTelemetry SDK or the Collector.
+  const [plainHttp, setPlainHttp] = useState(false)
 
   const preset =
     frameworkPresets.find((f) => f.id === selectedFrameworkId) ??
@@ -434,13 +418,6 @@ function OtelSetupSection({
   const setupCode = preset.setupCode
     .split('__SERVICE_NAME__')
     .join(project.name)
-
-  const envVarsCode = `# Auto-injected on Temps deployments.
-# Set these manually when running on Vercel, Fly, AWS, bare metal, etc.
-OTEL_EXPORTER_OTLP_ENDPOINT=${otlpEndpoint}
-OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
-OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <YOUR_API_KEY>
-OTEL_SERVICE_NAME=${project.name}`
 
   const { data: waitingProbe } = useQuery({
     ...hasTracesOptions({ path: { project_id: project.id } }),
@@ -469,7 +446,7 @@ OTEL_SERVICE_NAME=${project.name}`
   return (
     <div id="traces-setup">
       <SetupWizardShell
-        title="Setup OpenTelemetry"
+        title="Set up OpenTelemetry"
         description="Pick your framework — the snippet and endpoint are pre-filled for this service. Apps deployed on Temps get these env vars automatically."
         currentStep={wizardStep}
         steps={steps}
@@ -489,12 +466,15 @@ OTEL_SERVICE_NAME=${project.name}`
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
               {frameworkPresets.map((fw) => {
                 const Icon = fw.icon
-                const isSelected = selectedFrameworkId === fw.id
+                const isSelected = selectedFrameworkId === fw.id && !plainHttp
                 return (
                   <button
                     key={fw.id}
                     type="button"
-                    onClick={() => setSelectedFrameworkId(fw.id)}
+                    onClick={() => {
+                      setSelectedFrameworkId(fw.id)
+                      setPlainHttp(false)
+                    }}
                     className={cn(
                       'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
                       isSelected &&
@@ -519,6 +499,31 @@ OTEL_SERVICE_NAME=${project.name}`
                   </button>
                 )
               })}
+              <button
+                type="button"
+                onClick={() => setPlainHttp(true)}
+                className={cn(
+                  'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
+                  plainHttp &&
+                    'border-primary bg-primary/5 ring-2 ring-primary/20'
+                )}
+                aria-pressed={plainHttp}
+              >
+                <div className="rounded-md bg-muted p-2 text-foreground shrink-0">
+                  <Code2 className="size-5" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium leading-none truncate">
+                    Any language or framework
+                  </p>
+                  <p className="mt-1 text-xs text-muted-foreground truncate">
+                    Any OpenTelemetry SDK or the Collector
+                  </p>
+                </div>
+                {plainHttp && (
+                  <Check className="size-4 shrink-0 text-primary" />
+                )}
+              </button>
             </div>
 
             <div className="flex justify-end">
@@ -530,7 +535,28 @@ OTEL_SERVICE_NAME=${project.name}`
           </div>
         )}
 
-        {wizardStep === 'install' && (
+        {wizardStep === 'install' && plainHttp && (
+          <div className="space-y-6">
+            <ProjectWideOtlpNote />
+            <PlainHttpSetup project={project} signal="traces" />
+            <PlainHttpSetup project={project} signal="logs" />
+            <div className="flex items-center justify-between gap-3">
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('framework')}
+              >
+                <ArrowLeft className="mr-2 size-4" />
+                Back
+              </Button>
+              <Button onClick={() => setWizardStep('waiting')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {wizardStep === 'install' && !plainHttp && (
           <div className="space-y-6">
             <div className="flex items-center gap-3 rounded-lg border bg-card p-4">
               <div className="rounded-md bg-muted p-2">
@@ -594,31 +620,21 @@ OTEL_SERVICE_NAME=${project.name}`
                 Skip this if you deploy on Temps. Required when running the app
                 on Vercel, Fly, AWS, bare metal, etc.
               </p>
-              <div className="flex items-center gap-3">
-                <span className="text-xs text-muted-foreground shrink-0">
-                  Environment:
-                </span>
-                <Select
-                  value={effectiveSelectedEnvId}
-                  onValueChange={setSelectedEnvId}
-                >
-                  <SelectTrigger className="w-[200px] h-8">
-                    <SelectValue placeholder="Select environment" />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {environments?.map((env: EnvironmentResponse) => (
-                      <SelectItem key={env.id} value={String(env.id)}>
-                        {env.name}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </div>
-              <CodeBlock code={envVarsCode} language="bash" title=".env" />
+              <ProjectWideOtlpNote />
+              <ExternalOtelEnvBlock
+                projectId={project.id}
+                serviceName={project.name}
+              />
               <p className="text-xs text-muted-foreground">
-                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
+                Set <code>TEMPS_API_KEY</code> to a Temps API key (
                 <code>tk_...</code>) from{' '}
-                <strong>Settings &rarr; API Keys</strong>.
+                <Link
+                  className="underline underline-offset-4"
+                  to={`/settings/keys/new?name=${project.slug}-telemetry`}
+                >
+                  API keys
+                </Link>
+                . Keep it server-side.
               </p>
             </div>
 
@@ -730,9 +746,10 @@ export default function TracesList({ project }: TracesListProps) {
   // Debounce the free-text filters so we don't fire a query on every keystroke.
   const debouncedSearch = useDebounce(search, 300)
   const debouncedNamePattern = useDebounce(namePattern, 300)
-  const [environmentId, setEnvironmentId] = useState(
-    () => searchParams.get('env') || 'all'
-  )
+  // The project bar picks the environment (and owns `?env=`).
+  const [environmentFilter] = useEnvironmentFilter()
+  const environmentId =
+    environmentFilter === undefined ? 'all' : String(environmentFilter)
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
@@ -753,6 +770,14 @@ export default function TracesList({ project }: TracesListProps) {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
   })
+  // A deployment belongs to one environment: when the bar picks another,
+  // start over, as the page's own picker used to.
+  const [listedEnvironment, setListedEnvironment] = useState(environmentId)
+  if (listedEnvironment !== environmentId) {
+    setListedEnvironment(environmentId)
+    setDeploymentId('all')
+    setPage(1)
+  }
   // Server-side sort. Old `sort=none` links still resolve to the backend's
   // default order, while header clicks use the standard two-direction cycle.
   const [sortBy, setSortBy] = useState<'start_time' | 'duration' | null>(() => {
@@ -763,6 +788,30 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc'
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Links elsewhere ("Configure telemetry", the logs and metrics empty states)
+  // point at `#traces-setup`. A service that already has traces hides the
+  // setup section, so arriving with that hash has to open it, not just try to
+  // scroll to an element that is not there.
+  // The scroll waits on its own flag, not on the hash: the filter sync below
+  // rewrites the URL without it, and that must not cancel the scroll.
+  const { hash } = useLocation()
+  const [seenHash, setSeenHash] = useState<string | null>(null)
+  const [scrollToSetup, setScrollToSetup] = useState(false)
+  if (hash !== seenHash) {
+    setSeenHash(hash)
+    if (hash === '#traces-setup') {
+      setShowSetup(true)
+      setScrollToSetup(true)
+    }
+  }
+  useEffect(() => {
+    if (!showSetup || !scrollToSetup) return
+    const frame = requestAnimationFrame(() => {
+      scrollToElementId('traces-setup', { behavior: 'smooth' })
+      setScrollToSetup(false)
+    })
+    return () => cancelAnimationFrame(frame)
+  }, [showSetup, scrollToSetup])
   // Bumped by Refresh so relative ranges recompute against "now". Without
   // this, start/end freeze at mount (or last range change) and newly ingested
   // traces that land after that frozen end_time stay invisible until a full
@@ -776,14 +825,6 @@ export default function TracesList({ project }: TracesListProps) {
     void refreshKey
     return computeTracesTimeWindow(timeRange)
   }, [timeRange, refreshKey])
-
-  // Fetch environments for the filter dropdown
-  const { data: environments } = useQuery({
-    ...getEnvironmentsOptions({
-      path: { project_id: project.id },
-    }),
-    enabled: !!project.id,
-  })
 
   // Registered facets are platform-global, so there is no project scoping.
   // Only a facet filters here; any other key gets the create-facet prompt.
@@ -817,31 +858,37 @@ export default function TracesList({ project }: TracesListProps) {
 
   const deployments = deploymentsData?.deployments
 
-  // Sync state to URL
+  // Sync state to URL, keeping the bar's `?env=`.
   useEffect(() => {
-    const params = new URLSearchParams()
-    if (timeRange !== '24h') params.set('range', timeRange)
-    if (serviceName) params.set('service', serviceName)
-    if (status !== 'all') params.set('status', status)
-    if (debouncedSearch) params.set('q', debouncedSearch)
-    if (debouncedNamePattern) params.set('name', debouncedNamePattern)
-    if (environmentId !== 'all') params.set('env', environmentId)
-    if (deploymentId !== 'all') params.set('deploy', deploymentId)
-    if (attrKey) params.set('attr_key', attrKey)
-    if (attrKey && debouncedAttrValue)
-      params.set('attr_value', debouncedAttrValue)
-    if (page > 1) params.set('page', page.toString())
-    if (sortBy === null) params.set('sort', 'none')
-    else if (sortBy !== 'start_time') params.set('sort', sortBy)
-    if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
-    setSearchParams(params, { replace: true })
+    setSearchParams(
+      (current) => {
+        const params = new URLSearchParams()
+        const environment = current.get(ENVIRONMENT_PARAM)
+        if (environment) params.set(ENVIRONMENT_PARAM, environment)
+        if (timeRange !== '24h') params.set('range', timeRange)
+        if (serviceName) params.set('service', serviceName)
+        if (status !== 'all') params.set('status', status)
+        if (debouncedSearch) params.set('q', debouncedSearch)
+        if (debouncedNamePattern) params.set('name', debouncedNamePattern)
+        if (deploymentId !== 'all') params.set('deploy', deploymentId)
+        if (attrKey) params.set('attr_key', attrKey)
+        if (attrKey && debouncedAttrValue)
+          params.set('attr_value', debouncedAttrValue)
+        if (page > 1) params.set('page', page.toString())
+        if (sortBy === null) params.set('sort', 'none')
+        else if (sortBy !== 'start_time') params.set('sort', sortBy)
+        if (sortBy !== null && sortOrder !== 'desc')
+          params.set('dir', sortOrder)
+        return params
+      },
+      { replace: true }
+    )
   }, [
     timeRange,
     serviceName,
     status,
     debouncedSearch,
     debouncedNamePattern,
-    environmentId,
     deploymentId,
     attrKey,
     debouncedAttrValue,
@@ -978,11 +1025,6 @@ export default function TracesList({ project }: TracesListProps) {
     setServiceName(v === '__all__' ? '' : v)
     setPage(1)
   }, [])
-  const handleEnvironmentChange = useCallback((v: string) => {
-    setEnvironmentId(v)
-    setDeploymentId('all') // Reset deployment when environment changes
-    setPage(1)
-  }, [])
   const handleDeploymentChange = useCallback((v: string) => {
     setDeploymentId(v)
     setPage(1)
@@ -1043,9 +1085,7 @@ export default function TracesList({ project }: TracesListProps) {
               onClick={() => {
                 setShowSetup((v) => !v)
                 requestAnimationFrame(() => {
-                  document
-                    .getElementById('traces-setup')
-                    ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                  scrollToElementId('traces-setup', { behavior: 'smooth' })
                 })
               }}
             >
@@ -1108,25 +1148,6 @@ export default function TracesList({ project }: TracesListProps) {
                     <SelectItem value="ERROR">Error</SelectItem>
                   </SelectContent>
                 </Select>
-
-                {environments && environments.length > 0 && (
-                  <Select
-                    value={environmentId}
-                    onValueChange={handleEnvironmentChange}
-                  >
-                    <SelectTrigger className="w-full sm:w-[180px]">
-                      <SelectValue placeholder="Environment" />
-                    </SelectTrigger>
-                    <SelectContent>
-                      <SelectItem value="all">All Environments</SelectItem>
-                      {environments.map((env: EnvironmentResponse) => (
-                        <SelectItem key={env.id} value={String(env.id)}>
-                          {env.name}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                )}
 
                 {deployments && deployments.length > 0 && (
                   <Select
@@ -1222,9 +1243,7 @@ export default function TracesList({ project }: TracesListProps) {
                     size="sm"
                     className="gap-2"
                     onClick={() => {
-                      document
-                        .getElementById('traces-setup')
-                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+                      scrollToElementId('traces-setup', { behavior: 'smooth' })
                     }}
                   >
                     <Settings2 className="h-3.5 w-3.5" />

@@ -311,3 +311,22 @@ export function chatPermissionLabel(option: ChatSelectOption): string {
       return option.name
   }
 }
+
+/**
+ * The runtime a conversation is stored with, as a selection. A turn sent with
+ * it changes nothing on the server, which is what the first turn of a chat
+ * that was just created or loaded must do.
+ */
+export function storedConversationRuntime(conversation: {
+  ai_provider: string
+  ai_model?: string | null
+  ai_thinking_level?: string | null
+  ai_permission_mode?: string | null
+}): ChatRuntimeSelection {
+  return {
+    providerId: conversation.ai_provider,
+    modelId: conversation.ai_model ?? null,
+    thinkingOptionId: conversation.ai_thinking_level ?? null,
+    permissionModeId: conversation.ai_permission_mode ?? null,
+  }
+}

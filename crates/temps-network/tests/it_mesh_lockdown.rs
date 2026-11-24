@@ -18,6 +18,15 @@
 //! only, and `TEMPS_RUN_DIND_TESTS=1`.
 
 #![cfg(all(feature = "integration_kernel", target_os = "linux"))]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test: reads fixture configuration from the environment"
+)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration test: a failed setup step should abort the test with its message"
+)]
 
 use ipnet::Ipv4Net;
 use temps_network::mesh::{ensure_lockdown, lockdown_state, LockdownState, MeshLockdown};
@@ -31,6 +40,7 @@ fn lockdown(node_api_port: Option<u16>, relay: bool) -> MeshLockdown {
         vxlan_port: 4789,
         mesh: "10.201.0.0/16".parse::<Ipv4Net>().unwrap(),
         node_api_port,
+        agent_api: None,
         relay,
     }
 }

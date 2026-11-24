@@ -8,6 +8,7 @@ import {
   getEmailOptions,
   getEmailQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { resendEmail } from '@/api/client'
 import { problemMessage } from '@/components/email/sharedUtils'
 import { client } from '@/api/client/client.gen'
@@ -150,7 +151,7 @@ function HtmlPreview({ html }: { html: string }) {
     <div className="border rounded-lg overflow-hidden bg-white">
       <iframe
         ref={iframeRef}
-        title="Email HTML Preview"
+        title="Email HTML preview"
         className="w-full border-0"
         style={{ height: `${iframeHeight}px` }}
         sandbox="allow-same-origin"
@@ -411,21 +412,18 @@ function EmailDetailContent({ email }: { email: EmailResponse }) {
             >
               <TabsList className="grid w-full grid-cols-2 sm:grid-cols-3 mb-4 h-auto">
                 {hasHtml && (
-                  <TabsTrigger value="preview" className="gap-2">
-                    <Eye className="h-4 w-4" />
+                  <TabsTrigger value="preview" icon={Eye}>
                     Preview
                   </TabsTrigger>
                 )}
                 {hasHtml && (
-                  <TabsTrigger value="html-source" className="gap-2">
-                    <Code className="h-4 w-4" />
-                    HTML Source
+                  <TabsTrigger value="html-source" icon={Code}>
+                    HTML source
                   </TabsTrigger>
                 )}
                 {hasText && (
-                  <TabsTrigger value="text" className="gap-2">
-                    <FileText className="h-4 w-4" />
-                    Plain Text
+                  <TabsTrigger value="text" icon={FileText}>
+                    Plain text
                   </TabsTrigger>
                 )}
               </TabsList>
@@ -545,16 +543,16 @@ export function EmailDetail() {
 
   useEffect(() => {
     setBreadcrumbs([
-      { label: 'Email', href: '/email?tab=emails' },
+      { label: 'Email', href: '/email' },
       { label: email?.subject || 'Email Details' },
     ])
   }, [setBreadcrumbs, email?.subject])
 
   const backAction = (
     <Button variant="ghost" size="sm" asChild>
-      <Link to="/email?tab=emails">
+      <Link to="/email">
         <ArrowLeft className="h-4 w-4 mr-2" />
-        Back to Emails
+        Back to email
       </Link>
     </Button>
   )
@@ -597,7 +595,13 @@ export function EmailDetail() {
       verdict={<Status tone={verdict.tone} label={verdict.label} />}
       actions={
         <>
-          {backAction}
+          <RefreshButton
+            queryKeys={[
+              getEmailQueryKey({ path: { id: email.id } }),
+              ['email-events', email.id],
+              ['email-tracking-links', email.id],
+            ]}
+          />
           {canResend(email) && (
             <Button
               variant="outline"

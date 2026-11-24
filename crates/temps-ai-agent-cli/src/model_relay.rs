@@ -12,6 +12,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use temps_core::crypto::constant_time_eq;
 
 use axum::body::{to_bytes, Body};
 use axum::extract::{DefaultBodyLimit, Path, State};
@@ -259,15 +260,13 @@ impl SandboxModelRelayService {
                 purpose: "chat.application.model_relay".to_string(),
                 reason: format!("could not initialize the sandbox model relay: {error}"),
             })?;
-        let compatible_client = temps_agents::ai_cli::openai_compatible::external_only_http_client(
-            None,
-        )
-        .map_err(|error| AiError::Provider {
-            purpose: "chat.application.model_relay".to_string(),
-            reason: format!(
-                "could not initialize the OpenAI-compatible model relay client: {error}"
-            ),
-        })?;
+        let compatible_client = temps_ai_cli::openai_compatible::external_only_http_client(None)
+            .map_err(|error| AiError::Provider {
+                purpose: "chat.application.model_relay".to_string(),
+                reason: format!(
+                    "could not initialize the OpenAI-compatible model relay client: {error}"
+                ),
+            })?;
         Ok(Self {
             client,
             compatible_client,
@@ -325,14 +324,12 @@ impl SandboxModelRelayService {
             SandboxProviderCredential::OpenAiCompatible { .. } => selected_model
                 .as_deref()
                 .map(|selection| {
-                    temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(
-                        selection,
-                    )
-                    .map(str::to_string)
-                    .map_err(|error| AiError::Provider {
-                        purpose: "chat.application.model_relay".to_string(),
-                        reason: error.to_string(),
-                    })
+                    temps_ai_cli::openai_compatible::upstream_model_from_selection(selection)
+                        .map(str::to_string)
+                        .map_err(|error| AiError::Provider {
+                            purpose: "chat.application.model_relay".to_string(),
+                            reason: error.to_string(),
+                        })
                 })
                 .transpose()?,
             _ => None,
@@ -343,7 +340,7 @@ impl SandboxModelRelayService {
                 SandboxProviderCredential::AnthropicApiKey(_) => Some("anthropic"),
                 SandboxProviderCredential::OpenAiApiKey(_) => Some("openai"),
                 SandboxProviderCredential::OpenAiCompatible { .. } => {
-                    Some(temps_agents::ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
+                    Some(temps_ai_cli::openai_compatible::OPENCODE_COMPATIBLE_PROVIDER_ID)
                 }
                 _ => None,
             }
@@ -848,7 +845,7 @@ fn resolve_opencode_model(
         SandboxProviderCredential::AnthropicApiKey(_) => "anthropic/",
         SandboxProviderCredential::OpenAiApiKey(_) => "openai/",
         SandboxProviderCredential::OpenAiCompatible { .. } => {
-            return temps_agents::ai_cli::openai_compatible::upstream_model_from_selection(model)
+            return temps_ai_cli::openai_compatible::upstream_model_from_selection(model)
                 .map(|_| model.to_string())
                 .map_err(|error| AiError::Provider {
                     purpose: "chat.application.model_relay".to_string(),
@@ -1005,15 +1002,18 @@ fn upstream_url(
 
 fn resolve_claude_model(selected_model: Option<&str>) -> Result<String, AiError> {
     let model = match selected_model.map(str::trim) {
-        None | Some("") | Some("default") | Some("sonnet") => "claude-sonnet-5",
-        Some("opus") => "claude-opus-5",
+        // Claude Code's aliases name a family; the relay pins the current
+        // model of it. A concrete `claude-*` id passes through, so a model
+        // released after this build is selectable without a Temps change.
+        None | Some("") | Some("default") | Some("sonnet") => "claude-sonnet-5-5",
+        Some("opus") => "claude-opus-5-5",
         // `[1m]` values are account-aware Claude CLI context selectors, not
         // Anthropic Messages API model identifiers. The CLI keeps the selector
         // for its launch; the relay pins the upstream body to the corresponding
         // existing concrete family.
-        Some("sonnet[1m]") => "claude-sonnet-5",
-        Some("opus[1m]") => "claude-opus-5",
-        Some("haiku") => "claude-haiku-4-5",
+        Some("sonnet[1m]") => "claude-sonnet-5-5",
+        Some("opus[1m]") => "claude-opus-5-5",
+        Some("haiku") => "claude-haiku-5-5",
         Some(model) if model.starts_with("claude-") => model,
         Some(model) => {
             return Err(AiError::Provider {
@@ -1206,18 +1206,6 @@ impl IntoResponse for RelayError {
         };
         (status, self.to_string()).into_response()
     }
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    if left.len() != right.len() {
-        return false;
-    }
-    left.iter()
-        .zip(right)
-        .fold(0_u8, |difference, (left, right)| {
-            difference | (left ^ right)
-        })
-        == 0
 }
 
 async fn relay_handler(
@@ -1611,15 +1599,27 @@ mod tests {
 
     #[test]
     fn relay_resolves_default_and_aliases_to_concrete_models() {
-        assert_eq!(resolve_claude_model(None).unwrap(), "claude-sonnet-5");
-        assert_eq!(resolve_claude_model(Some("opus")).unwrap(), "claude-opus-5");
+        assert_eq!(resolve_claude_model(None).unwrap(), "claude-sonnet-5-5");
+        assert_eq!(
+            resolve_claude_model(Some("opus")).unwrap(),
+            "claude-opus-5-5"
+        );
+        assert_eq!(
+            resolve_claude_model(Some("haiku")).unwrap(),
+            "claude-haiku-5-5"
+        );
         assert_eq!(
             resolve_claude_model(Some("opus[1m]")).unwrap(),
-            "claude-opus-5"
+            "claude-opus-5-5"
         );
         assert_eq!(
             resolve_claude_model(Some("sonnet[1m]")).unwrap(),
-            "claude-sonnet-5"
+            "claude-sonnet-5-5"
+        );
+        // A concrete id newer than this build is passed through unchanged.
+        assert_eq!(
+            resolve_claude_model(Some("claude-fable-5-2")).unwrap(),
+            "claude-fable-5-2"
         );
         assert!(resolve_claude_model(Some("unbounded-provider-model")).is_err());
     }
@@ -1627,8 +1627,8 @@ mod tests {
     #[test]
     fn claude_one_million_selector_never_reaches_the_upstream_model_field() {
         for (selector, concrete) in [
-            ("opus[1m]", "claude-opus-5"),
-            ("sonnet[1m]", "claude-sonnet-5"),
+            ("opus[1m]", "claude-opus-5-5"),
+            ("sonnet[1m]", "claude-sonnet-5-5"),
         ] {
             let selected = resolve_claude_model(Some(selector)).unwrap();
             let request = serde_json::json!({ "model": selector, "max_tokens": 1024 });

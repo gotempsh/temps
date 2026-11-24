@@ -11,7 +11,14 @@ import {
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { ServiceHealthBadge } from '@/components/storage/ServiceHealthCard'
+import { ServiceLogIngestionCard } from '@/components/storage/ServiceLogIngestionCard'
+import { Collapsible, CollapsibleContent } from '@/components/ui/collapsible'
+import {
+  LogIngestBudgetWarning,
+  SERVICE_LOG_SETTINGS_PARAM,
+} from '@/components/observability/LogIngestBudgetNotice'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -33,10 +40,11 @@ import {
   RefreshCw,
   ScrollText,
   Server,
+  Settings2,
 } from 'lucide-react'
 import type { DateRange } from 'react-day-picker'
 import { useCallback, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Link, useParams } from 'react-router'
+import { Link, useParams, useSearchParams } from 'react-router'
 import { useUrlSearchText } from '@temps-sdk/ds'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
@@ -131,6 +139,21 @@ export function ServiceLogs() {
   })
 
   const [text, setText] = useUrlSearchText('q')
+  // Log settings are a rarely changed knob, so they stay folded away on this
+  // page until asked for. Kept in the URL so a notice can deep-link to them.
+  const [searchParams, setSearchParams] = useSearchParams()
+  const settingsOpen =
+    searchParams.get('settings') === SERVICE_LOG_SETTINGS_PARAM
+  const setSettingsOpen = (open: boolean) =>
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev)
+        if (open) next.set('settings', SERVICE_LOG_SETTINGS_PARAM)
+        else next.delete('settings')
+        return next
+      },
+      { replace: true }
+    )
   const [activeLevels, setActiveLevels] = useState<LogLevel[]>([])
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
@@ -304,23 +327,22 @@ export function ServiceLogs() {
     <div className="flex-1 overflow-auto">
       <div className="p-4 space-y-6 md:p-6">
         {/* Header — mirrors ServiceDetail so the Logs view reads as one app. */}
-        <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div className="flex items-center gap-3">
-            <Button asChild variant="ghost" size="icon">
-              <Link to={`/storage/${id}`} aria-label="Back to service">
-                <ArrowLeft className="h-4 w-4" />
-              </Link>
-            </Button>
-            {svc ? (
-              <ServiceLogo service={svc.service_type} className="h-8 w-8" />
-            ) : (
-              <ScrollText className="h-8 w-8 text-muted-foreground" />
-            )}
-            <div className="flex flex-col gap-2">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-xl font-semibold sm:text-2xl">
-                  {svc?.name ?? id}
-                </h1>
+        <div className="flex items-start gap-3">
+          <Button asChild variant="ghost" size="icon">
+            <Link to={`/storage/${id}`} aria-label="Back to service">
+              <ArrowLeft className="h-4 w-4" />
+            </Link>
+          </Button>
+          {svc ? (
+            <ServiceLogo service={svc.service_type} className="h-8 w-8" />
+          ) : (
+            <ScrollText className="h-8 w-8 text-muted-foreground" />
+          )}
+          <PageHeader
+            className="min-w-0 flex-1"
+            title={svc?.name ?? id}
+            verdict={
+              <>
                 {svc ? (
                   <>
                     <Badge
@@ -351,49 +373,71 @@ export function ServiceLogs() {
                   <ScrollText className="h-3 w-3" />
                   Logs
                 </Badge>
-              </div>
-              {svc ? (
-                <p className="text-sm text-muted-foreground">
+              </>
+            }
+            description={
+              svc ? (
+                <>
                   Created <TimeAgo date={svc.created_at} />
-                </p>
-              ) : null}
-            </div>
-          </div>
-
-          {/* Same action row as the detail page; Monitoring/Browse Data link
-              back out, and Refresh replaces the kebab for this view. */}
-          <div className="flex items-center gap-2 self-start sm:self-auto flex-wrap">
-            {svc?.status === 'running' ? (
-              <Link to={`/storage/${id}/monitoring`}>
-                <Button variant="outline" size="sm" className="gap-2">
-                  <Server className="h-4 w-4" />
-                  <span className="max-sm:sr-only">Monitoring</span>
+                </>
+              ) : undefined
+            }
+            actions={
+              /* Same action row as the detail page; Monitoring/Browse data
+                 link back out, and Refresh replaces the kebab for this view. */
+              <>
+                {svc?.status === 'running' ? (
+                  <Link to={`/storage/${id}/monitoring`}>
+                    <Button variant="outline" size="sm" className="gap-2">
+                      <Server className="h-4 w-4" />
+                      <span className="max-sm:sr-only">Monitoring</span>
+                    </Button>
+                  </Link>
+                ) : null}
+                <Link to={`/storage/${id}/browse`}>
+                  <Button variant="outline" size="sm" className="gap-2">
+                    <Database className="h-4 w-4" />
+                    <span className="max-sm:sr-only">Browse data</span>
+                  </Button>
+                </Link>
+                <Button
+                  variant={settingsOpen ? 'secondary' : 'outline'}
+                  size="sm"
+                  className="gap-2"
+                  aria-expanded={settingsOpen}
+                  aria-controls="service-log-settings"
+                  onClick={() => setSettingsOpen(!settingsOpen)}
+                >
+                  <Settings2 className="h-4 w-4" />
+                  <span className="max-sm:sr-only">Log settings</span>
                 </Button>
-              </Link>
-            ) : null}
-            <Link to={`/storage/${id}/browse`}>
-              <Button variant="outline" size="sm" className="gap-2">
-                <Database className="h-4 w-4" />
-                <span className="max-sm:sr-only">Browse Data</span>
-              </Button>
-            </Link>
-            <Button
-              variant="outline"
-              size="sm"
-              className="gap-2"
-              onClick={() => {
-                setRangeAnchor(Date.now())
-                setRefreshKey((k) => k + 1)
-              }}
-              disabled={refreshing}
-            >
-              <RefreshCw
-                className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
-              />
-              <span className="max-sm:sr-only">Refresh</span>
-            </Button>
-          </div>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-2"
+                  onClick={() => {
+                    setRangeAnchor(Date.now())
+                    setRefreshKey((k) => k + 1)
+                  }}
+                  disabled={refreshing}
+                >
+                  <RefreshCw
+                    className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`}
+                  />
+                  <span className="max-sm:sr-only">Refresh</span>
+                </Button>
+              </>
+            }
+          />
         </div>
+
+        <Collapsible open={settingsOpen} onOpenChange={setSettingsOpen}>
+          <CollapsibleContent id="service-log-settings">
+            <ServiceLogIngestionCard serviceId={serviceId} />
+          </CollapsibleContent>
+        </Collapsible>
+
+        <LogIngestBudgetWarning scope={{ externalServiceId: serviceId }} />
 
         {/* Filter bar */}
         <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:flex-wrap">

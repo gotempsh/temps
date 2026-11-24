@@ -5,36 +5,40 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
+use crate::workflow::WorkflowBuilder;
+use crate::workflow::WorkflowCancellationProvider;
+use crate::workflow::WorkflowError;
+use crate::workflow_executor::JobTracker;
+use crate::workflow_executor::WorkflowExecutor;
 use chrono::Timelike;
 use futures::StreamExt;
 use sea_orm::{
     sea_query::Expr, ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
 };
 use std::sync::Arc;
-use temps_core::{
-    DockerHandle, Job, JobQueue, JobTracker, WorkflowBuilder, WorkflowCancellationProvider,
-    WorkflowError, WorkflowExecutor,
-};
+use temps_config::deployment_config::DeploymentConfigExt;
+use temps_core::{DockerHandle, Job, JobQueue};
 use temps_database::DbConnection;
 use temps_deployer::{static_deployer::StaticDeployer, ContainerDeployer, ImageBuilder};
+use temps_deployment_logs::LogService;
 use temps_entities::{deployment_jobs, deployments, environments, projects};
 use temps_error_tracking::services::SourceMapService;
 use temps_git::GitProviderManagerTrait;
-use temps_logs::LogService;
+use temps_presets::templates::TemplateProvenanceTelemetry;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
-    AgentSyncService, BuildImageJobBuilder, BuilderNodeResolver, ConfigureAgentsJobBuilder,
-    ConfigureCronsJobBuilder, ConfigureMetricAlertsJobBuilder, CronConfigService,
-    DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, MetricAlertConfigService, OffloadFallback,
-    PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage, VerifyLocalImageJob,
+    AgentSyncService, BuilderNodeResolver, CronConfigService, MetricAlertConfigService,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
-use crate::services::failure_classifier::{classify_failure_reason, FAILURE_CLASSIFIER_VERSION};
+use crate::services::failure_classifier::{
+    classify_failure_reason, compose_security_check, FAILURE_CLASSIFIER_VERSION,
+};
+
+mod job_registry;
 
 /// A lexically-last retained status used after a cleanup attempt fails.
 ///
@@ -46,6 +50,14 @@ const RETAINED_CLEANUP_RETRY_PREFIX: &str = "retained:zz-cleanup-retry:";
 
 fn retained_cleanup_retry_status() -> String {
     retained_cleanup_retry_status_at(chrono::Utc::now())
+}
+
+/// How a registered container is torn down.
+enum TeardownPath {
+    /// Started through the workload plane: retired by deleting its workload.
+    Plane(crate::services::plane_deployer::ReplicaWorkload),
+    /// A legacy container: stopped and removed by its node's deployer.
+    Deployer(Arc<dyn ContainerDeployer>),
 }
 
 fn retained_cleanup_retry_status_at(at: chrono::DateTime<chrono::Utc>) -> String {
@@ -135,6 +147,12 @@ fn deploy_failed_telemetry_event(
         .with("failure_stage", failure.stage.as_str())
         .with("failure_code", failure.code.as_str())
         .with("classifier_version", FAILURE_CLASSIFIER_VERSION)
+        // An additive property does not change stage/code matching semantics,
+        // so it does not increment the taxonomy's classifier_version.
+        .with_opt(
+            "compose_security_check",
+            compose_security_check(reason).map(|check| check.as_str()),
+        )
         .with_opt("source_type", source_type)
         .with_opt("preset", preset),
         template_slug.as_deref(),
@@ -216,25 +234,19 @@ async fn connect_build_node(
         .and_then(|value| value.get("_version"))
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0);
-    crate::cluster_ca::build_node_deployer(
-        &node.address,
-        token,
-        node.name.clone(),
-        config,
-        encryption,
-    )
-    .await
-    .map(|remote| {
-        remote
-            .with_build_limits(limits)
-            .with_build_limits_version(version)
-    })
-    .map_err(|error| {
-        format!(
-            "Cannot connect to build node '{}' (id={}): {error}",
-            node.name, node.id
-        )
-    })
+    crate::cluster_ca::build_node_deployer(node, token, config, encryption)
+        .await
+        .map(|remote| {
+            remote
+                .with_build_limits(limits)
+                .with_build_limits_version(version)
+        })
+        .map_err(|error| {
+            format!(
+                "Cannot connect to build node '{}' (id={}): {error}",
+                node.name, node.id
+            )
+        })
 }
 
 /// How long a per-architecture build candidate has to answer its health probe.
@@ -422,7 +434,7 @@ fn offload_build_candidate(
 /// and `target_labels`, each inheriting the project's when the environment
 /// does not set it. One resolver for the build, the pre-build placement check
 /// and the deploy, so all three reason about the same pool of nodes.
-fn resolve_placement_constraints(
+pub(crate) fn resolve_placement_constraints(
     environment_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
     project_config: Option<&temps_entities::deployment_config::DeploymentConfig>,
 ) -> (Option<Vec<i32>>, Option<serde_json::Value>) {
@@ -467,14 +479,25 @@ pub struct WorkflowExecutionService {
     /// capture never overlaps one of the same deployment.
     capture_guard: Arc<crate::jobs::DeploymentCaptureGuard>,
     docker_handle: Arc<DockerHandle>,
+    /// How long one container's stop and removal may take in a teardown. Always
+    /// `CONTAINER_TEARDOWN_TIMEOUT_SECS` outside tests, which shorten it.
+    container_teardown_timeout: std::time::Duration,
     source_map_service: OnceCell<Arc<SourceMapService>>,
     node_scheduler: OnceCell<Arc<crate::services::NodeScheduler>>,
+    /// ADR-055 Phase 5: the unified scheduler's inputs, for `shadow` and
+    /// `enforce` environments.
+    workload_placement: OnceCell<Arc<crate::services::WorkloadPlacementService>>,
+    /// The workload plane `enforce` environments start replicas through.
+    workload_plane: OnceCell<Arc<temps_workload_plane::WorkloadPlane>>,
     encryption_service: OnceCell<Arc<temps_core::EncryptionService>>,
     file_store: OnceCell<Arc<dyn temps_file_store::FileStore>>,
     /// Anonymous product telemetry reporter (late-bound, optional). Set via
     /// [`Self::set_telemetry`]; defaults to a no-op when unset so the deploy
     /// path never depends on telemetry being wired.
     telemetry: OnceCell<Arc<dyn temps_core::telemetry::TelemetryReporter>>,
+    /// ADR 068 D5: the deploy warning (late-bound, optional).
+    environment_addresses: OnceCell<Arc<temps_core::environment_address::EnvironmentAddressSlot>>,
+    workflow_control: OnceCell<Arc<dyn temps_core::WorkflowControl>>,
     /// Audit sink for deploy-path security events (late-bound, optional).
     ///
     /// Currently the ADR-045 "this deployment received the host Docker socket"
@@ -482,6 +505,13 @@ pub struct WorkflowExecutionService {
     /// auditing being wired, and a missing sink degrades to a log line rather
     /// than failing a deployment.
     audit_logger: OnceCell<Arc<dyn temps_core::AuditLogger>>,
+}
+
+/// The platform's stop grace period, for containers that never served traffic.
+fn default_stop_grace() -> std::time::Duration {
+    std::time::Duration::from_secs(
+        temps_config::deployment_config::resolve_stop_timeout_seconds(None),
+    )
 }
 
 impl WorkflowExecutionService {
@@ -517,11 +547,18 @@ impl WorkflowExecutionService {
             screenshot_service,
             capture_guard,
             docker_handle,
+            container_teardown_timeout: std::time::Duration::from_secs(
+                crate::jobs::mark_deployment_complete::CONTAINER_TEARDOWN_TIMEOUT_SECS,
+            ),
             source_map_service: OnceCell::new(),
             node_scheduler: OnceCell::new(),
+            workload_placement: OnceCell::new(),
+            workload_plane: OnceCell::new(),
             encryption_service: OnceCell::new(),
             file_store: OnceCell::new(),
             telemetry: OnceCell::new(),
+            environment_addresses: OnceCell::new(),
+            workflow_control: OnceCell::new(),
             audit_logger: OnceCell::new(),
         }
     }
@@ -536,6 +573,19 @@ impl WorkflowExecutionService {
         let _ = self.telemetry.set(reporter);
     }
 
+    /// Wire the ADR 068 D5 deploy warning.
+    /// Optional workflows plugin, resolved after every plugin registers.
+    pub fn set_workflow_control(&self, control: Arc<dyn temps_core::WorkflowControl>) {
+        let _ = self.workflow_control.set(control);
+    }
+
+    pub fn set_environment_addresses(
+        &self,
+        slot: Arc<temps_core::environment_address::EnvironmentAddressSlot>,
+    ) {
+        let _ = self.environment_addresses.set(slot);
+    }
+
     /// The telemetry reporter, or a no-op when none has been wired. Always safe
     /// to call `report()` on the result; it never blocks or fails.
     fn telemetry(&self) -> Arc<dyn temps_core::telemetry::TelemetryReporter> {
@@ -548,6 +598,19 @@ impl WorkflowExecutionService {
     /// Set the node scheduler for multi-node deployments
     pub fn set_node_scheduler(&self, scheduler: Arc<crate::services::NodeScheduler>) {
         let _ = self.node_scheduler.set(scheduler);
+    }
+
+    /// Set the placement service `shadow`/`enforce` deployments use.
+    pub fn set_workload_placement(
+        &self,
+        placement: Arc<crate::services::WorkloadPlacementService>,
+    ) {
+        let _ = self.workload_placement.set(placement);
+    }
+
+    /// Set the workload plane `enforce` deployments start replicas through.
+    pub fn set_workload_plane(&self, plane: Arc<temps_workload_plane::WorkloadPlane>) {
+        let _ = self.workload_plane.set(plane);
     }
 
     /// Set the encryption service for decrypting node tokens during remote deployments
@@ -1086,1943 +1149,20 @@ impl WorkflowExecutionService {
         environment: &environments::Model,
         deployment: &deployments::Model,
         db_job: &deployment_jobs::Model,
-    ) -> Result<Arc<dyn temps_core::WorkflowTask>, WorkflowExecutionError> {
+    ) -> Result<Arc<dyn crate::workflow::WorkflowTask>, WorkflowExecutionError> {
         debug!(
             "🔧 Creating job instance for: {} ({})",
             db_job.name, db_job.job_type
         );
 
-        match db_job.job_type.as_str() {
-            "DownloadRepoJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let repo_owner = config
-                    .get("repo_owner")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig("repo_owner missing".to_string())
-                    })?;
-
-                let repo_name = config
-                    .get("repo_name")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig("repo_name missing".to_string())
-                    })?;
-
-                // Check if this is a public repo
-                let is_public_repo = config
-                    .get("is_public_repo")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                // Get git_url for public repos
-                let git_url = config
-                    .get("git_url")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Get connection_id for private repos (optional for public repos)
-                let connection_id = config
-                    .get("git_provider_connection_id")
-                    .and_then(|v| v.as_i64())
-                    .map(|v| v as i32);
-
-                // Validate: public repos need git_url, private repos need connection_id
-                if is_public_repo && git_url.is_none() {
-                    return Err(WorkflowExecutionError::InvalidJobConfig(
-                        "git_url is required for public repositories".to_string(),
-                    ));
-                }
-                if !is_public_repo && connection_id.is_none() {
-                    return Err(WorkflowExecutionError::InvalidJobConfig(
-                        "git_provider_connection_id is required for private repositories"
-                            .to_string(),
-                    ));
-                }
-
-                // Get branch_ref from job config (set by workflow planner based on deployment)
-                // Fallback to project.main_branch if not specified
-                let branch_ref = config
-                    .get("branch_ref")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| deployment.branch_ref.clone().unwrap_or("main".to_string()));
-
-                // Get tag_ref from job config (for tag-based deployments)
-                let tag_ref = config
-                    .get("tag_ref")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // Get commit_sha from job config (for specific commit
-                // deployments). An empty string is "no commit", never a ref —
-                // older deployments stored '' for manual triggers.
-                let commit_sha = config
-                    .get("commit_sha")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| is_concrete_commit_ref(s))
-                    .map(|s| s.to_string());
-
-                let mut builder = DownloadRepoBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .repo_owner(repo_owner.to_string())
-                    .repo_name(repo_name.to_string())
-                    .is_public_repo(is_public_repo)
-                    .branch_ref(branch_ref)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .db(self.db.clone());
-
-                // Add git_url for public repos
-                if let Some(url) = git_url {
-                    builder = builder.git_url(url);
-                }
-
-                // Add connection_id for private repos
-                if let Some(id) = connection_id {
-                    builder = builder.git_provider_connection_id(id);
-                }
-
-                // Add tag_ref if present (highest priority in checkout)
-                if let Some(tag) = tag_ref {
-                    builder = builder.tag_ref(tag);
-                }
-
-                // Add commit_sha if present (second priority in checkout)
-                if let Some(commit) = commit_sha {
-                    builder = builder.commit_sha(commit);
-                }
-
-                if let Some(directory) = config.get("directory").and_then(|v| v.as_str()) {
-                    builder = builder.project_directory(directory.to_string());
-                }
-                if config
-                    .get("pull_only_root_directory")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false)
-                {
-                    builder = builder.pull_only_root_directory(true);
-                }
-
-                let job = builder.build(self.git_provider.clone())?;
-
-                Ok(Arc::new(job))
-            }
-
-            "BuildImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let dockerfile_path = config
-                    .get("dockerfile_path")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("Dockerfile");
-
-                // Get dependencies to find the download job
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let download_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "download_repo".to_string());
-
-                // Fetch deployment to get its URL for naming
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                let image_tag = format!("{}:latest", deployment.slug);
-
-                // Route implicit Docker Hub base images through the
-                // operator's configured registry mirror/prefix, if any.
-                // Falls back to unconfigured (no rewriting) rather than
-                // failing the build if settings can't be read -- the
-                // existing anonymous-pull behavior is always a safe default.
-                let registry_mirror_prefix = self
-                    .config_service
-                    .get_settings()
-                    .await
-                    .ok()
-                    .and_then(|settings| settings.registry_mirror_prefix);
-
-                // Same source of truth as placement: a control-plane profile
-                // must select a remote builder before constructing the job.
-                let local_workloads_enabled = self
-                    .node_scheduler
-                    .get()
-                    .map(|scheduler| scheduler.local_workloads_enabled())
-                    .unwrap_or(true);
-
-                let mut builder = BuildImageJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .image_tag(image_tag)
-                    .dockerfile_path(dockerfile_path.to_string())
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .registry_mirror_prefix(registry_mirror_prefix)
-                    .local_workloads_enabled(local_workloads_enabled);
-
-                builder = builder
-                    .preset(project.preset)
-                    .preset_config(project.preset_config.clone());
-
-                // Unseal build args from job_config. The planner derives build
-                // args from env vars and stores them encrypted (build_args
-                // contain everything env vars contain, including any value
-                // marked secret — they leak into `docker history` if dumped
-                // in plaintext).
-                let enc_for_build_args = self.encryption_service.get();
-                let build_args_map = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    enc_for_build_args,
-                    "build_args",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-                // Worker builds cannot receive registry credentials, so a
-                // build that needs them stays on the control plane.
-                let needs_npm_credentials =
-                    crate::jobs::npmrc::plan_npmrc(&build_args_map).is_some();
-                // Names whose values may be sent to a worker build (names
-                // only, plaintext). A job planned before the field existed
-                // has none: a worker then receives no value at all.
-                let worker_build_arg_keys: std::collections::BTreeSet<String> = config
-                    .get(crate::services::workflow_planner::WORKER_BUILD_ARG_KEYS_FIELD)
-                    .and_then(|value| value.as_array())
-                    .map(|keys| {
-                        keys.iter()
-                            .filter_map(|key| key.as_str().map(str::to_owned))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                // Only a secret value the framework inlines changes what a
-                // worker builds; such a build stays here when it can.
-                let inlined_build_variables =
-                    withheld_inlined_variables(build_args_map.keys(), &worker_build_arg_keys);
-                builder = builder.worker_build_arg_keys(worker_build_arg_keys);
-                if !build_args_map.is_empty() {
-                    let build_args: Vec<(String, String)> = build_args_map.into_iter().collect();
-                    builder = builder.build_args(build_args);
-                }
-
-                // Add build context if present (for monorepo subdirectories)
-                if let Some(build_context_value) = config.get("build_context") {
-                    if let Some(build_context_str) = build_context_value.as_str() {
-                        if !build_context_str.is_empty() && build_context_str != "." {
-                            builder = builder.build_context(build_context_str.to_string());
-                        }
-                    }
-                }
-
-                // Cross-build for any worker architecture this deployment could
-                // be scheduled onto. Empty on a homogeneous cluster, which is
-                // the single native build every deployment does today.
-                //
-                // This runs at build time even though placement happens later,
-                // because the build job precedes scheduling in the workflow;
-                // the node selectors below are the same ones the scheduler will
-                // apply, so we never build for an architecture this deployment
-                // cannot land on.
-                //
-                // Off unless the operator asked for it. Cross-builds are
-                // emulated and slow, and deriving them from cluster topology
-                // would let one node joining change build behaviour for every
-                // deployment — including breaking builds outright on a control
-                // plane without the matching QEMU binfmt handlers. Environment
-                // setting wins, inheriting the project's when unset.
-                let cross_builds_enabled = environment
-                    .deployment_config
-                    .as_ref()
-                    .and_then(|c| c.cross_architecture_builds)
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.cross_architecture_builds)
-                    })
-                    .unwrap_or(false);
-
-                if !cross_builds_enabled && local_workloads_enabled {
-                    debug!(
-                        deployment_id = db_job.deployment_id,
-                        "Cross-architecture builds disabled; building for the control plane's \
-                         platform only"
-                    );
-                }
-
-                // The platforms a multi-arch build must cover; empty for the
-                // usual single native build.
-                let mut cross_build_platforms: Vec<String> = Vec::new();
-                if let (true, Some(scheduler)) = (
-                    cross_builds_enabled && local_workloads_enabled,
-                    self.node_scheduler.get(),
-                ) {
-                    let (target_nodes, target_labels) = resolve_placement_constraints(
-                        environment.deployment_config.as_ref(),
-                        project.deployment_config.as_ref(),
-                    );
-
-                    match scheduler
-                        .required_build_platforms_for_project(
-                            target_labels.as_ref(),
-                            target_nodes.as_deref(),
-                            Some(&project.slug),
-                        )
-                        .await
-                    {
-                        Ok(platforms) if !platforms.is_empty() => {
-                            info!(
-                                deployment_id = db_job.deployment_id,
-                                platforms = ?platforms,
-                                "Cluster spans multiple architectures — building one image per platform"
-                            );
-                            cross_build_platforms = platforms.clone();
-                            builder = builder.target_platforms(platforms);
-                        }
-                        Ok(_) => {}
-                        Err(crate::services::node_service::NodeError::Validation { message }) => {
-                            return Err(WorkflowExecutionError::InvalidJobConfig(message));
-                        }
-                        // Not being able to enumerate nodes must not block a
-                        // build: fall back to the native-only build and let the
-                        // deploy path's architecture check catch a mismatch.
-                        Err(e) => {
-                            warn!(
-                                deployment_id = db_job.deployment_id,
-                                "Could not determine cluster architectures ({}); \
-                                 building for the control plane's platform only",
-                                e
-                            );
-                        }
-                    }
-                }
-
-                let build_location =
-                    temps_entities::deployment_config::DeploymentConfig::resolve_build_location(
-                        environment.deployment_config.as_ref(),
-                        project.deployment_config.as_ref(),
-                    );
-                let image_builder: Arc<dyn ImageBuilder> = if build_location
-                    == temps_entities::deployment_config::BuildLocation::Ci
-                {
-                    inlined_variables_allow_offload(&inlined_build_variables).map_err(
-                        |reason| {
-                            WorkflowExecutionError::InvalidJobConfig(format!(
-                                "Deployment {} CI build cannot transfer inlined secrets: {reason}",
-                                deployment.id
-                            ))
-                        },
-                    )?;
-                    if needs_npm_credentials {
-                        return Err(WorkflowExecutionError::InvalidJobConfig(format!(
-                            "Deployment {} CI build cannot transfer package-manager credentials",
-                            deployment.id
-                        )));
-                    }
-                    let encryption = self.encryption_service.get().ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "CI build encryption service unavailable".into(),
-                        )
-                    })?;
-                    let service = crate::services::ci_dispatch::CiDispatchService::new(
-                        self.db.clone(),
-                        encryption.clone(),
-                        self.config_service.data_dir(),
-                    )
-                    .map_err(|error| WorkflowExecutionError::InvalidJobConfig(error.to_string()))?;
-                    builder = builder.external_build(true);
-                    let (target_nodes, target_labels) = resolve_placement_constraints(
-                        environment.deployment_config.as_ref(),
-                        project.deployment_config.as_ref(),
-                    );
-                    let local_platform = if local_workloads_enabled {
-                        self.image_builder.ensure_platform_discovered().await
-                    } else {
-                        None
-                    };
-                    let selected = if let Some(platform) = &local_platform {
-                        let platforms = if cross_build_platforms.is_empty() {
-                            vec![platform.clone()]
-                        } else {
-                            cross_build_platforms.clone()
-                        };
-                        self.select_platform_builders(
-                            deployment.id,
-                            &project.slug,
-                            target_nodes.as_deref(),
-                            target_labels.as_ref(),
-                            &platforms,
-                        )
-                        .await
-                    } else {
-                        let static_output_only = deployment_jobs::Entity::find()
-                            .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
-                            .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
-                            .one(self.db.as_ref())
-                            .await?
-                            .is_some();
-                        self.select_node_builder(
-                            deployment.id,
-                            &project.slug,
-                            target_nodes.as_deref(),
-                            target_labels.as_ref(),
-                            static_output_only,
-                        )
-                        .await
-                    };
-                    match selected {
-                        Ok(selected) => {
-                            let targets: Vec<_> = selected
-                                .into_iter()
-                                .map(|selected| crate::jobs::build_image::WorkerPlatformBuilder {
-                                    platform: selected.platform,
-                                    node_id: selected.node_id,
-                                    node_name: selected.node_name,
-                                    builder: Arc::new(
-                                        crate::services::ci_dispatch::CiImageBuilder {
-                                            service: service.clone(),
-                                            deployment_id: deployment.id,
-                                            target: selected.remote,
-                                        },
-                                    ),
-                                })
-                                .collect();
-                            let primary = targets
-                                .first()
-                                .ok_or_else(|| {
-                                    WorkflowExecutionError::InvalidJobConfig(
-                                        "CI build has no artifact target worker".into(),
-                                    )
-                                })?
-                                .builder
-                                .clone();
-                            builder = builder.platform_builders(targets);
-                            primary
-                        }
-                        Err(error) if local_platform.is_some() => {
-                            if cross_build_platforms.is_empty() {
-                                builder =
-                                    builder.target_platforms(local_platform.into_iter().collect());
-                            }
-                            builder = builder.build_location_notice(format!("CI builds run remotely. Artifacts use the control plane's daemon because no eligible worker can receive them: {error}"));
-                            Arc::new(crate::services::ci_dispatch::CiImageBuilder {
-                                service,
-                                deployment_id: deployment.id,
-                                target: self.image_builder.clone(),
-                            })
-                        }
-                        Err(error) => return Err(error),
-                    }
-                } else if local_workloads_enabled
-                    && build_location
-                        == temps_entities::deployment_config::BuildLocation::ControlPlane
-                {
-                    self.image_builder.clone()
-                } else if local_workloads_enabled {
-                    // The operator asked to keep this build off the control
-                    // plane. A worker build is a preference: when no worker
-                    // can produce the same image the control plane would, the
-                    // build stays here and the build log says why.
-                    let (target_nodes, target_labels) = resolve_placement_constraints(
-                        environment.deployment_config.as_ref(),
-                        project.deployment_config.as_ref(),
-                    );
-                    match self
-                        .select_offload_builder(
-                            deployment.id,
-                            &project.slug,
-                            target_nodes.as_deref(),
-                            target_labels.as_ref(),
-                            &cross_build_platforms,
-                            needs_npm_credentials,
-                            &inlined_build_variables,
-                        )
-                        .await
-                    {
-                        Ok(selected) => {
-                            // Whether the node has a free build slot is only
-                            // known when the build is about to be sent, after
-                            // the repository download. The build job asks
-                            // then, and builds on the control plane instead
-                            // when the node stays busy. This must come before
-                            // `target_platforms`, which it records to restore.
-                            builder = builder.offload_fallback(OffloadFallback::new(
-                                selected.agent.clone(),
-                                selected.node_id,
-                                selected.node_name.clone(),
-                                selected.agent.build_queue_wait(),
-                                self.image_builder.clone(),
-                            ));
-                            // The control plane's own post-build jobs read
-                            // the image from its daemon, so the finished
-                            // image is streamed back once the build is done.
-                            builder = builder
-                                .remote_builder_node_id(selected.node_id)
-                                .target_platforms(vec![selected.platform.clone()])
-                                .copy_image_to_control_plane(
-                                    self.image_builder.clone(),
-                                    selected.node_name.clone(),
-                                );
-                            selected.remote
-                        }
-                        Err(reason) => {
-                            warn!(
-                                deployment_id = deployment.id,
-                                project_slug = %project.slug,
-                                "Build location is 'node' but building on the control plane: {}",
-                                reason
-                            );
-                            builder = builder.build_location_notice(format!(
-                                "⚠️ Build location is set to 'node', but this build runs on the \
-                                 control plane: {reason}"
-                            ));
-                            self.image_builder.clone()
-                        }
-                    }
-                } else {
-                    // A static site's image is only read for its output
-                    // files, which DeployStaticJob fetches from the build node
-                    // and the control plane serves; it never runs anywhere.
-                    let static_output_only = deployment_jobs::Entity::find()
-                        .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
-                        .filter(deployment_jobs::Column::JobType.eq("DeployStaticJob"))
-                        .one(self.db.as_ref())
-                        .await?
-                        .is_some();
-                    // No local daemon: build on a node. The image is then
-                    // handed to each replica's node by DeployImageJob.
-                    let (target_nodes, target_labels) = resolve_placement_constraints(
-                        environment.deployment_config.as_ref(),
-                        project.deployment_config.as_ref(),
-                    );
-                    let mut selected = self
-                        .select_node_builder(
-                            deployment.id,
-                            &project.slug,
-                            target_nodes.as_deref(),
-                            target_labels.as_ref(),
-                            static_output_only,
-                        )
-                        .await?;
-                    if selected.len() > 1 {
-                        // A mixed-architecture deployment: one native build
-                        // per architecture, each on its own worker.
-                        let primary = selected[0].remote.clone();
-                        builder = builder.platform_builders(
-                            selected
-                                .into_iter()
-                                .map(|selected| crate::jobs::build_image::WorkerPlatformBuilder {
-                                    platform: selected.platform,
-                                    node_id: selected.node_id,
-                                    node_name: selected.node_name,
-                                    builder: selected.remote,
-                                })
-                                .collect(),
-                        );
-                        primary
-                    } else {
-                        let selected = selected.pop().ok_or_else(|| {
-                            WorkflowExecutionError::JobCreationFailed(format!(
-                                "Deployment {}: no build node was selected",
-                                deployment.id
-                            ))
-                        })?;
-                        builder = builder
-                            .remote_builder_node_id(selected.node_id)
-                            .target_platforms(vec![selected.platform.clone()]);
-                        selected.remote
-                    }
-                };
-                let job = builder.build(image_builder)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployContainerJob" | "DeployImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(3000) as u16;
-
-                // Explicit environment/project port override, as resolved by the
-                // planner. `Some` here means `resolve_container_port()` must use
-                // it directly instead of falling back to image EXPOSE detection.
-                let configured_port = config
-                    .get("configured_port")
-                    .and_then(|v| v.as_i64())
-                    .map(|p| p as u16);
-
-                // Get replicas with priority: environment > project > job config > default (1)
-                let replicas = environment
-                    .deployment_config
-                    .as_ref()
-                    .map(|c| c.replicas as u32)
-                    .or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .map(|c| c.replicas as u32)
-                    })
-                    .or_else(|| {
-                        config
-                            .get("replicas")
-                            .and_then(|v| v.as_i64())
-                            .map(|r| r as u32)
-                    })
-                    .unwrap_or(1);
-
-                debug!(
-                    "🔢 Deploying with {} replicas (env: {:?}, project: {:?})",
-                    replicas,
-                    environment.deployment_config.as_ref().map(|c| c.replicas),
-                    project.deployment_config.as_ref().map(|c| c.replicas)
-                );
-
-                // Unseal sensitive maps from job_config. The planner stores
-                // env vars / remote env vars / secrets as AES-256-GCM
-                // ciphertext under `*_encrypted` keys (with a non-sensitive
-                // `*_keys` list for debugging). `read_sealed` also falls back
-                // to plaintext for jobs queued before the encryption rollout.
-                let enc_for_unseal = self.encryption_service.get();
-                let env_variables = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    enc_for_unseal,
-                    "environment_variables",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-
-                let remote_env_variables =
-                    crate::services::sensitive_envelope::read_sealed_optional(
-                        config,
-                        enc_for_unseal,
-                        "remote_environment_variables",
-                    )
-                    .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-
-                // Secrets are mounted as files under /run/secrets/<KEY>; never
-                // injected as env vars. Same envelope as above.
-                let secrets = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    enc_for_unseal,
-                    "secrets",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-                if !secrets.is_empty() {
-                    debug!(
-                        "🔐 Mounting {} secret file(s) into container: {}",
-                        secrets.len(),
-                        secrets.keys().cloned().collect::<Vec<_>>().join(", ")
-                    );
-                }
-                debug!(
-                    "🌍 Using {} environment variables for deployment (from job config): {}",
-                    env_variables.len(),
-                    env_variables.keys().cloned().collect::<Vec<_>>().join(", ")
-                );
-
-                // Get dependencies to find the build job
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let build_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "build_image".to_string());
-
-                // Fetch deployment to get its URL for naming
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                // Check if this is an external image deployment (from remote deployment)
-                let use_external_image = config
-                    .get("use_external_image")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-
-                let external_image_tag = if use_external_image {
-                    config
-                        .get("image_name")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())
-                } else {
-                    None
-                };
-
-                // Same constraints the pre-build placement check used
-                let (target_nodes, target_labels) = resolve_placement_constraints(
-                    environment.deployment_config.as_ref(),
-                    project.deployment_config.as_ref(),
-                );
-
-                // Resolve CPU/memory limits + requests from environment first,
-                // then project. Each field is resolved independently so an
-                // env override can supply only memory while inheriting the
-                // project's CPU. When neither side configures a value we leave
-                // it unset and the deployer applies no limit at the Docker
-                // layer (rather than the previous hardcoded 1000m/512Mi).
-                let env_cfg = environment.deployment_config.as_ref();
-                let proj_cfg = project.deployment_config.as_ref();
-                let resolve_i32 = |getter: fn(
-                    &temps_entities::deployment_config::DeploymentConfig,
-                ) -> Option<i32>|
-                 -> Option<i32> {
-                    env_cfg
-                        .and_then(getter)
-                        .or_else(|| proj_cfg.and_then(getter))
-                };
-                // CPU values are stored as microcores in the DB (1_000_000 = 1 core);
-                // memory is stored as MB. Format with explicit suffixes the deployer
-                // understands: `u` for microcores, `Mi` for mebibytes.
-                let cpu_limit_micro = resolve_i32(|c| c.cpu_limit);
-                let memory_limit_mb = resolve_i32(|c| c.memory_limit);
-                let cpu_request_micro = resolve_i32(|c| c.cpu_request);
-                let memory_request_mb = resolve_i32(|c| c.memory_request);
-                // Readiness budget: environment override, then project, then
-                // the platform default. A slow-booting app gets more time by
-                // raising this, instead of failing as a generic timeout.
-                let health_check_timeout_secs =
-                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
-                        resolve_i32(|c| c.health_check_timeout_seconds),
-                    );
-                let resources = ResourceUsage {
-                    cpu_limit: cpu_limit_micro.map(|u| format!("{}u", u)),
-                    memory_limit: memory_limit_mb.map(|mb| format!("{}Mi", mb)),
-                    cpu_request: cpu_request_micro.map(|u| format!("{}u", u)),
-                    memory_request: memory_request_mb.map(|mb| format!("{}Mi", mb)),
-                };
-
-                // ADR 045: the executing host compares this against its own
-                // grant. A constructor argument, so no deploy path can omit it.
-                //
-                // The authority comes from the plan, not from an `AuthContext`
-                // — there is no request here, this runs from the queue. The
-                // planner recorded whether the principal that asked for the
-                // deployment was allowed to deploy a host-root project, and
-                // `planned_deploy_caller` fails closed when it did not say.
-                let mut builder = DeployImageJobBuilder::new(
-                    project.slug.clone(),
-                    crate::services::workflow_planner::planned_deploy_caller(config),
-                )
-                .job_id(db_job.job_id.clone())
-                .build_job_id(build_job_id)
-                .target(DeploymentTarget::Docker {
-                    registry_url: "local".to_string(),
-                    network: Some(temps_core::NETWORK_NAME.to_string()),
-                })
-                .service_name(deployment.slug.clone())
-                .namespace("default".to_string())
-                .audit_logger(self.audit_logger.get().cloned())
-                .port(port as u32)
-                .configured_port(configured_port)
-                .health(
-                    env_cfg
-                        .and_then(|c| c.health.clone())
-                        .or_else(|| proj_cfg.and_then(|c| c.health.clone())),
-                )
-                .health_check_timeout_secs(health_check_timeout_secs)
-                .replicas(replicas)
-                .environment_variables(env_variables)
-                .remote_environment_variables(remote_env_variables)
-                .cross_node_service_blockers(
-                    crate::services::workflow_planner::read_cross_node_blockers(config),
-                )
-                .secrets(secrets)
-                .resources(resources)
-                .log_id(db_job.log_id.clone())
-                .log_service(self.log_service.clone())
-                .failed_container_retention(self.db.clone(), deployment.id);
-
-                if let Some(command) = deployment
-                    .metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.command.clone())
-                {
-                    builder = builder.command(Some(command));
-                }
-
-                // Apply explicit deploy-time health-check path override (image/static
-                // deploys can't read .temps.yaml, so the deploy request carries it on
-                // the deployment metadata). When set, it wins over .temps.yaml.
-                if let Some(health_path) = deployment
-                    .metadata
-                    .as_ref()
-                    .and_then(|m| m.health_check_path.clone())
-                {
-                    debug!(
-                        "🩺 Applying deploy-time health check path override: {}",
-                        health_path
-                    );
-                    builder = builder.health_check_path_override(Some(health_path));
-                }
-
-                // Inject node scheduler for multi-node support
-                if let Some(scheduler) = self.node_scheduler.get() {
-                    builder = builder.node_scheduler(scheduler.clone());
-                }
-
-                // Inject encryption service for decrypting node tokens
-                if let Some(enc_service) = self.encryption_service.get() {
-                    builder = builder.encryption_service(enc_service.clone());
-                }
-                // Config service for resolving the cluster CA when deploying to
-                // https:// nodes over mTLS (ADR-020 WS-2.1).
-                builder = builder.config_service(self.config_service.clone());
-
-                // Inject image builder for transferring images to remote nodes
-                builder = builder.image_builder(self.image_builder.clone());
-
-                // Set target nodes if configured
-                if let Some(nodes) = target_nodes {
-                    builder = builder.target_nodes(nodes);
-                }
-
-                // Set target labels for label-based node scheduling
-                if let Some(labels) = target_labels {
-                    builder = builder.target_labels(labels);
-                }
-
-                // Resolve anti-affinity from environment or project config
-                let anti_affinity = environment
-                    .deployment_config
-                    .as_ref()
-                    .map(|c| c.anti_affinity)
-                    .unwrap_or_else(|| {
-                        project
-                            .deployment_config
-                            .as_ref()
-                            .map(|c| c.anti_affinity)
-                            .unwrap_or(true)
-                    });
-                builder = builder.anti_affinity(anti_affinity);
-
-                // Rolling update awareness: query existing containers for this
-                // environment so the scheduler can avoid placing new replicas on
-                // nodes that still host outgoing containers.
-                if anti_affinity {
-                    use temps_entities::deployment_containers;
-
-                    // Find the most recent previous deployment for this environment
-                    let prev_deployment = deployments::Entity::find()
-                        .filter(deployments::Column::EnvironmentId.eq(deployment.environment_id))
-                        .filter(deployments::Column::ProjectId.eq(deployment.project_id))
-                        .filter(deployments::Column::Id.ne(deployment.id))
-                        .filter(deployments::Column::State.eq("deployed"))
-                        .order_by_desc(deployments::Column::CreatedAt)
-                        .one(self.db.as_ref())
-                        .await
-                        .ok()
-                        .flatten();
-
-                    if let Some(prev) = prev_deployment {
-                        let existing_containers = deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(prev.id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default();
-
-                        let exclude_ids: Vec<i32> = existing_containers
-                            .iter()
-                            .filter_map(|c| c.node_id)
-                            .collect::<std::collections::HashSet<_>>()
-                            .into_iter()
-                            .collect();
-
-                        if !exclude_ids.is_empty() {
-                            debug!(
-                                "Anti-affinity: excluding {} node(s) with existing containers: {:?}",
-                                exclude_ids.len(),
-                                exclude_ids
-                            );
-                            builder = builder.exclude_node_ids(exclude_ids);
-                        }
-                    }
-                }
-
-                // If using external image, set the image tag directly (bypasses build job lookup)
-                if let Some(ref image_tag) = external_image_tag {
-                    debug!("🐳 Using external image tag for deployment: {}", image_tag);
-                    builder = builder.external_image_tag(image_tag.clone());
-                }
-
-                // Where the image lives (registry vs. only on this control
-                // plane) — decides whether a remote worker pulls it or receives
-                // it via import. Absent on job configs planned before the field
-                // existed; the job then derives it (see `DeployImageSource::resolve`).
-                builder = builder.image_source_from_job_config(config);
-
-                // Apply container log rotation settings from config, and — for a
-                // registry-sourced image — the same private-registry credentials
-                // `PullExternalImageJob` uses, so a worker node can pull the image
-                // itself via `POST /agent/images/pull` without the control plane
-                // ever needing a Docker daemon. Only forwarded when the image's
-                // registry matches the configured registry (same matching rule as
-                // `PullExternalImageJob`, never send credentials to a registry that
-                // didn't ask for them).
-                if let Ok(settings) = self.config_service.get_settings().await {
-                    builder =
-                        builder.container_log_config(temps_deployer::ContainerLogConfig::new(
-                            settings.container_logs.max_size.clone(),
-                            settings.container_logs.max_file,
-                        ));
-
-                    if let Some(ref image_tag) = external_image_tag {
-                        let reg = &settings.docker_registry;
-                        if reg.enabled {
-                            if let (Some(username), Some(password), Some(registry_url)) = (
-                                reg.username.clone(),
-                                reg.password.clone(),
-                                reg.registry_url.clone(),
-                            ) {
-                                let image_registry =
-                                    PullExternalImageJob::registry_from_image_ref(image_tag);
-                                let configured_registry =
-                                    PullExternalImageJob::registry_host_from_url(&registry_url);
-                                if matches!(
-                                    (&image_registry, &configured_registry),
-                                    (Some(image_registry), Some(configured_registry))
-                                        if image_registry == configured_registry
-                                ) {
-                                    builder = builder.registry_credentials(
-                                        temps_deployer::remote::RemotePullCredentials {
-                                            username: Some(username),
-                                            password: Some(password),
-                                            identity_token: None,
-                                            server_address: Some(registry_url),
-                                        },
-                                    );
-                                } else {
-                                    warn!(
-                                        image_registry = ?image_registry,
-                                        configured_registry = ?configured_registry,
-                                        "Skipping Docker registry credentials for remote pull because the image registry does not match"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-
-                let job = builder.build(self.container_deployer.clone())?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureCronsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                // Get download_job_id from config, fallback to default
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                // Get deploy_container_job_id from dependencies
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "deploy_container".to_string());
-
-                // Get cron service
-                let cron_service = self.cron_service.clone();
-
-                let job = ConfigureCronsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .environment_id(environment.id)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), cron_service)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureMetricAlertsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "mark_deployment_complete".to_string());
-
-                let alert_service = self.alert_service.clone();
-
-                let job = ConfigureMetricAlertsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .environment_id(environment.id)
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), alert_service)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ConfigureAgentsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deploy_container_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "deploy_container".to_string());
-
-                let agent_sync_service = self.agent_sync_service.clone();
-
-                let job = ConfigureAgentsJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .download_job_id(download_job_id)
-                    .deploy_container_job_id(deploy_container_job_id)
-                    .project_id(project.id)
-                    .log_id(Some(db_job.log_id.clone()))
-                    .log_service(self.log_service.clone())
-                    .build(self.db.clone(), agent_sync_service)?;
-
-                Ok(Arc::new(job))
-            }
-
-            "MarkDeploymentCompleteJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let deployment_id = config
-                    .get("deployment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "deployment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let mut builder = crate::jobs::MarkDeploymentCompleteJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .deployment_id(deployment_id)
-                    .db(self.db.clone())
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .container_deployer(self.container_deployer.clone())
-                    .queue(self.queue.clone())
-                    .config_service(self.config_service.clone());
-
-                if let Some(enc_service) = self.encryption_service.get() {
-                    builder = builder.encryption_service(enc_service.clone());
-                }
-                // Config service for resolving the cluster CA when deploying to
-                // https:// nodes over mTLS (ADR-020 WS-2.1).
-                builder = builder.config_service(self.config_service.clone());
-
-                let job = builder.build()?;
-
-                Ok(Arc::new(job))
-            }
-
-            "TakeScreenshotJob" => {
-                // Screenshot service is always available now
-                let screenshot_service = &self.screenshot_service;
-
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let deployment_id = config
-                    .get("deployment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "deployment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let job = crate::jobs::TakeScreenshotJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .deployment_id(deployment_id)
-                    .screenshot_service(screenshot_service.clone())
-                    .capture_guard(self.capture_guard.clone())
-                    .config_service(self.config_service.clone())
-                    .db(self.db.clone())
-                    .log_id(db_job.log_id.clone())
-                    .log_service(self.log_service.clone())
-                    .build()?;
-
-                Ok(Arc::new(job))
-            }
-
-            "ScanVulnerabilitiesJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let deployment_id = config
-                    .get("deployment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "deployment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let project_id = config
-                    .get("project_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "project_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let environment_id = config
-                    .get("environment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "environment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let branch = config
-                    .get("branch")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig("branch is required".to_string())
-                    })?
-                    .to_string();
-
-                // Manual triggers (redeploy, import) have no commit — the
-                // scan still runs against the built image; the commit is
-                // only recorded as scan metadata when known.
-                let commit_hash = config
-                    .get("commit_hash")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "download_job_id is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let build_job_id = config
-                    .get("build_job_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "build_job_id is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let job = crate::jobs::ScanVulnerabilitiesJob::new(
-                    db_job.job_id.clone(),
-                    deployment_id,
-                    project_id,
-                    environment_id,
-                    branch,
-                    commit_hash,
-                    download_job_id,
-                    build_job_id,
-                    self.db.clone(),
-                    self.docker_handle.clone(),
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone())
-                .with_image_builder(self.image_builder.clone());
-                let job = match self.builder_node_resolver() {
-                    Some(resolver) => job.with_builder_node_resolver(resolver),
-                    None => job,
-                };
-
-                Ok(Arc::new(job))
-            }
-
-            "CaptureSourceMapsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let deployment_id = config
-                    .get("deployment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "deployment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let project_id = config
-                    .get("project_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "project_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let release = config
-                    .get("release")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig("release is required".to_string())
-                    })?
-                    .to_string();
-
-                let build_job_id = config
-                    .get("build_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("build_image")
-                    .to_string();
-
-                let search_paths: Vec<String> = config
-                    .get("search_paths")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let path_rewrites: Vec<(String, String)> = config
-                    .get("path_rewrites")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let source_map_service = self
-                    .source_map_service
-                    .get()
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "SourceMapService not configured".to_string(),
-                        )
-                    })?
-                    .clone();
-
-                let job = crate::jobs::CaptureSourceMapsJob::new(
-                    db_job.job_id.clone(),
-                    deployment_id,
-                    project_id,
-                    release,
-                    build_job_id,
-                    search_paths,
-                    path_rewrites,
-                    self.image_builder.clone(),
-                    source_map_service,
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-                let job = match self.builder_node_resolver() {
-                    Some(resolver) => job.with_builder_node_resolver(resolver),
-                    None => job,
-                };
-
-                Ok(Arc::new(job))
-            }
-
-            "CaptureSourceFilesJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let project_id = config
-                    .get("project_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "project_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let release = config
-                    .get("release")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig("release is required".to_string())
-                    })?
-                    .to_string();
-
-                let download_job_id = config
-                    .get("download_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("download_repo")
-                    .to_string();
-
-                let build_job_id = config
-                    .get("build_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("build_image")
-                    .to_string();
-
-                // None (or null) = default to the Docker build context.
-                let error_source_root = config
-                    .get("error_source_root")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let extensions: Vec<String> = config
-                    .get("extensions")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let source_map_service = self
-                    .source_map_service
-                    .get()
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "SourceMapService not configured".to_string(),
-                        )
-                    })?
-                    .clone();
-
-                let job = crate::jobs::CaptureSourceFilesJob::new(
-                    db_job.job_id.clone(),
-                    project_id,
-                    release,
-                    download_job_id,
-                    build_job_id,
-                    error_source_root,
-                    extensions,
-                    source_map_service,
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-
-                Ok(Arc::new(job))
-            }
-
-            "PersistStaticAssetsJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let deployment_id = config
-                    .get("deployment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "deployment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let project_id = config
-                    .get("project_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "project_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let environment_id = config
-                    .get("environment_id")
-                    .and_then(|v| v.as_i64())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "environment_id is required".to_string(),
-                        )
-                    })? as i32;
-
-                let build_job_id = config
-                    .get("build_job_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("build_image")
-                    .to_string();
-
-                let search_paths: Vec<String> = config
-                    .get("search_paths")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let path_rewrites: Vec<(String, String)> = config
-                    .get("path_rewrites")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let deployment_slug = config
-                    .get("deployment_slug")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&deployment_id.to_string())
-                    .to_string();
-
-                let chunks_dir = self
-                    .config_service
-                    .static_dir()
-                    .join("chunks")
-                    .join(project_id.to_string())
-                    .join(environment_id.to_string())
-                    .join(deployment_slug);
-
-                let mut job = crate::jobs::PersistStaticAssetsJob::new(
-                    db_job.job_id.clone(),
-                    deployment_id,
-                    project_id,
-                    environment_id,
-                    build_job_id,
-                    search_paths,
-                    path_rewrites,
-                    self.image_builder.clone(),
-                    chunks_dir,
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-
-                // Wire file store for CAS blob storage
-                if let Some(store) = self.file_store.get() {
-                    job = job.with_file_store(store.clone());
-                }
-
-                // Wire database for URL→hash mapping
-                job = job.with_db(self.db.clone());
-
-                if let Some(resolver) = self.builder_node_resolver() {
-                    job = job.with_builder_node_resolver(resolver);
-                }
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                // Get dependencies to find the build job (DeployStaticJob depends on BuildImageJob)
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let build_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "build_image".to_string());
-
-                // Get static output directory from config (path inside container after build)
-                // This is typically "/app/dist" or "/app/build" depending on the framework
-                let static_output_dir = config
-                    .get("static_output_dir")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("/app/dist")
-                    .to_string();
-
-                debug!(
-                    "📦 DeployStaticJob will extract files from container path: {}",
-                    static_output_dir
-                );
-
-                // Fetch deployment to get slugs
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                let job = DeployStaticJob::new(
-                    db_job.job_id.clone(),
-                    build_job_id,
-                    static_output_dir,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    self.static_deployer.clone(),
-                    self.image_builder.clone(),
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-                let job = match self.builder_node_resolver() {
-                    Some(resolver) => job.with_builder_node_resolver(resolver),
-                    None => job,
-                };
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticFromSourceJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let download_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "download_repo".to_string());
-
-                let directory = config
-                    .get("directory")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(".")
-                    .to_string();
-
-                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
-                    .one(self.db.as_ref())
-                    .await?
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
-                    })?;
-
-                let job = DeployStaticFromSourceJob::new(
-                    db_job.job_id.clone(),
-                    download_job_id,
-                    directory,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    self.static_deployer.clone(),
-                )
-                .with_log_id(db_job.log_id.clone())
-                .with_log_service(self.log_service.clone());
-
-                Ok(Arc::new(job))
-            }
-
-            "PullExternalImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let image_ref = config
-                    .get("image_ref")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "image_ref is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let external_image_id = config
-                    .get("external_image_id")
-                    .and_then(|v| v.as_i64())
-                    .map(|id| id as i32);
-
-                let image_registry = PullExternalImageJob::registry_from_image_ref(&image_ref);
-
-                let mut job = PullExternalImageJob::new(
-                    db_job.job_id.clone(),
-                    image_ref,
-                    external_image_id,
-                    self.docker_handle.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
-
-                // Pass private registry credentials only to the configured registry.
-                if let Ok(settings) = self.config_service.get_settings().await {
-                    let reg = &settings.docker_registry;
-                    if reg.enabled {
-                        if let (Some(username), Some(password), Some(registry_url)) = (
-                            reg.username.clone(),
-                            reg.password.clone(),
-                            reg.registry_url.clone(),
-                        ) {
-                            let configured_registry =
-                                PullExternalImageJob::registry_host_from_url(&registry_url);
-                            if matches!(
-                                (&image_registry, &configured_registry),
-                                (Some(image_registry), Some(configured_registry))
-                                    if image_registry == configured_registry
-                            ) {
-                                job = job.with_registry_credentials(
-                                    bollard::auth::DockerCredentials {
-                                        username: Some(username),
-                                        password: Some(password),
-                                        serveraddress: Some(registry_url),
-                                        ..Default::default()
-                                    },
-                                );
-                            } else {
-                                warn!(
-                                    image_registry = ?image_registry,
-                                    configured_registry = ?configured_registry,
-                                    "Skipping Docker registry credentials because the image registry does not match"
-                                );
-                            }
-                        }
-                    }
-                }
-
-                Ok(Arc::new(job))
-            }
-
-            "VerifyLocalImageJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let image_ref = config
-                    .get("image_ref")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "image_ref is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let expected_image_id = config
-                    .get("expected_image_id")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let job = VerifyLocalImageJob::new(
-                    db_job.job_id.clone(),
-                    image_ref,
-                    expected_image_id,
-                    self.docker_handle.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
-
-                Ok(Arc::new(job))
-            }
-
-            "DeployStaticBundleJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let bundle_path = config
-                    .get("bundle_path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "bundle_path is required".to_string(),
-                        )
-                    })?
-                    .to_string();
-
-                let content_type = config
-                    .get("content_type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("application/gzip")
-                    .to_string();
-
-                let static_bundle_id = config
-                    .get("static_bundle_id")
-                    .and_then(|v| v.as_i64())
-                    .map(|id| id as i32);
-                let source_directory = config
-                    .get("source_directory")
-                    .and_then(|value| value.as_str())
-                    .unwrap_or(".")
-                    .to_string();
-
-                // Get data directory from config service for local storage
-                let data_dir = self.config_service.data_dir();
-
-                let job = DeployStaticBundleJob::new(
-                    db_job.job_id.clone(),
-                    project.id,
-                    bundle_path,
-                    content_type,
-                    static_bundle_id,
-                    project.slug.clone(),
-                    environment.slug.clone(),
-                    deployment.slug.clone(),
-                    source_directory,
-                    data_dir,
-                    self.static_deployer.clone(),
-                )
-                .with_log_service(self.log_service.clone(), db_job.log_id.clone());
-
-                Ok(Arc::new(job))
-            }
-
-            "PrepareSourceBundleJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-                let archive_path = config
-                    .get("archive_path")
-                    .and_then(|value| value.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "archive_path is required".to_string(),
-                        )
-                    })?;
-                let archive_path = std::path::Path::new(archive_path);
-                if archive_path.is_absolute()
-                    || archive_path.components().any(|component| {
-                        matches!(
-                            component,
-                            std::path::Component::ParentDir
-                                | std::path::Component::RootDir
-                                | std::path::Component::Prefix(_)
-                        )
-                    })
-                {
-                    return Err(WorkflowExecutionError::InvalidJobConfig(
-                        "source archive path must remain inside the Temps data directory"
-                            .to_string(),
-                    ));
-                }
-                let absolute_path = self.config_service.data_dir().join(archive_path);
-                Ok(Arc::new(
-                    PrepareSourceBundleJob::new(
-                        db_job.job_id.clone(),
-                        absolute_path,
-                        project.slug.clone(),
-                    )
-                    .with_log_service(self.log_service.clone(), db_job.log_id.clone()),
-                ))
-            }
-
-            // Unsupported job types - log warning but don't fail the entire workflow
-            "HealthCheckJob" | "DeployBasicJob" | "BuildStaticJob" => {
-                warn!(
-                    "Skipping unsupported job type: {} (not yet implemented)",
-                    db_job.job_type
-                );
-                // Return a no-op job that succeeds immediately
-                Err(WorkflowExecutionError::UnsupportedJobType(
-                    db_job.job_type.clone(),
-                ))
-            }
-
-            "DeployComposeJob" => {
-                let config = db_job.job_config.as_ref().ok_or_else(|| {
-                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
-                })?;
-
-                let compose_path = config
-                    .get("compose_path")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                let env_vars = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    self.encryption_service.get(),
-                    "environment_vars",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-                let build_args = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    self.encryption_service.get(),
-                    "build_args",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-                // Absent on jobs queued before compose secret support; the
-                // reader returns an empty map, so those deploy unchanged.
-                let secrets = crate::services::sensitive_envelope::read_sealed(
-                    config,
-                    self.encryption_service.get(),
-                    "secrets",
-                )
-                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
-                // Plain JSON, not sealed: service names are not sensitive.
-                // Absent on jobs queued before scoping shipped, which reads as
-                // "every secret goes to every service" — the prior behaviour.
-                let secret_compose_services: std::collections::HashMap<String, Vec<String>> =
-                    config
-                        .get("secret_compose_services")
-                        .cloned()
-                        .map(serde_json::from_value)
-                        .transpose()
-                        .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?
-                        .unwrap_or_default();
-
-                // Projects created before directory normalization was applied on
-                // every write path can hold "" or "/" here. Both are rejected by
-                // the job's path confinement, so normalize to the repo root
-                // marker instead of failing the deployment.
-                let directory = config
-                    .get("directory")
-                    .and_then(|v| v.as_str())
-                    .map(|d| d.trim().trim_start_matches('/'))
-                    .filter(|d| !d.is_empty())
-                    .unwrap_or(".")
-                    .to_string();
-
-                // Get dependencies to find the download job ID
-                let dependencies: Vec<String> = db_job
-                    .dependencies
-                    .as_ref()
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
-
-                let download_job_id = dependencies
-                    .first()
-                    .cloned()
-                    .unwrap_or_else(|| "download_repo".to_string());
-
-                // Inline compose content (for manual projects without git repo)
-                let compose_content = config
-                    .get("compose_content")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-
-                // User-provided compose override from project preset_config
-                let compose_override = project.preset_config.as_ref().and_then(|pc| {
-                    if let temps_entities::preset::PresetConfig::DockerCompose(cfg) = pc {
-                        cfg.compose_override.clone()
-                    } else {
-                        None
-                    }
-                });
-
-                // Services the user opted to exclude from this project's compose
-                // stack (e.g. an unmanaged database in favor of a Temps-managed one).
-                let (excluded_services, relaxed_capability_services, unsandboxed_services) =
-                    compose_service_security_settings(project.preset_config.as_ref());
-                let public_ports = project
-                    .preset_config
-                    .as_ref()
-                    .and_then(|config| match config {
-                        temps_entities::preset::PresetConfig::DockerCompose(config) => {
-                            Some(config.public_ports.clone())
-                        }
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-
-                let compose_policy =
-                    temps_entities::compose_security_policies::Entity::find_by_id(project.id)
-                        .one(self.db.as_ref())
-                        .await
-                        .map_err(|error| {
-                            WorkflowError::JobExecutionFailed(format!(
-                                "Failed to load Compose security policy for project {}: {error}",
-                                project.id
-                            ))
-                        })?
-                        .map(|row| row.policy)
-                        .unwrap_or_default();
-                // Build the executor from the handle rather than from a
-                // resolved client: `ComposeExecutor` already carries the
-                // "no daemon here" case (`docker_available()`), and
-                // `DeployComposeJob::execute_locked` uses it to refuse with a
-                // `LocalWorkloadsDisabled` failure naming the remedy.
-                //
-                // Resolving the daemon *here* instead would abort job
-                // construction, which happens before `WorkflowExecutor`
-                // exists — so the deployment would be failed by the outer
-                // processor while its already-inserted `deployment_jobs` rows
-                // stayed `pending` forever, with no per-job reason anywhere in
-                // the UI. Constructing unconditionally keeps the refusal on
-                // the job's own execution path, where the tracker records it.
-                let compose_executor = Arc::new(
-                    temps_deployer::compose::ComposeExecutor::new_with_handle(
-                        self.docker_handle.clone(),
-                        self.config_service.data_dir(),
-                    )
-                    .with_security_policy(compose_policy),
-                );
-
-                // Same startup-timeout setting as single-container deploys:
-                // environment override, then project, then the default.
-                let compose_ready_timeout_secs =
-                    temps_entities::deployment_config::resolve_health_check_timeout_seconds(
-                        environment
-                            .deployment_config
-                            .as_ref()
-                            .and_then(|c| c.health_check_timeout_seconds)
-                            .or_else(|| {
-                                project
-                                    .deployment_config
-                                    .as_ref()
-                                    .and_then(|c| c.health_check_timeout_seconds)
-                            }),
-                    );
-
-                let job = crate::jobs::DeployComposeJobBuilder::new()
-                    .job_id(db_job.job_id.clone())
-                    .deployment_id(deployment.id)
-                    .project_id(project.id)
-                    .environment_id(environment.id)
-                    .db(self.db.clone())
-                    .compose_executor(compose_executor)
-                    .compose_path(compose_path)
-                    .directory(directory)
-                    .compose_content(compose_content)
-                    .compose_override(compose_override)
-                    .excluded_services(excluded_services)
-                    .relaxed_capability_services(relaxed_capability_services)
-                    .unsandboxed_services(unsandboxed_services)
-                    .ready_timeout_secs(compose_ready_timeout_secs)
-                    .public_ports(public_ports)
-                    .download_job_id(download_job_id)
-                    .environment_vars(env_vars)
-                    .secrets(secrets)
-                    .secret_compose_services(secret_compose_services)
-                    .build_args(build_args)
-                    .log_id(Some(db_job.log_id.clone()))
-                    .log_service(self.log_service.clone())
-                    .build()?;
-
-                Ok(Arc::new(job))
-            }
-
-            _ => {
-                warn!("Unknown job type: {}", db_job.job_type);
-                Err(WorkflowExecutionError::UnsupportedJobType(
-                    db_job.job_type.clone(),
-                ))
-            }
-        }
+        job_registry::construct_job(&job_registry::JobRecord {
+            service: self,
+            project,
+            environment,
+            deployment,
+            db_job,
+        })
+        .await
     }
 
     /// Choose a worker node to build a source image that would otherwise be
@@ -3178,7 +1318,6 @@ impl WorkflowExecutionService {
         Ok(selected)
     }
 
-    #[allow(dead_code)]
     /// Choose the node that builds a source image when the control plane
     /// has no Docker daemon.
     ///
@@ -3742,135 +1881,6 @@ impl WorkflowExecutionService {
         Ok(())
     }
 
-    /// DEPRECATED: This logic is now handled by MarkDeploymentCompleteJob
-    #[allow(dead_code)]
-    async fn update_deployment_from_context(
-        &self,
-        deployment_id: i32,
-        context: &temps_core::WorkflowContext,
-    ) -> Result<(), WorkflowExecutionError> {
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::deployment_containers;
-
-        debug!(
-            "📝 Updating deployment {} with workflow outputs",
-            deployment_id
-        );
-
-        let deployment = self.get_deployment(deployment_id).await?;
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-
-        // Extract image info from build job output
-        if let Ok(Some(image_tag)) = context.get_output::<String>("build_image", "image_tag") {
-            active_deployment.image_name = Set(Some(image_tag));
-        }
-
-        // Extract container info from deploy job output and create deployment_container records
-        if let Ok(Some(container_id)) =
-            context.get_output::<String>("deploy_container", "container_id")
-        {
-            let container_name = context
-                .get_output::<String>("deploy_container", "container_name")
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| format!("container-{}", deployment_id));
-
-            let container_port = if context
-                .get_output::<bool>("deploy_container", "portless")?
-                .unwrap_or(false)
-            {
-                None
-            } else {
-                Some(
-                    context
-                        .get_output::<i32>("deploy_container", "container_port")?
-                        .unwrap_or(8080),
-                )
-            };
-
-            let host_port = context
-                .get_output::<i32>("deploy_container", "host_port")
-                .ok()
-                .flatten();
-
-            let now = chrono::Utc::now();
-
-            // Create deployment_container record
-            let deployment_container = deployment_containers::ActiveModel {
-                deployment_id: Set(deployment_id),
-                container_id: Set(container_id.clone()),
-                container_name: Set(container_name.clone()),
-                container_port: Set(container_port),
-                host_port: Set(container_port.and(host_port)),
-                image_name: Set(match &active_deployment.image_name {
-                    sea_orm::ActiveValue::Set(v) => v.clone(),
-                    sea_orm::ActiveValue::Unchanged(v) => v.clone(),
-                    _ => None,
-                }),
-                status: Set(Some("running".to_string())),
-                created_at: Set(now),
-                deployed_at: Set(now),
-                ready_at: Set(Some(now)), // Assume ready immediately for now
-                deleted_at: Set(None),
-                ..Default::default()
-            };
-
-            deployment_container.insert(self.db.as_ref()).await?;
-
-            info!(
-                "Created deployment_container record for container {}",
-                container_id
-            );
-        }
-
-        // Update state to deployed
-        active_deployment.state = Set("deployed".to_string());
-
-        active_deployment.update(self.db.as_ref()).await?;
-
-        info!("Updated deployment {} with workflow outputs", deployment_id);
-        Ok(())
-    }
-
-    /// DEPRECATED: This logic is now handled by MarkDeploymentCompleteJob
-    /// Update the environment's current_deployment_id to point to this deployment
-    #[allow(dead_code)]
-    async fn update_environment_current_deployment(
-        &self,
-        deployment_id: i32,
-    ) -> Result<(), WorkflowExecutionError> {
-        use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::environments;
-
-        debug!(
-            "📝 Updating environment to set current deployment to {}",
-            deployment_id
-        );
-
-        // Get the deployment to find its environment_id
-        let deployment = self.get_deployment(deployment_id).await?;
-
-        // Update the environment (only if not soft-deleted)
-        let environment = environments::Entity::find_by_id(deployment.environment_id)
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| {
-                WorkflowExecutionError::EnvironmentNotFound(deployment.environment_id)
-            })?;
-
-        let mut active_environment: environments::ActiveModel = environment.into();
-        active_environment.current_deployment_id = Set(Some(deployment_id));
-
-        active_environment.update(self.db.as_ref()).await?;
-
-        info!(
-            "Updated environment {} to point to deployment {}",
-            deployment.environment_id, deployment_id
-        );
-        Ok(())
-    }
-
     async fn teardown_deployer_for_node(
         &self,
         node_id: Option<i32>,
@@ -3878,6 +1888,25 @@ impl WorkflowExecutionService {
         let Some(node_id) = node_id else {
             return Ok(self.container_deployer.clone());
         };
+        let (_, deployer) = self
+            .remote_deployer_for_node(node_id, "removing a retained container")
+            .await?;
+        Ok(Arc::new(deployer))
+    }
+
+    /// The agent client for worker node `node_id`, for `purpose` (named in
+    /// every error).
+    async fn remote_deployer_for_node(
+        &self,
+        node_id: i32,
+        purpose: &str,
+    ) -> Result<
+        (
+            temps_entities::nodes::Model,
+            temps_deployer::remote::RemoteNodeDeployer,
+        ),
+        WorkflowExecutionError,
+    > {
         use temps_entities::nodes;
 
         let node = nodes::Entity::find_by_id(node_id)
@@ -3885,51 +1914,161 @@ impl WorkflowExecutionService {
             .await?
             .ok_or_else(|| {
                 WorkflowExecutionError::JobCreationFailed(format!(
-                    "Cannot remove container from missing worker node {node_id}"
+                    "Worker node {node_id} is not registered (while {purpose})"
                 ))
             })?;
         let encrypted_token = node.token_encrypted.as_ref().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Worker node {node_id} has no agent token; retained containers cannot be removed safely"
+                "Worker node {node_id} has no agent token, so Temps cannot reach it safely (while {purpose})"
             ))
         })?;
         let encryption_service = self.encryption_service.get().ok_or_else(|| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Encryption service is unavailable; retained containers on worker node {node_id} cannot be removed safely"
+                "Encryption service is unavailable, so worker node {node_id} cannot be reached (while {purpose})"
             ))
         })?;
         let token_bytes = encryption_service
             .decrypt(encrypted_token)
             .map_err(|error| {
                 WorkflowExecutionError::JobCreationFailed(format!(
-                    "Failed to decrypt the agent token for worker node {node_id}: {error}"
+                    "Failed to decrypt the agent token for worker node {node_id} (while {purpose}): {error}"
                 ))
             })?;
         let token = String::from_utf8(token_bytes).map_err(|error| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Agent token for worker node {node_id} is not valid UTF-8: {error}"
+                "Agent token for worker node {node_id} is not valid UTF-8 (while {purpose}): {error}"
             ))
         })?;
         let deployer = crate::cluster_ca::build_node_deployer(
-            &node.address,
+            &node,
             token,
-            node.name,
             self.config_service.as_ref(),
             encryption_service.as_ref(),
         )
         .await
         .map_err(|error| {
             WorkflowExecutionError::JobCreationFailed(format!(
-                "Failed to connect to worker node {node_id} while removing a retained container: {error}"
+                "Failed to connect to worker node {node_id} (while {purpose}): {error}"
             ))
         })?;
-        Ok(Arc::new(deployer))
+        Ok((node, deployer))
+    }
+
+    /// Where this deployment of a Compose environment runs, which host a
+    /// pending move leaves, and whether the home still has to be pinned.
+    async fn plan_compose_stack(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+        policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+    ) -> Result<
+        (
+            crate::services::compose_placement::ComposePlacementPlan,
+            crate::jobs::ComposeStackHost,
+            Option<crate::jobs::ComposeStackHost>,
+        ),
+        WorkflowExecutionError,
+    > {
+        let (target_nodes, target_labels) = resolve_placement_constraints(
+            environment.deployment_config.as_ref(),
+            project.deployment_config.as_ref(),
+        );
+        let plan =
+            crate::services::compose_placement::ComposePlacementService::new(self.db.clone())
+                .plan(
+                    self.node_scheduler.get().map(Arc::as_ref),
+                    project,
+                    environment,
+                    target_nodes.as_deref(),
+                    target_labels.as_ref(),
+                )
+                .await
+                .map_err(|source| WorkflowExecutionError::ComposePlacement {
+                    deployment_id: deployment.id,
+                    source,
+                })?;
+        let host = self
+            .compose_stack_host(plan.home, policy, "deploying a Compose stack")
+            .await?;
+        if !host.is_control_plane() {
+            self.refuse_linked_services_on_worker(project, deployment, &host)
+                .await?;
+        }
+        let vacate_host = match plan.vacate {
+            Some(old) => Some(
+                self.compose_stack_host(old, policy, "moving a Compose stack off it")
+                    .await?,
+            ),
+            None => None,
+        };
+        info!(
+            deployment_id = deployment.id,
+            environment_id = environment.id,
+            home = %host.describe(),
+            pinned = plan.pinned,
+            moving_from = ?vacate_host.as_ref().map(crate::jobs::ComposeStackHost::describe),
+            "Planned Compose stack placement"
+        );
+        Ok((plan, host, vacate_host))
+    }
+
+    async fn compose_stack_host(
+        &self,
+        node_id: Option<i32>,
+        policy: &temps_entities::compose_security::ComposeSecurityPolicy,
+        purpose: &str,
+    ) -> Result<crate::jobs::ComposeStackHost, WorkflowExecutionError> {
+        let Some(node_id) = node_id else {
+            return Ok(crate::jobs::ComposeStackHost::ControlPlane);
+        };
+        let (node, deployer) = self.remote_deployer_for_node(node_id, purpose).await?;
+        Ok(crate::jobs::ComposeStackHost::Worker {
+            node_id,
+            node_name: node.name,
+            deployer: Arc::new(deployer),
+            policy: policy.clone(),
+        })
+    }
+
+    /// Linked Temps-managed services are reached by container name on the
+    /// control plane's Docker network. A stack on a worker has no route to
+    /// them, so it would start with connection strings that never connect.
+    async fn refuse_linked_services_on_worker(
+        &self,
+        project: &projects::Model,
+        deployment: &deployments::Model,
+        host: &crate::jobs::ComposeStackHost,
+    ) -> Result<(), WorkflowExecutionError> {
+        use temps_entities::{external_services, project_services};
+        let linked = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project.id))
+            .find_also_related(external_services::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        if linked.is_empty() {
+            return Ok(());
+        }
+        let services = linked
+            .iter()
+            .map(|(link, service)| match service {
+                Some(service) => format!("'{}'", service.name),
+                None => format!("service {}", link.service_id),
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        Err(WorkflowExecutionError::ComposeLinkedServicesOnWorker {
+            deployment_id: deployment.id,
+            host: host.describe(),
+            services,
+        })
     }
 
     async fn teardown_registered_container(
         &self,
         container: temps_entities::deployment_containers::Model,
         retry_failed_cleanup: bool,
+        stop_grace: std::time::Duration,
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
@@ -3940,8 +2079,27 @@ impl WorkflowExecutionService {
             || original_status
                 .as_deref()
                 .is_some_and(|status| status.starts_with("retained:"));
-        let deployer = match self.teardown_deployer_for_node(container.node_id).await {
-            Ok(deployer) => deployer,
+        // A replica an `enforce` deployment started through the workload
+        // plane is retired by deleting its workload: the plane removes the
+        // instance (a container or a microVM Docker cannot see). Removing
+        // only the container would leave the workload running or restarted,
+        // and a microVM's 404 must never count as "already removed".
+        let resolved = match crate::services::plane_deployer::deployment_replica_workload(
+            self.db.as_ref(),
+            container.deployment_id,
+            &container_id,
+        )
+        .await
+        {
+            Ok(Some(workload)) => Ok(TeardownPath::Plane(workload)),
+            Ok(None) => self
+                .teardown_deployer_for_node(container.node_id)
+                .await
+                .map(TeardownPath::Deployer),
+            Err(error) => Err(WorkflowExecutionError::ReplicaRetire(error)),
+        };
+        let teardown = match resolved {
+            Ok(teardown) => teardown,
             Err(error) if rotate_retry => {
                 if let Err(rotation_error) = self
                     .rotate_retained_cleanup_retry(&container, &container_id, None)
@@ -3989,15 +2147,93 @@ impl WorkflowExecutionService {
             return Ok(None);
         }
 
-        if let Err(error) = deployer.stop_container(&container_id).await {
-            warn!(
-                "Failed to stop container {} on node {:?}: {}",
-                container_id, container.node_id, error
-            );
-        }
+        let removal: Result<(), String> = match teardown {
+            TeardownPath::Plane(workload) => {
+                // The plane removes a retired replica without a graceful stop,
+                // so give a container replica its stop grace first, bounded
+                // like the deployer path below. An unreachable node only loses
+                // the grace period; the replica is still retired.
+                if workload.container && !workload.retired {
+                    match self.teardown_deployer_for_node(container.node_id).await {
+                        Ok(deployer) => {
+                            let budget = crate::jobs::mark_deployment_complete::teardown_budget(
+                                self.container_teardown_timeout,
+                                stop_grace,
+                            );
+                            if tokio::time::timeout(
+                                budget,
+                                crate::services::plane_deployer::stop_replica_before_retiring(
+                                    deployer.as_ref(),
+                                    &container_id,
+                                    workload,
+                                    stop_grace,
+                                ),
+                            )
+                            .await
+                            .is_err()
+                            {
+                                warn!(
+                                    container_id = %container_id,
+                                    budget_seconds = budget.as_secs(),
+                                    "Graceful stop of the replica did not answer in time; retiring it \
+                                     through the workload plane"
+                                );
+                            }
+                        }
+                        Err(error) => warn!(
+                            container_id = %container_id,
+                            node_id = ?container.node_id,
+                            %error,
+                            "Cannot reach the replica's node to stop it gracefully; retiring it \
+                             through the workload plane without the stop grace period"
+                        ),
+                    }
+                }
+                crate::services::plane_deployer::retire_replica_workload(
+                    self.workload_plane.get().map(Arc::as_ref),
+                    container.deployment_id,
+                    &container_id,
+                    workload,
+                )
+                .await
+                .map_err(|error| error.to_string())
+            }
+            TeardownPath::Deployer(deployer) => {
+                // Bounded here, around the runtime calls only, so that a timeout
+                // still reaches the code below, which restores the row claimed
+                // above. An unanswering worker's client would otherwise take
+                // minutes per call while a sweep holds the lifecycle lock.
+                let teardown_timeout = crate::jobs::mark_deployment_complete::teardown_budget(
+                    self.container_teardown_timeout,
+                    stop_grace,
+                );
+                let removal = tokio::time::timeout(teardown_timeout, async {
+                    if let Err(error) = deployer
+                        .stop_container_with_grace(&container_id, stop_grace)
+                        .await
+                    {
+                        warn!(
+                            "Failed to stop container {} on node {:?}: {}",
+                            container_id, container.node_id, error
+                        );
+                    }
+                    match deployer.remove_container(&container_id).await {
+                        Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => Ok(()),
+                        Err(error) => Err(error.to_string()),
+                    }
+                })
+                .await;
+                removal.unwrap_or_else(|_| {
+                    Err(format!(
+                        "no answer after {}s; it may still be running",
+                        teardown_timeout.as_secs()
+                    ))
+                })
+            }
+        };
 
-        match deployer.remove_container(&container_id).await {
-            Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+        match removal {
+            Ok(()) => {}
             Err(error) => {
                 // Never hide a still-live container from later cleanup attempts.
                 // Retained failures receive a timestamped, lexically-last state,
@@ -4112,12 +2348,10 @@ impl WorkflowExecutionService {
                             .add(deployments::Column::Id.lt(current_deployment.id)),
                     ),
             )
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "built",
-                "completed",
-            ]))
+            .filter(
+                deployments::Column::State
+                    .is_in(crate::jobs::mark_deployment_complete::TEARDOWN_SWEPT_STATES),
+            )
             .order_by_desc(deployments::Column::CreatedAt)
             .limit(MAX_TEARDOWN_DEPLOYMENTS)
             .all(self.db.as_ref())
@@ -4125,8 +2359,34 @@ impl WorkflowExecutionService {
 
         let mut first_stopped_container_id: Option<String> = None;
         let mut total_containers_cleaned = 0;
+        // Superseded containers drain for the project's stop timeout (#1806).
+        let stop_grace = if previous_deployments.is_empty() {
+            std::time::Duration::ZERO
+        } else {
+            crate::jobs::mark_deployment_complete::superseded_stop_grace(
+                self.db.as_ref(),
+                environment_id,
+            )
+            .await
+        };
 
         for deployment in previous_deployments {
+            let lifecycle_lock =
+                crate::jobs::mark_deployment_complete::environment_lifecycle_lock(environment_id);
+            let _lifecycle_guard = lifecycle_lock.lock().await;
+            let Some(deployment) = crate::jobs::mark_deployment_complete::deployment_still_swept(
+                self.db.as_ref(),
+                deployment.id,
+            )
+            .await?
+            else {
+                debug!(
+                    deployment_id = deployment.id,
+                    "Deployment changed state before teardown; leaving it as is"
+                );
+                continue;
+            };
+
             // Get all non-deleted containers for this deployment
             let containers = deployment_containers::Entity::find()
                 .filter(deployment_containers::Column::DeploymentId.eq(deployment.id))
@@ -4144,8 +2404,18 @@ impl WorkflowExecutionService {
                 containers.len()
             );
 
-            for container in containers {
-                match self.teardown_registered_container(container, false).await {
+            // Several at once, so a worker that stops answering costs this lock
+            // one timeout per batch rather than one per replica.
+            let removals: Vec<_> =
+                futures::stream::iter(containers.into_iter().map(|container| {
+                    self.teardown_registered_container(container, false, stop_grace)
+                }))
+                .buffered(crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS)
+                .collect()
+                .await;
+            let mut removed_every_container = true;
+            for removal in removals {
+                match removal {
                     Ok(Some(container_id)) => {
                         info!("Removed container {}", container_id);
                         if first_stopped_container_id.is_none() {
@@ -4153,8 +2423,38 @@ impl WorkflowExecutionService {
                         }
                         total_containers_cleaned += 1;
                     }
-                    Ok(None) => {}
-                    Err(error) => warn!("Failed to teardown previous container: {error}"),
+                    // Another task claimed it, and that task may yet fail.
+                    Ok(None) => removed_every_container = false,
+                    Err(error) => {
+                        removed_every_container = false;
+                        warn!("Failed to teardown previous container: {error}");
+                    }
+                }
+            }
+
+            // Nothing is left running, so it is no longer active. Only after
+            // removing containers: a deployment with none may still be building,
+            // and one with a live row stays swept so the next deploy retries it.
+            // Guarded so a concurrent transition is not overwritten.
+            if removed_every_container {
+                let stopped = deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("stopped"))
+                    .col_expr(
+                        deployments::Column::UpdatedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .filter(deployments::Column::Id.eq(deployment.id))
+                    .filter(
+                        deployments::Column::State
+                            .is_in(crate::jobs::mark_deployment_complete::TEARDOWN_SWEPT_STATES),
+                    )
+                    .exec(self.db.as_ref())
+                    .await;
+                if let Err(error) = stopped {
+                    warn!(
+                        deployment_id = deployment.id,
+                        "Failed to mark a torn-down deployment stopped; the next deploy will: {error}"
+                    );
                 }
             }
         }
@@ -4215,7 +2515,10 @@ impl WorkflowExecutionService {
         let cleanup_results = futures::stream::iter(
             retained_failed
                 .into_iter()
-                .map(|(container, _)| self.teardown_registered_container(container, true)),
+                // Containers that failed readiness never served: default grace.
+                .map(|(container, _)| {
+                    self.teardown_registered_container(container, true, default_stop_grace())
+                }),
         )
         .buffer_unordered(RETAINED_CLEANUP_CONCURRENCY)
         .collect::<Vec<_>>()
@@ -4387,7 +2690,7 @@ impl WorkflowExecutionService {
 struct NoOpLogWriter;
 
 #[async_trait::async_trait]
-impl temps_core::LogWriter for NoOpLogWriter {
+impl crate::workflow::LogWriter for NoOpLogWriter {
     async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
         // Jobs write to their own log files directly, so this is a no-op
         Ok(())
@@ -4504,6 +2807,33 @@ pub enum WorkflowExecutionError {
         platform: String,
         reason: String,
     },
+
+    /// Finding or retiring a replica the workload plane started.
+    #[error(transparent)]
+    ReplicaRetire(#[from] crate::services::plane_deployer::ReplicaRetireError),
+    /// Where a Compose stack lives could not be decided, or its home cannot
+    /// take this deployment (see `services::compose_placement`).
+    #[error("Deployment {deployment_id}: {source}")]
+    ComposePlacement {
+        deployment_id: i32,
+        #[source]
+        source: crate::services::compose_placement::ComposePlacementError,
+    },
+
+    /// A Compose stack whose home is a worker links Temps-managed services,
+    /// which its containers there cannot reach.
+    #[error(
+        "Deployment {deployment_id} would run this Docker Compose stack on {host}, but the \
+         project is linked to Temps-managed services ({services}) whose connection details \
+         only resolve on the control plane. Compose stacks on worker nodes cannot reach linked \
+         services yet: unlink them and run the database inside the stack, or move the stack to \
+         the control plane in the environment's Node scheduling settings"
+    )]
+    ComposeLinkedServicesOnWorker {
+        deployment_id: i32,
+        host: String,
+        services: String,
+    },
 }
 
 impl WorkflowExecutionError {
@@ -4526,13 +2856,23 @@ impl WorkflowExecutionError {
             | Self::DedicatedNodesNotPinned { .. }
             // The cluster's state: a target architecture has no reachable
             // worker. Recorded on the deployment with the fix.
-            | Self::NoBuilderForArchitecture { .. } => true,
+            | Self::NoBuilderForArchitecture { .. }
+            // A Compose stack whose home links services it cannot reach.
+            | Self::ComposeLinkedServicesOnWorker { .. } => true,
+            // The stack's home is offline, nothing can take its first
+            // deployment, or a concurrent deployment pinned it elsewhere.
+            // Recorded on the deployment with the fix.
+            Self::ComposePlacement { source, .. } => !matches!(
+                source,
+                crate::services::compose_placement::ComposePlacementError::Database { .. }
+            ),
             Self::DatabaseError(_)
             | Self::NoJobsFound(_)
             | Self::MissingJobConfig(_)
             | Self::InvalidJobConfig(_)
             | Self::UnsupportedJobType(_)
-            | Self::JobCreationFailed(_) => false,
+            | Self::JobCreationFailed(_)
+            | Self::ReplicaRetire(_) => false,
         }
     }
 }
@@ -4548,7 +2888,7 @@ mod tests {
     #[test]
     fn user_caused_failures_are_workload_outcomes() {
         use super::WorkflowExecutionError;
-        use temps_core::WorkflowError;
+        use crate::workflow::WorkflowError;
 
         let outcomes = [
             WorkflowExecutionError::WorkflowFailed(WorkflowError::JobValidationFailed(
@@ -4801,15 +3141,8 @@ mod tests {
     use sea_orm::{ActiveModelTrait, DatabaseBackend, MockDatabase, Set};
     use std::collections::HashMap;
 
-    use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
-
-    async fn docker_available() -> bool {
-        match bollard::Docker::connect_with_local_defaults() {
-            Ok(docker) => docker.ping().await.is_ok(),
-            Err(_) => false,
-        }
-    }
+    use temps_test_utils::TestDatabase;
 
     #[test]
     fn retained_cleanup_retries_sort_after_unattempted_rows_and_rotate() {
@@ -5004,6 +3337,86 @@ mod tests {
             let classification = classify_failure_reason(Some(message));
             assert_eq!(classification.stage, expected_stage, "message: {message}");
             assert_eq!(classification.code, expected_code, "message: {message}");
+        }
+    }
+
+    #[test]
+    fn compose_failure_telemetry_only_emits_catalog_check_labels() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        use temps_presets::compose_security::ComposeSecurityCheckExt;
+        for definition in ComposeSecurityCheck::catalog() {
+            let check = definition.id;
+            assert_eq!(serde_json::to_value(check).unwrap(), check.as_str());
+            for prefix in [
+                "Compose security policy rejected",
+                "Invalid compose override",
+            ] {
+                let reason = format!("{prefix} [check={}] private-field for service 'private-service': private-value", check.as_str());
+                let event = deploy_failed_telemetry_event(Some(&reason), None, None, None);
+                assert_eq!(
+                    event.properties["failure_code"], "compose_policy_rejected",
+                    "{reason}"
+                );
+                let old_reason =
+                    format!("{prefix} private-field for service 'private-service': private-value");
+                assert_eq!(
+                    classify_failure_reason(Some(&reason)),
+                    classify_failure_reason(Some(&old_reason)),
+                    "metadata must not change matching: {reason}"
+                );
+                assert_eq!(event.properties["compose_security_check"], check.as_str());
+                assert_eq!(
+                    event.properties["classifier_version"],
+                    FAILURE_CLASSIFIER_VERSION
+                );
+                assert!(!serde_json::to_string(&event).unwrap().contains("private-"));
+            }
+        }
+        for reason in [
+            "Compose security policy rejected privileged for service 'app': old failure",
+            "Compose security policy rejected [check=private-value] private-field",
+            "Compose security policy rejected [check=unclassified] private-field [check=privileged]",
+            "Container exited during startup. Last log lines: Compose security policy rejected [check=privileged]",
+            "Container exited during startup. Container logs for unhealthy/stopped services: Compose security policy rejected [check=privileged]",
+        ] {
+            let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
+            assert!(!event.properties.contains_key("compose_security_check"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn real_oom_policy_rejections_emit_the_check_without_changing_the_taxonomy() {
+        let error = temps_deployer::compose::ComposeError::SecurityPolicyViolation {
+            check: Some(temps_entities::compose_security::ComposeSecurityCheck::OomKiller),
+            service: "app".to_string(), field: "oom_kill_disable".to_string(),
+            reason: "disabling the OOM killer can turn container memory pressure into a host-wide denial of service".to_string(),
+        };
+        let reason = format!(
+            "Compose configuration check failed for project 42 (policy_violation): {error}"
+        );
+        let event = deploy_failed_telemetry_event(Some(&reason), None, None, None);
+        assert_eq!(event.properties["compose_security_check"], "oom_killer");
+        let old_reason = reason.replace("[check=oom_killer] ", "");
+        let old_classification = classify_failure_reason(Some(&old_reason));
+        assert_eq!(
+            event.properties["failure_code"],
+            old_classification.code.as_str()
+        );
+        assert_eq!(
+            event.properties["classifier_version"],
+            FAILURE_CLASSIFIER_VERSION
+        );
+    }
+
+    #[test]
+    fn build_output_cannot_claim_a_compose_security_check() {
+        for reason in [
+            "Compose prepare/pull failed: Docker Compose command failed for project 'app': build stderr: Compose security policy rejected [check=privileged]",
+            "Required job 'build_image' failed: Compose security policy rejected [check=privileged]",
+            "Compose deploy failed: service 'Compose security policy rejected [check=privileged]' exited",
+        ] {
+            let event = deploy_failed_telemetry_event(Some(reason), None, None, None);
+            assert!(!event.properties.contains_key("compose_security_check"), "{reason}");
         }
     }
 
@@ -5486,6 +3899,8 @@ mod tests {
                 memory_percent: Some(12.5),
                 network_rx_bytes: 1024000,
                 network_tx_bytes: 512000,
+                block_read_bytes: None,
+                block_write_bytes: None,
                 timestamp: chrono::Utc::now(),
                 ..Default::default()
             })
@@ -5703,6 +4118,751 @@ mod tests {
         Ok(())
     }
 
+    /// What one persisted `deployment_jobs` row must produce: the job, named by
+    /// the struct its `Debug` prints, or the exact error.
+    enum JobOutcome {
+        Builds(&'static str),
+        Fails(String),
+    }
+
+    struct JobRow {
+        job_type: &'static str,
+        config: Option<serde_json::Value>,
+        dependencies: Option<serde_json::Value>,
+        outcome: JobOutcome,
+    }
+
+    impl JobRow {
+        fn builds(
+            job_type: &'static str,
+            job_struct: &'static str,
+            config: serde_json::Value,
+        ) -> Self {
+            Self {
+                job_type,
+                config: Some(config),
+                dependencies: None,
+                outcome: JobOutcome::Builds(job_struct),
+            }
+        }
+
+        fn invalid(job_type: &'static str, config: serde_json::Value, message: &str) -> Self {
+            Self {
+                job_type,
+                config: Some(config),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Invalid job config: {message}")),
+            }
+        }
+
+        fn unsupported(job_type: &'static str) -> Self {
+            Self {
+                job_type,
+                config: Some(serde_json::json!({})),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Unsupported job type: {job_type}")),
+            }
+        }
+
+        fn without_config(job_type: &'static str) -> Self {
+            Self {
+                job_type,
+                config: None,
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Missing job config for job: {JOB_UNDER_TEST}")),
+            }
+        }
+
+        fn depends_on(mut self, job_id: &str) -> Self {
+            self.dependencies = Some(serde_json::json!([job_id]));
+            self
+        }
+    }
+
+    const JOB_UNDER_TEST: &str = "job_under_test";
+
+    /// Every `deployment_jobs.job_type` string that constructs a job.
+    const BUILDABLE_JOB_TYPES: [&str; 21] = [
+        "DownloadRepoJob",
+        "BuildImageJob",
+        "DeployContainerJob",
+        "DeployImageJob",
+        "ConfigureCronsJob",
+        "DeploymentWorkflowsJob",
+        "ConfigureMetricAlertsJob",
+        "ConfigureAgentsJob",
+        "MarkDeploymentCompleteJob",
+        "TakeScreenshotJob",
+        "ScanVulnerabilitiesJob",
+        "CaptureSourceMapsJob",
+        "CaptureSourceFilesJob",
+        "PersistStaticAssetsJob",
+        "DeployStaticJob",
+        "DeployStaticFromSourceJob",
+        "PullExternalImageJob",
+        "VerifyLocalImageJob",
+        "DeployStaticBundleJob",
+        "PrepareSourceBundleJob",
+        "DeployComposeJob",
+    ];
+
+    /// Strings that were once job types but construct nothing, and strings that
+    /// only look like job types: the column is free-form text.
+    const REFUSED_JOB_TYPES: [&str; 7] = [
+        "HealthCheckJob",
+        "DeployBasicJob",
+        "BuildStaticJob",
+        "NotAJob",
+        "",
+        "downloadrepojob",
+        " DownloadRepoJob",
+    ];
+
+    /// A valid row for each job type: the smallest config it accepts, then one
+    /// that sets every field it reads.
+    fn job_rows_that_build() -> Vec<JobRow> {
+        use serde_json::json;
+        vec![
+            JobRow::builds(
+                "DownloadRepoJob",
+                "DownloadRepoJob",
+                json!({
+                    "repo_owner": "owner",
+                    "repo_name": "repo",
+                    "git_provider_connection_id": 1,
+                }),
+            ),
+            JobRow::builds(
+                "DownloadRepoJob",
+                "DownloadRepoJob",
+                json!({
+                    "repo_owner": "owner",
+                    "repo_name": "repo",
+                    "is_public_repo": true,
+                    "git_url": "https://git.example.com/owner/repo.git",
+                    "branch_ref": "develop",
+                    "tag_ref": "v1.0.0",
+                    "commit_sha": "0123456789abcdef",
+                    "directory": "apps/web",
+                    "pull_only_root_directory": true,
+                }),
+            ),
+            JobRow::builds("BuildImageJob", "BuildImageJob", json!({})),
+            JobRow::builds(
+                "BuildImageJob",
+                "BuildImageJob",
+                json!({
+                    "dockerfile_path": "docker/Dockerfile",
+                    "build_context": "apps/web",
+                    "build_args": { "NODE_ENV": "production" },
+                    "worker_build_arg_keys": ["NODE_ENV"],
+                }),
+            )
+            .depends_on("fetch_source"),
+            JobRow::builds("DeployContainerJob", "DeployImageJob", json!({})),
+            JobRow::builds("DeployImageJob", "DeployImageJob", json!({})),
+            JobRow::builds(
+                "DeployImageJob",
+                "DeployImageJob",
+                json!({
+                    "port": 8080,
+                    "configured_port": 8081,
+                    "replicas": 3,
+                    "use_external_image": true,
+                    "image_name": "registry.example.com/team/app:1.0.0",
+                    "environment_variables": { "APP_MODE": "production" },
+                    "secrets": { "API_TOKEN": "not-a-real-token" },
+                }),
+            )
+            .depends_on("build_step"),
+            JobRow::builds("ConfigureCronsJob", "ConfigureCronsJob", json!({})),
+            JobRow::builds(
+                "DeploymentWorkflowsJob",
+                "DeploymentWorkflowsJob",
+                json!({}),
+            ),
+            JobRow::builds(
+                "ConfigureCronsJob",
+                "ConfigureCronsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds(
+                "ConfigureMetricAlertsJob",
+                "ConfigureMetricAlertsJob",
+                json!({}),
+            ),
+            JobRow::builds(
+                "ConfigureMetricAlertsJob",
+                "ConfigureMetricAlertsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds("ConfigureAgentsJob", "ConfigureAgentsJob", json!({})),
+            JobRow::builds(
+                "ConfigureAgentsJob",
+                "ConfigureAgentsJob",
+                json!({ "download_job_id": "fetch_source" }),
+            )
+            .depends_on("deploy_step"),
+            JobRow::builds(
+                "MarkDeploymentCompleteJob",
+                "MarkDeploymentCompleteJob",
+                json!({ "deployment_id": 41 }),
+            ),
+            JobRow::builds(
+                "TakeScreenshotJob",
+                "TakeScreenshotJob",
+                json!({ "deployment_id": 41 }),
+            ),
+            JobRow::builds(
+                "ScanVulnerabilitiesJob",
+                "ScanVulnerabilitiesJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "branch": "main",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                }),
+            ),
+            JobRow::builds(
+                "ScanVulnerabilitiesJob",
+                "ScanVulnerabilitiesJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "branch": "main",
+                    "commit_hash": "0123456789abcdef",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                }),
+            ),
+            JobRow::builds(
+                "CaptureSourceMapsJob",
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41, "project_id": 42, "release": "1.0.0" }),
+            ),
+            JobRow::builds(
+                "CaptureSourceMapsJob",
+                "CaptureSourceMapsJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "release": "1.0.0",
+                    "build_job_id": "build_step",
+                    "search_paths": ["/app/dist"],
+                    "path_rewrites": [["/app/", "~/"]],
+                }),
+            ),
+            JobRow::builds(
+                "CaptureSourceFilesJob",
+                "CaptureSourceFilesJob",
+                json!({ "project_id": 42, "release": "1.0.0" }),
+            ),
+            JobRow::builds(
+                "CaptureSourceFilesJob",
+                "CaptureSourceFilesJob",
+                json!({
+                    "project_id": 42,
+                    "release": "1.0.0",
+                    "download_job_id": "fetch_source",
+                    "build_job_id": "build_step",
+                    "error_source_root": "src",
+                    "extensions": ["ts", "tsx"],
+                }),
+            ),
+            JobRow::builds(
+                "PersistStaticAssetsJob",
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41, "project_id": 42, "environment_id": 43 }),
+            ),
+            JobRow::builds(
+                "PersistStaticAssetsJob",
+                "PersistStaticAssetsJob",
+                json!({
+                    "deployment_id": 41,
+                    "project_id": 42,
+                    "environment_id": 43,
+                    "build_job_id": "build_step",
+                    "search_paths": ["/app/dist"],
+                    "path_rewrites": [["/app/", "~/"]],
+                    "deployment_slug": "deployment-41",
+                }),
+            ),
+            JobRow::builds("DeployStaticJob", "DeployStaticJob", json!({})),
+            JobRow::builds(
+                "DeployStaticJob",
+                "DeployStaticJob",
+                json!({ "static_output_dir": "/app/out" }),
+            )
+            .depends_on("build_step"),
+            JobRow::builds(
+                "DeployStaticFromSourceJob",
+                "DeployStaticFromSourceJob",
+                json!({}),
+            ),
+            JobRow::builds(
+                "DeployStaticFromSourceJob",
+                "DeployStaticFromSourceJob",
+                json!({ "directory": "site" }),
+            )
+            .depends_on("fetch_source"),
+            JobRow::builds(
+                "PullExternalImageJob",
+                "PullExternalImageJob",
+                json!({ "image_ref": "registry.example.com/team/app:1.0.0" }),
+            ),
+            JobRow::builds(
+                "PullExternalImageJob",
+                "PullExternalImageJob",
+                json!({
+                    "image_ref": "registry.example.com/team/app:1.0.0",
+                    "external_image_id": 44,
+                }),
+            ),
+            JobRow::builds(
+                "VerifyLocalImageJob",
+                "VerifyLocalImageJob",
+                json!({ "image_ref": "app:1.0.0" }),
+            ),
+            JobRow::builds(
+                "VerifyLocalImageJob",
+                "VerifyLocalImageJob",
+                json!({ "image_ref": "app:1.0.0", "expected_image_id": "sha256:abc" }),
+            ),
+            JobRow::builds(
+                "DeployStaticBundleJob",
+                "DeployStaticBundleJob",
+                json!({ "bundle_path": "bundles/site.tgz" }),
+            ),
+            JobRow::builds(
+                "DeployStaticBundleJob",
+                "DeployStaticBundleJob",
+                json!({
+                    "bundle_path": "bundles/site.zip",
+                    "content_type": "application/zip",
+                    "static_bundle_id": 45,
+                    "source_directory": "public",
+                }),
+            ),
+            JobRow::builds(
+                "PrepareSourceBundleJob",
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "sources/site.tgz" }),
+            ),
+            JobRow::builds(
+                "DeployComposeJob",
+                "DeployComposeJob",
+                json!({ "compose_path": "compose.yaml" }),
+            ),
+            JobRow::builds(
+                "DeployComposeJob",
+                "DeployComposeJob",
+                json!({
+                    "compose_path": "compose.yaml",
+                    "directory": "/services/api",
+                    "compose_content": "services: {}",
+                    "environment_vars": { "APP_MODE": "production" },
+                    "build_args": { "NODE_ENV": "production" },
+                    "secrets": { "API_TOKEN": "not-a-real-token" },
+                    "secret_compose_services": { "API_TOKEN": ["web"] },
+                }),
+            )
+            .depends_on("fetch_source"),
+        ]
+    }
+
+    /// A config that names each required field in turn, pinning which field is
+    /// reported and in what order.
+    fn job_rows_with_invalid_config() -> Vec<JobRow> {
+        use serde_json::json;
+        let mut rows = vec![
+            JobRow::invalid("DownloadRepoJob", json!({}), "repo_owner missing"),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner" }),
+                "repo_name missing",
+            ),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner", "repo_name": "repo", "is_public_repo": true }),
+                "git_url is required for public repositories",
+            ),
+            JobRow::invalid(
+                "DownloadRepoJob",
+                json!({ "repo_owner": "owner", "repo_name": "repo" }),
+                "git_provider_connection_id is required for private repositories",
+            ),
+            JobRow::invalid(
+                "MarkDeploymentCompleteJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid("TakeScreenshotJob", json!({}), "deployment_id is required"),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41 }),
+                "project_id is required",
+            ),
+            JobRow::invalid(
+                "CaptureSourceMapsJob",
+                json!({ "deployment_id": 41, "project_id": 42 }),
+                "release is required",
+            ),
+            JobRow::invalid("CaptureSourceFilesJob", json!({}), "project_id is required"),
+            JobRow::invalid(
+                "CaptureSourceFilesJob",
+                json!({ "project_id": 42 }),
+                "release is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({}),
+                "deployment_id is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41 }),
+                "project_id is required",
+            ),
+            JobRow::invalid(
+                "PersistStaticAssetsJob",
+                json!({ "deployment_id": 41, "project_id": 42 }),
+                "environment_id is required",
+            ),
+            JobRow::invalid("PullExternalImageJob", json!({}), "image_ref is required"),
+            JobRow::invalid("VerifyLocalImageJob", json!({}), "image_ref is required"),
+            JobRow::invalid(
+                "DeployStaticBundleJob",
+                json!({}),
+                "bundle_path is required",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({}),
+                "archive_path is required",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "/etc/passwd" }),
+                "source archive path must remain inside the Temps data directory",
+            ),
+            JobRow::invalid(
+                "PrepareSourceBundleJob",
+                json!({ "archive_path": "sources/../../outside.tgz" }),
+                "source archive path must remain inside the Temps data directory",
+            ),
+            JobRow::invalid(
+                "DeployComposeJob",
+                json!({ "secret_compose_services": "web" }),
+                "invalid type: string \"web\", expected a map",
+            ),
+        ];
+        // Each required field of the scan job, in the order it is read.
+        let mut scan_config = serde_json::Map::new();
+        for (field, value) in [
+            ("deployment_id", json!(41)),
+            ("project_id", json!(42)),
+            ("environment_id", json!(43)),
+            ("branch", json!("main")),
+            ("download_job_id", json!("fetch_source")),
+            ("build_job_id", json!("build_step")),
+        ] {
+            rows.push(JobRow::invalid(
+                "ScanVulnerabilitiesJob",
+                serde_json::Value::Object(scan_config.clone()),
+                &format!("{field} is required"),
+            ));
+            scan_config.insert(field.to_string(), value);
+        }
+        rows
+    }
+
+    async fn assert_job_row(
+        service: &WorkflowExecutionService,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment_id: i32,
+        deployment: &deployments::Model,
+        row: &JobRow,
+    ) {
+        let mut db_job = planned_job(deployment_id, JOB_UNDER_TEST, row.job_type);
+        db_job.job_config = row.config.clone();
+        db_job.dependencies = row.dependencies.clone();
+        let label = format!("{:?} with config {:?}", row.job_type, row.config);
+
+        let result = service
+            .create_job_from_record(project, environment, deployment, &db_job)
+            .await;
+        match (result, &row.outcome) {
+            (Ok(job), JobOutcome::Builds(job_struct)) => {
+                let built = format!("{job:?}");
+                assert!(
+                    built.starts_with(&format!("{job_struct} {{")),
+                    "{label} must build {job_struct}, built {built}"
+                );
+                assert_eq!(job.job_id(), JOB_UNDER_TEST, "{label}");
+                println!("{label} => {built}");
+            }
+            (Err(error), JobOutcome::Fails(message)) => {
+                assert_eq!(&error.to_string(), message, "{label}");
+            }
+            (Ok(job), JobOutcome::Fails(message)) => {
+                panic!("{label} must fail with {message:?}, built {job:?}")
+            }
+            (Err(error), JobOutcome::Builds(job_struct)) => {
+                panic!("{label} must build {job_struct}, failed with {error}")
+            }
+        }
+    }
+
+    /// `deployment_jobs.job_type` is free-form text read back from the
+    /// database, so this table is the contract of the column: every string it
+    /// may hold, and the job or the error each one yields.
+    #[tokio::test]
+    async fn every_job_type_string_builds_its_job_or_returns_its_error(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        let mut rows: Vec<JobRow> = BUILDABLE_JOB_TYPES
+            .into_iter()
+            .map(JobRow::without_config)
+            .collect();
+        rows.extend(REFUSED_JOB_TYPES.into_iter().map(JobRow::unsupported));
+        // A refused string fails on its type, before any config is read.
+        rows.extend(REFUSED_JOB_TYPES.into_iter().map(|job_type| JobRow {
+            config: None,
+            ..JobRow::unsupported(job_type)
+        }));
+        rows.extend(job_rows_with_invalid_config());
+        for row in &rows {
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                row,
+            )
+            .await;
+        }
+
+        let rows_that_build = job_rows_that_build();
+        for job_type in BUILDABLE_JOB_TYPES {
+            assert!(
+                rows_that_build.iter().any(|row| row.job_type == job_type),
+                "{job_type} has no row that builds it"
+            );
+        }
+
+        // Some jobs need a service the plugin binds late: they read their
+        // config first, then refuse without it.
+        let refusal = |job_type: &str| {
+            match job_type {
+            "DeploymentWorkflowsJob" => Some("Job creation failed: Durable workflows service is required for deployment workflow jobs"),
+            "CaptureSourceMapsJob" | "CaptureSourceFilesJob" => {
+                Some("Invalid job config: SourceMapService not configured")
+            }
+            "MarkDeploymentCompleteJob" => {
+                Some("Workflow error: Job validation failed: encryption_service is required")
+            }
+            _ => None,
+        }
+        };
+        for row in &rows_that_build {
+            let Some(message) = refusal(row.job_type) else {
+                continue;
+            };
+            let refused = JobRow {
+                job_type: row.job_type,
+                config: row.config.clone(),
+                dependencies: None,
+                outcome: JobOutcome::Fails(message.to_string()),
+            };
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                &refused,
+            )
+            .await;
+        }
+        service.set_workflow_control(Arc::new(
+            crate::services::cron_workflows::fake::FakeWorkflowControl::default(),
+        ));
+        service.set_source_map_service(Arc::new(SourceMapService::new(db.clone())));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+
+        for row in &rows_that_build {
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                deployment.id,
+                &deployment,
+                row,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// A job added to the registry without a row here fails, and so does a
+    /// string claimed twice: the first registration would silently win.
+    #[test]
+    fn the_job_type_table_covers_exactly_what_the_registry_claims() {
+        let mut registered = job_registry::registered_job_types();
+        registered.sort_unstable();
+        let mut buildable = BUILDABLE_JOB_TYPES.to_vec();
+        buildable.sort_unstable();
+        assert_eq!(registered, buildable);
+
+        for job_type in job_registry::UNSUPPORTED_JOB_TYPES {
+            assert!(
+                REFUSED_JOB_TYPES.contains(job_type),
+                "{job_type} has no row in the table"
+            );
+            assert!(
+                !registered.contains(job_type),
+                "{job_type} is both registered and refused"
+            );
+        }
+    }
+
+    /// The jobs named after the deployment read its row again rather than
+    /// trusting the caller's copy, so a row deleted under them is reported.
+    #[tokio::test]
+    async fn jobs_that_read_the_deployment_again_report_a_deleted_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let missing_deployment = deployment.id + 1_000;
+
+        for job_type in [
+            "BuildImageJob",
+            "DeployContainerJob",
+            "DeployImageJob",
+            "DeployStaticJob",
+            "DeployStaticFromSourceJob",
+        ] {
+            let row = JobRow {
+                job_type,
+                config: Some(serde_json::json!({})),
+                dependencies: None,
+                outcome: JobOutcome::Fails(format!("Deployment {missing_deployment} not found")),
+            };
+            assert_job_row(
+                &service,
+                &project,
+                &environment,
+                missing_deployment,
+                &deployment,
+                &row,
+            )
+            .await;
+        }
+
+        Ok(())
+    }
+
+    /// Which builder a `BuildImageJob` gets follows the environment's build
+    /// location and whether this host runs workloads.
+    #[tokio::test]
+    async fn the_build_location_decides_who_builds_the_image(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_config::{BuildLocation, DeploymentConfig};
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let mut db_job = planned_job(deployment.id, JOB_UNDER_TEST, "BuildImageJob");
+        db_job.job_config = Some(serde_json::json!({ "build_args": { "NODE_ENV": "production" } }));
+        let at = |location| {
+            Some(DeploymentConfig {
+                build_location: Some(location),
+                ..Default::default()
+            })
+        };
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+
+        // Node: a preference. With no worker to take it, the build stays here,
+        // for this host's platform rather than a worker's.
+        environment.deployment_config = at(BuildLocation::Node);
+        let job = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await?;
+        let built = format!("{job:?}");
+        assert!(built.contains("target_platforms: []"), "{built}");
+        println!("node, no worker => {built}");
+
+        // CI: never silently local, so a missing prerequisite is an error.
+        environment.deployment_config = at(BuildLocation::Ci);
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a CI build without its encryption service must not build locally");
+        assert_eq!(
+            error.to_string(),
+            "Invalid job config: CI build encryption service unavailable"
+        );
+
+        // CI with its prerequisites still needs a worker to receive the
+        // artifacts when this host's builder knows no platform of its own.
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a CI build with nowhere to put its artifacts must not start");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Job creation failed: Deployment {} cannot select a build node: node scheduler \
+                 is unavailable",
+                deployment.id
+            )
+        );
+
+        // No local daemon: a node must build it, and there is none.
+        let service = control_plane_service(db.clone()).await?;
+        environment.deployment_config = None;
+        let error = service
+            .create_job_from_record(&project, &environment, &deployment, &db_job)
+            .await
+            .expect_err("a control plane with no worker has nowhere to build");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Invalid job config: Deployment {}: no target worker has reported a buildable \
+                 architecture, so there is no platform to build for. Check that a worker is \
+                 active and has completed a heartbeat (`temps join`), and that the target \
+                 nodes/labels select it",
+                deployment.id
+            )
+        );
+
+        Ok(())
+    }
+
     /// Whatever stops a workflow from being assembled, the planned job rows
     /// must not be left saying "pending" on a deployment that is over. A
     /// self-hosted operator staring at a timeline that never resolves has no
@@ -5820,7 +4980,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_deployment_workflow_with_jobs() -> Result<(), Box<dyn std::error::Error>>
     {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -5925,7 +5085,7 @@ mod tests {
     #[tokio::test]
     async fn failed_status_path_sanitizes_operator_template_and_raw_reason(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -6049,6 +5209,36 @@ mod tests {
         db: Arc<DbConnection>,
         fail_remove_container: Option<&'static str>,
         remove_calls: Arc<std::sync::atomic::AtomicUsize>,
+        /// A stop of a container with this prefix never answers, like an
+        /// unreachable worker's.
+        hang_stop_prefix: Option<&'static str>,
+        stops: Arc<StopLoad>,
+    }
+
+    #[derive(Default)]
+    struct StopLoad {
+        in_flight: std::sync::atomic::AtomicUsize,
+        most_in_flight: std::sync::atomic::AtomicUsize,
+    }
+
+    /// Counts one stop as in flight until it finishes or is abandoned.
+    struct StopInFlight(Arc<StopLoad>);
+
+    impl StopInFlight {
+        fn enter(load: Arc<StopLoad>) -> Self {
+            use std::sync::atomic::Ordering::SeqCst;
+            let in_flight = load.in_flight.fetch_add(1, SeqCst) + 1;
+            load.most_in_flight.fetch_max(in_flight, SeqCst);
+            Self(load)
+        }
+    }
+
+    impl Drop for StopInFlight {
+        fn drop(&mut self) {
+            self.0
+                .in_flight
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 
     #[async_trait]
@@ -6083,6 +5273,7 @@ mod tests {
             &self,
             container_id: &str,
         ) -> Result<(), temps_deployer::DeployerError> {
+            let _in_flight = StopInFlight::enter(self.stops.clone());
             let container = temps_entities::deployment_containers::Entity::find()
                 .filter(temps_entities::deployment_containers::Column::ContainerId.eq(container_id))
                 .one(self.db.as_ref())
@@ -6096,6 +5287,12 @@ mod tests {
                  observe an Exited container with no signal that the exit is an \
                  intentional teardown, and fires a false ContainerCrash alarm"
             );
+            if self
+                .hang_stop_prefix
+                .is_some_and(|prefix| container_id.starts_with(prefix))
+            {
+                std::future::pending::<()>().await;
+            }
             Ok(())
         }
 
@@ -6177,7 +5374,7 @@ mod tests {
         };
         use temps_entities::{deployment_containers, nodes};
 
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             eprintln!("Skipping retired worker cleanup test: Docker unavailable");
             return Ok(());
         }
@@ -6308,12 +5505,135 @@ mod tests {
         Ok(())
     }
 
+    /// A worker that stops answering must not hold the environment's lifecycle
+    /// lock for minutes per replica, which would block pausing and resuming its
+    /// healthy deployments. Each replica gets one bounded attempt, several at
+    /// once, and what could not be removed stays recorded for the next deploy.
+    #[tokio::test]
+    async fn test_teardown_bounds_how_long_an_unanswering_worker_can_hold_it_up(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Skipping container teardown integration test: Docker unavailable");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        let previous = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("previous-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let replicas = crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS + 1;
+        let mut container_ids: Vec<String> = (0..replicas).map(|n| format!("hung-{n}")).collect();
+        container_ids.push("answers-1".to_string());
+        for container_id in &container_ids {
+            deployment_containers::ActiveModel {
+                deployment_id: Set(previous.id),
+                container_id: Set(container_id.clone()),
+                container_name: Set(container_id.clone()),
+                container_port: Set(Some(3000)),
+                status: Set(Some("running".to_string())),
+                deployed_at: Set(Utc::now()),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(10);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let stops = Arc::new(StopLoad::default());
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer {
+            db: db.clone(),
+            fail_remove_container: None,
+            remove_calls: Arc::default(),
+            hang_stop_prefix: Some("hung-"),
+            stops: stops.clone(),
+        });
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(DockerHandle::available(Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        )));
+        let mut service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            container_deployer,
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            Arc::new(crate::jobs::DeploymentCaptureGuard::default()),
+            docker,
+        );
+        service.container_teardown_timeout = std::time::Duration::from_secs(2);
+
+        let stopped = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            service.teardown_previous_deployment(project.id, environment.id, &current_deployment),
+        )
+        .await
+        .expect("a worker that never answers must not hang the sweep")?;
+        assert_eq!(stopped.as_deref(), Some("answers-1"));
+
+        let most = stops
+            .most_in_flight
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            most > 1 && most <= crate::jobs::mark_deployment_complete::MAX_CONCURRENT_REPLICA_STOPS,
+            "stops overlap, within the limit: {most} at once"
+        );
+        let rows = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.eq(previous.id))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(rows.len(), container_ids.len());
+        for row in rows {
+            if row.container_id == "answers-1" {
+                assert!(row.deleted_at.is_some(), "{} was removed", row.container_id);
+            } else {
+                assert!(
+                    row.deleted_at.is_none(),
+                    "{} may still be running, so a later deploy must find it",
+                    row.container_id
+                );
+                assert_eq!(row.status.as_deref(), Some("running"));
+            }
+        }
+        let after = deployments::Entity::find_by_id(previous.id)
+            .one(db.as_ref())
+            .await?
+            .ok_or("deployment row")?;
+        assert_eq!(after.state, "completed", "stays eligible for a retry");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
     ) -> Result<(), Box<dyn std::error::Error>> {
         use temps_entities::{deployment_containers, nodes};
 
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             eprintln!("Skipping container teardown integration test: Docker unavailable");
             return Ok(());
         }
@@ -6343,6 +5663,61 @@ mod tests {
             deployment_id: Set(previous_deployment.id),
             container_id: Set("old-container-1".to_string()),
             container_name: Set("old-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // A resume leaves a deployment "deployed", and a newer deployment
+        // supersedes it like any other. Older than the one above, so that one
+        // stays the first container stopped.
+        let resumed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("resumed-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(7)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let resumed_container = deployment_containers::ActiveModel {
+            deployment_id: Set(resumed_deployment.id),
+            container_id: Set("resumed-container-1".to_string()),
+            container_name: Set("resumed-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Paused once this sweep has selected it, while it waits for the lock
+        // below: a resume needs its containers.
+        let pausing_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("pausing-deployment".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(8)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let pausing_container = deployment_containers::ActiveModel {
+            deployment_id: Set(pausing_deployment.id),
+            container_id: Set("pausing-container-1".to_string()),
+            container_name: Set("pausing-container-1".to_string()),
             container_port: Set(Some(3000)),
             deployed_at: Set(Utc::now()),
             ..Default::default()
@@ -6462,6 +5837,51 @@ mod tests {
         .insert(db.as_ref())
         .await?;
 
+        // One container this sweep cannot reach, so the deployment still has a
+        // live row and must stay in a swept state for the next deploy to retry.
+        let unreachable_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("unreachable-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(9)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(unreachable_deployment.id),
+            container_id: Set("unreachable-container-1".to_string()),
+            container_name: Set("unreachable-container-1".to_string()),
+            container_port: Set(Some(3000)),
+            node_id: Set(Some(unavailable_node.id)),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Older and still building: it has no containers yet, so there is
+        // nothing to say it is finished.
+        let building_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("building-deployment".to_string()),
+            state: Set("running".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(10)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
         let legacy_retry_container = deployment_containers::ActiveModel {
             deployment_id: Set(failed_deployment.id),
             container_id: Set("legacy-remote-failure".to_string()),
@@ -6527,6 +5947,8 @@ mod tests {
             db: db.clone(),
             fail_remove_container: Some("legacy-remove-error"),
             remove_calls: remove_calls.clone(),
+            hang_stop_prefix: None,
+            stops: Arc::default(),
         });
         let static_deployer = Arc::new(MockStaticDeployer);
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
@@ -6557,11 +5979,70 @@ mod tests {
             docker,
         );
 
-        let stopped_container_id = service
-            .teardown_previous_deployment(project.id, environment.id, &current_deployment)
+        // The sweep waits for a pause holding the lifecycle lock, and what it
+        // selected before that is checked again once it gets the lock.
+        let lifecycle_lock =
+            crate::jobs::mark_deployment_complete::environment_lifecycle_lock(environment.id);
+        let pause_in_progress = lifecycle_lock.lock().await;
+        let teardown =
+            service.teardown_previous_deployment(project.id, environment.id, &current_deployment);
+        tokio::pin!(teardown);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(200), &mut teardown)
+                .await
+                .is_err(),
+            "the sweep must wait for the lifecycle lock"
+        );
+        deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("paused"))
+            .filter(deployments::Column::Id.eq(pausing_deployment.id))
+            .exec(db.as_ref())
             .await?;
+        drop(pause_in_progress);
+        let stopped_container_id = teardown.await?;
 
         assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
+
+        let state_of = |id: i32| {
+            let db = db.clone();
+            async move {
+                deployments::Entity::find_by_id(id)
+                    .one(db.as_ref())
+                    .await
+                    .map(|deployment| deployment.map(|deployment| deployment.state))
+            }
+        };
+        assert_eq!(
+            state_of(previous_deployment.id).await?.as_deref(),
+            Some("stopped"),
+            "a deployment with every container removed is no longer active"
+        );
+        assert_eq!(
+            state_of(resumed_deployment.id).await?.as_deref(),
+            Some("stopped")
+        );
+        assert_eq!(
+            state_of(unreachable_deployment.id).await?.as_deref(),
+            Some("completed"),
+            "a live container keeps the deployment in a swept state for a retry"
+        );
+        assert_eq!(
+            state_of(building_deployment.id).await?.as_deref(),
+            Some("running"),
+            "no container was removed, so nothing says this one is finished"
+        );
+        assert_eq!(
+            state_of(pausing_deployment.id).await?.as_deref(),
+            Some("paused")
+        );
+        let pausing_refreshed = deployment_containers::Entity::find_by_id(pausing_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("paused container row still exists");
+        assert!(
+            pausing_refreshed.deleted_at.is_none(),
+            "a resume needs the containers of a deployment paused during the sweep"
+        );
 
         let refreshed = deployment_containers::Entity::find_by_id(container.id)
             .one(db.as_ref())
@@ -6569,6 +6050,15 @@ mod tests {
             .expect("container row still exists");
         assert!(refreshed.deleted_at.is_some());
         assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let resumed_refreshed = deployment_containers::Entity::find_by_id(resumed_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("resumed container row still exists");
+        assert!(
+            resumed_refreshed.deleted_at.is_some(),
+            "a resumed deployment's container must not outlive a newer deployment"
+        );
 
         let retained_refreshed = deployment_containers::Entity::find_by_id(retained_container.id)
             .one(db.as_ref())
@@ -6642,12 +6132,12 @@ mod tests {
         .insert(db.as_ref())
         .await?;
         let first_result = service
-            .teardown_registered_container(stale_snapshot.clone(), true)
+            .teardown_registered_container(stale_snapshot.clone(), true, default_stop_grace())
             .await?;
         assert_eq!(first_result, Some(stale_snapshot.container_id.clone()));
         let calls_after_winner = remove_calls.load(std::sync::atomic::Ordering::SeqCst);
         let stale_result = service
-            .teardown_registered_container(stale_snapshot.clone(), true)
+            .teardown_registered_container(stale_snapshot.clone(), true, default_stop_grace())
             .await?;
         assert_eq!(stale_result, None);
         assert_eq!(
@@ -6750,6 +6240,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -6789,12 +6281,14 @@ mod tests {
             mesh_wg_endpoint: None,
             mesh_wg_address: None,
             failover_at: None,
+            drain_requested_at: None,
             dns_resolver_running: None,
             dns_resolver_tasks_alive: None,
             dns_resolver_last_sync_at: None,
             dns_resolver_consecutive_failures: 0,
             dns_resolver_last_error: None,
             dns_resolver_record_count: None,
+            deployments_without_resolver: None,
             build_limits: None,
             public_ingress_enabled: false,
             public_ingress_running: None,
@@ -6803,6 +6297,13 @@ mod tests {
             public_ingress_route_count: None,
             public_ingress_unsupported_route_count: None,
             public_ingress_unsupported_reasons: serde_json::json!([]),
+            occupied_ranges: None,
+            overlay_status: None,
+            overlay_last_error: None,
+            overlay_ready_cidr: None,
+            overlay_remediation: None,
+            overlay_network_name: None,
+            overlay_vxlan_vni: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -6904,7 +6405,7 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_only_dedicated_nodes_could_run_fails_before_any_job_runs(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -6994,7 +6495,7 @@ mod tests {
     #[tokio::test]
     async fn the_pre_build_placement_check_only_rejects_unpinned_dedicated_placement(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !docker_available().await {
+        if !temps_test_utils::docker_available().await {
             println!("Docker not available, skipping");
             return Ok(());
         }
@@ -7056,6 +6557,126 @@ mod tests {
             Err(WorkflowExecutionError::DedicatedNodesNotPinned { .. })
         ));
 
+        Ok(())
+    }
+
+    /// Compose placement failures the operator acts on are recorded as
+    /// deployment outcomes; a database failure is Temps' own fault.
+    #[test]
+    fn compose_placement_failures_are_outcomes_except_database_errors() {
+        use crate::services::compose_placement::ComposePlacementError;
+        let offline = WorkflowExecutionError::ComposePlacement {
+            deployment_id: 12,
+            source: ComposePlacementError::HomeNodeUnavailable {
+                environment_id: 3,
+                environment_name: "production".to_string(),
+                node_id: 7,
+                node_name: "worker-a".to_string(),
+                state: "offline".to_string(),
+            },
+        };
+        let message = offline.to_string();
+        assert!(message.starts_with("Deployment 12: "), "{message}");
+        assert!(message.contains("'worker-a' (id 7)"), "{message}");
+        assert!(offline.is_workload_outcome());
+        assert_eq!(
+            crate::services::failure_classifier::classify_failure_reason(Some(&message)).code,
+            crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
+        );
+
+        let database = WorkflowExecutionError::ComposePlacement {
+            deployment_id: 12,
+            source: ComposePlacementError::Database {
+                environment_id: 3,
+                operation: "reading the Compose placement",
+                source: sea_orm::DbErr::Custom("connection reset".to_string()),
+            },
+        };
+        assert!(!database.is_workload_outcome());
+
+        let linked = WorkflowExecutionError::ComposeLinkedServicesOnWorker {
+            deployment_id: 12,
+            host: "worker node 'worker-a' (id 7)".to_string(),
+            services: "'orders-db'".to_string(),
+        };
+        let message = linked.to_string();
+        assert!(message.contains("'orders-db'"), "{message}");
+        assert!(linked.is_workload_outcome());
+        assert_eq!(
+            crate::services::failure_classifier::classify_failure_reason(Some(&message)).code,
+            crate::services::failure_classifier::DeploymentFailureCode::InvalidConfiguration
+        );
+    }
+
+    /// A first Compose deployment pinned to a worker goes to that worker; an
+    /// unconstrained one stays on the control plane; a pinned home that went
+    /// offline is never replaced.
+    #[tokio::test]
+    async fn compose_stacks_go_to_their_home_and_never_fail_over(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !temps_test_utils::docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, mut environment, deployment) = create_test_data(&db).await?;
+        let service = service_with_docker_handle(db.clone(), disabled_docker_handle()).await?;
+        let node_service = Arc::new(crate::services::NodeService::new(db.clone()));
+        service.set_node_scheduler(Arc::new(
+            crate::services::NodeScheduler::new(node_service).with_local_workloads_enabled(true),
+        ));
+        service.set_encryption_service(Arc::new(temps_core::EncryptionService::new(
+            TEST_MASTER_KEY,
+        )?));
+        let worker = insert_node(
+            db.as_ref(),
+            "worker-a",
+            "http://127.0.0.1:9",
+            "linux/amd64",
+            serde_json::json!({}),
+        )
+        .await?;
+        let policy = temps_entities::compose_security::ComposeSecurityPolicy::default();
+
+        // Unconstrained: the control plane, as Compose always ran.
+        let (plan, host, vacate) = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await?;
+        assert!(host.is_control_plane(), "{host:?}");
+        assert!(!plan.pinned);
+        assert!(vacate.is_none());
+
+        // Target Nodes naming the worker: the worker.
+        environment.deployment_config = with_placement(Some(vec![worker.id]), None);
+        let (plan, host, _) = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await?;
+        assert_eq!(host.node_id(), Some(worker.id), "{host:?}");
+        assert!(!plan.pinned);
+
+        // Pinned there, then the worker goes offline: refused, never moved.
+        crate::services::compose_placement::ComposePlacementService::new(db.clone())
+            .pin(environment.id, Some(worker.id))
+            .await?;
+        let mut offline: temps_entities::nodes::ActiveModel = worker.clone().into();
+        offline.status = Set("offline".to_string());
+        offline.update(db.as_ref()).await?;
+        environment.deployment_config = None;
+        let error = service
+            .plan_compose_stack(&project, &environment, &deployment, &policy)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                WorkflowExecutionError::ComposePlacement {
+                    source: crate::services::compose_placement::ComposePlacementError::HomeNodeUnavailable { node_id, .. },
+                    ..
+                } if node_id == worker.id
+            ),
+            "{error:?}"
+        );
         Ok(())
     }
 

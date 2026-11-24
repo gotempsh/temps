@@ -10,7 +10,7 @@
 
 use thiserror::Error;
 
-use temps_agents::error::AgentError;
+use temps_agent_core::error::AgentError;
 
 /// Typed errors for the snapshot sub-API (ADR-037).
 ///
@@ -51,7 +51,7 @@ pub enum SandboxSnapshotError {
     /// (ADR-048 phase 2). Refused before anything touches the sandbox.
     #[error(
         "Snapshots are not available yet for sandboxes on worker nodes (this sandbox runs on node '{node}'). \
-         Create the sandbox on the control plane (`--node control-plane`) to snapshot it."
+         Create the sandbox on the control plane (`--node control-plane`) to snapshot it, on an install whose control plane runs workloads itself."
     )]
     NotOnWorkerNode { node: String },
 
@@ -170,6 +170,21 @@ pub enum SandboxError {
     #[error("Job {job_id} not found in sandbox {sandbox_id}")]
     JobNotFound { sandbox_id: String, job_id: String },
 
+    /// A create's progress was asked for by a `creation_id` this server is
+    /// not tracking for the caller: unknown, another user's, or finished
+    /// long enough ago to have been dropped.
+    #[error("No sandbox create with creation_id '{creation_id}' is tracked for user {user_id}")]
+    CreationNotFound { creation_id: String, user_id: i32 },
+
+    /// The client-chosen `creation_id` of a create is malformed.
+    #[error("creation_id '{creation_id}' is invalid: use 8 to 64 letters, digits, '-' or '_'")]
+    CreationIdInvalid { creation_id: String },
+
+    /// The client-chosen `creation_id` already names another create of the
+    /// same user.
+    #[error("creation_id '{creation_id}' is already used by another sandbox create of user {user_id}; generate a new one per create")]
+    CreationIdInUse { creation_id: String, user_id: i32 },
+
     /// The underlying provider failed to create the container.
     #[error("Failed to create sandbox for user {user_id}: {reason}")]
     CreateFailed { user_id: i32, reason: String },
@@ -194,6 +209,13 @@ pub enum SandboxError {
     /// path, etc.). Mapped to HTTP 400.
     #[error("Validation error: {message}")]
     Validation { message: String },
+    #[error("Sandbox {sandbox_id} requested {requested} CPU cores on a host with {host} cores (allowed range 0.01 to {max})")]
+    CpuLimit {
+        sandbox_id: String,
+        requested: f64,
+        host: f64,
+        max: f64,
+    },
 
     /// The container runtime could not pull the sandbox image: the tag is
     /// not published, the registry is unreachable or access was denied.
@@ -250,6 +272,21 @@ pub enum SandboxError {
     )]
     ProjectHasNoRepo { project_id: i32, name: String },
 
+    /// The project stores no clone URL, and asking its git connection for
+    /// the URL of the repository it names failed (the repository is gone,
+    /// the connection lost access or needs reauthorizing). Mapped to HTTP
+    /// 502: the provider, not the request, is what failed.
+    #[error(
+        "Project {project_id} ('{name}') stores no clone URL, and git connection {connection_id} could not look up its repository {repository}: {reason}"
+    )]
+    ProjectRepositoryUnresolved {
+        project_id: i32,
+        name: String,
+        connection_id: i32,
+        repository: String,
+        reason: String,
+    },
+
     /// An operation exceeded the per-sandbox timeout.
     #[error("Operation timed out in sandbox {sandbox_id} after {timeout_secs}s")]
     Timeout {
@@ -277,13 +314,21 @@ pub enum SandboxError {
     /// yet (ADR-048 phase 1). The request is well-formed; it just cannot be
     /// served where the sandbox lives. Mapped to HTTP 422.
     #[error(
-        "{feature} is not available yet for sandboxes on worker nodes (sandbox {sandbox_id} runs on node '{node_name}'). Create the sandbox on the control plane (`--node control-plane`) to use it."
+        "{feature} is not available yet for sandboxes on worker nodes (sandbox {sandbox_id} runs on node '{node_name}'). Create the sandbox on the control plane (`--node control-plane`) to use it, on an install whose control plane runs workloads itself."
     )]
     UnsupportedOnWorkerNode {
         sandbox_id: String,
         node_name: String,
         feature: String,
     },
+
+    /// The sandbox's backend cannot enforce a `restricted` egress policy
+    /// (only Docker sandboxes can). The request is well-formed; it just
+    /// cannot be honoured where the sandbox runs. Mapped to HTTP 422.
+    #[error(
+        "Sandbox {sandbox_id} runs on the {backend} backend, which cannot restrict egress to an allow-list of hosts and CIDR blocks. Use egress mode 'internet' for it, or create the sandbox on the docker backend."
+    )]
+    EgressPolicyUnsupported { sandbox_id: String, backend: String },
 
     /// The sandbox's worker node refused the operation because it would
     /// replace a live sandbox there (ADR-048). Mapped to HTTP 409.
@@ -303,6 +348,23 @@ pub enum SandboxError {
     /// (offline, draining, pending enrollment).
     #[error("Node '{node}' is {status} and cannot take new sandboxes right now. Pick another node or wait until it is active.")]
     NodeNotReady { node: String, status: String },
+
+    /// This server is a control plane that runs no workloads, and what was
+    /// asked for needs its own host (ADR 063): a sandbox explicitly on the
+    /// control plane, an application workspace, or an operation on a row
+    /// that has no worker node. Mapped to 409.
+    #[error("{message}")]
+    NoLocalHost { message: String },
+
+    /// Automatic placement on a control plane that runs no workloads found
+    /// no worker that can take the sandbox (ADR 063). `detail` says whether
+    /// none has joined or names each worker and why it was passed over.
+    /// Mapped to the worker-node-required problem (409, Settings → Nodes).
+    #[error(
+        "No node can run this sandbox: this control plane runs no workloads, so sandboxes run \
+         only on worker nodes, and {detail}"
+    )]
+    NoWorkerNodeForSandboxes { detail: String },
 
     /// No node is eligible for automatic placement (ADR-048).
     #[error("No node can run sandboxes: every allowed node is offline or the allow-list is empty. Allow a node under AI Workflows → Sandbox (/agent-sandbox/sandbox) or with `bunx @temps-sdk/cli sandbox nodes allow`.")]
@@ -332,6 +394,10 @@ pub enum SandboxError {
         service_id: i32,
         reason: String,
     },
+
+    /// A service a sandbox was asked to link to does not exist.
+    #[error("Cannot link sandbox to service {service_id}: no such service")]
+    ServiceNotFound { service_id: i32 },
 
     /// Two linked services exposed the same variable name with different
     /// values. Silently choosing one would connect application code to the
@@ -382,6 +448,69 @@ pub enum SandboxError {
         #[source]
         source: temps_config::ConfigServiceError,
     },
+
+    /// The platform settings holding the sandbox limits could not be read, so
+    /// a create request cannot be checked against them. Fails closed rather
+    /// than creating a sandbox no limit was applied to. Mapped to 500.
+    #[error("Could not load the sandbox limit settings to check a create request from user {user_id}: {source}")]
+    LimitSettings {
+        user_id: i32,
+        #[source]
+        source: temps_config::ConfigServiceError,
+    },
+
+    /// The user already has as many sandboxes as the operator allows
+    /// (`agent_sandbox.max_sandboxes_per_user`). Destroying one frees a slot.
+    /// Mapped to 422.
+    #[error("User {user_id} already has {live} sandbox(es) and the limit is {limit}; destroy one to create another")]
+    UserSandboxLimitReached { user_id: i32, limit: u32, live: u64 },
+}
+
+impl SandboxError {
+    /// What a caller is told about this error: the `Display` text, except for
+    /// [`Self::ProjectRepositoryUnresolved`], whose provider `reason` describes
+    /// a git connection the caller may not own (an organization's). That
+    /// reason belongs in the server log; the caller gets the project, the
+    /// connection, the repository and how to recover.
+    pub fn caller_detail(&self) -> String {
+        match self {
+            SandboxError::ProjectRepositoryUnresolved {
+                project_id,
+                name,
+                connection_id,
+                repository,
+                ..
+            } => format!(
+                "Project {project_id} ('{name}') stores no clone URL, and git connection \
+                 {connection_id} could not look up its repository {repository}. Check that the \
+                 repository still exists and that the connection still has access to it, or \
+                 set the project's repository URL."
+            ),
+            other => other.to_string(),
+        }
+    }
+
+    /// An explicit request for the control plane on a server that runs no
+    /// workloads (ADR 063).
+    pub fn control_plane_requested_without_workloads() -> Self {
+        SandboxError::NoLocalHost {
+            message: "This control plane runs no workloads, so a sandbox cannot run on it \
+                      (node 'control-plane'). Leave `node` empty to place the sandbox on a \
+                      worker node, or name one (list them with `bunx @temps-sdk/cli sandbox \
+                      nodes`)."
+                .to_string(),
+        }
+    }
+
+    /// `operation` needs this server's own host, which runs nothing (ADR 063).
+    pub fn no_local_host(operation: &str) -> Self {
+        SandboxError::NoLocalHost {
+            message: AgentError::NoLocalSandboxHost {
+                operation: operation.to_string(),
+            }
+            .to_string(),
+        }
+    }
 }
 
 /// How to get a sandbox whose VM is not running back, which depends on what
@@ -443,7 +572,7 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         let reason = if reason.contains("default-address-pools") {
             reason.to_string()
         } else {
-            temps_agents::error::network_pool_exhausted_reason(sandbox_id, reason)
+            temps_agent_core::error::network_pool_exhausted_reason(sandbox_id, reason)
         };
         return SandboxError::NetworkCapacityExhausted {
             sandbox_id: sandbox_id.to_string(),
@@ -479,6 +608,14 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         },
         // A request the provider (or a worker node, ADR-048) rejected as
         // invalid is the caller's error, not a failed exec.
+        AgentError::SandboxCpuLimit {
+            requested, host, ..
+        } => SandboxError::CpuLimit {
+            sandbox_id: sandbox_id.into(),
+            requested,
+            host,
+            max: crate::services::create_policy::max_cpu_limit(None, Some(host)),
+        },
         AgentError::Validation { message } => SandboxError::Validation { message },
         AgentError::Io(e) => SandboxError::Io(e),
         // ADR-048: a feature sandboxes on worker nodes cannot serve yet — a
@@ -489,6 +626,18 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
             sandbox_id: sandbox_id.to_string(),
             node_name,
             feature,
+        },
+        // A restricted egress policy on a backend that cannot enforce one: a
+        // 422 naming the backend, never a silently wider policy.
+        AgentError::SandboxEgressPolicyUnsupported { backend, .. } => {
+            SandboxError::EgressPolicyUnsupported {
+                sandbox_id: sandbox_id.to_string(),
+                backend,
+            }
+        }
+        // ADR 063: this host runs nothing; a 409 with what is possible instead.
+        no_host @ AgentError::NoLocalSandboxHost { .. } => SandboxError::NoLocalHost {
+            message: no_host.to_string(),
         },
         // ADR-048: the worker refused to replace a live sandbox — a 409, and
         // nothing is torn down for it.
@@ -512,6 +661,32 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_unenforceable_egress_policy_is_a_422_naming_the_backend() {
+        let err = from_agent_error(
+            "sbx_abc",
+            AgentError::SandboxEgressPolicyUnsupported {
+                sandbox: "temps-sandbox-abc".into(),
+                backend: "firecracker".into(),
+            },
+        );
+        assert!(
+            matches!(&err, SandboxError::EgressPolicyUnsupported { sandbox_id, backend }
+                if sandbox_id == "sbx_abc" && backend == "firecracker"),
+            "{err:?}"
+        );
+        let text = err.to_string();
+        assert!(
+            text.contains("sbx_abc") && text.contains("firecracker"),
+            "{text}"
+        );
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(
+            problem.status_code,
+            axum::http::StatusCode::UNPROCESSABLE_ENTITY
+        );
+    }
 
     #[test]
     fn worker_conflicts_are_409s_not_failures() {
@@ -539,7 +714,7 @@ mod tests {
             AgentError::SandboxCreationFailed {
                 run_id: 3,
                 provider: "docker".into(),
-                reason: temps_agents::error::image_pull_failure_reason(
+                reason: temps_agent_core::error::image_pull_failure_reason(
                     "registry.example.test/team/img:9.9.9",
                     "manifest unknown",
                 ),
@@ -813,6 +988,59 @@ mod tests {
     }
 
     #[test]
+    fn no_local_host_errors_are_typed_conflicts() {
+        let err = from_agent_error(
+            "sbx_x",
+            AgentError::NoLocalSandboxHost {
+                operation: "An application workspace".into(),
+            },
+        );
+        assert!(matches!(err, SandboxError::NoLocalHost { .. }), "{err:?}");
+        let problem = temps_core::problemdetails::Problem::from(err);
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body["error_code"],
+            temps_agent_core::error::NO_LOCAL_SANDBOX_HOST_ERROR_CODE
+        );
+        assert!(!problem.body.contains_key("setup_path"));
+
+        let problem = temps_core::problemdetails::Problem::from(
+            SandboxError::control_plane_requested_without_workloads(),
+        );
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn no_worker_node_is_the_worker_node_required_problem() {
+        let problem =
+            temps_core::problemdetails::Problem::from(SandboxError::NoWorkerNodeForSandboxes {
+                detail: "no worker node has joined it yet".into(),
+            });
+        assert_eq!(problem.status_code, axum::http::StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body["error_code"],
+            temps_core::WORKER_NODE_REQUIRED_ERROR_CODE
+        );
+        assert_eq!(
+            problem.body["setup_path"],
+            temps_core::WORKER_NODE_SETUP_PATH
+        );
+        let detail = problem.body["detail"].as_str().unwrap();
+        assert!(
+            detail.contains("runs no workloads, so sandboxes run only on worker nodes"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("no worker node has joined it yet"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains(temps_core::WORKER_NODE_REQUIRED_REMEDY),
+            "{detail}"
+        );
+    }
+
+    #[test]
     fn from_agent_error_catchall_becomes_exec_failed() {
         let agent = AgentError::AiCliNotInstalled {
             provider: "claude".into(),
@@ -837,7 +1065,7 @@ mod tests {
             SandboxError::NetworkCapacityExhausted { sandbox_id, reason } => {
                 assert_eq!(sandbox_id, "sbx_abc");
                 assert!(reason.contains("default-address-pools"), "{reason}");
-                assert!(reason.contains("Delete sandboxes"), "{reason}");
+                assert!(reason.contains("Stop sandboxes"), "{reason}");
             }
             other => panic!("expected NetworkCapacityExhausted, got {other:?}"),
         }
@@ -845,7 +1073,7 @@ mod tests {
 
     #[test]
     fn provider_reason_that_already_carries_guidance_is_not_wrapped_twice() {
-        let reason = temps_agents::error::network_pool_exhausted_reason(
+        let reason = temps_agent_core::error::network_pool_exhausted_reason(
             "temps-sandbox-abc",
             "all predefined address pools have been fully subnetted",
         );
@@ -873,5 +1101,34 @@ mod tests {
             },
         );
         assert!(matches!(err, SandboxError::Unavailable { .. }), "{err:?}");
+    }
+
+    #[test]
+    fn a_caller_is_not_shown_the_providers_error_about_a_project_connection() {
+        let err = SandboxError::ProjectRepositoryUnresolved {
+            project_id: 3,
+            name: "example-project".into(),
+            connection_id: 11,
+            repository: "example-owner/example-repository".into(),
+            reason: "403 from https://git.example.test for installation 99".into(),
+        };
+        // The log keeps everything.
+        assert!(err.to_string().contains("installation 99"));
+        let detail = err.caller_detail();
+        assert!(detail.contains("Project 3 ('example-project')"), "{detail}");
+        assert!(detail.contains("git connection 11"), "{detail}");
+        assert!(
+            detail.contains("example-owner/example-repository"),
+            "{detail}"
+        );
+        assert!(!detail.contains("git.example.test"), "{detail}");
+        assert!(!detail.contains("installation 99"), "{detail}");
+
+        // Every other error is told as it is.
+        let other = SandboxError::ProjectHasNoRepo {
+            project_id: 3,
+            name: "example-project".into(),
+        };
+        assert_eq!(other.caller_detail(), other.to_string());
     }
 }

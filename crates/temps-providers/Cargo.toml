@@ -5,31 +5,35 @@
 name = "temps-providers"
 version.workspace = true
 edition.workspace = true
+description = "Managed services (Postgres, MariaDB, MongoDB, Redis, S3): container lifecycle, upgrades, data import, health and query APIs"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
+temps-docker-util = { path = "../temps-docker-util" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
+temps-service-protocol = { path = "../temps-service-protocol" }
 temps-entities = { path = "../temps-entities" }
-temps-logs = { path = "../temps-logs" }
-temps-query = { path = "../temps-query" }
-temps-query-postgres = { path = "../temps-query-postgres" }
-temps-query-s3 = { path = "../temps-query-s3" }
-temps-query-redis = { path = "../temps-query-redis" }
-temps-query-mongodb = { path = "../temps-query-mongodb" }
+temps-deployment-logs = { path = "../temps-deployment-logs" }
+temps-providers-core = { path = "../temps-providers-core" }
+temps-providers-postgres = { path = "../temps-providers-postgres" }
+temps-providers-s3 = { path = "../temps-providers-s3" }
+temps-providers-mariadb = { path = "../temps-providers-mariadb" }
+temps-providers-mongodb = { path = "../temps-providers-mongodb" }
+temps-providers-redis = { path = "../temps-providers-redis" }
 temps-dns = { path = "../temps-dns" }
+temps-node-dns = { path = "../temps-node-dns" }
 temps-network = { path = "../temps-network" }
 temps-metrics = { path = "../temps-metrics" }
-temps-monitoring = { path = "../temps-monitoring" }
+temps-alarms = { path = "../temps-alarms" }
+temps-workload-docker = { path = "../temps-workload-docker" }
 serde = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-anyhow = { workspace = true }
 async-trait = { workspace = true }
 bollard = { workspace = true }
 futures = { workspace = true }
@@ -37,39 +41,45 @@ tracing = { workspace = true }
 reqwest = { workspace = true }
 sea-orm = { workspace = true }
 sqlx = { workspace = true }
-redis = { version = "1.3.0", features = ["tokio-comp", "connection-manager"] }
-mongodb = "3.7.0"
+redis = { workspace = true }
+mongodb = { workspace = true, features = ["default"] }
 aws-sdk-s3 = { workspace = true }
-aws-smithy-runtime = "1.9"
-hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
 chrono = { workspace = true }
-flate2 = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
-tar = { workspace = true }
 http = { workspace = true }
 uuid = { workspace = true }
-regex = "1.11.1"
+regex = { workspace = true }
 utoipa = { workspace = true }
 thiserror = { workspace = true }
 axum = { workspace = true }
-axum-macros = { workspace = true }
-schemars = { workspace = true }
-urlencoding = "2.1"
-percent-encoding = { workspace = true }
-tokio-postgres = "0.7"
-base64 = { workspace = true }
-hmac = "0.13"
+urlencoding = { workspace = true }
+tokio-postgres = { workspace = true }
+hmac = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 
 [features]
-docker-tests = []
+docker-tests = ["temps-providers-core/docker-tests", "temps-providers-postgres/docker-tests", "temps-providers-s3/docker-tests", "temps-providers-mariadb/docker-tests", "temps-providers-mongodb/docker-tests", "temps-providers-redis/docker-tests"]
 
 [dev-dependencies]
-tokio-test = "0.4"
+temps-test-containers = { path = "../temps-test-containers" }
+anyhow = { workspace = true }
+temps-providers-core = { path = "../temps-providers-core", features = ["test-support"] }
+temps-test-utils = { path = "../temps-test-utils" }
+tracing-subscriber = { workspace = true }
+# Paused-clock tests (`start_paused`, `time::advance`).
+tokio = { workspace = true, features = ["test-util"] }
+# ADR-055 golden captures of the container-create request.
+temps-docker-capture = { path = "../temps-docker-capture" }
 testcontainers = { workspace = true }
+flate2 = { workspace = true }
 hyper = { version = "1", features = ["client", "http1", "http2"] }
 temps-migrations = { path = "../temps-migrations" }
+# Router-level 401 tests (`ServiceExt::oneshot`).
+tower = { workspace = true }
+
+[lints]
+workspace = true

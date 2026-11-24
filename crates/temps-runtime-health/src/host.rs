@@ -955,3 +955,38 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod worker_report_round_trip_tests {
+    use super::*;
+    #[test]
+    fn worker_report_round_trip_preserves_assignment_and_bounded_outcome() {
+        let observation = crate::Observation {
+            assignment_id: Uuid::new_v4(),
+            revision: Uuid::new_v4(),
+            placement_generation: 1,
+            epoch: 2,
+            sequence: 3,
+            state: crate::HealthState::Unhealthy,
+            reason: crate::HealthReason::HttpStatusMismatch,
+        };
+        let report = ReportBatch {
+            collection_epoch: 2,
+            session: Uuid::new_v4(),
+            challenge: Uuid::new_v4(),
+            observations: vec![TimedObservation {
+                observation: observation.clone(),
+                age_ms: 20,
+            }],
+        };
+        let encoded = serde_json::to_vec(&report).unwrap();
+        let decoded: ReportBatch = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.session, report.session);
+        assert_eq!(decoded.challenge, report.challenge);
+        assert_eq!(decoded.observations[0].observation, observation);
+        assert_eq!(decoded.observations[0].age_ms, 20);
+        let mut unexpected = serde_json::to_value(&report).unwrap();
+        unexpected["body"] = serde_json::json!("forbidden response body");
+        assert!(serde_json::from_value::<ReportBatch>(unexpected).is_err());
+    }
+}

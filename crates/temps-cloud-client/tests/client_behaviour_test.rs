@@ -12,6 +12,11 @@
 //! instance data or uptime.** It either succeeds, or it degrades to a state the
 //! operator can see.
 
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
 use std::net::SocketAddr;
 
 use axum::{routing::post, Json, Router};

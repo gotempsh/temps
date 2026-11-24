@@ -7,7 +7,11 @@ use serde;
 use serde_json::Value;
 
 use axum::http::{HeaderValue, StatusCode};
-use axum::{http::header::CONTENT_TYPE, response::IntoResponse, Json};
+use axum::{
+    http::header::{CONTENT_TYPE, RETRY_AFTER},
+    response::IntoResponse,
+    Json,
+};
 use serde::Serialize;
 
 use utoipa::ToSchema;
@@ -42,12 +46,12 @@ pub struct ProblemDetails {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instance: Option<String>,
     /// Additional properties of the problem
+    #[serde(flatten)]
     #[schema(additional_properties = true)]
     pub extensions: BTreeMap<String, Value>,
 }
 
 /// Representation of a Problem error to return to the client.
-#[allow(dead_code)] // These fields are used by the various features.
 #[derive(Debug, Clone)]
 pub struct Problem {
     /// The status code of the problem.
@@ -57,6 +61,9 @@ pub struct Problem {
     /// Internal-only metadata carried to response middleware. This is never
     /// serialized into the RFC 7807 response body.
     permission_denial: Option<PermissionDenialMarker>,
+    /// Seconds sent in the `Retry-After` response header, when the client
+    /// should wait before repeating the request.
+    retry_after_secs: Option<u64>,
 }
 
 /// Stable authorization guard denial categories used by security auditing.
@@ -68,6 +75,9 @@ pub enum PermissionDenialKind {
     ProjectAccess,
     ProjectPermission,
     MissingPrincipal,
+    /// A cookie-authenticated, state-changing request that did not come from
+    /// the console's own origin (see [`crate::same_origin`]).
+    CrossOriginRequest,
 }
 
 impl PermissionDenialKind {
@@ -79,6 +89,7 @@ impl PermissionDenialKind {
             Self::ProjectAccess => "project_access",
             Self::ProjectPermission => "project_permission",
             Self::MissingPrincipal => "missing_principal",
+            Self::CrossOriginRequest => "cross_origin_request",
         }
     }
 }
@@ -112,6 +123,7 @@ where
         status_code: status_code.into(),
         body: BTreeMap::new(),
         permission_denial: None,
+        retry_after_secs: None,
     }
 }
 
@@ -163,6 +175,19 @@ impl Problem {
         self.with_value("instance", value.into())
     }
 
+    /// Tell the client how many seconds to wait before retrying, as a
+    /// `Retry-After` header. The body is unchanged: add a typed field with
+    /// [`Problem::with_value`] when clients should read it from the body too.
+    pub fn with_retry_after(mut self, seconds: u64) -> Self {
+        self.retry_after_secs = Some(seconds);
+        self
+    }
+
+    /// The `Retry-After` seconds this problem will send, if any.
+    pub fn retry_after_secs(&self) -> Option<u64> {
+        self.retry_after_secs
+    }
+
     /// Specify an arbitrary value to include in the problem.
     ///
     /// # Parameters
@@ -207,6 +232,11 @@ impl IntoResponse for Problem {
         if let Some(marker) = self.permission_denial {
             response.extensions_mut().insert(marker);
         }
+        if let Some(seconds) = self.retry_after_secs {
+            response
+                .headers_mut()
+                .insert(RETRY_AFTER, HeaderValue::from(seconds));
+        }
 
         response
     }
@@ -216,6 +246,28 @@ impl IntoResponse for Problem {
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+
+    #[test]
+    fn problem_schema_and_serialization_flatten_extension_members() {
+        let schema =
+            serde_json::to_value(<ProblemDetails as utoipa::PartialSchema>::schema()).unwrap();
+        assert!(schema["properties"].get("extensions").is_none());
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("extensions")));
+        let problem = ProblemDetails {
+            type_url: None,
+            title: "Conflict".into(),
+            status: Some(409),
+            detail: None,
+            instance: None,
+            extensions: BTreeMap::from([("code".into(), serde_json::json!("ACTOR_CHANGED"))]),
+        };
+        let value = serde_json::to_value(problem).unwrap();
+        assert_eq!(value["code"], "ACTOR_CHANGED");
+        assert!(value.get("extensions").is_none());
+    }
 
     #[tokio::test]
     async fn permission_denial_marker_is_internal_and_preserves_body() {
@@ -244,6 +296,29 @@ mod tests {
         assert_eq!(json["title"], "Forbidden");
         assert_eq!(json["required_permission"], "users:write");
         assert!(json.get("permission_denial").is_none());
+    }
+
+    #[test]
+    fn retry_after_is_sent_as_a_header_only_when_set() {
+        let response = new(StatusCode::TOO_MANY_REQUESTS)
+            .with_title("Cooling down")
+            .with_retry_after(17)
+            .into_response();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("17")
+        );
+        let ordinary = new(StatusCode::CONFLICT).with_title("Conflict");
+        assert_eq!(ordinary.retry_after_secs(), None);
+        assert!(ordinary
+            .into_response()
+            .headers()
+            .get(RETRY_AFTER)
+            .is_none());
     }
 
     #[test]

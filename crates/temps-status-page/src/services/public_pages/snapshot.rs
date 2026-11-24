@@ -32,50 +32,143 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use axum::body::Bytes;
 use chrono::{NaiveDate, Utc};
+use sea_orm::sea_query::{Expr, Query};
 use sea_orm::{
     ColumnTrait, DatabaseBackend, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
     QueryFilter, QueryOrder, Statement, Value,
 };
 use temps_core::UtcDateTime;
-use temps_entities::{projects, status_pages};
+use temps_entities::{status_monitors, status_page_monitors, status_pages};
 use tokio::sync::Mutex;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
-use super::render::render_public_page_html;
+use super::events::{
+    incident_events, maintenance_event, newest_events, IncidentSource, MaintenanceSource, PageEvent,
+};
+use super::feed::render_atom_feed;
+use super::render::{render_public_page_html_with, render_unlock_page, PageActions};
 use super::types::{
     PublicComponentStatus, PublicDayStatus, PublicIncident, PublicIncidentSeverity,
-    PublicIncidentStatus, PublicIncidentUpdate, PublicStatusComponent, PublicStatusPageResponse,
-    PublicUptimeDay, PUBLIC_HISTORY_DAYS,
+    PublicIncidentStatus, PublicIncidentUpdate, PublicMaintenance, PublicMaintenanceStatus,
+    PublicStatusComponent, PublicStatusPageResponse, PublicUptimeDay, StatusPageAppearance,
+    PUBLIC_HISTORY_DAYS,
+};
+use crate::services::subscribers::notices::{
+    incident_notices, notice_for, PageNotice, NOTICE_WINDOW,
 };
 
 /// How often the background loop rebuilds every published snapshot.
 pub const REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// A check older than this no longer counts as the current state.
 const CURRENT_STATUS_MAX_AGE_HOURS: i64 = 24;
-/// Resolved incidents stay on the public page for this many days.
-const RESOLVED_INCIDENT_RETENTION_DAYS: i64 = 14;
+/// Resolved incidents stay on the public page for this many days: as long as
+/// the uptime bars they explain.
+const RESOLVED_INCIDENT_RETENTION_DAYS: i64 = PUBLIC_HISTORY_DAYS as i64;
 /// Most incidents shown per page (active ones first).
-const MAX_INCIDENTS_PER_PAGE: i64 = 25;
+const MAX_INCIDENTS_PER_PAGE: i64 = 50;
 /// Most public updates shown per incident.
 const MAX_UPDATES_PER_INCIDENT: usize = 20;
+/// Most entries in a page's Atom feed.
+pub const FEED_ENTRIES: usize = 50;
 /// Bound on bind parameters per `IN (...)` list; Postgres allows 65535.
 const MAX_IDS_PER_QUERY: usize = 1000;
+
+/// The password of a protected page (ADR 108 D2), as the public routes
+/// need it: the version signed into access cookies and the argon2 hash the
+/// unlock form is checked against.
+#[derive(Debug, Clone)]
+pub struct PageGate {
+    pub version: i32,
+    pub hash: String,
+}
 
 /// A published page, ready to serve.
 #[derive(Debug)]
 pub struct PublishedSnapshot {
     /// Internal bookkeeping only; never serialized.
     pub(crate) status_page_id: i32,
-    pub(crate) project_id: i32,
+    /// Projects the page shows components of.
+    pub(crate) project_ids: HashSet<i32>,
     /// Custom hostnames (#1412) whose ownership is proven. A request tagged by
     /// the proxy with a hostname not in this set gets the 404, so removing a
     /// hostname takes effect here before the proxy's route table reloads.
     pub(crate) custom_hosts: HashSet<String>,
+    /// The page's public capability; internal, for building links in mail.
+    pub(crate) slug: String,
+    /// Heading and look of the page, for the small pages the subscription
+    /// links render (confirm, unsubscribe).
+    pub(crate) title: String,
+    pub(crate) appearance: StatusPageAppearance,
+    /// When subscriptions were switched on, `None` while they are off. Only
+    /// updates published after it are announced (ADR 108 D2).
+    pub(crate) subscriptions_since: Option<UtcDateTime>,
+    /// Announcements derived from this snapshot's public incidents, within
+    /// [`NOTICE_WINDOW`]. Empty while subscriptions are off.
+    pub(crate) notices: Vec<PageNotice>,
     pub json: Bytes,
     pub html: Bytes,
+    /// The same page for a custom hostname: identical except that the
+    /// subscribe form posts to the hostname's own path.
+    pub html_custom_host: Bytes,
+    /// The page's Atom feed, for its slug URL and for a custom hostname
+    /// (only the links differ).
+    pub feed: Bytes,
+    pub feed_custom_host: Bytes,
+    /// Set when the page needs a password.
+    pub(crate) gate: Option<PageGate>,
+    /// The newest [`FEED_ENTRIES`] public events, for the feed and webhooks.
+    pub(crate) events: Vec<PageEvent>,
+    /// The password form a protected page shows instead, for its slug URL
+    /// and for a custom hostname. Empty for an open page.
+    pub locked_html: Bytes,
+    pub locked_html_custom_host: Bytes,
 }
 
 impl PublishedSnapshot {
+    pub fn status_page_id(&self) -> i32 {
+        self.status_page_id
+    }
+
+    /// The page's password, when it has one.
+    pub fn gate(&self) -> Option<&PageGate> {
+        self.gate.as_ref()
+    }
+
+    /// The password form to serve, by whether the request came through a
+    /// custom hostname.
+    pub fn locked_html_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.locked_html_custom_host.clone()
+        } else {
+            self.locked_html.clone()
+        }
+    }
+
+    /// Whether the page shows the subscribe form.
+    pub fn accepts_subscriptions(&self) -> bool {
+        self.subscriptions_since.is_some()
+    }
+
+    /// The HTML to serve for a request, by whether it came through a custom
+    /// hostname.
+    pub fn html_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.html_custom_host.clone()
+        } else {
+            self.html.clone()
+        }
+    }
+
+    /// The Atom feed to serve, by whether the request came through a custom
+    /// hostname.
+    pub fn feed_for(&self, custom_host: Option<&str>) -> Bytes {
+        if custom_host.is_some() {
+            self.feed_custom_host.clone()
+        } else {
+            self.feed.clone()
+        }
+    }
+
     /// Whether this page may be served for a request tagged with
     /// `custom_host` (the proxy's `x-temps-status-host`), or for an untagged
     /// request to its slug URL.
@@ -100,7 +193,7 @@ impl Scope {
         match self {
             Scope::All => true,
             Scope::Page(id) => snapshot.status_page_id == id,
-            Scope::Project(id) => snapshot.project_id == id,
+            Scope::Project(id) => snapshot.project_ids.contains(&id),
         }
     }
 }
@@ -110,6 +203,10 @@ pub(crate) struct DayCounts {
     pub operational: i64,
     pub degraded: i64,
     pub down: i64,
+    /// Sum and count of response times of checks that got an answer (down
+    /// checks are left out: a timeout is not a response time).
+    pub latency_sum_ms: i64,
+    pub latency_samples: i64,
 }
 
 impl DayCounts {
@@ -121,6 +218,15 @@ impl DayCounts {
         self.operational += other.operational;
         self.degraded += other.degraded;
         self.down += other.down;
+        self.latency_sum_ms += other.latency_sum_ms;
+        self.latency_samples += other.latency_samples;
+    }
+
+    fn avg_response_time_ms(self) -> Option<u32> {
+        (self.latency_samples > 0).then(|| {
+            let avg = self.latency_sum_ms as f64 / self.latency_samples as f64;
+            avg.round().clamp(0.0, f64::from(u32::MAX)) as u32
+        })
     }
 }
 
@@ -140,6 +246,8 @@ pub(crate) struct SelectionRow {
     pub status_page_id: i32,
     pub monitor_id: i32,
     pub display_name: String,
+    pub group_name: Option<String>,
+    pub project_id: i32,
     pub environment_id: Option<i32>,
     pub is_active: bool,
 }
@@ -149,8 +257,11 @@ pub(crate) struct IncidentRow {
     /// The page this row was selected for; an incident appears once per page.
     pub status_page_id: i32,
     pub id: i32,
+    pub project_id: i32,
     pub environment_id: Option<i32>,
     pub monitor_id: Option<i32>,
+    /// Explicitly public heading, if the admin wrote one.
+    pub public_title: Option<String>,
     pub severity: String,
     pub status: String,
     pub started_at: UtcDateTime,
@@ -160,9 +271,37 @@ pub(crate) struct IncidentRow {
 #[derive(Debug, Clone, FromQueryResult)]
 pub(crate) struct PublicUpdateRow {
     pub incident_id: i32,
+    pub id: i32,
     pub status: String,
     pub message: String,
     pub created_at: UtcDateTime,
+    /// When the update became public; announcements count from here.
+    pub published_at: UtcDateTime,
+}
+
+/// A maintenance window in progress or scheduled, with the page's monitors
+/// it covers (only those still on the page).
+#[derive(Debug, Clone)]
+pub(crate) struct MaintenanceRow {
+    pub id: i32,
+    pub title: String,
+    pub description: Option<String>,
+    pub starts_at: UtcDateTime,
+    pub ends_at: UtcDateTime,
+    pub created_at: UtcDateTime,
+    pub monitor_ids: Vec<i32>,
+}
+
+#[derive(Debug, FromQueryResult)]
+struct MaintenanceMonitorRow {
+    status_page_id: i32,
+    id: i32,
+    title: String,
+    description: Option<String>,
+    starts_at: UtcDateTime,
+    ends_at: UtcDateTime,
+    created_at: UtcDateTime,
+    monitor_id: i32,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -172,6 +311,8 @@ struct DayRow {
     operational: i64,
     degraded: i64,
     down: i64,
+    latency_sum_ms: i64,
+    latency_samples: i64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -192,6 +333,9 @@ pub(crate) struct RefreshData {
     pub incidents: HashMap<i32, Vec<IncidentRow>>,
     /// Public updates per incident, newest first.
     pub updates: HashMap<i32, Vec<PublicUpdateRow>>,
+    /// Maintenance windows in progress or scheduled per status page,
+    /// soonest first.
+    pub maintenances: HashMap<i32, Vec<MaintenanceRow>>,
 }
 
 pub struct StatusSnapshotCache {
@@ -219,6 +363,11 @@ impl StatusSnapshotCache {
     }
 
     /// Number of published pages currently served.
+    /// Every snapshot being served, for the subscriber dispatcher.
+    pub fn all(&self) -> Vec<Arc<PublishedSnapshot>> {
+        self.snapshots.load().values().cloned().collect()
+    }
+
     pub fn len(&self) -> usize {
         self.snapshots.load().len()
     }
@@ -243,16 +392,51 @@ impl StatusSnapshotCache {
         self.rebuild(Scope::Project(project_id)).await
     }
 
+    /// Drop the cached completed-day uptime of `monitor_ids`, so the next
+    /// rebuild recomputes it (a maintenance window changed what counts).
+    pub async fn forget_history(&self, monitor_ids: &[i32]) {
+        let mut state = self.writer.lock().await;
+        for monitor_id in monitor_ids {
+            state.history.remove(monitor_id);
+        }
+    }
+
     /// Stop serving a page. Infallible: no database access.
     pub async fn remove_page(&self, status_page_id: i32) {
         let _guard = self.writer.lock().await;
         self.swap_without(Scope::Page(status_page_id));
     }
 
-    /// Stop serving every page of a deleted project.
+    /// Stop serving every page showing a component of a project.
     pub async fn remove_project(&self, project_id: i32) {
         let _guard = self.writer.lock().await;
         self.swap_without(Scope::Project(project_id));
+    }
+
+    /// Build the public view of `page` as it would be served now, without
+    /// publishing it or touching the served snapshots.
+    ///
+    /// It uses a history of its own rather than the refresh loop's: the
+    /// writer lock is never held, so unpublishing or replacing a link never
+    /// waits behind a preview, and a draft's monitors never enter the
+    /// long-lived cache. A preview therefore reads its page's history (at most
+    /// [`super::MAX_MONITORS_PER_STATUS_PAGE`] monitors) in full.
+    pub async fn preview(
+        &self,
+        page: &status_pages::Model,
+    ) -> Result<PublicStatusPageResponse, DbErr> {
+        let mut state = WriterState::default();
+        let now = Utc::now();
+        let db = self.db.as_ref();
+        let selections = load_selections(db, &[page.id]).await?;
+        let monitor_ids: Vec<i32> = selections
+            .iter()
+            .map(|s| s.monitor_id)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let data = load_refresh_data(db, &mut state, &monitor_ids, &[page.id], now).await?;
+        Ok(assemble_public_page(page, &selections, &data, now))
     }
 
     /// Rebuild forever on [`REFRESH_INTERVAL`]. A failed refresh keeps the
@@ -287,16 +471,37 @@ impl StatusSnapshotCache {
         let now = Utc::now();
         let db = self.db.as_ref();
 
-        // A project being deleted is marked `is_deleted` before its rows are
-        // removed; if that removal fails part-way, its pages must still go dark.
-        let mut query = status_pages::Entity::find()
-            .inner_join(projects::Entity)
-            .filter(projects::Column::IsDeleted.eq(false))
-            .filter(status_pages::Column::IsPublished.eq(true));
+        let mut query =
+            status_pages::Entity::find().filter(status_pages::Column::IsPublished.eq(true));
         query = match scope {
             Scope::All => query,
             Scope::Page(id) => query.filter(status_pages::Column::Id.eq(id)),
-            Scope::Project(id) => query.filter(status_pages::Column::ProjectId.eq(id)),
+            Scope::Project(id) => query.filter(
+                status_pages::Column::Id.in_subquery(
+                    Query::select()
+                        .column((
+                            status_page_monitors::Entity,
+                            status_page_monitors::Column::StatusPageId,
+                        ))
+                        .from(status_page_monitors::Entity)
+                        .inner_join(
+                            status_monitors::Entity,
+                            Expr::col((status_monitors::Entity, status_monitors::Column::Id))
+                                .equals((
+                                    status_page_monitors::Entity,
+                                    status_page_monitors::Column::MonitorId,
+                                )),
+                        )
+                        .and_where(
+                            Expr::col((
+                                status_monitors::Entity,
+                                status_monitors::Column::ProjectId,
+                            ))
+                            .eq(id),
+                        )
+                        .to_owned(),
+                ),
+            ),
         };
         let pages = query.order_by_asc(status_pages::Column::Id).all(db).await?;
 
@@ -328,16 +533,91 @@ impl StatusSnapshotCache {
         let mut built = Vec::with_capacity(pages.len());
         for page in &pages {
             let page_selections = by_page.remove(&page.id).unwrap_or_default();
-            let response = assemble_public_page(page, &page_selections, &data, now);
+            // Every component of this page belonged to projects that were
+            // deleted: there is nothing left to show, so it is not served
+            // (the console shows the page as having no components).
+            if page_selections.is_empty() {
+                warn!(
+                    status_page_id = page.id,
+                    "published status page has no components left; not serving it"
+                );
+                continue;
+            }
+            let project_ids: HashSet<i32> = page_selections.iter().map(|s| s.project_id).collect();
+            let AssembledPage {
+                response,
+                notices,
+                events,
+            } = assemble_page(page, &page_selections, &data, now);
+            let base_path = format!("/api/status/{}", page.slug);
+            let feed = Bytes::from(render_atom_feed(&page.slug, &response, &events, &base_path));
+            let events_for_snapshot = events.clone();
+            let feed_custom_host =
+                Bytes::from(render_atom_feed(&page.slug, &response, &events, ""));
+            let subscriptions_since = subscriptions_since(page);
+            let accepts = subscriptions_since.is_some();
+            let gate = page.password_hash.clone().map(|hash| PageGate {
+                version: page.password_version,
+                hash,
+            });
+            // A protected page has no feed: a feed reader cannot type the
+            // password, so the link is not offered.
+            let open = gate.is_none();
+            let base_subscribe = format!("{base_path}/subscribe");
+            let base_feed = format!("{base_path}/feed.atom");
+            let html = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some(base_subscribe.as_str()),
+                    feed: open.then_some(base_feed.as_str()),
+                },
+            ));
+            let html_custom_host = Bytes::from(render_public_page_html_with(
+                &response,
+                PageActions {
+                    subscribe: accepts.then_some("/subscribe"),
+                    feed: open.then_some("/feed.atom"),
+                },
+            ));
+            let (locked_html, locked_html_custom_host) = if open {
+                (Bytes::new(), Bytes::new())
+            } else {
+                (
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        &format!("{base_path}/unlock"),
+                        None,
+                    )),
+                    Bytes::from(render_unlock_page(
+                        &response.title,
+                        &response.appearance,
+                        "/unlock",
+                        None,
+                    )),
+                )
+            };
             match serde_json::to_vec(&response) {
                 Ok(json) => built.push((
                     page.slug.clone(),
                     Arc::new(PublishedSnapshot {
                         status_page_id: page.id,
-                        project_id: page.project_id,
+                        project_ids,
                         custom_hosts: verified_hosts.remove(&page.id).unwrap_or_default(),
+                        slug: page.slug.clone(),
+                        title: response.title.clone(),
+                        appearance: response.appearance.clone(),
+                        subscriptions_since,
+                        notices,
                         json: Bytes::from(json),
-                        html: Bytes::from(render_public_page_html(&response)),
+                        html,
+                        html_custom_host,
+                        feed,
+                        feed_custom_host,
+                        gate,
+                        events: events_for_snapshot,
+                        locked_html,
+                        locked_html_custom_host,
                     }),
                 )),
                 Err(e) => error!(
@@ -386,17 +666,16 @@ async fn load_selections(
 ) -> Result<Vec<SelectionRow>, DbErr> {
     let mut rows = Vec::new();
     for chunk in page_ids.chunks(MAX_IDS_PER_QUERY) {
-        // The join on `sm.project_id = sp.project_id` re-checks ownership at
-        // read time, so a selection can never surface another project's
-        // monitor even if one were ever written.
+        // A project being deleted is marked `is_deleted` before its rows are
+        // removed; its components leave every page at once, even if that
+        // removal fails part-way.
         let sql = format!(
             r#"
-            SELECT spm.status_page_id, spm.monitor_id, spm.display_name,
-                   sm.environment_id, sm.is_active
+            SELECT spm.status_page_id, spm.monitor_id, spm.display_name, spm.group_name,
+                   sm.project_id, sm.environment_id, sm.is_active
             FROM status_page_monitors spm
-            JOIN status_pages sp ON sp.id = spm.status_page_id
-            JOIN projects p ON p.id = sp.project_id AND NOT p.is_deleted
-            JOIN status_monitors sm ON sm.id = spm.monitor_id AND sm.project_id = sp.project_id
+            JOIN status_monitors sm ON sm.id = spm.monitor_id
+            JOIN projects p ON p.id = sm.project_id AND NOT p.is_deleted
             WHERE spm.status_page_id IN ({})
             ORDER BY spm.status_page_id, spm.position, spm.id
             "#,
@@ -426,17 +705,38 @@ async fn load_day_counts(
         let n = chunk.len();
         let sql = format!(
             r#"
-            SELECT monitor_id, bucket, operational, degraded, down
+            SELECT monitor_id, bucket, operational, degraded, down,
+                   latency_sum_ms, latency_samples
             FROM (
                 SELECT monitor_id,
                        date_trunc('day', checked_at AT TIME ZONE 'UTC') AT TIME ZONE 'UTC' AS bucket,
                        COUNT(*) FILTER (WHERE status = 'operational') AS operational,
                        COUNT(*) FILTER (WHERE status IN ('degraded', 'partial_outage')) AS degraded,
-                       COUNT(*) FILTER (WHERE status IN ('down', 'major_outage')) AS down
-                FROM status_checks
-                WHERE monitor_id IN ({})
-                  AND checked_at >= ${}
-                  AND checked_at < ${}
+                       COUNT(*) FILTER (WHERE status IN ('down', 'major_outage')) AS down,
+                       COALESCE(SUM(response_time_ms) FILTER (
+                           WHERE status NOT IN ('down', 'major_outage')
+                       ), 0)::BIGINT AS latency_sum_ms,
+                       COUNT(response_time_ms) FILTER (
+                           WHERE status NOT IN ('down', 'major_outage')
+                       ) AS latency_samples
+                FROM status_checks c
+                WHERE c.monitor_id IN ({})
+                  AND c.checked_at >= ${}
+                  AND c.checked_at < ${}
+                  -- Checks taken during a maintenance window of a page that
+                  -- still shows the monitor are not counted (ADR 108 D2). A
+                  -- cancelled window counts until it was cancelled.
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM status_page_maintenance_monitors mm
+                      JOIN status_page_maintenances m ON m.id = mm.maintenance_id
+                      JOIN status_page_monitors spm
+                        ON spm.status_page_id = m.status_page_id
+                       AND spm.monitor_id = mm.monitor_id
+                      WHERE mm.monitor_id = c.monitor_id
+                        AND c.checked_at >= m.starts_at
+                        AND c.checked_at < LEAST(m.ends_at, COALESCE(m.cancelled_at, m.ends_at))
+                  )
                 GROUP BY monitor_id, bucket
             ) sub
             "#,
@@ -461,6 +761,8 @@ async fn load_day_counts(
                     operational: row.operational,
                     degraded: row.degraded,
                     down: row.down,
+                    latency_sum_ms: row.latency_sum_ms,
+                    latency_samples: row.latency_samples,
                 },
             );
         }
@@ -571,21 +873,20 @@ async fn load_refresh_data(
         // limit can never push an active incident off the page.
         let sql = format!(
             r#"
-            WITH pages AS (
-                SELECT id AS status_page_id, project_id
-                FROM status_pages
-                WHERE id IN ({})
-            ),
-            sel AS (
-                SELECT spm.status_page_id, spm.monitor_id, sm.environment_id
+            WITH sel AS (
+                SELECT spm.status_page_id, spm.monitor_id, sm.environment_id, sm.project_id
                 FROM status_page_monitors spm
-                JOIN pages p ON p.status_page_id = spm.status_page_id
-                JOIN status_monitors sm
-                  ON sm.id = spm.monitor_id AND sm.project_id = p.project_id
+                JOIN status_monitors sm ON sm.id = spm.monitor_id
+                JOIN projects pr ON pr.id = sm.project_id AND NOT pr.is_deleted
+                WHERE spm.status_page_id IN ({})
+            ),
+            pages AS (
+                SELECT DISTINCT status_page_id, project_id FROM sel
             ),
             candidates AS (
                 SELECT p.status_page_id, i.id, i.project_id, i.environment_id,
-                       i.monitor_id, i.severity, i.status, i.started_at, i.resolved_at
+                       i.monitor_id, i.public_title, i.severity, i.status,
+                       i.started_at, i.resolved_at
                 FROM pages p
                 JOIN status_incidents i ON i.project_id = p.project_id
                 WHERE (i.status <> 'resolved' OR i.resolved_at >= ${} OR i.started_at >= ${})
@@ -605,8 +906,8 @@ async fn load_refresh_data(
                       WHERE u.incident_id = i.id AND u.is_public AND NOT u.is_system
                   )
             )
-            SELECT status_page_id, id, environment_id, monitor_id, severity,
-                   status, started_at, resolved_at
+            SELECT status_page_id, id, project_id, environment_id, monitor_id, public_title,
+                   severity, status, started_at, resolved_at
             FROM (
                 SELECT candidates.*,
                        ROW_NUMBER() OVER (
@@ -651,9 +952,10 @@ async fn load_refresh_data(
         // never makes a refresh read its whole history.
         let sql = format!(
             r#"
-            SELECT incident_id, status, message, created_at
+            SELECT incident_id, id, status, message, created_at,
+                   COALESCE(published_at, created_at) AS published_at
             FROM (
-                SELECT incident_id, status, message, created_at, id,
+                SELECT incident_id, status, message, created_at, published_at, id,
                        ROW_NUMBER() OVER (
                            PARTITION BY incident_id ORDER BY created_at DESC, id DESC
                        ) AS rn
@@ -677,6 +979,52 @@ async fn load_refresh_data(
         .await?
         {
             data.updates.entry(row.incident_id).or_default().push(row);
+        }
+    }
+
+    for chunk in page_ids.chunks(MAX_IDS_PER_QUERY) {
+        let n = chunk.len();
+        // At most `MAX_OPEN_PER_PAGE` windows per page, each over at most the
+        // page's monitors.
+        let sql = format!(
+            r#"
+            SELECT m.status_page_id, m.id, m.title, m.description, m.starts_at, m.ends_at,
+                   m.created_at, mm.monitor_id
+            FROM status_page_maintenances m
+            JOIN status_page_maintenance_monitors mm ON mm.maintenance_id = m.id
+            JOIN status_page_monitors spm
+              ON spm.status_page_id = m.status_page_id AND spm.monitor_id = mm.monitor_id
+            WHERE m.status_page_id IN ({})
+              AND m.cancelled_at IS NULL
+              AND m.ends_at > ${}
+            ORDER BY m.status_page_id, m.starts_at, m.id, mm.monitor_id
+            "#,
+            placeholders(1, n),
+            n + 1
+        );
+        let mut values = id_values(chunk);
+        values.push(now.into());
+        for row in MaintenanceMonitorRow::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            &sql,
+            values,
+        ))
+        .all(db)
+        .await?
+        {
+            let windows = data.maintenances.entry(row.status_page_id).or_default();
+            match windows.last_mut() {
+                Some(window) if window.id == row.id => window.monitor_ids.push(row.monitor_id),
+                _ => windows.push(MaintenanceRow {
+                    id: row.id,
+                    title: row.title,
+                    description: row.description,
+                    starts_at: row.starts_at,
+                    ends_at: row.ends_at,
+                    created_at: row.created_at,
+                    monitor_ids: vec![row.monitor_id],
+                }),
+            }
         }
     }
 
@@ -705,6 +1053,21 @@ pub(crate) fn day_status(counts: DayCounts) -> PublicDayStatus {
     }
 }
 
+/// When subscriptions were switched on, if they are on. A page switched on
+/// without a recorded time announces nothing from before now.
+fn subscriptions_since(page: &status_pages::Model) -> Option<UtcDateTime> {
+    page.subscriptions_enabled
+        .then(|| page.subscriptions_enabled_at.unwrap_or_else(Utc::now))
+}
+
+/// The public view of a page and the announcements derived from it.
+pub(crate) struct AssembledPage {
+    pub response: PublicStatusPageResponse,
+    pub notices: Vec<PageNotice>,
+    /// The newest [`FEED_ENTRIES`] events, for the Atom feed.
+    pub events: Vec<PageEvent>,
+}
+
 /// Build the public view of one page from pre-fetched data. Pure: everything
 /// it can publish is passed in, so tests can assert what reaches the output.
 pub(crate) fn assemble_public_page(
@@ -713,8 +1076,28 @@ pub(crate) fn assemble_public_page(
     data: &RefreshData,
     now: UtcDateTime,
 ) -> PublicStatusPageResponse {
+    assemble_page(page, selections, data, now).response
+}
+
+/// [`assemble_public_page`] plus the subscriber notices: built from the
+/// assembled public incidents, never from the rows behind them, so a notice
+/// can only say what the page says.
+pub(crate) fn assemble_page(
+    page: &status_pages::Model,
+    selections: &[SelectionRow],
+    data: &RefreshData,
+    now: UtcDateTime,
+) -> AssembledPage {
+    let appearance = StatusPageAppearance::from_model(page);
     let today = now.date_naive();
     let first_day = today - chrono::Days::new(u64::from(PUBLIC_HISTORY_DAYS - 1));
+    let incidents = public_incidents(page.id, selections, data, now);
+    let maintenances = public_maintenances(page.id, selections, data, now);
+    let in_maintenance: HashSet<i32> = maintenances
+        .iter()
+        .filter(|m| m.public.status == PublicMaintenanceStatus::InProgress)
+        .flat_map(|m| m.monitor_ids.iter().copied())
+        .collect();
 
     let empty_days = HashMap::new();
     let components: Vec<PublicStatusComponent> = selections
@@ -722,20 +1105,44 @@ pub(crate) fn assemble_public_page(
         .map(|selection| {
             let monitor_days = data.days.get(&selection.monitor_id).unwrap_or(&empty_days);
             let mut total = DayCounts::default();
-            let days = first_day
+            let mut latest_latency = None;
+            let days: Vec<PublicUptimeDay> = first_day
                 .iter_days()
                 .take(PUBLIC_HISTORY_DAYS as usize)
                 .map(|day| {
                     let counts = monitor_days.get(&day).copied().unwrap_or_default();
                     total.add(counts);
+                    let latency = counts.avg_response_time_ms();
+                    if latency.is_some() {
+                        latest_latency = latency;
+                    }
                     PublicUptimeDay {
                         date: day.format("%Y-%m-%d").to_string(),
                         status: day_status(counts),
-                        uptime_percentage: uptime_percentage(counts),
+                        uptime_percentage: uptime_percentage(counts)
+                            .filter(|_| appearance.show_uptime_percentage),
+                        avg_response_time_ms: latency.filter(|_| appearance.show_response_times),
+                        // Hiding uptime hides the counts it is computed from.
+                        total_checks: appearance
+                            .show_uptime_percentage
+                            .then_some(clamp_count(counts.measured())),
+                        failed_checks: appearance
+                            .show_uptime_percentage
+                            .then_some(clamp_count(counts.down)),
+                        degraded_checks: appearance
+                            .show_uptime_percentage
+                            .then_some(clamp_count(counts.degraded)),
+                        incidents: incidents
+                            .iter()
+                            .filter(|i| i.affects(selection.monitor_id) && i.overlaps(day, today))
+                            .map(|i| i.public.title.clone())
+                            .collect(),
                     }
                 })
                 .collect();
-            let status = if selection.is_active {
+            let status = if selection.is_active && in_maintenance.contains(&selection.monitor_id) {
+                PublicComponentStatus::Maintenance
+            } else if selection.is_active {
                 data.latest_status
                     .get(&selection.monitor_id)
                     .map(|s| PublicComponentStatus::from_check_status(s))
@@ -745,14 +1152,72 @@ pub(crate) fn assemble_public_page(
             };
             PublicStatusComponent {
                 name: selection.display_name.clone(),
+                group: selection.group_name.clone(),
                 status,
-                uptime_percentage: uptime_percentage(total),
+                uptime_percentage: uptime_percentage(total)
+                    .filter(|_| appearance.show_uptime_percentage),
+                avg_response_time_ms: latest_latency.filter(|_| appearance.show_response_times),
                 days,
             }
         })
         .collect();
 
-    let incidents = public_incidents(page.id, selections, data);
+    let maintenance_events: Vec<PageEvent> = maintenances
+        .iter()
+        .map(|m| {
+            maintenance_event(&MaintenanceSource {
+                maintenance_id: m.id,
+                created_at: m.created_at,
+                maintenance: &m.public,
+            })
+        })
+        .collect();
+    let notices = match subscriptions_since(page) {
+        Some(since) => {
+            let since = since.max(now - NOTICE_WINDOW);
+            let mut notices: Vec<PageNotice> = incidents
+                .iter()
+                .flat_map(|incident| {
+                    incident_notices(
+                        &page.title,
+                        &IncidentSource {
+                            incident_id: incident.incident_id,
+                            update_ids: &incident.update_ids,
+                            update_published_at: &incident.update_published_at,
+                            incident: &incident.public,
+                        },
+                        since,
+                        now,
+                    )
+                })
+                .collect();
+            notices.extend(
+                maintenance_events
+                    .iter()
+                    .filter(|e| e.published_at >= since && e.published_at <= now)
+                    .map(|e| notice_for(&page.title, e.clone())),
+            );
+            notices
+        }
+        None => Vec::new(),
+    };
+    let events = newest_events(
+        incidents
+            .iter()
+            .flat_map(|incident| {
+                incident_events(&IncidentSource {
+                    incident_id: incident.incident_id,
+                    update_ids: &incident.update_ids,
+                    update_published_at: &incident.update_published_at,
+                    incident: &incident.public,
+                })
+            })
+            .chain(maintenance_events)
+            .collect(),
+        FEED_ENTRIES,
+    );
+    let incidents: Vec<PublicIncident> = incidents.into_iter().map(|i| i.public).collect();
+    let maintenances: Vec<PublicMaintenance> = maintenances.into_iter().map(|m| m.public).collect();
 
     let mut status = components
         .iter()
@@ -773,15 +1238,110 @@ pub(crate) fn assemble_public_page(
         status = status.max(floor);
     }
 
-    PublicStatusPageResponse {
-        title: page.title.clone(),
-        description: page.description.clone(),
-        status,
-        components,
-        incidents,
-        history_days: PUBLIC_HISTORY_DAYS,
-        generated_at: now,
+    AssembledPage {
+        response: PublicStatusPageResponse {
+            title: page.title.clone(),
+            description: page.description.clone(),
+            appearance,
+            status,
+            components,
+            incidents,
+            maintenances,
+            history_days: PUBLIC_HISTORY_DAYS,
+            generated_at: now,
+        },
+        notices,
+        events,
     }
+}
+
+fn clamp_count(count: i64) -> u32 {
+    u32::try_from(count.max(0)).unwrap_or(u32::MAX)
+}
+
+/// A public incident plus which of the page's monitors it concerns, for
+/// marking the days it covers on those components' bars.
+struct AssembledIncident {
+    public: PublicIncident,
+    incident_id: i32,
+    /// Ids of `public.updates`, in the same order.
+    update_ids: Vec<i32>,
+    /// When each of `public.updates` became public, in the same order.
+    update_published_at: Vec<UtcDateTime>,
+    /// `None` when the incident concerns every component of the page.
+    monitor_ids: Option<HashSet<i32>>,
+    started_on: NaiveDate,
+    resolved_on: Option<NaiveDate>,
+}
+
+impl AssembledIncident {
+    fn affects(&self, monitor_id: i32) -> bool {
+        self.monitor_ids
+            .as_ref()
+            .is_none_or(|ids| ids.contains(&monitor_id))
+    }
+
+    fn overlaps(&self, day: NaiveDate, today: NaiveDate) -> bool {
+        self.started_on <= day && day <= self.resolved_on.unwrap_or(today)
+    }
+}
+
+/// A public maintenance window plus the ids behind it.
+struct AssembledMaintenance {
+    public: PublicMaintenance,
+    id: i32,
+    created_at: UtcDateTime,
+    monitor_ids: Vec<i32>,
+}
+
+/// The page's open maintenance windows, soonest first, naming only the
+/// covered components this page shows. A window none of whose monitors is
+/// on the page any more is left out.
+fn public_maintenances(
+    status_page_id: i32,
+    selections: &[SelectionRow],
+    data: &RefreshData,
+    now: UtcDateTime,
+) -> Vec<AssembledMaintenance> {
+    let Some(windows) = data.maintenances.get(&status_page_id) else {
+        return Vec::new();
+    };
+    windows
+        .iter()
+        .filter(|window| window.ends_at > now)
+        .filter_map(|window| {
+            let covered: HashSet<i32> = window.monitor_ids.iter().copied().collect();
+            let mut affected: Vec<String> = Vec::new();
+            for selection in selections
+                .iter()
+                .filter(|s| covered.contains(&s.monitor_id))
+            {
+                if !affected.contains(&selection.display_name) {
+                    affected.push(selection.display_name.clone());
+                }
+            }
+            if affected.is_empty() {
+                return None;
+            }
+            Some(AssembledMaintenance {
+                public: PublicMaintenance {
+                    title: window.title.clone(),
+                    description: window.description.clone(),
+                    status: if window.starts_at <= now {
+                        PublicMaintenanceStatus::InProgress
+                    } else {
+                        PublicMaintenanceStatus::Scheduled
+                    },
+                    starts_at: window.starts_at,
+                    ends_at: window.ends_at,
+                    affected_components: affected,
+                },
+                id: window.id,
+                created_at: window.created_at,
+                monitor_ids: window.monitor_ids.clone(),
+            })
+        })
+        .collect()
 }
 
 /// Incidents selected for `status_page_id` that concern this page's selection
@@ -791,12 +1351,15 @@ pub(crate) fn assemble_public_page(
 /// - linked to a monitor: shown only if that monitor is selected;
 /// - linked to an environment only: shown only if a selected monitor watches
 ///   that environment;
-/// - project-wide: shown on every page of the project.
+/// - project-wide: shown on every page with a component of the project,
+///   affecting that project's components (all of them when the page shows
+///   nothing else).
 fn public_incidents(
     status_page_id: i32,
     selections: &[SelectionRow],
     data: &RefreshData,
-) -> Vec<PublicIncident> {
+    now: UtcDateTime,
+) -> Vec<AssembledIncident> {
     let Some(incidents) = data.incidents.get(&status_page_id) else {
         return Vec::new();
     };
@@ -808,26 +1371,48 @@ fn public_incidents(
     incidents
         .iter()
         .filter_map(|incident| {
-            let affected: Vec<String> = match (incident.monitor_id, incident.environment_id) {
-                (Some(monitor_id), _) => {
-                    vec![names_by_monitor.get(&monitor_id)?.to_string()]
-                }
-                (None, Some(environment_id)) => {
-                    let names: Vec<String> = selections
-                        .iter()
-                        .filter(|s| s.environment_id == Some(environment_id))
-                        .map(|s| s.display_name.clone())
-                        .collect();
-                    if names.is_empty() {
-                        return None;
+            let (affected, monitor_ids): (Vec<String>, Option<HashSet<i32>>) =
+                match (incident.monitor_id, incident.environment_id) {
+                    (Some(monitor_id), _) => (
+                        vec![names_by_monitor.get(&monitor_id)?.to_string()],
+                        Some(HashSet::from([monitor_id])),
+                    ),
+                    (None, Some(environment_id)) => {
+                        let matching: Vec<&SelectionRow> = selections
+                            .iter()
+                            .filter(|s| s.environment_id == Some(environment_id))
+                            .collect();
+                        if matching.is_empty() {
+                            return None;
+                        }
+                        (
+                            matching.iter().map(|s| s.display_name.clone()).collect(),
+                            Some(matching.iter().map(|s| s.monitor_id).collect()),
+                        )
                     }
-                    names
-                }
-                (None, None) => Vec::new(),
-            };
-            let updates: Vec<PublicIncidentUpdate> = data
-                .updates
-                .get(&incident.id)?
+                    (None, None) => {
+                        let matching: Vec<&SelectionRow> = selections
+                            .iter()
+                            .filter(|s| s.project_id == incident.project_id)
+                            .collect();
+                        if matching.is_empty() {
+                            return None;
+                        }
+                        if matching.len() == selections.len() {
+                            (Vec::new(), None)
+                        } else {
+                            (
+                                matching.iter().map(|s| s.display_name.clone()).collect(),
+                                Some(matching.iter().map(|s| s.monitor_id).collect()),
+                            )
+                        }
+                    }
+                };
+            let rows = data.updates.get(&incident.id)?;
+            let update_ids: Vec<i32> = rows.iter().map(|u| u.id).collect();
+            let update_published_at: Vec<UtcDateTime> =
+                rows.iter().map(|u| u.published_at).collect();
+            let updates: Vec<PublicIncidentUpdate> = rows
                 .iter()
                 .map(|u| PublicIncidentUpdate {
                     status: PublicIncidentStatus::from_internal(&u.status),
@@ -837,17 +1422,41 @@ fn public_incidents(
                 .collect();
             let latest = updates.first()?;
             let resolved = incident.status == "resolved";
-            Some(PublicIncident {
-                severity: PublicIncidentSeverity::from_internal(&incident.severity),
-                status: if resolved {
-                    PublicIncidentStatus::Resolved
-                } else {
-                    latest.status
+            let severity = PublicIncidentSeverity::from_internal(&incident.severity);
+            let resolved_at = if resolved { incident.resolved_at } else { None };
+            Some(AssembledIncident {
+                public: PublicIncident {
+                    title: incident
+                        .public_title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|t| !t.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| severity.heading().to_string()),
+                    severity,
+                    status: if resolved {
+                        PublicIncidentStatus::Resolved
+                    } else {
+                        latest.status
+                    },
+                    affected_components: affected,
+                    started_at: incident.started_at,
+                    resolved_at,
+                    updates,
                 },
-                affected_components: affected,
-                started_at: incident.started_at,
-                resolved_at: if resolved { incident.resolved_at } else { None },
-                updates,
+                incident_id: incident.id,
+                update_ids,
+                update_published_at,
+                monitor_ids,
+                started_on: incident.started_at.date_naive(),
+                // A resolved incident without a timestamp ends the day it
+                // started rather than running to today.
+                resolved_on: resolved.then(|| {
+                    resolved_at
+                        .unwrap_or(incident.started_at)
+                        .min(now)
+                        .date_naive()
+                }),
             })
         })
         .collect()
@@ -870,12 +1479,23 @@ mod tests {
         let now = now();
         status_pages::Model {
             id: 7,
-            project_id: 3,
             slug: "0123456789abcdef0123456789abcdef".to_string(),
             title: "Public title".to_string(),
             description: None,
             is_published: true,
             published_at: Some(now),
+            theme: "auto".to_string(),
+            accent_color: None,
+            logo_url: None,
+            website_url: None,
+            show_uptime_percentage: true,
+            show_response_times: true,
+            subscriptions_enabled: false,
+            subscriptions_enabled_at: None,
+            subscription_sender: None,
+            subscription_sender_scoped: false,
+            password_hash: None,
+            password_version: 0,
             created_at: now,
             updated_at: now,
         }
@@ -886,17 +1506,26 @@ mod tests {
             status_page_id: 7,
             monitor_id,
             display_name: name.to_string(),
+            group_name: None,
+            project_id: 3,
             environment_id,
             is_active: true,
         }
+    }
+
+    fn in_project(mut row: SelectionRow, project_id: i32) -> SelectionRow {
+        row.project_id = project_id;
+        row
     }
 
     fn incident(id: i32, monitor_id: Option<i32>, environment_id: Option<i32>) -> IncidentRow {
         IncidentRow {
             status_page_id: 7,
             id,
+            project_id: 3,
             environment_id,
             monitor_id,
+            public_title: None,
             severity: "major".to_string(),
             status: "investigating".to_string(),
             started_at: now(),
@@ -907,9 +1536,11 @@ mod tests {
     fn update(incident_id: i32, message: &str) -> PublicUpdateRow {
         PublicUpdateRow {
             incident_id,
+            id: incident_id * 100,
             status: "identified".to_string(),
             message: message.to_string(),
             created_at: now(),
+            published_at: now(),
         }
     }
 
@@ -1051,7 +1682,8 @@ mod tests {
         resolved.resolved_at = Some(now());
         data.incidents.insert(7, vec![resolved]);
         data.updates.insert(10, vec![update(10, "fixed")]);
-        let out = assemble_public_page(&page(), &[], &data, now());
+        // A project-wide incident needs its project on the page.
+        let out = assemble_public_page(&page(), &[selection(1, "API", None)], &data, now());
         assert_eq!(out.incidents[0].status, PublicIncidentStatus::Resolved);
         assert!(out.incidents[0].resolved_at.is_some());
         assert_eq!(out.status, PublicComponentStatus::Unknown);
@@ -1079,5 +1711,202 @@ mod tests {
                 "public JSON must not contain {forbidden:?}: {json}"
             );
         }
+    }
+
+    #[test]
+    fn days_carry_latency_check_counts_and_incident_titles() {
+        let now = now();
+        let today = now.date_naive();
+        let yesterday = today - chrono::Days::new(1);
+        let mut data = RefreshData::default();
+        data.latest_status.insert(1, "operational".to_string());
+        data.days.insert(
+            1,
+            HashMap::from([
+                (
+                    yesterday,
+                    DayCounts {
+                        operational: 8,
+                        down: 2,
+                        latency_sum_ms: 1000,
+                        latency_samples: 8,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    today,
+                    DayCounts {
+                        operational: 4,
+                        latency_sum_ms: 403,
+                        latency_samples: 4,
+                        ..Default::default()
+                    },
+                ),
+            ]),
+        );
+        let mut custom = incident(10, Some(1), None);
+        custom.public_title = Some("Delayed email delivery".to_string());
+        custom.started_at = yesterday.and_hms_opt(23, 0, 0).expect("time").and_utc();
+        data.incidents.insert(7, vec![custom]);
+        data.updates.insert(10, vec![update(10, "Looking into it")]);
+
+        let out = assemble_public_page(&page(), &[selection(1, "API", None)], &data, now);
+        let days = &out.components[0].days;
+        let (y, t) = (&days[days.len() - 2], &days[days.len() - 1]);
+        assert_eq!(y.avg_response_time_ms, Some(125));
+        assert_eq!((y.total_checks, y.failed_checks), (Some(10), Some(2)));
+        assert_eq!(y.uptime_percentage, Some(80.0));
+        assert_eq!(t.avg_response_time_ms, Some(101));
+        // The open incident started yesterday and runs through today.
+        assert_eq!(y.incidents, vec!["Delayed email delivery"]);
+        assert_eq!(t.incidents, vec!["Delayed email delivery"]);
+        assert!(days[days.len() - 3].incidents.is_empty());
+        // The latest day with measurements drives the headline number.
+        assert_eq!(out.components[0].avg_response_time_ms, Some(101));
+        assert_eq!(out.incidents[0].title, "Delayed email delivery");
+    }
+
+    #[test]
+    fn incident_without_public_title_gets_severity_heading_never_internal_title() {
+        let mut data = RefreshData::default();
+        data.incidents.insert(7, vec![incident(10, None, None)]);
+        data.updates.insert(10, vec![update(10, "public text")]);
+        // A project-wide incident needs its project on the page.
+        let out = assemble_public_page(&page(), &[selection(1, "API", None)], &data, now());
+        assert_eq!(out.incidents[0].title, "Partial outage");
+    }
+
+    #[test]
+    fn incident_marks_only_the_components_it_affects() {
+        let mut data = RefreshData::default();
+        data.incidents.insert(7, vec![incident(10, Some(2), None)]);
+        data.updates.insert(10, vec![update(10, "web only")]);
+        let out = assemble_public_page(
+            &page(),
+            &[selection(1, "API", None), selection(2, "Web", None)],
+            &data,
+            now(),
+        );
+        let today = |c: usize| out.components[c].days.last().map(|d| d.incidents.len());
+        assert_eq!(today(0), Some(0));
+        assert_eq!(today(1), Some(1));
+    }
+
+    #[test]
+    fn project_wide_incident_affects_only_that_projects_components() {
+        let mut data = RefreshData::default();
+        data.incidents.insert(7, vec![incident(10, None, None)]);
+        data.updates
+            .insert(10, vec![update(10, "project 3 is degraded")]);
+        let selections = [
+            selection(1, "API", None),
+            in_project(selection(2, "Billing", None), 4),
+        ];
+        let out = assemble_public_page(&page(), &selections, &data, now());
+        assert_eq!(out.incidents.len(), 1);
+        assert_eq!(out.incidents[0].affected_components, ["API"]);
+        let today = |c: usize| out.components[c].days.last().map(|d| d.incidents.len());
+        assert_eq!(today(0), Some(1));
+        assert_eq!(
+            today(1),
+            Some(0),
+            "another project's component is unaffected"
+        );
+
+        // A page showing only that project's components: the incident is
+        // about the whole page, so it lists no components.
+        let out = assemble_public_page(&page(), &selections[..1], &data, now());
+        assert!(out.incidents[0].affected_components.is_empty());
+    }
+
+    #[test]
+    fn project_wide_incident_of_a_project_not_on_the_page_is_dropped() {
+        let mut data = RefreshData::default();
+        data.incidents.insert(7, vec![incident(10, None, None)]);
+        data.updates.insert(10, vec![update(10, "elsewhere")]);
+        let out = assemble_public_page(
+            &page(),
+            &[in_project(selection(2, "Billing", None), 4)],
+            &data,
+            now(),
+        );
+        assert!(out.incidents.is_empty());
+    }
+
+    #[test]
+    fn components_carry_their_group_name() {
+        let mut grouped = selection(1, "API", None);
+        grouped.group_name = Some("Temps Cloud".to_string());
+        let out = assemble_public_page(
+            &page(),
+            &[grouped, selection(2, "Docs", None)],
+            &RefreshData::default(),
+            now(),
+        );
+        assert_eq!(out.components[0].group.as_deref(), Some("Temps Cloud"));
+        assert_eq!(out.components[1].group, None);
+    }
+
+    #[test]
+    fn resolved_incident_stops_marking_days_after_resolution() {
+        let now = now();
+        let mut data = RefreshData::default();
+        let mut resolved = incident(10, None, None);
+        resolved.status = "resolved".to_string();
+        resolved.started_at = now - chrono::Duration::days(3);
+        resolved.resolved_at = Some(now - chrono::Duration::days(2));
+        data.incidents.insert(7, vec![resolved]);
+        data.updates.insert(10, vec![update(10, "fixed")]);
+        let out = assemble_public_page(&page(), &[selection(1, "API", None)], &data, now);
+        let marked: Vec<bool> = out.components[0]
+            .days
+            .iter()
+            .rev()
+            .take(5)
+            .map(|d| !d.incidents.is_empty())
+            .collect();
+        assert_eq!(marked, vec![false, false, true, true, false]);
+    }
+
+    #[test]
+    fn hidden_uptime_and_response_times_are_left_out_of_the_output() {
+        let now = now();
+        let mut data = RefreshData::default();
+        data.days.insert(
+            1,
+            HashMap::from([(
+                now.date_naive(),
+                DayCounts {
+                    operational: 4,
+                    latency_sum_ms: 400,
+                    latency_samples: 4,
+                    ..Default::default()
+                },
+            )]),
+        );
+        let mut hidden = page();
+        hidden.show_uptime_percentage = false;
+        hidden.show_response_times = false;
+        let out = assemble_public_page(&hidden, &[selection(1, "API", None)], &data, now);
+        let component = &out.components[0];
+        assert_eq!(component.uptime_percentage, None);
+        assert_eq!(component.avg_response_time_ms, None);
+        let today = component.days.last().expect("today");
+        assert_eq!(today.uptime_percentage, None);
+        assert_eq!(today.avg_response_time_ms, None);
+        // The check counts would give the hidden percentage away.
+        assert_eq!(
+            (
+                today.total_checks,
+                today.failed_checks,
+                today.degraded_checks
+            ),
+            (None, None, None)
+        );
+        let json = serde_json::to_string(&out).expect("public json");
+        assert!(!json.contains("\"total_checks\":4"), "{json}");
+        // The bar still says how the day went.
+        assert_eq!(today.status, PublicDayStatus::Operational);
+        assert!(!out.appearance.show_response_times);
     }
 }

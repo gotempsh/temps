@@ -15,6 +15,28 @@ import {
   formatChartTooltipLabel,
 } from '@/lib/chart-tooltip'
 import { yAxisTickProps } from '@/lib/chart-axis-ticks'
+import {
+  PG_CACHE_HIT_RATIO_METRIC,
+  formatPgCacheHitRatio,
+  metricTileValue,
+  pgCacheHitRatioDescription,
+  pgCacheHitRatioLabel,
+  pgCacheHitRatioScopedLabel,
+} from '@/lib/pg-cache-hit'
+import {
+  CONTAINER_CPU_METRIC,
+  CONTAINER_CPU_METRIC_LABELS,
+  CONTAINER_CPU_TILE_HINT,
+  CONTAINER_CPU_TILE_LABEL,
+  CONTAINER_CPU_UTILIZATION_METRIC,
+  alertableMetrics,
+  containerCpuAxisWidth,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  containerCpuTileText,
+  formatContainerCpuMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -73,6 +95,7 @@ import {
 import { useState } from 'react'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
+import { getErrorMessage } from '@/utils/errorHandling'
 import {
   LineChart,
   Line,
@@ -83,6 +106,16 @@ import {
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
 import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
+import {
+  serviceMetricsEngine,
+  type ServiceMetricsEngine,
+} from '@/lib/service-metrics-engine'
+import {
+  MARIADB_FLAG_METRICS,
+  formatFlagValue,
+  MARIADB_METRIC_LABELS,
+  MARIADB_METRICS,
+} from '@/lib/mariadb-metrics'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -148,7 +181,7 @@ function isMonitoringUnavailable(err: unknown): boolean {
 // Metric configuration per engine
 // ---------------------------------------------------------------------------
 
-type EngineKind = 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs'
+type EngineKind = ServiceMetricsEngine
 
 const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
   postgres: [
@@ -169,6 +202,12 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'mongo.op_query_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: [
+    'mariadb.connections_used_ratio',
+    'mariadb.buffer_pool_hit_ratio',
+    'mariadb.queries_total',
+    'mariadb.database_size_bytes',
+  ],
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -181,18 +220,23 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_capacity_used_bytes',
     'rustfs_cluster_objects_total',
   ],
+  // Only the engine-agnostic container stats exist for these.
+  unsupported: [],
 }
 
 // Container resource metrics — CPU/memory of the docker container(s) backing
 // the service, sampled every ~30s by the health monitor. Engine-agnostic:
 // shown for every engine ahead of the engine-specific stats.
 const CONTAINER_STAT_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_METRIC,
   'container.memory_used_bytes',
 ]
 
+// Alertable container metrics. CPU alerts threshold the share of the
+// container's limit: 80 on `container.cpu_percent` would mean 0.8 of one
+// core whatever the limit.
 const CONTAINER_METRICS = [
-  'container.cpu_percent',
+  CONTAINER_CPU_UTILIZATION_METRIC,
   'container.memory_used_bytes',
   'container.memory_percent',
 ]
@@ -201,8 +245,10 @@ const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   postgres: 'pg.connections',
   redis: 'redis.connected_clients',
   mongodb: 'mongo.connections_current',
+  mariadb: 'mariadb.connections',
   s3: 's3.bucket_count',
   rustfs: 'rustfs_cluster_capacity_used_bytes',
+  unsupported: CONTAINER_CPU_METRIC,
 }
 
 const KNOWN_METRICS: Record<EngineKind, string[]> = {
@@ -282,6 +328,7 @@ const KNOWN_METRICS: Record<EngineKind, string[]> = {
     'mongo.cursor_timed_out_total',
     'mongo.replication_buffer_ratio',
   ],
+  mariadb: MARIADB_METRICS,
   s3: [
     's3.bucket_count',
     's3.total_size_bytes',
@@ -311,21 +358,12 @@ const KNOWN_METRICS: Record<EngineKind, string[]> = {
     'rustfs_system_process_resident_memory_bytes',
     's3.bucket_count',
   ],
+  unsupported: [],
 }
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
-
-function isNormalEngine(engine: string): engine is EngineKind {
-  return ['postgres', 'redis', 'mongodb', 's3', 'rustfs'].includes(engine)
-}
-
-function normalizeEngine(engine: string, dockerImage?: string): EngineKind {
-  if (engine === 's3' && dockerImage?.toLowerCase().includes('rustfs'))
-    return 'rustfs'
-  return isNormalEngine(engine) ? engine : 'postgres'
-}
 
 /** Compact relative time, e.g. "just now", "12s ago", "3m ago", "2h ago". */
 function formatRelativeTime(iso: string): string {
@@ -343,7 +381,15 @@ function formatRelativeTime(iso: string): string {
 }
 
 function formatMetricValue(name: string, value: number): string {
-  if (name.endsWith('_bytes')) return formatBytes(value)
+  if (name === PG_CACHE_HIT_RATIO_METRIC) return formatPgCacheHitRatio(value)
+  const cpu = formatContainerCpuMetric(name, value)
+  if (cpu !== null) return cpu
+  if (MARIADB_FLAG_METRICS.has(name)) {
+    const flag = formatFlagValue(value)
+    if (flag !== null) return flag
+  }
+  if (name.endsWith('_bytes') || name.endsWith('_bytes_total'))
+    return formatBytes(value)
   if (name.endsWith('_ratio')) return `${(value * 100).toFixed(1)}%`
   if (name.endsWith('_percent')) return `${value.toFixed(1)}%`
   if (name.endsWith('_seconds') || name.endsWith('_sec'))
@@ -363,10 +409,41 @@ function formatMetricValue(name: string, value: number): string {
 }
 
 const METRIC_LABELS: Record<string, string> = {
-  // Docker CLI convention: 100% == one core fully used.
-  'container.cpu_percent': 'CPU',
+  ...CONTAINER_CPU_METRIC_LABELS,
   'container.memory_used_bytes': 'Memory',
   'container.memory_percent': 'Memory %',
+  [PG_CACHE_HIT_RATIO_METRIC]: pgCacheHitRatioLabel(),
+  ...MARIADB_METRIC_LABELS,
+}
+
+// The stat tiles show the latest instance-wide value, so a per-database
+// metric names that scope.
+function statTileLabel(name: string): string {
+  if (name === PG_CACHE_HIT_RATIO_METRIC)
+    return pgCacheHitRatioScopedLabel('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_LABEL
+  return labelForMetric(name)
+}
+
+// The tooltip of a stat tile: what the value means and how fresh it is.
+function statTileHint(name: string): string | undefined {
+  if (name === PG_CACHE_HIT_RATIO_METRIC)
+    return pgCacheHitRatioDescription('all')
+  if (name === CONTAINER_CPU_METRIC) return CONTAINER_CPU_TILE_HINT
+  return undefined
+}
+
+// A stat tile's text. CPU reads in cores against the container's limit, the
+// same way the resources card shows it.
+function statTileText(
+  name: string,
+  lookup: (metric: string) => number | undefined,
+  cluster: boolean
+): string {
+  if (name === CONTAINER_CPU_METRIC)
+    return containerCpuTileText(lookup, cluster)
+  const latest = metricTileValue(name, lookup)
+  return latest != null ? formatMetricValue(name, latest) : '—'
 }
 
 function labelForMetric(name: string): string {
@@ -408,7 +485,10 @@ function AddAlertRuleDialog({
   engine,
   onSuccess,
 }: AddAlertRuleDialogProps) {
-  const alertMetrics = [...CONTAINER_METRICS, ...KNOWN_METRICS[engine]]
+  const alertMetrics = alertableMetrics([
+    ...CONTAINER_METRICS,
+    ...KNOWN_METRICS[engine],
+  ])
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
@@ -424,15 +504,17 @@ function AddAlertRuleDialog({
       setName('')
       setThreshold('0')
     },
-    onError: (err: Error) =>
-      toast.error('Failed to create alert rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to create alert rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent>
         <DialogHeader>
-          <DialogTitle>Add Alert Rule</DialogTitle>
+          <DialogTitle>Add alert rule</DialogTitle>
           <DialogDescription>
             Fire an alarm when the chosen metric crosses the threshold.
           </DialogDescription>
@@ -532,7 +614,7 @@ function AddAlertRuleDialog({
             {create.isPending && (
               <Loader2 className="h-4 w-4 mr-2 animate-spin" />
             )}
-            Add Rule
+            Add rule
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -575,8 +657,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
   const updateRule = useMutation({
     ...externalServiceMetricsUpdateAlertRuleMutation(),
     onSuccess: () => invalidate(),
-    onError: (err: Error) =>
-      toast.error('Failed to update rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to update rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   const removeRule = useMutation({
@@ -586,8 +670,10 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       setRuleToDelete(null)
       invalidate()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to delete rule', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to delete rule', {
+        description: getErrorMessage(err),
+      }),
   })
 
   return (
@@ -599,7 +685,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
             size="sm"
             className="w-full justify-between px-0 text-sm font-medium hover:bg-transparent"
           >
-            Alert Rules
+            Alert rules
             <ChevronDown
               className={`h-4 w-4 text-muted-foreground transition-transform ${open ? 'rotate-180' : ''}`}
             />
@@ -747,7 +833,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
               onClick={() => setAddDialogOpen(true)}
             >
               <Plus className="h-4 w-4" />
-              Add Rule
+              Add rule
             </Button>
           </div>
         </CollapsibleContent>
@@ -770,7 +856,7 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
       >
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Delete Alert Rule</DialogTitle>
+            <DialogTitle>Delete alert rule</DialogTitle>
             <DialogDescription>
               Delete the rule{' '}
               <span className="font-medium text-foreground">
@@ -812,7 +898,11 @@ function AlertRulesSection({ serviceId, engine }: AlertRulesSectionProps) {
 type LiveMetricsProps = {
   serviceId: number
   engine: EngineKind
+  /** Raw service type, named in the notice for engines without a collector. */
+  serviceType: string
   latestMetrics: MetricLatest[]
+  /** The service runs as a cluster; see `containerCpuTileText`. */
+  cluster: boolean
 }
 
 // --chart-1 is oklch(0.59 0.2032 256.82) = #0070f3 in globals.css.
@@ -820,7 +910,13 @@ type LiveMetricsProps = {
 // This matches the design token — not an arbitrary choice.
 const CHART_LINE_COLOR = '#0070f3'
 
-function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
+function LiveMetrics({
+  serviceId,
+  engine,
+  serviceType,
+  latestMetrics,
+  cluster,
+}: LiveMetricsProps) {
   // Container CPU/memory first — resource saturation is the first thing an
   // operator checks — then the engine-specific headline stats.
   const statMetrics = [
@@ -848,18 +944,34 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
 
   const firingCount = 0
 
-  // Range chart data
+  // Range chart data: the series behind the selected tile.
+  const chartMetric = containerCpuChartMetric(selectedMetric, cluster)
   const rangeLabel = HOURS_TO_RANGE[rangeHours] ?? '1h'
   const { data: rangeData, isLoading: rangeLoading } = useQuery({
     ...externalServiceMetricsGetRangeOptions({
       path: { id: serviceId },
-      query: { metric: selectedMetric, range: rangeLabel },
+      query: { metric: chartMetric, range: rangeLabel },
     }),
     staleTime: 15_000,
     refetchInterval: 30_000,
   })
+  // Before a cluster's busiest-member series starts, chart the members' CPU
+  // history instead of an empty range.
+  const historyMetric = containerCpuHistoryMetric(selectedMetric, chartMetric)
+  const { data: historyData, isLoading: historyLoading } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? chartMetric, range: rangeLabel },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 15_000,
+    refetchInterval: 30_000,
+  })
 
-  const chartData = (rangeData ?? []).map((p) => ({
+  const chartPoints = historyMetric
+    ? withCpuHistory(rangeData ?? [], historyData ?? [])
+    : (rangeData ?? [])
+  const chartData = chartPoints.map((p) => ({
     time: new Date(p.time).getTime(),
     value: p.value,
   }))
@@ -882,38 +994,54 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
         </div>
       )}
 
+      {engine === 'unsupported' && (
+        <p className="rounded-md border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+          {serviceType} metrics such as connections, queries and storage are not
+          collected yet. Container CPU and memory are shown below.
+        </p>
+      )}
+
       {/* Stat row */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
-        {statMetrics.map((name) => {
-          const latest = latestByName.get(name)
-          const isSelected = name === selectedMetric
-          return (
-            <button
-              key={name}
-              type="button"
-              onClick={() => setSelectedMetric(name)}
-              className={`flex flex-col gap-0.5 rounded-md border p-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
-                isSelected
-                  ? 'border-primary/40 bg-primary/5 ring-1 ring-inset ring-primary/30'
-                  : 'border-border bg-card'
-              }`}
-            >
-              <span className="text-[11px] font-medium text-muted-foreground">
-                {labelForMetric(name)}
-              </span>
-              <span className="text-base font-semibold tabular-nums text-foreground">
-                {latest != null ? formatMetricValue(name, latest.value) : '—'}
-              </span>
-            </button>
-          )
-        })}
+      <div className="@container">
+        <div className="grid grid-cols-2 gap-2 @lg:grid-cols-3 @3xl:grid-cols-6">
+          {statMetrics.map((name) => {
+            const text = statTileText(
+              name,
+              (m) => latestByName.get(m)?.value,
+              cluster
+            )
+            const isSelected = name === selectedMetric
+            return (
+              <button
+                key={name}
+                type="button"
+                onClick={() => setSelectedMetric(name)}
+                className={`flex flex-col gap-0.5 rounded-md border p-3 text-left transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring ${
+                  isSelected
+                    ? 'border-primary/40 bg-primary/5 ring-1 ring-inset ring-primary/30'
+                    : 'border-border bg-card'
+                }`}
+              >
+                <span
+                  className="text-[11px] font-medium text-muted-foreground"
+                  title={statTileHint(name)}
+                >
+                  {statTileLabel(name)}
+                </span>
+                <span className="text-base font-semibold tabular-nums text-foreground">
+                  {text}
+                </span>
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* Range selector + chart */}
       <div className="space-y-2 overflow-visible">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <span className="text-sm font-medium">
-            {labelForMetric(selectedMetric)}
+            {labelForMetric(chartMetric)}
           </span>
           <div className="flex gap-1">
             {RANGE_OPTIONS.map((opt) => (
@@ -930,12 +1058,14 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
           </div>
         </div>
         <div className="relative z-20 h-48 w-full overflow-visible">
-          {rangeLoading ? (
+          {rangeLoading || (historyMetric != null && historyLoading) ? (
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
               <Loader2 className="h-4 w-4 animate-spin mr-2" />
               Loading…
             </div>
-          ) : chartData.length === 0 ? (
+          ) : !chartData.some((p) => p.value != null) ? (
+            // Every bucket is returned; `null` ones are gaps the line breaks
+            // at, so "no data" means no bucket holds a sample.
             <div className="flex h-full items-center justify-center text-xs text-muted-foreground">
               No data for this range
             </div>
@@ -959,16 +1089,17 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                   tickLine={false}
                   axisLine={false}
                   width={
-                    selectedMetric.endsWith('_ratio') ||
-                    selectedMetric.endsWith('_percent')
+                    containerCpuAxisWidth(chartMetric) ??
+                    (chartMetric.endsWith('_ratio') ||
+                    chartMetric.endsWith('_percent')
                       ? 56
-                      : selectedMetric.endsWith('_bytes')
+                      : chartMetric.endsWith('_bytes')
                         ? 60
-                        : 44
+                        : 44)
                   }
                   {...yAxisTickProps(
                     chartData.map((p) => p.value),
-                    { format: (v) => formatMetricValue(selectedMetric, v) }
+                    { format: (v) => formatMetricValue(chartMetric, v) }
                   )}
                 />
                 <Tooltip
@@ -982,8 +1113,8 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                     formatChartTooltipLabel(Number(label))
                   }
                   formatter={(v) => [
-                    formatMetricValue(selectedMetric, Number(v)),
-                    labelForMetric(selectedMetric),
+                    formatMetricValue(chartMetric, Number(v)),
+                    labelForMetric(chartMetric),
                   ]}
                 />
                 <Line
@@ -1012,7 +1143,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
 
 export interface MonitoringCardProps {
   serviceId: number
-  /** 'postgres' | 'redis' | 'mongodb' | 's3' | 'rustfs' */
+  /** Service type, e.g. 'postgres', 'mariadb' or 's3' */
   engine: string
   /** Docker image — used to detect RustFS when service_type is 's3' */
   dockerImage?: string
@@ -1022,6 +1153,8 @@ export interface MonitoringCardProps {
   /** Called after monitoring is toggled on/off so the parent can refetch the
    *  service (which owns the `metricsEnabled` flag). */
   onMonitoringChange?: () => void
+  /** The service runs as a cluster (more than one container). */
+  cluster?: boolean
 }
 
 /**
@@ -1036,9 +1169,10 @@ export function MonitoringCard({
   dockerImage,
   metricsEnabled = false,
   onMonitoringChange,
+  cluster = false,
 }: MonitoringCardProps) {
   const queryClient = useQueryClient()
-  const normalEngine = normalizeEngine(engine, dockerImage)
+  const normalEngine = serviceMetricsEngine(engine, dockerImage)
 
   // Poll /latest every 3s. If the result is null/empty → State B. If data → State C.
   // HTTP 404 from the backend means metrics are not enabled → State A.
@@ -1104,8 +1238,10 @@ export function MonitoringCard({
       // the query un-gates.
       onMonitoringChange?.()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to enable monitoring', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to enable monitoring', {
+        description: getErrorMessage(err),
+      }),
   })
 
   const disableMonitoring = useMutation({
@@ -1119,8 +1255,10 @@ export function MonitoringCard({
       })
       onMonitoringChange?.()
     },
-    onError: (err: Error) =>
-      toast.error('Failed to disable monitoring', { description: err.message }),
+    onError: (err) =>
+      toast.error('Failed to disable monitoring', {
+        description: getErrorMessage(err),
+      }),
   })
 
   // State A: monitoring disabled for this service. Either the service flag is
@@ -1132,7 +1270,7 @@ export function MonitoringCard({
     return (
       <EmptyPlaceholder
         icon={Activity}
-        title="Database Monitoring"
+        title="Database monitoring"
         description="Performance metrics, query insights, and historical trends."
       >
         <Button
@@ -1147,7 +1285,7 @@ export function MonitoringCard({
           {enableMonitoring.isPending && (
             <Loader2 className="h-4 w-4 mr-2 animate-spin" />
           )}
-          Enable Monitoring
+          Enable monitoring
         </Button>
       </EmptyPlaceholder>
     )
@@ -1249,7 +1387,9 @@ export function MonitoringCard({
         <LiveMetrics
           serviceId={serviceId}
           engine={normalEngine}
+          serviceType={engine}
           latestMetrics={latestMetrics}
+          cluster={cluster}
         />
       </CardContent>
     </Card>

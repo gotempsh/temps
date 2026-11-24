@@ -111,9 +111,9 @@ fn file_op_err(
     public_id: &str,
     op: &str,
     path: impl Into<String>,
-    err: temps_agents::error::AgentError,
+    err: temps_agent_core::error::AgentError,
 ) -> SandboxError {
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
     match err {
         AgentError::Validation { .. }
         | AgentError::SandboxUnsupportedOnNode { .. }
@@ -148,6 +148,31 @@ impl SandboxService {
             .registry()
             .provider()
             .read_file(&handle, path)
+            .await
+            .map_err(|e| file_op_err(public_id, "read", path.to_string(), e))?;
+        Ok(bytes)
+    }
+
+    /// [`fs_read`](Self::fs_read), refusing a file larger than `max_bytes`
+    /// with [`SandboxError::Validation`] naming the sandbox, path and limit.
+    /// Providers that can stop early (Docker, microsandbox) never buffer more
+    /// than about `max_bytes`, so callers that only need a bounded amount of
+    /// a file, or must cap their memory, use this instead of `fs_read`.
+    pub async fn fs_read_bounded(
+        &self,
+        public_id: &str,
+        user_id: i32,
+        path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, SandboxError> {
+        validate_absolute(path, "read")?;
+        let (row, internal_id) = self.resolve_id(public_id, user_id).await?;
+        let handle = self.live_handle(&row).await?;
+        self.touch(internal_id, row.timeout_secs).await;
+        let bytes = self
+            .registry()
+            .provider()
+            .read_file_bounded(&handle, path, max_bytes)
             .await
             .map_err(|e| file_op_err(public_id, "read", path.to_string(), e))?;
         Ok(bytes)
@@ -625,7 +650,7 @@ fn shell_quote(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
 
     #[test]
     fn file_op_errors_keep_precise_provider_meanings() {

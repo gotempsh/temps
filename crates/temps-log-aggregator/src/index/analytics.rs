@@ -140,6 +140,121 @@ pub struct HistogramBucket {
     pub count: i64,
 }
 
+/// Parse repeatable `attr=<key><op><value>` query parameters (and
+/// `attr=<key>?` for "exists") into index predicates.
+pub fn parse_attr_predicates(raws: &[String]) -> Result<Vec<AttrPredicate>, LogAggregatorError> {
+    raws.iter().map(|s| parse_attr_predicate(s)).collect()
+}
+
+pub(crate) fn attr_filter_error(raw: &str) -> LogAggregatorError {
+    LogAggregatorError::Validation {
+        message: format!(
+            "invalid attribute filter {raw:?}: expected <key><op><value> with op in =, !=, ^= \
+             (prefix), >, < or <key>? for \"exists\""
+        ),
+    }
+}
+
+pub fn parse_attr_predicate(raw: &str) -> Result<AttrPredicate, LogAggregatorError> {
+    if let Some(key) = raw.strip_suffix('?') {
+        if key.is_empty() {
+            return Err(attr_filter_error(raw));
+        }
+        return Ok(AttrPredicate {
+            key: key.to_string(),
+            op: AttrOp::Exists,
+            value: None,
+        });
+    }
+    // Two-character operators first: `!=`/`^=` both contain `=`, so checking
+    // the single-`=` case first would split them in the wrong place.
+    for (token, op) in [("!=", AttrOp::Neq), ("^=", AttrOp::Prefix)] {
+        if let Some(idx) = raw.find(token) {
+            let (key, rest) = (&raw[..idx], &raw[idx + token.len()..]);
+            if key.is_empty() {
+                return Err(attr_filter_error(raw));
+            }
+            return Ok(AttrPredicate {
+                key: key.to_string(),
+                op,
+                value: Some(rest.to_string()),
+            });
+        }
+    }
+    for (ch, op) in [('=', AttrOp::Eq), ('>', AttrOp::Gt), ('<', AttrOp::Lt)] {
+        if let Some(idx) = raw.find(ch) {
+            let (key, rest) = (&raw[..idx], &raw[idx + 1..]);
+            if key.is_empty() {
+                return Err(attr_filter_error(raw));
+            }
+            return Ok(AttrPredicate {
+                key: key.to_string(),
+                op,
+                value: Some(rest.to_string()),
+            });
+        }
+    }
+    Err(attr_filter_error(raw))
+}
+
+/// Add the counts of lines the index does not hold yet to an indexed
+/// histogram.
+///
+/// The line index is written per sealed chunk, so the newest minutes of a
+/// window live only in the writer's head buffers until they seal; without
+/// this a live histogram drops to nothing at its right edge. `unindexed`
+/// uses the index's bucket alignment and group names. The indexed series
+/// keep their top-N shape: a group the index returned keeps its name, a new
+/// one takes a free slot up to `max_groups` (largest first) and anything
+/// beyond folds into `"other"`, exactly like the index's own overflow.
+pub fn merge_histogram(
+    indexed: Vec<HistogramBucket>,
+    unindexed: Vec<HistogramBucket>,
+    max_groups: u32,
+) -> Vec<HistogramBucket> {
+    if unindexed.is_empty() {
+        return indexed;
+    }
+    let mut named: std::collections::BTreeSet<String> = indexed
+        .iter()
+        .filter_map(|b| b.group.clone())
+        .filter(|g| g != "other")
+        .collect();
+    let mut new_totals: BTreeMap<String, i64> = BTreeMap::new();
+    for bucket in &unindexed {
+        if let Some(group) = bucket.group.as_ref().filter(|g| !named.contains(*g)) {
+            *new_totals.entry(group.clone()).or_default() += bucket.count;
+        }
+    }
+    let mut new_groups: Vec<(String, i64)> = new_totals.into_iter().collect();
+    new_groups.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    for (group, _) in new_groups {
+        if named.len() >= max_groups as usize {
+            break;
+        }
+        named.insert(group);
+    }
+
+    let mut counts: BTreeMap<(DateTime<Utc>, Option<String>), i64> = BTreeMap::new();
+    for bucket in indexed {
+        *counts.entry((bucket.ts, bucket.group)).or_default() += bucket.count;
+    }
+    for bucket in unindexed {
+        let group = bucket.group.map(|g| {
+            if g == "other" || named.contains(&g) {
+                g
+            } else {
+                "other".to_string()
+            }
+        });
+        *counts.entry((bucket.ts, group)).or_default() += bucket.count;
+    }
+    counts
+        .into_iter()
+        .map(|((ts, group), count)| HistogramBucket { ts, group, count })
+        .collect()
+}
+
 /// One row of an aggregation: the group values (in `group_by` order) and
 /// the metric.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
@@ -250,27 +365,27 @@ pub(crate) enum Scoping {
 }
 
 /// Everything about a target that changes the SQL: where the rows live, how
-/// the attributes are stored, how a project is named, and whether forgotten
-/// chunks are masked by tombstones instead of deleted.
+/// the attributes are stored, how a project is named, and where the
+/// tombstones of forgotten chunks are kept.
 pub(crate) struct Dialect {
     pub lines_table: &'static str,
     pub attrs: AttrStorage,
     pub scoping: Scoping,
-    /// Table of chunk seqs the instance has forgotten. `Some` only where
-    /// `DELETE` is not available (Cloud): every read then excludes them, so
-    /// compaction and purge never double-count.
+    /// Table of chunk seqs the instance has forgotten. Every read excludes
+    /// them, so compaction and purge never double-count. On Cloud they are
+    /// the only mechanism (no `DELETE` through the proxies); locally they
+    /// mask rows until a batched, partition-scoped reclaim removes them.
     pub tombstones: Option<&'static str>,
 }
 
 impl Dialect {
-    /// The instance's own ClickHouse. Must render exactly the SQL this file
-    /// has always rendered.
+    /// The instance's own ClickHouse.
     pub fn local() -> Self {
         Self {
             lines_table: super::clickhouse::LOCAL_LINES_TABLE,
             attrs: AttrStorage::Json,
             scoping: Scoping::Raw,
-            tombstones: None,
+            tombstones: Some(super::clickhouse::LOCAL_FORGOTTEN_CHUNKS_TABLE),
         }
     }
 
@@ -539,7 +654,8 @@ fn attr_exists_expr(key: &str, d: &Dialect) -> Result<String, LogAggregatorError
     })
 }
 
-fn level_name(l: LogLevel) -> &'static str {
+/// A level as the line index names it in group values (`info`, `warn`, …).
+pub(crate) fn level_name(l: LogLevel) -> &'static str {
     match l {
         LogLevel::Trace => "trace",
         LogLevel::Debug => "debug",
@@ -647,11 +763,19 @@ pub(crate) fn build_where(
     // `chunk_seq` is only unique within one manifest, so an uncorrelated
     // subquery would let one instance's tombstone hide a sibling instance's
     // lines in the same tenant.
+    // Locally the table only ever holds this instance's chunks, so no
+    // correlation is needed.
     if let Some(tombstones) = d.tombstones {
-        let p = sql.bind(Param::Str(instance_ref.unwrap_or_default()));
-        sql.conditions.push(format!(
-            "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones} WHERE instance_ref = {p})"
-        ));
+        if d.is_cloud() {
+            let p = sql.bind(Param::Str(instance_ref.unwrap_or_default()));
+            sql.conditions.push(format!(
+                "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones} WHERE instance_ref = {p})"
+            ));
+        } else {
+            sql.conditions.push(format!(
+                "chunk_seq NOT IN (SELECT chunk_seq FROM {tombstones})"
+            ));
+        }
     }
     if !query.levels.is_empty() {
         let v = sql.bind(Param::StrList(
@@ -809,9 +933,132 @@ pub(crate) fn test_cloud_link(dir: &std::path::Path) -> Arc<temps_cloud_client::
     link
 }
 
+/// Parse one `group_by`/`keys` item: a label facet name (`env`, `service`,
+/// `level`, `stream`, `project`, `external_service`, `node`, `deploy`,
+/// `container`) or `attr:<name>` for an attribute.
+pub fn parse_group_key(raw: &str) -> Result<GroupKey, LogAggregatorError> {
+    let raw = raw.trim();
+    if let Some(attr) = raw.strip_prefix("attr:") {
+        if attr.is_empty() {
+            return Err(LogAggregatorError::Validation {
+                message: "attr: group key needs a name, e.g. attr:worker".to_string(),
+            });
+        }
+        return Ok(GroupKey::Attr(attr.to_string()));
+    }
+    let field: FacetField = serde_json::from_value(serde_json::Value::String(raw.to_string()))
+        .map_err(|_| LogAggregatorError::Validation {
+            message: format!(
+                "unknown group key {raw:?}; expected one of env, service, level, stream, \
+                 project, external_service, node, deploy, container, or attr:<name>"
+            ),
+        })?;
+    Ok(GroupKey::Label(field))
+}
+
+/// Parse a comma-separated list of group keys.
+pub fn parse_group_keys(raw: &str) -> Result<Vec<GroupKey>, LogAggregatorError> {
+    let keys: Result<Vec<GroupKey>, LogAggregatorError> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(parse_group_key)
+        .collect();
+    let keys = keys?;
+    if keys.is_empty() {
+        return Err(LogAggregatorError::Validation {
+            message: "at least one group-by key is required".to_string(),
+        });
+    }
+    Ok(keys)
+}
+
+/// Parse a `metric` parameter: `count`, or `<fn>:<attr>` for
+/// `count_distinct`, `avg`, `p50`, `p95`, `p99`, `max`, `sum`.
+pub fn parse_metric(raw: &str) -> Result<Metric, LogAggregatorError> {
+    let invalid = || LogAggregatorError::Validation {
+        message: format!(
+            "invalid metric {raw:?}; expected count, or one of count_distinct, avg, p50, p95, \
+             p99, max, sum followed by :<attr>"
+        ),
+    };
+    if raw == "count" {
+        return Ok(Metric::Count);
+    }
+    let (name, attr) = raw.split_once(':').ok_or_else(invalid)?;
+    if attr.is_empty() {
+        return Err(invalid());
+    }
+    Ok(match name {
+        "count_distinct" => Metric::CountDistinct(attr.to_string()),
+        "avg" => Metric::Avg(attr.to_string()),
+        "p50" => Metric::P50(attr.to_string()),
+        "p95" => Metric::P95(attr.to_string()),
+        "p99" => Metric::P99(attr.to_string()),
+        "max" => Metric::Max(attr.to_string()),
+        "sum" => Metric::Sum(attr.to_string()),
+        _ => return Err(invalid()),
+    })
+}
+
+/// Upper bound on any of these endpoints' `limit`/`max_groups`, regardless of
+/// what the caller asks for.
+pub const MAX_ANALYTICS_LIMIT: u32 = 1000;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bucket(minute: u32, group: Option<&str>, count: i64) -> HistogramBucket {
+        HistogramBucket {
+            ts: format!("2026-01-01T00:{minute:02}:00Z").parse().unwrap(),
+            group: group.map(str::to_string),
+            count,
+        }
+    }
+
+    #[test]
+    fn merge_histogram_adds_unindexed_minutes_to_the_indexed_series() {
+        let merged = merge_histogram(
+            vec![bucket(0, None, 10), bucket(1, None, 4)],
+            vec![bucket(1, None, 3), bucket(2, None, 7)],
+            8,
+        );
+        assert_eq!(
+            merged,
+            vec![bucket(0, None, 10), bucket(1, None, 7), bucket(2, None, 7)]
+        );
+    }
+
+    #[test]
+    fn merge_histogram_admits_new_groups_only_into_free_slots() {
+        let merged = merge_histogram(
+            vec![bucket(0, Some("info"), 10), bucket(0, Some("warn"), 2)],
+            vec![
+                bucket(1, Some("info"), 5),
+                bucket(1, Some("error"), 3),
+                bucket(1, Some("debug"), 1),
+            ],
+            3,
+        );
+        // `error` (the larger) takes the one free slot; `debug` folds.
+        assert_eq!(
+            merged,
+            vec![
+                bucket(0, Some("info"), 10),
+                bucket(0, Some("warn"), 2),
+                bucket(1, Some("error"), 3),
+                bucket(1, Some("info"), 5),
+                bucket(1, Some("other"), 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_histogram_without_unindexed_lines_is_the_indexed_answer() {
+        let indexed = vec![bucket(0, Some("a"), 1), bucket(0, Some("other"), 9)];
+        assert_eq!(merge_histogram(indexed.clone(), Vec::new(), 1), indexed);
+    }
 
     /// The dialect every pre-Cloud expectation in this file is written
     /// against; its SQL must not move.
@@ -1059,7 +1306,7 @@ mod tests {
     }
 
     #[test]
-    fn every_cloud_read_excludes_forgotten_chunks_and_no_local_read_does() {
+    fn every_cloud_read_excludes_forgotten_chunks_correlated_to_this_instance() {
         let dir = tempfile::tempdir().expect("temp dir");
         let tombstones = "chunk_seq NOT IN (SELECT chunk_seq FROM telemetry_log_forgotten_chunks \
                           WHERE instance_ref = ?)";
@@ -1084,6 +1331,29 @@ mod tests {
         assert!(!sql
             .where_clause()
             .contains("telemetry_log_forgotten_chunks"));
+    }
+
+    #[test]
+    fn every_local_read_excludes_locally_forgotten_chunks_uncorrelated() {
+        // A forget is a tombstone locally too (a bare DELETE mutated every
+        // day partition), so every read must mask it until the reclaim pass
+        // deletes the rows. The local table holds one instance's chunks
+        // only: no `instance_ref` column, no bound parameter.
+        for scope in [
+            LogAccessScope::All,
+            LogAccessScope::Allowed {
+                project_ids: vec![7],
+                external_service_ids: vec![],
+            },
+        ] {
+            let sql = build_where(&q(scope), &[], &local()).unwrap();
+            let clause = sql.where_clause();
+            assert!(
+                clause.contains("chunk_seq NOT IN (SELECT chunk_seq FROM log_forgotten_chunks)"),
+                "{clause}"
+            );
+            assert!(!clause.contains("instance_ref"), "{clause}");
+        }
     }
 
     #[test]

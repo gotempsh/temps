@@ -52,7 +52,7 @@ test('a refused provider list is not rendered as "no SSO providers configured"',
   expect(html).toContain('SSO providers: access denied')
   expect(html).toContain('Requires settings:write permission')
   expect(html).not.toContain('No SSO providers configured')
-  expect(html).not.toContain('Add SSO Provider')
+  expect(html).not.toContain('Add SSO provider')
   client.clear()
 })
 
@@ -61,7 +61,7 @@ test('a verified-empty provider list still onboards the operator', () => {
   client.setQueryData(providersKey, [])
   const html = render(client)
   expect(html).toContain('No SSO providers configured')
-  expect(html).toContain('Add SSO Provider')
+  expect(html).toContain('Add SSO provider')
   expect(html).not.toContain('access denied')
   client.clear()
 })

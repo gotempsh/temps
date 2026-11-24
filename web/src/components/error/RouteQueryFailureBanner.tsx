@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ReadFailure } from '@/components/ui/read-failure'
+import { cn } from '@/lib/utils'
 import {
   collectRouteQueryFailures,
   representativeFailure,
@@ -14,7 +15,12 @@ import { useCallback, useRef, useSyncExternalStore } from 'react'
 function sameFailures(a: RouteQueryFailure[], b: RouteQueryFailure[]): boolean {
   return (
     a.length === b.length &&
-    a.every((f, i) => f.queryHash === b[i].queryHash && f.error === b[i].error)
+    a.every(
+      (f, i) =>
+        f.queryHash === b[i].queryHash &&
+        f.error === b[i].error &&
+        f.retained === b[i].retained
+    )
   )
 }
 
@@ -25,7 +31,11 @@ function sameFailures(a: RouteQueryFailure[], b: RouteQueryFailure[]): boolean {
  * Mount it once, above the routes. It renders nothing while everything
  * loaded, so a healthy page pays for one cache subscription.
  */
-export function RouteQueryFailureBanner() {
+export function RouteQueryFailureBanner({
+  className,
+}: {
+  className?: string
+} = {}) {
   const queryClient = useQueryClient()
   const snapshot = useRef<RouteQueryFailure[]>([])
 
@@ -61,14 +71,24 @@ export function RouteQueryFailureBanner() {
 
   const failure = representativeFailure(failures)
   if (!failure) return null
+  // A moved window that did not load leaves the earlier window on screen.
+  const retained = failures.every((f) => f.retained)
 
   return (
-    <div className="px-2 pb-4 sm:px-0" data-route-query-failure>
+    <div
+      className={cn('px-2 pb-3 sm:px-0', className)}
+      data-route-query-failure
+    >
       <ReadFailure
         resource={
-          failures.length > 1 ? 'Some data on this page' : 'Data on this page'
+          retained
+            ? 'Latest data on this page'
+            : failures.length > 1
+              ? 'Some data on this page'
+              : 'Data on this page'
         }
         error={failure.error}
+        cached={retained}
         onRetry={retry}
         retrying={retrying}
         routeLevel

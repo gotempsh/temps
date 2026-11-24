@@ -3,6 +3,7 @@
 
 import type { AuthFlavorDto, ProviderCatalogDto } from '@/api/client'
 import { problemDetail } from '@/lib/api-problem'
+import { withReturnTo } from '@/lib/safe-return-to'
 
 export const LOCAL_LOGIN_METHOD = 'local'
 /** One-click subscription sign-in run by the server's own CLI. */
@@ -140,35 +141,23 @@ export function harnessSetupStatus(
   return provider.workspace_ready ? 'Credential saved' : 'Needs attention'
 }
 
-export function workspaceReturnTo(value: string | null): string {
-  if (
-    !value ||
-    !value.startsWith('/') ||
-    value.startsWith('//') ||
-    /[\\\s]/.test(value)
-  )
-    return '/ai-first'
-  const url = new URL(value, 'https://temps.invalid')
-  if (url.origin !== 'https://temps.invalid') return '/ai-first'
-  if (
-    url.pathname !== '/ai-first' &&
-    url.pathname !== '/workspaces' &&
-    !/^\/workspaces\/[a-zA-Z0-9_-]+$/.test(url.pathname)
-  )
-    return '/ai-first'
-  return `${url.pathname}${url.search}`
-}
+/**
+ * Where the agent credentials autofix runs with are managed. Not in the
+ * navigation: harnesses were retired as a console feature, and these pages
+ * remain only as the setup step autofix links to.
+ */
+export const AUTOFIX_CREDENTIALS_PATH = '/agent-sandbox/providers'
 
-export function harnessSetupHref(providerId: string | null, returnTo: string) {
+/**
+ * The credentials list, or one harness's page, carrying a validated
+ * `returnTo` so finishing setup can send the user back to their task.
+ */
+export function harnessSetupHref(
+  providerId: string | null,
+  returnTo?: string | null
+): string {
   const path =
-    '/agent-sandbox/providers' +
+    AUTOFIX_CREDENTIALS_PATH +
     (providerId ? `/${encodeURIComponent(providerId)}` : '')
-  return `${path}?returnTo=${encodeURIComponent(workspaceReturnTo(returnTo))}`
-}
-
-export function harnessSectionHref(path: string, search: string): string {
-  const returnTo = new URLSearchParams(search).get('returnTo')
-  return returnTo
-    ? `${path}?${new URLSearchParams({ returnTo: workspaceReturnTo(returnTo) })}`
-    : path
+  return withReturnTo(path, returnTo)
 }

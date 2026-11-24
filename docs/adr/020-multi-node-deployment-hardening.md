@@ -3,7 +3,7 @@
 **Status:** Accepted — decisions resolved 2026-06-27 (see Decisions); implementation in progress on `harden/multi-node-deployments`
 **Date:** 2026-06-27
 **Author:** David Viejo
-**Companion:** [`020-multi-node-hardening-audit.md`](./020-multi-node-hardening-audit.md) — the full 75-finding security & reliability audit this ADR responds to.
+**Companion:** [`supporting/020-multi-node-hardening-audit.md`](./supporting/020-multi-node-hardening-audit.md) — the full 75-finding security & reliability audit this ADR responds to.
 
 ## Context
 

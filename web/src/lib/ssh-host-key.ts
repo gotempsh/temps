@@ -28,3 +28,23 @@ export function hostKeyCompareCommand(algorithm: string): string {
   const file = hostKeyFileForAlgorithm(algorithm)
   return file ? `ssh-keygen -lf ${file}` : ALL_HOST_KEYS_COMMAND
 }
+
+/**
+ * The SSH port typed into the enroll form, or why it cannot be used. The form
+ * used to read anything unparseable as 22 and pass 70000 through, so a typo
+ * probed a different port than the one shown.
+ */
+export function parseSshPort(
+  value: string
+): { port: number; error: null } | { port: null; error: string } {
+  const trimmed = value.trim()
+  if (trimmed === '') return { port: null, error: 'Enter a port (usually 22)' }
+  if (!/^\d+$/.test(trimmed)) {
+    return { port: null, error: 'The port must be a whole number' }
+  }
+  const port = Number(trimmed)
+  if (port < 1 || port > 65535) {
+    return { port: null, error: 'The port must be between 1 and 65535' }
+  }
+  return { port, error: null }
+}

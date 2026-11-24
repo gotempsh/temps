@@ -5,8 +5,8 @@
 //!
 //! This module provides ready-to-use job implementations for common deployment tasks.
 
+use crate::workflow::WorkflowError;
 use std::sync::{Arc, LazyLock};
-use temps_core::WorkflowError;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 static ARCHIVE_EXTRACTION_SEMAPHORE: LazyLock<Arc<Semaphore>> =
@@ -55,6 +55,7 @@ pub mod build_image;
 pub mod builder_node;
 pub mod capture_source_files;
 pub mod capture_source_maps;
+pub mod compose_host;
 pub mod configure_agents;
 pub mod configure_crons;
 pub mod configure_metric_alerts;
@@ -63,6 +64,7 @@ pub mod deploy_image;
 pub mod deploy_static;
 pub mod deploy_static_bundle;
 pub mod deploy_static_from_source;
+pub mod deployment_workflows;
 pub mod download_repo;
 pub mod image_source;
 pub mod mark_deployment_complete;
@@ -91,6 +93,7 @@ pub use build_image::*;
 pub use builder_node::BuilderNodeResolver;
 pub use capture_source_files::*;
 pub use capture_source_maps::*;
+pub use compose_host::{ComposeStackHost, PreparedStack};
 pub use configure_agents::*;
 pub use configure_crons::*;
 pub use configure_metric_alerts::*;

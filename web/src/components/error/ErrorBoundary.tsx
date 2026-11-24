@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import React, { Component, ReactNode } from 'react'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 
 interface ErrorBoundaryProps {
   children: ReactNode
@@ -110,6 +111,9 @@ export class ErrorBoundary extends Component<
             >
               Try again
             </button>
+            <p className="text-sm text-muted-foreground">
+              Need help with Temps? <DiscordHelpLink />
+            </p>
           </div>
         </div>
       )

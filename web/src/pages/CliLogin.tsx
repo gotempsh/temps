@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { invalidateApiKeyQueries } from '@/lib/api-key-queries'
 import { useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -69,7 +70,12 @@ export function CliLogin() {
     meta: { errorTitle: 'Approval failed' },
     onSuccess: async () => {
       toast.success('CLI device authorized')
-      await queryClient.invalidateQueries({ queryKey: lookupOptions.queryKey })
+      // Approval mints a `cli-device:` API key: refresh the key list and the
+      // AI harness status, which counts that key once it is used.
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: lookupOptions.queryKey }),
+        invalidateApiKeyQueries(queryClient),
+      ])
     },
     onError: (error, variables) => {
       if (handleSensitiveActionError(error, () => approve.mutate(variables))) {

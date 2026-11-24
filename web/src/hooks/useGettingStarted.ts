@@ -4,7 +4,6 @@
 import { useState } from 'react'
 import { useActivationSignals } from './useActivationSignals'
 import { useManualHarnessCompletion } from './useManualHarnessCompletion'
-import { FIRST_DEPLOY_PATH } from '@/lib/first-deploy'
 
 const DISMISSED_KEY = 'temps_getting_started_dismissed'
 
@@ -26,16 +25,15 @@ export function useGettingStarted() {
   const manualHarness = useManualHarnessCompletion()
 
   const allItems: GettingStartedItem[] = [
-    // First because nothing else on this list matters until something runs:
-    // it proves Docker, image pulls and routing work on this host, and the
-    // guide it opens offers a one-click sample when there is no code yet.
+    // Reuse project creation: template configuration and deployment progress
+    // remain in their existing feature pages.
     {
       key: 'deploy',
       label: 'Deploy your first app',
       description:
-        'Launch a sample app in one click, or deploy your own from Git or a Docker image, and get a live URL.',
+        'Choose a starter template, configure your project, and follow its first deployment to a live URL.',
       done: signals.firstDeploySucceeded,
-      href: FIRST_DEPLOY_PATH,
+      href: '/projects/new?source=templates',
       cta: 'Deploy an app',
     },
     {
@@ -64,12 +62,12 @@ export function useGettingStarted() {
     // team collaboration last.
     {
       key: 'domain',
-      label: 'Add a wildcard domain',
+      label: 'Make your apps reachable',
       description:
-        'Point a wildcard DNS record at this server and get HTTPS for all apps.',
-      done: signals.wildcardDomainReady,
-      href: '/domains/add',
-      cta: 'Add domain',
+        'Give apps an address others can open: a wildcard preview domain pointed at this server, or a tunnel that publishes environment hosts.',
+      done: signals.appsReachable,
+      href: '/settings#preview-domain',
+      cta: 'Set up',
     },
     {
       key: 'notifications',

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use temps_core::secret_string::SecretString;
 use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_providers::externalsvc::RustfsService;
 use temps_providers::managed_names::ManagedServiceNames;
@@ -201,7 +202,7 @@ pub struct EnableBlobRequest {
     /// Root user for S3 access
     pub root_user: Option<String>,
     /// Root password for S3 access
-    pub root_password: Option<String>,
+    pub root_password: Option<SecretString>,
 }
 
 /// Response after enabling Blob service

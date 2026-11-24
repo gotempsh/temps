@@ -6,6 +6,8 @@ pub mod gemini;
 pub mod openai_compat;
 pub mod openai_native;
 mod openai_responses;
+pub(crate) mod prompt_cache;
+mod stream_text;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -141,6 +143,62 @@ pub fn route_model_to_provider(model: &str) -> Option<&'static str> {
     None
 }
 
+/// A low-cost, current chat model per vendor provider, used for internal calls
+/// when nothing names one and to verify a new key. Self-hosted providers have
+/// none: their model is whatever the administrator picked from the server's
+/// own listing.
+pub fn low_cost_default_model(provider: &str) -> Option<&'static str> {
+    low_cost_models(provider).first().copied()
+}
+
+/// Low-cost chat models per vendor provider, current first, then the earlier
+/// low-cost defaults. A key that cannot serve the current one (a restricted
+/// project, an older account) still gets a cheap chat model it does serve,
+/// instead of whatever its catalog happens to list first.
+pub fn low_cost_models(provider: &str) -> &'static [&'static str] {
+    match provider {
+        "openai" => &["gpt-6-luna", "gpt-5.6-luna", "gpt-5-nano", "gpt-4o-mini"],
+        "anthropic" => &["claude-haiku-5-5", "claude-haiku-4-5"],
+        "gemini" => &["gemini-3.5-flash-lite"],
+        "xai" => &["grok-4.7", "grok-4.6", "grok-4.5"],
+        "openrouter" => &["openai/gpt-6-luna", "openai/gpt-4o-mini"],
+        _ => &[],
+    }
+}
+
+/// Whether a catalog id names a model that answers chat requests. Vendor
+/// catalogs also list image, speech, transcription, embedding and moderation
+/// models, which must never be picked as a fallback chat model. Audio-capable
+/// chat models (`gpt-audio`) answer chat and stay eligible.
+pub fn is_chat_model_id(model: &str) -> bool {
+    let id = model.to_ascii_lowercase();
+    let id = id.rsplit('/').next().unwrap_or(id.as_str());
+    const NON_CHAT_PREFIXES: &[&str] = &[
+        "text-embedding-",
+        "embedding-",
+        "dall-e",
+        "gpt-image",
+        "imagen",
+        "tts-",
+        "whisper",
+        "omni-moderation",
+        "text-moderation",
+        "sora",
+    ];
+    const NON_CHAT_MARKERS: &[&str] = &[
+        "-embedding",
+        "-image",
+        "-tts",
+        "-transcribe",
+        "-realtime",
+        "-moderation",
+    ];
+    !NON_CHAT_PREFIXES
+        .iter()
+        .any(|prefix| id.starts_with(prefix))
+        && !NON_CHAT_MARKERS.iter().any(|marker| id.contains(marker))
+}
+
 /// OpenAI-compatible providers reuse the same adapter with different config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderConfig {
@@ -239,6 +297,13 @@ impl reqwest::dns::Resolve for TrustedPrivateOnlyResolver {
     }
 }
 
+#[allow(
+    clippy::expect_used,
+    reason = "the builder only sets timeouts, a redirect policy and a resolver; with the \
+              rustls backend and bundled webpki roots, build() has no failure path for this \
+              configuration, and falling back to an unhardened client would bypass the SSRF \
+              resolver"
+)]
 fn build_client<R: reqwest::dns::Resolve + 'static>(
     timeout: Duration,
     resolver: Arc<R>,

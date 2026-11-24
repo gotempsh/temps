@@ -62,12 +62,14 @@ impl MigrationTrait for Migration {
                             .primary_key()
                             .default(1),
                     )
-                    // Pool we slice into per-node CIDRs (e.g. 172.20.0.0/16).
+                    // Pool we slice into per-node CIDRs. Only a fresh database
+                    // runs this, so editing the default here changes new
+                    // installs only (ADR 056); existing rows keep their pool.
                     .col(
                         ColumnDef::new(NetworkConfig::ComputePoolCidr)
                             .text()
                             .not_null()
-                            .default("172.20.0.0/16"),
+                            .default(temps_entities::network_config::DEFAULT_COMPUTE_POOL_CIDR),
                     )
                     // Prefix length per allocated /n (default /24 → 256 hosts/node).
                     .col(

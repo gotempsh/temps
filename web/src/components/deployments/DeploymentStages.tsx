@@ -387,7 +387,7 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col gap-4 p-6">
         <DialogHeader>
-          <DialogTitle>Stage Details</DialogTitle>
+          <DialogTitle>Stage details</DialogTitle>
           <DialogDescription>
             Execution details for{' '}
             <span className="font-mono">{stage.name}</span>
@@ -554,7 +554,7 @@ export function DeploymentStages({
             variant="secondary"
             className="capitalize bg-orange-500/10 text-orange-700 dark:text-orange-600 border-orange-500/20"
           >
-            In Progress
+            In progress
           </Badge>
         )
       case 'pending':
@@ -591,7 +591,17 @@ export function DeploymentStages({
               >
                 {getStatusIcon(stage.status)}
                 <div className="flex min-w-0 items-center gap-3">
-                  <h3 className="font-medium text-sm">
+                  {/* One line: a long description (an image digest) would
+                      otherwise wrap under the duration and actions. The
+                      full text stays in the tooltip and the step's logs. */}
+                  <h3
+                    className="min-w-0 truncate font-medium text-sm"
+                    title={
+                      stage.description
+                        ? `${stage.name}: ${stage.description}`
+                        : stage.name
+                    }
+                  >
                     {stage.name}
                     {stage.description && (
                       <span className="ml-2 font-normal text-sm text-muted-foreground">
@@ -602,7 +612,7 @@ export function DeploymentStages({
                   {getStatusBadge(stage.status)}
                 </div>
               </div>
-              <div className="flex shrink-0 items-center gap-2 sm:gap-3">
+              <div className="flex shrink-0 items-center gap-2 pl-3 sm:gap-3">
                 {stage.status === 'failure' && (
                   <Button
                     variant="outline"

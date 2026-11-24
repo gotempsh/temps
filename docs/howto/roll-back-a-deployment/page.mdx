@@ -34,7 +34,7 @@ Do **not** roll back when:
 
 - The issue is in a database migration (rollback does not undo schema changes)
 - The previous version had the same issue
-- The Docker image from the target deployment has been pruned from the server
+- The target deployment's image was built or uploaded and has since been pruned from the server (an image pulled from a registry is pulled again automatically)
 
 ---
 
@@ -93,7 +93,11 @@ A rollback is faster than a normal deployment because it skips the build phase:
 
 <Properties>
   <Property name="Image must exist locally">
-    Rollback uses the Docker image from the target deployment. If Docker has pruned old images (due to disk space), the rollback will fail with an error suggesting you redeploy from source instead. To prevent this, ensure you have enough disk space or configure Docker's image retention.
+    Rollback uses the Docker image from the target deployment. The nightly cleanup removes deployment images older than the image retention period (14 days by default, always keeping the 5 most recent per environment and never the image an environment is serving). What happens on rollback to a removed image depends on where it came from:
+
+    - **Pulled from a registry** (`temps deploy:image`): Temps pulls it again from the same reference. The rollback fails with an explanatory error only if the registry no longer serves that tag, or now serves a different image under it.
+    - **Built from source**: the rollback fails with an error suggesting you redeploy to rebuild it. Raise the project's image retention to keep a longer rollback window.
+    - **Uploaded** (`temps deploy:local-image` or the upload API): never removed by the cleanup, because Temps has no way to get it back.
   </Property>
   <Property name="Static presets">
     For projects using static file presets (not Docker containers), rollback works differently — it simply updates the environment's `current_deployment_id` pointer without any container operations.

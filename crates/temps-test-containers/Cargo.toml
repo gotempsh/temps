@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-test-containers"
+version.workspace = true
+edition.workspace = true
+description = "Labels Docker containers started by tests, removes them when the test process exits, and reaps those left by dead runs"
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+testcontainers = { workspace = true, features = ["watchdog"] }
+bollard = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time", "macros"] }
+libc = { workspace = true }
+
+[lints]
+workspace = true

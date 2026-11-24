@@ -47,6 +47,37 @@ if ! git diff-index --quiet HEAD --; then
     exit 1
 fi
 
+# Verify explicitly prepared SDK versions before preparing the server release.
+python3 scripts/sdk_release.py plan --tag "v${VERSION}" || exit 1
+
+# SDKs that changed since their last release publish with this tag only once
+# the SDK Release Prep PR is merged (pushing release/v${VERSION} or
+# `gh workflow run sdk-release-prep.yml -f tag=v${VERSION}` opens it).
+# --check changes nothing; it exits 1 while files would change and 2 when the
+# check itself failed (a registry lookup, an invalid manifest).
+PREPARE_STATUS=0
+python3 scripts/sdk_release.py prepare --tag "v${VERSION}" --check > /dev/null || PREPARE_STATUS=$?
+if [ "$PREPARE_STATUS" -ne 0 ] && [ "$PREPARE_STATUS" -ne 1 ]; then
+    echo -e "${RED}Error: could not determine which SDKs v${VERSION} should publish (see above).${NC}"
+    exit 1
+fi
+if [ "$PREPARE_STATUS" -eq 1 ]; then
+    if [ "$(python3 scripts/sdk_release.py plan --tag "v${VERSION}")" != "[]" ]; then
+        # Publishing a stale selection would ship newer code under the selected versions.
+        echo -e "${RED}Error: the prepared SDK selection for v${VERSION} is stale.${NC}"
+        echo "Re-run: gh workflow run sdk-release-prep.yml -f tag=v${VERSION}, then merge its PR."
+        exit 1
+    fi
+    echo -e "${YELLOW}SDK releases for v${VERSION} are not prepared (see above).${NC}"
+    echo "Prepare them with: gh workflow run sdk-release-prep.yml -f tag=v${VERSION}, then merge its PR."
+    echo -e "${YELLOW}Release the server without publishing those SDK changes? (y/N)${NC}"
+    read -r CONTINUE
+    if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
+        echo "Aborted"
+        exit 1
+    fi
+fi
+
 # Run tests
 echo -e "${GREEN}Running tests...${NC}"
 if ! cargo test --workspace --lib; then
@@ -79,6 +110,11 @@ sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" Cargo.toml && rm Carg
 # Update temps-cli Cargo.toml
 sed -i.bak "s/^version = \".*\"/version = \"${VERSION}\"/" crates/temps-cli/Cargo.toml && rm crates/temps-cli/Cargo.toml.bak
 
+# Keep workspace package versions in the committed lockfile in sync.
+# --workspace retains locked third-party dependency versions.
+cargo update --workspace
+cargo check --lib
+
 # Show changes
 echo -e "${GREEN}Version updated in:${NC}"
 echo "  - Cargo.toml"
@@ -105,8 +141,8 @@ read -r
 
 # Commit version bump
 echo -e "${GREEN}Committing version bump...${NC}"
-git add Cargo.toml crates/temps-cli/Cargo.toml CHANGELOG.md
-git commit -m "chore: bump version to v${VERSION}"
+git add Cargo.toml crates/temps-cli/Cargo.toml Cargo.lock CHANGELOG.md
+git commit -s -m "chore: bump version to v${VERSION}"
 
 # Create tag
 echo -e "${GREEN}Creating tag v${VERSION}...${NC}"

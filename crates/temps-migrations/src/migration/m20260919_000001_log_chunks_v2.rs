@@ -136,6 +136,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DbBackend, Statement, TransactionTrait};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     const LEGACY_SNAPSHOT_SQL: &str = r#"
@@ -258,6 +259,7 @@ mod tests {
             ))
             .with_env_var("POSTGRES_PASSWORD", "migration-test")
             .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await
         {

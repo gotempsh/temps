@@ -10,9 +10,9 @@ use axum::{
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::permissions::Permission;
-use temps_auth::{AuthContext, RequireAuth};
+use temps_authz::permission_guard;
+use temps_authz::permissions::Permission;
+use temps_authz::{AuthContext, RequireAuth};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use utoipa::{OpenApi, ToSchema};
 
@@ -887,7 +887,7 @@ mod tests {
     }
 
     use axum::http::StatusCode;
-    use temps_auth::permissions::Role;
+    use temps_authz::permissions::Role;
     use temps_entities::users;
 
     fn test_auth(role: Role) -> AuthContext {

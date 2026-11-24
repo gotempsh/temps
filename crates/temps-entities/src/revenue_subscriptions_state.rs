@@ -25,6 +25,10 @@ pub struct Model {
     pub started_at: Option<DBDateTime>,
     pub canceled_at: Option<DBDateTime>,
     pub updated_at: DBDateTime,
+    /// `occurred_at` of the newest provider event projected into this row.
+    /// Older events are not projected, so out-of-order delivery cannot
+    /// roll the state back. `None` means no event has been applied yet.
+    pub last_event_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

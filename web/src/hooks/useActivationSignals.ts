@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useQuery } from '@tanstack/react-query'
+import type { PreviewDomainStatusResponse } from '@/api/client'
 import {
   listConnectionsOptions,
   listDomainsOptions,
@@ -13,17 +14,18 @@ import {
   listDnsProvidersOptions,
   listUsersOptions,
   getAiProviderStatusOptions,
-  listApiKeysOptions,
+  getAiHarnessStatusOptions,
+  getPreviewDomainStatusOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from './useSettings'
 import { useIsInstanceAdmin } from './useIsInstanceAdmin'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
-import { getAiHarnessStatus } from '@/lib/ai-onboarding'
+import { harnessStatusOf } from '@/lib/ai-onboarding'
 import { hasCompletedDeployment } from '@/lib/first-deploy'
 import { ROUTE_FAILURE_IGNORE } from '@/lib/route-query-failures'
 
 export interface ActivationSignals {
-  /** Dedicated active admin key has authenticated an external AI harness */
+  /** An external AI harness authenticated (see `GET /api-keys/ai-harness/status`) */
   aiHarnessConfigured: boolean
   /** Active provider can power Temps' built-in chat and AI features */
   aiProviderConfigured: boolean
@@ -31,6 +33,11 @@ export interface ActivationSignals {
   gitConnected: boolean
   /** At least one active wildcard domain in the database */
   wildcardDomainReady: boolean
+  /**
+   * Apps get an address someone else can open (ADR 068 D5): the preview
+   * domain is usable, or a tunnel publishes environment hosts.
+   */
+  appsReachable: boolean
   /** At least one project created */
   hasProject: boolean
   /** At least one deployment has completed (an app went live) */
@@ -130,20 +137,30 @@ export function useActivationSignals(): ActivationSignals {
     enabled: isAdmin,
   })
 
+  // Platform settings, so instance administrators only, like the reads above.
+  const { data: previewStatus, isLoading: previewStatusLoading } = useQuery({
+    ...getPreviewDomainStatusOptions(),
+    retry: false,
+    enabled: isAdmin,
+    staleTime: 60_000,
+  })
+
   const { data: aiProviderStatus, isLoading: aiProviderStatusLoading } =
     useQuery({
       ...getAiProviderStatusOptions(),
       retry: false,
     })
 
-  const { data: apiKeysData, isLoading: apiKeysLoading } = useQuery({
-    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
-    retry: false,
-    // Shares its cache entry with the AI-harness setup banner, and each
-    // observer's `meta` replaces the other's: both must opt out. Roles without
-    // API-key access are refused here, which is not a failure of the page.
-    meta: { routeFailure: ROUTE_FAILURE_IGNORE },
-  })
+  const { data: aiHarnessStatus, isLoading: aiHarnessStatusLoading } = useQuery(
+    {
+      ...getAiHarnessStatusOptions(),
+      retry: false,
+      // Shares its cache entry with the AI-harness setup banner, and each
+      // observer's `meta` replaces the other's: both must opt out. Roles without
+      // API-key access are refused here, which is not a failure of the page.
+      meta: { routeFailure: ROUTE_FAILURE_IGNORE },
+    }
+  )
 
   // TEMP: pretend nothing is set up yet, for building the first-run
   // experience. See lib/devSimulate.ts. Placed after all hooks so hook order
@@ -154,6 +171,7 @@ export function useActivationSignals(): ActivationSignals {
       aiProviderConfigured: false,
       gitConnected: false,
       wildcardDomainReady: false,
+      appsReachable: false,
       hasProject: false,
       firstDeploySucceeded: false,
       externalUrlSet: false,
@@ -179,13 +197,13 @@ export function useActivationSignals(): ActivationSignals {
     !servicesLoading &&
     !backupSchedulesLoading &&
     !dnsProvidersLoading &&
+    !previewStatusLoading &&
     !usersLoading &&
     !aiProviderStatusLoading &&
-    !apiKeysLoading
+    !aiHarnessStatusLoading
 
   const aiProviderConfigured = aiProviderStatus?.configured === true
-  const aiHarnessConfigured =
-    getAiHarnessStatus(apiKeysData?.api_keys) === 'connected'
+  const aiHarnessConfigured = harnessStatusOf(aiHarnessStatus) === 'connected'
 
   const gitConnected =
     (connections?.connections?.filter((c) => c.is_active).length ?? 0) > 0
@@ -193,6 +211,12 @@ export function useActivationSignals(): ActivationSignals {
   const wildcardDomainReady =
     domainsData?.domains?.some((d) => d.is_wildcard && d.status === 'active') ??
     false
+
+  const appsReachable = appsReachableSignal(
+    isAdmin,
+    previewStatus,
+    wildcardDomainReady
+  )
 
   const hasProject = (projectsData?.projects?.length ?? 0) > 0
   const firstDeploySucceeded = hasCompletedDeployment(projectStatistics)
@@ -220,7 +244,7 @@ export function useActivationSignals(): ActivationSignals {
   const completed = [
     aiHarnessConfigured,
     gitConnected,
-    wildcardDomainReady,
+    appsReachable,
     hasProject,
     firstDeploySucceeded,
     externalUrlSet && !unreadable.externalUrl,
@@ -236,6 +260,7 @@ export function useActivationSignals(): ActivationSignals {
     aiProviderConfigured,
     gitConnected,
     wildcardDomainReady,
+    appsReachable,
     hasProject,
     firstDeploySucceeded,
     externalUrlSet,
@@ -249,4 +274,24 @@ export function useActivationSignals(): ActivationSignals {
     completedCount: completed,
     totalCount: TOTAL - unreadableCount,
   }
+}
+
+/**
+ * "Make your apps reachable" (ADR 068): done when the preview domain is
+ * usable or a tunnel gives every environment an address. Who cannot read
+ * the preview domain status keeps the wildcard-domain signal, the closest
+ * thing they can see.
+ */
+export function appsReachableSignal(
+  isAdmin: boolean,
+  previewStatus:
+    | Pick<PreviewDomainStatusResponse, 'status' | 'tunnel_environment_hosts'>
+    | undefined,
+  wildcardDomainReady: boolean
+): boolean {
+  if (!isAdmin) return wildcardDomainReady
+  return (
+    previewStatus?.status === 'usable' ||
+    !!previewStatus?.tunnel_environment_hosts
+  )
 }

@@ -29,6 +29,9 @@ pub struct AppState {
     /// Metrics store for time-series metric queries and writes.
     /// Optional — present only when the metrics subsystem is enabled in config.
     pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Worker metrics reporting status (ADR 061); `None` when the control
+    /// plane runs without a metrics store.
+    pub worker_metrics_status: Option<Arc<temps_metrics::WorkerMetricsStatusBoard>>,
     /// Direct DB connection for alert rule CRUD (monitoring_alert_rules table).
     pub db: Arc<DatabaseConnection>,
     /// API key service — used to provision `si_` ingest keys when metrics are
@@ -188,9 +191,16 @@ impl From<CreatableServiceTypeRoute> for crate::externalsvc::ServiceType {
     }
 }
 
+/// A route segment that names no service type.
+#[derive(Debug, thiserror::Error)]
+#[error("Invalid service type: {service_type}")]
+pub struct InvalidServiceTypeRoute {
+    pub service_type: String,
+}
+
 impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
-    pub fn from_str(s: &str) -> anyhow::Result<Self> {
+    pub fn from_str(s: &str) -> Result<Self, InvalidServiceTypeRoute> {
         match s.to_lowercase().as_str() {
             "mariadb" => Ok(ServiceTypeRoute::Mariadb),
             "mongodb" => Ok(ServiceTypeRoute::Mongodb),
@@ -201,7 +211,9 @@ impl ServiceTypeRoute {
             "blob" => Ok(ServiceTypeRoute::Blob),
             "rustfs" => Ok(ServiceTypeRoute::Rustfs),
             "minio" => Ok(ServiceTypeRoute::Minio),
-            _ => Err(anyhow::anyhow!("Invalid service type: {}", s)),
+            _ => Err(InvalidServiceTypeRoute {
+                service_type: s.to_string(),
+            }),
         }
     }
 
@@ -326,6 +338,10 @@ pub struct ExternalServiceInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ServiceMemberInfo {
     pub id: i32,
+    /// Configured member kind. For a PostgreSQL cluster this is `monitor` or
+    /// `replica`, and every data node is `replica`, including the current
+    /// primary: which node is primary is runtime state, read it from
+    /// `live_state`.
     pub role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub node_id: Option<i32>,
@@ -670,7 +686,12 @@ pub struct CreateExternalServiceRequest {
     #[serde(default = "default_topology")]
     #[schema(example = "standalone")]
     pub topology: String,
-    /// Cluster member specifications. Required when topology is "cluster".
+    /// Cluster member specifications for topology "cluster". Optional: when
+    /// omitted the cluster gets a monitor, a primary and a replica, all on the
+    /// control plane (one host, so it survives a member failing, not the host
+    /// failing). When given it must hold exactly one `monitor` and at least
+    /// one `primary` or `replica`; set `node_id` to spread members across
+    /// worker nodes.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }
@@ -695,7 +716,8 @@ pub struct ClusterMemberRequest {
 pub struct RetryClusterRequest {
     /// Cluster member specifications (same format as create).
     /// If omitted, the original member configuration is reconstructed from
-    /// the preserved service_members records.
+    /// the preserved service_members records, or, when none were recorded,
+    /// the default monitor + primary + replica layout is used.
     #[serde(default)]
     pub members: Vec<ClusterMemberRequest>,
 }

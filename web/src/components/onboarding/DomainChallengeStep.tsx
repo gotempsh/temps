@@ -115,13 +115,13 @@ export function DomainChallengeStep({
     return (
       <div className="space-y-6">
         <div className="text-center space-y-2">
-          <h2 className="text-2xl font-bold">Domain Already Configured</h2>
+          <h2 className="text-2xl font-bold">Domain already configured</h2>
           <p className="text-muted-foreground">
             Your wildcard domain is already set up
           </p>
         </div>
 
-        <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+        <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
           <CheckCircle2 className="h-4 w-4 text-green-600" />
           <AlertDescription>
             <p className="text-sm mb-2">
@@ -149,7 +149,7 @@ export function DomainChallengeStep({
   return (
     <div className="space-y-6">
       <div className="text-center space-y-2">
-        <h2 className="text-2xl font-bold">Domain Challenge Verification</h2>
+        <h2 className="text-2xl font-bold">Domain challenge verification</h2>
         <p className="text-muted-foreground">
           Choose how to verify domain ownership for SSL certificates
         </p>
@@ -175,7 +175,7 @@ export function DomainChallengeStep({
       </Alert>
 
       {/* Wildcard domains require DNS-01 challenge */}
-      <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+      <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
         <Shield className="h-4 w-4 text-blue-600" />
         <AlertTitle>DNS-01 Challenge Required</AlertTitle>
         <AlertDescription>
@@ -212,7 +212,7 @@ export function DomainChallengeStep({
               Creating Domain...
             </>
           ) : (
-            'Create Domain & Verify'
+            'Create domain & verify'
           )}
         </Button>
       </div>

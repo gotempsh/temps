@@ -75,6 +75,14 @@ function renderPage(role: string) {
   )
 }
 
+// Only the provider list counts: the page also loads the Cloudflare Access
+// tokens card, which a provider delete does not refresh.
+function listFetches(api: ReturnType<typeof mockApi>) {
+  return api.calls.filter(
+    (c) => c.method === 'GET' && c.path === '/dns-providers'
+  ).length
+}
+
 async function openRowMenu(view: ReturnType<typeof render>) {
   const trigger = await view.findByLabelText('Open menu')
   await act(async () => {
@@ -88,9 +96,9 @@ test('an administrator can reach Delete Provider from the row menu', async () =>
   })
   const view = renderPage('admin')
   await openRowMenu(view)
-  expect(await view.findByText('View Details')).toBeTruthy()
-  expect(view.queryByText('Test Connection')).not.toBeNull()
-  expect(view.queryByText('Delete Provider')).not.toBeNull()
+  expect(await view.findByText('View details')).toBeTruthy()
+  expect(view.queryByText('Test connection')).not.toBeNull()
+  expect(view.queryByText('Delete provider')).not.toBeNull()
   api.restore()
 })
 
@@ -100,9 +108,9 @@ test('a restricted user sees View Details but neither Test Connection nor Delete
   })
   const view = renderPage('user')
   await openRowMenu(view)
-  expect(await view.findByText('View Details')).toBeTruthy()
-  expect(view.queryByText('Test Connection')).toBeNull()
-  expect(view.queryByText('Delete Provider')).toBeNull()
+  expect(await view.findByText('View details')).toBeTruthy()
+  expect(view.queryByText('Test connection')).toBeNull()
+  expect(view.queryByText('Delete provider')).toBeNull()
   api.restore()
 })
 
@@ -122,9 +130,9 @@ test('a refused delete keeps the confirmation open and the list unrefreshed', as
   const view = renderPage('admin')
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
-  const confirm = await view.findByRole('button', { name: 'Delete Provider' })
+  const confirm = await view.findByRole('button', { name: 'Delete provider' })
   await act(async () => {
     fireEvent.click(confirm)
   })
@@ -137,7 +145,7 @@ test('a refused delete keeps the confirmation open and the list unrefreshed', as
   await waitFor(() =>
     expect(view.getByText('Delete DNS provider Example DNS?')).toBeTruthy()
   )
-  expect(api.calls.filter((c) => c.method === 'GET').length).toBe(1)
+  expect(listFetches(api)).toBe(1)
 
   // The failure is reported with the server's own reason, never as a success.
   expect(await view.findByText('Failed to delete DNS provider')).toBeTruthy()
@@ -160,19 +168,17 @@ test('a delete the server accepts closes the confirmation and refreshes the list
   const view = renderPage('admin')
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
   await act(async () => {
     fireEvent.click(
-      await view.findByRole('button', { name: 'Delete Provider' })
+      await view.findByRole('button', { name: 'Delete provider' })
     )
   })
   await waitFor(() =>
     expect(view.queryByText('Delete DNS provider Example DNS?')).toBeNull()
   )
-  await waitFor(() =>
-    expect(api.calls.filter((c) => c.method === 'GET').length).toBe(2)
-  )
+  await waitFor(() => expect(listFetches(api)).toBe(2))
   expect(
     await view.findByText('DNS provider deleted successfully')
   ).toBeTruthy()
@@ -209,7 +215,7 @@ test('losing write access while the confirmation is open closes it for good', as
   const view = render(page('admin'))
   await openRowMenu(view)
   await act(async () => {
-    fireEvent.click(await view.findByText('Delete Provider'))
+    fireEvent.click(await view.findByText('Delete provider'))
   })
   expect(await view.findByText('Delete DNS provider Example DNS?')).toBeTruthy()
 

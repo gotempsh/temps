@@ -17,7 +17,7 @@ export const FLAG_VALUE_TYPES: {
 ]
 
 /** Where the value an app actually receives came from. */
-export type ValueSource = 'override' | 'default' | 'disabled'
+export type ValueSource = 'override' | 'default' | 'disabled' | 'invalid-rules'
 
 export interface EffectiveValue {
   value: unknown
@@ -61,6 +61,11 @@ export function environmentOverride(
  * SDK's `evaluate()` — same order, same precedence. If this drifts, the console
  * shows one value while the app sees another, which is worse than showing
  * nothing.
+ *
+ * Targeting rules are not evaluated here: they depend on who is asking. This
+ * is the value for a user who matches no rule, and the list marks flags with
+ * rules so it is never read as "what everyone gets". The sheet's test panel
+ * evaluates rules on the server for a given user.
  */
 export function resolveEffectiveValue(
   flag: FlagResponse,
@@ -74,6 +79,11 @@ export function resolveEffectiveValue(
   // The kill switch outranks everything, including a stored override.
   if (!override.enabled)
     return { value: flag.default_value, source: 'disabled' }
+
+  // Stored rules that do not decode make the server serve the default with
+  // reason ERROR, whatever value is set here.
+  if (override.rules_valid === false)
+    return { value: flag.default_value, source: 'invalid-rules' }
 
   if (override.value === null || override.value === undefined) {
     return { value: flag.default_value, source: 'default' }

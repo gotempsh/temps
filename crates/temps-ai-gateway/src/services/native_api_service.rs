@@ -1103,6 +1103,8 @@ impl NativeApiService {
                 200,
                 false,
                 record.provider_key_id.is_none(),
+                crate::types::PromptTokensDetails::default(),
+                crate::services::usage_service::UsageCount::BatchTotal,
                 &context,
             )
             .await?;
@@ -1760,6 +1762,8 @@ mod tests {
                 .unwrap(),
         );
         let log = temps_entities::ai_usage_logs::Model {
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             id: 1,
             timestamp: chrono::Utc::now(),
             user_id: Some(4),
@@ -1778,10 +1782,13 @@ mod tests {
             trace_id: None,
             project_id: None,
             token_id: None,
+            price_known: None,
         };
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![record]])
+                // No catalogue price for the batch model.
+                .append_query_results([Vec::<temps_entities::ai_provider_models::Model>::new()])
                 .append_query_results([vec![log]])
                 .append_exec_results([
                     MockExecResult {

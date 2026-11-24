@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use temps_config::ConfigService;
 use temps_core::route_table::RouteTableRefresher;
 use temps_core::UtcDateTime;
-use temps_entities::{domains, status_page_domains, status_pages};
+use temps_entities::{acme_orders, domains, status_page_domains, status_pages};
 use tracing::{error, info, warn};
 use utoipa::ToSchema;
 
@@ -49,9 +49,24 @@ fn lease_until() -> UtcDateTime {
     (chrono::Utc::now() + CERTIFICATE_OPERATION_LEASE).trunc_subsecs(6)
 }
 
-/// Attach/verify/renew operations allowed per project per hour. Each one can start
+/// Attach/verify/renew operations allowed per status page per hour. Each one can start
 /// an ACME order, so this bounds the load on the CA and its rate limits.
 pub const DOMAIN_OPERATIONS_PER_HOUR: usize = 30;
+
+/// The same operations across every status page on the instance. Pages are
+/// platform-level and cheap to create, so without this ceiling more pages
+/// would mean more ACME orders; the CA account and its rate limits are shared
+/// with every other hostname this instance serves.
+pub const INSTANCE_DOMAIN_OPERATIONS_PER_HOUR: usize = 60;
+
+/// Recent attach/verify/renew operations, for [`StatusPageDomainService::throttle`].
+#[derive(Default)]
+struct OperationLog {
+    /// Per status page; bounded by the number of pages with recent operations.
+    per_page: std::collections::HashMap<i32, std::collections::VecDeque<std::time::Instant>>,
+    /// Every page together; at most [`INSTANCE_DOMAIN_OPERATIONS_PER_HOUR`] entries.
+    instance: std::collections::VecDeque<std::time::Instant>,
+}
 
 /// How ownership of a hostname is proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, ToSchema)]
@@ -358,24 +373,6 @@ pub(crate) async fn release_page_certificates<C: ConnectionTrait>(
     Ok(result.rows_affected())
 }
 
-/// Release the certificates of every status-page hostname of a project, as
-/// soon as the project is fenced for deletion.
-pub(crate) async fn release_project_certificates(
-    db: &DatabaseConnection,
-    project_id: i32,
-) -> Result<u64, sea_orm::DbErr> {
-    let result = db
-        .execute(Statement::from_sql_and_values(
-            DatabaseBackend::Postgres,
-            r#"UPDATE status_page_domains SET domain_id = NULL
-               WHERE domain_id IS NOT NULL
-                 AND status_page_id IN (SELECT id FROM status_pages WHERE project_id = $1)"#,
-            [project_id.into()],
-        ))
-        .await?;
-    Ok(result.rows_affected())
-}
-
 pub struct StatusPageDomainService {
     db: Arc<DatabaseConnection>,
     config_service: Arc<ConfigService>,
@@ -384,11 +381,8 @@ pub struct StatusPageDomainService {
     /// Knows every hostname an application serves; consulted before any
     /// hostname is attached.
     route_table: Arc<dyn RouteTableRefresher>,
-    /// Recent attach/verify operations per project, for [`Self::throttle`].
-    /// Bounded by the number of projects with recent operations.
-    operations: std::sync::Mutex<
-        std::collections::HashMap<i32, std::collections::VecDeque<std::time::Instant>>,
-    >,
+    /// Recent attach/verify/renew operations, for [`Self::throttle`].
+    operations: std::sync::Mutex<OperationLog>,
 }
 
 impl StatusPageDomainService {
@@ -405,7 +399,7 @@ impl StatusPageDomainService {
             cache,
             certificates,
             route_table,
-            operations: std::sync::Mutex::new(std::collections::HashMap::new()),
+            operations: std::sync::Mutex::new(OperationLog::default()),
         }
     }
 
@@ -424,20 +418,23 @@ impl StatusPageDomainService {
             Vec::new()
         } else {
             domains::Entity::find()
-                .filter(domains::Column::Id.is_in(domain_ids))
+                .filter(domains::Column::Id.is_in(domain_ids.iter().copied()))
                 .all(self.db.as_ref())
                 .await?
         };
+        let open_orders = self.open_order_domains(&domain_ids).await?;
         let target = self.dns_target().await;
-        Ok(bindings
-            .into_iter()
-            .map(|binding| {
-                let row = binding
-                    .domain_id
-                    .and_then(|id| rows.iter().find(|r| r.id == id));
-                to_response(&binding, row, page.is_published, &target)
-            })
-            .collect())
+        let mut responses = Vec::with_capacity(bindings.len());
+        for binding in bindings {
+            let row = binding
+                .domain_id
+                .and_then(|id| rows.iter().find(|r| r.id == id));
+            let open = binding
+                .domain_id
+                .is_some_and(|id| open_orders.contains(&id));
+            responses.push(to_response(&binding, row, page.is_published, &target, open));
+        }
+        Ok(responses)
     }
 
     pub async fn attach(
@@ -450,8 +447,9 @@ impl StatusPageDomainService {
         if acme_email.trim().is_empty() {
             return Err(StatusPageError::AcmeEmailRequired { hostname });
         }
-        let page = self.page(status_page_id).await?;
-        self.throttle(page.project_id)?;
+        // 404 for a missing page before any hostname work.
+        self.page(status_page_id).await?;
+        self.throttle(status_page_id)?;
         self.ensure_no_live_application(&hostname).await?;
 
         // Check and claim in one transaction, holding two locks. Every check
@@ -552,7 +550,6 @@ impl StatusPageDomainService {
         };
         info!(
             status_page_id,
-            project_id = page.project_id,
             hostname = %hostname,
             "attached custom hostname to status page"
         );
@@ -680,7 +677,7 @@ impl StatusPageDomainService {
     }
 
     /// Check the preconditions shared by `verify` and `renew`, and count the
-    /// operation against the project's budget.
+    /// operation against the page's budget.
     async fn prepare_order(
         &self,
         status_page_id: i32,
@@ -699,7 +696,7 @@ impl StatusPageDomainService {
                 hostname,
             });
         }
-        self.throttle(page.project_id)?;
+        self.throttle(status_page_id)?;
         Ok((page, binding))
     }
 
@@ -756,9 +753,10 @@ impl StatusPageDomainService {
         let row = domains::Entity::find_by_id(domain_id)
             .one(self.db.as_ref())
             .await?;
+        let open = self.has_open_order(Some(domain_id)).await?;
         let state = row
             .as_ref()
-            .map_or(OrderState::NeedsNew, |r| order_state(r, &hostname));
+            .map_or(OrderState::NeedsNew, |r| order_state(r, &hostname, open));
         match state {
             OrderState::Current => {}
             OrderState::Open => {
@@ -942,30 +940,42 @@ impl StatusPageDomainService {
     }
 
     /// At most [`DOMAIN_OPERATIONS_PER_HOUR`] attach/verify/renew operations
-    /// per project per hour: each one can start an ACME order.
-    fn throttle(&self, project_id: i32) -> Result<(), StatusPageError> {
+    /// per status page per hour, and [`INSTANCE_DOMAIN_OPERATIONS_PER_HOUR`]
+    /// across all of them: each one can start an ACME order. A refused
+    /// operation is not counted against either budget.
+    fn throttle(&self, status_page_id: i32) -> Result<(), StatusPageError> {
         let now = std::time::Instant::now();
         let window = std::time::Duration::from_secs(3600);
-        let mut operations = self
+        let retry_after = |times: &std::collections::VecDeque<std::time::Instant>| {
+            times
+                .front()
+                .map(|oldest| window.saturating_sub(now.duration_since(*oldest)).as_secs())
+                .unwrap_or(60)
+        };
+        let mut log = self
             .operations
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        operations.retain(|_, times| {
+        log.per_page.retain(|_, times| {
             times.retain(|t| now.duration_since(*t) < window);
             !times.is_empty()
         });
-        let times = operations.entry(project_id).or_default();
+        log.instance.retain(|t| now.duration_since(*t) < window);
+        if log.instance.len() >= INSTANCE_DOMAIN_OPERATIONS_PER_HOUR {
+            return Err(StatusPageError::InstanceDomainOperationsThrottled {
+                status_page_id,
+                retry_after_secs: retry_after(&log.instance),
+            });
+        }
+        let times = log.per_page.entry(status_page_id).or_default();
         if times.len() >= DOMAIN_OPERATIONS_PER_HOUR {
-            let retry_after_secs = times
-                .front()
-                .map(|oldest| window.saturating_sub(now.duration_since(*oldest)).as_secs())
-                .unwrap_or(60);
             return Err(StatusPageError::DomainOperationsThrottled {
-                project_id,
-                retry_after_secs,
+                status_page_id,
+                retry_after_secs: retry_after(times),
             });
         }
         times.push_back(now);
+        log.instance.push_back(now);
         Ok(())
     }
 
@@ -1034,6 +1044,41 @@ impl StatusPageDomainService {
             })
     }
 
+    /// Certificate status and ACME order status are independent during renewal.
+    /// Fetch only the latest order per domain, in one query for the whole page.
+    async fn open_order_domains(
+        &self,
+        domain_ids: &[i32],
+    ) -> Result<HashSet<i32>, StatusPageError> {
+        if domain_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let orders = acme_orders::Entity::find()
+            .select_only()
+            .column(acme_orders::Column::DomainId)
+            .column(acme_orders::Column::Status)
+            .filter(acme_orders::Column::DomainId.is_in(domain_ids.iter().copied()))
+            .distinct_on([(acme_orders::Entity, acme_orders::Column::DomainId)])
+            .order_by_asc(acme_orders::Column::DomainId)
+            .order_by_desc(acme_orders::Column::CreatedAt)
+            .order_by_desc(acme_orders::Column::Id)
+            .into_tuple::<(i32, String)>()
+            .all(self.db.as_ref())
+            .await?;
+        Ok(orders
+            .into_iter()
+            .filter(|(_, status)| matches!(status.as_str(), "pending" | "ready" | "processing"))
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    async fn has_open_order(&self, domain_id: Option<i32>) -> Result<bool, StatusPageError> {
+        let Some(id) = domain_id else {
+            return Ok(false);
+        };
+        Ok(self.open_order_domains(&[id]).await?.contains(&id))
+    }
+
     async fn one(
         &self,
         binding: &status_page_domains::Model,
@@ -1048,7 +1093,13 @@ impl StatusPageDomainService {
             None => None,
         };
         let target = self.dns_target().await;
-        Ok(to_response(binding, row.as_ref(), published, &target))
+        Ok(to_response(
+            binding,
+            row.as_ref(),
+            published,
+            &target,
+            self.has_open_order(binding.domain_id).await?,
+        ))
     }
 
     /// Refuse a hostname that anything else stores a claim on: the
@@ -1084,7 +1135,7 @@ impl StatusPageDomainService {
         let settings = temps_entities::settings::Entity::find_by_id(1)
             .one(conn)
             .await?
-            .map(|row| temps_core::AppSettings::from_json(row.data))
+            .map(|row| temps_config::AppSettings::from_json(row.data))
             .unwrap_or_default();
         if settings.is_reserved_hostname(hostname) {
             return Err(in_use(
@@ -1186,8 +1237,8 @@ enum DnsTarget {
 /// Whether the binding's own `domains` row holds a usable certificate for
 /// `hostname`, which is what proves ownership. Mirrors the serving condition
 /// of the route table and of [`load_verified_hosts`]. The row's `status` is
-/// deliberately not consulted: a renewal order moves it to
-/// `challenge_requested` while the current certificate is still valid.
+/// deliberately not consulted: a pending renewal can retain `active` while
+/// the current certificate is still valid.
 fn holds_certificate(row: &domains::Model, hostname: &str) -> bool {
     row.certificate.is_some()
         && row.private_key.is_some()
@@ -1209,7 +1260,13 @@ enum OrderState {
     NeedsNew,
 }
 
-fn order_state(row: &domains::Model, hostname: &str) -> OrderState {
+fn order_state(row: &domains::Model, hostname: &str, open: bool) -> OrderState {
+    if matches!(row.status.as_str(), "failed" | "active_renewal_failed") {
+        return OrderState::NeedsNew;
+    }
+    if open {
+        return OrderState::Open;
+    }
     match row.status.as_str() {
         "active" if holds_certificate(row, hostname) => OrderState::Current,
         "challenge_requested" => OrderState::Open,
@@ -1217,9 +1274,16 @@ fn order_state(row: &domains::Model, hostname: &str) -> OrderState {
     }
 }
 
-fn domain_status(row: Option<&domains::Model>, hostname: &str) -> StatusPageDomainStatus {
+fn domain_status(
+    row: Option<&domains::Model>,
+    hostname: &str,
+    open: bool,
+) -> StatusPageDomainStatus {
     match row {
         None => StatusPageDomainStatus::Unverified,
+        Some(row) if holds_certificate(row, hostname) && open && row.status == "active" => {
+            StatusPageDomainStatus::RenewalPending
+        }
         Some(row) if holds_certificate(row, hostname) => match row.status.as_str() {
             "active" => StatusPageDomainStatus::Active,
             "challenge_requested" | "pending" => StatusPageDomainStatus::RenewalPending,
@@ -1235,9 +1299,10 @@ fn to_response(
     row: Option<&domains::Model>,
     published: bool,
     target: &DnsTarget,
+    open: bool,
 ) -> StatusPageDomainResponse {
     let method = VerificationMethod::from_stored(&binding.verification_method);
-    let status = domain_status(row, &binding.hostname);
+    let status = domain_status(row, &binding.hostname, open);
     let has_certificate = row.is_some_and(|r| holds_certificate(r, &binding.hostname));
     let mut dns_records = Vec::new();
     match target {
@@ -1410,9 +1475,8 @@ pub(crate) mod test_support {
             Ok(row.id)
         }
 
-        /// Like `DomainService::request_challenge`: a new order moves the
-        /// row to `challenge_requested` with a fresh DNS-01 value and keeps
-        /// any certificate it already holds.
+        /// Like `DomainService::request_challenge`: a new order keeps a serving
+        /// certificate active, with independent persisted ACME order state.
         async fn request_challenge(
             &self,
             domain_id: i32,
@@ -1424,8 +1488,26 @@ pub(crate) mod test_support {
                 .orders
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                 + 1;
+            acme_orders::ActiveModel {
+                domain_id: Set(domain_id),
+                order_url: Set(format!(
+                    "https://acme.example.test/order/{domain_id}/{order}"
+                )),
+                email: Set("ops@example.test".into()),
+                status: Set("pending".into()),
+                identifiers: Set(serde_json::json!([])),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
+            let status = if holds_certificate(&row, hostname) {
+                "active"
+            } else {
+                "challenge_requested"
+            };
             let mut active: domains::ActiveModel = row.into();
-            active.status = Set("challenge_requested".to_string());
+            active.status = Set(status.to_string());
             active.dns_challenge_value = Set(Some(format!("txt-value-{order}")));
             active
                 .update(self.db.as_ref())
@@ -1466,6 +1548,11 @@ pub(crate) mod test_support {
                     .map_err(|e| e.to_string())?;
                 return Err(reason);
             }
+            acme_orders::Entity::delete_many()
+                .filter(acme_orders::Column::DomainId.eq(domain_id))
+                .exec(self.db.as_ref())
+                .await
+                .map_err(|e| e.to_string())?;
             let issued = self.completed.lock().map_err(|e| e.to_string())?.len() + 1;
             let certificate = format!("-----BEGIN CERTIFICATE-----\ntest-{issued}\n");
             let expires = chrono::Utc::now() + chrono::Duration::days(90);
@@ -1577,7 +1664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn domain_operations_are_throttled_per_project() {
+    async fn domain_operations_are_throttled_per_page() {
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
         let config = temps_config::ServerConfig::new(
             "127.0.0.1:3000".to_string(),
@@ -1600,9 +1687,30 @@ mod tests {
         }
         assert!(matches!(
             service.throttle(7),
-            Err(StatusPageError::DomainOperationsThrottled { project_id: 7, .. })
+            Err(StatusPageError::DomainOperationsThrottled {
+                status_page_id: 7,
+                ..
+            })
         ));
-        service.throttle(8).expect("other projects are independent");
+        service
+            .throttle(8)
+            .expect("other pages have their own budget");
+
+        // More pages do not mean more ACME orders: the instance has a ceiling.
+        let mut page = 100;
+        while service.throttle(page).is_ok() {
+            page += 1;
+            assert!(page < 1000, "instance ceiling never reached");
+        }
+        assert!(matches!(
+            service.throttle(page + 1),
+            Err(StatusPageError::InstanceDomainOperationsThrottled { .. })
+        ));
+        // 30 for page 7 and 1 for page 8 were already counted; refusals are not.
+        assert_eq!(
+            usize::try_from(page - 100).expect("pages added"),
+            INSTANCE_DOMAIN_OPERATIONS_PER_HOUR - DOMAIN_OPERATIONS_PER_HOUR - 1
+        );
     }
 
     #[test]

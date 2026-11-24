@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { readFailureServerDetail } from '@/lib/read-failure'
 import type { RestoreRunView } from '@/api/client/types.gen'
 import { withHttpStatus } from '@/components/nodes/node-eviction'
 
@@ -226,8 +227,15 @@ export const PHASES: ReadonlyArray<{ id: string; label: string }> = [
   // archives) download it here, before writing anything; it stays cancellable.
   { id: 'download', label: 'Download backup' },
   { id: 'provision', label: 'Provision' },
+  // A service on a worker node whose agent already runs its maximum of
+  // backups and restores: nothing has run yet, and it stays cancellable.
+  { id: 'waiting_for_node', label: 'Wait for the node' },
   { id: 'restore', label: 'Restore data' },
   { id: 'recover', label: 'Recover WAL' },
+  // A restore on a worker node whose outcome Temps cannot establish (the node
+  // is unreachable, or has no record of it): the run keeps the database held
+  // until the node answers or an operator releases it.
+  { id: 'outcome_unknown', label: 'Confirm the outcome with the node' },
   { id: 'verify', label: 'Verify' },
   { id: 'completed', label: 'Completed' },
 ]
@@ -570,4 +578,21 @@ export function completionToast(
         description: run.error_message ?? interruptedFallbackMessage(run.phase),
       }
   }
+}
+
+export function restoreRequestFailure(
+  error: unknown,
+  operation: 'plan' | 'start',
+  orphan: boolean
+): string {
+  const detail = readFailureServerDetail(error)
+  if (detail && detail !== 'The restore operation could not be completed')
+    return detail
+  const guidance =
+    operation === 'start'
+      ? 'Check the restore history for this database before starting another restore.'
+      : 'Check the destination server logs for the restore-plan error, then retry the preview.'
+  return orphan
+    ? `${guidance} Verify that the destination server can read the selected backup from the S3 source.`
+    : guidance
 }

@@ -11,7 +11,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_authz::{permission_guard, RequireAuth};
 use temps_core::{
     problemdetails::{self, Problem},
     ProblemDetails,
@@ -20,7 +20,7 @@ use utoipa::{OpenApi, ToSchema};
 
 use crate::settings_service::GeoSettingsService;
 use crate::{GeoIpError, GeoIpService, GeoLocation};
-use temps_core::GeoSettings;
+use temps_config::GeoSettings;
 
 #[derive(OpenApi)]
 #[openapi(
@@ -63,6 +63,11 @@ impl From<GeoIpError> for Problem {
             GeoIpError::NonGlobalAddress(_) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("IP Not Found")
                 .with_detail(error.to_string()),
+            GeoIpError::DatabaseNotLoaded { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Geolocation Database Not Loaded")
+                    .with_detail(error.to_string())
+            }
             GeoIpError::Settings(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Settings Unavailable")
                 .with_detail(error.to_string()),
@@ -78,6 +83,7 @@ impl From<GeoIpError> for Problem {
             | GeoIpError::InvalidDatabase { .. }
             | GeoIpError::WriteFailed { .. }
             | GeoIpError::ReloadFailed { .. }
+            | GeoIpError::WrongDatabaseKind { .. }
             | GeoIpError::Database(_) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Geolocation Error")
                 .with_detail(error.to_string()),
@@ -147,7 +153,8 @@ impl From<(String, GeoLocation)> for GeoLocationResponse {
         (status = 401, description = "Authentication required", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "IP address not found in database", body = ProblemDetails),
-        (status = 500, description = "Internal server error", body = ProblemDetails)
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+        (status = 503, description = "No GeoIP database is loaded yet", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -219,6 +226,14 @@ pub struct GeoDatabaseStatusResponse {
     /// How often the scheduled refresh job runs
     #[schema(example = 24i64)]
     pub refresh_interval_hours: u64,
+    /// Whether the optional ASN database is loaded. Without it, datacenter
+    /// traffic cannot be detected or excluded from analytics.
+    #[schema(example = true)]
+    pub asn_database_loaded: bool,
+    /// When MaxMind built the loaded ASN database (ISO 8601, UTC); `null` when
+    /// none is loaded
+    #[schema(example = "2026-10-20T08:15:16Z")]
+    pub asn_build_time: Option<String>,
 }
 
 /// Render a timestamp the way every Temps API does: ISO 8601, UTC, `Z` suffix.
@@ -233,7 +248,11 @@ impl GeoDatabaseStatusResponse {
     /// database answering lookups right now -- they differ when an operator
     /// dropped a file in by hand, which is exactly the case where a stored-only
     /// answer would mislead.
-    fn build(settings: GeoSettings, live_build_epoch: Option<u64>) -> Self {
+    fn build(
+        settings: GeoSettings,
+        live_build_epoch: Option<u64>,
+        asn_build_epoch: Option<u64>,
+    ) -> Self {
         let effective = GeoSettings {
             build_epoch: live_build_epoch.or(settings.build_epoch),
             ..settings
@@ -259,6 +278,11 @@ impl GeoDatabaseStatusResponse {
             stale_after_days,
             is_stale,
             refresh_interval_hours: u64::from(effective.effective_refresh_interval_hours()),
+            asn_database_loaded: asn_build_epoch.is_some(),
+            asn_build_time: asn_build_epoch
+                .and_then(|epoch| i64::try_from(epoch).ok())
+                .and_then(|epoch| chrono::DateTime::from_timestamp(epoch, 0))
+                .map(to_iso8601),
         }
     }
 }
@@ -290,7 +314,11 @@ pub async fn get_geo_database_status(
     permission_guard!(auth, SettingsRead);
 
     let settings = state.geo_settings_service.load().await?;
-    let response = GeoDatabaseStatusResponse::build(settings, state.geo_ip_service.build_epoch());
+    let response = GeoDatabaseStatusResponse::build(
+        settings,
+        state.geo_ip_service.build_epoch(),
+        state.geo_ip_service.asn_build_epoch(),
+    );
 
     Ok(Json(response))
 }
@@ -299,7 +327,9 @@ pub async fn get_geo_database_status(
 mod tests {
     use super::*;
     use crate::MockGeoIpService;
-    use temps_core::{GEO_CHECK_STATUS_ERROR, GEO_CHECK_STATUS_OK, GEO_SOURCE_MAXMIND_OFFICIAL};
+    use temps_config::GEO_CHECK_STATUS_ERROR;
+    use temps_config::GEO_CHECK_STATUS_OK;
+    use temps_config::GEO_SOURCE_MAXMIND_OFFICIAL;
 
     fn test_state() -> Arc<AppState> {
         let db = Arc::new(
@@ -328,7 +358,7 @@ mod tests {
         })
     }
 
-    fn test_auth_context() -> temps_auth::AuthContext {
+    fn test_auth_context() -> temps_authz::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
             name: "Test User".to_string(),
@@ -349,7 +379,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
-        temps_auth::AuthContext::new_session(user, temps_auth::Role::Admin)
+        temps_authz::AuthContext::new_session(user, temps_authz::Role::Admin)
     }
 
     /// `/geo/status` sits under the same prefix as the `/geo/{ip}` wildcard.
@@ -410,7 +440,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(response.license_key_configured);
         assert_eq!(response.source.as_deref(), Some("maxmind_official"));
@@ -430,7 +460,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
         let rendered = serde_json::to_string(&response).expect("render the status response");
 
         assert!(!rendered.contains("plaintext-key"));
@@ -447,12 +477,23 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(!response.license_key_configured);
         assert_eq!(response.age_days, Some(0));
         assert!(response.is_stale);
         assert_eq!(response.last_error.as_deref(), Some("HTTP 401"));
+    }
+
+    #[test]
+    fn a_lookup_without_a_database_is_a_503_saying_what_to_do() {
+        let problem = Problem::from(GeoIpError::DatabaseNotLoaded {
+            ip: "8.8.8.8".parse().unwrap(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        let detail = problem.body.get("detail").and_then(|v| v.as_str());
+        assert!(detail.is_some_and(|detail| detail.contains("MaxMind license key")));
     }
 
     #[test]
@@ -463,7 +504,7 @@ mod tests {
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, Some(live_epoch));
+        let response = GeoDatabaseStatusResponse::build(settings, Some(live_epoch), None);
 
         assert_eq!(response.build_epoch, i64::try_from(live_epoch).ok());
         assert_eq!(response.age_days, Some(1));
@@ -479,17 +520,17 @@ mod tests {
             build_epoch: epoch_days_ago(2),
             last_check_at: Some(chrono::Utc::now()),
             last_check_status: Some(
-                temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
+                temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY.to_string(),
             ),
             ..GeoSettings::default()
         };
 
-        let response = GeoDatabaseStatusResponse::build(settings, None);
+        let response = GeoDatabaseStatusResponse::build(settings, None, None);
 
         assert!(!response.license_key_configured);
         assert_eq!(
             response.last_check_status.as_deref(),
-            Some(temps_core::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
+            Some(temps_config::GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY)
         );
         assert_eq!(response.last_error, None);
         assert!(
@@ -500,7 +541,7 @@ mod tests {
 
     #[test]
     fn status_response_reports_nothing_known_without_metadata() {
-        let response = GeoDatabaseStatusResponse::build(GeoSettings::default(), None);
+        let response = GeoDatabaseStatusResponse::build(GeoSettings::default(), None, None);
 
         assert_eq!(response.source, None);
         assert_eq!(response.age_days, None);
@@ -510,11 +551,26 @@ mod tests {
         // every 0 hours" on an instance that has not been configured.
         assert_eq!(
             response.stale_after_days,
-            i64::from(temps_core::DEFAULT_GEO_STALE_LOOKUP_DAYS)
+            i64::from(temps_config::DEFAULT_GEO_STALE_LOOKUP_DAYS)
         );
         assert_eq!(
             response.refresh_interval_hours,
-            u64::from(temps_core::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+            u64::from(temps_config::DEFAULT_GEO_REFRESH_INTERVAL_HOURS)
+        );
+    }
+
+    #[test]
+    fn status_response_reports_the_asn_database() {
+        let missing = GeoDatabaseStatusResponse::build(GeoSettings::default(), None, None);
+        assert!(!missing.asn_database_loaded);
+        assert_eq!(missing.asn_build_time, None);
+
+        let loaded =
+            GeoDatabaseStatusResponse::build(GeoSettings::default(), None, Some(1_792_052_116));
+        assert!(loaded.asn_database_loaded);
+        assert_eq!(
+            loaded.asn_build_time.as_deref(),
+            Some("2026-10-15T08:15:16Z")
         );
     }
 
@@ -523,6 +579,7 @@ mod tests {
         let location = GeoLocation {
             country: Some("United States".to_string()),
             country_code: Some("US".to_string()),
+            continent_code: None,
             city: Some("New York".to_string()),
             latitude: Some(40.7128),
             longitude: Some(-74.0060),
@@ -530,6 +587,7 @@ mod tests {
             timezone: Some("America/New_York".to_string()),
             is_eu: false,
             asn_org: None,
+            asn_number: None,
             is_hosting_provider: None,
         };
 

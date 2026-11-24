@@ -69,7 +69,7 @@ for (const width of [360, 768, 1440]) {
     await expect(page.getByText('Issuance will not start yet')).toBeVisible()
     await expect(page.getByLabel('Zone')).toBeVisible()
     await expect(
-      page.getByRole('button', { name: 'Save Changes' })
+      page.getByRole('button', { name: 'Save', exact: true })
     ).toBeVisible()
     await expectNoHorizontalScroll(page, width)
     expect(errors).toEqual([])
@@ -93,7 +93,7 @@ for (const width of [360, 768, 1440]) {
     expect(errors).toEqual([])
   })
 
-  test(`workflows empty state offers service creation at ${width}px`, async ({
+  test(`workflows empty state points to a project's workflows at ${width}px`, async ({
     page,
   }) => {
     await page.setViewportSize({ width, height: 900 })
@@ -101,12 +101,15 @@ for (const width of [360, 768, 1440]) {
     page.on('pageerror', (error) => errors.push(error.message))
     await mockApi(page, false)
 
-    await page.goto('/ai-workflows')
+    await page.goto('/workflows')
     await expect(
       page.getByRole('heading', { name: 'Workflows', level: 1 })
     ).toBeVisible()
+    await expect(page.getByText('No workflows yet')).toBeVisible()
     await expect(
-      page.getByRole('link', { name: 'Create service' })
+      page.getByRole('link', {
+        name: 'Open a project’s Durable workflows tab',
+      })
     ).toBeVisible()
     await expectNoHorizontalScroll(page, width)
     expect(errors).toEqual([])

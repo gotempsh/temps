@@ -20,6 +20,7 @@ import {
 } from './compose-check'
 
 const supported: ComposeHostStatusResponse = {
+  applicable: true,
   probed: true,
   available: true,
   supported: true,
@@ -35,6 +36,19 @@ describe('Compose host warning', () => {
     expect(composeHostWarning(undefined)).toBeNull()
     expect(composeHostWarning({ ...supported, probed: false })).toBeNull()
     expect(composeHostWarning(supported)).toBeNull()
+  })
+
+  test('stays silent on an instance that runs no Compose workloads', () => {
+    // A hosted control plane has no Docker: a missing Compose CLI is expected.
+    expect(
+      composeHostWarning({
+        ...supported,
+        applicable: false,
+        available: false,
+        supported: false,
+        problem: 'Could not run `docker compose version`',
+      })
+    ).toBeNull()
   })
 
   test('uses the server explanation when there is one', () => {

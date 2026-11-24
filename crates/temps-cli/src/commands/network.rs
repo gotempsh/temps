@@ -65,7 +65,7 @@ pub struct SetupMultiNodeCommand {
     #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
     pub private_address: Option<String>,
 
-    /// Interface carrying the private address (for example enp6s0.4000 or
+    /// Interface carrying the private address (for example eth1.100 or
     /// wg0). Normally detected from the address.
     #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
     pub underlay_dev: Option<String>,
@@ -266,14 +266,33 @@ impl NetworkCommand {
 
 async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
     let cmd_wireguard = cmd.wireguard;
-    let database_url = cmd
-        .database_url
-        .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| {
-            anyhow::anyhow!("TEMPS_DATABASE_URL must be set in the protected process environment")
-        })?;
-    let db = temps_database::establish_connection(&database_url)
+    // Environment-only (never a flag), then the installed service: run with
+    // sudo, this shell has usually lost TEMPS_DATABASE_URL.
+    let database = crate::database_url_source::resolve_database_url(
+        cmd.database_url
+            .or_else(|| std::env::var(crate::database_url_source::DATABASE_URL_ENV).ok())
+            .as_deref(),
+        crate::database_url_source::UrlDiscovery::InstalledService,
+    )?;
+    database.announce_discovery();
+    // The data directory and the server's encryption key before any change
+    // is made, so a missing one fails with nothing half-applied.
+    let data_dir = match cmd
+        .data_dir
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
+    {
+        Some(dir) => dir,
+        None => crate::server_secrets::service_data_dir(&database)?
+            .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
+            .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?,
+    };
+
+    // Before connecting, so a missing or malformed key fails with the pool,
+    // mesh and overlay unchanged.
+    let key = crate::server_secrets::encryption_key(&data_dir, &database)?;
+    key.announce();
+    let encryption = Arc::new(key.into_encryption()?);
+    let db = temps_schema::establish_connection(database.url())
         .await
         .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
 
@@ -292,28 +311,38 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
     let requested_prefix = cmd
         .node_prefix_len
         .unwrap_or(current_network.subnet_prefix_len);
-    let cluster_network = allocator
+    let pool_change = allocator
         .configure_pool(requested_pool, requested_prefix)
         .await
         .map_err(|error| anyhow::anyhow!("cluster network configuration refused: {error}"))?;
+    // ADR 056: allocations that were handed out but never applied move to
+    // the new pool; their nodes pick them up on their next network poll.
+    for moved in &pool_change.reassigned {
+        println!(
+            "Moved node '{}' from {} to {}; it applies the new subnet on its next network poll",
+            moved.node_name, moved.from, moved.to
+        );
+    }
+    let cluster_network = pool_change.config;
 
+    let settings = temps_entities::settings::Entity::find_by_id(1)
+        .one(db.as_ref())
+        .await
+        .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
+        .map(|model| temps_config::AppSettings::from_json(model.data))
+        .unwrap_or_default();
+    // What `temps serve --wg-endpoint` recorded, so this command publishes
+    // the same WireGuard endpoint the running server does.
+    let advertised_wg_endpoint = settings.multi_node.wg_endpoint.clone();
     let private_address = match cmd.private_address {
         Some(value) if !value.trim().is_empty() => value,
-        _ => {
-            let settings = temps_entities::settings::Entity::find_by_id(1)
-                .one(db.as_ref())
-                .await
-                .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
-                .map(|model| temps_core::AppSettings::from_json(model.data))
-                .unwrap_or_default();
-            settings.multi_node.private_address.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "the control-plane private address is not configured; pass \
+        _ => settings.multi_node.private_address.ok_or_else(|| {
+            anyhow::anyhow!(
+                "the control-plane private address is not configured; pass \
                      --private-address <IP> or start once with \
                      `temps serve --private-address <IP>`"
-                )
-            })?
-        }
+            )
+        })?,
     };
 
     if cmd.wireguard {
@@ -338,12 +367,6 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         );
     }
 
-    let data_dir = cmd
-        .data_dir
-        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
-        .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
-        .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
-
     let docker = Arc::new(
         bollard::Docker::connect_with_defaults()
             .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
@@ -353,18 +376,12 @@ async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<
         db.clone(),
         docker.as_ref(),
         Some(private_address.trim()),
+        advertised_wg_endpoint.as_deref(),
         cmd.underlay_dev.as_deref(),
         Some(&mesh_key_dir),
     )
     .await
     .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
-    let encryption_key = temps_config::resolve_installation_secrets(&data_dir)
-        .map_err(|error| anyhow::anyhow!("could not resolve installation secrets: {error}"))?
-        .encryption_key;
-    let encryption = Arc::new(
-        temps_core::EncryptionService::new(&encryption_key)
-            .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
-    );
     let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
     let services =
         temps_providers::ExternalServiceManager::new(db.clone(), encryption, docker, dns_registry);

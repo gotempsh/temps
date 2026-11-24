@@ -3,6 +3,16 @@
 
 //! providers services and utilities
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
+use temps_providers_core::utils;
+pub use temps_providers_core::{readiness, workload};
+
 mod alert_rule_service;
 pub mod continuous_archive;
 pub mod data_import;
@@ -10,20 +20,28 @@ pub mod env_vars_provider_impl;
 pub mod externalsvc;
 pub mod health_monitor;
 pub mod managed_names;
-pub mod mariadb_query;
+pub mod managed_tls;
+mod node_alert_rule_service;
+pub mod node_runtime;
 pub mod parameter_strategies;
 pub mod pg_stat_statements;
 pub mod postgres_lifecycle;
 pub mod postgres_upgrade_service;
 pub mod query_service;
-pub mod readiness;
 pub mod remote_service_client;
+pub mod sandbox_access;
+pub mod sandbox_engines;
+pub mod sandbox_mariadb;
+pub mod sandbox_mongodb;
+pub mod sandbox_redis;
+pub mod sandbox_s3;
 pub mod service_dns;
 pub mod services;
+pub mod worker_s3_scope;
+mod workflow_journal;
 pub use services::*;
 pub mod plugin;
 mod types;
-mod utils;
 pub use externalsvc::ClusterRole;
 pub use externalsvc::PgAutoFailoverState;
 pub use externalsvc::S3Credentials;

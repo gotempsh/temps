@@ -12,6 +12,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct TempsConfig {
+    /// Durable workflows started once after this deployment becomes live.
+    /// Inputs identify the project, environment and deployment; at most 16 names.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deployment_workflows: Vec<String>,
+
     /// Cron job configurations
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cron: Option<Vec<CronJobConfig>>,
@@ -80,10 +85,36 @@ pub struct SourceContextConfig {
     pub include: Option<Vec<String>>,
 }
 
-/// Cron job configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Cron job configuration.
+///
+/// Two modes (ADR-055 §14):
+///
+/// - **http** (`path`): a GET to `path` on the environment's running
+///   deployment, as before;
+/// - **job** (`command`): `command` runs in a new container from the
+///   environment's current deployment image, with the environment's
+///   variables, until it exits. Kubernetes CronJob semantics apply:
+///   `concurrency_policy`, `starting_deadline_seconds`, `retry_limit`,
+///   `timeout_seconds` and `ttl_seconds_after_finished`.
+///
+/// ```yaml
+/// cron:
+///   - path: /api/cron/cleanup          # http
+///     schedule: "0 * * * *"
+///   - name: nightly-report             # job
+///     command: ["bin/report", "--yesterday"]
+///     schedule: "0 3 * * *"
+///     concurrency_policy: forbid
+///     retry_limit: 2
+///     timeout_seconds: 1800
+///   - workflow: send-digest            # workflow (ADR-106)
+///     input: { "period": "weekly" }
+///     schedule: "0 8 * * 1"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CronJobConfig {
-    /// HTTP path to invoke for this cron job
+    /// HTTP path to invoke (`http` mode). Leave it out for a `job`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub path: String,
 
     /// Cron schedule in standard cron format
@@ -91,9 +122,132 @@ pub struct CronJobConfig {
     /// Example: "0 0 * * *" (daily at midnight)
     pub schedule: String,
 
-    /// Optional name/description for the cron job
+    /// Optional name/description for the cron job. For a `job`, it is also
+    /// what identifies the cron between deployments.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+
+    /// `job` mode: the argv to run in the environment's image. It replaces
+    /// the image's command; the image's entrypoint is kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+
+    /// `workflow` mode: the durable workflow each occurrence starts a run of.
+    /// Leave out `path` and `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<String>,
+
+    /// `workflow` mode: the input every run gets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<serde_json::Value>,
+
+    /// `job` and `workflow` modes: what a run does while the previous one is
+    /// still active. Default `forbid`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency_policy: Option<CronConcurrencyPolicy>,
+
+    /// `job` and `workflow` modes: a run that cannot start within this many
+    /// seconds of its scheduled time is skipped instead of started late.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starting_deadline_seconds: Option<u32>,
+
+    /// `job` mode: attempts after the first when a run fails. Default 0.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_limit: Option<u32>,
+
+    /// `job` mode: maximum run time, after which the run is stopped and
+    /// failed. Default one hour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u32>,
+
+    /// `job` mode: how long a finished run's container (and its logs) is
+    /// kept. Default ten minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_seconds_after_finished: Option<u32>,
+}
+
+impl CronJobConfig {
+    /// Whether this entry is a `job` (it has a `command`).
+    pub fn is_job(&self) -> bool {
+        self.command.is_some()
+    }
+
+    /// Whether this entry starts a workflow (it has a `workflow`).
+    pub fn is_workflow(&self) -> bool {
+        self.workflow.is_some()
+    }
+
+    /// Names of the fields only a `job` runs with, for refusing them on a
+    /// `workflow` entry.
+    pub fn run_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.retry_limit.is_some() {
+            fields.push("retry_limit");
+        }
+        if self.timeout_seconds.is_some() {
+            fields.push("timeout_seconds");
+        }
+        if self.ttl_seconds_after_finished.is_some() {
+            fields.push("ttl_seconds_after_finished");
+        }
+        fields
+    }
+
+    /// Names of the `job`-only fields this entry sets, for refusing them on
+    /// an `http` entry.
+    pub fn job_only_fields(&self) -> Vec<&'static str> {
+        let mut fields = Vec::new();
+        if self.concurrency_policy.is_some() {
+            fields.push("concurrency_policy");
+        }
+        if self.starting_deadline_seconds.is_some() {
+            fields.push("starting_deadline_seconds");
+        }
+        if self.retry_limit.is_some() {
+            fields.push("retry_limit");
+        }
+        if self.timeout_seconds.is_some() {
+            fields.push("timeout_seconds");
+        }
+        if self.ttl_seconds_after_finished.is_some() {
+            fields.push("ttl_seconds_after_finished");
+        }
+        fields
+    }
+}
+
+/// What a `job` cron run does while the previous run is still active
+/// (Kubernetes CronJob `concurrencyPolicy`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronConcurrencyPolicy {
+    /// Start it anyway: runs overlap.
+    Allow,
+    /// Skip it: the active run finishes first.
+    #[default]
+    Forbid,
+    /// Stop the active run and start this one.
+    Replace,
+}
+
+impl CronConcurrencyPolicy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CronConcurrencyPolicy::Allow => "allow",
+            CronConcurrencyPolicy::Forbid => "forbid",
+            CronConcurrencyPolicy::Replace => "replace",
+        }
+    }
+
+    /// Parses the stored value; anything unknown is `forbid`, the safe
+    /// choice.
+    pub fn from_stored(value: &str) -> Self {
+        match value {
+            "allow" => CronConcurrencyPolicy::Allow,
+            "replace" => CronConcurrencyPolicy::Replace,
+            _ => CronConcurrencyPolicy::Forbid,
+        }
+    }
 }
 
 /// Build configuration
@@ -122,6 +276,16 @@ pub struct BuildConfig {
     /// Output directory for static builds
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_dir: Option<String>,
+
+    /// Variables to pass as build arguments even though the Dockerfile
+    /// declares them where Docker keeps the value in the final image's
+    /// metadata, readable by anyone who can pull the image. Without this, a
+    /// control-plane build withholds them.
+    ///
+    /// Prefer a BuildKit secret mount, which needs no opt-in:
+    /// `RUN --mount=type=secret,id=NAME,env=NAME ...`
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret_build_args: Option<Vec<String>>,
 }
 
 /// Health check configuration
@@ -286,7 +450,7 @@ pub struct AgentYamlConfig {
     /// Legacy alias for `model`. `None` means "use the platform default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// Preferred model identifier for the CLI (e.g. "sonnet", "opus", "gpt-5-codex").
+    /// Preferred model identifier for the CLI (e.g. "sonnet", "opus", "gpt-6.2-sol").
     /// NULL means: let the CLI pick its default. This is independent from `provider` —
     /// the provider decides which CLI runs; `ai_model` picks the model inside that CLI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -535,7 +699,7 @@ pub struct WorkflowYamlConfig {
     /// AI provider override. `None` means "use the platform default".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    /// Preferred model for the CLI (e.g. "sonnet", "gpt-5-codex"). `None` = CLI default.
+    /// Preferred model for the CLI (e.g. "sonnet", "gpt-6.2-sol"). `None` = CLI default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_model: Option<String>,
     #[serde(default = "default_max_turns")]
@@ -1001,6 +1165,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_parse_secret_build_args_opt_in() {
+        let config = TempsConfig::from_yaml(
+            "build:\n  secret_build_args:\n    - API_KEY\n    - SIGNING_KEY\n",
+        )
+        .unwrap();
+        assert_eq!(
+            config.build.unwrap().secret_build_args,
+            Some(vec!["API_KEY".to_string(), "SIGNING_KEY".to_string()])
+        );
+        let config = TempsConfig::from_yaml("build:\n  dockerfile: Dockerfile\n").unwrap();
+        assert_eq!(config.build.unwrap().secret_build_args, None);
+    }
+
+    #[test]
     fn test_parse_complete_config() {
         let yaml = r#"
 cron:
@@ -1097,6 +1275,73 @@ cron:
     }
 
     #[test]
+    fn job_cron_entries_parse_next_to_http_ones() {
+        let yaml = r#"
+cron:
+  - path: /api/cron/cleanup
+    schedule: "0 * * * *"
+  - name: nightly-report
+    command: ["bin/report", "--yesterday"]
+    schedule: "0 3 * * *"
+    concurrency_policy: replace
+    starting_deadline_seconds: 120
+    retry_limit: 2
+    timeout_seconds: 1800
+    ttl_seconds_after_finished: 60
+"#;
+        let config = TempsConfig::from_yaml(yaml).unwrap();
+        let crons = config.cron_jobs();
+        assert_eq!(crons.len(), 2);
+
+        assert!(!crons[0].is_job());
+        assert!(crons[0].job_only_fields().is_empty());
+
+        let job = crons[1];
+        assert!(job.is_job());
+        assert!(job.path.is_empty());
+        assert_eq!(
+            job.command.as_deref(),
+            Some(&["bin/report".to_string(), "--yesterday".to_string()][..])
+        );
+        assert_eq!(job.concurrency_policy, Some(CronConcurrencyPolicy::Replace));
+        assert_eq!(job.starting_deadline_seconds, Some(120));
+        assert_eq!(job.retry_limit, Some(2));
+        assert_eq!(job.timeout_seconds, Some(1800));
+        assert_eq!(job.ttl_seconds_after_finished, Some(60));
+        assert_eq!(job.job_only_fields().len(), 5);
+    }
+
+    #[test]
+    fn an_unknown_concurrency_policy_is_a_parse_error_and_stored_values_default_to_forbid() {
+        let yaml = r#"
+cron:
+  - command: ["true"]
+    schedule: "* * * * *"
+    concurrency_policy: sometimes
+"#;
+        assert!(TempsConfig::from_yaml(yaml).is_err());
+        assert_eq!(
+            CronConcurrencyPolicy::default(),
+            CronConcurrencyPolicy::Forbid
+        );
+        assert_eq!(
+            CronConcurrencyPolicy::from_stored("allow"),
+            CronConcurrencyPolicy::Allow
+        );
+        assert_eq!(
+            CronConcurrencyPolicy::from_stored("garbage"),
+            CronConcurrencyPolicy::Forbid
+        );
+        for policy in [
+            CronConcurrencyPolicy::Allow,
+            CronConcurrencyPolicy::Forbid,
+            CronConcurrencyPolicy::Replace,
+        ] {
+            assert_eq!(CronConcurrencyPolicy::from_stored(policy.as_str()), policy);
+        }
+    }
+
+    #[test]
     fn test_parse_config_no_crons() {
         let yaml = r#"
 build:
@@ -1115,12 +1360,14 @@ build:
                 path: "/api/cron/test".to_string(),
                 schedule: "0 0 * * *".to_string(),
                 name: Some("Test Cron".to_string()),
+                ..Default::default()
             }]),
             build: None,
             env: None,
             health: None,
             agents: None,
             workflows: None,
+            deployment_workflows: vec![],
             source_context: None,
             alerts: None,
         };

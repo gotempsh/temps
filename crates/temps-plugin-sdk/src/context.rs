@@ -75,15 +75,15 @@ impl PluginContext {
 
     pub async fn permissions(
         &self,
-    ) -> Result<temps_core::external_plugin::channel::HostCapabilities, crate::error::PluginSdkError>
+    ) -> Result<temps_plugin_protocol::channel::HostCapabilities, crate::error::PluginSdkError>
     {
         self.temps_client.host_capabilities().await
     }
 
     pub async fn generate_ai(
         &self,
-        request: temps_core::external_plugin::channel::GenerateAi,
-    ) -> Result<temps_core::external_plugin::channel::GenerateAiResult, crate::error::PluginSdkError>
+        request: temps_plugin_protocol::channel::GenerateAi,
+    ) -> Result<temps_plugin_protocol::channel::GenerateAiResult, crate::error::PluginSdkError>
     {
         self.temps_client.generate_ai(request).await
     }
@@ -105,7 +105,7 @@ impl PluginContext {
             .ok_or(crate::error::PluginSdkError::NoActor)?;
         Ok(crate::api::PlatformApi::new(
             self.temps_client.clone(),
-            temps_core::external_plugin::channel::ActorToken::new(token),
+            temps_plugin_protocol::channel::ActorToken::new(token),
         ))
     }
 
@@ -119,7 +119,7 @@ impl PluginContext {
             .ok_or(crate::error::PluginSdkError::NoActor)?;
         Ok(crate::api::PlatformApi::new(
             self.temps_client.clone(),
-            temps_core::external_plugin::channel::ActorToken::new(token),
+            temps_plugin_protocol::channel::ActorToken::new(token),
         ))
     }
 

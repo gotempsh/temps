@@ -1,0 +1,679 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::get,
+    Extension, Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use utoipa::ToSchema;
+
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_core::audit::{AuditContext, AuditOperation};
+use temps_core::problemdetails::Problem;
+use temps_core::RequestMetadata;
+use temps_entities::project_agents;
+
+use crate::error::AgentError;
+use crate::handlers::AppState;
+use crate::services::config_service::UpsertAgentRequest;
+
+// ── Audit structs ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentCreatedAudit {
+    context: AuditContext,
+    project_id: i32,
+    agent_id: i32,
+    slug: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentUpdatedAudit {
+    context: AuditContext,
+    project_id: i32,
+    agent_id: i32,
+    slug: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AgentDeletedAudit {
+    context: AuditContext,
+    project_id: i32,
+    slug: String,
+}
+
+impl AuditOperation for AgentCreatedAudit {
+    fn operation_type(&self) -> String {
+        "AGENT_CREATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for AgentUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "AGENT_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+impl AuditOperation for AgentDeletedAudit {
+    fn operation_type(&self) -> String {
+        "AGENT_DELETED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+// ── Response DTOs ─────────────────────────────────────────────────────────────
+
+/// Response DTO for a single agent — masks the encrypted API key.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct AgentConfigResponse {
+    pub id: i32,
+    pub project_id: i32,
+    pub slug: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub source: String,
+    pub enabled: bool,
+    pub trigger_config: serde_json::Value,
+    pub prompt: Option<String>,
+    pub ai_provider: String,
+    /// Preferred model for the CLI (e.g. "sonnet", "gpt-6.2-sol"). `None` means default.
+    pub ai_model: Option<String>,
+    /// `true` if an API key is set; `false` otherwise.
+    pub api_key_set: bool,
+    pub ai_provider_key_id: Option<i32>,
+    pub max_turns: i32,
+    pub timeout_seconds: i32,
+    pub daily_budget_cents: i32,
+    pub cooldown_minutes: i32,
+    pub branch_prefix: String,
+    pub deliverable: String,
+    /// None = use global sandbox setting, true = force on, false = force off
+    pub sandbox_enabled: Option<bool>,
+    /// Private config repo containing .claude/ directory (skills, MCP, plugins).
+    pub config_repo_url: Option<String>,
+    /// Branch of the config repo to use.
+    pub config_repo_branch: Option<String>,
+    /// MCP servers config (Claude Code settings.json mcpServers format).
+    /// Credential-bearing legacy inline values are write-only and appear as
+    /// `***`. Omit this field on update to preserve their stored values.
+    pub mcp_servers_config: Option<serde_json::Value>,
+    /// Skills config as JSON array.
+    pub skills_config: Option<serde_json::Value>,
+    /// Tools config as JSON array. Legacy custom-tool webhook URLs and headers
+    /// are write-only and appear as `***`. Omit this field on update to
+    /// preserve their stored values.
+    pub tools_config: Option<serde_json::Value>,
+    /// Public webhook URL for triggering this agent externally.
+    /// Only set when `on: { webhook: true }` is configured.
+    /// Usage: `POST {webhook_url}` with header `X-Webhook-Token: {webhook_token}`
+    pub webhook_url: Option<String>,
+    /// Secret token for the `X-Webhook-Token` header.
+    ///
+    /// Returned in full exactly once, by the request that mints it (creating
+    /// an agent with the webhook trigger on, or turning that trigger on).
+    /// Every later read is `***`: the row holds only a digest, so the token
+    /// cannot be shown again. Turn the webhook trigger off and on to mint a
+    /// replacement.
+    pub webhook_token: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<project_agents::Model> for AgentConfigResponse {
+    fn from(model: project_agents::Model) -> Self {
+        Self {
+            id: model.id,
+            project_id: model.project_id,
+            slug: model.slug,
+            name: model.name,
+            description: model.description,
+            source: model.source,
+            enabled: model.enabled,
+            trigger_config: model.trigger_config,
+            prompt: model.prompt,
+            ai_provider: model.ai_provider,
+            ai_model: model.ai_model,
+            api_key_set: model.api_key_encrypted.is_some(),
+            ai_provider_key_id: model.ai_provider_key_id,
+            max_turns: model.max_turns,
+            timeout_seconds: model.timeout_seconds,
+            daily_budget_cents: model.daily_budget_cents,
+            cooldown_minutes: model.cooldown_minutes,
+            branch_prefix: model.branch_prefix,
+            deliverable: model.deliverable,
+            sandbox_enabled: model.sandbox_enabled,
+            config_repo_url: model.config_repo_url,
+            config_repo_branch: model.config_repo_branch,
+            mcp_servers_config: model
+                .mcp_servers_config
+                .map(|value| mask_mcp_credential_values(&value)),
+            skills_config: model.skills_config,
+            tools_config: model
+                .tools_config
+                .map(|value| mask_custom_tool_credential_values(&value)),
+            webhook_url: model
+                .webhook_id
+                .as_ref()
+                .map(|id| format!("/api/agents/webhook/{}", id)),
+            // What the row holds is a digest, not the token, so there is
+            // nothing to reveal a prefix of. `***` says "set, not shown".
+            webhook_token: model.webhook_token.as_ref().map(|_| "***".to_string()),
+            created_at: model.created_at.to_rfc3339(),
+            updated_at: model.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+impl AgentConfigResponse {
+    /// Carry the webhook token this request minted, in full, this once.
+    ///
+    /// `Cache-Control: no-store` goes on the response that uses this; see
+    /// the handlers.
+    fn with_minted_webhook_token(mut self, minted: Option<String>) -> Self {
+        if let Some(token) = minted {
+            self.webhook_token = Some(token);
+        }
+        self
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ListAgentsResponse {
+    pub items: Vec<AgentConfigResponse>,
+    pub total: usize,
+}
+
+/// Legacy inline MCP configs are still accepted for backward compatibility,
+/// but normal agent responses must never expose their credential-bearing
+/// URL, environment, or header fields.
+fn mask_mcp_credential_values(config: &serde_json::Value) -> serde_json::Value {
+    if let Some(slugs) = config.as_array() {
+        return if slugs.iter().all(serde_json::Value::is_string) {
+            config.clone()
+        } else {
+            serde_json::Value::String("***".to_string())
+        };
+    }
+    let Some(servers) = config.as_object() else {
+        return serde_json::Value::String("***".to_string());
+    };
+    let mut masked = serde_json::Map::new();
+    for (server_name, server_config) in servers {
+        let Some(obj) = server_config.as_object() else {
+            masked.insert(
+                server_name.clone(),
+                serde_json::Value::String("***".to_string()),
+            );
+            continue;
+        };
+        let mut server = obj.clone();
+        if server.get("url").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "url".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
+        }
+        if let Some(env) = server.get("env").and_then(|v| v.as_object()) {
+            let masked_env: serde_json::Map<String, serde_json::Value> = env
+                .keys()
+                .map(|k| (k.clone(), serde_json::Value::String("***".to_string())))
+                .collect();
+            server.insert("env".to_string(), serde_json::Value::Object(masked_env));
+        } else if server.get("env").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "env".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
+        }
+        if let Some(headers) = server.get("headers").and_then(|v| v.as_object()) {
+            let masked_headers = headers
+                .keys()
+                .map(|key| (key.clone(), serde_json::Value::String("***".to_string())))
+                .collect();
+            server.insert(
+                "headers".to_string(),
+                serde_json::Value::Object(masked_headers),
+            );
+        } else if server.get("headers").is_some_and(|value| !value.is_null()) {
+            server.insert(
+                "headers".to_string(),
+                serde_json::Value::String("***".to_string()),
+            );
+        }
+        masked.insert(server_name.clone(), serde_json::Value::Object(server));
+    }
+    serde_json::Value::Object(masked)
+}
+
+fn mask_custom_tool_credential_values(config: &serde_json::Value) -> serde_json::Value {
+    let Some(tools) = config.as_array() else {
+        return serde_json::Value::String("***".to_string());
+    };
+    let masked = tools
+        .iter()
+        .map(|tool| {
+            let Some(object) = tool.as_object() else {
+                return serde_json::Value::String("***".to_string());
+            };
+            let mut tool = object.clone();
+            for field in ["webhook_url", "url"] {
+                if tool.get(field).is_some_and(|value| !value.is_null()) {
+                    tool.insert(
+                        field.to_string(),
+                        serde_json::Value::String("***".to_string()),
+                    );
+                }
+            }
+            if let Some(headers) = tool.get("headers").and_then(|value| value.as_object()) {
+                let masked_headers = headers
+                    .keys()
+                    .map(|key| (key.clone(), serde_json::Value::String("***".to_string())))
+                    .collect();
+                tool.insert(
+                    "headers".to_string(),
+                    serde_json::Value::Object(masked_headers),
+                );
+            } else if tool.get("headers").is_some_and(|value| !value.is_null()) {
+                tool.insert(
+                    "headers".to_string(),
+                    serde_json::Value::String("***".to_string()),
+                );
+            }
+            serde_json::Value::Object(tool)
+        })
+        .collect();
+    serde_json::Value::Array(masked)
+}
+
+// ── Routes ────────────────────────────────────────────────────────────────────
+
+pub fn routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/projects/{project_id}/agents",
+            get(list_agents).post(create_agent),
+        )
+        .route(
+            "/projects/{project_id}/agents/{slug}",
+            get(get_agent).put(update_agent).delete(delete_agent),
+        )
+}
+
+// ── Handlers ──────────────────────────────────────────────────────────────────
+
+#[utoipa::path(
+    tag = "Agents",
+    get,
+    path = "/projects/{project_id}/agents",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    responses(
+        (status = 200, description = "List of agents for project", body = ListAgentsResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_agents(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let agents = app_state
+        .config_service
+        .list_agents(project_id)
+        .await
+        .map_err(Problem::from)?;
+
+    let total = agents.len();
+    Ok(Json(ListAgentsResponse {
+        items: agents.into_iter().map(AgentConfigResponse::from).collect(),
+        total,
+    }))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    post,
+    path = "/projects/{project_id}/agents",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    request_body = UpsertAgentRequest,
+    responses(
+        (status = 201, description = "Agent created", body = AgentConfigResponse),
+        (status = 400, description = "Validation error"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_agent(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(project_id): Path<i32>,
+    Json(request): Json<UpsertAgentRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let minted = app_state
+        .config_service
+        .create_agent(project_id, request)
+        .await
+        .map_err(Problem::from)?;
+    let agent = minted.agent;
+
+    let audit = AgentCreatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        agent_id: agent.id,
+        slug: agent.slug.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for agent creation (project {}, slug {}): {}",
+            project_id,
+            agent.slug,
+            e
+        );
+    }
+
+    // The webhook token is in this body in full and nowhere else, so keep
+    // it out of every cache between here and the caller.
+    Ok((
+        StatusCode::CREATED,
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    get,
+    path = "/projects/{project_id}/agents/{slug}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "Agent slug"),
+    ),
+    responses(
+        (status = 200, description = "Agent config", body = AgentConfigResponse),
+        (status = 404, description = "Agent not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_agent(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Path((project_id, slug)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let agent = app_state
+        .config_service
+        .get_agent_by_slug(project_id, &slug)
+        .await
+        .map_err(Problem::from)?
+        .ok_or_else(|| {
+            Problem::from(AgentError::AgentNotFound {
+                project_id,
+                slug: slug.clone(),
+            })
+        })?;
+
+    Ok(Json(AgentConfigResponse::from(agent)))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    put,
+    path = "/projects/{project_id}/agents/{slug}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "Agent slug"),
+    ),
+    request_body = UpsertAgentRequest,
+    responses(
+        (status = 200, description = "Agent updated", body = AgentConfigResponse),
+        (status = 400, description = "Validation error"),
+        (status = 404, description = "Agent not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn update_agent(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, slug)): Path<(i32, String)>,
+    Json(request): Json<UpsertAgentRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    let minted = app_state
+        .config_service
+        .update_agent(project_id, &slug, request)
+        .await
+        .map_err(Problem::from)?;
+    let agent = minted.agent;
+
+    let audit = AgentUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        agent_id: agent.id,
+        slug: agent.slug.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for agent update (project {}, slug {}): {}",
+            project_id,
+            agent.slug,
+            e
+        );
+    }
+
+    // Turning the webhook trigger on mints a token; same contract as
+    // creation -- in full once, never cached.
+    Ok((
+        [(axum::http::header::CACHE_CONTROL, "no-store")],
+        Json(
+            AgentConfigResponse::from(agent).with_minted_webhook_token(minted.minted_webhook_token),
+        ),
+    ))
+}
+
+#[utoipa::path(
+    tag = "Agents",
+    delete,
+    path = "/projects/{project_id}/agents/{slug}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("slug" = String, Path, description = "Agent slug"),
+    ),
+    responses(
+        (status = 204, description = "Agent deleted"),
+        (status = 404, description = "Agent not found"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn delete_agent(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((project_id, slug)): Path<(i32, String)>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
+
+    app_state
+        .config_service
+        .delete_agent(project_id, &slug)
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = AgentDeletedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        project_id,
+        slug: slug.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(
+            "Failed to create audit log for agent delete (project {}, slug {}): {}",
+            project_id,
+            &slug,
+            e
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_inline_mcp_response_masks_url_env_and_headers() {
+        let config = serde_json::json!({
+            "remote": {
+                "url": "https://user:password@mcp.example.test?token=secret",
+                "env": {"API_TOKEN": "env-secret"},
+                "headers": {"Authorization": "Bearer header-secret"},
+                "command": "npx"
+            },
+            "malformed": "raw-secret"
+        });
+
+        let masked = mask_mcp_credential_values(&config);
+
+        assert_eq!(masked["remote"]["url"], "***");
+        assert_eq!(masked["remote"]["env"]["API_TOKEN"], "***");
+        assert_eq!(masked["remote"]["headers"]["Authorization"], "***");
+        assert_eq!(masked["remote"]["command"], "npx");
+        assert_eq!(masked["malformed"], "***");
+        let serialized = masked.to_string();
+        for secret in ["password", "env-secret", "header-secret", "raw-secret"] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+
+    #[test]
+    fn current_mcp_slug_references_are_preserved() {
+        let config = serde_json::json!(["github", "filesystem"]);
+
+        assert_eq!(mask_mcp_credential_values(&config), config);
+        assert_eq!(
+            mask_mcp_credential_values(&serde_json::json!(["github", {"url": "secret"}])),
+            "***"
+        );
+    }
+
+    #[test]
+    fn legacy_custom_tool_response_masks_webhook_urls_and_headers() {
+        let config = serde_json::json!([
+            {
+                "type": "custom",
+                "name": "deploy",
+                "webhook_url": "https://hooks.example.test/secret",
+                "headers": {
+                    "Authorization": "Bearer secret",
+                    "X-Api-Key": "api-secret"
+                },
+                "description": "Deploy the application"
+            },
+            "malformed-secret"
+        ]);
+
+        let masked = mask_custom_tool_credential_values(&config);
+
+        assert_eq!(masked[0]["webhook_url"], "***");
+        assert_eq!(masked[0]["headers"]["Authorization"], "***");
+        assert_eq!(masked[0]["headers"]["X-Api-Key"], "***");
+        assert_eq!(masked[0]["description"], "Deploy the application");
+        assert_eq!(masked[1], "***");
+        let serialized = masked.to_string();
+        for secret in [
+            "hooks.example.test",
+            "Bearer secret",
+            "api-secret",
+            "malformed-secret",
+        ] {
+            assert!(!serialized.contains(secret));
+        }
+    }
+}

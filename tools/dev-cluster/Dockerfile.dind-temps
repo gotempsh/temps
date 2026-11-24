@@ -45,7 +45,10 @@ RUN install -m 0755 -d /etc/apt/keyrings \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/debian trixie stable" \
        > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
+    # The Compose plugin: Docker Compose projects run on workers as well as
+    # on the control plane, through `docker compose` on the node itself.
     && apt-get install -y --no-install-recommends docker-ce docker-ce-cli containerd.io \
+        docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 # Rust stable. Pinning to "stable" (not a specific version) so workspace

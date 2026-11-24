@@ -12,6 +12,7 @@
 //! - Event delivery: forwarding platform events to subscribing plugins
 //! - API: listing plugin manifests via REST endpoint
 
+pub mod actor;
 pub mod catalog;
 pub mod channel;
 pub mod event_listener;
@@ -20,6 +21,7 @@ pub mod handler;
 pub mod host_api;
 pub mod install;
 pub mod install_progress;
+pub mod launcher;
 pub mod manager;
 pub mod plugin;
 pub mod proxy;
@@ -33,3 +35,7 @@ pub use channel::PluginChannel;
 pub use event_listener::PluginEventListener;
 pub use plugin::ExternalPluginsPlugin;
 pub use service::ExternalPluginsService;
+
+pub mod ai_tools;
+
+mod watches;

@@ -12,6 +12,8 @@ import {
 } from '@/lib/read-failure'
 import { markReadFailureHandled } from '@/lib/route-query-failures'
 
+const CACHED_NOTE = 'Showing last-known data. It is stale and may have changed.'
+
 /**
  * Inline read recovery. Retry only replays a query, never a mutation.
  *
@@ -48,6 +50,51 @@ export function ReadFailure({
   const forbidden = isForbiddenRead(error)
   const serverDetail = readFailureServerDetail(error)
   const Icon = forbidden ? ShieldAlert : AlertTriangle
+  const title = forbidden
+    ? `${resource}: access denied`
+    : `${resource} unavailable`
+  const retryButton = onRetry && (
+    <Button
+      // Often rendered inside a form: a default submit button would
+      // save the form instead of replaying the read.
+      type="button"
+      variant="outline"
+      size="sm"
+      className={routeLevel ? 'h-7 shrink-0 px-2.5 text-xs' : undefined}
+      aria-disabled={retrying}
+      onClick={() => {
+        if (!retrying) onRetry()
+      }}
+    >
+      {retrying ? 'Retrying…' : 'Retry'}
+    </Button>
+  )
+  if (routeLevel) {
+    // Shown above whatever page is open, so it takes one line: the page under
+    // it is still the thing the user came for. The server's reason is the
+    // most specific thing to show; the full explanation is on hover.
+    const explanation = cached
+      ? `${readFailureExplanation(error)} ${CACHED_NOTE}`
+      : readFailureExplanation(error)
+    const full = serverDetail ? `${explanation} ${serverDetail}` : explanation
+    return (
+      <div
+        role="alert"
+        data-read-failure={forbidden ? 'forbidden' : 'failed'}
+        className="flex items-center gap-2 rounded-md border border-warning/50 bg-warning/10 px-3 py-1.5 text-sm text-warning-strong dark:border-warning"
+      >
+        <Icon className="size-4 shrink-0" aria-hidden="true" />
+        <p className="min-w-0 flex-1 truncate" title={full}>
+          <span className="font-medium">{title}</span>
+          <span className="opacity-80"> · {serverDetail ?? explanation}</span>
+          <span className="sr-only">
+            {serverDetail ? ` ${explanation}` : ''}
+          </span>
+        </p>
+        {retryButton}
+      </div>
+    )
+  }
   return (
     <Alert
       variant="warning"
@@ -57,9 +104,7 @@ export function ReadFailure({
       }
     >
       {!embedded && <Icon className="size-4" />}
-      <AlertTitle>
-        {forbidden ? `${resource}: access denied` : `${resource} unavailable`}
-      </AlertTitle>
+      <AlertTitle>{title}</AlertTitle>
       <AlertDescription className="space-y-2">
         <p>{readFailureExplanation(error)}</p>
         {serverDetail && (
@@ -67,24 +112,8 @@ export function ReadFailure({
             <span className="font-medium">Server response:</span> {serverDetail}
           </p>
         )}
-        {cached && (
-          <p>Showing last-known data. It is stale and may have changed.</p>
-        )}
-        {onRetry && (
-          <Button
-            // Often rendered inside a form: a default submit button would
-            // save the form instead of replaying the read.
-            type="button"
-            variant="outline"
-            size="sm"
-            aria-disabled={retrying}
-            onClick={() => {
-              if (!retrying) onRetry()
-            }}
-          >
-            {retrying ? 'Retrying…' : 'Retry'}
-          </Button>
-        )}
+        {cached && <p>{CACHED_NOTE}</p>}
+        {retryButton}
       </AlertDescription>
     </Alert>
   )

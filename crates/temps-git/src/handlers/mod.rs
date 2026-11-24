@@ -11,6 +11,8 @@ pub mod github;
 pub(crate) mod github_manifest_binding;
 pub mod gitlab;
 pub mod public;
+mod pull_request;
+pub mod reauthorize;
 pub mod repositories;
 pub mod types;
 pub mod update_token;
@@ -28,6 +30,14 @@ pub use public::PublicRepositoriesApiDoc;
 /// so no delivery that worked is refused; the other providers set their own.
 pub(crate) const PROVIDER_EVENT_BODY_LIMIT: usize = 2 * 1024 * 1024;
 
+/// Extract a branch without changing occurrences of the prefix inside its name.
+fn branch_from_ref(git_ref: &str, allow_bare: bool) -> Option<String> {
+    git_ref
+        .strip_prefix("refs/heads/")
+        .or_else(|| (allow_bare && !git_ref.starts_with("refs/")).then_some(git_ref))
+        .map(str::to_owned)
+}
+
 /// Configure the session-authenticated routes for git providers: provider and
 /// connection management, repository browsing, and the OAuth/installation
 /// callbacks a provider redirects the operator's browser to.
@@ -37,6 +47,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .merge(github::configure_routes())
         .merge(gitlab::configure_routes())
         .merge(public::configure_routes())
+        .merge(reauthorize::configure_routes())
 }
 
 /// Configure the webhook receivers git providers deliver events to (ADR-051
@@ -80,7 +91,7 @@ mod public_route_tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn AuditOperation,
-        ) -> temps_core::anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -114,8 +125,16 @@ mod public_route_tests {
     /// Handler state over a database that has nothing queued: any query a
     /// handler issues fails, so a response that needed no data proves the
     /// request was turned away before any database work.
-    fn state() -> Arc<AppState> {
-        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    pub(super) fn state() -> Arc<AppState> {
+        state_over(MockDatabase::new(DatabaseBackend::Postgres))
+    }
+
+    /// Like [`state`], over a database the test has queued results on.
+    pub(super) fn state_over(database: MockDatabase) -> Arc<AppState> {
+        state_with_db(Arc::new(database.into_connection()))
+    }
+
+    pub(super) fn state_with_db(db: Arc<temps_database::DbConnection>) -> Arc<AppState> {
         let config_service = Arc::new(temps_config::ConfigService::new(
             Arc::new(
                 temps_config::ServerConfig::new(
@@ -140,6 +159,7 @@ mod public_route_tests {
                 ),
                 queue.clone(),
                 config_service.clone(),
+                Arc::new(temps_core::NoopAuditLogger),
             ),
         );
         let github_service = Arc::new(crate::services::github::GithubAppService::new(
@@ -195,9 +215,10 @@ mod public_route_tests {
             .expect("request builds")
     }
 
-    const RECEIVERS: [&str; 6] = [
+    const RECEIVERS: [&str; 7] = [
         "/webhook/git/github/events",
         "/webhook/source/github/events",
+        "/webhook/git/github/repo-events",
         "/webhook/git/gitlab/events",
         "/webhook/git/gitea/events",
         "/webhook/git/bitbucket/events/not-a-registered-token",
@@ -230,6 +251,7 @@ mod public_route_tests {
     #[tokio::test]
     async fn browser_callbacks_and_management_routes_stay_off_the_public_router() {
         for path in [
+            "/git-providers/github/manifest/start",
             "/webhook/git/github/auth",
             "/webhook/git/github/callback",
             "/webhook/git/github/install",
@@ -284,7 +306,7 @@ mod public_route_tests {
         assert_eq!(
             status(
                 configure_routes(),
-                post("/git-providers/github/manifest-state", "")
+                post("/git-providers/github/manifest/start", "")
             )
             .await,
             StatusCode::UNAUTHORIZED
@@ -303,6 +325,33 @@ mod public_route_tests {
             }
             let request = request
                 .body(Body::from(r#"{"ref":"refs/heads/main"}"#))
+                .expect("request builds");
+            assert_eq!(
+                status(configure_public_routes(), request).await,
+                StatusCode::UNAUTHORIZED,
+                "signature {signature:?} must not be accepted"
+            );
+        }
+    }
+
+    /// A repository webhook delivery is authenticated against the secret of
+    /// a project connected to the repository it names. One that carries no
+    /// usable `X-Hub-Signature-256` is turned away before any lookup (the
+    /// state's database fails every query, so a 401 proves none was made).
+    #[tokio::test]
+    async fn a_github_repo_delivery_without_a_signature_is_rejected_before_lookup() {
+        for signature in [None, Some("not-a-signature"), Some("sha1=deadbeef")] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri("/webhook/git/github/repo-events")
+                .header("X-GitHub-Event", "push");
+            if let Some(signature) = signature {
+                request = request.header("X-Hub-Signature-256", signature);
+            }
+            let request = request
+                .body(Body::from(
+                    r#"{"ref":"refs/heads/main","after":"abc","repository":{"name":"r","owner":{"login":"o"}}}"#,
+                ))
                 .expect("request builds");
             assert_eq!(
                 status(configure_public_routes(), request).await,

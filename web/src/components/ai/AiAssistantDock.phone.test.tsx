@@ -8,11 +8,13 @@ import {
   fireEvent,
   render,
   screen,
+  waitFor,
   within,
 } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { client } from '@/api/client/client.gen'
+import { restoreApiClient } from '@/test/api-client'
 import { installBrowserWindow } from '@/test/dom'
 import { DockBody } from './AiAssistantDock'
 import {
@@ -49,6 +51,8 @@ const assistant: AiAssistantValue = {
   projectId: null,
   openSeq: 0,
   open: () => {},
+  openPage: () => {},
+  clearInitialContext: () => {},
   close: () => {},
   toggle: () => {},
   pageContext: null,
@@ -70,6 +74,9 @@ const originalMatchMedia = window.matchMedia
 const mediaListeners = new Set<() => void>()
 
 beforeEach(() => {
+  // The dock reopens the chat it last remembered (`temps.ai.activeChat` in
+  // localStorage), and storage outlives a test file: start from none.
+  localStorage.clear()
   // happy-dom never fires `change` on a MediaQueryList when the viewport
   // moves, so share one listener set and notify it from setViewport.
   window.matchMedia = ((query: string) => ({
@@ -99,10 +106,12 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup()
-  client.setConfig(originalConfig)
+  restoreApiClient(originalConfig)
   happyDOM()?.setViewport({ width: DESKTOP })
   window.matchMedia = originalMatchMedia
   mediaListeners.clear()
+  // Opening a chat remembers it; a later dock would reopen it, not the list.
+  window.localStorage.clear()
 })
 
 function setViewport(width: number) {
@@ -112,7 +121,41 @@ function setViewport(width: number) {
   })
 }
 
-async function renderPhonePage(search = '') {
+// The chat list that fills the screen on a phone, as opposed to the one in the
+// side panel (hidden below `lg` by CSS, which happy-dom does not apply).
+const inPlaceChat = (title: string) =>
+  waitFor(() => {
+    const chat = screen
+      .getAllByText(title)
+      .find((element) => !element.closest('aside[aria-label="Chats"]'))
+    if (!chat) throw new Error(`"${title}" is only listed in the side panel`)
+    return chat
+  })
+
+// The list beside the conversation is a resizable panel; its handle is hidden
+// whenever that panel is collapsed out of the way.
+const sideListShown = () =>
+  !document
+    .querySelector('[aria-label="Resize chat list"]')
+    ?.classList.contains('hidden')
+
+// What the chat list says above its chats when it fills the screen.
+const LIST_INTRO = /Resume any AI conversation/
+
+const backArrow = () =>
+  screen.getByRole('button', { name: 'Back to all conversations' })
+
+async function settle() {
+  // The composer focuses itself on the next animation frame after it mounts;
+  // let that settle before the layout changes under test.
+  await act(async () => {
+    await new Promise((resolve) => setTimeout(resolve, 50))
+  })
+}
+
+// The page opens on the assistant's start screen, behind which the chat list
+// waits. Phones have no room for both, so the back arrow swaps them.
+async function renderPhonePage() {
   setViewport(PHONE)
   const view = render(
     <QueryClientProvider
@@ -120,72 +163,65 @@ async function renderPhonePage(search = '') {
         new QueryClient({ defaultOptions: { queries: { retry: false } } })
       }
     >
-      <MemoryRouter initialEntries={[`/chat${search}`]}>
+      <MemoryRouter initialEntries={['/chat']}>
         <AiAssistantContext.Provider value={assistant}>
           <DockBody layout="page" onClose={() => {}} />
         </AiAssistantContext.Provider>
       </MemoryRouter>
     </QueryClientProvider>
   )
-  await screen.findByRole('button', { name: 'Show chat list' })
-  // The composer focuses itself on the next animation frame after it mounts;
-  // let that settle so it cannot land after the focus moves under test.
-  await act(async () => {
-    await new Promise((resolve) => setTimeout(resolve, 50))
-  })
+  await screen.findByRole('button', { name: 'Back to all conversations' })
+  await settle()
   return view
 }
 
-test('on a phone the chat list starts closed and opens in place of the conversation', async () => {
-  await renderPhonePage('?chat=chat-one')
-  expect(screen.queryByText('Chats')).toBeNull()
+async function openChatOnPhone(title: string) {
+  fireEvent.click(backArrow())
+  fireEvent.click(await inPlaceChat(title))
+  await waitFor(() => expect(screen.queryByText(LIST_INTRO)).toBeNull())
+  await settle()
+}
 
-  const toggle = screen.getByRole('button', { name: 'Show chat list' })
-  expect(toggle.getAttribute('aria-expanded')).toBe('false')
-  fireEvent.click(toggle)
+test('on a phone the back arrow shows the chat list in place, without a side panel', async () => {
+  await renderPhonePage()
+  expect(screen.queryByText(LIST_INTRO)).toBeNull()
 
-  expect(await screen.findByText('Chats')).toBeTruthy()
-  // Focus follows the swap to the control that closes the list.
-  expect(document.activeElement).toBe(
-    screen.getByRole('button', { name: 'Close chat list' })
-  )
+  fireEvent.click(backArrow())
+
+  expect(await screen.findByText(LIST_INTRO)).toBeTruthy()
+  expect(await inPlaceChat('Chat two')).toBeTruthy()
+  expect(sideListShown()).toBe(false)
 })
 
-test('closing the phone chat list returns focus to its toggle', async () => {
-  await renderPhonePage('?chat=chat-one')
-  fireEvent.click(screen.getByRole('button', { name: 'Show chat list' }))
-  fireEvent.click(
-    await screen.findByRole('button', { name: 'Close chat list' })
-  )
+test('picking a chat on a phone opens it in place of the list', async () => {
+  await renderPhonePage()
+  await openChatOnPhone('Chat one')
 
-  expect(screen.queryByText('Chats')).toBeNull()
-  expect(document.activeElement).toBe(
-    screen.getByRole('button', { name: 'Show chat list' })
-  )
+  expect(backArrow()).toBeTruthy()
+  expect(sideListShown()).toBe(false)
 })
 
-test('picking the chat that is already open still returns focus to the toggle', async () => {
-  await renderPhonePage('?chat=chat-one')
-  fireEvent.click(screen.getByRole('button', { name: 'Show chat list' }))
-  const list = (await screen.findByText('Chats')).closest('aside')!
-  fireEvent.click(within(list).getByText('Chat one'))
+test('the back arrow on a phone returns from a chat to the list', async () => {
+  await renderPhonePage()
+  await openChatOnPhone('Chat one')
 
-  expect(screen.queryByText('Chats')).toBeNull()
-  expect(document.activeElement).toBe(
-    screen.getByRole('button', { name: 'Show chat list' })
-  )
+  fireEvent.click(backArrow())
+
+  expect(await screen.findByText(LIST_INTRO)).toBeTruthy()
+  expect(await inPlaceChat('Chat two')).toBeTruthy()
 })
 
 test('resizing from a phone to desktop shows the list beside the conversation', async () => {
-  await renderPhonePage('?chat=chat-one')
-  expect(screen.queryByText('Chats')).toBeNull()
+  await renderPhonePage()
+  await openChatOnPhone('Chat one')
+  expect(sideListShown()).toBe(false)
 
   setViewport(DESKTOP)
 
-  expect(await screen.findByText('Chats')).toBeTruthy()
+  expect(sideListShown()).toBe(true)
   expect(
-    screen
-      .getByRole('button', { name: 'Hide chat list' })
-      .getAttribute('aria-expanded')
-  ).toBe('true')
+    within(screen.getByRole('complementary', { name: 'Chats' })).getByText(
+      'Chat two'
+    )
+  ).toBeTruthy()
 })

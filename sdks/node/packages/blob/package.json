@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/blob",
-  "version": "0.0.4",
+  "version": "0.0.5-beta.1",
   "description": "Blob storage SDK for the Temps platform",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -40,5 +40,10 @@
     "@vitest/coverage-v8": "^4.1.0",
     "typescript": "^5.5.4",
     "vitest": "^4.1.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/blob"
   }
 }

@@ -233,6 +233,16 @@ mod tests {
     const DOCKER_HUB_QUALIFIED: &str = "docker.io/library/nginx:1.27";
     const LOCAL_GIT_BUILD: &str = "example-app-1666:latest";
 
+    /// Image cleanup keeps its own copy of the prefix to never prune a
+    /// control-plane-only image; the two must not drift apart.
+    #[test]
+    fn image_cleanup_uses_the_same_reserved_prefix() {
+        assert_eq!(
+            RESERVED_LOCAL_IMAGE_PREFIX,
+            temps_docker_housekeeping::services::RESERVED_LOCAL_IMAGE_PREFIX
+        );
+    }
+
     #[test]
     fn reserved_prefix_is_detected() {
         assert!(is_reserved_local_image_ref(UPLOADED));

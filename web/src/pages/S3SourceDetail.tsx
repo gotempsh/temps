@@ -3,14 +3,16 @@
 
 'use client'
 
+import { describePathStyleReason } from '@/lib/s3-endpoint'
 import {
   deleteBackupScheduleMutation,
   disableBackupScheduleMutation,
   enableBackupScheduleMutation,
   getBackupOptions,
   getS3SourceOptions,
+  getS3SourceQueryKey,
   listBackupSchedulesOptions,
-  listSourceBackupsOptions,
+  listBackupSchedulesQueryKey,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   BackupScheduleResponse,
@@ -33,6 +35,9 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { readFailureServerDetail } from '@/lib/read-failure'
+import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -44,11 +49,16 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { testS3SourceConnection } from '@/lib/s3-sources'
+import { OrphanBackupBadge } from './service-restore/OrphanBackupBadge'
 import {
-  listSourceBackupsWithScan,
-  testS3SourceConnection,
-} from '@/lib/s3-sources'
+  mergeDiscovery,
+  visibleOrphans,
+  type SourceDiscovery,
+} from './service-restore/source-discovery'
+import { restoreSourceBackupsQuery } from './service-restore/restore-queries'
 import { runScheduleNow } from '@/lib/schedule-runs'
+import { workerCredentialsPresentation } from '@/lib/s3-source-presentation'
 import { cn, isPitrCapableFormat } from '@/lib/utils'
 import {
   iconForServiceType,
@@ -107,6 +117,24 @@ import {
   sourceBackupsRefetchInterval,
 } from '@/lib/live-refetch'
 
+function BackupRow({
+  href,
+  children,
+}: {
+  href?: string
+  children: React.ReactNode
+}) {
+  if (!href) return <div>{children}</div>
+  return (
+    <Link
+      to={href}
+      className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+    >
+      {children}
+    </Link>
+  )
+}
+
 /** Format a wall-clock timeout from seconds into a human-readable string.
  * Mirrors the helper in `BackupDetail.tsx`; if this gets copied a third
  * time it should move to `lib/utils.ts`. */
@@ -117,6 +145,28 @@ function formatTimeoutSecs(secs: number): string {
   if (hours > 0 && minutes > 0) return `${hours}h ${minutes}m`
   if (hours > 0) return `${hours}h`
   return `${minutes}m`
+}
+
+function WorkerCredentialsFact({ source }: { source: S3SourceResponse }) {
+  const presentation = workerCredentialsPresentation(
+    source.worker_credentials,
+    source.managed_by_cloud
+  )
+  return (
+    <div className="min-w-0">
+      <dt className="text-base font-medium text-muted-foreground sm:text-sm">
+        Worker node credentials
+      </dt>
+      <dd className="space-y-1 text-base sm:text-sm">
+        <Badge variant={presentation.warning ? 'warning-subtle' : 'secondary'}>
+          {presentation.label}
+        </Badge>
+        <p className="text-sm text-muted-foreground">
+          {presentation.description}
+        </p>
+      </dd>
+    </div>
+  )
 }
 
 function sourceFacts(source: S3SourceResponse): DetailFact[] {
@@ -161,18 +211,41 @@ export function S3SourceDetail() {
     enabled: !!sourceId,
   })
 
+  const queryClient = useQueryClient()
   const { data: backupIndex, isLoading: isLoadingBackups } = useQuery({
-    ...listSourceBackupsOptions({
-      path: { id: sourceId! },
-    }),
+    ...restoreSourceBackupsQuery(sourceId!, false),
     enabled: !!sourceId,
     refetchOnWindowFocus: refetchOnFocusWhenStale,
-    // A backup started by a schedule, the CLI or another operator must show
-    // up in Recent Backups. The listing returns the whole history, so it is
-    // only polled slowly; running backups are followed per record below.
     refetchInterval: (query) =>
       sourceBackupsRefetchInterval(query.state.data?.backups),
   })
+  // Discovery runs only through this source's button. Navigating while a scan
+  // is in flight leaves its results and diagnostics with the original source.
+  const discoveryQuery = useQuery({
+    queryKey: ['source-backup-discovery', sourceId] as const,
+    enabled: false,
+    retry: false,
+    queryFn: async ({ queryKey }) => {
+      const id = queryKey[1]
+      if (!id) throw new Error('Select an S3 source to scan.')
+      const result = await queryClient.fetchQuery({
+        ...restoreSourceBackupsQuery(id, true),
+        staleTime: 0,
+      })
+      return mergeDiscovery(
+        queryClient.getQueryData<SourceDiscovery>(queryKey),
+        result
+      )
+    },
+  })
+  const discovery = discoveryQuery.data
+  const discoveryErrors = discoveryQuery.error
+    ? [
+        readFailureServerDetail(discoveryQuery.error) ||
+          discoveryQuery.error.message ||
+          'Check the S3 connection and retry discovery.',
+      ]
+    : (discovery?.errors ?? [])
 
   // Follow each running backup on its own record (O(running)) instead of
   // re-reading the whole listing every few seconds, and refetch the listing
@@ -251,44 +324,13 @@ export function S3SourceDetail() {
     },
   })
 
-  const queryClient = useQueryClient()
-
   useEffect(() => {
     if (!settledRunningBackups || !sourceId) return
     void queryClient.invalidateQueries({
-      queryKey: listSourceBackupsOptions({ path: { id: sourceId } }).queryKey,
+      queryKey: restoreSourceBackupsQuery(sourceId, false).queryKey,
+      exact: true,
     })
   }, [settledRunningBackups, sourceId, queryClient])
-
-  // "Discover orphan backups" — explicit opt-in S3 scan. Slow on some
-  // endpoints (5-30 s on OVH); only triggered by user action.
-  const discoverOrphansMutation = useMutation({
-    mutationFn: () => {
-      if (!sourceId) {
-        return Promise.reject(new Error('S3 source id is unknown'))
-      }
-      return listSourceBackupsWithScan(sourceId)
-    },
-    onSuccess: (result) => {
-      const scanned = result.backups.filter(
-        (b) => (b as { source?: string }).source === 's3_scan'
-      ).length
-      toast.success(
-        scanned > 0
-          ? `Found ${scanned} additional backup${scanned === 1 ? '' : 's'} in S3`
-          : 'No additional backups found in S3'
-      )
-      // Refresh the normal listing so newly discovered entries appear.
-      void queryClient.invalidateQueries({
-        queryKey: listSourceBackupsOptions({ path: { id: sourceId! } })
-          .queryKey,
-      })
-    },
-    onError: (err: unknown) => {
-      const message = err instanceof Error ? err.message : 'Unknown error'
-      toast.error('S3 scan failed', { description: message })
-    },
-  })
 
   const disableMutation = useMutation({
     ...disableBackupScheduleMutation(),
@@ -338,11 +380,12 @@ export function S3SourceDetail() {
           backupIndex?.backups ?? [],
           runningBackupQueries.map((result) => result.data)
         ),
+        ...visibleOrphans(backupIndex?.backups ?? [], discovery),
       ].sort(
         (a, b) =>
           new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
       ),
-    [backupIndex, runningBackupQueries]
+    [backupIndex, runningBackupQueries, discovery]
   )
 
   // Client-side filter + pagination over the recent-backups list. The list
@@ -435,7 +478,7 @@ export function S3SourceDetail() {
     <Button variant="outline" size="sm" asChild>
       <Link to="/backups">
         <ArrowLeft className="mr-2 h-4 w-4" />
-        Back to Backups
+        Back to backups
       </Link>
     </Button>
   )
@@ -472,6 +515,13 @@ export function S3SourceDetail() {
       title={source.name}
       actions={
         <>
+          <RefreshButton
+            queryKeys={[
+              getS3SourceQueryKey({ path: { id: sourceId! } }),
+              restoreSourceBackupsQuery(sourceId!, false).queryKey,
+              queryKeyPrefix(listBackupSchedulesQueryKey),
+            ]}
+          />
           {backAction}
           <Button
             variant="outline"
@@ -494,7 +544,7 @@ export function S3SourceDetail() {
               <div className="min-w-0">
                 <CardTitle className="text-base font-semibold flex items-center gap-2">
                   <CalendarDays className="h-5 w-5 shrink-0" />
-                  Backup Schedules
+                  Backup schedules
                 </CardTitle>
                 <CardDescription>
                   Scheduled backups writing to this S3 source
@@ -529,7 +579,7 @@ export function S3SourceDetail() {
                         to={`/backups/s3-sources/${sourceId}/schedules/new`}
                       >
                         <Plus className="mr-2 h-4 w-4" />
-                        New Schedule
+                        New schedule
                       </Link>
                     </Button>
                   }
@@ -552,10 +602,10 @@ export function S3SourceDetail() {
                           Timeout
                         </TableHead>
                         <TableHead className="hidden md:table-cell">
-                          Last Run
+                          Last run
                         </TableHead>
                         <TableHead className="hidden lg:table-cell">
-                          Next Run
+                          Next run
                         </TableHead>
                         <TableHead className="w-12 text-right">
                           <span className="sr-only">Actions</span>
@@ -724,7 +774,7 @@ export function S3SourceDetail() {
             <CardHeader className="border-b px-5 py-4 flex flex-row items-start justify-between gap-3 space-y-0">
               <div>
                 <CardTitle className="text-base font-semibold">
-                  Recent Backups
+                  Recent backups
                 </CardTitle>
                 <CardDescription>
                   Backups that have been written to this S3 source
@@ -733,11 +783,11 @@ export function S3SourceDetail() {
               <Button
                 variant="outline"
                 size="sm"
-                onClick={() => discoverOrphansMutation.mutate()}
-                disabled={discoverOrphansMutation.isPending || !sourceId}
+                onClick={() => void discoveryQuery.refetch()}
+                disabled={discoveryQuery.isFetching || !sourceId}
                 title="Scan S3 for backups not tracked in the database — useful after a Temps restore from a different instance"
               >
-                {discoverOrphansMutation.isPending ? (
+                {discoveryQuery.isFetching ? (
                   <Loader2 className="mr-2 h-4 w-4 animate-spin" />
                 ) : (
                   <ScanSearch className="mr-2 h-4 w-4" />
@@ -749,6 +799,27 @@ export function S3SourceDetail() {
               </Button>
             </CardHeader>
             <CardContent className="p-5">
+              {discoveryErrors.length > 0 ? (
+                <div role="alert" className="mb-4 text-sm text-destructive">
+                  <strong>Discovery incomplete</strong>
+                  <ul>
+                    {discoveryErrors.map((error, index) => (
+                      <li key={index}>{error}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                discovery && (
+                  <p
+                    role="status"
+                    className="mb-4 text-sm text-muted-foreground"
+                  >
+                    {discovery.orphans.length === 0
+                      ? 'No additional backups found in S3.'
+                      : `Found ${discovery.orphans.length} additional backup${discovery.orphans.length === 1 ? '' : 's'} in S3.`}
+                  </p>
+                )
+              )}
               {/* Search bar — instant client filter across name, service,
                 engine, state, UUID, format. */}
               {!isLoadingBackups && sortedBackups.length > 0 && (
@@ -812,10 +883,13 @@ export function S3SourceDetail() {
                     const FallbackIcon = iconForServiceType(backup.engine)
 
                     return (
-                      <Link
-                        key={`${backup.source}-${backup.backup_id || backup.location}`}
-                        to={`/backups/s3-sources/${id}/backups/${backup.backup_id}`}
-                        className="block focus:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 rounded-lg"
+                      <BackupRow
+                        key={`${backup.source}-${backup.backup_id || backup.location}-${backup.created_at}`}
+                        href={
+                          isOrphan
+                            ? undefined
+                            : `/backups/s3-sources/${id}/backups/${backup.backup_id}`
+                        }
                       >
                         <div className="flex flex-col gap-3 rounded-lg border p-3 transition-colors hover:bg-muted/50 sm:flex-row sm:items-center sm:justify-between sm:p-4">
                           {/* Left: name + meta */}
@@ -854,11 +928,16 @@ export function S3SourceDetail() {
                                     PITR
                                   </Badge>
                                 ) : null}
-                                {isOrphan ? (
-                                  <Badge variant="outline" className="text-xs">
-                                    orphan
-                                  </Badge>
-                                ) : null}
+                                {isOrphan ? <OrphanBackupBadge /> : null}
+                                {isOrphan &&
+                                  (discoveryQuery.isError ||
+                                    discovery?.staleLocations.has(
+                                      backup.location
+                                    )) && (
+                                    <Badge variant="outline">
+                                      From an earlier scan
+                                    </Badge>
+                                  )}
                               </div>
                               <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
                                 <span className="font-mono">
@@ -922,7 +1001,7 @@ export function S3SourceDetail() {
                             )}
                           </div>
                         </div>
-                      </Link>
+                      </BackupRow>
                     )
                   })}
                 </div>
@@ -985,25 +1064,35 @@ export function S3SourceDetail() {
                     Endpoint URL
                   </dt>
                   <dd className="break-all text-base sm:text-sm">
-                    {source.endpoint}
+                    {source.effective_endpoint ?? source.endpoint}
                   </dd>
                 </div>
               )}
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Force Path Style
+                  Force path style
                 </dt>
-                <dd className="text-base sm:text-sm">
+                <dd className="space-y-1 text-base sm:text-sm">
                   <Badge
-                    variant={source.force_path_style ? 'default' : 'secondary'}
+                    variant={
+                      source.effective_force_path_style
+                        ? 'default'
+                        : 'secondary'
+                    }
                   >
-                    {source.force_path_style ? 'Enabled' : 'Disabled'}
+                    {source.effective_force_path_style ? 'Enabled' : 'Disabled'}
                   </Badge>
+                  {source.path_style_reason !== 'configured' && (
+                    <p className="text-xs text-muted-foreground">
+                      {describePathStyleReason(source.path_style_reason)}
+                    </p>
+                  )}
                 </dd>
               </div>
+              <WorkerCredentialsFact source={source} />
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Access Key ID
+                  Access key ID
                 </dt>
                 <dd className="truncate font-mono text-base sm:text-sm">
                   &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;
@@ -1011,7 +1100,7 @@ export function S3SourceDetail() {
               </div>
               <div className="min-w-0">
                 <dt className="text-base font-medium text-muted-foreground sm:text-sm">
-                  Secret Key
+                  Secret key
                 </dt>
                 <dd className="truncate font-mono text-base sm:text-sm">
                   &bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;

@@ -10,8 +10,10 @@
 //! 1. `pg_stat_activity` — client-backend connection counts by state
 //!    (active/idle/idle-in-txn/other + total), long-running and blocked query
 //!    counts. Engine background processes are excluded.
-//! 2. `pg_stat_database` — cache-hit ratio, commits, rollbacks, deadlocks,
-//!    temp file usage, tuple DML rates, tuple fetch vs. return ratio
+//! 2. `pg_stat_database` — shared-buffer block counters (the scraper turns
+//!    them into the windowed cache hit ratio, see
+//!    [`crate::cache_hit_window`]), commits, rollbacks, deadlocks, temp file
+//!    usage, tuple DML rates, tuple fetch vs. return ratio
 //! 3. `pg_stat_replication` — per-replica write and replay lag (seconds)
 //! 4. `pg_stat_checkpointer` / `pg_stat_bgwriter` — checkpoint rates
 //! 5. `pg_stat_wal` (PG 15+) — WAL bytes, records, full-page images, buffer
@@ -20,6 +22,9 @@
 //!    user tables (bloat indicator)
 //! 7. `pg_locks` — count of waiting (blocked) lock requests
 //! 8. `pg_database_size()` — size of the current database in bytes
+//! 9. `pg_stat_archiver`, `pg_ls_archive_statusdir()` and `pg_ls_waldir()` —
+//!    WAL archiving success, failure and stalls, and `pg_wal`'s size against
+//!    `max_wal_size`
 //!
 //! All errors are logged as warnings and result in an empty metric batch
 //! being returned so the scraper loop is never blocked by a slow or
@@ -32,6 +37,7 @@ use tokio_postgres::NoTls;
 use tracing::{debug, warn};
 
 use super::{Collector, CollectorConfig};
+use crate::cache_hit_window::{PG_BLKS_HIT, PG_BLKS_READ, PG_STATS_RESET};
 use crate::error::MetricsError;
 use crate::store::{MetricKind, MetricPoint};
 
@@ -383,7 +389,7 @@ async fn collect_metrics(
     }
 
     // -------------------------------------------------------------------------
-    // 2. pg_stat_database — cache hit ratio, commits, rollbacks, deadlocks,
+    // 2. pg_stat_database — block counters, commits, rollbacks, deadlocks,
     //    temp file usage, tuple DML counters, tuple fetch/return ratio.
     //
     //    Each metric is emitted twice:
@@ -391,9 +397,20 @@ async fn collect_metrics(
     //      * once UNLABELLED as an instance-wide aggregate.
     //    The stat tiles read the unlabelled row so they show the whole
     //    instance, not one arbitrary database (the store's latest-value query
-    //    can only pick one row per metric name). Sums are plain SUM; the two
-    //    ratios are recomputed from summed numerators/denominators so they stay
+    //    can only pick one row per metric name). Sums are plain SUM; the fetch
+    //    ratio is recomputed from summed numerators/denominators so it stays
     //    mathematically correct (you cannot average per-db ratios).
+    //
+    //    `blks_hit` / `blks_read` are reported raw, never as a ratio: they are
+    //    lifetime counters (PostgreSQL 15+ keeps them across a clean restart),
+    //    so a ratio of them reflects history, not the current workload. The
+    //    scraper derives `pg.cache_hit_ratio` from their deltas over a
+    //    trailing window (`crate::cache_hit_window`). They are reported per
+    //    database only: the scraper builds the instance-wide window from the
+    //    per-database deltas, because a summed counter goes backwards when a
+    //    database is dropped and would read as a reset. Each database's
+    //    `stats_reset` time goes with them so the window can drop the
+    //    interval spanning a `pg_stat_reset()`.
     //    Internal Postgres databases (template0, template1) are excluded.
     // -------------------------------------------------------------------------
     {
@@ -403,7 +420,8 @@ async fn collect_metrics(
                         xact_commit, xact_rollback, deadlocks, \
                         temp_files, temp_bytes, \
                         tup_inserted, tup_updated, tup_deleted, \
-                        tup_returned, tup_fetched \
+                        tup_returned, tup_fetched, \
+                        EXTRACT(EPOCH FROM stats_reset)::float8 \
                  FROM pg_stat_database \
                  WHERE datname NOT IN ('template0', 'template1') \
                    AND datname IS NOT NULL",
@@ -412,8 +430,6 @@ async fn collect_metrics(
             .await?;
 
         // Instance-wide accumulators for the unlabelled aggregate points.
-        let mut sum_blks_hit: i64 = 0;
-        let mut sum_blks_read: i64 = 0;
         let mut sum_commit: i64 = 0;
         let mut sum_rollback: i64 = 0;
         let mut sum_deadlocks: i64 = 0;
@@ -439,9 +455,8 @@ async fn collect_metrics(
             let tup_deleted: i64 = row.get(10);
             let tup_returned: i64 = row.get(11);
             let tup_fetched: i64 = row.get(12);
+            let stats_reset: Option<f64> = row.get(13);
 
-            sum_blks_hit += blks_hit;
-            sum_blks_read += blks_read;
             sum_commit += xact_commit;
             sum_rollback += xact_rollback;
             sum_deadlocks += deadlocks;
@@ -456,22 +471,28 @@ async fn collect_metrics(
             let mut db_labels = HashMap::new();
             db_labels.insert("datname".into(), datname.to_owned());
 
-            let total_blks = blks_hit + blks_read;
-            let cache_hit_ratio = if total_blks > 0 {
-                blks_hit as f64 / total_blks as f64
-            } else {
-                1.0 // No blocks read yet — treat as 100 % cache hit.
-            };
-
+            // Counters: callers receive raw cumulative values; the scraper
+            // computes deltas before writing to the store.
             points.push(make_point(
-                "pg.cache_hit_ratio",
-                cache_hit_ratio,
+                PG_BLKS_HIT,
+                blks_hit as f64,
+                MetricKind::Counter,
+                db_labels.clone(),
+            ));
+            points.push(make_point(
+                PG_BLKS_READ,
+                blks_read as f64,
+                MetricKind::Counter,
+                db_labels.clone(),
+            ));
+            // Lets the cache hit window drop the interval spanning a
+            // `pg_stat_reset()`, which the per-counter delta step can miss.
+            points.push(make_point(
+                PG_STATS_RESET,
+                stats_reset.unwrap_or(0.0),
                 MetricKind::Gauge,
                 db_labels.clone(),
             ));
-
-            // Counters: callers receive raw cumulative values; the scraper
-            // computes deltas before writing to the store.
             points.push(make_point(
                 "pg.commits_total",
                 xact_commit as f64,
@@ -544,34 +565,12 @@ async fn collect_metrics(
 
         // Instance-wide aggregates (no `datname` label). The stat tiles read
         // these so they reflect the whole instance rather than one database.
-        let total_blks = sum_blks_hit + sum_blks_read;
-        let instance_cache_hit_ratio = if total_blks > 0 {
-            sum_blks_hit as f64 / total_blks as f64
-        } else {
-            1.0
-        };
         let instance_fetch_ratio = if sum_returned > 0 {
             sum_fetched as f64 / sum_returned as f64
         } else {
             1.0
         };
 
-        points.push(make_point(
-            "pg.cache_hit_ratio",
-            instance_cache_hit_ratio,
-            MetricKind::Gauge,
-            HashMap::new(),
-        ));
-        // Lifetime block accesses behind the ratio. A new server's first
-        // reads all miss the cache, so alert rules on the ratio are only
-        // evaluated once this is large enough to mean something. A gauge (not
-        // a `_total` counter) because the evaluator needs the absolute volume.
-        points.push(make_point(
-            "pg.cache_blocks_accessed",
-            total_blks as f64,
-            MetricKind::Gauge,
-            HashMap::new(),
-        ));
         points.push(make_point(
             "pg.tuple_fetch_ratio",
             instance_fetch_ratio,
@@ -932,7 +931,208 @@ async fn collect_metrics(
         ));
     }
 
+    // -------------------------------------------------------------------------
+    // 9. WAL archiving and pg_wal size — the two signals of an archive target
+    //    that stopped accepting WAL. PostgreSQL keeps every segment it could
+    //    not archive, so a broken `archive_command` grows `pg_wal` without
+    //    bound until the disk is full. One row from `pg_stat_archiver` and
+    //    two directory listings (`pg_ls_waldir()` and
+    //    `pg_ls_archive_statusdir()`, a few thousand entries at most even
+    //    when bloated) per scrape. Both listings need superuser or
+    //    `pg_monitor`; without them the size and stall signals are skipped
+    //    and the archiver metrics are still reported.
+    // -------------------------------------------------------------------------
+    {
+        let archiver = client
+            .query_one(
+                "SELECT archived_count::bigint, failed_count::bigint, \
+                        EXTRACT(EPOCH FROM last_archived_time)::float8, \
+                        EXTRACT(EPOCH FROM last_failed_time)::float8, \
+                        current_setting('archive_mode'), \
+                        pg_size_bytes(current_setting('max_wal_size'))::bigint, \
+                        EXTRACT(EPOCH FROM now())::float8 \
+                 FROM pg_stat_archiver",
+                &[],
+            )
+            .await;
+        let wal_dir_bytes = client
+            .query_one(
+                "SELECT COALESCE(SUM(size), 0)::bigint FROM pg_ls_waldir()",
+                &[],
+            )
+            .await
+            .ok()
+            .and_then(|row| row.try_get::<_, i64>(0).ok());
+        // Segments waiting for `archive_command`, and how long the oldest
+        // has waited. An `archive_command` that hangs in its own retries
+        // never records a failure in `pg_stat_archiver`, so this is the only
+        // sign of it. Same permission rule as `pg_ls_waldir()`.
+        let ready = client
+            .query_one(
+                "SELECT count(*)::bigint, \
+                        EXTRACT(EPOCH FROM now() - min(modification))::float8 \
+                 FROM pg_ls_archive_statusdir() WHERE name LIKE '%.ready'",
+                &[],
+            )
+            .await
+            .ok();
+        let ready_count = ready.as_ref().and_then(|row| row.try_get::<_, i64>(0).ok());
+        let oldest_ready_age_secs = ready
+            .as_ref()
+            .and_then(|row| row.try_get::<_, Option<f64>>(1).ok())
+            .flatten();
+        match archiver {
+            Ok(row) => {
+                let stats = ArchiverStats {
+                    archived_count: row.try_get(0)?,
+                    failed_count: row.try_get(1)?,
+                    last_archived_epoch: row.try_get(2)?,
+                    last_failed_epoch: row.try_get(3)?,
+                    archive_mode: row.try_get::<_, String>(4)?,
+                    max_wal_size_bytes: row.try_get(5)?,
+                    now_epoch: row.try_get(6)?,
+                    wal_dir_bytes,
+                    ready_count,
+                    oldest_ready_age_secs,
+                };
+                for (name, value, kind) in archiver_points(&stats) {
+                    points.push(make_point(name, value, kind, HashMap::new()));
+                }
+            }
+            Err(_) => {
+                debug!(
+                    source_id,
+                    engine = "postgres",
+                    "pg_stat_archiver not readable; skipping WAL archiving metrics"
+                );
+            }
+        }
+    }
+
     Ok(points)
+}
+
+/// One scrape of `pg_stat_archiver`, the WAL settings and `pg_wal`'s size.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct ArchiverStats {
+    pub archived_count: i64,
+    pub failed_count: i64,
+    pub last_archived_epoch: Option<f64>,
+    pub last_failed_epoch: Option<f64>,
+    pub archive_mode: String,
+    pub max_wal_size_bytes: i64,
+    pub now_epoch: f64,
+    /// `None` when `pg_ls_waldir()` is not permitted.
+    pub wal_dir_bytes: Option<i64>,
+    /// `.ready` files in `archive_status`; `None` when not permitted.
+    pub ready_count: Option<i64>,
+    /// Age of the oldest `.ready` file; `None` when there is none or it is
+    /// not permitted.
+    pub oldest_ready_age_secs: Option<f64>,
+}
+
+/// A segment waiting this long for `archive_command` means archiving has
+/// stalled, even if no attempt has failed yet: WAL-G retrying an endpoint it
+/// cannot reach holds one attempt open for a long time without failing.
+/// Healthy archiving ships a segment in seconds.
+pub const ARCHIVE_STALL_SECS: f64 = 300.0;
+
+/// `pg.archiver_failing`: 1 while archiving is on and either its most
+/// recent attempt failed with no success since, or a segment has waited
+/// [`ARCHIVE_STALL_SECS`] to be archived. Archiving catching up resets it
+/// to 0, which is what resolves the alarm.
+pub const PG_ARCHIVER_FAILING: &str = "pg.archiver_failing";
+/// `pg.archiver_stall_check_available`: 1 when the role may list
+/// `archive_status` (superuser or `pg_monitor`), so `pg.archiver_failing`
+/// also covers an archiver that stalls without failing; 0 when it may not,
+/// and only recorded failures count.
+pub const PG_ARCHIVER_STALL_CHECK_AVAILABLE: &str = "pg.archiver_stall_check_available";
+/// `pg_wal`'s size as a multiple of `max_wal_size`. Healthy servers stay
+/// near or below 1; a stalled archiver or a stale slot drives it up.
+pub const PG_WAL_DIR_TO_MAX_WAL_SIZE_RATIO: &str = "pg.wal_dir_to_max_wal_size_ratio";
+
+/// The metric points of one [`ArchiverStats`]. Gauges never end in
+/// `_total`/`_count` (the query layer charts those as counter rates).
+pub(crate) fn archiver_points(stats: &ArchiverStats) -> Vec<(&'static str, f64, MetricKind)> {
+    let archiving_on = !stats.archive_mode.eq_ignore_ascii_case("off");
+    let failed_since_success = match (stats.last_failed_epoch, stats.last_archived_epoch) {
+        (Some(failed), Some(archived)) => failed > archived,
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    let stalled = stats
+        .oldest_ready_age_secs
+        .is_some_and(|age| age >= ARCHIVE_STALL_SECS);
+    let failing = archiving_on && (failed_since_success || stalled);
+    let mut points = vec![
+        (
+            "pg.archiver_archived_total",
+            stats.archived_count as f64,
+            MetricKind::Counter,
+        ),
+        (
+            "pg.archiver_failed_total",
+            stats.failed_count as f64,
+            MetricKind::Counter,
+        ),
+        (
+            PG_ARCHIVER_FAILING,
+            if failing { 1.0 } else { 0.0 },
+            MetricKind::Gauge,
+        ),
+        (
+            "pg.archive_mode_on",
+            if archiving_on { 1.0 } else { 0.0 },
+            MetricKind::Gauge,
+        ),
+        (
+            "pg.max_wal_size_bytes",
+            stats.max_wal_size_bytes as f64,
+            MetricKind::Gauge,
+        ),
+    ];
+    if let Some(archived) = stats.last_archived_epoch {
+        points.push((
+            "pg.archiver_last_archived_age_seconds",
+            (stats.now_epoch - archived).max(0.0),
+            MetricKind::Gauge,
+        ));
+    }
+    // Without the `archive_status` listing a stall that has reported no
+    // failure cannot be seen, so `pg.archiver_failing` only reflects
+    // failures. Reported rather than left to look like healthy archiving.
+    points.push((
+        PG_ARCHIVER_STALL_CHECK_AVAILABLE,
+        if stats.ready_count.is_some() {
+            1.0
+        } else {
+            0.0
+        },
+        MetricKind::Gauge,
+    ));
+    if let Some(count) = stats.ready_count {
+        points.push((
+            "pg.archiver_ready_segments",
+            count as f64,
+            MetricKind::Gauge,
+        ));
+        points.push((
+            "pg.archiver_oldest_ready_age_seconds",
+            stats.oldest_ready_age_secs.unwrap_or(0.0).max(0.0),
+            MetricKind::Gauge,
+        ));
+    }
+    if let Some(bytes) = stats.wal_dir_bytes {
+        points.push(("pg.wal_dir_bytes", bytes as f64, MetricKind::Gauge));
+        if stats.max_wal_size_bytes > 0 {
+            points.push((
+                PG_WAL_DIR_TO_MAX_WAL_SIZE_RATIO,
+                bytes as f64 / stats.max_wal_size_bytes as f64,
+                MetricKind::Gauge,
+            ));
+        }
+    }
+    points
 }
 
 #[cfg(test)]
@@ -941,6 +1141,126 @@ mod tests {
     use crate::store::SourceKind;
     use std::time::Duration;
 
+    fn archiver(last_archived: Option<f64>, last_failed: Option<f64>, mode: &str) -> ArchiverStats {
+        ArchiverStats {
+            archived_count: 10,
+            failed_count: 3,
+            last_archived_epoch: last_archived,
+            last_failed_epoch: last_failed,
+            archive_mode: mode.to_string(),
+            max_wal_size_bytes: 1 << 30,
+            now_epoch: 10_000.0,
+            wal_dir_bytes: Some(36 * (1 << 30)),
+            ready_count: Some(0),
+            oldest_ready_age_secs: None,
+        }
+    }
+
+    fn value(points: &[(&'static str, f64, MetricKind)], name: &str) -> Option<f64> {
+        points
+            .iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, v, _)| *v)
+    }
+
+    #[test]
+    fn a_failure_after_the_last_success_is_failing() {
+        let points = archiver_points(&archiver(Some(9_000.0), Some(9_500.0), "on"));
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(1.0));
+        assert_eq!(
+            value(&points, "pg.archiver_last_archived_age_seconds"),
+            Some(1_000.0)
+        );
+    }
+
+    #[test]
+    fn failures_with_no_success_ever_are_failing() {
+        let points = archiver_points(&archiver(None, Some(9_500.0), "on"));
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(1.0));
+        assert_eq!(
+            value(&points, "pg.archiver_last_archived_age_seconds"),
+            None
+        );
+    }
+
+    #[test]
+    fn a_success_after_the_last_failure_clears_it() {
+        let points = archiver_points(&archiver(Some(9_900.0), Some(9_500.0), "on"));
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(0.0));
+    }
+
+    /// WAL-G retrying an unreachable endpoint holds one attempt open: no
+    /// failure is recorded, segments just pile up. That is failing too.
+    #[test]
+    fn a_segment_waiting_five_minutes_with_no_failure_is_failing() {
+        let stalled = ArchiverStats {
+            ready_count: Some(5),
+            oldest_ready_age_secs: Some(ARCHIVE_STALL_SECS + 1.0),
+            ..archiver(Some(9_000.0), None, "on")
+        };
+        let points = archiver_points(&stalled);
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(1.0));
+        assert_eq!(value(&points, "pg.archiver_ready_segments"), Some(5.0));
+        assert_eq!(
+            value(&points, "pg.archiver_oldest_ready_age_seconds"),
+            Some(ARCHIVE_STALL_SECS + 1.0)
+        );
+
+        // A segment queued for a few seconds is normal.
+        let busy = ArchiverStats {
+            ready_count: Some(2),
+            oldest_ready_age_secs: Some(4.0),
+            ..archiver(Some(9_000.0), None, "on")
+        };
+        assert_eq!(
+            value(&archiver_points(&busy), PG_ARCHIVER_FAILING),
+            Some(0.0)
+        );
+
+        // Not permitted to list archive_status: no ready metrics, no guess,
+        // and the stall check says it could not run.
+        let unreadable = ArchiverStats {
+            ready_count: None,
+            oldest_ready_age_secs: None,
+            ..archiver(Some(9_000.0), None, "on")
+        };
+        let points = archiver_points(&unreadable);
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(0.0));
+        assert_eq!(value(&points, "pg.archiver_ready_segments"), None);
+        assert_eq!(value(&points, PG_ARCHIVER_STALL_CHECK_AVAILABLE), Some(0.0));
+        assert_eq!(
+            value(&archiver_points(&busy), PG_ARCHIVER_STALL_CHECK_AVAILABLE),
+            Some(1.0)
+        );
+    }
+
+    #[test]
+    fn archiving_off_is_never_failing() {
+        let points = archiver_points(&archiver(None, Some(9_500.0), "off"));
+        assert_eq!(value(&points, PG_ARCHIVER_FAILING), Some(0.0));
+        assert_eq!(value(&points, "pg.archive_mode_on"), Some(0.0));
+    }
+
+    #[test]
+    fn the_wal_backlog_is_a_multiple_of_max_wal_size() {
+        let points = archiver_points(&archiver(None, None, "on"));
+        assert_eq!(value(&points, PG_WAL_DIR_TO_MAX_WAL_SIZE_RATIO), Some(36.0));
+        assert_eq!(
+            value(&points, "pg.wal_dir_bytes"),
+            Some((36u64 << 30) as f64)
+        );
+        let unreadable = ArchiverStats {
+            wal_dir_bytes: None,
+            ..archiver(None, None, "on")
+        };
+        let points = archiver_points(&unreadable);
+        assert_eq!(value(&points, PG_WAL_DIR_TO_MAX_WAL_SIZE_RATIO), None);
+        // Counters stay counters, gauges stay gauges.
+        assert!(points
+            .iter()
+            .all(|(name, _, kind)| name.ends_with("_total") == (*kind == MetricKind::Counter)));
+    }
+
     /// Regression: on a primary with a standby the replication query's lag
     /// columns came back as `numeric` and decoding them as `f64` panicked
     /// the scrape task, so an HA cluster never recorded any Postgres metric.
@@ -948,6 +1268,7 @@ mod tests {
     /// standby, so this checks the exact query against a real server.
     #[tokio::test]
     async fn replication_lag_columns_decode_as_f64() {
+        use temps_test_containers::TestContainerExt;
         use testcontainers::{
             core::{ContainerPort, WaitFor},
             runners::AsyncRunner,
@@ -960,6 +1281,7 @@ mod tests {
                 "database system is ready to accept connections",
             ))
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .with_test_labels()
             .start()
             .await
         {

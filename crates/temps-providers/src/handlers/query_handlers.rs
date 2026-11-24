@@ -12,12 +12,12 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::problemdetails::Problem;
-use temps_query::{ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions};
+use temps_providers_core::query::{
+    ContainerInfo, ContainerPath, EntityInfo, QueryBudget, QueryOptions,
+};
 use utoipa::ToSchema;
 
-use super::audit::{
-    AiBackendCategory, AiDataAccessChangedAudit, AiEntityCategory, AiRowsReadAudit,
-};
+use super::audit::{AiBackendCategory, AiEntityCategory, AiRowsReadAudit};
 use super::types::AppState;
 
 // ============================================================================
@@ -65,8 +65,8 @@ impl From<ContainerInfo> for ContainerResponse {
                 .map(|t| t.to_string()),
             entity_type_label: info.capabilities.entity_type_label,
             entity_count_hint: info.capabilities.entity_count_hint.map(|hint| match hint {
-                temps_query::EntityCountHint::Small => "small".to_string(),
-                temps_query::EntityCountHint::Large => "large".to_string(),
+                temps_providers_core::query::EntityCountHint::Small => "small".to_string(),
+                temps_providers_core::query::EntityCountHint::Large => "large".to_string(),
             }),
             metadata: serde_json::to_value(info.metadata).unwrap_or_default(),
         }
@@ -317,7 +317,7 @@ fn query_budget(is_ai_call: bool) -> QueryBudget {
     }
 }
 
-fn data_rows_to_json(rows: Vec<temps_query::DataRow>) -> Vec<serde_json::Value> {
+fn data_rows_to_json(rows: Vec<temps_providers_core::query::DataRow>) -> Vec<serde_json::Value> {
     rows.into_iter()
         .map(|row| serde_json::Value::Object(row.into_iter().collect()))
         .collect()
@@ -334,15 +334,19 @@ fn filter_shape(filter: Option<&serde_json::Value>) -> Option<String> {
         .map(str::to_string)
 }
 
-fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: usize) -> Problem {
+fn query_error_problem(
+    error: temps_providers_core::query::DataError,
+    service_id: i32,
+    limit: usize,
+) -> Problem {
     let (status, title, kind, safe_detail) = match &error {
-        temps_query::DataError::ResultLimitExceeded { .. } => (
+        temps_providers_core::query::DataError::ResultLimitExceeded { .. } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             "Query Result Too Large",
             "result_limit_exceeded",
             Some("The query result exceeds the configured response limits".to_string()),
         ),
-        temps_query::DataError::InvalidQuery(_) => (
+        temps_providers_core::query::DataError::InvalidQuery(_) => (
             StatusCode::BAD_REQUEST,
             "Invalid Query",
             "invalid_query",
@@ -350,23 +354,23 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
         ),
         // The detail carries only the caller's own container path, depth and
         // the backend's limit, so it is safe to return verbatim.
-        temps_query::DataError::ContainerPathTooDeep { .. } => (
+        temps_providers_core::query::DataError::ContainerPathTooDeep { .. } => (
             StatusCode::BAD_REQUEST,
             "Invalid Container Path",
             "container_path_too_deep",
             Some(error.to_string()),
         ),
-        temps_query::DataError::QueryFailed(_)
-        | temps_query::DataError::BackendQueryFailed { .. } => (
+        temps_providers_core::query::DataError::QueryFailed(_)
+        | temps_providers_core::query::DataError::BackendQueryFailed { .. } => (
             StatusCode::BAD_REQUEST,
             "Query Failed",
             "backend_query_failed",
             None,
         ),
-        temps_query::DataError::NotFound(_) => {
+        temps_providers_core::query::DataError::NotFound(_) => {
             (StatusCode::NOT_FOUND, "Not Found", "not_found", None)
         }
-        temps_query::DataError::QueryTimeout(_) => (
+        temps_providers_core::query::DataError::QueryTimeout(_) => (
             StatusCode::GATEWAY_TIMEOUT,
             "Query Timed Out",
             "query_timeout",
@@ -392,20 +396,20 @@ fn query_error_problem(error: temps_query::DataError, service_id: i32, limit: us
     problem
 }
 
-/// Map a [`temps_query::DataError`] raised while *navigating* a data source
+/// Map a [`temps_providers_core::query::DataError`] raised while *navigating* a data source
 /// (listing containers/entities, reading container or entity info) to an HTTP
 /// problem. `operation` completes "Failed to ..." in the detail.
 ///
 /// Client mistakes (a path deeper than the backend's hierarchy, a malformed
 /// request, an unknown container) are 4xx; only backend/infrastructure
 /// failures are 5xx. The match is exhaustive on purpose: adding a
-/// [`temps_query::DataError`] variant must force a decision here.
+/// [`temps_providers_core::query::DataError`] variant must force a decision here.
 fn navigation_error_problem(
-    error: temps_query::DataError,
+    error: temps_providers_core::query::DataError,
     service_id: i32,
     operation: &str,
 ) -> Problem {
-    use temps_query::DataError;
+    use temps_providers_core::query::DataError;
 
     let (status, title) = match &error {
         DataError::ContainerPathTooDeep { .. } => {
@@ -443,43 +447,6 @@ fn navigation_error_problem(
         .with_detail(format!("Failed to {operation}: {error}"))
 }
 
-/// Whether an agent-originated request may read this service's rows.
-///
-/// Pure so the gate can be tested without standing up an `AppState`; this is
-/// the branch that decides whether table contents reach a third-party LLM
-/// provider, so it must not be exercised only through integration paths.
-fn ai_may_read_rows(is_ai_call: bool, service_ai_data_access: bool) -> bool {
-    !is_ai_call || service_ai_data_access
-}
-
-/// Whether this engine's *entity names* are schema shape or stored user data.
-///
-/// The allowlist below draws the line this module's AI gating depends on:
-/// schema navigation is open to the agent, row contents are opt-in. For
-/// relational and document stores an entity is a table or collection — a name
-/// the developer chose, carrying nothing a user typed. For key-value and object
-/// stores the entity *is* the datum: Redis `list_entities` returns keys, which
-/// routinely embed session tokens, emails and user IDs (`session:<token>`,
-/// `ratelimit:<email>`), and S3 returns object names, which are user-supplied
-/// filenames (`invoices/acme-corp-2026-q1.pdf`). Enumerating those is a row
-/// read in all but name, so it belongs behind the same opt-in — otherwise an
-/// operator who deliberately left row access off still leaks the contents of
-/// their cache and bucket to the model.
-///
-/// Unknown engines are treated as data-bearing. A backend added later is gated
-/// until somebody has actually reasoned about what its entity names contain,
-/// which is the same secure-by-default posture the AI operation allowlist uses.
-fn entity_names_are_user_data(service_type: &str) -> bool {
-    !matches!(
-        service_type.trim().to_ascii_lowercase().as_str(),
-        "postgres" | "postgresql" | "mysql" | "mariadb" | "mongodb"
-    )
-}
-
-fn entity_info_contains_user_data(service_type: &str) -> bool {
-    entity_names_are_user_data(service_type) || service_type.trim().eq_ignore_ascii_case("mongodb")
-}
-
 /// Fixed audit categories derived only from an allowlisted engine type.
 /// Unknown future engines fail closed to non-identifying categories.
 fn ai_read_audit_categories(service_type: &str) -> (AiBackendCategory, AiEntityCategory) {
@@ -494,75 +461,21 @@ fn ai_read_audit_categories(service_type: &str) -> (AiBackendCategory, AiEntityC
     }
 }
 
-/// Enforce the `ai_data_access` opt-in on an endpoint that returns *entity
-/// names*, for engines where those names are user data.
+/// The audit categories for a row read the AI assistant makes, or `None` for a
+/// person reading in the console.
 ///
-/// Shared by `list_entities` and `get_entity_info` so the pair cannot drift —
-/// which they had: both were allowlisted for the agent under one comment saying
-/// both were gated, and only one was. Factoring the decision into a single
-/// function is the point; two call sites implementing "the same" rule is how
-/// the gap appeared in the first place.
-async fn apply_entity_name_gate(
+/// The assistant reads data with the user's own permissions — whatever they can
+/// open in the data browser, it can read for them, with no separate switch.
+/// What it read is still recorded, so an operator can see which services' rows
+/// went to the AI provider and when.
+async fn ai_row_read_categories(
     app_state: &AppState,
     service_id: i32,
     is_ai_call: bool,
-    includes_entity_info: bool,
-) -> Result<(), Problem> {
-    if !is_ai_call {
-        return Ok(());
-    }
-
-    let service = app_state
-        .external_service_manager
-        .get_service(service_id)
-        .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Service Not Found")
-                .with_detail(e.to_string())
-        })?;
-
-    let exposes_user_data = if includes_entity_info {
-        entity_info_contains_user_data(&service.service_type)
-    } else {
-        entity_names_are_user_data(&service.service_type)
-    };
-    if exposes_user_data {
-        let data_kind = if includes_entity_info {
-            "sampled schema, keys, and object names"
-        } else {
-            "keys and object names"
-        };
-        enforce_ai_data_access(app_state, service_id, is_ai_call, data_kind).await?;
-    }
-
-    Ok(())
-}
-
-/// Resolve the service and enforce the per-service `ai_data_access` opt-in for
-/// agent-originated calls.
-///
-/// Shared by [`read_entity_rows`] and [`list_entities`] so the two cannot
-/// drift: the row endpoint and the key/object enumeration endpoint expose the
-/// same class of data on key-value and object stores, and gating only one of
-/// them leaves the other as a way around the opt-in.
-///
-/// A no-op for human callers — their authorization is `ExternalServicesRead`,
-/// checked by the caller before this runs.
-///
-/// Returns fixed, non-identifying backend/entity categories for an agent call
-/// that passed the gate. User-controlled service and entity names never leave
-/// this function for audit serialization.
-async fn enforce_ai_data_access(
-    app_state: &AppState,
-    service_id: i32,
-    is_ai_call: bool,
-    what: &str,
 ) -> Result<Option<(AiBackendCategory, AiEntityCategory)>, Problem> {
     if !is_ai_call {
         return Ok(None);
     }
-
     let service = app_state
         .external_service_manager
         .get_service(service_id)
@@ -570,26 +483,11 @@ async fn enforce_ai_data_access(
         .map_err(|e| {
             temps_core::problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Service Not Found")
-                .with_detail(e.to_string())
+                .with_detail(format!(
+                    "Service {service_id} not found while reading rows for the AI assistant: {e}"
+                ))
         })?;
-
-    if ai_may_read_rows(is_ai_call, service.ai_data_access) {
-        return Ok(Some(ai_read_audit_categories(&service.service_type)));
-    }
-
-    Err(temps_core::problemdetails::new(StatusCode::FORBIDDEN)
-        .with_title("AI Data Access Not Enabled")
-        .with_detail(format!(
-            "Reading {what} from service '{}' (id {}) is not enabled for the AI assistant. \
-             Container and schema names are still readable. An operator can turn data access on \
-             under Settings → AI data access on the service page; it is off by default because \
-             this data can contain password hashes, tokens and personal information that would be \
-             sent to the configured AI provider.",
-            service.name, service_id
-        ))
-        .with_value("service_id", service_id)
-        .with_value("service_name", service.name.clone())
-        .with_value("setup_path", format!("/storage/{service_id}")))
+    Ok(Some(ai_read_audit_categories(&service.service_type)))
 }
 
 /// Parse the `filter` query-string parameter into the backend-specific JSON
@@ -625,8 +523,8 @@ fn parse_row_filter(
 /// Read rows from an entity (read-only `GET`; see [`query_data`] for the
 /// `POST` form used by the console).
 ///
-/// Gated for AI callers by the service's `ai_data_access` opt-in — see
-/// [`temps_core::ai_tool_call::AiToolCall`].
+/// The AI assistant reads through this with the user's own permissions; its
+/// reads are audited — see [`temps_core::ai_tool_call::AiToolCall`].
 #[utoipa::path(
     get,
     path = "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data",
@@ -645,7 +543,7 @@ fn parse_row_filter(
         (status = 200, description = "Query results", body = QueryDataResponse),
         (status = 400, description = "Invalid query or filter"),
         (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions, or AI data access not enabled for this service"),
+        (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Service, container, or entity not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -663,31 +561,18 @@ pub async fn read_entity_rows(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let is_ai_call = ai_call.is_some();
 
-    // Per-service opt-in for agent row access. Schema browsing stays open —
-    // only the rows themselves are gated, because those are what would be
-    // shipped to a third-party LLM provider.
-    //
-    // NOTE ON PROJECT SCOPING: `ApiCallScope::project_ids` constrains only
-    // operations that take a `project_id` parameter (see `build_request_parts`
-    // in temps-ai-api-tools). This route is keyed by `service_id`, so the
-    // conversation's project boundary does NOT narrow it — an agent chatting
-    // about project A can reach a service linked only to project B, bounded by
-    // the caller's own `ExternalServicesRead`. That is accepted deliberately:
-    // services are a platform-level resource that can be shared across
-    // projects, so there is no single owning project to scope to, and the
-    // `ai_data_access` opt-in below is the intended boundary — an operator
-    // enables row access per service, whatever project the chat is about.
-    let ai_audit_categories =
-        enforce_ai_data_access(&app_state, service_id, is_ai_call, "row data").await?;
+    // The assistant reads rows with the user's own permissions: the checks
+    // above are the boundary, exactly as for the console. Its reads are
+    // audited below. `assert_service_owned_by_caller` keeps a project-scoped
+    // caller inside the services linked to their projects.
+    let ai_audit_categories = ai_row_read_categories(&app_state, service_id, is_ai_call).await?;
 
     let filter_schema = app_state
         .query_service
@@ -735,10 +620,9 @@ pub async fn read_entity_rows(
     let truncated = result.stats.truncated;
     let rows = data_rows_to_json(result.rows);
 
-    // Record what the model actually read. The `ai_data_access` toggle is
-    // audited, but that only says the door was opened; this says what went
-    // through it. Stable ID, fixed categories and shape only — names and values
-    // can both contain secrets, so the audit type cannot represent either.
+    // Record what the model actually read: stable ID, fixed categories and
+    // shape only — names and values can both contain secrets, so the audit
+    // type cannot represent either.
     if let Some((backend_category, entity_category)) = ai_audit_categories {
         let audit = AiRowsReadAudit {
             context: temps_core::audit::AuditContext {
@@ -865,11 +749,9 @@ pub async fn check_explorer_support(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Get service configuration
@@ -1149,11 +1031,9 @@ pub async fn list_root_containers(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let path = ContainerPath::root();
@@ -1193,11 +1073,9 @@ pub async fn list_containers_at_path(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Parse path from URL (segments separated by /)
@@ -1246,11 +1124,9 @@ pub async fn get_container_info(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
@@ -1289,26 +1165,16 @@ pub async fn list_entities(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str)): Path<(i32, String)>,
-    ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
     axum::extract::Query(query): axum::extract::Query<ListEntitiesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
-
-    let is_ai_call = ai_call.is_some();
-
-    // This operation is allowlisted for the agent as "schema shape only", which
-    // is true of tables and collections but NOT of keys and object names — on
-    // Redis and S3 the entity name *is* user data. See `apply_entity_name_gate`.
-    apply_entity_name_gate(&app_state, service_id, is_ai_call, false).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments);
@@ -1357,27 +1223,15 @@ pub async fn get_entity_info(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<AppState>>,
     Path((service_id, path_str, entity)): Path<(i32, String, String)>,
-    ai_call: Option<axum::Extension<temps_core::ai_tool_call::AiToolCall>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
-
-    // Same engine-dependent gate as `list_entities`. This endpoint was
-    // allowlisted for the agent alongside it, under a comment claiming both
-    // were gated — but only `list_entities` was. It leaks less than a row read,
-    // yet it is not nothing: on MongoDB the reported `fields` are inferred from
-    // an actual sampled document, so in a schemaless store those keys can be
-    // user-written, and on Redis/S3 a 200-vs-404 is an existence oracle for a
-    // guessed key or object name (`session:<token>`), plus TTL and etag.
-    apply_entity_name_gate(&app_state, service_id, ai_call.is_some(), true).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
     let path = ContainerPath::new(segments.clone());
@@ -1449,11 +1303,9 @@ pub async fn query_data(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     let segments: Vec<String> = path_str.split('/').map(String::from).collect();
@@ -1533,11 +1385,9 @@ pub async fn download_object(
     // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
     // not *this* service. Without the tenancy check a caller scoped to project A
     // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
+    // and for row data that is the whole database. Every service-keyed read in
+    // `metrics_handlers` carries this too; it matters most for deployment
+    // tokens, whose project scope only takes effect inside this helper.
     super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
 
     // Parse path
@@ -1555,11 +1405,13 @@ pub async fn download_object(
         .await
         .map_err(|e| {
             let (status, title) = match &e {
-                temps_query::DataError::NotFound(_) => (StatusCode::NOT_FOUND, "Object Not Found"),
-                temps_query::DataError::InvalidQuery(_) => {
+                temps_providers_core::query::DataError::NotFound(_) => {
+                    (StatusCode::NOT_FOUND, "Object Not Found")
+                }
+                temps_providers_core::query::DataError::InvalidQuery(_) => {
                     (StatusCode::BAD_REQUEST, "Invalid Request")
                 }
-                temps_query::DataError::OperationNotSupported(_) => {
+                temps_providers_core::query::DataError::OperationNotSupported(_) => {
                     (StatusCode::BAD_REQUEST, "Operation Not Supported")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "Download Error"),
@@ -1593,161 +1445,6 @@ pub async fn download_object(
     headers.insert(header::CONTENT_DISPOSITION, content_disposition);
 
     Ok((headers, body))
-}
-
-// ============================================================================
-// AI data access opt-in
-// ============================================================================
-
-#[derive(Debug, Deserialize, ToSchema)]
-pub struct ToggleAiDataAccessRequest {
-    /// Whether the AI assistant may read row data from this service.
-    #[schema(example = false)]
-    pub enabled: bool,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct AiDataAccessResponse {
-    /// Service id
-    pub service_id: i32,
-    /// Whether the AI assistant may read row data from this service
-    #[schema(example = false)]
-    pub enabled: bool,
-}
-
-/// Report whether the AI assistant may read row data from this service.
-///
-/// Always answers (rather than 404-ing when disabled) so the console can render
-/// the capability with an "off — here's how to turn it on" state instead of
-/// hiding it, and so the agent can tell "not set up" apart from "not supported".
-#[utoipa::path(
-    get,
-    path = "/external-services/{service_id}/query/ai-data-access",
-    operation_id = "get_ai_data_access",
-    tag = "External Services - Query",
-    params(("service_id" = i32, Path, description = "External service id")),
-    responses(
-        (status = 200, description = "Current AI data access setting", body = AiDataAccessResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "Service not found"),
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn get_ai_data_access(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    Path(service_id): Path<i32>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ExternalServicesRead);
-    // SECURITY: `ExternalServicesRead` says the caller may read *some* service,
-    // not *this* service. Without the tenancy check a caller scoped to project A
-    // can enumerate `service_id` and read a service linked only to project B —
-    // and for row data that is the whole database. The sibling write handler
-    // `set_ai_data_access` has always carried this, as does every service-keyed
-    // read in `metrics_handlers`; the data-browser reads were the outlier, which
-    // matters most for deployment tokens, whose project scope only takes effect
-    // inside this helper.
-    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
-
-    let service = app_state
-        .external_service_manager
-        .get_service(service_id)
-        .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Service Not Found")
-                .with_detail(e.to_string())
-        })?;
-
-    Ok(Json(AiDataAccessResponse {
-        service_id,
-        enabled: service.ai_data_access,
-    }))
-}
-
-/// Enable or disable AI assistant access to this service's row data.
-///
-/// Off by default. Row contents can include password hashes, API tokens and
-/// personal data, and enabling this sends them to the configured AI provider —
-/// so it is a deliberate, audited, per-service decision by the operator.
-#[utoipa::path(
-    patch,
-    path = "/external-services/{service_id}/query/ai-data-access",
-    operation_id = "set_ai_data_access",
-    tag = "External Services - Query",
-    request_body = ToggleAiDataAccessRequest,
-    params(("service_id" = i32, Path, description = "External service id")),
-    responses(
-        (status = 200, description = "Setting applied", body = AiDataAccessResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "Service not found"),
-        (status = 500, description = "Internal server error"),
-    ),
-    security(("bearer_auth" = []))
-)]
-pub async fn set_ai_data_access(
-    RequireAuth(auth): RequireAuth,
-    State(app_state): State<Arc<AppState>>,
-    Path(service_id): Path<i32>,
-    axum::Extension(metadata): axum::Extension<temps_core::RequestMetadata>,
-    Json(request): Json<ToggleAiDataAccessRequest>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ExternalServicesWrite);
-    // Same tenancy check the metrics toggle uses: holding
-    // ExternalServicesWrite must not let a caller widen AI access to a
-    // service that isn't theirs.
-    super::metrics_handlers::assert_service_owned_by_caller(service_id, &auth, &app_state).await?;
-
-    let service = app_state
-        .external_service_manager
-        .get_service(service_id)
-        .await
-        .map_err(|e| {
-            temps_core::problemdetails::new(StatusCode::NOT_FOUND)
-                .with_title("Service Not Found")
-                .with_detail(e.to_string())
-        })?;
-
-    let active = temps_entities::external_services::ActiveModel {
-        id: sea_orm::ActiveValue::Set(service_id),
-        ai_data_access: sea_orm::ActiveValue::Set(request.enabled),
-        ..Default::default()
-    };
-    sea_orm::EntityTrait::update(active)
-        .exec(app_state.db.as_ref())
-        .await
-        .map_err(|e| {
-            tracing::error!(service_id, error = %e, "Failed to update ai_data_access");
-            temps_core::problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Update Failed")
-                .with_detail(format!(
-                    "Failed to update AI data access for service {service_id}: {e}"
-                ))
-        })?;
-
-    // Audited: this widens what a third party (the AI provider) can see, so it
-    // must be attributable. A failure here must not fail the request — the
-    // setting is already persisted.
-    let audit = AiDataAccessChangedAudit {
-        context: temps_core::audit::AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.clone()),
-            user_agent: metadata.user_agent.clone(),
-        },
-        service_id,
-        service_name: service.name.clone(),
-        enabled: request.enabled,
-    };
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        tracing::error!(service_id, error = %e, "Failed to write ai_data_access audit log");
-    }
-
-    Ok(Json(AiDataAccessResponse {
-        service_id,
-        enabled: request.enabled,
-    }))
 }
 
 // ============================================================================
@@ -1791,11 +1488,6 @@ pub fn configure_query_routes() -> axum::Router<Arc<AppState>> {
             "/external-services/{service_id}/query/containers/{path}/entities/{entity}/data",
             axum::routing::post(query_data).get(read_entity_rows),
         )
-        // AI data access opt-in (read + toggle)
-        .route(
-            "/external-services/{service_id}/query/ai-data-access",
-            axum::routing::get(get_ai_data_access).patch(set_ai_data_access),
-        )
         // Download object (S3 only)
         .route(
             "/external-services/{service_id}/query/containers/{path}/entities/{entity}/download",
@@ -1824,25 +1516,6 @@ mod tests {
         // rather than being truncated mid-body by the tool caller.
         assert_eq!(effective_row_limit(500, false), 500);
         assert_eq!(effective_row_limit(500, true), AI_MAX_ROWS);
-    }
-
-    #[test]
-    fn ai_may_read_rows_requires_the_per_service_opt_in() {
-        // The whole point of the gate: an agent call against a service that
-        // has not opted in must be refused, even though the caller's
-        // ExternalServicesRead permission would otherwise allow it.
-        assert!(!ai_may_read_rows(true, false));
-        assert!(ai_may_read_rows(true, true));
-    }
-
-    #[test]
-    fn ai_may_read_rows_never_blocks_human_callers() {
-        // The opt-in governs the built-in assistant only. Console and CLI
-        // traffic is governed by permissions, and must be unaffected whatever
-        // the flag says — otherwise enabling the AI feature would silently
-        // change who can browse their own data.
-        assert!(ai_may_read_rows(false, false));
-        assert!(ai_may_read_rows(false, true));
     }
 
     #[test]
@@ -1887,7 +1560,7 @@ mod tests {
     fn query_error_problem_does_not_echo_backend_diagnostics() {
         let secret = "alice@example.com tok_live_secret";
         let problem = query_error_problem(
-            temps_query::DataError::QueryFailed(format!("syntax near {secret}")),
+            temps_providers_core::query::DataError::QueryFailed(format!("syntax near {secret}")),
             7,
             100,
         );
@@ -1900,7 +1573,7 @@ mod tests {
     fn navigating_below_a_leaf_container_is_a_bad_request_not_a_server_error() {
         // Reported as a 500 when the console asked for the child containers
         // of a PostgreSQL schema.
-        let error = temps_query::DataError::container_path_too_deep(
+        let error = temps_providers_core::query::DataError::container_path_too_deep(
             "PostgreSQL",
             &ContainerPath::from_slice(&["appdb", "pg_catalog"]),
             2,
@@ -1919,7 +1592,7 @@ mod tests {
 
     #[test]
     fn navigation_errors_are_classified_by_who_caused_them() {
-        use temps_query::DataError;
+        use temps_providers_core::query::DataError;
         let status_of =
             |error: DataError| navigation_error_problem(error, 7, "list entities").status_code;
 
@@ -1947,7 +1620,7 @@ mod tests {
 
     #[test]
     fn data_query_with_too_deep_container_path_is_a_bad_request() {
-        let error = temps_query::DataError::container_path_too_deep(
+        let error = temps_providers_core::query::DataError::container_path_too_deep(
             "S3",
             &ContainerPath::from_slice(&["bucket", "prefix"]),
             1,
@@ -1959,7 +1632,7 @@ mod tests {
     #[test]
     fn invalid_query_problem_does_not_echo_submitted_values() {
         let problem = query_error_problem(
-            temps_query::DataError::InvalidQuery(
+            temps_providers_core::query::DataError::InvalidQuery(
                 "invalid email alice@example.com with tok_live_secret".to_string(),
             ),
             7,
@@ -1974,7 +1647,7 @@ mod tests {
     #[test]
     fn result_limit_problem_does_not_echo_sensitive_entity_name() {
         let problem = query_error_problem(
-            temps_query::DataError::ResultLimitExceeded {
+            temps_providers_core::query::DataError::ResultLimitExceeded {
                 entity: "session:tok_live_secret:alice@example.com".to_string(),
                 limit_kind: "wire_cell_bytes",
                 limit: 64,
@@ -1986,40 +1659,6 @@ mod tests {
         let serialized = serde_json::to_string(&problem.body).expect("problem body serializes");
         assert!(!serialized.contains("alice@example.com"));
         assert!(!serialized.contains("tok_live_secret"));
-    }
-
-    #[test]
-    fn entity_names_are_user_data_for_key_value_and_object_stores() {
-        // `list_entities` is allowlisted for the agent as schema navigation.
-        // That framing only holds where an entity is a table or collection. On
-        // Redis the entity is a KEY (`session:<token>`, `ratelimit:<email>`)
-        // and on S3 it is an object name (a user-supplied filename), so
-        // enumerating them is a row read wearing a different hat — and left
-        // ungated it was a way around the `ai_data_access` opt-in entirely.
-        assert!(entity_names_are_user_data("redis"));
-        assert!(entity_names_are_user_data("s3"));
-        assert!(entity_names_are_user_data("rustfs"));
-    }
-
-    #[test]
-    fn entity_names_are_schema_for_relational_and_document_stores() {
-        // Table and collection names are chosen by the developer, not typed by
-        // an end user. Gating these would break the navigation the agent needs
-        // to resolve "the users table in the landing database" to a path.
-        assert!(!entity_names_are_user_data("postgres"));
-        assert!(!entity_names_are_user_data("mariadb"));
-        assert!(!entity_names_are_user_data("mysql"));
-        assert!(!entity_names_are_user_data("mongodb"));
-        // Casing and stray whitespace must not open the gate.
-        assert!(!entity_names_are_user_data("  PostgreSQL "));
-    }
-
-    #[test]
-    fn mongodb_entity_info_is_data_bearing_even_when_collection_names_are_not() {
-        assert!(!entity_names_are_user_data("mongodb"));
-        assert!(entity_info_contains_user_data("mongodb"));
-        assert!(entity_info_contains_user_data(" MongoDB "));
-        assert!(!entity_info_contains_user_data("postgres"));
     }
 
     #[test]
@@ -2044,16 +1683,6 @@ mod tests {
             ai_read_audit_categories("future-secret-bearing-engine"),
             (AiBackendCategory::Unknown, AiEntityCategory::Unknown)
         );
-    }
-
-    #[test]
-    fn entity_names_are_user_data_defaults_closed_for_unknown_engines() {
-        // Secure-by-default: a backend added later is gated until someone has
-        // reasoned about what its entity names actually contain. The failure
-        // mode of guessing wrong in the other direction is silent data leakage
-        // to a third-party model provider.
-        assert!(entity_names_are_user_data("some-future-engine"));
-        assert!(entity_names_are_user_data(""));
     }
 
     #[test]

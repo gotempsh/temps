@@ -90,10 +90,19 @@ test.describe('platform navigation', () => {
     ).toBeVisible()
 
     // The provider catalogue is the entry point for every managed-service flow,
-    // so an empty list here means database provisioning is unreachable.
+    // so an empty list here means database provisioning is unreachable. A
+    // fresh instance shows it inline; once a database exists it moves behind
+    // the header's "Create database" menu, which a user opens to see it.
+    const offered = (engine: string) =>
+      page.getByText(engine, { exact: true }).filter({ visible: true }).first()
+    const createMenu = page.getByRole('button', { name: /^Create database/ })
+    await expect(createMenu.or(offered('PostgreSQL')).first()).toBeVisible()
+    if (await createMenu.isVisible()) {
+      await createMenu.click()
+    }
     for (const engine of ['PostgreSQL', 'Redis', 'MongoDB', 'MariaDB']) {
       await expect(
-        page.getByText(engine, { exact: true }).first(),
+        offered(engine),
         `${engine} should be offered on the databases page`
       ).toBeVisible()
     }

@@ -2,15 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use sea_orm::{
-    sea_query::LockType, ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend,
-    DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
-    TransactionTrait,
+    sea_query::{Expr, LockType},
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseTransaction,
+    EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::{env_var_environments, env_vars, environments};
 use thiserror::Error;
 
+use super::secret_suggestion::{secret_suggestion, SecretSuggestionReason};
 use super::types::{DeletedEnvVar, EnvVarEnvironment, EnvVarWithEnvironments, UpdateEnvVarOutcome};
 
 #[derive(Error, Debug)]
@@ -57,26 +58,53 @@ pub enum EnvVarError {
     /// optional — omitting it keeps the existing ciphertext — but explicitly
     /// passing an empty string is a logic error in the caller, and a
     /// destructive one: the write cannot be read back or undone.
+    ///
+    /// `omit_keeps_stored` says whether the caller's write path keeps the
+    /// stored value when the value is omitted (this crate's service does);
+    /// only then does the message tell the user to omit it. temps-projects'
+    /// legacy service has no such path and leaves it `false`.
     #[error(
-        "Secret env var '{key}' requires a non-empty value. Omit the value entirely to keep the one already stored."
+        "Secret env var '{key}' requires a non-empty value{}",
+        secret_value_required_hint(*.omit_keeps_stored)
     )]
-    SecretValueRequired { key: String },
+    SecretValueRequired {
+        key: String,
+        omit_keeps_stored: bool,
+    },
 
     #[error(
         "Secret environment variable '{key}' (id={var_id}) is write-only and cannot be revealed"
     )]
     SecretValueCannotBeRevealed { var_id: i32, key: String },
 
+    /// Raised by temps-projects' legacy env var service, which has no
+    /// authorization or audit context: a secret's plaintext is available only
+    /// through this crate's permission-checked, audited reveal flow.
+    #[error(
+        "Secret env var '{key}' (id={var_id}) must be read through the audited reveal endpoint"
+    )]
+    SecretValueRequiresAuditedReveal { var_id: i32, key: String },
+
     #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
     )]
     AmbiguousValue { project_id: i32, key: String },
 
-    #[error("Environment variable '{key}' already exists in one of the selected environments")]
+    #[error(
+        "Environment variable '{key}' already exists in the same scope (project-wide, or one of the selected environments)"
+    )]
     AlreadyExists { key: String },
 
     #[error("Other error: {0}")]
     Other(String),
+}
+
+fn secret_value_required_hint(omit_keeps_stored: bool) -> &'static str {
+    if omit_keeps_stored {
+        ". Omit the value entirely to keep the one already stored."
+    } else {
+        ""
+    }
 }
 
 impl From<sea_orm::DbErr> for EnvVarError {
@@ -98,6 +126,19 @@ impl From<sea_orm::TransactionError<EnvVarError>> for EnvVarError {
                 EnvVarError::DatabaseConnectionError(e.to_string())
             }
         }
+    }
+}
+
+/// Whether two env vars with the same key would compete for one deployment
+/// scope. An empty set is project-wide. A project-wide default plus an
+/// environment-scoped override is the supported precedence
+/// (`select_effective_environment_variables`), so only two project-wide
+/// rows, or two rows sharing an environment, collide.
+fn env_var_scopes_collide(requested: &[i32], existing: &[i32]) -> bool {
+    match (requested.is_empty(), existing.is_empty()) {
+        (true, true) => true,
+        (false, false) => existing.iter().any(|id| requested.contains(id)),
+        _ => false,
     }
 }
 
@@ -149,6 +190,39 @@ impl EnvVarService {
             })
     }
 
+    /// The "store as secret" suggestion for a variable's plaintext: none for
+    /// a secret, or once the operator has dismissed it.
+    /// Whether `candidate` is the value already stored. The console's edit
+    /// dialog sends back the value it revealed even when only the scope
+    /// changed, and a dismissal was about that value, so it must survive. An
+    /// unreadable stored value counts as changed: the hint reappearing is the
+    /// safe way to be wrong.
+    fn is_stored_value(
+        encryption_service: &EncryptionService,
+        stored_value: &str,
+        was_encrypted: bool,
+        candidate: &str,
+    ) -> bool {
+        if !was_encrypted {
+            return stored_value == candidate;
+        }
+        encryption_service
+            .decrypt_string(stored_value)
+            .is_ok_and(|plaintext| plaintext == candidate)
+    }
+
+    fn suggestion_for(
+        key: &str,
+        plaintext: &str,
+        is_secret: bool,
+        dismissed: bool,
+    ) -> Option<SecretSuggestionReason> {
+        if is_secret || dismissed {
+            return None;
+        }
+        secret_suggestion(key, plaintext)
+    }
+
     /// Resolve every requested environment inside the authorized project.
     ///
     /// Environment IDs are globally allocated, so accepting an ID without the
@@ -197,6 +271,23 @@ impl EnvVarService {
             .collect()
     }
 
+    /// Every environment the variable is linked to, deleted ones included,
+    /// sorted so two link sets compare equal regardless of order.
+    async fn linked_environment_ids(
+        txn: &DatabaseTransaction,
+        var_id: i32,
+    ) -> Result<Vec<i32>, EnvVarError> {
+        let mut ids: Vec<i32> = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
+            .all(txn)
+            .await?
+            .into_iter()
+            .map(|link| link.environment_id)
+            .collect();
+        ids.sort_unstable();
+        Ok(ids)
+    }
+
     /// Soft-deleted environments of `project_id` that `var_id` is still
     /// linked to, ordered by id.
     ///
@@ -234,7 +325,10 @@ impl EnvVarService {
     ) -> Result<Vec<EnvVarWithEnvironments>, EnvVarError> {
         let vars = env_vars::Entity::find()
             .filter(env_vars::Column::ProjectId.eq(project_id))
-            .order_by_desc(env_vars::Column::UpdatedAt)
+            // Alphabetical and stable: ordering by `updated_at` moved a
+            // variable to the top every time it was saved.
+            .order_by_asc(env_vars::Column::Key)
+            .order_by_asc(env_vars::Column::Id)
             .all(self.db.as_ref())
             .await?;
 
@@ -281,10 +375,18 @@ impl EnvVarService {
 
             // Marked secrets are omitted from API responses. Deployment reads
             // use a separate internal path; HTTP reveal rejects secret rows.
-            let value = if var.is_secret {
-                None
+            let (value, secret_suggestion) = if var.is_secret {
+                (None, None)
             } else {
-                Some(self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?)
+                let plaintext =
+                    self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)?;
+                let suggestion = Self::suggestion_for(
+                    &var.key,
+                    &plaintext,
+                    false,
+                    var.secret_suggestion_dismissed_at.is_some(),
+                );
+                (Some(plaintext), suggestion)
             };
 
             result.push(EnvVarWithEnvironments {
@@ -297,10 +399,58 @@ impl EnvVarService {
                 environments,
                 include_in_preview: var.include_in_preview,
                 is_secret: var.is_secret,
+                secret_suggestion,
             });
         }
 
         Ok(result)
+    }
+
+    /// Serialize writes to one key of a project and refuse a scope another
+    /// row of that key already holds. The advisory lock makes the check and
+    /// the following insert/update atomic against concurrent writers; a
+    /// unique index cannot express this because project-wide scope is the
+    /// absence of junction rows.
+    async fn claim_key_scope(
+        txn: &DatabaseTransaction,
+        project_id: i32,
+        key: &str,
+        requested_environment_ids: &[i32],
+        excluded_var_id: Option<i32>,
+    ) -> Result<(), EnvVarError> {
+        // Namespaced so env vars and secrets of the same key do not contend.
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1, hashtext($2))",
+            [project_id.into(), format!("env_var:{key}").into()],
+        ))
+        .await?;
+
+        let mut query = env_vars::Entity::find()
+            .filter(env_vars::Column::ProjectId.eq(project_id))
+            .filter(env_vars::Column::Key.eq(key));
+        if let Some(var_id) = excluded_var_id {
+            query = query.filter(env_vars::Column::Id.ne(var_id));
+        }
+        let existing = query
+            .find_with_related(env_var_environments::Entity)
+            .all(txn)
+            .await?;
+        let collides = existing.iter().any(|(var, links)| {
+            // The legacy direct column scopes a row like a junction link.
+            let existing_environment_ids = links
+                .iter()
+                .map(|link| link.environment_id)
+                .chain(var.environment_id)
+                .collect::<Vec<_>>();
+            env_var_scopes_collide(requested_environment_ids, &existing_environment_ids)
+        });
+        if collides {
+            return Err(EnvVarError::AlreadyExists {
+                key: key.to_string(),
+            });
+        }
+        Ok(())
     }
 
     pub async fn create_environment_variable(
@@ -313,32 +463,14 @@ impl EnvVarService {
         is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
         if is_secret && value.is_empty() {
-            return Err(EnvVarError::SecretValueRequired { key });
-        }
-
-        let existing_env_vars = env_vars::Entity::find()
-            .filter(env_vars::Column::ProjectId.eq(project_id))
-            .filter(env_vars::Column::Key.eq(&key))
-            .find_with_related(env_var_environments::Entity)
-            .all(self.db.as_ref())
-            .await?;
-
-        let existing_env_ids: Vec<i32> = existing_env_vars
-            .into_iter()
-            .flat_map(|(_, env_var_envs)| {
-                env_var_envs
-                    .into_iter()
-                    .map(|env_var_env| env_var_env.environment_id)
-            })
-            .collect();
-
-        for env_id in &environment_ids {
-            if existing_env_ids.contains(env_id) {
-                return Err(EnvVarError::AlreadyExists { key: key.clone() });
-            }
+            return Err(EnvVarError::SecretValueRequired {
+                key,
+                omit_keeps_stored: true,
+            });
         }
 
         let encrypted_value = self.encrypt_value(&key, &value)?;
+        let secret_suggestion = Self::suggestion_for(&key, &value, is_secret, false);
 
         let result = self
             .db
@@ -350,6 +482,7 @@ impl EnvVarService {
                 Box::pin(async move {
                     let scoped_environments =
                         Self::environments_in_project(txn, project_id, &environment_ids).await?;
+                    Self::claim_key_scope(txn, project_id, &key, &environment_ids, None).await?;
 
                     let new_var = env_vars::ActiveModel {
                         project_id: Set(project_id),
@@ -405,6 +538,7 @@ impl EnvVarService {
                         environments,
                         include_in_preview: var.include_in_preview,
                         is_secret: var.is_secret,
+                        secret_suggestion,
                     })
                 })
             })
@@ -522,7 +656,10 @@ impl EnvVarService {
                     // credential is unusable and the classification cannot
                     // be demoted. Mirrors the create-time guard.
                     if final_is_secret && value_is_explicitly_empty {
-                        return Err(EnvVarError::SecretValueRequired { key: key.clone() });
+                        return Err(EnvVarError::SecretValueRequired {
+                            key: key.clone(),
+                            omit_keeps_stored: true,
+                        });
                     }
 
                     // A promotion is the transition non-secret -> secret. It is
@@ -534,21 +671,51 @@ impl EnvVarService {
                     let stored_value = env_var.value.clone();
                     let previous_key = env_var.key.clone();
                     let previous_include_in_preview = env_var.include_in_preview;
-                    let mut previous_environment_ids: Vec<i32> =
-                        env_var_environments::Entity::find()
-                            .filter(env_var_environments::Column::EnvVarId.eq(var_id))
-                            .all(txn)
-                            .await?
-                            .into_iter()
-                            .map(|link| link.environment_id)
-                            .collect();
-                    previous_environment_ids.sort_unstable();
+                    let previous_environment_ids =
+                        Self::linked_environment_ids(txn, var_id).await?;
+
+                    // Only a change of key or scope can create a collision.
+                    // Re-checking an unchanged row would lock the operator
+                    // out of editing a duplicate that predates this check,
+                    // when the fix is to edit or delete one of the pair.
+                    let mut final_environment_ids = environment_ids
+                        .iter()
+                        .chain(preserved_ids.iter())
+                        .copied()
+                        .collect::<Vec<_>>();
+                    final_environment_ids.sort_unstable();
+                    final_environment_ids.dedup();
+                    if previous_key != key || previous_environment_ids != final_environment_ids {
+                        Self::claim_key_scope(
+                            txn,
+                            project_id,
+                            &key,
+                            &final_environment_ids,
+                            Some(var_id),
+                        )
+                        .await?;
+                    }
+                    let was_dismissed = env_var.secret_suggestion_dismissed_at.is_some();
+                    let unchanged = was_dismissed
+                        && value.as_deref().is_some_and(|new_value| {
+                            Self::is_stored_value(
+                                &encryption_service,
+                                &stored_value,
+                                was_encrypted,
+                                new_value,
+                            )
+                        });
 
                     let mut active_var: env_vars::ActiveModel = env_var.into();
                     active_var.key = Set(key.clone());
                     if let Some(encrypted_value) = encrypted_value_opt {
                         active_var.value = Set(encrypted_value);
                         active_var.is_encrypted = Set(true);
+                        // A dismissal was about the old value; judge a new
+                        // one afresh.
+                        if !unchanged {
+                            active_var.secret_suggestion_dismissed_at = Set(None);
+                        }
                     } else if promoted_to_secret && !was_encrypted {
                         // Legacy plaintext row being promoted without a new
                         // value: encrypt what is already there so the secret is
@@ -577,6 +744,28 @@ impl EnvVarService {
                     }
                     active_var.include_in_preview = Set(include_in_preview);
                     active_var.updated_at = Set(chrono::Utc::now());
+
+                    let secret_suggestion = match &value {
+                        Some(new_value) => {
+                            Self::suggestion_for(&key, new_value, final_is_secret, unchanged)
+                        }
+                        None if final_is_secret || was_dismissed => None,
+                        None => {
+                            let plaintext = if was_encrypted {
+                                encryption_service
+                                    .decrypt_string(&stored_value)
+                                    .map_err(|e| EnvVarError::DecryptionFailed {
+                                        var_id,
+                                        key: key.clone(),
+                                        reason: e.to_string(),
+                                    })?
+                            } else {
+                                stored_value.clone()
+                            };
+                            Self::suggestion_for(&key, &plaintext, false, false)
+                        }
+                    };
+
                     let var = active_var.update(txn).await?;
 
                     let mut replaced_links = env_var_environments::Entity::delete_many()
@@ -665,6 +854,7 @@ impl EnvVarService {
                             environments,
                             include_in_preview: var.include_in_preview,
                             is_secret: var.is_secret,
+                            secret_suggestion,
                         },
                         promoted_to_secret,
                         changed_fields,
@@ -703,6 +893,56 @@ impl EnvVarService {
             .await?;
         }
         Ok(env_var)
+    }
+
+    /// Records that a regular variable is not a credential, so the "store as
+    /// secret" suggestion stops showing for its current value. Leaves
+    /// `updated_at` alone: the variable itself did not change. Returns the
+    /// variable's key for the caller's audit record.
+    ///
+    /// Takes the same row lock as `update_environment_variable`, so the two
+    /// serialize: a concurrent value change (which clears the dismissal) or
+    /// promotion to secret cannot land between the check and the write and
+    /// leave a dismissal meant for the old value on the new one.
+    pub async fn dismiss_secret_suggestion(
+        &self,
+        project_id: i32,
+        var_id: i32,
+    ) -> Result<String, EnvVarError> {
+        self.db
+            .transaction::<_, String, EnvVarError>(|txn| {
+                Box::pin(async move {
+                    let var = env_vars::Entity::find_by_id(var_id)
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .lock(LockType::NoKeyUpdate)
+                        .one(txn)
+                        .await?
+                        .ok_or_else(|| {
+                            EnvVarError::NotFound(format!(
+                                "Environment variable {} not found in project {}",
+                                var_id, project_id
+                            ))
+                        })?;
+                    if var.is_secret {
+                        return Err(EnvVarError::InvalidInput(format!(
+                            "Environment variable '{}' (id={}) is already a secret; there is no suggestion to dismiss",
+                            var.key, var.id
+                        )));
+                    }
+                    env_vars::Entity::update_many()
+                        .col_expr(
+                            env_vars::Column::SecretSuggestionDismissedAt,
+                            Expr::value(chrono::Utc::now()),
+                        )
+                        .filter(env_vars::Column::Id.eq(var_id))
+                        .filter(env_vars::Column::ProjectId.eq(project_id))
+                        .exec(txn)
+                        .await?;
+                    Ok(var.key)
+                })
+            })
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn delete_environment_variable(
@@ -855,7 +1095,41 @@ mod tests {
             include_in_preview: false,
             is_encrypted,
             is_secret,
+            secret_suggestion_dismissed_at: None,
         }
+    }
+
+    #[test]
+    fn secret_value_required_message_tells_the_user_to_omit_only_when_that_keeps_the_value() {
+        let keeps = EnvVarError::SecretValueRequired {
+            key: "API_KEY".to_string(),
+            omit_keeps_stored: true,
+        };
+        assert_eq!(
+            keeps.to_string(),
+            "Secret env var 'API_KEY' requires a non-empty value. Omit the value entirely to keep the one already stored."
+        );
+
+        let legacy = EnvVarError::SecretValueRequired {
+            key: "API_KEY".to_string(),
+            omit_keeps_stored: false,
+        };
+        assert_eq!(
+            legacy.to_string(),
+            "Secret env var 'API_KEY' requires a non-empty value"
+        );
+    }
+
+    #[test]
+    fn audited_reveal_message_names_the_variable() {
+        let error = EnvVarError::SecretValueRequiresAuditedReveal {
+            var_id: 7,
+            key: "API_KEY".to_string(),
+        };
+        assert_eq!(
+            error.to_string(),
+            "Secret env var 'API_KEY' (id=7) must be read through the audited reveal endpoint"
+        );
     }
 
     #[test]
@@ -957,8 +1231,12 @@ mod tests {
             environment_id: 5,
             created_at: chrono::Utc::now(),
         };
+        let mut live_environment = make_deleted_environment(5, 10, "staging");
+        live_environment.deleted_at = None;
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![live_environment]])
+                .append_exec_results([key_locked()])
                 .append_query_results(vec![vec![(existing_var, Some(existing_link))]])
                 .into_connection(),
         );
@@ -983,11 +1261,101 @@ mod tests {
         }
     }
 
+    /// The per-key advisory lock `claim_key_scope` takes before its check.
+    fn key_locked() -> MockExecResult {
+        MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 0,
+        }
+    }
+
+    #[test]
+    fn env_var_scopes_collide_only_within_one_scope() {
+        // Two project-wide rows compete for every deployment.
+        assert!(env_var_scopes_collide(&[], &[]));
+        // Two rows sharing an environment compete there.
+        assert!(env_var_scopes_collide(&[1, 2], &[2, 3]));
+        // Disjoint environments never meet.
+        assert!(!env_var_scopes_collide(&[1], &[2]));
+        // A project-wide default with an environment override is the
+        // documented precedence, in either order of creation.
+        assert!(!env_var_scopes_collide(&[], &[4]));
+        assert!(!env_var_scopes_collide(&[4], &[]));
+    }
+
+    #[tokio::test]
+    async fn test_create_second_project_wide_var_with_same_key_is_rejected() {
+        let existing_var = make_env_var_model(1, 10, "LOG_LEVEL", "v", false);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // No environments requested: no environment lookup.
+                .append_exec_results([key_locked()])
+                .append_query_results(vec![vec![(
+                    existing_var,
+                    None::<env_var_environments::Model>,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), make_encryption_service());
+
+        let result = service
+            .create_environment_variable(
+                10,
+                vec![],
+                "LOG_LEVEL".to_string(),
+                "debug".to_string(),
+                false,
+                false,
+            )
+            .await;
+
+        assert!(
+            matches!(&result, Err(EnvVarError::AlreadyExists { key }) if key == "LOG_LEVEL"),
+            "got {result:?}"
+        );
+        // The check ran under the per-key lock, inside the transaction.
+        drop(service);
+        let log = Arc::try_unwrap(db)
+            .expect("service dropped, so the test holds the only handle")
+            .into_transaction_log();
+        let statements = format!("{log:?}");
+        assert!(statements.contains("pg_advisory_xact_lock"), "{statements}");
+    }
+
+    #[tokio::test]
+    async fn test_update_renaming_onto_a_taken_key_is_rejected() {
+        // Renaming LOG_LEVEL_OLD to LOG_LEVEL, which another project-wide
+        // row already holds, would leave two rows competing for the key.
+        let encryption_service = make_encryption_service();
+        let before = make_env_var_model(3, 10, "LOG_LEVEL_OLD", "encrypted", true);
+        let other = make_env_var_model(4, 10, "LOG_LEVEL", "encrypted", true);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![before]])
+                .append_exec_results([checks_locked()])
+                .append_query_results([no_deleted_links()])
+                // Previous links: none, the row is project-wide.
+                .append_query_results(vec![Vec::<env_var_environments::Model>::new()])
+                .append_exec_results([key_locked()])
+                .append_query_results(vec![vec![(other, None::<env_var_environments::Model>)]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let result = service
+            .update_environment_variable(10, 3, "LOG_LEVEL".to_string(), None, vec![], false, None)
+            .await;
+
+        assert!(
+            matches!(&result, Err(EnvVarError::AlreadyExists { key }) if key == "LOG_LEVEL"),
+            "got {result:?}"
+        );
+    }
+
     async fn assert_create_rejects_unavailable_environment(environment_id: i32) {
         let svc = make_encryption_service();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
-                .append_query_results([Vec::<env_vars::Model>::new()])
                 .append_query_results([Vec::<environments::Model>::new()])
                 .into_connection(),
         );
@@ -1086,6 +1454,156 @@ mod tests {
             result[0].value.is_none(),
             "secret value must not be returned"
         );
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variables_suggests_secrets_unless_dismissed_or_secret() {
+        let svc = make_encryption_service();
+        let credential = svc
+            .encrypt_string("postgres://app:hunter2@db.internal/app")
+            .unwrap();
+        let plain = svc.encrypt_string("production").unwrap();
+
+        let mut dismissed = make_env_var_model(2, 10, "CACHE_URL", &credential, true);
+        dismissed.secret_suggestion_dismissed_at = Some(chrono::Utc::now());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    make_env_var_model(1, 10, "DATABASE_URL", &credential, true),
+                    dismissed,
+                    make_env_var_model_full(3, 10, "QUEUE_URL", &credential, true, true),
+                    make_env_var_model(4, 10, "NODE_ENV", &plain, true),
+                ]])
+                .append_query_results(vec![Vec::<(
+                    env_var_environments::Model,
+                    Option<environments::Model>,
+                )>::new()])
+                .into_connection(),
+        );
+
+        let service = EnvVarService::new(db, svc);
+        let result = service.get_environment_variables(10, None).await.unwrap();
+        let suggestions: Vec<_> = result
+            .iter()
+            .map(|var| (var.key.as_str(), var.secret_suggestion))
+            .collect();
+
+        assert_eq!(
+            suggestions,
+            vec![
+                (
+                    "DATABASE_URL",
+                    Some(SecretSuggestionReason::ConnectionStringPassword)
+                ),
+                ("CACHE_URL", None),
+                ("QUEUE_URL", None),
+                ("NODE_ENV", None),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_get_environment_variables_orders_by_key_not_last_update() {
+        let mock = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .append_query_results(vec![Vec::<(
+                    env_var_environments::Model,
+                    Option<environments::Model>,
+                )>::new()])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(mock.clone(), make_encryption_service());
+
+        service.get_environment_variables(10, None).await.unwrap();
+
+        drop(service);
+        let log = Arc::try_unwrap(mock)
+            .unwrap_or_else(|_| panic!("the service should hold the only other reference"))
+            .into_transaction_log();
+        let sql = format!("{:?}", log[0]);
+        assert!(
+            sql.contains(r#"ORDER BY \"env_vars\".\"key\" ASC, \"env_vars\".\"id\" ASC"#),
+            "list must be alphabetical so saving a variable does not move it: {sql}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_secret_suggestion_rejects_unknown_and_secret_variables() {
+        let svc = make_encryption_service();
+        let encrypted = svc.encrypt_string("x").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<env_vars::Model>::new()])
+                .append_query_results([vec![make_env_var_model_full(
+                    5,
+                    10,
+                    "API_TOKEN",
+                    &encrypted,
+                    true,
+                    true,
+                )]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, svc);
+
+        let missing = service
+            .dismiss_secret_suggestion(10, 404)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&missing, EnvVarError::NotFound(msg) if msg.contains("404") && msg.contains("project 10")),
+            "{missing}"
+        );
+
+        let secret = service.dismiss_secret_suggestion(10, 5).await.unwrap_err();
+        assert!(
+            matches!(&secret, EnvVarError::InvalidInput(msg) if msg.contains("API_TOKEN")),
+            "{secret}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dismiss_secret_suggestion_locks_the_row_before_writing() {
+        let svc = make_encryption_service();
+        let encrypted = svc.encrypt_string("x").unwrap();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![make_env_var_model_full(
+                    5,
+                    10,
+                    "LOOKS_LIKE_A_TOKEN",
+                    &encrypted,
+                    true,
+                    false,
+                )]])
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db.clone(), svc);
+
+        let key = service.dismiss_secret_suggestion(10, 5).await.unwrap();
+        assert_eq!(key, "LOOKS_LIKE_A_TOKEN");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let log = db.into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "check and write share one transaction: {log:?}"
+        );
+        let statements = format!("{:?}", log[0]).to_uppercase();
+        let lock = statements
+            .find("FOR NO KEY UPDATE")
+            .unwrap_or_else(|| panic!("the read must lock the row: {statements}"));
+        let write = statements
+            .find("UPDATE \\\"ENV_VARS\\\"")
+            .unwrap_or_else(|| panic!("the dismissal must be written: {statements}"));
+        assert!(lock < write, "lock before write: {statements}");
     }
 
     #[tokio::test]
@@ -1363,8 +1881,12 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            shield_mode: None,
+            shield_exempt_paths: Default::default(),
             force_https: None,
             last_activity_at: None,
+            ingress_mode: Default::default(),
+            workload_mode: Default::default(),
         }
     }
 
@@ -1686,7 +2208,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "API_KEY"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "API_KEY"
         ));
     }
 
@@ -1722,7 +2244,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            EnvVarError::SecretValueRequired { ref key } if key == "TOKEN"
+            EnvVarError::SecretValueRequired { ref key, .. } if key == "TOKEN"
         ));
     }
 
@@ -1808,8 +2330,8 @@ mod tests {
 mod integration_tests {
     use super::*;
     use chrono::Utc;
-    use temps_database::test_utils::{is_container_runtime_unavailable, TestDatabase};
     use temps_entities::{preset::Preset, projects, upstream_config::UpstreamList};
+    use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
 
     const ENCRYPTION_KEY: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
@@ -2147,6 +2669,182 @@ mod integration_tests {
                 .unwrap_or_else(|e| {
                     panic!("env var {operation} after a running check failed: {e}")
                 });
+        }
+    }
+
+    mod secret_suggestion_lifecycle {
+        use super::*;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{preset::Preset, projects};
+        use temps_test_utils::{is_container_runtime_unavailable, TestDatabase};
+
+        async fn test_database() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(database) => Some(database),
+                Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                    eprintln!("Docker unavailable, skipping secret suggestion test: {error:#}");
+                    None
+                }
+                Err(error) => panic!("secret suggestion test database setup failed: {error:#}"),
+            }
+        }
+
+        async fn insert_project(test_db: &TestDatabase) -> i32 {
+            projects::ActiveModel {
+                name: Set("Shop".to_string()),
+                slug: Set("shop".to_string()),
+                repo_name: Set("shop".to_string()),
+                repo_owner: Set("operator".to_string()),
+                directory: Set("/".to_string()),
+                main_branch: Set("main".to_string()),
+                preset: Set(Preset::Nixpacks),
+                ..Default::default()
+            }
+            .insert(test_db.connection())
+            .await
+            .unwrap()
+            .id
+        }
+
+        async fn listed_suggestion(
+            service: &EnvVarService,
+            project_id: i32,
+        ) -> Option<SecretSuggestionReason> {
+            let vars = service
+                .get_environment_variables(project_id, None)
+                .await
+                .unwrap();
+            assert_eq!(vars.len(), 1);
+            vars[0].secret_suggestion
+        }
+
+        #[tokio::test]
+        async fn dismissal_lasts_until_the_value_changes_and_promotion_clears_it() {
+            let Some(test_db) = test_database().await else {
+                return;
+            };
+            let project_id = insert_project(&test_db).await;
+            let service = EnvVarService::new(
+                test_db.connection_arc(),
+                Arc::new(EncryptionService::new(ENCRYPTION_KEY).unwrap()),
+            );
+
+            let created = service
+                .create_environment_variable(
+                    project_id,
+                    vec![],
+                    "DATABASE_URL".to_string(),
+                    "postgres://app:hunter2@db/app".to_string(),
+                    false,
+                    false,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                created.secret_suggestion,
+                Some(SecretSuggestionReason::ConnectionStringPassword),
+                "the create response tells the caller straight away"
+            );
+            assert_eq!(
+                listed_suggestion(&service, project_id).await,
+                created.secret_suggestion
+            );
+
+            let before = env_vars::Entity::find_by_id(created.id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            let key = service
+                .dismiss_secret_suggestion(project_id, created.id)
+                .await
+                .unwrap();
+            assert_eq!(key, "DATABASE_URL");
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
+            let after = env_vars::Entity::find_by_id(created.id)
+                .one(test_db.connection())
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                after.updated_at, before.updated_at,
+                "dismissing is not an edit of the variable"
+            );
+
+            // Changing something other than the value keeps the dismissal.
+            let kept = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    None,
+                    vec![],
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(kept.var.secret_suggestion, None);
+
+            // So does re-sending the same value, which the console's edit
+            // dialog does after revealing it.
+            let resent = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    Some("postgres://app:hunter2@db/app".to_string()),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resent.var.secret_suggestion, None);
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
+
+            // A new value is judged afresh.
+            let changed = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    Some("postgres://app:rotated@db/app".to_string()),
+                    vec![],
+                    true,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                changed.var.secret_suggestion,
+                Some(SecretSuggestionReason::ConnectionStringPassword)
+            );
+            assert_eq!(
+                listed_suggestion(&service, project_id).await,
+                Some(SecretSuggestionReason::ConnectionStringPassword)
+            );
+
+            let promoted = service
+                .update_environment_variable(
+                    project_id,
+                    created.id,
+                    "DATABASE_URL".to_string(),
+                    None,
+                    vec![],
+                    true,
+                    Some(true),
+                )
+                .await
+                .unwrap();
+            assert_eq!(promoted.var.secret_suggestion, None);
+            assert_eq!(listed_suggestion(&service, project_id).await, None);
+            assert!(matches!(
+                service
+                    .dismiss_secret_suggestion(project_id, created.id)
+                    .await,
+                Err(EnvVarError::InvalidInput(_))
+            ));
         }
     }
 }

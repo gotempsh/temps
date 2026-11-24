@@ -8,11 +8,9 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { ProviderCatalogDto } from '@/api/client'
 import { HarnessSetupRow } from './AgentSandboxProvidersList'
 import { ProviderEditor } from './AgentSandboxProviderDetail'
-import { WorkspaceHarnessSetup } from '@/components/ai-first/WorkspaceHarnessSetup'
 import { SetupWizardShell } from '@/components/project/setup/SetupWizardShell'
 import {
   harnessSetupHref,
-  harnessSectionHref,
   harnessCheckError,
   harnessSetupStatus,
   harnessConnectionMethods,
@@ -20,7 +18,6 @@ import {
   openAiCompatibleCredential,
   openAiCompatibleModelSelection,
   openAiCompatibleUpstreamModel,
-  workspaceReturnTo,
   credentialVerificationMessage,
 } from './harness-onboarding'
 
@@ -75,7 +72,6 @@ describe('harness onboarding', () => {
               credential_saved: true,
             }}
             isActive={false}
-            embedded
           />
         </MemoryRouter>
       </QueryClientProvider>
@@ -84,31 +80,18 @@ describe('harness onboarding', () => {
     expect(html).toContain('Verify saved login')
     expect(html).toContain('not verified')
   })
-  test('section navigation preserves only an allowlisted workspace return path', () => {
-    const returnTo = '/ai-first?application=example&thread=example-thread'
-    for (const path of [
-      '/agent-sandbox',
-      '/agent-sandbox/providers',
-      '/agent-sandbox/sandbox',
-      '/agent-sandbox/preview',
-      '/agent-sandbox/secrets',
-    ]) {
-      const href = harnessSectionHref(
-        path,
-        `?returnTo=${encodeURIComponent(returnTo)}&credential=ignored`
-      )
-      expect(
-        new URL(href, 'https://temps.invalid').searchParams.get('returnTo')
-      ).toBe(returnTo)
-      expect(href).not.toContain('credential')
-      expect(harnessSectionHref(path, '')).toBe(path)
-      expect(
-        new URL(
-          harnessSectionHref(path, '?returnTo=https://example.com'),
-          'https://temps.invalid'
-        ).searchParams.get('returnTo')
-      ).toBe('/ai-first')
-    }
+  test('setup links carry only a safe in-app return path', () => {
+    expect(harnessSetupHref(null)).toBe('/agent-sandbox/providers')
+    expect(harnessSetupHref('claude_cli')).toBe(
+      '/agent-sandbox/providers/claude_cli'
+    )
+    const returnTo = '/projects/demo/settings/automation?section=autofixer'
+    const link = new URL(
+      harnessSetupHref('claude_cli', returnTo),
+      'https://temps.invalid'
+    )
+    expect(link.pathname).toBe('/agent-sandbox/providers/claude_cli')
+    expect(link.searchParams.get('returnTo')).toBe(returnTo)
   })
   test('Codex shows one method at a time and prefers a detected host login', () => {
     const codex: ProviderCatalogDto = {
@@ -340,122 +323,6 @@ describe('harness onboarding', () => {
     expect(html).not.toContain('max-w-3xl')
   })
 
-  test('connection step does not show model controls or ask for a first prompt', () => {
-    const html = renderToStaticMarkup(
-      <QueryClientProvider client={new QueryClient()}>
-        <MemoryRouter>
-          <WorkspaceHarnessSetup
-            provider={{
-              ...provider,
-              auth_flavors: [
-                {
-                  id: 'oauth',
-                  label: 'Subscription (OAuth)',
-                  description: 'Use a subscription token.',
-                  format: 'oauth_token',
-                  env_var: null,
-                },
-                {
-                  id: 'api_key',
-                  label: 'API Key',
-                  description: 'Use an API key.',
-                  format: 'api_key',
-                  env_var: null,
-                },
-              ],
-            }}
-            mode="connection"
-            selection={{
-              providerId: provider.id,
-              modelId: null,
-              thinkingOptionId: null,
-              permissionModeId: null,
-            }}
-            onChange={() => {}}
-          />
-        </MemoryRouter>
-      </QueryClientProvider>
-    )
-    expect(html).toContain('Connect once. Reuse this account')
-    expect(html).toContain('aria-label="Connection method"')
-    expect(html).toContain('Subscription (OAuth)')
-    expect(html).toContain('API Key')
-    expect(html).toContain('Use a subscription token.')
-    expect(html).toContain('id="cred-claude_cli"')
-    expect(html).not.toContain('Login on this server')
-    // Tuning and diagnostics stay on the harness page, out of the wizard.
-    expect(html).not.toContain('Advanced')
-    expect(html).not.toContain('Check setup')
-    expect(html).not.toContain('Default model')
-    expect(html).not.toContain('workspace-prompt')
-    expect(html).not.toContain('Back to workspace')
-  })
-
-  test('a saved connection is a one-line summary in the wizard, not a form', () => {
-    const html = renderToStaticMarkup(
-      <QueryClientProvider client={new QueryClient()}>
-        <MemoryRouter>
-          <WorkspaceHarnessSetup
-            provider={{
-              ...provider,
-              auth_flavors: [
-                {
-                  id: 'subscription',
-                  label: 'Claude subscription',
-                  description: 'Paste a token.',
-                  format: 'oauth_token',
-                  env_var: null,
-                },
-              ],
-              credential_saved: true,
-              credential_verification_status: 'verified',
-              current_auth_type: 'subscription',
-              workspace_ready: true,
-            }}
-            mode="connection"
-            selection={{
-              providerId: provider.id,
-              modelId: null,
-              thinkingOptionId: null,
-              permissionModeId: null,
-            }}
-            onChange={() => {}}
-          />
-        </MemoryRouter>
-      </QueryClientProvider>
-    )
-    expect(html).toContain('Connected')
-    expect(html).toContain('Claude subscription')
-    expect(html).toContain('Replace')
-    expect(html).not.toContain('id="cred-claude_cli"')
-    expect(html).not.toContain('Use saved Claude Code connection')
-  })
-
-  test('model step does not ask for credentials again', () => {
-    const html = renderToStaticMarkup(
-      <QueryClientProvider client={new QueryClient()}>
-        <WorkspaceHarnessSetup
-          provider={{
-            ...provider,
-            workspace_ready: true,
-            credential_saved: true,
-          }}
-          mode="model"
-          selection={{
-            providerId: provider.id,
-            modelId: null,
-            thinkingOptionId: null,
-            permissionModeId: null,
-          }}
-          onChange={() => {}}
-        />
-      </QueryClientProvider>
-    )
-    expect(html).toContain('Models unavailable')
-    expect(html).toContain('Thinking')
-    expect(html).not.toContain('Save credential')
-  })
-
   test('keeps underlying problem, network, and proxy errors visible', () => {
     expect(harnessCheckError({ detail: 'Credential expired' })).toBe(
       'Credential expired'
@@ -478,34 +345,19 @@ describe('harness onboarding', () => {
     ).toBe('Needs attention')
   })
 
-  test('returns to the original workspace and thread after setup', () => {
-    const destination =
-      '/ai-first?application=app_example&thread=thread_example'
-    expect(workspaceReturnTo(destination)).toBe(destination)
-    const link = new URL(
-      harnessSetupHref('claude_cli', destination),
-      'https://temps.invalid'
-    )
-    expect(link.pathname).toBe('/agent-sandbox/providers/claude_cli')
-    expect(link.searchParams.get('returnTo')).toBe(destination)
-  })
-
-  test('rejects external, malformed, and unrelated setup return paths', () => {
+  test('drops external and malformed return paths instead of forwarding them', () => {
     for (const value of [
       null,
       '//example.com',
       'https://example.com',
       '/\\example.com',
-      '/settings',
-      '/workspaces/../../settings',
-      '/ai-first\n',
+      '/projects\n',
       'javascript:alert(1)',
     ]) {
-      expect(workspaceReturnTo(value)).toBe('/ai-first')
+      expect(harnessSetupHref('claude_cli', value)).toBe(
+        '/agent-sandbox/providers/claude_cli'
+      )
     }
-    expect(workspaceReturnTo('/workspaces/app_example')).toBe(
-      '/workspaces/app_example'
-    )
   })
 
   const renderRow = (row: ProviderCatalogDto) =>
@@ -513,7 +365,7 @@ describe('harness onboarding', () => {
       <MemoryRouter>
         <table>
           <tbody>
-            <HarnessSetupRow provider={row} returnTo="/ai-first" />
+            <HarnessSetupRow provider={row} />
           </tbody>
         </table>
       </MemoryRouter>
@@ -550,9 +402,7 @@ describe('harness onboarding', () => {
     })
     expect(html).toContain('<tr')
     expect(html).toContain('aria-label="Manage Claude Code"')
-    expect(html).toContain(
-      `href="${harnessSetupHref('claude_cli', '/ai-first')}"`
-    )
+    expect(html).toContain(`href="${harnessSetupHref('claude_cli')}"`)
     expect(html).toContain('Claude subscription')
     expect(html).toContain('Credential saved')
     // The name is the only link: no separate Connect/Manage button.
@@ -609,5 +459,37 @@ describe('harness onboarding', () => {
     )
     expect(html).toContain('Model to verify')
     expect(html).not.toContain('reusable credential is never injected')
+  })
+
+  test('a setup link carries a return path only when one is given and safe', () => {
+    expect(harnessSetupHref('claude_cli', null)).toBe(
+      '/agent-sandbox/providers/claude_cli'
+    )
+    expect(harnessSetupHref(null, 'https://example.com')).toBe(
+      '/agent-sandbox/providers'
+    )
+    const returnTo = '/projects/demo/settings/automation'
+    expect(harnessSetupHref(null, returnTo)).toBe(
+      `/agent-sandbox/providers?returnTo=${encodeURIComponent(returnTo)}`
+    )
+  })
+
+  test('harness setup only offers a way back when it was opened from a task', () => {
+    const editor = (returnTo?: string | null) =>
+      renderToStaticMarkup(
+        <QueryClientProvider client={new QueryClient()}>
+          <MemoryRouter>
+            <ProviderEditor
+              provider={provider}
+              isActive={false}
+              returnTo={returnTo}
+            />
+          </MemoryRouter>
+        </QueryClientProvider>
+      )
+    expect(editor()).not.toContain('>Back<')
+    const back = editor('/projects/demo/settings/automation')
+    expect(back).toContain('>Back<')
+    expect(back).toContain('href="/projects/demo/settings/automation"')
   })
 })

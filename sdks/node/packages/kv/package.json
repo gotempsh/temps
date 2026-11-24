@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/kv",
-  "version": "0.0.4",
+  "version": "0.0.5-beta.1",
   "description": "Key-Value store SDK for Temps platform",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -44,5 +44,10 @@
   },
   "engines": {
     "node": ">=18.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/kv"
   }
 }

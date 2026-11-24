@@ -19,6 +19,14 @@
 //! `list_metric_names`) read/write only ClickHouse and never touch the inner
 //! Postgres storage. No Postgres container is required.
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -89,11 +97,13 @@ async fn start_ch_container() -> Option<(ClickHouseOtelConfig, Box<dyn std::any:
     let config = ClickHouseOtelConfig::new(&url, "temps_otel_test", "default", "test");
 
     // A bare client for the migration runner + readiness probe.
-    let probe = ::clickhouse::Client::default()
-        .with_url(&url)
-        .with_database("temps_otel_test")
-        .with_user("default")
-        .with_password("test");
+    let probe = temps_clickhouse::build_client(
+        &url,
+        "temps_otel_test",
+        "default",
+        "test",
+        temps_clickhouse::ClickHouseCompression::Lz4,
+    );
 
     // Wait until the HTTP listener actually accepts queries.
     let mut last_err = String::new();

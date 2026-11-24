@@ -3,6 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use temps_core::secret_string::SecretString;
 use utoipa::ToSchema;
 
 /// Derive a stable URL slug for an OIDC provider that can be shown to
@@ -83,12 +84,12 @@ pub struct OidcProviderResponse {
     pub managed_by_cloud: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct CreateOidcProviderRequest {
     pub name: String,
     pub issuer_url: String,
     pub client_id: String,
-    pub client_secret: String,
+    pub client_secret: SecretString,
     #[serde(default = "default_scopes")]
     pub scopes: String,
     #[serde(default = "default_true")]
@@ -136,12 +137,12 @@ fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[derive(Debug, Clone, Deserialize, ToSchema)]
 pub struct UpdateOidcProviderRequest {
     pub name: Option<String>,
     pub issuer_url: Option<String>,
     pub client_id: Option<String>,
-    pub client_secret: Option<String>,
+    pub client_secret: Option<SecretString>,
     pub scopes: Option<String>,
     pub jit_provisioning: Option<bool>,
     pub enabled: Option<bool>,
@@ -337,6 +338,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

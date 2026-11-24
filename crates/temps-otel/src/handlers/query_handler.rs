@@ -23,7 +23,7 @@ use crate::services::cross_project::is_valid_trace_id;
 use crate::services::{CrossProjectTraceError, SiblingRef, UnifiedTrace};
 use crate::types::*;
 use crate::OtelAppState;
-use temps_auth::{
+use temps_authz::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
@@ -149,6 +149,30 @@ pub struct SpanStatsQueryParams {
     pub sort_order: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Apdex threshold `T` in milliseconds (default
+    /// [`DEFAULT_APDEX_THRESHOLD_MS`]): spans at or under `T` satisfy, up to
+    /// `4T` tolerate, slower ones frustrate.
+    pub apdex_threshold_ms: Option<f64>,
+}
+
+/// The Apdex threshold when the caller names none: half a second, the
+/// conventional default for a web request.
+pub const DEFAULT_APDEX_THRESHOLD_MS: f64 = 500.0;
+/// The largest Apdex threshold accepted: ten minutes.
+pub const MAX_APDEX_THRESHOLD_MS: f64 = 600_000.0;
+
+/// The Apdex threshold to score with, or a 400 naming the bad value.
+fn apdex_threshold(requested: Option<f64>) -> Result<f64, Problem> {
+    let threshold = requested.unwrap_or(DEFAULT_APDEX_THRESHOLD_MS);
+    if !threshold.is_finite() || threshold <= 0.0 || threshold > MAX_APDEX_THRESHOLD_MS {
+        return Err(temps_core::error_builder::bad_request()
+            .title("Invalid Apdex threshold")
+            .detail(format!(
+                "apdex_threshold_ms must be greater than 0 and at most {MAX_APDEX_THRESHOLD_MS}, got {threshold}"
+            ))
+            .build());
+    }
+    Ok(threshold)
 }
 
 /// Response for `GET /otel/span-stats`.
@@ -339,7 +363,7 @@ pub struct GenAiQueryParams {
     pub end_time: Option<String>,
     /// Filter by gen_ai.system (e.g. "openai", "anthropic").
     pub gen_ai_system: Option<String>,
-    /// Filter by gen_ai.request.model (e.g. "gpt-4", "claude-sonnet-4-20250514").
+    /// Filter by gen_ai.request.model (e.g. "gpt-6.2-sol", "claude-sonnet-5-5").
     pub gen_ai_model: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -732,6 +756,7 @@ pub async fn query_traces(
     });
 
     let query = TraceQuery {
+        attribute_path: None,
         project_id: params.project_id,
         trace_id: params.trace_id,
         service_name: params.service_name,
@@ -818,6 +843,7 @@ pub async fn query_trace_summaries(
     )?;
 
     let query = TraceQuery {
+        attribute_path: None,
         project_id: params.project_id,
         trace_id: params.trace_id,
         service_name: params.service_name,
@@ -944,6 +970,7 @@ pub async fn query_trace_summaries(
         ("sort_order" = Option<String>, Query, description = "asc | desc (default)"),
         ("limit" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
         ("offset" = Option<u64>, Query, description = "Page offset"),
+        ("apdex_threshold_ms" = Option<f64>, Query, description = "Apdex threshold T in ms (default 500, at most 600000): at or under T satisfies, up to 4T tolerates"),
     ),
     responses(
         (status = 200, description = "Per-operation latency statistics", body = SpanStatsResponse),
@@ -960,6 +987,7 @@ pub async fn query_span_stats(
     Query(params): Query<SpanStatsQueryParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, OtelRead);
+    let apdex_threshold_ms = apdex_threshold(params.apdex_threshold_ms)?;
 
     let (start_time, end_time) =
         discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
@@ -1043,6 +1071,7 @@ pub async fn query_span_stats(
             .unwrap_or_default(),
         limit: params.limit,
         offset: params.offset,
+        apdex_threshold_ms: Some(apdex_threshold_ms),
     };
 
     // The count ignores limit/offset but must keep every other filter, or the
@@ -1668,7 +1697,7 @@ pub async fn get_ingest_errors(
         ("project_id" = i32, Query, description = "Project ID"),
         ("service_name" = Option<String>, Query, description = "Filter by service name"),
         ("gen_ai_system" = Option<String>, Query, description = "Filter by AI system (openai, anthropic, etc.)"),
-        ("gen_ai_model" = Option<String>, Query, description = "Filter by model (gpt-4, claude-sonnet-4-20250514, etc.)"),
+        ("gen_ai_model" = Option<String>, Query, description = "Filter by model (gpt-6.2-sol, claude-sonnet-5-5, etc.)"),
         ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
@@ -1912,13 +1941,13 @@ pub struct CrossProjectSiblingsParams {
 /// team model in OSS to scope against. Infrastructure errors from the checker
 /// drop the project (fail closed) rather than disclosing its spans.
 async fn readable_project_ids(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     state: &OtelAppState,
     project_ids: impl IntoIterator<Item = i32>,
 ) -> std::collections::HashSet<i32> {
     let project_ids: std::collections::HashSet<i32> = project_ids.into_iter().collect();
 
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin) {
         return project_ids;
     }
     let Some(checker) = state.project_access_checker.as_deref() else {
@@ -2198,6 +2227,31 @@ mod tests {
     use super::*;
 
     use crate::services::cross_project::{AnnotatedSpan, ProjectRef};
+
+    #[test]
+    fn apdex_threshold_defaults_to_half_a_second_and_rejects_nonsense() {
+        assert_eq!(apdex_threshold(None).unwrap(), DEFAULT_APDEX_THRESHOLD_MS);
+        assert_eq!(apdex_threshold(Some(250.0)).unwrap(), 250.0);
+        assert_eq!(
+            apdex_threshold(Some(MAX_APDEX_THRESHOLD_MS)).unwrap(),
+            MAX_APDEX_THRESHOLD_MS
+        );
+        for bad in [
+            0.0,
+            -1.0,
+            f64::NAN,
+            f64::INFINITY,
+            MAX_APDEX_THRESHOLD_MS + 1.0,
+        ] {
+            let problem = apdex_threshold(Some(bad)).expect_err("rejected");
+            assert_eq!(problem.status_code, axum::http::StatusCode::BAD_REQUEST);
+            let detail = problem.body.get("detail").and_then(|d| d.as_str());
+            assert!(
+                detail.is_some_and(|d| d.contains("apdex_threshold_ms")),
+                "detail names the parameter: {detail:?}"
+            );
+        }
+    }
     use crate::types::{SpanKind, SpanRecord, SpanStatusCode};
     use std::collections::{BTreeMap, HashSet};
 

@@ -51,7 +51,7 @@ export function ApiKeyEditModal({
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="sm:max-w-[550px]">
         <DialogHeader>
-          <DialogTitle>Edit API Key</DialogTitle>
+          <DialogTitle>Edit API key</DialogTitle>
           <DialogDescription>
             Update the details of your API key. Note that permissions cannot be
             changed after creation.
@@ -78,6 +78,13 @@ export function ApiKeyEditModal({
               <Label htmlFor="edit-is_active">Active</Label>
             </div>
 
+            <p className="text-sm text-muted-foreground">
+              Scope:{' '}
+              {apiKey?.project_id
+                ? `Project #${apiKey.project_id}${apiKey.environment_id ? ` · Environment #${apiKey.environment_id}` : ' · All environments'}`
+                : 'Account-wide'}
+              . To change scope, revoke this key and create another.
+            </p>
             <div className="space-y-2">
               <Label htmlFor="edit-expires_at">
                 Expiration Date (optional)

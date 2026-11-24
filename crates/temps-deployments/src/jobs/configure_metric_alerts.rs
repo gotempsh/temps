@@ -20,14 +20,18 @@
 //! - Project-scoped rules (`environment_id = NULL`) are never touched by this
 //!   job — they remain exclusively under UI/API control.
 
+use crate::workflow::JobResult;
+use crate::workflow::WorkflowContext;
+use crate::workflow::WorkflowError;
+use crate::workflow::WorkflowTask;
 use async_trait::async_trait;
 use sea_orm::EntityTrait;
 use std::path::Path;
 use std::sync::Arc;
-use temps_core::{JobResult, TempsConfig, WorkflowContext, WorkflowError, WorkflowTask};
+use temps_core::TempsConfig;
 use temps_database::DbConnection;
+use temps_deployment_logs::{LogLevel, LogService};
 use temps_entities::projects;
-use temps_logs::{LogLevel, LogService};
 use tracing::warn;
 
 use crate::jobs::temps_yaml::{read_temps_yaml, TempsYamlLookup};

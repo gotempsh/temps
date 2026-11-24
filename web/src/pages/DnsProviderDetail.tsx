@@ -4,6 +4,7 @@
 import {
   addManagedDomain,
   applyHostnameMode,
+  createIngressConnector,
   deleteDnsProvider as deleteProvider,
   getDnsProvider as getProvider,
   listManagedDomains,
@@ -56,6 +57,14 @@ import {
   requireDeliveryData,
 } from '@/components/domains/delivery-errors'
 import { HostnameConflictList } from '@/components/domains/HostnameConflictList'
+import {
+  NO_ZONE_TUNNEL,
+  ZoneTunnelChoice,
+  tunnelKindFor,
+  tunnelNameFor,
+  type ZoneTunnel,
+} from '@/components/domains/ZoneTunnelChoice'
+import { problemDetail } from '@/lib/api-problem'
 import {
   conflictDecisionsRequest,
   conflictKey,
@@ -243,6 +252,7 @@ export default function DnsProviderDetail() {
   const [isEditDialogOpen, setIsEditDialogOpen] = useState(false)
   const [isDeleteDialogOpen, setIsDeleteDialogOpen] = useState(false)
   const [isAddDomainDialogOpen, setIsAddDomainDialogOpen] = useState(false)
+  const [zoneTunnel, setZoneTunnel] = useState<ZoneTunnel>(NO_ZONE_TUNNEL)
   const [domainToRemove, setDomainToRemove] =
     useState<ManagedDomainResponse | null>(null)
 
@@ -377,12 +387,40 @@ export default function DnsProviderDetail() {
           sync_generated_records: data.proxied_by_default,
         },
       })
-      return requireDeliveryData(response)
+      requireDeliveryData(response)
+      // ADR 058 D10: the tunnel for the zone, created right after it. The
+      // zone stays added if this fails; the message says where to retry.
+      const kind = provider ? tunnelKindFor(provider.provider_type) : undefined
+      if (zoneTunnel.mode !== 'tunnel' || !kind) return { tunnelError: null }
+      const tunnel = await createIngressConnector({
+        body: {
+          name: tunnelNameFor(data.domain),
+          provider: kind,
+          values: { dns_provider_id: providerId, domain: data.domain },
+          node_ids: zoneTunnel.nodeIds,
+        },
+      })
+      return {
+        tunnelError: tunnel.error
+          ? problemDetail(tunnel.error, 'The provider refused the tunnel.')
+          : null,
+      }
     },
-    onSuccess: () => {
-      toast.success('Zone added successfully')
+    onSuccess: ({ tunnelError }) => {
+      if (tunnelError) {
+        toast.warning('Zone added, but its tunnel was not created', {
+          description: `${tunnelError} Set it up from a worker's page.`,
+        })
+      } else {
+        toast.success(
+          zoneTunnel.mode === 'tunnel'
+            ? 'Zone and tunnel added. Apps under it go live through the tunnel.'
+            : 'Zone added successfully'
+        )
+      }
       refetchDomains()
       setIsAddDomainDialogOpen(false)
+      setZoneTunnel(NO_ZONE_TUNNEL)
       addDomainForm.reset()
     },
     onError: (err: Error) => {
@@ -596,7 +634,7 @@ export default function DnsProviderDetail() {
   useEffect(() => {
     if (provider) {
       setBreadcrumbs([
-        { label: 'DNS Providers', href: '/dns-providers' },
+        { label: 'DNS providers', href: '/dns-providers' },
         { label: provider.name },
       ])
     }
@@ -651,7 +689,7 @@ export default function DnsProviderDetail() {
               busyLabel="Testing…"
             >
               <TestTube2 className="mr-2 size-4" />
-              Test Connection
+              Test connection
             </Button>
             <Button
               variant="outline"
@@ -761,7 +799,7 @@ export default function DnsProviderDetail() {
                                 className="flex items-center gap-1"
                               >
                                 <XCircle className="h-3 w-3" />
-                                Not Verified
+                                Not verified
                               </Badge>
                             )}
                             {domain.auto_manage && (
@@ -961,7 +999,7 @@ export default function DnsProviderDetail() {
             {zones && zones.zones.length > 0 && (
               <Card>
                 <CardHeader>
-                  <CardTitle>Available Zones</CardTitle>
+                  <CardTitle>Available zones</CardTitle>
                   <CardDescription>
                     DNS zones available in this provider account
                   </CardDescription>
@@ -1141,7 +1179,7 @@ export default function DnsProviderDetail() {
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>
         <DialogContent>
           <DialogHeader>
-            <DialogTitle>Edit DNS Provider</DialogTitle>
+            <DialogTitle>Edit DNS provider</DialogTitle>
             <DialogDescription>Update the provider settings</DialogDescription>
           </DialogHeader>
           <Form {...editForm}>
@@ -1244,7 +1282,7 @@ export default function DnsProviderDetail() {
                   busy={updateProviderMut.isPending}
                   busyLabel="Saving…"
                 >
-                  Save Changes
+                  Save
                 </Button>
               </DialogFooter>
             </form>
@@ -1358,6 +1396,12 @@ export default function DnsProviderDetail() {
                 )}
               />
 
+              <ZoneTunnelChoice
+                providerType={provider.provider_type}
+                value={zoneTunnel}
+                onChange={setZoneTunnel}
+              />
+
               <DialogFooter>
                 <Button
                   type="button"
@@ -1371,11 +1415,13 @@ export default function DnsProviderDetail() {
                   busy={addDomainMut.isPending}
                   busyLabel="Adding…"
                   disabled={
-                    providerSupportsZoneSelection &&
-                    (zonesPending ||
-                      zonesError ||
-                      selectableZones.length === 0 ||
-                      !addDomainForm.watch('domain'))
+                    (zoneTunnel.mode === 'tunnel' &&
+                      zoneTunnel.nodeIds.length === 0) ||
+                    (providerSupportsZoneSelection &&
+                      (zonesPending ||
+                        zonesError ||
+                        selectableZones.length === 0 ||
+                        !addDomainForm.watch('domain')))
                   }
                 >
                   Add zone

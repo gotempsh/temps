@@ -18,6 +18,8 @@ API itself works, but they never exercise `apps/temps-cli` at all.
 argv parsing, Commander's command wiring, and stdout/`--json` formatting
 actually work — exactly what breaks an agent running `bunx @temps-sdk/cli
 ...` even when the underlying API is fine. See its section below.
+`edge-rules-scenario` drives the real CLI the same way, and checks every
+rule against live requests through the proxy.
 
 Every `*-scenario` command follows the same shape: build/deploy whatever
 real infrastructure the feature needs (never synthetic DB rows), drive it
@@ -156,6 +158,10 @@ bun run src/index.ts email-scenario --json                      # machine-readab
 # every step against the same live instance.
 bun run src/index.ts cli-scenario
 bun run src/index.ts cli-scenario --image traefik/whoami:latest --json  # machine-readable (CI)
+
+# Edge rules through the real CLI against a deployed app, checked with live
+# requests through the proxy (log-only, enforce, apply, delete).
+bun run src/index.ts edge-rules-scenario --image traefik/whoami:latest --port 80
 
 # kv-storage: real Redis-backed data-plane round trip (no console UI exists
 # for this feature beyond an enabled/healthy badge).
@@ -402,6 +408,33 @@ any normal dev-slot instance works, as long as it's launched with
 
 Verified passing (3x back-to-back): real SMTP send → real receipt in Mailpit
 → real open/click tracking-pixel and redirect hits → real `email_events` rows.
+
+### `edge-rules-scenario` steps
+
+Rules are managed with the real CLI (`src/lib/cli-exec.ts`); every claim
+about enforcement is checked with an HTTP request through the instance's
+proxy to the deployed app, never by reading the API back:
+
+1. deploy a public image (`traefik/whoami`, which answers 200 on any path)
+   and wait until the proxy serves it
+2. `edge-rules create` a block rule on `/admin` without `--mode`: it must
+   come back log-only, `/admin` must keep reaching the app, and the rule's
+   match count (`edge-rules list --json`) must climb, which proves the proxy
+   loaded and evaluated it
+3. `edge-rules test` reports the log-only match without a decision
+4. `edge-rules enforce`: `/ADMIN/users` gets the rule's 403 and body, `/`
+   still reaches the app, the ACME challenge path is not evaluated, and a
+   raw `/.well-known/acme-challenge/../../admin` (sent over a socket so the
+   dot segments reach the proxy) is still blocked
+5. `edge-rules export`, add a redirect rule, `apply --dry-run` (one create),
+   `apply --yes`; the order follows the file, the existing rule keeps its
+   id, `/old?page=2` answers 308 to `/new?page=2`, and a second
+   `apply --dry-run` has nothing to do
+6. `edge-rules delete` every rule; `/admin` reaches the app again
+7. tear down the deployment and project unless `--keep`
+
+Rule changes reach the proxy within about 5 s and match counts within
+about 10 s; each live check polls for up to 45 s.
 
 ### `cli-scenario` steps
 
@@ -726,8 +759,9 @@ container, which no deploy response exposes.
 7. confirm `has_events` is now `true`
 
 **Real gap found and fixed** (see `chore(sdk): regenerate @temps-sdk/api`):
-`packages/api/openapi.json` — the source for the SDK this entire suite
-depends on — had drifted to 590 of the live server's 674 paths. The whole
+the spec copy that then fed the SDK this entire suite depends on (since
+removed; `packages/api` now generates from `apps/temps-cli/openapi.json`) had
+drifted to 590 of the live server's 674 paths. The whole
 `temps-analytics` query surface used by this scenario
 (`getEventEntries`/`checkAnalyticsHasEvents`/`getVisitorJourney`/etc.) was
 unreachable from any TypeScript consumer until the SDK was regenerated from
@@ -818,6 +852,10 @@ archiving was off. Made a no-op after the first backup on a given service
 every single backup. Confirmed live 3x, including that the second and third
 backups on the same service skip the archiving setup entirely (faster
 restore, no extra container recreate).
+
+### `postgres-cross-server-recovery-scenario`
+
+From `apps/temps-e2e`, run `TEMPS_BIN=/path/to/temps bun run e2e postgres-cross-server-recovery-scenario`. With Docker available, the scenario starts two disposable Temps servers with independent catalogs and one MinIO bucket. It writes 500 MiB to PostgreSQL, takes two WAL-G backups, and restores the older snapshot on the second server. It checks the row count, byte count, checksum, and absence of a table created between backups. The recovery CI shard runs the same command.
 
 ### `pitr-scenario` steps
 

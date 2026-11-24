@@ -9,6 +9,8 @@ import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
 import { projectSourceAction } from './source.js'
 import { projectHostingAction } from './hosting.js'
+import { projectContainerSecurityAction } from './container-security.js'
+import { projectIdenticalBuildsAction } from './identical-builds.js'
 import { projectGroupAction } from './group.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 import { cloudflareCapabilityAction } from './cloudflare-capability.js'
@@ -154,6 +156,27 @@ export function registerProjectsCommands(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('--json', 'Output in JSON format')
     .action(projectHostingAction)
+
+  projects
+    .command('container-security')
+    .description('Show or change which Linux capabilities the project\'s deployment containers get back (only NET_BIND_SERVICE can be allowed; Compose services and microVMs are not affected)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--allow <capabilities...>', 'Allow these capabilities, e.g. NET_BIND_SERVICE (asks for confirmation)')
+    .option('--remove <capabilities...>', 'Stop allowing these capabilities')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip the confirmation (for automation)')
+    .action(projectContainerSecurityAction)
+
+  projects
+    .command('identical-builds')
+    .description(
+      'Show or change what the project\'s builds do when an identical build (same repository, commit, build path and build-time values) is already running: build in parallel, queue, or build once and share the image'
+    )
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--mode <mode>', 'parallel (default), queue or share')
+    .option('--scope <scope>', 'Which builds wait for each other: source (same repository and path, the default) or fingerprint (only identical builds)')
+    .option('--json', 'Output in JSON format')
+    .action(projectIdenticalBuildsAction)
 
   projects
     .command('config')

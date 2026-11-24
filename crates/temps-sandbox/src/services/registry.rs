@@ -4,7 +4,7 @@
 //! In-memory map from sandbox internal ID → `SandboxHandle`. Keeps live
 //! container handles for the lifetime of the server process.
 //!
-//! Separate from `temps-agents::SandboxRegistry` because (a) we own
+//! Separate from `temps_sandbox_providers::sandbox_registry::SandboxRegistry` because (a) we own
 //! lifecycle differently (standalone sandboxes don't tie to agent runs)
 //! and (b) `release` here marks the DB row "destroyed" rather than
 //! deleting per-run data.
@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, RwLock};
 
-use temps_agents::error::AgentError;
-use temps_agents::sandbox::{
+use temps_agent_core::error::AgentError;
+use temps_sandbox_providers::{
     user::SANDBOX_CHOWN, RuntimeCompatibility, SandboxCreateConfig, SandboxHandle, SandboxProvider,
 };
 
@@ -51,8 +51,8 @@ pub enum VmProbe {
 /// the service's whole control group (systemd's default) or a host reboot takes
 /// them down; Docker containers and local processes are not, so that guess
 /// would be wrong for them.
-fn not_running_reason(backend: temps_agents::sandbox::SandboxBackend) -> String {
-    use temps_agents::sandbox::SandboxBackend;
+fn not_running_reason(backend: temps_sandbox_providers::SandboxBackend) -> String {
+    use temps_sandbox_providers::SandboxBackend;
     match backend {
         SandboxBackend::Firecracker | SandboxBackend::Microsandbox => format!(
             "its {backend} VM process exited or was stopped (for example when the Temps service \
@@ -94,7 +94,7 @@ impl PlannedDowntime {
 }
 
 /// The lock guards are held only for their `Drop`.
-#[allow(dead_code)]
+#[allow(dead_code)] // variants hold their guard only for its Drop
 enum Claim {
     Planned(tokio::sync::OwnedRwLockWriteGuard<()>),
     Observing(tokio::sync::OwnedRwLockReadGuard<()>),
@@ -134,6 +134,12 @@ pub struct StandaloneSandboxRegistry {
     /// generation marker remains set while the future is in flight, making
     /// cancellation fail closed; concurrent callers wait here and re-check it.
     recovery_fence_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
+    /// One handle recovery per sandbox at a time. Recovering re-checks the
+    /// container's file ownership, which takes seconds on a large workspace;
+    /// requests that arrive together (a chat opening several panels after a
+    /// restart) wait for the first recovery and reuse its handle instead of
+    /// each repeating it.
+    recover_locks: Mutex<HashMap<i32, Arc<Mutex<()>>>>,
     /// Stop-then-start operations the control plane itself performs. See
     /// [`PlannedDowntime`].
     planned_downtime: Arc<PlannedDowntime>,
@@ -187,6 +193,7 @@ impl StandaloneSandboxRegistry {
             runtime_compatibility: Mutex::new(HashMap::new()),
             recovered_in_this_generation: RwLock::new(HashSet::new()),
             recovery_fence_locks: Mutex::new(HashMap::new()),
+            recover_locks: Mutex::new(HashMap::new()),
             planned_downtime: Arc::new(PlannedDowntime::default()),
             nodes,
         }
@@ -248,7 +255,7 @@ impl StandaloneSandboxRegistry {
     /// provider level (image is loaded from the tarball if not present).
     pub async fn create_from_snapshot(
         &self,
-        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_sandbox_providers::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         let id = config.run_id;
@@ -332,7 +339,7 @@ impl StandaloneSandboxRegistry {
         &self,
         id: i32,
         public_id: &str,
-        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        artifact: &temps_sandbox_providers::SnapshotArtifact,
         config: SandboxCreateConfig,
     ) -> Result<SandboxHandle, AgentError> {
         if let Ok(handle) = self.get_or_recover(id, public_id).await {
@@ -399,7 +406,23 @@ impl StandaloneSandboxRegistry {
     /// provider side returns handles for stopped sandboxes too, so lifecycle
     /// ops like `start` can act on them. Callers that need the container
     /// to be running (e.g. `exec`) must check separately.
-    async fn get_or_recover(&self, id: i32, public_id: &str) -> Result<SandboxHandle, AgentError> {
+    pub(crate) async fn get_or_recover(
+        &self,
+        id: i32,
+        public_id: &str,
+    ) -> Result<SandboxHandle, AgentError> {
+        if let Some(h) = self.handles.read().await.get(&id).cloned() {
+            return Ok(h);
+        }
+        let recover_lock = {
+            let mut locks = self.recover_locks.lock().await;
+            locks
+                .entry(id)
+                .or_insert_with(|| Arc::new(Mutex::new(())))
+                .clone()
+        };
+        let _recover_guard = recover_lock.lock().await;
+        // Whoever held the lock before us may have recovered it already.
         if let Some(h) = self.handles.read().await.get(&id).cloned() {
             return Ok(h);
         }
@@ -663,6 +686,19 @@ impl StandaloneSandboxRegistry {
         }
     }
 
+    /// Apply an egress policy to the sandbox's compute. Same recovery as
+    /// [`Self::start`]. Callers serialize it with other compute changes
+    /// through [`Self::begin_planned_downtime`].
+    pub async fn set_egress_policy(
+        &self,
+        id: i32,
+        public_id: &str,
+        policy: &temps_sandbox_providers::SandboxEgressPolicy,
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider.set_egress_policy(&handle, policy).await
+    }
+
     /// Grow the sandbox's root disk (Firecracker only). Same recovery.
     pub async fn resize_disk(
         &self,
@@ -800,8 +836,8 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temps_agents::ai_cli::OnEventCallback;
-    use temps_agents::sandbox::{SandboxExecResult, SandboxHandle};
+    use temps_agent_core::OnEventCallback;
+    use temps_sandbox_providers::{SandboxExecResult, SandboxHandle};
 
     /// What [`FakeProvider::is_alive`] answers.
     #[derive(Clone, Copy)]
@@ -920,8 +956,9 @@ mod tests {
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_sandbox_providers::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             })
         }
 
@@ -992,7 +1029,7 @@ mod tests {
             &self,
             _handle: &SandboxHandle,
             pattern: &str,
-            _signal: temps_agents::sandbox::KillSignal,
+            _signal: temps_sandbox_providers::KillSignal,
         ) -> Result<(), AgentError> {
             let _ = pattern;
             Ok(())
@@ -1075,8 +1112,9 @@ mod tests {
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_sandbox_providers::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             }))
         }
 
@@ -1158,6 +1196,33 @@ mod tests {
             vec![Some(7)]
         );
         assert_eq!(provider.stops.load(Ordering::SeqCst), 1);
+    }
+
+    /// Requests that reach a sandbox together after a restart share one
+    /// recovery instead of each re-running it.
+    #[tokio::test]
+    async fn concurrent_requests_after_a_restart_recover_the_sandbox_once() {
+        let provider = Arc::new(
+            FakeProvider::new()
+                .with_known("abc123")
+                .with_recovery_delay(Duration::from_millis(50)),
+        );
+        let reg = Arc::new(StandaloneSandboxRegistry::local_only(provider.clone()));
+
+        let lookups = (0..4).map(|_| {
+            let reg = reg.clone();
+            tokio::spawn(async move { reg.get(42, "sbx_abc123").await })
+        });
+        for lookup in futures::future::join_all(lookups).await {
+            let handle = lookup.expect("lookup task").expect("recovered handle");
+            assert_eq!(handle.sandbox_id, "docker-id-abc123");
+        }
+
+        assert_eq!(
+            provider.recovered_on.lock().expect("recovered_on").len(),
+            1,
+            "four concurrent lookups must share a single recovery"
+        );
     }
 
     /// When the hosting node cannot be looked up, recovery fails instead of
@@ -1567,8 +1632,9 @@ mod tests {
                 sandbox_id: "stale-docker-id".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_sandbox_providers::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 
@@ -1596,8 +1662,9 @@ mod tests {
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
-                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                backend: temps_sandbox_providers::SandboxBackend::Docker,
                 image: String::new(),
+                conditions: Vec::new(),
             },
         );
 
@@ -1772,6 +1839,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
@@ -1805,6 +1873,7 @@ mod tests {
             pids_limit: None,
             disk_size_mb: None,
             allow_docker: false,
+            egress_policy: Default::default(),
             network_mode: None,
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),

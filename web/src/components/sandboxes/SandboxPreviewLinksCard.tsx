@@ -65,8 +65,6 @@ interface SandboxPreviewLinksCardProps {
   destroyed: boolean
   /** Preview URLs are configured on this install. */
   configured: boolean
-  /** The sandbox runs on a worker node (no preview URLs there yet). */
-  onWorkerNode: boolean
   /** Port worth offering as a starting point. */
   suggestedPort?: number
 }
@@ -84,13 +82,11 @@ export function SandboxPreviewLinksCard({
   running,
   destroyed,
   configured,
-  onWorkerNode,
   suggestedPort,
 }: SandboxPreviewLinksCardProps) {
   const [links, setLinks] = useState<CreatedLink[]>([])
   const blocked = previewLinkBlockedReason({
     configured,
-    onWorkerNode,
     hasPassword,
     destroyed,
     running,
@@ -147,7 +143,7 @@ export function SandboxPreviewLinksCard({
             <AlertTitle>Preview links unavailable</AlertTitle>
             <AlertDescription>
               {blocked}
-              {!configured && !onWorkerNode && !destroyed && (
+              {!configured && !destroyed && (
                 <>
                   {' '}
                   <Link
@@ -158,7 +154,7 @@ export function SandboxPreviewLinksCard({
                   </Link>
                 </>
               )}
-              {configured && !onWorkerNode && !hasPassword && !destroyed && (
+              {configured && !hasPassword && !destroyed && (
                 <>
                   {' '}
                   <a

@@ -48,9 +48,9 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
   {
     id: 'openai',
     name: 'OpenAI',
-    tagline: 'GPT-5.6 family and o-series reasoning models',
-    models: 'GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, GPT-5 Nano, o3',
-    defaultModel: 'gpt-5-nano',
+    tagline: 'GPT-6 family reasoning models',
+    models: 'GPT-6.2 Sol, GPT-6.2 Astra, GPT-6.1 Terra, GPT-6 Luna',
+    defaultModel: 'gpt-6-luna',
     accentClass: 'bg-emerald-500/10 text-emerald-600 dark:text-emerald-400',
     keyDocsUrl: 'https://platform.openai.com/api-keys',
   },
@@ -58,8 +58,9 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     id: 'anthropic',
     name: 'Anthropic',
     tagline: 'Claude Opus, Sonnet, and Haiku',
-    models: 'Claude Opus 5, Claude Sonnet 5, Claude Fable 5, Claude Haiku 4.5',
-    defaultModel: 'claude-haiku-4-5',
+    models:
+      'Claude Opus 5.5, Claude Sonnet 5.5, Claude Haiku 5.5, Claude Fable 5.2',
+    defaultModel: 'claude-haiku-5-5',
     accentClass: 'bg-orange-500/10 text-orange-600 dark:text-orange-400',
     keyDocsUrl: 'https://console.anthropic.com/settings/keys',
   },
@@ -67,8 +68,8 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     id: 'xai',
     name: 'xAI',
     tagline: 'Grok reasoning and code models',
-    models: 'Grok 4.5, Grok 4.20',
-    defaultModel: 'grok-4.5',
+    models: 'Grok 4.7, Grok 4.6, Grok 4.3, Grok Build',
+    defaultModel: 'grok-4.7',
     accentClass:
       'bg-neutral-900/10 text-neutral-900 dark:bg-neutral-50/10 dark:text-neutral-50',
     keyDocsUrl: 'https://console.x.ai/team/default/api-keys',
@@ -76,8 +77,9 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
   {
     id: 'gemini',
     name: 'Google Gemini',
-    tagline: 'Gemini Pro and Flash',
-    models: 'Gemini 3.6 Flash, Gemini 3.5 Flash, Gemini 3.1 Pro',
+    tagline: 'Gemini 4 and Flash',
+    models:
+      'Gemini 4 Neon, Gemini 4 Hydrogen, Gemini 3.8 Flash, Gemini 3.5 Flash-Lite',
     defaultModel: 'gemini-3.5-flash-lite',
     accentClass: 'bg-sky-500/10 text-sky-600 dark:text-sky-400',
     keyDocsUrl: 'https://aistudio.google.com/app/apikey',
@@ -86,16 +88,17 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
     id: 'openrouter',
     name: 'OpenRouter',
     tagline: 'One key, hundreds of models from every vendor',
-    models: 'GPT-4o, Claude Sonnet 5, Llama 3.3, DeepSeek, and more',
-    defaultModel: 'openai/gpt-4o-mini',
+    models: 'GPT-6.2, Claude Sonnet 5.5, Gemini 4, DeepSeek V4, and more',
+    defaultModel: 'openai/gpt-6-luna',
     accentClass: 'bg-violet-500/10 text-violet-600 dark:text-violet-400',
     keyDocsUrl: 'https://openrouter.ai/keys',
   },
   {
     id: 'openai_compatible',
-    name: 'Self-hosted (OpenAI-compatible)',
-    tagline: 'MLX, vLLM, llama.cpp, LM Studio or Ollama on your own network',
-    models: 'Whatever models your server lists at /v1/models',
+    name: 'OpenAI-compatible',
+    tagline:
+      'Any API that speaks the OpenAI protocol: DeepSeek, Groq, Together, or vLLM, Ollama and LM Studio on your network',
+    models: 'Whatever models the server lists at /v1/models',
     // Placeholder for code snippets; a configured key's own default model
     // is used instead when there is one.
     defaultModel: 'your-model-id',
@@ -107,6 +110,19 @@ export const AI_PROVIDERS: readonly AiProviderMeta[] = [
 export const BY_ID: Record<string, AiProviderMeta> = Object.fromEntries(
   AI_PROVIDERS.map((p) => [p.id, p])
 )
+
+/**
+ * The provider named by an `?add=<id>` deep link, whose add-key dialog the AI
+ * Gateway page should open. Anything that is not a supported provider id —
+ * including inherited object keys like `constructor` — is ignored.
+ */
+export function providerFromAddParam(
+  value: string | null | undefined
+): AiProviderMeta | undefined {
+  return value && Object.prototype.hasOwnProperty.call(BY_ID, value)
+    ? BY_ID[value]
+    : undefined
+}
 
 /** Look up provider metadata by id. Returns `undefined` for unknown ids. */
 export function getAiProvider(id: string): AiProviderMeta | undefined {
@@ -151,4 +167,22 @@ export interface AiProviderIconProps extends IconBaseProps {
    * The inner mark is sized to ~60 % of the wrapper.
    */
   size?: number
+}
+
+/**
+ * The host (and port) a provider key's base URL points at, e.g.
+ * `api.deepseek.com` or `10.0.0.5:8000`, so several keys of one provider
+ * (OpenAI-compatible endpoints above all) can be told apart in a list.
+ * Null when the key uses the vendor's default endpoint.
+ */
+export function providerKeyEndpoint(
+  baseUrl: string | null | undefined
+): string | null {
+  const trimmed = baseUrl?.trim()
+  if (!trimmed) return null
+  try {
+    return new URL(trimmed).host || trimmed
+  } catch {
+    return trimmed
+  }
 }

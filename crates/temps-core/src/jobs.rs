@@ -54,6 +54,38 @@ pub struct GitPushEventJob {
     pub recovery_of_deployment_id: Option<i32>,
 }
 
+/// Why a branch's preview environment is no longer needed.
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum PreviewBranchCloseReason {
+    /// The branch was deleted from the repository.
+    BranchDeleted,
+    /// A pull/merge request from the branch was closed without merging.
+    PullRequestClosed { number: i64 },
+    /// A pull/merge request from the branch was merged.
+    PullRequestMerged { number: i64 },
+}
+
+impl fmt::Display for PreviewBranchCloseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::BranchDeleted => write!(f, "branch deleted"),
+            Self::PullRequestClosed { number } => write!(f, "pull request #{number} closed"),
+            Self::PullRequestMerged { number } => write!(f, "pull request #{number} merged"),
+        }
+    }
+}
+
+/// A webhook reported that `branch` of `project_id`'s repository is done
+/// with (deleted, or its pull request closed). The consumer tears down the
+/// project's preview environment for that branch, if it has one.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PreviewBranchClosedJob {
+    pub project_id: i32,
+    pub branch: String,
+    pub reason: PreviewBranchCloseReason,
+}
+
 /// Request to deploy a prebuilt Docker image to a project (no build step).
 ///
 /// Project-scoped like `GitPushEventJob` — the consumer resolves the target
@@ -313,6 +345,19 @@ pub struct AutopilotTriggerJob {
     pub error_group_id: Option<i32>,
 }
 
+/// An error group just became something to fix: it was seen for the first
+/// time, or a resolved/ignored group came back (ADR-054). Emitted by error
+/// ingest whether or not an alert rule matches; autofix decides per project
+/// whether to act on it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorGroupOpenedJob {
+    pub project_id: i32,
+    pub error_group_id: i32,
+    pub environment_id: Option<i32>,
+    /// `true` when a resolved or ignored group regressed.
+    pub regression: bool,
+}
+
 /// Job for when an alarm is resolved
 ///
 /// `environment_id` and `deployment_id` are `Option` because service-scoped
@@ -475,6 +520,8 @@ pub enum Job {
     ProvisionCertificate(ProvisionCertificateJob),
     CalculateRepositoryPreset(CalculateRepositoryPresetJob),
     GitPushEvent(GitPushEventJob),
+    /// Tear down a branch's preview environment (see [`PreviewBranchClosedJob`]).
+    PreviewBranchClosed(PreviewBranchClosedJob),
     /// Deploy a prebuilt Docker image to a project (no build) — fired by the
     /// template one-click flow when a template carries a prebuilt image.
     DeployImageRequested(DeployImageRequestedJob),
@@ -510,6 +557,8 @@ pub enum Job {
     AlarmResolved(AlarmResolvedJob),
     // Autopilot events
     AutopilotTrigger(AutopilotTriggerJob),
+    /// A new or regressed error group (ADR-054).
+    ErrorGroupOpened(ErrorGroupOpenedJob),
     // Backup events — the trigger flows through the same JobQueue as
     // deployments: the HTTP handler / cron tick publishes BackupRequested,
     // the `BackupJobProcessor` consumes it and runs the engine in a
@@ -552,6 +601,7 @@ impl fmt::Display for Job {
             Job::ProvisionCertificate(job) => write!(f, "ProvisionCertificate({})", job.domain),
             Job::CalculateRepositoryPreset(job) => write!(f, "CalculateRepositoryPreset(repository_id: {})", job.repository_id),
             Job::GitPushEvent(job) => write!(f, "GitPushEvent(project_id: {}, owner: {}, repo: {}, branch: {:?}, tag: {:?}, commit: {})", job.project_id, job.owner, job.repo, job.branch, job.tag, job.commit),
+            Job::PreviewBranchClosed(job) => write!(f, "PreviewBranchClosed(project_id: {}, branch: {}, reason: {})", job.project_id, job.branch, job.reason),
             Job::DeployImageRequested(job) => write!(f, "DeployImageRequested(project_id: {}, image_ref: {})", job.project_id, job.image_ref),
             Job::RedeploySourceBundleRequested(job) => write!(f, "RedeploySourceBundleRequested(project_id: {}, environment_id: {}, source_deployment_id: {})", job.project_id, job.environment_id, job.source_deployment_id),
             Job::CronInvocationError(job) => write!(f, "CronInvocationError(cron_id: {}, env: {}, error: {})", job.cron_job_id, job.environment_id, job.error_message),
@@ -575,6 +625,7 @@ impl fmt::Display for Job {
             Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {:?}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
             Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
+            Job::ErrorGroupOpened(job) => write!(f, "ErrorGroupOpened(project: {}, group: {}, regression: {})", job.project_id, job.error_group_id, job.regression),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupStarted(job) => write!(f, "BackupStarted(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),

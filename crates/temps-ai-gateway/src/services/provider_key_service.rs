@@ -107,8 +107,8 @@ impl ProviderKeyService {
         let base_url = base_url.map(str::trim).filter(|url| !url.is_empty());
         if self_hosted && base_url.is_none() {
             return Err(AiGatewayError::Validation {
-                message: "A base URL is required for a self-hosted (OpenAI-compatible) provider, \
-                          e.g. http://10.0.0.5:8000/v1"
+                message: "A base URL is required for an OpenAI-compatible provider, \
+                          e.g. https://api.deepseek.com/v1 or http://10.0.0.5:8000/v1"
                     .to_string(),
             });
         }
@@ -131,7 +131,7 @@ impl ProviderKeyService {
         if capabilities.is_some() && !self_hosted {
             return Err(AiGatewayError::Validation {
                 message: format!(
-                    "Capabilities can only be declared for self-hosted providers, not '{provider}'"
+                    "Capabilities can only be declared for OpenAI-compatible providers, not '{provider}'"
                 ),
             });
         }
@@ -314,7 +314,7 @@ impl ProviderKeyService {
         if changes.capabilities.is_some() && !self_hosted {
             return Err(AiGatewayError::Validation {
                 message: format!(
-                    "Capabilities can only be declared for self-hosted providers; key {id} is '{}'",
+                    "Capabilities can only be declared for OpenAI-compatible providers; key {id} is '{}'",
                     existing.provider
                 ),
             });

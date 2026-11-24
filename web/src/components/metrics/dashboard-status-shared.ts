@@ -7,14 +7,19 @@ export type Section = NonNullable<
   OtelDashboardResponse['layout']
 >['sections'][number]
 
-/** Flatten a dashboard's sections to the (metric, aggregation) pairs it plots. */
+/**
+ * Flatten a dashboard's sections to the (metric, aggregation) pairs it plots.
+ * A tile charting a saved log search plots no metric, so it is left out.
+ */
 export function dashboardTiles(
   sections: Section[] | undefined
 ): { metricName: string; aggregation?: string }[] {
   return (sections ?? []).flatMap((s) =>
-    (s.tiles ?? []).map((t) => ({
-      metricName: t.metric_name,
-      aggregation: t.aggregation,
-    }))
+    (s.tiles ?? [])
+      .filter((t) => t.source?.kind !== 'logs')
+      .map((t) => ({
+        metricName: t.metric_name,
+        aggregation: t.aggregation,
+      }))
   )
 }

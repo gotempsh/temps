@@ -17,7 +17,13 @@ type Form = ReturnType<typeof useForm<ProviderFormData>>
 
 let form: Form | undefined
 
-function Harness({ type }: { type: 'email' | 'webhook' }) {
+function Harness({
+  type,
+  onRevealCredential,
+}: {
+  type: 'email' | 'webhook' | 'telegram'
+  onRevealCredential?: (field: string) => Promise<string>
+}) {
   const created = useForm<ProviderFormData>({
     resolver: zodResolver(providerSchema),
     defaultValues: {
@@ -30,6 +36,8 @@ function Harness({ type }: { type: 'email' | 'webhook' }) {
         timeout_secs: 30,
         to_addresses: ['ops@example.test'],
         from_address: 'alerts@example.test',
+        bot_token: '***',
+        chat_id: '-1001234567890',
       },
     },
   })
@@ -42,6 +50,7 @@ function Harness({ type }: { type: 'email' | 'webhook' }) {
       onSubmit={async () => {}}
       hideProviderType
       hideSubmit
+      onRevealCredential={onRevealCredential}
     />
   )
 }
@@ -52,7 +61,7 @@ function box(view: ReturnType<typeof render>, label: RegExp) {
 
 test('SMTP port stays empty after being changed and then cleared', () => {
   const view = render(<Harness type="email" />)
-  const port = box(view, /SMTP Port/i)
+  const port = box(view, /SMTP port/i)
   expect(port.value).toBe('587')
   fireEvent.change(port, { target: { value: '25' } })
   expect(port.value).toBe('25')
@@ -65,9 +74,9 @@ test('SMTP port stays empty after being changed and then cleared', () => {
 
 test('an emptied SMTP port fails validation rather than submitting the old default', async () => {
   const view = render(<Harness type="email" />)
-  fireEvent.change(box(view, /SMTP Port/i), { target: { value: '25' } })
-  fireEvent.change(box(view, /SMTP Port/i), { target: { value: '' } })
-  expect(box(view, /SMTP Port/i).value).toBe('')
+  fireEvent.change(box(view, /SMTP port/i), { target: { value: '25' } })
+  fireEvent.change(box(view, /SMTP port/i), { target: { value: '' } })
+  expect(box(view, /SMTP port/i).value).toBe('')
   let valid = true
   await act(async () => {
     valid = (await form?.trigger()) ?? true
@@ -81,4 +90,45 @@ test('webhook timeout stays empty after being changed and then cleared', () => {
   fireEvent.change(timeout, { target: { value: '60' } })
   fireEvent.change(timeout, { target: { value: '' } })
   expect(timeout.value).toBe('')
+})
+
+function deferred() {
+  let resolve: (value: string) => void = () => {}
+  const promise = new Promise<string>((done) => {
+    resolve = done
+  })
+  return { promise, resolve }
+}
+
+test('a token typed while a reveal is loading is not overwritten by it', async () => {
+  const reveal = deferred()
+  const view = render(
+    <Harness type="telegram" onRevealCredential={() => reveal.promise} />
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Reveal value' }))
+
+  fireEvent.change(box(view, /Bot token/i), {
+    target: { value: '123456789:AAReplacement' },
+  })
+  await act(async () => {
+    reveal.resolve('123456789:AAStoredToken')
+    await reveal.promise
+  })
+
+  expect(form?.getValues('config.bot_token')).toBe('123456789:AAReplacement')
+})
+
+test('a reveal with no edit in between still shows the stored token', async () => {
+  const reveal = deferred()
+  const view = render(
+    <Harness type="telegram" onRevealCredential={() => reveal.promise} />
+  )
+  fireEvent.click(view.getByRole('button', { name: 'Reveal value' }))
+  await act(async () => {
+    reveal.resolve('123456789:AAStoredToken')
+    await reveal.promise
+  })
+
+  expect(form?.getValues('config.bot_token')).toBe('123456789:AAStoredToken')
+  expect(view.getByRole('button', { name: 'Hide value' })).toBeTruthy()
 })

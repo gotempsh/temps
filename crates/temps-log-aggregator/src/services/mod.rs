@@ -8,10 +8,13 @@ mod collector;
 mod compactor;
 mod forget_sweeper;
 pub(crate) mod global_search;
+mod ingest_budget;
+pub(crate) mod log_series;
 mod metadata;
 mod reindexer;
 mod remote_collector;
 mod retention;
+pub(crate) mod saved_search;
 pub(crate) mod search;
 mod tail;
 
@@ -26,6 +29,15 @@ pub use forget_sweeper::{
     ForgetSweepReport, ForgetSweeper, DEFAULT_FORGET_BATCH, FORGET_SWEEP_BURST_PAUSE,
     FORGET_SWEEP_INTERVAL,
 };
+pub use ingest_budget::{
+    Admission, IngestBudget, IngestDropReason, IngestLimiter, IngestLimits, IngestOverride,
+    IngestOverrides, IngestSource, ThrottledLogSource, BURST_SECONDS, STATS_WINDOW,
+    THROTTLED_VISIBLE_FOR,
+};
+pub use log_series::{
+    LogSeries, LogSeriesMethod, LogSeriesPoint, LogSeriesService, SeriesRequest, COUNT_PAGE_SIZE,
+    MAX_NUMERIC_SERIES_BUCKETS, MAX_SERIES_BUCKETS, SERIES_SCAN_CAP,
+};
 pub use metadata::{LogEventsQuery, LogMetadataService};
 pub use reindexer::{ReindexReport, ReindexService, DEFAULT_REINDEX_BATCH};
 pub use remote_collector::{
@@ -33,5 +45,9 @@ pub use remote_collector::{
     RemoteLogStream,
 };
 pub use retention::RetentionService;
+pub use saved_search::{
+    decode_query as decode_saved_search_query, LogSavedSearchService, NewSavedSearch,
+    SavedSearchQuery, SavedSearchUpdate, MAX_SAVED_SEARCHES_PER_PROJECT, SAVED_SEARCH_TIME_RANGES,
+};
 pub use search::LogSearchService;
 pub use tail::TailService;

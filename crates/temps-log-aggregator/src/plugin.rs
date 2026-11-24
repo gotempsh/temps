@@ -22,8 +22,9 @@ use crate::index::clickhouse::{ClickHouseLineIndex, LineIndexTarget};
 use crate::index::timescale::TimescaleLineIndex;
 use crate::index::{LineIndex, NoLineIndex};
 use crate::services::{
-    ChunkWriterService, CollectorService, CompactorService, LogMetadataService, LogSearchService,
-    RemoteContainerLogSource, RemoteLogCollectorService, RetentionService, TailService,
+    ChunkWriterService, CollectorService, CompactorService, IngestBudget, IngestLimits,
+    IngestOverrides, LogMetadataService, LogSearchService, RemoteContainerLogSource,
+    RemoteLogCollectorService, RetentionService, TailService,
 };
 use crate::services::{
     ForgetSweeper, ReindexService, DEFAULT_FORGET_BATCH, DEFAULT_REINDEX_BATCH,
@@ -40,6 +41,9 @@ use temps_clickhouse::ClickHouseConfig;
 /// (`container_logs.cache_mb` / `head_buffer_mb`, persisted and audited);
 /// this is how often a change is picked up without a restart.
 const BUDGET_SYNC_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How often log ingest key usage counters are written (ADR 108 D1).
+const INGEST_KEY_USAGE_FLUSH_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Interval for the periodic flush ticker (10 seconds)
 const FLUSH_TICKER_INTERVAL: Duration = Duration::from_secs(10);
@@ -141,6 +145,10 @@ impl TempsPlugin for LogAggregatorPlugin {
             // ── ADR-046 chunk read-through cache ─────────────────────────
             // Built before the chunk writer so the writer can write-through
             // into the same cache a sealing node reads from (ADR-046 §6a).
+            #[allow(
+                clippy::disallowed_methods,
+                reason = "bootstrap: TEMPS_DATA_DIR locates the data directory and is fixed before the database exists"
+            )]
             let data_dir = std::env::var("TEMPS_DATA_DIR")
                 .map(std::path::PathBuf::from)
                 .ok();
@@ -151,7 +159,7 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Opened at the default budget; the persisted setting is applied
             // as soon as the plugin starts (and re-applied every minute).
             let cache_bytes =
-                u64::from(temps_core::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
+                u64::from(temps_config::ContainerLogSettings::default().cache_mb) * 1024 * 1024;
             let cache = ChunkCache::open(cache_dir, cache_bytes)
                 .await
                 .map_err(|e| PluginError::PluginRegistrationFailed {
@@ -262,6 +270,15 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Metadata service (used by collector to resume from last known position on restart)
             let collector_metadata = Arc::new(LogMetadataService::new(db.clone()));
 
+            // Per-container ingestion budget, shared by the local and remote
+            // collectors. Starts at the defaults; initialization applies the
+            // saved settings before any stream starts, and the budget sync
+            // keeps them current.
+            let ingest_budget = Arc::new(IngestBudget::new(IngestLimits::from_settings(
+                &temps_config::ContainerLogSettings::default(),
+            )));
+            context.register_service(ingest_budget.clone());
+
             // Collector service. The chunk writer now owns the whole seal
             // pipeline (object write + manifest insert) itself, so the
             // collector no longer needs an on-chunk-flushed callback.
@@ -269,6 +286,7 @@ impl TempsPlugin for LogAggregatorPlugin {
                 docker_handle,
                 chunk_writer.clone(),
                 collector_metadata,
+                ingest_budget.clone(),
                 10_000,
             )
             .with_db(db.clone());
@@ -329,6 +347,40 @@ impl TempsPlugin for LogAggregatorPlugin {
             // Audit service
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
+            // ── ADR 108 D1: saved searches and the log-alert series ─────
+            // The saved-search list is plain project configuration; the
+            // series source is what the metric alert evaluator pulls on its
+            // interval to count the lines a saved search matches. Both are
+            // registered unconditionally: a log alert must be configurable
+            // whether or not a line index exists, and the counter picks the
+            // index or a bounded chunk scan per query.
+            let saved_search_service =
+                Arc::new(crate::services::LogSavedSearchService::new(db.clone()));
+            context.register_service(saved_search_service.clone());
+            let log_series_service = Arc::new(crate::services::LogSeriesService::new(
+                saved_search_service.clone(),
+                store.clone(),
+                line_index.clone(),
+                Arc::new(ManifestRepo::new(db.clone())),
+                db.clone(),
+            ));
+            context.register_service(
+                log_series_service.clone() as Arc<dyn temps_core::log_series::LogSeriesSource>
+            );
+
+            // ── ADR 108 D1: HTTP log ingest ─────────────────────────────
+            // Keys are project configuration; the ingest service writes
+            // through the same chunk writer and per-project budget a
+            // container's lines go through.
+            let ingest_key_service = Arc::new(crate::ingest::LogIngestKeyService::new(db.clone()));
+            context.register_service(ingest_key_service.clone());
+            let ingest_service = Arc::new(crate::ingest::LogIngestService::new(
+                ingest_key_service.clone(),
+                Arc::new(chunk_writer.clone()),
+                ingest_budget.clone(),
+            ));
+            context.register_service(ingest_service.clone());
+
             // App state for handlers
             let app_state = create_log_aggregator_app_state(
                 search_service,
@@ -340,6 +392,11 @@ impl TempsPlugin for LogAggregatorPlugin {
                 db.clone(),
                 line_index,
                 chunk_writer.clone(),
+                ingest_budget,
+                saved_search_service,
+                log_series_service,
+                ingest_service,
+                ingest_key_service,
             )
             .await;
             context.register_service(app_state);
@@ -363,6 +420,19 @@ impl TempsPlugin for LogAggregatorPlugin {
             let compactor_storage = context.require_service::<dyn LogStorage>();
             let compactor_cache = (*context.require_service::<ChunkCache>()).clone();
             let retention_metadata = context.require_service::<LogMetadataService>();
+
+            // The saved ingestion budget must be in force before the first
+            // stream opens: startup replays every container's backlog, and
+            // judging it by the defaults would drop lines a raised budget
+            // allows (or keep ones a lowered budget does not).
+            if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
+                let ingest_budget = context.require_service::<IngestBudget>();
+                apply_saved_ingest_limits(&config_service, &ingest_budget).await;
+            }
+            {
+                let ingest_budget = context.require_service::<IngestBudget>();
+                apply_ingest_overrides(db.as_ref(), &ingest_budget).await;
+            }
 
             // ── Flush ticker ────────────────────────────────────────────
             // Seals every head buffer whose flush policy (ADR-046 §1) says
@@ -409,10 +479,12 @@ impl TempsPlugin for LogAggregatorPlugin {
                 let remote_chunk_writer = context.require_service::<ChunkWriterService>();
                 let remote_metadata = context.require_service::<LogMetadataService>();
                 let remote_tail_tx = context.require_service::<CollectorService>().tail_sender();
+                let remote_ingest_budget = context.require_service::<IngestBudget>();
                 let remote_collector = Arc::new(RemoteLogCollectorService::new(
                     remote_source,
                     remote_chunk_writer,
                     remote_metadata,
+                    remote_ingest_budget,
                     remote_tail_tx,
                 ));
                 let recovery_writer = chunk_writer.clone();
@@ -461,12 +533,14 @@ impl TempsPlugin for LogAggregatorPlugin {
             }
 
             // ── Budget sync ─────────────────────────────────────────────
-            // Settings → Monitoring → container logs: read cache size and
-            // per-container head buffer. Applied now and re-read every
-            // minute so a saved setting never needs a restart.
+            // Settings → Monitoring → container logs: read cache size,
+            // per-container head buffer and ingestion budget. Applied now and
+            // re-read every minute so a saved setting never needs a restart.
             if let Some(config_service) = context.get_service::<temps_config::ConfigService>() {
                 let cache = context.require_service::<ChunkCache>();
                 let writer = context.require_service::<ChunkWriterService>();
+                let ingest_budget = context.require_service::<IngestBudget>();
+                let override_db = db.clone();
                 let recovery_writer = chunk_writer.clone();
                 tokio::spawn(async move {
                     recovery_writer.wait_for_recovery().await;
@@ -492,11 +566,45 @@ impl TempsPlugin for LogAggregatorPlugin {
                                     );
                                     writer.set_head_max_bytes(head_bytes);
                                 }
+                                let ingest_limits = IngestLimits::from_settings(logs);
+                                if ingest_budget.limits() != ingest_limits {
+                                    tracing::info!(
+                                        ingest_lines_per_sec = logs.ingest_lines_per_sec,
+                                        ingest_kib_per_sec = logs.ingest_kib_per_sec,
+                                        "per-container log ingestion budget applied"
+                                    );
+                                    ingest_budget.set_limits(ingest_limits);
+                                }
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "could not read container log budgets; keeping current")
                             }
                         }
+                        // Per-project / per-service overrides, set on the
+                        // project's and the service's settings pages.
+                        apply_ingest_overrides(override_db.as_ref(), &ingest_budget).await;
+                    }
+                });
+            }
+
+            // ── Log ingest key usage (ADR 108 D1) ───────────────────────
+            // Line counts and last-used times are summed in memory per
+            // request and written here, one statement per key used since
+            // the last tick, so ingest costs no database write per request.
+            {
+                let ingest_keys = context.require_service::<crate::ingest::LogIngestKeyService>();
+                let idle_ingest = context.require_service::<crate::ingest::LogIngestService>();
+                // The same tick releases keys idle for a while (a deleted
+                // project's keys are never revoked), so their streams close.
+                tokio::spawn(async move {
+                    let mut interval = tokio::time::interval(INGEST_KEY_USAGE_FLUSH_INTERVAL);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                    loop {
+                        interval.tick().await;
+                        ingest_keys.flush_usage().await;
+                        idle_ingest
+                            .retire_idle_keys(crate::ingest::service::IDLE_KEY_RETIREMENT)
+                            .await;
                     }
                 });
             }
@@ -691,14 +799,70 @@ impl TempsPlugin for LogAggregatorPlugin {
             line_index: old.line_index.clone(),
             manifests: old.manifests.clone(),
             chunk_writer: old.chunk_writer.clone(),
+            ingest_budget: old.ingest_budget.clone(),
+            saved_search_service: old.saved_search_service.clone(),
+            log_series_service: old.log_series_service.clone(),
+            ingest_service: old.ingest_service.clone(),
+            ingest_key_service: old.ingest_key_service.clone(),
         });
         let routes = handlers::configure_routes().with_state(app_state);
 
         Some(PluginRoutes::new(routes))
     }
 
+    fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
+        let state = context.require_service::<LogAggregatorAppState>();
+        let routes = handlers::configure_public_routes().with_state(state.ingest_service.clone());
+        Some(PluginRoutes::new(routes))
+    }
+
     fn openapi_schema(&self) -> Option<OpenApi> {
         Some(<handlers::LogAggregatorApiDoc as OpenApiTrait>::openapi())
+    }
+}
+
+/// How long initialization waits for the saved ingestion budget before
+/// starting the collectors with the current one.
+const INGEST_SETTINGS_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn apply_saved_ingest_limits(
+    config_service: &temps_config::ConfigService,
+    ingest_budget: &IngestBudget,
+) {
+    match tokio::time::timeout(INGEST_SETTINGS_TIMEOUT, config_service.get_settings()).await {
+        Ok(Ok(settings)) => {
+            let logs = &settings.container_logs;
+            ingest_budget.set_limits(IngestLimits::from_settings(logs));
+            tracing::info!(
+                ingest_lines_per_sec = logs.ingest_lines_per_sec,
+                ingest_kib_per_sec = logs.ingest_kib_per_sec,
+                "per-container log ingestion budget loaded"
+            );
+        }
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "could not read the saved log ingestion budget at startup; using the defaults until the next budget sync"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = INGEST_SETTINGS_TIMEOUT.as_secs(),
+            "reading the saved log ingestion budget at startup timed out; using the defaults until the next budget sync"
+        ),
+    }
+}
+
+/// Load the per-project / per-service ingestion overrides into `ingest_budget`.
+/// A failed read keeps the overrides already applied.
+async fn apply_ingest_overrides(db: &sea_orm::DatabaseConnection, ingest_budget: &IngestBudget) {
+    match tokio::time::timeout(INGEST_SETTINGS_TIMEOUT, IngestOverrides::load(db)).await {
+        Ok(Ok(overrides)) => ingest_budget.set_overrides(overrides),
+        Ok(Err(e)) => tracing::warn!(
+            error = %e,
+            "could not read per-project/service log ingestion overrides; keeping current"
+        ),
+        Err(_) => tracing::warn!(
+            timeout_secs = INGEST_SETTINGS_TIMEOUT.as_secs(),
+            "reading per-project/service log ingestion overrides timed out; keeping current"
+        ),
     }
 }
 

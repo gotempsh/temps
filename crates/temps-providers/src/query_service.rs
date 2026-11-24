@@ -1,18 +1,20 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha256;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use temps_core::url_validation::{resolve_and_validate_domain, validate_outbound_ip};
-use temps_query::{
+use temps_providers_core::query::{
     ContainerInfo, ContainerPath, DataError, DataSource, EntityInfo, QueryOptions, QueryResult,
     Result,
 };
-use temps_query_mongodb::MongoDBSource;
-use temps_query_postgres::PostgresSource;
-use temps_query_redis::RedisSource;
-use temps_query_s3::S3Source;
+use temps_providers_mongodb::query::MongoDBSource;
+use temps_providers_postgres::query::PostgresSource;
+use temps_providers_redis::query::RedisSource;
+use temps_providers_s3::query::S3Source;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -22,8 +24,29 @@ use crate::externalsvc::postgres::PostgresInputConfig;
 use crate::externalsvc::redis::RedisInputConfig;
 use crate::externalsvc::rustfs::RustfsConfig;
 use crate::externalsvc::s3::S3InputConfig;
-use crate::mariadb_query::MariaDbSource;
 use crate::ExternalServiceManager;
+use temps_providers_mariadb::query::MariaDbSource;
+
+/// Domain separation for the explorer role's password. Changing it changes
+/// every derived password, which is safe only because
+/// [`QueryService::ensure_readonly_user`] sets the password on each new
+/// connection instead of assuming the stored one still matches.
+const EXPLORER_PASSWORD_TAG: &str = "temps-explorer-password-v1";
+
+/// The password of the read-only explorer role on `host`. It is derived rather
+/// than stored, and changes when the administrator password does.
+fn derive_explorer_password(
+    host: &str,
+    admin_password: &str,
+) -> std::result::Result<String, DataError> {
+    let mut mac = Hmac::<Sha256>::new_from_slice(admin_password.as_bytes()).map_err(|error| {
+        DataError::InvalidConfiguration(format!(
+            "Cannot derive the explorer password for PostgreSQL host '{host}': {error}"
+        ))
+    })?;
+    mac.update(format!("{EXPLORER_PASSWORD_TAG}:{host}").as_bytes());
+    Ok(format!("te_{}", hex::encode(mac.finalize().into_bytes())))
+}
 
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
@@ -54,13 +77,49 @@ impl PostgresConnectionPolicy {
     }
 }
 
+/// Replace a worker-placed service's loopback `host` with its node's data
+/// address. Every engine but Postgres embeds the host in a URL, where an IPv6
+/// literal must be bracketed; the Postgres source takes a bare host. A host
+/// the operator set explicitly is kept.
+///
+/// Returns whether the host was replaced, i.e. whether it now comes from the
+/// node record rather than from the service's own parameters. That decides
+/// how it is vetted: see [`vet_dial_target`].
+fn use_worker_host(
+    parameters: &mut serde_json::Value,
+    service_type: &crate::externalsvc::ServiceType,
+    data_address: &str,
+) -> bool {
+    let Some(params) = parameters.as_object_mut() else {
+        return false;
+    };
+    let stored = params.get("host").and_then(|v| v.as_str()).unwrap_or("");
+    if !temps_core::node_address::is_local_service_host(stored) {
+        return false;
+    }
+    let host = match service_type {
+        crate::externalsvc::ServiceType::Postgres => data_address.to_string(),
+        _ => temps_core::node_address::url_host(data_address),
+    };
+    params.insert("host".to_string(), serde_json::Value::String(host));
+    true
+}
+
 fn postgres_connection_target(
     cluster_primary: Option<(String, u16)>,
     standalone_host: String,
     standalone_port: u16,
+    standalone_host_from_node: bool,
 ) -> (String, u16, PostgresConnectionPolicy) {
     match cluster_primary {
         Some((host, port)) => (host, port, PostgresConnectionPolicy::ManagedPrivate),
+        // A standalone service on a worker is dialled at the node's private
+        // data address, like a cluster primary: it must stay on that network.
+        None if standalone_host_from_node => (
+            standalone_host,
+            standalone_port,
+            PostgresConnectionPolicy::ManagedPrivate,
+        ),
         None => (
             standalone_host,
             standalone_port,
@@ -85,6 +144,36 @@ fn url_host(ip: IpAddr) -> String {
         IpAddr::V4(v4) => v4.to_string(),
         IpAddr::V6(v6) => format!("[{v6}]"),
     }
+}
+
+/// The host to dial for a data-browser connection.
+///
+/// `host_from_node` hosts were taken from the node record (see
+/// [`use_worker_host`]), not typed by whoever created the service: the control
+/// plane wrote that address itself when the worker joined, and it is normally
+/// private, so the operator-trust check in [`vet_query_target`] would refuse
+/// it. They must still be IP literals, so nothing else can be spliced into a
+/// connection string. Every other host goes through [`vet_query_target`].
+async fn vet_dial_target(
+    service_id: i32,
+    host: &str,
+    port: u16,
+    host_from_node: bool,
+) -> Result<String> {
+    if !host_from_node {
+        return vet_query_target(service_id, host, port).await;
+    }
+    let trimmed = host.trim();
+    let bare = trimmed
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    bare.parse::<IpAddr>().map(url_host).map_err(|_| {
+        DataError::InvalidConfiguration(format!(
+            "Service {service_id}: the node hosting it has data address '{bare}', which is not an \
+             IP address"
+        ))
+    })
 }
 
 /// SSRF guard for data-browser connections, mirroring the data-import guard
@@ -222,12 +311,10 @@ impl QueryService {
         database: &str,
         connection_policy: PostgresConnectionPolicy,
     ) -> std::result::Result<String, DataError> {
-        // Deterministic password derived from admin password so it's stable across calls
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-        let mut hasher = DefaultHasher::new();
-        format!("temps_explorer_{}_{}", host, admin_password).hash(&mut hasher);
-        let explorer_password = format!("te_{:x}", hasher.finish());
+        // The role statement below sets this password even when the role
+        // already exists, so a role provisioned with an earlier derivation
+        // moves to this one the next time a connection is opened.
+        let explorer_password = derive_explorer_password(host, admin_password)?;
 
         // Connect as admin to the target database
         let pg_source = connection_policy
@@ -326,11 +413,37 @@ impl QueryService {
         );
 
         // Get service configuration
-        let service = self
+        let mut service = self
             .external_service_manager
             .get_service_config(service_id)
             .await
             .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
+
+        // A standalone service on a worker node is stored with a loopback
+        // host, which is the wrong machine from here: dial the worker's data
+        // address instead. Cluster services resolve their primary below.
+        let placement = self
+            .external_service_manager
+            .get_service(service_id)
+            .await
+            .map_err(|e| DataError::ConnectionFailed(format!("Service not found: {}", e)))?;
+        let mut host_from_node = false;
+        if placement.topology != "cluster" {
+            let worker_address = self
+                .external_service_manager
+                .worker_data_address(&placement)
+                .await
+                .map_err(|e| {
+                    DataError::ConnectionFailed(format!(
+                        "Cannot resolve the node hosting service {}: {}",
+                        service_id, e
+                    ))
+                })?;
+            if let Some(address) = worker_address {
+                host_from_node =
+                    use_worker_host(&mut service.parameters, &service.service_type, &address);
+            }
+        }
 
         // Create connection based on service type
         let connection: Arc<dyn DataSource> = match service.service_type {
@@ -351,7 +464,8 @@ impl QueryService {
                         DataError::InvalidConfiguration(format!("Invalid port number: {}", e))
                     })?;
                 let password = config.password.unwrap_or_default();
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
 
                 let source =
                     MariaDbSource::connect(&dial_host, port, &config.username, &password, database)
@@ -409,6 +523,7 @@ impl QueryService {
                             Some((primary_host, primary_port)),
                             config.host.clone(),
                             5432,
+                            host_from_node,
                         )
                     }
                     Ok(None) => {
@@ -427,8 +542,8 @@ impl QueryService {
                         // passed on: the Postgres TLS ladder needs it for
                         // certificate verification and pins the addresses
                         // it resolves itself (`resolve_host_once`).
-                        vet_query_target(service_id, &config.host, port).await?;
-                        postgres_connection_target(None, config.host.clone(), port)
+                        vet_dial_target(service_id, &config.host, port, host_from_node).await?;
+                        postgres_connection_target(None, config.host.clone(), port, host_from_node)
                     }
                     Err(e) => {
                         return Err(DataError::ConnectionFailed(format!(
@@ -488,7 +603,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -517,7 +633,8 @@ impl QueryService {
 
                 // Build connection string with URL-encoded credentials
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("27017"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let password = config.password.unwrap_or_default();
 
                 // URL-encode username and password to handle special characters
@@ -564,7 +681,8 @@ impl QueryService {
 
                 // Build connection string with URL-encoded password
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
@@ -594,7 +712,8 @@ impl QueryService {
                 })?;
 
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("6379"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let password = config.password.unwrap_or_default();
 
                 let connection_string = if password.is_empty() {
@@ -623,7 +742,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -651,7 +771,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, &config.port)?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let s3_source = S3Source::new(
@@ -680,7 +801,8 @@ impl QueryService {
                     })?;
 
                 let port = parse_query_port(service_id, config.port.as_deref().unwrap_or("9000"))?;
-                let dial_host = vet_query_target(service_id, &config.host, port).await?;
+                let dial_host =
+                    vet_dial_target(service_id, &config.host, port, host_from_node).await?;
                 let endpoint = format!("http://{}:{}", dial_host, port);
 
                 let access_key = config.access_key.ok_or_else(|| {
@@ -1073,7 +1195,7 @@ impl QueryService {
             let options = options.clone();
             async move {
                 // Check if source supports querying
-                use temps_query::Queryable;
+                use temps_providers_core::query::Queryable;
 
                 if let Some(queryable) = conn.downcast_ref::<PostgresSource>() {
                     return queryable
@@ -1153,10 +1275,10 @@ impl QueryService {
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             Ok(provider.get_filter_schema())
         } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             Ok(provider.get_filter_schema())
         } else {
             Err(DataError::OperationNotSupported(
@@ -1185,10 +1307,10 @@ impl QueryService {
 
         // Check if source supports schema provider
         if let Some(provider) = conn.downcast_ref::<PostgresSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             provider.get_sort_schema(container_path, entity_name)
         } else if let Some(provider) = conn.downcast_ref::<MariaDbSource>() {
-            use temps_query::QuerySchemaProvider;
+            use temps_providers_core::query::QuerySchemaProvider;
             provider.get_sort_schema(container_path, entity_name)
         } else {
             Err(DataError::OperationNotSupported(
@@ -1245,7 +1367,7 @@ impl QueryService {
             async move {
                 // Check if source implements Downloadable trait
                 if let Some(downloadable) = conn.downcast_ref::<S3Source>() {
-                    use temps_query::Downloadable;
+                    use temps_providers_core::query::Downloadable;
                     downloadable.download(&path_clone, &entity_name).await
                 } else {
                     Err(DataError::OperationNotSupported(
@@ -1261,6 +1383,233 @@ impl QueryService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::externalsvc::ServiceType;
+
+    /// Pinned: this value is what a provisioned role holds, and a stable hash
+    /// is the point of moving off `DefaultHasher`, whose output may change
+    /// with the Rust release.
+    #[test]
+    fn explorer_password_is_a_stable_hmac_of_host_and_admin_password() {
+        assert_eq!(
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "te_4d59c2734e20f0770a21b65a09151b137a8ac423845a9aa5dfc4c9a82899cd0d"
+        );
+        assert_ne!(
+            derive_explorer_password("db.internal", "other-password").unwrap(),
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "a new administrator password must change it"
+        );
+        assert_ne!(
+            derive_explorer_password("other.internal", "admin-password").unwrap(),
+            derive_explorer_password("db.internal", "admin-password").unwrap(),
+            "each host gets its own"
+        );
+    }
+
+    /// A database provisioned by an earlier release holds the previous
+    /// `te_<64-bit hash>` password. The next connection moves the role to the
+    /// new one, without the operator doing anything, and retires the old one.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn existing_explorer_role_moves_to_the_new_password_on_next_connection() {
+        use temps_test_containers::TestContainerExt;
+        use testcontainers::{
+            core::ContainerPort, core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt,
+        };
+
+        const ADMIN_PASSWORD: &str = "explorer-rotation-admin";
+        const LEGACY_PASSWORD: &str = "te_1f2e3d4c5b6a7988";
+
+        let started = GenericImage::new("postgres", "17-alpine")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_exposed_port(ContainerPort::Tcp(5432))
+            .with_env_var("POSTGRES_PASSWORD", ADMIN_PASSWORD)
+            .with_test_labels()
+            .start()
+            .await;
+        let container = match started {
+            Ok(container) => container,
+            Err(error) => {
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) {
+                    eprintln!("Skipping Docker-dependent test: {error}");
+                    return;
+                }
+                panic!("Failed to start PostgreSQL: {error}");
+            }
+        };
+        let port = container.get_host_port_ipv4(5432).await.unwrap();
+        let policy = PostgresConnectionPolicy::Standard;
+
+        // The image's temporary init server also logs "ready": wait for the
+        // final server, which listens on TCP.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let admin = loop {
+            match policy
+                .connect("127.0.0.1", port, "postgres", ADMIN_PASSWORD, "postgres")
+                .await
+            {
+                Ok(admin) => break admin,
+                Err(error) if std::time::Instant::now() > deadline => {
+                    panic!("PostgreSQL never accepted the admin login: {error}")
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
+            }
+        };
+        admin
+            .execute_raw(&format!(
+                "CREATE ROLE {} LOGIN PASSWORD '{LEGACY_PASSWORD}'",
+                QueryService::EXPLORER_USER
+            ))
+            .await
+            .unwrap();
+        policy
+            .connect(
+                "127.0.0.1",
+                port,
+                QueryService::EXPLORER_USER,
+                LEGACY_PASSWORD,
+                "postgres",
+            )
+            .await
+            .expect("the role starts on the password of the earlier derivation");
+
+        let password = QueryService::ensure_readonly_user(
+            "127.0.0.1",
+            port,
+            "postgres",
+            ADMIN_PASSWORD,
+            "postgres",
+            policy,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            password,
+            derive_explorer_password("127.0.0.1", ADMIN_PASSWORD).unwrap()
+        );
+        policy
+            .connect(
+                "127.0.0.1",
+                port,
+                QueryService::EXPLORER_USER,
+                &password,
+                "postgres",
+            )
+            .await
+            .expect("the explorer logs in with the new password");
+        assert!(
+            policy
+                .connect(
+                    "127.0.0.1",
+                    port,
+                    QueryService::EXPLORER_USER,
+                    LEGACY_PASSWORD,
+                    "postgres",
+                )
+                .await
+                .is_err(),
+            "the old password must stop working"
+        );
+    }
+
+    /// Regression: a MariaDB service placed on a worker node is stored with
+    /// host `localhost`, so the data explorer dialled the control plane and
+    /// could not open it.
+    #[test]
+    fn worker_placed_mariadb_is_browsed_at_its_node_address() {
+        let mut parameters = serde_json::json!({ "host": "localhost", "port": "33061" });
+        assert!(use_worker_host(
+            &mut parameters,
+            &ServiceType::Mariadb,
+            "10.100.0.7"
+        ));
+        assert_eq!(parameters["host"], "10.100.0.7");
+        assert_eq!(
+            parameters["port"], "33061",
+            "the published host port is kept"
+        );
+    }
+
+    #[test]
+    fn worker_host_is_bracketed_for_url_engines_but_not_postgres() {
+        let mut redis = serde_json::json!({ "host": "127.0.0.1" });
+        use_worker_host(&mut redis, &ServiceType::Redis, "fd00::7");
+        assert_eq!(redis["host"], "[fd00::7]");
+
+        let mut postgres = serde_json::json!({ "host": "localhost" });
+        use_worker_host(&mut postgres, &ServiceType::Postgres, "fd00::7");
+        assert_eq!(postgres["host"], "fd00::7");
+    }
+
+    #[test]
+    fn explicit_service_host_is_kept_on_a_worker() {
+        let mut parameters = serde_json::json!({ "host": "db.internal" });
+        assert!(
+            !use_worker_host(&mut parameters, &ServiceType::Mariadb, "10.100.0.7"),
+            "an operator-set host is not from the node, so it is still vetted"
+        );
+        assert_eq!(parameters["host"], "db.internal");
+
+        let mut missing = serde_json::json!({ "port": "3306" });
+        assert!(use_worker_host(
+            &mut missing,
+            &ServiceType::Mariadb,
+            "10.100.0.7"
+        ));
+        assert_eq!(missing["host"], "10.100.0.7", "a missing host means local");
+    }
+
+    /// Regression: the node's data address is normally private, which the
+    /// operator-trust check refuses, so a worker-placed service could not be
+    /// browsed even with the host rewritten.
+    #[tokio::test]
+    async fn a_private_node_address_is_dialled_without_operator_trust() {
+        for node_address in ["10.100.0.7", "192.168.1.9", "172.16.3.4"] {
+            vet_query_target(1, node_address, 3306)
+                .await
+                .expect_err("an operator-set private host is refused");
+            assert_eq!(
+                vet_dial_target(1, node_address, 3306, true).await.unwrap(),
+                node_address,
+                "{node_address} came from the node record"
+            );
+            vet_dial_target(1, node_address, 3306, false)
+                .await
+                .expect_err("the same host typed by an operator is still refused");
+        }
+        assert_eq!(
+            vet_dial_target(1, "fd00::7", 3306, true).await.unwrap(),
+            "[fd00::7]"
+        );
+        assert_eq!(
+            vet_dial_target(1, "[fd00::7]", 3306, true).await.unwrap(),
+            "[fd00::7]"
+        );
+    }
+
+    /// A node-derived host is never a name: nothing but an address may be
+    /// spliced into a connection string on that path.
+    #[tokio::test]
+    async fn a_node_host_that_is_not_an_address_is_refused() {
+        for host in [
+            "db.internal",
+            "10.0.0.5@evil",
+            "10.0.0.5:3306",
+            "",
+            "evil/x",
+        ] {
+            let err = vet_dial_target(42, host, 3306, true)
+                .await
+                .expect_err("only IP literals are accepted from the node record");
+            assert!(
+                matches!(err, DataError::InvalidConfiguration(ref m) if m.contains("Service 42")),
+                "{host:?}: {err}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn vet_query_target_allows_explicit_loopback_for_managed_services() {
@@ -1347,15 +1696,23 @@ mod tests {
             Some(("10.0.0.8".to_string(), 6432)),
             "public.example".to_string(),
             5432,
+            false,
         );
         assert_eq!(cluster.0, "10.0.0.8");
         assert_eq!(cluster.1, 6432);
         assert_eq!(cluster.2, PostgresConnectionPolicy::ManagedPrivate);
 
-        let standalone = postgres_connection_target(None, "public.example".to_string(), 5433);
+        let standalone =
+            postgres_connection_target(None, "public.example".to_string(), 5433, false);
         assert_eq!(standalone.0, "public.example");
         assert_eq!(standalone.1, 5433);
         assert_eq!(standalone.2, PostgresConnectionPolicy::Standard);
+
+        // A standalone service on a worker is dialled at the node's private
+        // address, so it takes the private-network policy a cluster does.
+        let on_worker = postgres_connection_target(None, "10.100.0.7".to_string(), 5433, true);
+        assert_eq!(on_worker.0, "10.100.0.7");
+        assert_eq!(on_worker.2, PostgresConnectionPolicy::ManagedPrivate);
     }
 
     #[tokio::test]

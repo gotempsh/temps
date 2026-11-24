@@ -12,6 +12,8 @@ import {
   validateCreateScheduleAutomation,
   type RetentionCleanupReport,
 } from './index.js'
+import { registerBackupsCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 describe('formatBytes', () => {
   test('scales through units with one decimal place', () => {
@@ -233,5 +235,36 @@ describe('resolveRestartConsent (#1415)', () => {
     })
     await resolveRestartConsent(d)
     expect(events).toContain('warn: This backup restarts the database.')
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('backups sources create credential sources', () => {
+  test('--secret-key-stdin sends the piped secret access key exactly', async () => {
+    const run = await runWithApi(registerBackupsCommands,
+      ['backups', 'sources', 'create', '-n', 's3', '--bucket', 'b', '--region', 'us-east-1', '--access-key', 'AKIAEXAMPLE', '--secret-key-stdin', '-y'],
+      { 'POST /backups/s3-sources': (_url: URL, body: unknown) => ({ id: 1, name: 's3', bucket_name: 'b', region: 'us-east-1', created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' }) },
+      { stdin: CREDENTIAL_SENTINEL })
+    expect(run.error).toBeUndefined()
+    expect(credentialBody(run, 'POST /backups/s3-sources').secret_key).toBe(CREDENTIAL_SENTINEL)
   })
 })

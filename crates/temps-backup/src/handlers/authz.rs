@@ -23,8 +23,9 @@
 
 use axum::http::StatusCode;
 use std::collections::{BTreeMap, BTreeSet};
-use temps_auth::Permission;
+use temps_auth::{deny_deployment_token, Permission};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::BackupScheduleAuthority;
 use tracing::error;
 
 use crate::handlers::types::BackupAppState;
@@ -344,6 +345,73 @@ pub(crate) fn require_global_backup_admin(
         resource: "global backup resources".to_string(),
         detail: format!("Only an administrator may {operation}"),
     }))
+}
+
+/// The caller's authority over instance-wide backup schedules, handed to the
+/// service layer so it re-checks what the handler already enforced (NV1).
+pub(crate) fn schedule_authority(auth: &temps_auth::AuthContext) -> BackupScheduleAuthority {
+    BackupScheduleAuthority::from_instance_admin(auth.is_instance_admin())
+}
+
+/// Guard creating, changing, triggering or deleting a schedule that targets
+/// every external service or includes the control plane (NV1).
+///
+/// Stricter than [`require_global_backup_admin`] on purpose: that guard fails
+/// open on a plain OSS install with no project-access checker, which is right
+/// for "no team boundary yet" but wrong here. An instance-wide schedule dumps
+/// Temps's own database, so only an instance administrator may manage one --
+/// not a `Role::Custom` user or API key that happens to hold
+/// `settings:write` + `backups:*`, and never a deployment token.
+pub(crate) fn require_instance_wide_schedule_admin(
+    auth: &temps_auth::AuthContext,
+    schedule: &str,
+    operation: &str,
+) -> Result<(), Problem> {
+    deny_deployment_token!(auth);
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    error!(
+        schedule,
+        operation,
+        user_id = auth.user_id(),
+        user_role = %auth.effective_role,
+        "non-admin caller denied an instance-wide backup schedule operation"
+    );
+    Err(Problem::from(BackupError::Forbidden {
+        resource: schedule.to_string(),
+        detail: format!(
+            "Only an instance administrator may {operation} a backup schedule that targets \
+             every service or includes the control plane"
+        ),
+    }))
+}
+
+/// [`require_instance_wide_schedule_admin`] for an existing schedule: a
+/// no-op unless the stored schedule is instance-wide. One primary-key read,
+/// skipped entirely for an instance administrator.
+pub(crate) async fn require_admin_for_instance_wide_schedule(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    schedule_id: i32,
+    operation: &str,
+) -> Result<(), Problem> {
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    let schedule = app_state
+        .backup_service
+        .get_backup_schedule(schedule_id)
+        .await
+        .map_err(Problem::from)?;
+    if schedule.target_all_services || schedule.include_control_plane {
+        return require_instance_wide_schedule_admin(
+            auth,
+            &format!("backup schedule {schedule_id}"),
+            operation,
+        );
+    }
+    Ok(())
 }
 
 pub(crate) async fn require_backup_access(
@@ -777,6 +845,104 @@ mod tests {
     #[test]
     fn deployment_token_denied_for_unlinked_service() {
         assert!(!deployment_token_may_access(7, &[]));
+    }
+
+    fn nv1_user() -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 42,
+            name: "Operator".to_string(),
+            email: "operator@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// NV1: a custom key holding `settings:write` + `backups:write` +
+    /// `backups:create` passes every `permission_guard!` on the schedule
+    /// endpoints, yet is not an instance administrator, so it must be refused
+    /// an instance-wide schedule -- with no fail-open for a plain OSS install.
+    #[test]
+    fn nv1_custom_backups_writer_is_denied_an_instance_wide_schedule() {
+        let key = temps_auth::AuthContext::new_api_key(
+            nv1_user(),
+            None,
+            Some(vec![
+                Permission::SettingsWrite,
+                Permission::BackupsWrite,
+                Permission::BackupsCreate,
+            ]),
+            "ops-automation".to_string(),
+            7,
+        );
+        assert!(key.has_permission(&Permission::BackupsCreate));
+        assert!(key.has_permission(&Permission::BackupsWrite));
+        let denied = require_instance_wide_schedule_admin(&key, "backup schedule 1", "create")
+            .expect_err("a non-admin custom key must not manage an instance-wide schedule");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        let body = serde_json::to_value(&denied.body).expect("problem serialises");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("instance administrator"), "{detail}");
+        assert_eq!(schedule_authority(&key), BackupScheduleAuthority::Scoped);
+
+        for role in [temps_auth::Role::Custom, temps_auth::Role::User] {
+            let session = temps_auth::AuthContext::new_session(nv1_user(), role.clone());
+            assert!(
+                require_instance_wide_schedule_admin(&session, "backup schedule 1", "create")
+                    .is_err(),
+                "{role} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn nv1_instance_admin_may_manage_an_instance_wide_schedule() {
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            let session = temps_auth::AuthContext::new_session(nv1_user(), role.clone());
+            assert!(
+                require_instance_wide_schedule_admin(&session, "backup schedule 1", "create")
+                    .is_ok(),
+                "{role} must be allowed"
+            );
+            assert_eq!(
+                schedule_authority(&session),
+                BackupScheduleAuthority::InstanceAdmin
+            );
+        }
+    }
+
+    #[test]
+    fn nv1_deployment_token_is_denied_an_instance_wide_schedule() {
+        let token = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deploy-token".to_string(),
+            Vec::new(),
+        );
+        let denied = require_instance_wide_schedule_admin(&token, "backup schedule 1", "run")
+            .expect_err("deployment tokens are refused");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        let body = serde_json::to_value(&denied.body).expect("problem serialises");
+        assert_eq!(
+            body["type"],
+            "https://temps.sh/probs/deployment-token-not-allowed"
+        );
+        assert_eq!(schedule_authority(&token), BackupScheduleAuthority::Scoped);
     }
 
     #[test]

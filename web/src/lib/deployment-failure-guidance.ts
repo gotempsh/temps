@@ -26,6 +26,11 @@ export function failureStageLabel(stage: DeploymentFailureStage): string {
   return STAGE_LABELS[stage] ?? 'Unknown'
 }
 
+/** The project's container security section, on its Protection page. */
+export function containerSecurityHref(projectSlug: string): string {
+  return `/projects/${projectSlug}/settings/security#container-security`
+}
+
 export interface FailureSettingsLink {
   href: string
   label: string
@@ -60,7 +65,7 @@ export function failureSettingsLink(
     case 'environment_variables':
       return {
         href: `/projects/${projectSlug}/environment-variables`,
-        label: 'Environment Variables',
+        label: 'Environment variables',
       }
     case 'git':
       return {
@@ -71,6 +76,11 @@ export function failureSettingsLink(
       return { href: '/settings/docker-registry', label: 'Docker registries' }
     case 'build_limits':
       return { href: '/settings/build-limits', label: 'Build limits' }
+    case 'container_security':
+      return {
+        href: containerSecurityHref(projectSlug),
+        label: 'Container security',
+      }
     default:
       return null
   }

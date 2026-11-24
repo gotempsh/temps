@@ -674,6 +674,30 @@ pub struct PipelineStats {
 
 // ── Query types ─────────────────────────────────────────────────────
 
+/// An attribute holding a request path, and the path it must serve.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttributePath {
+    pub key: String,
+    /// Starts with `/`, without a query string.
+    pub path: String,
+}
+
+impl AttributePath {
+    /// The prefixes of a value that serves `path` with a query or fragment.
+    pub fn suffixed(&self) -> [String; 2] {
+        [format!("{}?", self.path), format!("{}#", self.path)]
+    }
+
+    /// Whether `value` is the path, or the path with a query or fragment.
+    pub fn matches(&self, value: &str) -> bool {
+        value == self.path
+            || self
+                .suffixed()
+                .iter()
+                .any(|p| value.starts_with(p.as_str()))
+    }
+}
+
 /// Filter for querying traces.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TraceQuery {
@@ -689,10 +713,16 @@ pub struct TraceQuery {
     /// Filter by deployment ID (direct column on otel_spans).
     pub deployment_id: Option<i32>,
     /// Filter by span attributes (exact match on JSONB keys).
-    /// e.g. {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-4"}
+    /// e.g. {"gen_ai.system": "openai", "gen_ai.request.model": "gpt-6.2-sol"}
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// Spans whose attribute holds a request path that is this path, with or
+    /// without a query string or fragment (ADR 111, D2.4). `http.target`
+    /// carries the query (`/products/42?ref=home`), so an exact match would
+    /// miss it.
+    #[serde(default)]
+    pub attribute_path: Option<AttributePath>,
     /// When `true`, only return ROOT spans (no parent) — one row per trace.
     /// Roots are `parent_span_id IS NULL` on TimescaleDB and the `''`
     /// sentinel on ClickHouse; each backend applies its own form. Used by
@@ -879,6 +909,11 @@ pub struct SpanStatsQuery {
     pub sort_order: SortOrder,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Count spans at or under this duration as satisfied, and up to four
+    /// times it as tolerating, to give each operation an Apdex score
+    /// (ADR 111, D2). `None` computes no score.
+    #[serde(default)]
+    pub apdex_threshold_ms: Option<f64>,
 }
 
 impl SpanStatsQuery {
@@ -927,6 +962,28 @@ pub struct SpanStats {
     /// Start time of the most recent span in this group.
     #[schema(value_type = String, format = DateTime)]
     pub last_seen: DateTime<Utc>,
+    /// Apdex for `apdex_threshold_ms`: `(satisfied + tolerating / 2) /
+    /// count`, from 0 (everyone frustrated) to 1 (everyone satisfied).
+    /// `None` when the query asked for no score.
+    pub apdex: Option<f64>,
+    /// The threshold `T` the score used, in milliseconds.
+    pub apdex_threshold_ms: Option<f64>,
+    /// Spans at or under `T`.
+    pub satisfied_count: Option<i64>,
+    /// Spans over `T` and at or under `4T`.
+    pub tolerating_count: Option<i64>,
+    /// Spans over `4T`.
+    pub frustrated_count: Option<i64>,
+}
+
+/// The counts behind an Apdex score, as a backend aggregated them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ApdexCounts {
+    pub threshold_ms: f64,
+    /// Spans at or under the threshold.
+    pub satisfied: i64,
+    /// Spans over the threshold and at or under four times it.
+    pub tolerating: i64,
 }
 
 /// The raw duration aggregates a storage backend computes for one operation,
@@ -966,6 +1023,7 @@ pub fn build_span_stats(
     group: SpanStatsGroup,
     durations: SpanDurationStats,
     last_seen: DateTime<Utc>,
+    apdex: Option<ApdexCounts>,
 ) -> SpanStats {
     let SpanStatsGroup {
         project_id,
@@ -1006,6 +1064,11 @@ pub fn build_span_stats(
         coefficient_of_variation: ratio(durations.stddev_ms, durations.avg_ms),
         tail_ratio: ratio(durations.p99_ms, durations.p50_ms),
         last_seen,
+        apdex: apdex.map(|a| ratio(a.satisfied as f64 + a.tolerating as f64 / 2.0, count as f64)),
+        apdex_threshold_ms: apdex.map(|a| a.threshold_ms),
+        satisfied_count: apdex.map(|a| a.satisfied),
+        tolerating_count: apdex.map(|a| a.tolerating),
+        frustrated_count: apdex.map(|a| (count - a.satisfied - a.tolerating).max(0)),
     }
 }
 
@@ -1529,6 +1592,20 @@ pub struct IngestErrorSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_path_matches_with_a_query_or_fragment_only() {
+        let wanted = AttributePath {
+            key: "http.target".to_string(),
+            path: "/products/42".to_string(),
+        };
+        for value in ["/products/42", "/products/42?ref=home", "/products/42#top"] {
+            assert!(wanted.matches(value), "{value}");
+        }
+        for value in ["/products/420", "/products/42/reviews", "/products", ""] {
+            assert!(!wanted.matches(value), "{value}");
+        }
+    }
 
     // ── LogSeverity ordering ────────────────────────────────────────
 
@@ -2496,7 +2573,34 @@ mod tests {
             },
             d,
             chrono::Utc::now(),
+            None,
         )
+    }
+
+    #[test]
+    fn apdex_counts_satisfied_fully_and_tolerating_half() {
+        let stats = build_span_stats(
+            SpanStatsGroup {
+                project_id: 1,
+                service_name: "svc".into(),
+                span_name: "GET /checkout".into(),
+                kind: SpanKind::Server,
+                count: 10,
+                error_count: 0,
+            },
+            durations(100.0, 10.0, 50.0, 90.0),
+            chrono::Utc::now(),
+            Some(ApdexCounts {
+                threshold_ms: 500.0,
+                satisfied: 6,
+                tolerating: 2,
+            }),
+        );
+        assert_eq!(stats.apdex, Some(0.7));
+        assert_eq!(stats.frustrated_count, Some(2));
+        assert_eq!(stats.apdex_threshold_ms, Some(500.0));
+        let none = stats_with(10, 0, durations(100.0, 10.0, 50.0, 90.0));
+        assert_eq!(none.apdex, None, "no threshold, no score");
     }
 
     #[test]
@@ -2594,6 +2698,7 @@ mod tests {
             sort_order: SortOrder::default(),
             limit: None,
             offset: None,
+            apdex_threshold_ms: None,
         };
 
         assert_eq!(base.effective_limit(), SPAN_STATS_DEFAULT_LIMIT);

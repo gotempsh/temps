@@ -61,10 +61,84 @@ use utoipa::ToSchema;
 /// v7: a static bundle entry refused for its path (absolute, escaping the
 /// extraction directory, or a link) is `static_output_rejected` rather than
 /// `static_deploy_failed`.
-pub const FAILURE_CLASSIFIER_VERSION: u8 = 7;
+///
+/// v8: executor task failures and deployment persistence failures are platform
+/// errors, while terminal-state readiness errors are runtime container exits.
+/// Explicit Compose policy rejections take precedence over resource words in
+/// their diagnostics. Matching still ignores embedded application log tails.
+///
+/// v9: a container whose entrypoint could not be executed because it carries
+/// file capabilities Temps drops is `entrypoint_needs_capability`, read from
+/// the deploy job's own annotation, with a `suggested_fix`.
+pub const FAILURE_CLASSIFIER_VERSION: u8 = 9;
 
 /// Marker Compose deployments put before embedded container log tails.
 const CONTAINER_LOGS_MARKER: &str = "container logs for unhealthy/stopped services:";
+
+const COMPOSE_CHECK_MARKERS: [&str; 2] = [
+    "compose security policy rejected [check=",
+    "invalid compose override [check=",
+];
+
+/// Peel only wrappers produced by the workflow and Compose jobs. Never search
+/// arbitrary command output or user-controlled error fields for metadata.
+fn compose_policy_error_head(mut reason: &str) -> Option<&str> {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if COMPOSE_CHECK_MARKERS
+            .iter()
+            .any(|marker| reason.starts_with(marker))
+        {
+            return Some(reason);
+        }
+        if let Some(inner) = [
+            "job execution failed: ",
+            "job failed: ",
+            "workflow error: ",
+            "compose prepare/pull failed: ",
+            "compose deploy failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("required job 'deploy_compose' failed: ") {
+            reason = inner;
+            continue;
+        }
+        if let Some(inner) = reason.strip_prefix("compose configuration check failed for project ")
+        {
+            let (project_id, rest) = inner.split_once(" (")?;
+            project_id.parse::<i32>().ok()?;
+            let (_, inner) = rest.split_once("): ")?;
+            reason = inner;
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+/// Check labels are metadata, not failure signals (e.g. `oom_killer`).
+/// Removing only the newly introduced annotation preserves the existing
+/// stage/code matching semantics of the diagnostic text around it.
+fn without_compose_check_annotation(reason: &str) -> Option<String> {
+    let policy_error = compose_policy_error_head(reason)?;
+    let marker = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find(|marker| policy_error.starts_with(*marker))?;
+    let label_start = reason.len() - policy_error.len() + marker.len();
+    let label_end = label_start + reason[label_start..].find(']')? + 1;
+    let annotation_start = label_start - "[check=".len();
+    Some(format!(
+        "{}{}",
+        &reason[..annotation_start],
+        &reason[label_end..]
+    ))
+}
 
 /// The pipeline stage a deployment failed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
@@ -206,6 +280,10 @@ pub enum DeploymentFailureCode {
     /// Extracting or publishing static files failed for a reason not covered
     /// above.
     StaticDeployFailed,
+    // ── v9 ──────────────────────────────────────────────────────────────
+    /// The entrypoint binary carries file capabilities (`setcap`) that are
+    /// not in the container's bounding set, so the kernel refused to exec it.
+    EntrypointNeedsCapability,
     Unknown,
 }
 
@@ -262,6 +340,7 @@ impl DeploymentFailureCode {
             Self::StaticOutputRejected => "static_output_rejected",
             Self::BuildNodeUnreachable => "build_node_unreachable",
             Self::StaticDeployFailed => "static_deploy_failed",
+            Self::EntrypointNeedsCapability => "entrypoint_needs_capability",
             Self::Unknown => "unknown",
         }
     }
@@ -318,6 +397,7 @@ impl DeploymentFailureCode {
         Self::StaticOutputRejected,
         Self::BuildNodeUnreachable,
         Self::StaticDeployFailed,
+        Self::EntrypointNeedsCapability,
         Self::Unknown,
     ];
 }
@@ -341,6 +421,8 @@ pub enum FailureSettingsSection {
     DockerRegistry,
     /// Instance → Build limits.
     BuildLimits,
+    /// Project → Settings → Container security (allowed capabilities).
+    ContainerSecurity,
 }
 
 /// Local classification of a failed deployment's reason.
@@ -393,11 +475,18 @@ pub struct DeploymentFailureInfo {
     pub timeout_elapsed_seconds: Option<u64>,
     /// Version of the classifier that produced this view.
     pub classifier_version: u8,
+    /// A concrete fix Temps can describe precisely, for failures that have
+    /// one (`entrypoint_needs_capability`). Never applied automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suggested_fix: Option<super::entrypoint_capability::SuggestedFix>,
 }
 
 /// Build the API view for a failed deployment. Returns `None` when there is no
 /// reason to classify.
-pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
+pub fn describe_failure(
+    reason: Option<&str>,
+    project_id: Option<i32>,
+) -> Option<DeploymentFailureInfo> {
     let reason = reason?.trim();
     if reason.is_empty() {
         return None;
@@ -425,7 +514,45 @@ pub fn describe_failure(reason: Option<&str>) -> Option<DeploymentFailureInfo> {
         timeout_limit_seconds: is_timeout.then(|| timeout_limit_seconds(head)).flatten(),
         timeout_elapsed_seconds: is_timeout.then(|| elapsed_seconds(head)).flatten(),
         classifier_version: FAILURE_CLASSIFIER_VERSION,
+        suggested_fix: (classification.code == DeploymentFailureCode::EntrypointNeedsCapability)
+            .then(|| entrypoint_capability_annotation(reason))
+            .flatten()
+            .map(|(required, verified)| {
+                super::entrypoint_capability::SuggestedFix::new(&required, verified, project_id)
+            }),
     })
+}
+
+/// The capabilities the deploy job annotated a `deploy_container` failure
+/// with, read only from the start of the job's own error body.
+fn entrypoint_capability_annotation(reason: &str) -> Option<(Vec<String>, bool)> {
+    if failed_job_id(reason) != Some("deploy_container") {
+        return None;
+    }
+    let lower = reason.to_lowercase();
+    super::entrypoint_capability::parse_annotation(workflow_error_body(classification_head(&lower)))
+}
+
+/// Read only the typed check label written before any user-controlled error
+/// fields. Older failures and non-configurable validation errors have no label.
+/// Never infer a check from Compose content, service names or diagnostic text.
+pub fn compose_security_check(
+    reason: Option<&str>,
+) -> Option<temps_entities::compose_security::ComposeSecurityCheck> {
+    use temps_entities::compose_security::ComposeSecurityCheck;
+    let reason = reason?.to_lowercase();
+    let head = classification_head(&reason);
+    let policy_error = compose_policy_error_head(head)?;
+    let label = COMPOSE_CHECK_MARKERS
+        .iter()
+        .find_map(|marker| policy_error.strip_prefix(marker))?
+        .split_once(']')?
+        .0;
+    if label.len() > 64 || !label.bytes().all(|c| c.is_ascii_lowercase() || c == b'_') {
+        return None;
+    }
+    serde_json::from_value::<ComposeSecurityCheck>(serde_json::Value::String(label.to_string()))
+        .ok()
 }
 
 /// Static guidance per code. Never interpolates the raw reason.
@@ -590,7 +717,7 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
         ),
         C::ContainerExited => (
             "Container exited during startup",
-            "The app process exited (or kept restarting) right after starting. Check the runtime logs for the crash, verify the start command and required environment variables, and that the image's entrypoint runs a long-lived server. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
+            "The app process exited (or kept restarting) right after starting. Check the deployment's retained container logs, when they were captured, or the runtime logs for the startup crash or a missing environment variable. Verify the start command runs a long-lived server, HOST is 0.0.0.0, and the listen port matches the deployment port. Exit 137 can mean the process was OOM-killed; check the memory limit and runtime logs before raising the limit. If the logs report exec format error, use an image and application binaries built for the host CPU architecture, or publish a multi-architecture image.",
             Some(S::EnvironmentVariables),
         ),
         C::ImageNotFound => (
@@ -672,6 +799,11 @@ pub const fn guidance_for(code: DeploymentFailureCode) -> FailureGuidance {
             "Build node unreachable",
             "The build finished on a worker node, but Temps could not reach that node to fetch the built files. Check the node is online (Nodes page) and reachable from the control plane, then redeploy. If the node was removed, redeploy so the build runs on an available node.",
             Some(S::Deploy),
+        ),
+        C::EntrypointNeedsCapability => (
+            "Entrypoint needs a Linux capability",
+            "The image's entrypoint binary was marked with setcap, and Temps removes every Linux capability from project containers by default, so the kernel refused to start it. If it needs NET_BIND_SERVICE (listening on a port below 1024), allow it for this project in Container security and redeploy. Or keep full hardening: remove the file capabilities from the image (`setcap -r <binary>`) and listen on a port above 1024.",
+            Some(S::ContainerSecurity),
         ),
         C::StaticDeployFailed => (
             "Static files could not be published",
@@ -824,6 +956,45 @@ fn classification_head(lower: &str) -> &str {
         .map_or(lower, |idx| &lower[..idx])
 }
 
+/// The executor's error body after its own wrappers, not arbitrary build
+/// diagnostics that happen to contain an executor-shaped message.
+fn workflow_error_body(mut reason: &str) -> &str {
+    for _ in 0..16 {
+        reason = reason.trim_start();
+        if let Some(inner) = [
+            "workflow execution failed: ",
+            "workflow error: ",
+            "other error: ",
+            "job execution failed: ",
+            "job failed: ",
+            "some(\"",
+        ]
+        .iter()
+        .find_map(|prefix| reason.strip_prefix(prefix))
+        {
+            reason = inner;
+            continue;
+        }
+        if let Some(rest) = reason.strip_prefix("required job '") {
+            let Some((job, inner)) = rest.split_once("' failed: ") else {
+                break;
+            };
+            if job.is_empty()
+                || job.len() > 64
+                || !job
+                    .bytes()
+                    .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-')
+            {
+                break;
+            }
+            reason = inner;
+            continue;
+        }
+        break;
+    }
+    reason
+}
+
 /// Parse the first unsigned integer that immediately follows `prefix`.
 fn number_after(text: &str, prefix: &str) -> Option<u64> {
     text.match_indices(prefix).find_map(|(idx, _)| {
@@ -885,7 +1056,13 @@ pub fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let reason = reason.to_lowercase();
+    let lower = reason.to_lowercase();
+    let head = classification_head(&lower);
+    let semantic_reason = without_compose_check_annotation(head).map(|mut reason| {
+        reason.push_str(&lower[head.len()..]);
+        reason
+    });
+    let reason = semantic_reason.as_deref().unwrap_or(&lower);
 
     if reason.contains("out of memory")
         || reason.contains("oom")
@@ -946,10 +1123,42 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     use DeploymentFailureStage as S;
 
     let full = raw.to_lowercase();
-    let r = classification_head(&full);
+    let head = classification_head(&full);
+    let semantic_reason = without_compose_check_annotation(head);
+    let r = semantic_reason.as_deref().unwrap_or(head);
     let phase = job_phase(failed_job_id(raw));
     let is_compose = phase == Some(JobPhase::Compose) || r.contains("compose");
     let make = DeploymentFailureClassification::new;
+
+    // A failed executor task is an infrastructure fault, even when its panic
+    // payload happens to mention a build, timeout, health check or resource.
+    let executor_error = workflow_error_body(r);
+    if executor_error.starts_with("task execution failed: ")
+        || executor_error.starts_with("internal error executing job '")
+    {
+        return make(S::Platform, C::PlatformInternal);
+    }
+
+    // The deploy job's own annotation, never the container output.
+    if entrypoint_capability_annotation(raw).is_some() {
+        return make(S::Runtime, C::EntrypointNeedsCapability);
+    }
+
+    // Persistence failures belong to the platform even when their cause is a
+    // pool timeout. Match only the workflow error body, never embedded build
+    // diagnostics, before attributing timeout words to the current job phase.
+    if [
+        "failed to find deployment:",
+        "failed to find environment:",
+        "failed to find project:",
+        "failed to update project last_deployment:",
+        "database error:",
+    ]
+    .iter()
+    .any(|prefix| executor_error.starts_with(prefix))
+    {
+        return make(S::Platform, C::PlatformInternal);
+    }
 
     let timeout_signal = contains_any(
         r,
@@ -1029,6 +1238,41 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     if contains_any(r, &["worker builds cannot", "worker builds do not support"]) {
         return make(S::Configuration, C::InvalidConfiguration);
     }
+    // A Compose stack's placement refused the deployment before anything
+    // ran: its home node is offline (stacks never fail over, their volumes
+    // live there), no node can take its first deployment, it links
+    // services a worker cannot reach, or it was moved or pinned elsewhere
+    // while this deployment ran. The remedy is in the message. These come
+    // from planning (no job yet) or the Compose job, never from build or
+    // container output, whose free text could otherwise contain a phrase.
+    if matches!(phase, None | Some(JobPhase::Compose))
+        && contains_any(
+            r,
+            &[
+                "will not start the stack anywhere else",
+                "no node can take the first deployment of compose environment",
+                "compose stacks on worker nodes cannot reach linked services",
+                "was moved while deployment",
+                "by another deployment while this one was starting",
+            ],
+        )
+    {
+        return make(S::Configuration, C::InvalidConfiguration);
+    }
+
+    // An explicit policy rejection happened before any workload ran. Its
+    // diagnostic may name the OOM killer or other resources without exhausting them.
+    if is_compose
+        && contains_any(
+            r,
+            &[
+                "compose security policy rejected",
+                "invalid compose override",
+            ],
+        )
+    {
+        return make(S::Configuration, C::ComposePolicyRejected);
+    }
 
     // ── Resources ───────────────────────────────────────────────────────
     if contains_any(r, &["out of memory", "oomkilled", "exit code 137"]) || contains_word(r, "oom")
@@ -1056,7 +1300,15 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
     {
         return make(S::Configuration, C::ComposePolicyRejected);
     }
-    if r.contains("docker compose v2 is unavailable") {
+    // The node cannot run Compose stacks (yet): no Compose plugin, or a
+    // worker still publishing on its public address before its mesh is up.
+    if contains_any(
+        r,
+        &[
+            "docker compose v2 is unavailable",
+            "a compose stack publishes its ports only on a private address",
+        ],
+    ) {
         return make(S::Platform, C::ComposeUnavailable);
     }
     if contains_any(
@@ -1221,6 +1473,8 @@ fn classify_lowercase(raw: &str) -> DeploymentFailureClassification {
             "' dead",
             "exited with code",
             "exited before",
+            "is in terminal state exited",
+            "is in terminal state dead",
         ],
     ) {
         return make(S::Runtime, C::ContainerExited);
@@ -1692,6 +1946,138 @@ mod tests {
     }
 
     #[test]
+    fn infrastructure_and_terminal_state_messages_do_not_fall_through() {
+        let cases = [
+            ("deploy_compose", "Compose security policy rejected oom_kill_disable for service 'app': disabling the OOM killer is not allowed", S::Configuration, C::ComposePolicyRejected),
+            ("deploy_container", "Task execution failed: task 7 panicked", S::Platform, C::PlatformInternal),
+            ("build_image", "Internal error executing job 'build_image' for deployment 42: task panicked", S::Platform, C::PlatformInternal),
+            ("build_image", "Internal error executing job 'build_image' for deployment 42: deadline elapsed during health check", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find deployment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find environment: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to find project: query failed", S::Platform, C::PlatformInternal),
+            ("mark_deployment_complete", "Failed to update project last_deployment: query failed", S::Platform, C::PlatformInternal),
+            ("deploy_compose", "Compose prepare/pull failed: Docker Compose command failed for project 'app': docker compose build failed: Database error: relation items does not exist", S::Build, C::ComposeBuildFailed),
+            ("deploy_compose", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Database error: connection pool closed", S::Platform, C::PlatformInternal),
+            ("deploy_container", "Container candidate-1 is in terminal state Exited and will not become ready", S::Runtime, C::ContainerExited),
+            ("deploy_container", "Container candidate-1 is in terminal state Dead and will not become ready", S::Runtime, C::ContainerExited),
+        ];
+        for (job, message, stage, code) in cases {
+            assert_class(&wrapped(job, message), stage, code);
+        }
+    }
+
+    #[test]
+    fn persistence_timeouts_stay_platform_failures() {
+        for prefix in [
+            "Failed to find deployment:",
+            "Failed to find environment:",
+            "Failed to find project:",
+            "Failed to update project last_deployment:",
+            "Database error:",
+        ] {
+            let message = format!("{prefix} Connection pool timed out after 30 seconds");
+            for reason in [
+                message.clone(),
+                wrapped("mark_deployment_complete", &message),
+            ] {
+                assert_class(&reason, S::Platform, C::PlatformInternal);
+                assert_eq!(legacy_failure_reason(Some(&reason)), "timeout");
+            }
+        }
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Failed to build image: Build failed: Database error: Connection pool timed out after 30 seconds",
+            ),
+            S::Build,
+            C::BuildTimeout,
+        );
+    }
+
+    #[test]
+    fn application_log_tails_cannot_claim_platform_failures() {
+        for marker in [
+            "Last log lines:",
+            "Container logs for unhealthy/stopped services:",
+        ] {
+            let reason = wrapped("deploy_container", &format!("Container exited during startup (exit code 1). {marker} Database error: task execution failed: connection refused"));
+            assert_class(&reason, S::Runtime, C::ContainerExited);
+        }
+        assert_class(
+            &wrapped("deploy_container", "an entirely novel failure"),
+            S::Deploy,
+            C::Unknown,
+        );
+        assert_class(
+            &wrapped(
+                "build_image",
+                "Build failed: application generator: Database error: schema missing",
+            ),
+            S::Build,
+            C::BuildError,
+        );
+    }
+
+    #[test]
+    fn executor_markers_in_application_build_output_stay_build_failures() {
+        for (job, message, code) in [
+            ("build_image", "Failed to build image: Build failed: process \"/bin/sh -c echo 'Task execution failed: invalid schema' >&2; exit 1\" did not complete successfully: exit code: 1", C::BuildError),
+            ("build_image", "Failed to build image: Build failed: Internal error executing job 'generate'", C::BuildError),
+            ("deploy_compose", "Compose prepare/pull failed: docker compose build failed: Task execution failed: invalid schema", C::ComposeBuildFailed),
+            ("deploy_compose", "Compose prepare/pull failed: docker compose build failed: Internal error executing job 'generate'", C::ComposeBuildFailed),
+        ] {
+            assert_class(&wrapped(job, message), S::Build, code);
+        }
+        assert_class(
+            "Workflow error: Other error: Task execution failed: task 7 panicked",
+            S::Platform,
+            C::PlatformInternal,
+        );
+        assert_class("Workflow execution failed: Job execution failed: Internal error executing job 'build_image' in workflow 'deployment-42' for deployment 42: task panicked", S::Platform, C::PlatformInternal);
+    }
+
+    #[test]
+    fn compose_check_metadata_survives_workflow_wrappers() {
+        use temps_entities::compose_security::ComposeSecurityCheck;
+        let inner = "Compose configuration check failed for project 42 (policy_violation): Compose security policy rejected [check=privileged] privileged for service 'app': refused";
+        for reason in [
+            inner.to_string(),
+            wrapped("deploy_compose", inner),
+            format!("Job execution failed: Required job 'deploy_compose' failed: {inner}"),
+        ] {
+            assert_eq!(
+                compose_security_check(Some(&reason)),
+                Some(ComposeSecurityCheck::Privileged)
+            );
+        }
+    }
+
+    #[test]
+    fn container_exit_guidance_covers_startup_diagnostics() {
+        let info = describe_failure(
+            Some("Container exited during startup (exit code 1) after 2s"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(info.code, C::ContainerExited);
+        for hint in [
+            "retained container logs",
+            "environment variable",
+            "0.0.0.0",
+            "listen port",
+            "137",
+            "OOM",
+            "start command",
+        ] {
+            assert!(info.remediation.contains(hint), "missing hint: {hint}");
+        }
+        // Not every surface shows logs under the guidance (the compact row
+        // only has a tooltip, and logs are only present when captured).
+        assert!(!info.remediation.contains("below"));
+    }
+
+    #[test]
     fn log_only_architecture_diagnostic_keeps_runtime_guidance_without_trusting_log_text() {
         let reason = wrapped("deploy_compose", "Compose deploy failed: Compose stack 'temps-1-2' did not become ready within 300s: service 'api' exited\n\nContainer logs for unhealthy/stopped services:\nexec format error");
         let result = classify_failure_reason(Some(&reason));
@@ -1868,7 +2254,7 @@ mod tests {
         let reason = wrapped("build_image", COPY_NODE_MODULES);
         assert_class(&reason, S::Build, C::DockerfileCopyNotFound);
 
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.code.as_str(), "dockerfile_copy_not_found");
         assert_eq!(info.failed_job.as_deref(), Some("build_image"));
         assert_eq!(info.settings_section, Some(FailureSettingsSection::Build));
@@ -1994,7 +2380,7 @@ mod tests {
             "build_image",
             "Failed to build image: Build failed: failed to solve: process \"/bin/sh -c make release\" did not complete successfully: exit code: 2",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.stage, S::Build);
         assert_eq!(info.code, C::BuildError);
         assert!(!info.remediation.contains("disk space"));
@@ -2008,7 +2394,7 @@ mod tests {
             "Failed to build image: Built image not found",
         );
         assert_class(&built, S::Image, C::ImageMissing);
-        let info = describe_failure(Some(&built)).unwrap();
+        let info = describe_failure(Some(&built), None).unwrap();
         assert!(info.remediation.contains("disk space"));
 
         // Docker no longer has the image when the deploy job needs it.
@@ -2023,6 +2409,69 @@ mod tests {
             "Failed to deploy container: image 'app:latest' not found",
         );
         assert_class(&untouched, S::Image, C::ImageMissing);
+    }
+
+    /// Compose placement refusals carry their remedy in the message and are
+    /// configuration outcomes. Built from the real errors, so rewording one
+    /// cannot silently change how its deployment failure is recorded.
+    #[test]
+    fn compose_placement_refusals_are_configuration_failures() {
+        use crate::services::compose_placement::ComposePlacementError as E;
+        let refusals = [
+            E::HomeNodeUnavailable {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                node_id: 3,
+                node_name: "worker-a".to_string(),
+                state: "offline".to_string(),
+            },
+            E::NoPlacement {
+                environment_id: 2,
+                environment_name: "production".to_string(),
+                reason: "no active node matches".to_string(),
+            },
+            E::PinnedConcurrently {
+                environment_id: 2,
+                pinned: "worker node #4".to_string(),
+                expected: "worker node #3".to_string(),
+            },
+            E::MovedConcurrently {
+                environment_id: 2,
+                deployment_id: 9,
+                expected: "worker node #3 (moving from the control plane)".to_string(),
+                current: "worker node #4 (moving from the control plane)".to_string(),
+            },
+        ];
+        for refusal in refusals {
+            assert_class(
+                &wrapped("deploy_compose", &refusal.to_string()),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+            // Raised while planning, before any job ran.
+            assert_class(
+                &format!("Compose placement refused deployment 9: {refusal}"),
+                S::Configuration,
+                C::InvalidConfiguration,
+            );
+        }
+    }
+
+    /// A build whose own output happens to contain a placement refusal's
+    /// wording is still a build failure, not a placement refusal.
+    #[test]
+    fn placement_wording_in_build_output_is_not_a_placement_refusal() {
+        let reason = wrapped(
+            "build_image",
+            "Build failed: step 4/9 RUN ./check.sh: lock was taken by another deployment while \
+             this one was starting; exit code 1",
+        );
+        let got = classify_failure_reason(Some(&reason));
+        assert_ne!(
+            (got.stage, got.code),
+            (S::Configuration, C::InvalidConfiguration),
+            "{reason}"
+        );
     }
 
     #[test]
@@ -2138,7 +2587,7 @@ mod tests {
             "deploy_compose",
             "Compose deploy failed: Compose stack 'temps-1-2' did not become ready within 300s: service 'web' is starting",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(info.code, C::HealthCheckTimeout);
         assert_eq!(info.stage, S::HealthCheck);
         assert_eq!(info.timeout_limit_seconds, Some(300));
@@ -2183,6 +2632,14 @@ mod tests {
         );
         assert_class(&unavailable, S::Platform, C::ComposeUnavailable);
 
+        // The worker agent's refusal while it still publishes on its public
+        // address (`AgentComposeError::PublicBindAddress`).
+        let off_mesh = wrapped(
+            "deploy_compose",
+            "Compose prepare/pull failed: worker node 'worker-a': This node publishes container ports on 203.0.113.10, a public address: it joined the cluster with a public address and is not on its WireGuard mesh yet. A Compose stack publishes its ports only on a private address, as the control plane keeps them on loopback, so project 'temps-1-2' was not prepared. Deploy again once the node is on the mesh (its mesh status is shown in the node list)",
+        );
+        assert_class(&off_mesh, S::Platform, C::ComposeUnavailable);
+
         let generic = wrapped(
             "deploy_compose",
             "Compose deploy failed: Compose command failed for project 'temps-1-2': docker compose up failed: Error response from daemon: Conflict. The container name is already in use",
@@ -2196,7 +2653,7 @@ mod tests {
             "deploy_compose",
             "Compose prepare/pull failed: Compose command failed for project 'temps-1-2': docker compose build timed out after 1800 seconds",
         );
-        let info = describe_failure(Some(&build)).unwrap();
+        let info = describe_failure(Some(&build), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Build, C::BuildTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(1800));
 
@@ -2236,7 +2693,7 @@ mod tests {
             "Docker responded with status code 404: failed to resolve reference \"docker.io/library/app:missing\": docker.io/library/app:missing: not found",
         );
         assert_class(&reason, S::Image, C::ImageNotFound);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
         assert_eq!(info.settings_section, Some(FailureSettingsSection::Source));
     }
@@ -2306,7 +2763,7 @@ mod tests {
     fn unrecognised_external_pull_failure_never_mentions_a_from_line() {
         let reason = external_pull_failure("Docker responded with status code 400: something new");
         assert_class(&reason, S::Image, C::ImagePullFailed);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(!info.remediation.contains("FROM"), "{}", info.remediation);
     }
 
@@ -2327,7 +2784,7 @@ mod tests {
             "Failed to build image: Build failed: failed to solve: docker.io/library/debian:no-such-tag: failed to resolve source metadata for docker.io/library/debian:no-such-tag: docker.io/library/debian:no-such-tag: not found",
         );
         assert_class(&reason, S::Image, C::BaseImagePull);
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert!(info.remediation.contains("FROM"));
     }
 
@@ -2410,7 +2867,7 @@ mod tests {
             "deploy_container",
             "Application never accepted connections on port 3000 within the readiness limit of 300s (waited 302s; last check: connection refused)",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(
             (info.stage, info.code),
             (S::HealthCheck, C::AppNotListening)
@@ -2442,7 +2899,7 @@ mod tests {
             "deploy_container",
             "Application readiness timed out on port 8080: health checks did not pass within the readiness limit of 120s (waited 121s; last check: request timed out)",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!(
             (info.stage, info.code),
             (S::HealthCheck, C::HealthCheckTimeout)
@@ -2496,7 +2953,7 @@ mod tests {
             "download_repo",
             "Git sparse clone of example/repo timed out after 300s",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Source, C::SourceTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(300));
     }
@@ -2507,7 +2964,7 @@ mod tests {
             "deploy_container",
             "Image pull 'team/app:1' exceeded the 30-minute worker deadline",
         );
-        let info = describe_failure(Some(&reason)).unwrap();
+        let info = describe_failure(Some(&reason), None).unwrap();
         assert_eq!((info.stage, info.code), (S::Image, C::ImagePullTimeout));
         assert_eq!(info.timeout_limit_seconds, Some(1800));
     }
@@ -2537,16 +2994,19 @@ mod tests {
     #[test]
     fn describe_failure_never_echoes_the_reason() {
         let secret = "ghp_shouldNeverLeak123";
-        let info = describe_failure(Some(&wrapped(
-            "build_image",
-            &format!("Build failed with token {secret}"),
-        )))
+        let info = describe_failure(
+            Some(&wrapped(
+                "build_image",
+                &format!("Build failed with token {secret}"),
+            )),
+            None,
+        )
         .unwrap();
         let json = serde_json::to_string(&info).unwrap();
         assert!(!json.contains(secret));
         assert_eq!(info.classifier_version, FAILURE_CLASSIFIER_VERSION);
-        assert!(describe_failure(None).is_none());
-        assert!(describe_failure(Some("   ")).is_none());
+        assert!(describe_failure(None, None).is_none());
+        assert!(describe_failure(Some("   "), None).is_none());
     }
 
     // ── Static-site deploy jobs ─────────────────────────────────────────
@@ -2615,7 +3075,7 @@ mod tests {
     fn bundle_entries_refused_for_their_path_are_rejected_output() {
         // The exact text `WorkflowError::InvalidArchiveEntry` renders, so a
         // reworded error cannot silently fall back to `static_deploy_failed`.
-        let entry = temps_core::WorkflowError::InvalidArchiveEntry {
+        let entry = crate::workflow::WorkflowError::InvalidArchiveEntry {
             path: "../escape.txt".to_string(),
             reason: "a '..' path component would write outside the extraction directory; use paths relative to the archive root".to_string(),
         }
@@ -2721,5 +3181,89 @@ mod tests {
     fn disk_exhaustion_during_static_extraction_stays_disk_exhausted() {
         let reason = static_extract("IO error: No space left on device (os error 28)");
         assert_class(&reason, S::Resource, C::DiskExhausted);
+    }
+
+    #[test]
+    fn an_annotated_deploy_failure_needs_a_capability_and_carries_the_fix() {
+        let reason = wrapped(
+            "deploy_container",
+            "Container keeps restarting during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] (restarted 5 times; last exit: exit code 126)",
+        );
+        assert_class(&reason, S::Runtime, C::EntrypointNeedsCapability);
+        let info = describe_failure(Some(&reason), Some(7)).unwrap();
+        assert_eq!(
+            info.settings_section,
+            Some(FailureSettingsSection::ContainerSecurity)
+        );
+        let fix = info.suggested_fix.clone().expect("a suggested fix");
+        assert_eq!(fix.required_capabilities, vec!["NET_BIND_SERVICE"]);
+        assert!(fix.verified);
+        assert_eq!(
+            fix.allow_capabilities,
+            vec![temps_workload::ContainerCapability::NetBindService]
+        );
+        assert_eq!(fix.setting, "allowed_capabilities");
+        assert_eq!(
+            fix.setting_path.as_deref(),
+            Some("/projects/7/container-security")
+        );
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["code"], "entrypoint_needs_capability");
+        assert_eq!(
+            json["suggested_fix"]["allow_capabilities"][0],
+            "NET_BIND_SERVICE"
+        );
+
+        let exited = wrapped(
+            "deploy_container",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE inferred] (exit code 1) after 2s",
+        );
+        let info = describe_failure(Some(&exited), None).unwrap();
+        assert_eq!(info.code, C::EntrypointNeedsCapability);
+        assert!(!info.suggested_fix.unwrap().verified);
+    }
+
+    #[test]
+    fn only_the_deploy_jobs_own_annotation_counts() {
+        // A plain 126 exit or crash loop stays a container exit.
+        for inner in [
+            "Container exited during startup (exit code 126) after 2s",
+            "Container keeps restarting during startup (restarted 5 times; last exit: exit code 126)",
+            // The image printing the marker into Docker's error text.
+            "Container exited during startup (exit code 1: [entrypoint_needs_capability: NET_BIND_SERVICE verified]) after 2s",
+            // ... or into the log tail.
+            "Container exited during startup (exit code 1). Last log lines: Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified]",
+        ] {
+            let reason = wrapped("deploy_container", inner);
+            assert_class(&reason, S::Runtime, C::ContainerExited);
+            assert!(describe_failure(Some(&reason), Some(1)).unwrap().suggested_fix.is_none());
+        }
+        // Another job's error cannot claim it.
+        let other = wrapped(
+            "deploy_compose",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE verified] (exit code 1)",
+        );
+        assert_ne!(
+            classify_failure_reason(Some(&other)).code,
+            C::EntrypointNeedsCapability
+        );
+        assert!(describe_failure(Some(&other), Some(1))
+            .unwrap()
+            .suggested_fix
+            .is_none());
+    }
+
+    #[test]
+    fn a_capability_no_project_can_allow_offers_only_the_image_fix() {
+        let reason = wrapped(
+            "deploy_container",
+            "Container exited during startup [entrypoint_needs_capability: NET_BIND_SERVICE,NET_RAW verified] (exit code 1) after 1s",
+        );
+        let fix = describe_failure(Some(&reason), Some(3))
+            .unwrap()
+            .suggested_fix
+            .unwrap();
+        assert!(fix.allow_capabilities.is_empty());
+        assert_eq!(fix.not_allowed_capabilities, vec!["NET_RAW"]);
     }
 }

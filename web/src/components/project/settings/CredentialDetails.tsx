@@ -8,8 +8,9 @@ import {
   CircleAlert,
   CircleHelp,
   Clock3,
-  PauseCircle,
   History,
+  ListChecks,
+  PauseCircle,
   ShieldCheck,
 } from 'lucide-react'
 import {
@@ -296,11 +297,14 @@ export function CredentialDetails({
         <TabsList aria-label={`${noun} views`}>
           <TabsTrigger
             value="checks"
+            icon={ListChecks}
             count={checks.data ? scoped.length : undefined}
           >
             Checks
           </TabsTrigger>
-          <TabsTrigger value="history">History</TabsTrigger>
+          <TabsTrigger value="history" icon={History}>
+            History
+          </TabsTrigger>
         </TabsList>
         <TabsContent value="checks" className="mt-5 space-y-4">
           <div>

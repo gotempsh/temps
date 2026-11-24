@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::time::Duration;
 use tokio_stream::Stream;
 
+use super::stream_text::{Utf8StreamDecoder, MAX_BUFFERED_STREAM_BYTES};
 use crate::error::AiGatewayError;
 use crate::providers::{AiProvider, ProviderCapability, ProviderHttpClient, ProviderInfo};
 use crate::types::*;
@@ -21,6 +22,22 @@ impl Default for GeminiProvider {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Major version of a `gemini-<major>[.<minor>]-...` model id.
+fn gemini_major_version(model: &str) -> Option<u32> {
+    model
+        .to_ascii_lowercase()
+        .strip_prefix("gemini-")?
+        .split(['.', '-'])
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Gemini 3 and later take a `thinkingLevel` instead of a thinking budget.
+fn uses_thinking_levels(model: &str) -> bool {
+    gemini_major_version(model).is_some_and(|major| major >= 3)
 }
 
 impl GeminiProvider {
@@ -187,7 +204,7 @@ impl GeminiProvider {
                 .as_ref()
                 .and_then(|extra| extra.get("reasoning_effort"))
                 .and_then(serde_json::Value::as_str)
-                .filter(|_| request.model.starts_with("gemini-3"))
+                .filter(|_| uses_thinking_levels(&request.model))
                 .map(|level| GeminiThinkingConfig {
                     thinking_level: level.to_string(),
                 }),
@@ -372,6 +389,7 @@ impl GeminiProvider {
             prompt_tokens: u.prompt_token_count,
             completion_tokens: u.candidates_token_count,
             total_tokens: u.total_token_count,
+            prompt_tokens_details: None,
         });
 
         let message_content = if text_content.is_empty() && !tool_calls.is_empty() {
@@ -511,6 +529,7 @@ impl GeminiProvider {
                     prompt_tokens: u.prompt_token_count,
                     completion_tokens: u.candidates_token_count,
                     total_tokens: u.total_token_count,
+                    prompt_tokens_details: None,
                 });
 
                 let chunk = ChatCompletionChunk {
@@ -565,18 +584,20 @@ impl AiProvider for GeminiProvider {
     }
 
     fn available_models(&self) -> Vec<ModelInfo> {
+        // Bootstrap fallback only: a key's live catalog (discovered from
+        // /v1beta/models) replaces this list once it is refreshed.
         let models = [
+            "gemini-4-neon",
+            "gemini-4-hydrogen",
+            "gemini-4-carbon",
+            "gemini-4-argon",
+            "gemini-3.8-flash",
             "gemini-3.6-flash",
-            "gemini-3.5-flash",
             "gemini-3.5-flash-lite",
-            "gemini-3.1-pro",
+            "gemini-3.1-pro-preview",
             "gemini-3.1-flash-lite",
-            "gemini-3-flash",
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
+            "gemini-3-flash-preview",
             "gemini-2.5-flash-lite",
-            "gemini-2-flash",
-            "gemini-2-flash-lite",
         ];
         models
             .iter()
@@ -623,14 +644,10 @@ impl AiProvider for GeminiProvider {
             });
         }
 
-        let gemini_response: GeminiResponse =
-            response
-                .json()
-                .await
-                .map_err(|e| AiGatewayError::TranslationError {
-                    provider: "gemini".to_string(),
-                    reason: format!("Failed to parse Gemini response: {}", e),
-                })?;
+        let gemini_response: GeminiResponse = response
+            .json()
+            .await
+            .map_err(|e| crate::error::response_body_error("gemini", "Gemini response", e))?;
 
         Self::translate_response(gemini_response, &request.model)
     }
@@ -685,12 +702,22 @@ impl AiProvider for GeminiProvider {
             // be presented to the caller as a completed reply.
             let mut saw_finish = false;
             let mut transport_failed = false;
+            let mut decoder = Utf8StreamDecoder::default();
 
             while let Some(chunk_result) = stream.next().await {
                 match chunk_result {
                     Ok(chunk) => {
-                        let text = String::from_utf8_lossy(&chunk);
-                        buffer.push_str(&text);
+                        decoder.decode_into(&chunk, &mut buffer);
+                        if buffer.len() > MAX_BUFFERED_STREAM_BYTES {
+                            transport_failed = true;
+                            yield Err(AiGatewayError::StreamError {
+                                model: model.clone(),
+                                reason: format!(
+                                    "upstream sent over {MAX_BUFFERED_STREAM_BYTES} bytes without ending an event"
+                                ),
+                            });
+                            break;
+                        }
 
                         while let Some(data_start) = buffer.find("data: ") {
                             let data_content_start = data_start + 6;
@@ -1024,6 +1051,32 @@ mod tests {
     }
 
     #[test]
+    fn test_translate_request_maps_thinking_for_gemini_4_and_later_only() {
+        for (model, expected) in [
+            ("gemini-4-hydrogen", Some("high")),
+            ("gemini-4.1-neon", Some("high")),
+            ("gemini-10-pro", Some("high")),
+            ("gemini-3-flash-preview", Some("high")),
+            ("gemini-2.5-pro", None),
+            ("gemini-flash-latest", None),
+        ] {
+            let mut request = make_request(Vec::new());
+            request.model = model.to_string();
+            request.extra = Some(serde_json::Map::from_iter([(
+                "reasoning_effort".to_string(),
+                serde_json::json!("high"),
+            )]));
+            let value = serde_json::to_value(GeminiProvider::translate_request(&request))
+                .expect("request serializes");
+            assert_eq!(
+                value["generationConfig"]["thinkingConfig"]["thinkingLevel"].as_str(),
+                expected,
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
     fn test_translate_request_maps_gemini_3_thinking_and_omits_sampling() {
         let mut request = make_request(Vec::new());
         request.model = "gemini-3.6-flash".to_string();
@@ -1248,11 +1301,13 @@ mod tests {
             content: Some(MessageContent::Parts(vec![
                 ContentPart {
                     r#type: "text".to_string(),
+                    cache_control: None,
                     text: Some("What's in this image?".to_string()),
                     image_url: None,
                 },
                 ContentPart {
                     r#type: "image_url".to_string(),
+                    cache_control: None,
                     text: None,
                     image_url: Some(serde_json::json!({
                         "url": "data:image/png;base64,iVBORw0KGgo="
@@ -1287,6 +1342,7 @@ mod tests {
             role: "user".to_string(),
             content: Some(MessageContent::Parts(vec![ContentPart {
                 r#type: "image_url".to_string(),
+                cache_control: None,
                 text: None,
                 image_url: Some(serde_json::json!({
                     "url": "https://example.com/photo.png"

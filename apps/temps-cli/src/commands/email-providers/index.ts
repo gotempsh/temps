@@ -21,11 +21,12 @@ import type {
 } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptSelect, promptConfirm } from '../../ui/prompts.js'
+import { promptText, promptPassword, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import {
   newline, header, icons, json, colors, success, info, warning,
   keyValue, formatDate,
 } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 const PROVIDER_TYPES: { name: string; value: EmailProviderTypeRoute }[] = [
   { name: 'Amazon SES', value: 'ses' },
@@ -66,6 +67,11 @@ interface DiscoverableDomainsOptions {
 }
 
 // --- Credential resolution ---
+
+/** Validator for a masked credential prompt: an empty answer is not a credential. */
+export function requireNonEmpty(value: string): true | string {
+  return value.length > 0 ? true : 'A value is required'
+}
 
 // Maps flags already supplied on the command line to the ses_credentials /
 // scaleway_credentials pair the API expects (exactly one populated, the
@@ -128,7 +134,7 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listProvidersAction)
 
-  emailProviders
+  const createCommand = emailProviders
     .command('create')
     .alias('add')
     .description('Create a new email provider')
@@ -143,6 +149,10 @@ export function registerEmailProvidersCommands(program: Command): void {
     .option('--project-id <id>', 'Scaleway project ID')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createProviderAction)
+  addCredentialSources(createCommand, [
+    { flag: 'secret-access-key', what: 'the AWS secret access key' },
+    { flag: 'api-key', what: 'the Scaleway API key' },
+  ])
 
   emailProviders
     .command('show')
@@ -280,14 +290,17 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         info('Create credentials at: https://console.aws.amazon.com/iam/')
         newline()
 
-        const accessKeyId = await promptText({
+        // Keep what was already supplied (e.g. --secret-access-key-file) and
+        // prompt only for what is missing (an empty flag counts as missing, as
+        // in resolveEmailProviderCredentials); the secret is typed masked.
+        const accessKeyId = options.accessKeyId || await promptText({
           message: 'AWS Access Key ID',
           required: true,
         })
 
-        const secretAccessKey = await promptText({
+        const secretAccessKey = options.secretAccessKey || await promptPassword({
           message: 'AWS Secret Access Key',
-          required: true,
+          validate: requireNonEmpty,
         })
 
         sesCredentials = {
@@ -302,12 +315,12 @@ async function createProviderAction(options: CreateOptions): Promise<void> {
         info('Create credentials at: https://console.scaleway.com/iam/api-keys')
         newline()
 
-        const apiKey = await promptText({
+        const apiKey = options.apiKey || await promptPassword({
           message: 'Scaleway API Key',
-          required: true,
+          validate: requireNonEmpty,
         })
 
-        const projectId = await promptText({
+        const projectId = options.projectId || await promptText({
           message: 'Scaleway Project ID',
           required: true,
         })

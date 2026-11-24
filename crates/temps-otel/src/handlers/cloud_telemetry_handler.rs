@@ -33,7 +33,7 @@ use crate::services::telemetry_write_mode::{
     TelemetryWriteModeError, CLOUD_SETUP_PATH,
 };
 use crate::OtelAppState;
-use temps_auth::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 use temps_entities::cloud_analytics_write_mode::CloudAnalyticsWriteMode;
@@ -636,10 +636,10 @@ pub async fn get_cloud_telemetry_status(
 /// A failure here is a 500 rather than an unfiltered list: "we could not check
 /// what you may see" must never resolve to "show everything".
 async fn hidden_project_ids(
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     state: &OtelAppState,
 ) -> Result<std::collections::HashSet<i32>, Problem> {
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+    if auth.is_admin() || auth.has_role(&temps_authz::Role::PlatformAdmin) {
         return Ok(std::collections::HashSet::new());
     }
     let (Some(checker), Some(user_id)) =

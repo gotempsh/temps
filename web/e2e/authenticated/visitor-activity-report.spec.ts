@@ -3,6 +3,16 @@
 
 import { expect, test, type Page } from '@playwright/test'
 
+/**
+ * The report's own environment picker. The project bar above every project
+ * page has one too, which these checks are not about.
+ */
+function reportEnvironmentPicker(page: Page, exact: boolean) {
+  return page
+    .getByRole('combobox', { name: 'Environment', exact })
+    .and(page.locator(':not(nav[aria-label="Project and environment"] *)'))
+}
+
 async function openSettings(page: Page) {
   if (
     !(await page
@@ -240,9 +250,7 @@ for (const width of [390, 1280]) {
       page.getByRole('button', { name: 'Enable daily reports' })
     ).toHaveCount(0)
     await expect(page.getByLabel('Public application URL')).toHaveCount(0)
-    await expect(
-      page.getByRole('combobox', { name: 'Environment', exact: true })
-    ).toHaveCount(0)
+    await expect(reportEnvironmentPicker(page, true)).toHaveCount(0)
     await expect(
       page.getByRole('list', { name: 'Activity report setup steps' })
     ).toHaveCount(0)
@@ -300,11 +308,18 @@ for (const width of [390, 1280]) {
     await expect(page.getByRole('button', { name: 'Run now' })).toHaveCount(0)
     await expect(page.getByText('Categories', { exact: true })).toBeVisible()
     await page.getByRole('button', { name: 'Preview my visitors' }).click()
+    // The provider's failure is shown where the preview runs; nothing is saved.
+    const failure = page
+      .getByRole('alert')
+      .filter({ hasText: 'The provider could not create a preview.' })
+    await expect(failure).toBeVisible()
     await expect(
-      page.getByText(/Your saved setup has not changed/)
+      failure.getByRole('button', { name: 'Try again', exact: true })
     ).toBeVisible()
     expect(saved).toBe(false)
-    await page.getByRole('button', { name: 'Preview my visitors' }).click()
+    await failure
+      .getByRole('button', { name: 'Try again', exact: true })
+      .click()
     await expect(page.getByText(report.summary)).toBeVisible()
     await page
       .getByRole('button', { name: 'Enable daily reports', exact: true })
@@ -575,7 +590,7 @@ for (const width of [390, 1280]) {
     await page.getByRole('button', { name: 'Change goal' }).click()
     await expect(
       page.getByRole('heading', { name: 'Suggested goals' })
-    ).toBeVisible()
+    ).toBeFocused()
     await page
       .getByRole('button', {
         name: 'Choose Documentation interest',
@@ -673,9 +688,7 @@ for (const width of [390, 1280]) {
       }
     )
     await page.goto(`/projects/${project.slug}/analytics/activity`)
-    const environment = page.getByRole('combobox', {
-      name: 'Environment',
-    })
+    const environment = reportEnvironmentPicker(page, false)
     const website = page.getByRole('combobox', {
       name: 'Website',
     })

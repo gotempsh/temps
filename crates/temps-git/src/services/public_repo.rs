@@ -12,17 +12,18 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::{Arc, OnceLock};
+use temps_presets::stored_preset::StoredPresetExt;
 use thiserror::Error;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 /// Errors that can occur when accessing public repositories
 #[derive(Error, Debug)]
 pub enum PublicRepoError {
-    #[error("Repository not found: {0}")]
-    NotFound(String),
+    #[error("Repository not found: {context}")]
+    NotFound { context: String },
 
-    #[error("Repository is not public: {0}")]
-    RepositoryNotPublic(String),
+    #[error("Repository is not public: {repository}")]
+    RepositoryNotPublic { repository: String },
 
     #[error("Rate limit exceeded")]
     RateLimitExceeded,
@@ -38,11 +39,12 @@ pub enum PublicRepoError {
     #[error("API error: {0}")]
     ApiError(String),
 
-    #[error("Branch not found: {0}")]
-    BranchNotFound(String),
+    #[error("Branch not found: {branch}")]
+    BranchNotFound { branch: String },
 
-    #[error("Provider not supported: {0}")]
-    ProviderNotSupported(String),
+    /// `subject` is the provider's name, or a sentence saying what it cannot do.
+    #[error("Provider not supported: {subject}")]
+    ProviderNotSupported { subject: String },
 
     #[error("Internal error: {0}")]
     Internal(String),
@@ -189,10 +191,12 @@ pub trait PublicRepoProvider: Send + Sync {
         _repo: &str,
         _tag: &str,
     ) -> Result<Option<String>, PublicRepoError> {
-        Err(PublicRepoError::ProviderNotSupported(format!(
-            "{} public repositories cannot look up tags",
-            self.provider_name()
-        )))
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot look up tags",
+                self.provider_name()
+            ),
+        })
     }
 
     /// The full object id of a commit given its full or abbreviated id;
@@ -203,10 +207,12 @@ pub trait PublicRepoProvider: Send + Sync {
         _repo: &str,
         _sha: &str,
     ) -> Result<Option<String>, PublicRepoError> {
-        Err(PublicRepoError::ProviderNotSupported(format!(
-            "{} public repositories cannot look up commits",
-            self.provider_name()
-        )))
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot look up commits",
+                self.provider_name()
+            ),
+        })
     }
 
     /// Resolve a branch, tag or commit to the commit it points at.
@@ -285,10 +291,12 @@ pub trait PublicRepoProvider: Send + Sync {
         _reference: &str,
     ) -> Result<Vec<crate::services::repository_directory::DirectoryListingEntry>, PublicRepoError>
     {
-        Err(PublicRepoError::ProviderNotSupported(format!(
-            "{} public repositories cannot list directories",
-            self.provider_name()
-        )))
+        Err(PublicRepoError::ProviderNotSupported {
+            subject: format!(
+                "{} public repositories cannot list directories",
+                self.provider_name()
+            ),
+        })
     }
 }
 
@@ -345,15 +353,14 @@ fn ensure_repository_is_public(
     if is_public {
         Ok(())
     } else {
-        Err(PublicRepoError::RepositoryNotPublic(format!(
-            "{}/{}",
-            owner, repo
-        )))
+        Err(PublicRepoError::RepositoryNotPublic {
+            repository: format!("{}/{}", owner, repo),
+        })
     }
 }
 
 impl GitHubPublicProvider {
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -363,17 +370,21 @@ impl GitHubPublicProvider {
             // would follow the redirect too).
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: None,
-        }
+        })
     }
 
     /// Create a provider with an authentication token (increases rate limit from 60 to 5000/hr)
-    pub fn with_token(token: String) -> Self {
+    pub fn with_token(token: String) -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -381,18 +392,22 @@ impl GitHubPublicProvider {
             // request; never allow a redirect to carry it to a third party.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for the GitHub public API: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             api_url: "https://api.github.com".to_string(),
             token: Some(token),
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_token_and_api_url(token: String, api_url: String) -> Self {
-        let mut provider = Self::with_token(token);
+        let mut provider = Self::with_token(token).expect("build test GitHub provider");
         provider.api_url = api_url;
         provider
     }
@@ -440,7 +455,7 @@ impl GitHubPublicProvider {
     fn map_error(e: reqwest::Error) -> PublicRepoError {
         let error_str = e.to_string();
         if error_str.contains("404") {
-            PublicRepoError::NotFound(error_str)
+            PublicRepoError::NotFound { context: error_str }
         } else if error_str.contains("403") || error_str.contains("rate limit") {
             PublicRepoError::RateLimitExceeded
         } else {
@@ -456,7 +471,9 @@ impl GitHubPublicProvider {
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
-            404 => Err(PublicRepoError::NotFound(context.to_string())),
+            404 => Err(PublicRepoError::NotFound {
+                context: context.to_string(),
+            }),
             429 => Err(PublicRepoError::RateLimitExceeded),
             403 if rate_limit_remaining == Some(0) => Err(PublicRepoError::RateLimitExceeded),
             403 => Err(PublicRepoError::PermissionDenied {
@@ -568,12 +585,6 @@ impl GitHubPublicProvider {
             )));
         }
         Ok(Some(sha))
-    }
-}
-
-impl Default for GitHubPublicProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -956,7 +967,7 @@ impl GitLabPublicProvider {
     const MAX_TREE_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
     const MAX_TREE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
 
-    pub fn new() -> Self {
+    pub fn new() -> Result<Self, PublicRepoError> {
         let client = reqwest::Client::builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
@@ -965,18 +976,22 @@ impl GitLabPublicProvider {
             // internal network.
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to create HTTP client");
+            .map_err(|error| {
+                PublicRepoError::Internal(format!(
+                    "Failed to create HTTP client for gitlab.com: {error}"
+                ))
+            })?;
 
-        Self {
+        Ok(Self {
             client,
             base_url: "https://gitlab.com".to_string(),
             custom_egress_limiter: None,
-        }
+        })
     }
 
     #[cfg(test)]
     fn with_test_base_url(base_url: String) -> Self {
-        let mut provider = Self::new();
+        let mut provider = Self::new().expect("build test GitLab provider");
         provider.base_url = base_url;
         provider
     }
@@ -1044,7 +1059,7 @@ impl GitLabPublicProvider {
     fn map_error(e: reqwest::Error) -> PublicRepoError {
         let error_str = e.to_string();
         if error_str.contains("404") {
-            PublicRepoError::NotFound(error_str)
+            PublicRepoError::NotFound { context: error_str }
         } else if error_str.contains("403")
             || error_str.contains("429")
             || error_str.contains("rate limit")
@@ -1061,7 +1076,9 @@ impl GitLabPublicProvider {
     ) -> Result<(), PublicRepoError> {
         match status.as_u16() {
             200..=299 => Ok(()),
-            404 => Err(PublicRepoError::NotFound(context.to_string())),
+            404 => Err(PublicRepoError::NotFound {
+                context: context.to_string(),
+            }),
             403 => Err(PublicRepoError::PermissionDenied {
                 operation: context.to_string(),
                 required_permission: "read_api and read_repository".to_string(),
@@ -1191,12 +1208,6 @@ impl GitLabPublicProvider {
             });
         }
         Ok(())
-    }
-}
-
-impl Default for GitLabPublicProvider {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1562,9 +1573,11 @@ impl PublicRepoProviderFactory {
     /// Create a provider for the given provider name
     pub fn create(provider: &str) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
-            "github" => Ok(Box::new(GitHubPublicProvider::new())),
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            "github" => Ok(Box::new(GitHubPublicProvider::new()?)),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 
@@ -1575,11 +1588,13 @@ impl PublicRepoProviderFactory {
     ) -> Result<Box<dyn PublicRepoProvider>, PublicRepoError> {
         match provider.to_lowercase().as_str() {
             "github" => match token {
-                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t))),
-                None => Ok(Box::new(GitHubPublicProvider::new())),
+                Some(t) => Ok(Box::new(GitHubPublicProvider::with_token(t)?)),
+                None => Ok(Box::new(GitHubPublicProvider::new()?)),
             },
-            "gitlab" => Ok(Box::new(GitLabPublicProvider::new())),
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            "gitlab" => Ok(Box::new(GitLabPublicProvider::new()?)),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 
@@ -1593,22 +1608,24 @@ impl PublicRepoProviderFactory {
         match provider.to_lowercase().as_str() {
             "github" => {
                 if gitlab_instance.is_some() {
-                    return Err(PublicRepoError::ProviderNotSupported(
-                        "Custom base URLs are supported only for GitLab".to_string(),
-                    ));
+                    return Err(PublicRepoError::ProviderNotSupported {
+                        subject: "Custom base URLs are supported only for GitLab".to_string(),
+                    });
                 }
                 match token {
-                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token))),
-                    None => Ok(Box::new(GitHubPublicProvider::new())),
+                    Some(token) => Ok(Box::new(GitHubPublicProvider::with_token(token)?)),
+                    None => Ok(Box::new(GitHubPublicProvider::new()?)),
                 }
             }
             "gitlab" => match gitlab_instance {
                 Some((base_url, hostname, addresses)) => Ok(Box::new(
                     GitLabPublicProvider::with_resolved_base_url(base_url, &hostname, &addresses)?,
                 )),
-                None => Ok(Box::new(GitLabPublicProvider::new())),
+                None => Ok(Box::new(GitLabPublicProvider::new()?)),
             },
-            _ => Err(PublicRepoError::ProviderNotSupported(provider.to_string())),
+            _ => Err(PublicRepoError::ProviderNotSupported {
+                subject: provider.to_string(),
+            }),
         }
     }
 }
@@ -1673,7 +1690,7 @@ mod tests {
             .expect_err("private repositories must never pass through public endpoints");
         assert!(matches!(
             error,
-            PublicRepoError::RepositoryNotPublic(name) if name == "owner/private"
+            PublicRepoError::RepositoryNotPublic { repository: name } if name == "owner/private"
         ));
     }
 
@@ -1810,7 +1827,7 @@ mod tests {
         let result = PublicRepoProviderFactory::create("bitbucket");
         assert!(result.is_err());
         match result {
-            Err(PublicRepoError::ProviderNotSupported(name)) => {
+            Err(PublicRepoError::ProviderNotSupported { subject: name }) => {
                 assert_eq!(name, "bitbucket");
             }
             _ => panic!("Expected ProviderNotSupported error"),
@@ -1823,7 +1840,9 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let not_found = PublicRepoError::NotFound("repo not found".to_string());
+        let not_found = PublicRepoError::NotFound {
+            context: "repo not found".to_string(),
+        };
         assert!(not_found.to_string().contains("not found"));
 
         let rate_limit = PublicRepoError::RateLimitExceeded;
@@ -1896,7 +1915,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            PublicRepoError::RepositoryNotPublic(name)
+            PublicRepoError::RepositoryNotPublic { repository: name }
                 if name == "example/private-repository"
         ));
         repository.assert_async().await;
@@ -2401,7 +2420,7 @@ mod tests {
         }
         assert!(matches!(
             BranchOnly.resolve_ref("o", "r", "v1").await,
-            Err(PublicRepoError::ProviderNotSupported(_))
+            Err(PublicRepoError::ProviderNotSupported { .. })
         ));
     }
 
@@ -2722,7 +2741,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_repository_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_repository("expressjs", "express").await {
             Ok(repo) => {
@@ -2739,7 +2758,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_list_branches_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.list_branches("expressjs", "express").await {
             Ok(branches) => {
@@ -2756,7 +2775,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_get_file_tree_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider
             .get_file_tree("expressjs", "express", "master")
@@ -2776,14 +2795,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_github_nonexistent_repo_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -2800,7 +2819,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_repository_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -2818,7 +2837,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_list_branches_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -2844,7 +2863,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_get_file_tree_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         // Using a smaller repo for file tree test
         match provider
@@ -2860,7 +2879,7 @@ mod tests {
             Err(PublicRepoError::RateLimitExceeded) => {
                 eprintln!("Skipping test due to rate limit");
             }
-            Err(PublicRepoError::BranchNotFound(_)) => {
+            Err(PublicRepoError::BranchNotFound { .. }) => {
                 // Try with master instead
                 eprintln!("main branch not found, this is expected if the default is master");
             }
@@ -2870,14 +2889,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_nonexistent_repo_real_api() {
-        let provider = GitLabPublicProvider::new();
+        let provider = GitLabPublicProvider::new().unwrap();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")
             .await;
 
         match result {
-            Err(PublicRepoError::NotFound(_)) => {
+            Err(PublicRepoError::NotFound { .. }) => {
                 // Expected
             }
             Err(PublicRepoError::RateLimitExceeded) => {
@@ -2894,7 +2913,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_preset_detection_with_github_real_api() {
-        let provider = GitHubPublicProvider::new();
+        let provider = GitHubPublicProvider::new().unwrap();
 
         match provider.get_file_tree("vercel", "next.js", "canary").await {
             Ok(files) => {

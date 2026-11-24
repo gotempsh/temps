@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import type { HttpCheckView } from '@/api/client'
 import {
   LOCAL_PROVIDER,
+  checkFilterBucket,
   checkSourceLabel,
   checksFor,
   credentialSource,
@@ -12,6 +13,7 @@ import {
   historyEventName,
   indicatorsBySubject,
   markProvider,
+  parseCheckFilter,
   parseWarningDays,
   scopeSummary,
 } from './http-checks'
@@ -138,5 +140,34 @@ describe('history events', () => {
       'Access scope changed'
     )
     expect(historyEventName('something_new', 'secret')).toBe('Secret activity')
+  })
+})
+
+describe('filtering by check result', () => {
+  const statuses = (
+    ...names: Parameters<typeof checkFilterBucket>[0][number]['status'][]
+  ) => names.map((status) => ({ status }))
+
+  test('the worst result decides, as it does for the row icon', () => {
+    expect(checkFilterBucket(statuses('healthy'))).toBe('healthy')
+    expect(checkFilterBucket(statuses('healthy', 'warning'))).toBe('warning')
+    expect(checkFilterBucket(statuses('warning', 'error', 'healthy'))).toBe(
+      'error'
+    )
+  })
+
+  test('nothing verified is not healthy', () => {
+    expect(checkFilterBucket([])).toBe('unchecked')
+    expect(checkFilterBucket(statuses('pending'))).toBe('unchecked')
+    expect(checkFilterBucket(statuses('unknown'))).toBe('unchecked')
+    expect(checkFilterBucket(statuses('healthy', 'unknown'))).toBe('unchecked')
+  })
+
+  test('a URL value that is not a filter shows everything', () => {
+    expect(parseCheckFilter('error')).toBe('error')
+    expect(parseCheckFilter('unchecked')).toBe('unchecked')
+    expect(parseCheckFilter('all')).toBe('all')
+    expect(parseCheckFilter('nonsense')).toBe('all')
+    expect(parseCheckFilter(null)).toBe('all')
   })
 })

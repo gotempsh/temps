@@ -4,6 +4,7 @@
 pub mod handlers;
 pub mod plugin;
 pub mod services;
+pub mod traffic_settings;
 pub mod types;
 
 // Re-export main types

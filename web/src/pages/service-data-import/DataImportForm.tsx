@@ -11,6 +11,7 @@ import type {
   DataImportSpec,
 } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { ConfirmNameBadge } from '@/components/ui/confirm-name-badge'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -326,9 +327,11 @@ export function DataImportForm({
                   <FormItem>
                     <FormLabel>
                       Type{' '}
-                      <code className="text-xs">
-                        {targetDatabase.trim() || 'the database name'}
-                      </code>{' '}
+                      {targetDatabase.trim() ? (
+                        <ConfirmNameBadge value={targetDatabase.trim()} />
+                      ) : (
+                        'the database name'
+                      )}{' '}
                       to confirm
                     </FormLabel>
                     <FormControl>

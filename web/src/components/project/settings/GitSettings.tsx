@@ -18,13 +18,16 @@ import {
   getProjectComposeValidationOptions,
   listConnectionsOptions,
   listGitProvidersOptions,
+  reinstallGithubWebhookMutation,
   reinstallGitlabWebhookMutation,
   updateAutomaticDeployMutation,
   updateGitSettingsMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { BuildConfigurationCard } from './BuildConfigurationCard'
 import { ComposeSecuritySettings } from './ComposeSecuritySettings'
 import { FollowedRepositoryNotice } from '@/components/project-groups/FollowedRepositoryNotice'
+import { DockerfileRuntimeSettings } from './DockerfileRuntimeSettings'
 import { useComposeSecurityPolicy } from '@/hooks/useComposeSecurityPolicy'
 import { RepositorySelector } from '@/components/repositories/RepositorySelector'
 import { BranchSelector } from '@/components/deployments/BranchSelector'
@@ -93,18 +96,17 @@ import {
 import { composeValidationWarning } from '@/lib/compose-check'
 import { ComposeCheckReportView } from '@/components/deployments/ComposeCheckReportView'
 import { composeSettingPatch } from '@/lib/compose-settings-patch'
+import { useRefreshPublicPresets } from '@/hooks/useRefreshPublicPresets'
+import { withoutLegacySandboxGrants } from '@/lib/build-configuration-form'
 import {
+  detectedPresetsFromPublic,
   normalizePresetPath,
   presetConfigForSelection,
   presetSelectionKey,
   splitPresetSelection,
 } from '@/lib/preset-selection'
 import { repositoryFilePath } from '@/lib/repository-file-path'
-import { problemDetail } from '@/lib/api-problem'
-import {
-  isRepositoryRootDirectory,
-  rootDirectoryHelp,
-} from '@/lib/project-directory'
+import { isRepositoryRootDirectory } from '@/lib/project-directory'
 import {
   projectSettingsSections,
   type ProjectSettingsView,
@@ -123,7 +125,6 @@ import {
   Database,
   EyeOff,
   FileIcon,
-  FolderIcon,
   GitBranchIcon,
   Info,
   Loader2,
@@ -137,7 +138,6 @@ import { useEffect, useMemo, useState } from 'react'
 import { useTheme } from 'next-themes'
 import { useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
-import FrameworkIcon from '../FrameworkIcon'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { FrameworkSelector } from '../FrameworkSelector'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -308,17 +308,19 @@ function GitSettingsInline({
     enabled: !!repositoryData?.id,
   })
   // Preset detection — public repos
+  const publicPresetRequest = {
+    path: {
+      provider: publicProvider,
+      owner: project?.repo_owner || '',
+      repo: project?.repo_name || '',
+    },
+    query: { base_url: publicRepository?.instanceUrl },
+  }
   const publicPresetQuery = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: publicProvider,
-        owner: project?.repo_owner || '',
-        repo: project?.repo_name || '',
-      },
-      query: { base_url: publicRepository?.instanceUrl },
-    }),
+    ...detectPublicPresetsOptions(publicPresetRequest),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
+  const refreshPublicPresets = useRefreshPublicPresets(publicPresetRequest)
   const publicRepositoryQuery = useQuery({
     ...getPublicRepositoryOptions({
       path: {
@@ -337,22 +339,16 @@ function GitSettingsInline({
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const effectivePresetData = presetQuery.data || publicPresetData
-  const effectivePresetLoading =
-    presetQuery.isLoading ||
-    publicPresetQuery.isLoading ||
-    publicPresetQuery.isFetching
+  const isDetectingPresets =
+    presetQuery.isLoading || publicPresetQuery.isLoading
+  const isRefreshingPresets =
+    presetQuery.isFetching ||
+    publicPresetQuery.isFetching ||
+    refreshPublicPresets.isPending
 
   // ---------------- Save helpers ----------------
   // The API expects a full update; build it from current project state plus overrides.
@@ -376,11 +372,11 @@ function GitSettingsInline({
       overrides.preset === 'nixpacks' && overrides.preset_config === undefined
         ? presetConfigForSelection('nixpacks', presetCfg)
         : (overrides.preset_config ?? presetCfg ?? undefined)
-    if (selectedPreset === 'docker-compose' && selectedPresetConfig) {
-      selectedPresetConfig = {
-        ...selectedPresetConfig,
-        unsandboxedServices: [],
-      }
+    if (selectedPresetConfig) {
+      selectedPresetConfig = withoutLegacySandboxGrants(
+        selectedPreset,
+        selectedPresetConfig
+      )
     }
     if (isLocalSource) {
       await updateProjectSettings.mutateAsync({
@@ -429,15 +425,7 @@ function GitSettingsInline({
   }
 
   // ---------------- Inline editors ----------------
-  const [editing, setEditing] = useState<
-    | null
-    | 'branch'
-    | 'framework'
-    | 'directory'
-    | 'dockerfile'
-    | 'buildContext'
-    | 'composePath'
-  >(null)
+  const [editing, setEditing] = useState<null | 'branch'>(null)
   const close = () => setEditing(null)
 
   // Tracks the branch-refresh button separately from `isLoadingBranches`
@@ -461,49 +449,6 @@ function GitSettingsInline({
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setBranchDraft(project.main_branch || '')
   }, [project.main_branch])
-
-  // Directory editor
-  const [directoryDraft, setDirectoryDraft] = useState('')
-  // The server refuses a root directory the repository does not have on the
-  // configured branch, naming what is there instead; keep that next to the
-  // field rather than only in a toast that disappears.
-  const [directoryError, setDirectoryError] = useState<string | null>(null)
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setDirectoryDraft(project.directory || './')
-  }, [project.directory])
-
-  // Dockerfile path editor
-  const [dockerfileDraft, setDockerfileDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setDockerfileDraft(
-      (project?.preset_config as any)?.dockerfilePath || 'Dockerfile'
-    )
-  }, [project?.preset_config])
-
-  // Dockerfile build context editor (overrides the root directory as the
-  // `docker build` context -- only needed when it must differ from where
-  // the Dockerfile itself is discovered, e.g. a monorepo build that needs
-  // sibling package sources outside the Dockerfile's own directory)
-  const [buildContextDraft, setBuildContextDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setBuildContextDraft((project?.preset_config as any)?.buildContext || '')
-  }, [project?.preset_config])
-
-  // Compose path editor
-  const [composePathDraft, setComposePathDraft] = useState('')
-  useEffect(() => {
-    // The draft intentionally resets after a successful server refetch.
-    // eslint-disable-next-line react-hooks/set-state-in-effect
-    setComposePathDraft(
-      (project?.preset_config as any)?.composePath || 'docker-compose.yml'
-    )
-  }, [project?.preset_config])
 
   const presetName = (project.preset || '').toString()
   const isDockerfilePreset = presetName === 'dockerfile'
@@ -623,6 +568,33 @@ function GitSettingsInline({
       await reinstallWebhook.mutateAsync({ path: { project_id: project.id! } })
       await refetch()
       toast.success('Webhook reinstalled')
+    } catch {
+      // The app-wide mutation handler already toasts this failure.
+    }
+  }
+
+  // GitHub repository webhook. A GitHub App delivers pushes through the App's
+  // own webhook; any other GitHub connection (personal access token, OAuth)
+  // needs a webhook on the repository itself, or pushes never deploy.
+  const reinstallGithubWebhook = useMutation({
+    ...reinstallGithubWebhookMutation(),
+    meta: {
+      errorTitle:
+        'Failed to install webhook — check your GitHub token can manage webhooks on the repo',
+    },
+  })
+  const needsGithubRepoWebhook =
+    currentProvider?.provider_type === 'github' &&
+    currentProvider.auth_method !== 'github_app'
+  const hasGithubWebhook = !!project.github_webhook_id
+
+  const handleReinstallGithubWebhook = async () => {
+    try {
+      await reinstallGithubWebhook.mutateAsync({
+        path: { project_id: project.id! },
+      })
+      await refetch()
+      toast.success('GitHub webhook installed')
     } catch {
       // The app-wide mutation handler already toasts this failure.
     }
@@ -784,13 +756,11 @@ function GitSettingsInline({
                   >
                     {project.repo_owner}/{project.repo_name}
                   </a>
-                  <Badge variant="secondary" className="text-xs">
-                    {isPublicRepo
-                      ? 'Public'
-                      : repositoryData?.private
-                        ? 'Private'
-                        : 'Connected'}
-                  </Badge>
+                  {(isPublicRepo || repositoryData?.private) && (
+                    <Badge variant="secondary" className="text-xs">
+                      {isPublicRepo ? 'Public' : 'Private'}
+                    </Badge>
+                  )}
                 </div>
                 {repositoryDescription && (
                   <p className="text-sm text-muted-foreground line-clamp-2">
@@ -855,19 +825,13 @@ function GitSettingsInline({
         </Card>
       )}
 
-      {/* ----------------- Build configuration card ----------------- */}
-      {(sections.showBuildConfiguration || sections.showGitAutomation) && (
-        <Card>
+      {/* ----------------- Production branch card ----------------- */}
+      {sections.showGitAutomation && (
+        <Card id="setting-production-branch" className="scroll-mt-4">
           <CardHeader>
-            <CardTitle className="text-base">
-              {sections.showGitAutomation
-                ? 'Production branch'
-                : 'Build configuration'}
-            </CardTitle>
+            <CardTitle className="text-base">Production branch</CardTitle>
             <CardDescription>
-              {sections.showGitAutomation
-                ? 'Commits pushed to this branch create production deployments.'
-                : 'Framework, source directory, and runtime-specific build settings.'}
+              The branch production deploys from, and whether a push deploys it.
             </CardDescription>
           </CardHeader>
           <CardContent className="p-0">
@@ -1018,352 +982,90 @@ function GitSettingsInline({
                 />
               )}
 
-              {sections.showBuildConfiguration && (
-                <>
-                  {/* Framework row */}
-                  <InlineRow
-                    label="Framework"
-                    editing={editing === 'framework'}
-                    onStartEdit={() => setEditing('framework')}
-                    onCancel={close}
-                    hideSaveButtons
-                    display={
-                      <div className="flex items-center gap-2 min-w-0">
-                        <FrameworkIcon
-                          preset={project.preset as any}
-                          className="size-5 shrink-0"
-                        />
-                        <span className="text-sm truncate">
-                          {project.preset}
-                        </span>
-                      </div>
-                    }
-                    editor={
-                      <div className="flex-1">
-                        <FrameworkSelector
-                          presetData={effectivePresetData as any}
-                          isLoading={effectivePresetLoading}
-                          error={presetQuery.error}
-                          selectedPreset={(() => {
-                            const dir = project.directory || './'
-                            const norm =
-                              dir === '.' || dir === './'
-                                ? 'root'
-                                : dir.startsWith('./')
-                                  ? dir.slice(2)
-                                  : dir
-                            return `${project.preset}::${norm}`
-                          })()}
-                          onSelectPreset={async (value) => {
-                            const { preset: slug, directory: dir } =
-                              splitPresetSelection(value)
-                            await saveGitField({ preset: slug, directory: dir })
-                            toast.success('Framework updated')
-                            close()
-                          }}
-                        />
-                      </div>
-                    }
-                  />
-
-                  {/* Directory row */}
-                  <InlineRow
-                    label="Root directory"
-                    editing={editing === 'directory'}
-                    onStartEdit={() => {
-                      setDirectoryDraft(project.directory || './')
-                      setDirectoryError(null)
-                      setEditing('directory')
-                    }}
-                    onCancel={() => {
-                      setDirectoryError(null)
-                      close()
-                    }}
-                    onSave={async () => {
-                      const next = directoryDraft || './'
-                      if (next === project.directory) {
-                        close()
-                        return
-                      }
-                      try {
-                        await saveGitField({ directory: next })
-                      } catch (error) {
-                        setDirectoryError(
-                          problemDetail(
-                            error,
-                            'The root directory could not be saved.'
-                          )
-                        )
-                        return
-                      }
-                      setDirectoryError(null)
-                      toast.success('Root directory updated')
-                      close()
-                    }}
-                    isPending={updateGitSettings.isPending}
-                    display={
-                      <div className="flex items-center gap-2 min-w-0">
-                        <FolderIcon className="size-4 text-muted-foreground shrink-0" />
-                        <span className="font-mono text-sm truncate">
-                          {project.directory || './'}
-                        </span>
-                      </div>
-                    }
-                    editor={
-                      <div className="flex-1 min-w-0 space-y-1">
-                        <Input
-                          value={directoryDraft}
-                          onChange={(e) => {
-                            setDirectoryDraft(e.target.value)
-                            setDirectoryError(null)
-                          }}
-                          placeholder="./"
-                          className="font-mono text-sm"
-                          aria-invalid={directoryError ? true : undefined}
-                          aria-describedby="root-directory-help"
-                          autoFocus
-                        />
-                        <p
-                          id="root-directory-help"
-                          role={directoryError ? 'alert' : undefined}
-                          className={cn(
-                            'text-xs',
-                            directoryError
-                              ? 'text-destructive'
-                              : 'text-muted-foreground'
-                          )}
-                        >
-                          {rootDirectoryHelp(
-                            directoryError,
-                            isLocalSource,
-                            project.main_branch
-                          )}
-                        </p>
-                      </div>
-                    }
-                  />
-                  <li
-                    className={cn(
-                      'px-6 py-4',
-                      isRepositoryRootDirectory(
-                        editing === 'directory'
-                          ? directoryDraft
-                          : project.directory
-                      ) && 'hidden'
-                    )}
-                  >
-                    <div className="flex items-start gap-4">
-                      <div className="w-32 shrink-0" aria-hidden="true" />
-                      <div className="flex min-w-0 items-start gap-2">
-                        <Checkbox
-                          id="pull-only-root-directory"
-                          checked={!!project.pull_only_root_directory}
-                          disabled={updateGitSettings.isPending}
-                          onCheckedChange={async (checked) => {
-                            await saveGitField({
-                              pull_only_root_directory: checked === true,
-                              ...(editing === 'directory'
-                                ? { directory: directoryDraft || './' }
-                                : {}),
-                            })
-                            if (editing === 'directory') {
-                              close()
-                            }
-                            toast.success(
-                              checked === true
-                                ? 'Deploy will pull only the root directory'
-                                : 'Deploy will pull the full repository'
-                            )
-                          }}
-                        />
-                        <div className="space-y-1">
-                          <label
-                            htmlFor="pull-only-root-directory"
-                            className="text-sm leading-none cursor-pointer"
-                          >
-                            Pull only the root directory
-                          </label>
-                          <p className="text-xs text-muted-foreground">
-                            Clone only this subdirectory instead of the whole
-                            repository.
-                          </p>
-                        </div>
-                      </div>
+              {sections.showGitAutomation && (
+                <li
+                  id="setting-automatic-deployments"
+                  className="scroll-mt-4 px-6 py-4"
+                >
+                  <div className="flex items-center gap-4">
+                    <div className="w-32 shrink-0 text-sm text-muted-foreground">
+                      Deploy on push
                     </div>
-                  </li>
+                    <div className="flex min-w-0 flex-1 items-center gap-3">
+                      <Switch
+                        aria-label="Automatic deployments"
+                        checked={autoDeployOn}
+                        onCheckedChange={handleAutoDeployToggle}
+                      />
+                      <p className="text-sm text-muted-foreground">
+                        {autoDeployOn
+                          ? 'Every push to this branch deploys production.'
+                          : 'Pushes do not deploy. Deploy manually or through the API.'}
+                      </p>
+                    </div>
+                  </div>
+                </li>
+              )}
+              {sections.showGitAutomation && isGitlab && (
+                <RepositoryWebhookRow
+                  providerName="GitLab"
+                  repository={`${project.repo_owner}/${project.repo_name}`}
+                  installed={hasWebhook}
+                  missingHint="Installing it needs your GitLab user to have the Maintainer role on"
+                  isPending={reinstallWebhook.isPending}
+                  onInstall={handleReinstallWebhook}
+                />
+              )}
 
-                  {/* Dockerfile path — only when dockerfile preset */}
-                  {isDockerfilePreset && (
-                    <InlineRow
-                      label="Dockerfile path"
-                      editing={editing === 'dockerfile'}
-                      onStartEdit={() => {
-                        setDockerfileDraft(
-                          (project?.preset_config as any)?.dockerfilePath ||
-                            'Dockerfile'
-                        )
-                        setEditing('dockerfile')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = dockerfileDraft || 'Dockerfile'
-                        if (next === (cfg.dockerfilePath || 'Dockerfile')) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'dockerfile',
-                            dockerfilePath: next,
-                          },
-                        })
-                        toast.success('Dockerfile path updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.dockerfilePath ||
-                              'Dockerfile'}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={dockerfileDraft}
-                          onChange={(e) => setDockerfileDraft(e.target.value)}
-                          placeholder="Dockerfile"
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-
-                  {/* Build context — only when dockerfile preset. Overrides the
-                docker build context (defaults to root directory above) for
-                monorepos where the Dockerfile needs sibling package sources
-                outside its own directory. */}
-                  {isDockerfilePreset && (
-                    <InlineRow
-                      label="Build context"
-                      editing={editing === 'buildContext'}
-                      onStartEdit={() => {
-                        setBuildContextDraft(
-                          (project?.preset_config as any)?.buildContext || ''
-                        )
-                        setEditing('buildContext')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = buildContextDraft.trim()
-                        if (next === (cfg.buildContext || '')) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'dockerfile',
-                            buildContext: next || undefined,
-                          },
-                        })
-                        toast.success('Build context updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FolderIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.buildContext || (
-                              <span className="text-muted-foreground italic">
-                                same as root directory
-                              </span>
-                            )}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={buildContextDraft}
-                          onChange={(e) => setBuildContextDraft(e.target.value)}
-                          placeholder={project.directory || './'}
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-
-                  {/* Compose path — only when compose preset */}
-                  {isComposePreset && (
-                    <InlineRow
-                      label="Compose file"
-                      editing={editing === 'composePath'}
-                      onStartEdit={() => {
-                        setComposePathDraft(
-                          (project?.preset_config as any)?.composePath ||
-                            'docker-compose.yml'
-                        )
-                        setEditing('composePath')
-                      }}
-                      onCancel={close}
-                      onSave={async () => {
-                        const cfg = (project.preset_config as any) || {}
-                        const next = composePathDraft || 'docker-compose.yml'
-                        if (
-                          next === (cfg.composePath || 'docker-compose.yml')
-                        ) {
-                          close()
-                          return
-                        }
-                        await saveGitField({
-                          preset_config: {
-                            ...cfg,
-                            preset: 'docker-compose',
-                            composePath: next,
-                          },
-                        })
-                        toast.success('Compose path updated')
-                        close()
-                      }}
-                      isPending={updateGitSettings.isPending}
-                      display={
-                        <div className="flex items-center gap-2 min-w-0">
-                          <FileIcon className="size-4 text-muted-foreground shrink-0" />
-                          <span className="font-mono text-sm truncate">
-                            {(project.preset_config as any)?.composePath ||
-                              'docker-compose.yml'}
-                          </span>
-                        </div>
-                      }
-                      editor={
-                        <Input
-                          value={composePathDraft}
-                          onChange={(e) => setComposePathDraft(e.target.value)}
-                          placeholder="docker-compose.yml"
-                          className="flex-1 font-mono text-sm"
-                          autoFocus
-                        />
-                      }
-                    />
-                  )}
-                </>
+              {sections.showGitAutomation && needsGithubRepoWebhook && (
+                <RepositoryWebhookRow
+                  providerName="GitHub"
+                  repository={`${project.repo_owner}/${project.repo_name}`}
+                  installed={hasGithubWebhook}
+                  missingHint="Installing it needs a token with the Webhooks: write permission (fine-grained) or the repo scope (classic), and admin access to"
+                  isPending={reinstallGithubWebhook.isPending}
+                  onInstall={handleReinstallGithubWebhook}
+                />
               )}
             </ul>
           </CardContent>
         </Card>
       )}
 
+      {sections.showBuildConfiguration && (
+        <BuildConfigurationCard
+          project={project}
+          saving={
+            updateGitSettings.isPending || updateProjectSettings.isPending
+          }
+          onSave={saveGitField}
+          detectedPresets={effectivePresetData?.presets}
+          isDetecting={isDetectingPresets}
+          isRefreshingDetection={isRefreshingPresets}
+          detectionError={presetQuery.error ?? publicPresetQuery.error}
+          onRefreshDetection={
+            isUploadedSource
+              ? undefined
+              : isPublicRepo
+                ? () => refreshPublicPresets.mutate()
+                : () => void presetQuery.refetch()
+          }
+        />
+      )}
+
+      {sections.showBuildConfiguration && isDockerfilePreset && (
+        <DockerfileRuntimeSettings
+          project={project}
+          saving={
+            updateGitSettings.isPending || updateProjectSettings.isPending
+          }
+          onSave={saveGitField}
+        />
+      )}
+
       {/* ----------------- Compose routing and service controls ----------------- */}
       {sections.showBuildConfiguration && isComposePreset && (
-        <Card>
+        <Card id="setting-docker-compose" className="scroll-mt-4">
           <CardHeader>
             <CardTitle className="text-base">Docker Compose</CardTitle>
             <CardDescription>
@@ -1725,105 +1427,80 @@ function GitSettingsInline({
           </CardContent>
         </Card>
       )}
-
-      {/* ----------------- Deployment behavior ----------------- */}
-      {sections.showGitAutomation && (
-        <Card>
-          <CardContent className="p-0 divide-y">
-            <div className="flex items-center gap-4 p-6">
-              <Switch
-                aria-label="Automatic deployments"
-                checked={autoDeployOn}
-                onCheckedChange={handleAutoDeployToggle}
-              />
-              <div className="flex-1 min-w-0">
-                <div className="text-sm font-medium">Automatic deployments</div>
-                <p className="text-xs text-muted-foreground">
-                  {autoDeployOn ? (
-                    <>
-                      Pushes to{' '}
-                      <span className="font-mono text-foreground">
-                        {project.main_branch}
-                      </span>{' '}
-                      trigger a new deployment.
-                    </>
-                  ) : (
-                    <>
-                      Pushes to{' '}
-                      <span className="font-mono text-foreground">
-                        {project.main_branch}
-                      </span>{' '}
-                      will not deploy. Use manual deploy or the API.
-                    </>
-                  )}
-                </p>
-              </div>
-            </div>
-
-            {isGitlab && (
-              <div className="flex items-center gap-4 p-6">
-                <div
-                  className={cn(
-                    'flex size-9 shrink-0 items-center justify-center rounded-full',
-                    hasWebhook ? 'bg-green-500/10' : 'bg-amber-500/10'
-                  )}
-                >
-                  {hasWebhook ? (
-                    <Check className="size-4 text-green-600 dark:text-green-400" />
-                  ) : (
-                    <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
-                  )}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <div className="text-sm font-medium">
-                    {hasWebhook
-                      ? 'GitLab webhook installed'
-                      : 'GitLab webhook not installed'}
-                  </div>
-                  <p className="text-xs text-muted-foreground">
-                    {hasWebhook ? (
-                      <>
-                        Push events from{' '}
-                        <span className="font-mono text-foreground">
-                          {project.repo_owner}/{project.repo_name}
-                        </span>{' '}
-                        reach Temps automatically.
-                      </>
-                    ) : (
-                      <>
-                        We couldn’t install the webhook automatically. Your
-                        GitLab user needs the Maintainer role on{' '}
-                        <span className="font-mono text-foreground">
-                          {project.repo_owner}/{project.repo_name}
-                        </span>
-                        .
-                      </>
-                    )}
-                  </p>
-                </div>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleReinstallWebhook}
-                  disabled={reinstallWebhook.isPending}
-                >
-                  {reinstallWebhook.isPending && (
-                    <Loader2 className="size-3 mr-1 animate-spin" />
-                  )}
-                  {hasWebhook ? 'Reinstall' : 'Install webhook'}
-                </Button>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-      )}
     </div>
+  )
+}
+
+// Status of the webhook that tells Temps about pushes to the repository, with
+// a button to install it (or replace it) when automatic registration failed
+// or the hook was deleted on the provider's side.
+function RepositoryWebhookRow({
+  providerName,
+  repository,
+  installed,
+  missingHint,
+  isPending,
+  onInstall,
+}: {
+  providerName: string
+  repository: string
+  installed: boolean
+  missingHint: string
+  isPending: boolean
+  onInstall: () => void
+}) {
+  return (
+    <li className="flex items-center gap-4 px-6 py-4">
+      <div
+        className={cn(
+          'flex size-9 shrink-0 items-center justify-center rounded-full',
+          installed ? 'bg-green-500/10' : 'bg-amber-500/10'
+        )}
+      >
+        {installed ? (
+          <Check className="size-4 text-green-600 dark:text-green-400" />
+        ) : (
+          <RefreshCw className="size-4 text-amber-700 dark:text-amber-400" />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="text-sm font-medium">
+          {installed
+            ? `${providerName} webhook installed`
+            : `${providerName} webhook not installed`}
+        </div>
+        <p className="text-xs text-muted-foreground">
+          {installed ? (
+            <>
+              Push events from{' '}
+              <span className="font-mono text-foreground">{repository}</span>{' '}
+              reach Temps automatically.
+            </>
+          ) : (
+            <>
+              Pushes won’t deploy until it is. {missingHint}{' '}
+              <span className="font-mono text-foreground">{repository}</span>.
+            </>
+          )}
+        </p>
+      </div>
+      <Button
+        variant="outline"
+        size="sm"
+        onClick={onInstall}
+        disabled={isPending}
+      >
+        {isPending && <Loader2 className="size-3 mr-1 animate-spin" />}
+        {installed ? 'Reinstall' : 'Install webhook'}
+      </Button>
+    </li>
   )
 }
 
 // One row in the build configuration list. Click anywhere on the row to edit;
 // while editing, the editor occupies the row, and Save/Cancel sit on the right.
 function InlineRow({
+  id,
   label,
   display,
   editor,
@@ -1834,6 +1511,8 @@ function InlineRow({
   isPending,
   hideSaveButtons,
 }: {
+  /** Anchor for links and the command palette (`setting-…`). */
+  id?: string
   label: string
   display: React.ReactNode
   editor: React.ReactNode
@@ -1845,7 +1524,7 @@ function InlineRow({
   hideSaveButtons?: boolean
 }) {
   return (
-    <li className="px-6 py-4">
+    <li id={id} className="scroll-mt-4 px-6 py-4">
       <div className="flex items-center gap-4">
         <div className="w-32 shrink-0 text-sm text-muted-foreground">
           {label}
@@ -1977,7 +1656,7 @@ function PublicPortsInline({
   const hasDuplicateRoutes = draft.some((row, i) => duplicateRoute(row, i))
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-public-routes" className="scroll-mt-4 space-y-3">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="space-y-1">
           <div className="flex items-center gap-2">
@@ -2478,7 +2157,7 @@ function ExcludedServicesInline({
   }
 
   return (
-    <div className="space-y-3">
+    <div id="setting-compose-services" className="scroll-mt-4 space-y-3">
       <div className="flex items-start justify-between gap-2">
         <div>
           <Label className="text-sm font-medium">Compose services</Label>
@@ -2842,15 +2521,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const publicPresetData = useMemo(() => {
     if (!publicPresetQuery.data?.presets?.length) return null
     return {
-      presets: publicPresetQuery.data.presets.map((p: any) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: p.compose_files,
-      })),
+      presets: detectedPresetsFromPublic(publicPresetQuery.data.presets),
     }
   }, [publicPresetQuery.data])
   const detectedPresetData =

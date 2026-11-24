@@ -10,8 +10,20 @@ import {
   buildSlackConfigUpdate,
   buildEmailConfigUpdate,
   buildWebhookConfigUpdate,
+  collectHeaderFlag,
+  parseHeaderFlags,
+  withHeaderHint,
   parseProviderIds,
+  hasTelegramConfigChanges,
+  parseTopicId,
+  buildTelegramConfigUpdate,
+  telegramChatChanges,
+  KEEP_STORED_SECRET,
+  addTelegramProvider,
+  updateTelegramProviderAction,
 } from './index.js'
+import { registerNotificationsCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 describe('parseEnabledFlag', () => {
   test('leaves the flag untouched when not provided', () => {
@@ -46,6 +58,7 @@ describe('hasSlackConfigChanges / hasEmailConfigChanges / hasWebhookConfigChange
     expect(hasWebhookConfigChanges({})).toBe(false)
     expect(hasWebhookConfigChanges({ url: 'https://example.com/hook' })).toBe(true)
     expect(hasWebhookConfigChanges({ method: 'PUT' })).toBe(true)
+    expect(hasWebhookConfigChanges({ header: ['X-Foo: bar'] })).toBe(true)
   })
 
   test('name/enabled-only updates are correctly detected as "no type-specific config"', () => {
@@ -145,6 +158,99 @@ describe('buildWebhookConfigUpdate', () => {
       timeout_secs: 30,
     })
   })
+
+  test('supplied headers replace the stored ones', () => {
+    expect(buildWebhookConfigUpdate(
+      { url: 'https://other.example.net/hook', headers: { Authorization: 'Bearer new' } },
+      { url: 'https://example.com/hook', method: 'POST', headers: { Authorization: '***' }, timeout_secs: 30 },
+    ).headers).toEqual({ Authorization: 'Bearer new' })
+  })
+
+  test('without supplied headers the stored (hidden) ones are sent back unchanged', () => {
+    expect(buildWebhookConfigUpdate(
+      { method: 'PUT' },
+      { url: 'https://example.com/hook', method: 'POST', headers: { Authorization: '***' }, timeout_secs: 30 },
+    ).headers).toEqual({ Authorization: '***' })
+  })
+})
+
+describe('collectHeaderFlag / parseHeaderFlags', () => {
+  test('commander collector accumulates repeated flags', () => {
+    expect(collectHeaderFlag('A: 1', collectHeaderFlag('B: 2'))).toEqual(['B: 2', 'A: 1'])
+  })
+
+  test('no flag leaves headers untouched', () => {
+    expect(parseHeaderFlags(undefined)).toEqual({ headers: undefined })
+  })
+
+  test('trims spaces and tabs around the name and value', () => {
+    expect(parseHeaderFlags(['  X-Foo \t:  \tbar baz \t '])).toEqual({ headers: { 'X-Foo': 'bar baz' } })
+  })
+
+  test('parses "Name: value", keeping colons inside the value', () => {
+    expect(parseHeaderFlags(['Authorization: Bearer abc', 'X-Url:https://x.example/a:b'])).toEqual({
+      headers: { Authorization: 'Bearer abc', 'X-Url': 'https://x.example/a:b' },
+    })
+  })
+
+  test('rejects a flag without a colon, a bad name, an empty value or a duplicate name', () => {
+    expect(parseHeaderFlags(['Authorization'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['Bad Name: x'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo:   '])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: 1', 'x-foo: 2'])).toHaveProperty('error')
+  })
+
+  test('rejects control characters in a value, but allows tabs, spaces and non-ASCII text', () => {
+    expect(parseHeaderFlags(['X-Foo: a\nb'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u0000b'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\u007fb'])).toHaveProperty('error')
+    // A CR/LF at the edge is rejected, not silently trimmed away.
+    expect(parseHeaderFlags(['X-Foo: value\n'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: \rvalue'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['\nX-Foo: value'])).toHaveProperty('error')
+    expect(parseHeaderFlags(['X-Foo: a\tb c'])).toEqual({ headers: { 'X-Foo': 'a\tb c' } })
+    expect(parseHeaderFlags(['X-Foo: caf\u00e9'])).toEqual({ headers: { 'X-Foo': 'caf\u00e9' } })
+  })
+
+  test('errors never repeat the raw flag, which may contain a credential', () => {
+    for (const bad of [
+      'Bad Name: secret-token',
+      'Authorization Bearer secret-token',
+      'secret-token:',
+      'secret-token: ***',
+      'secret-token: a\nb',
+    ]) {
+      const result = parseHeaderFlags([bad])
+      expect(result).toHaveProperty('error')
+      expect(JSON.stringify(result)).not.toContain('secret-token')
+    }
+    const duplicate = parseHeaderFlags(['secret-token: 1', 'Secret-Token: 2'])
+    expect(duplicate).toHaveProperty('error')
+    expect(JSON.stringify(duplicate)).not.toContain('ecret-')
+  })
+
+  test('keeps a header named __proto__ as an own property', () => {
+    const result = parseHeaderFlags(['__proto__: x'])
+    expect('headers' in result && Object.keys(result.headers ?? {})).toEqual(['__proto__'])
+    expect('headers' in result && JSON.stringify(result.headers)).toBe('{"__proto__":"x"}')
+  })
+
+  test('rejects the hidden placeholder as a real value', () => {
+    expect(parseHeaderFlags(['Authorization: ***'])).toHaveProperty('error')
+  })
+})
+
+describe('withHeaderHint', () => {
+  const refusal = "'url' was changed, so the masked value at 'headers.Authorization' must be entered again instead of '***'"
+
+  test('points at --header when the server refuses to restore hidden headers', () => {
+    expect(withHeaderHint(refusal, {})).toBe(`${refusal}. Pass each header again with --header "Name: value".`)
+  })
+
+  test('leaves other errors, and updates that already pass --header, alone', () => {
+    expect(withHeaderHint('Provider not found', {})).toBe('Provider not found')
+    expect(withHeaderHint(refusal, { header: ['A: b'] })).toBe(refusal)
+  })
 })
 
 describe('parseProviderIds', () => {
@@ -162,5 +268,126 @@ describe('parseProviderIds', () => {
 
   test('a single ID parses to a one-element array', () => {
     expect(parseProviderIds('42')).toEqual([42])
+  })
+})
+
+describe('telegram helpers', () => {
+  test('hasTelegramConfigChanges: true only when a telegram flag is present', () => {
+    expect(hasTelegramConfigChanges({})).toBe(false)
+    expect(hasTelegramConfigChanges({ botToken: '123:abc' })).toBe(true)
+    expect(hasTelegramConfigChanges({ chatId: '-1001' })).toBe(true)
+    // An empty --topic-id is a deliberate "clear the topic", not an absent flag.
+    expect(hasTelegramConfigChanges({ topicId: '' })).toBe(true)
+  })
+
+  test('parseTopicId: integers parse, empty clears, anything else is invalid', () => {
+    expect(parseTopicId(undefined)).toBeUndefined()
+    expect(parseTopicId('42')).toBe(42)
+    expect(parseTopicId(' 7 ')).toBe(7)
+    expect(parseTopicId('')).toBeNull()
+    expect(parseTopicId('0')).toBe('invalid')
+    expect(parseTopicId('-3')).toBe('invalid')
+    expect(parseTopicId('4.5')).toBe('invalid')
+    expect(parseTopicId('general')).toBe('invalid')
+    expect(parseTopicId('99999999999999999999')).toBe('invalid')
+  })
+
+  test('buildTelegramConfigUpdate keeps the stored token when --bot-token is omitted', () => {
+    const current = { bot_token: '***', chat_id: '-1001234567890', message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ chatId: '-1001234567890' }, undefined, current)).toEqual({
+      bot_token: KEEP_STORED_SECRET,
+      chat_id: '-1001234567890',
+      message_thread_id: 12,
+    })
+  })
+
+  test('buildTelegramConfigUpdate clears the topic when --chat-id moves to another chat', () => {
+    const current = { bot_token: '***', chat_id: -1001234567890, message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, undefined, current).message_thread_id).toBeNull()
+    // An explicit topic for the new chat is used as given.
+    expect(buildTelegramConfigUpdate({ chatId: '@alerts' }, 7, current).message_thread_id).toBe(7)
+    // Token-only and topic-only updates keep the stored chat's topic.
+    expect(buildTelegramConfigUpdate({ botToken: '123:new' }, undefined, current).message_thread_id).toBe(12)
+    expect(buildTelegramConfigUpdate({}, 9, current).message_thread_id).toBe(9)
+    // The same chat, numeric in storage and a string on the command line.
+    expect(buildTelegramConfigUpdate({ chatId: ' -1001234567890 ' }, undefined, current).message_thread_id).toBe(12)
+  })
+
+  test('telegramChatChanges only reports a different chat', () => {
+    const current = { bot_token: '***', chat_id: '-1001' }
+    expect(telegramChatChanges(undefined, current)).toBe(false)
+    expect(telegramChatChanges('-1001', current)).toBe(false)
+    expect(telegramChatChanges('-1002', current)).toBe(true)
+    expect(telegramChatChanges('-1002', null)).toBe(true)
+  })
+
+  test('buildTelegramConfigUpdate never echoes back a revealed token from the current config', () => {
+    const current = { bot_token: '123:revealed-secret', chat_id: '-1001' }
+    expect(buildTelegramConfigUpdate({}, undefined, current).bot_token).toBe(KEEP_STORED_SECRET)
+  })
+
+  test('buildTelegramConfigUpdate applies a new token, clears the topic, and stringifies a numeric chat id', () => {
+    const current = { bot_token: '***', chat_id: -1001234567890, message_thread_id: 12 }
+    expect(buildTelegramConfigUpdate({ botToken: '123:new' }, null, current)).toEqual({
+      bot_token: '123:new',
+      chat_id: '-1001234567890',
+      message_thread_id: null,
+    })
+  })
+})
+
+describe('invalid --topic-id', () => {
+  // Rejecting (rather than warning and returning) is what makes the command
+  // exit nonzero, so automation can tell the provider was not written.
+  test('fails telegram add before anything is sent', async () => {
+    await expect(
+      addTelegramProvider({ yes: true, name: 'alerts', botToken: '123:AA', chatId: '-1001', topicId: 'abc' }),
+    ).rejects.toThrow('Invalid value for --topic-id')
+  })
+
+  test('fails telegram update before anything is sent', async () => {
+    const provider = {
+      id: 7,
+      name: 'alerts',
+      provider_type: 'telegram',
+      enabled: true,
+      created_at: 0,
+      updated_at: 0,
+      config: { bot_token: KEEP_STORED_SECRET, chat_id: '-1001', message_thread_id: null },
+    }
+    await expect(updateTelegramProviderAction(7, provider, { id: '7', topicId: '4.2' })).rejects.toThrow(
+      'Invalid value for --topic-id',
+    )
+  })
+})
+
+// --- Credential file/stdin sources (shared value-source helper) ---
+
+const CREDENTIAL_SENTINEL = 's3cr3t-test-value'
+
+async function credentialFile(contents: string): Promise<string> {
+  const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+  const { tmpdir } = await import('node:os')
+  const { join } = await import('node:path')
+  const path = join(await mkdtemp(join(tmpdir(), 'temps-credential-')), 'credential.txt')
+  await writeFile(path, contents)
+  await chmod(path, 0o600)
+  return path
+}
+
+function credentialBody(run: { bodies: Array<{ request: string; body: unknown }> }, request: string): Record<string, unknown> {
+  const sent = run.bodies.find((b) => b.request === request)
+  expect(sent).toBeDefined()
+  return sent!.body as Record<string, unknown>
+}
+
+describe('notifications add credential sources', () => {
+  test('--bot-token-file sends the Telegram bot token from the file exactly', async () => {
+    const path = await credentialFile(CREDENTIAL_SENTINEL)
+    const run = await runWithApi(registerNotificationsCommands,
+      ['notifications', 'add', '-t', 'telegram', '-n', 'tg', '--bot-token-file', path, '--chat-id', '-1001234567890', '-y'],
+      { 'POST /notification-providers/telegram': { id: 1, name: 'tg', provider_type: 'telegram', enabled: true, config: {}, created_at: '2026-01-01T00:00:00Z', updated_at: '2026-01-01T00:00:00Z' } })
+    expect(run.error).toBeUndefined()
+    expect(JSON.stringify(credentialBody(run, 'POST /notification-providers/telegram'))).toContain(`"bot_token":"${CREDENTIAL_SENTINEL}"`)
   })
 })

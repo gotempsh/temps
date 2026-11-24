@@ -355,10 +355,21 @@ export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions)
     )
 
     await step('a real incident was created: severity "major", status "investigating", monitor_id matches', async () => {
-      const res = unwrap(
-        await listIncidents({ client, path: { project_id: project.id }, query: { status: 'investigating' } }),
-        'listIncidents',
-      ) as { incidents: Array<{ id: number; monitor_id: number | null; severity: string; status: string }>; total: number }
+      // The check result is written first and the incident is created from a
+      // queued job afterwards, so a status of major_outage can be visible
+      // before its incident exists.
+      const res = await pollUntil(
+        () =>
+          listIncidents({ client, path: { project_id: project.id }, query: { status: 'investigating' } }).then(
+            (r) =>
+              unwrap(r, 'listIncidents') as {
+                incidents: Array<{ id: number; monitor_id: number | null; severity: string; status: string }>
+                total: number
+              },
+          ),
+        (r) => r.incidents.some((i) => i.monitor_id === monitor.id),
+        { timeoutMs: 30_000, intervalMs: 1000, label: `investigating incident for monitor ${monitor.id}` },
+      )
       const incident = res.incidents.find((i) => i.monitor_id === monitor.id)
       if (!incident) throw new Error(`no investigating incident references monitor ${monitor.id}: ${JSON.stringify(res.incidents)}`)
       if (incident.severity !== 'major') throw new Error(`incident severity="${incident.severity}", expected "major"`)
@@ -447,13 +458,24 @@ export async function monitoringScenarioCommand(opts: MonitoringScenarioOptions)
     })
 
     await step('status overview back to fully operational', async () => {
-      const overview = unwrap(
-        await getStatusOverview({ client, path: { project_id: project.id } }),
-        'getStatusOverview',
+      // The overview rolls up BOTH monitors on the project. The recovery
+      // asserted above is the explicit monitor's; the environment's auto
+      // monitor runs its own check cycle and can still be reporting the
+      // outage from its last check, so this polls for the same reason the
+      // incident step does.
+      await pollUntil(
+        () =>
+          getStatusOverview({ client, path: { project_id: project.id } }).then((r) =>
+            unwrap(r, 'getStatusOverview'),
+          ),
+        (overview) => overview.status === 'operational',
+        {
+          timeoutMs: CHECK_CYCLE_TIMEOUT_MS,
+          intervalMs: 3000,
+          label: 'status overview recovery',
+          onPoll: (overview) => log(`    ...${overview.status}`),
+        },
       )
-      if (overview.status !== 'operational') {
-        throw new Error(`overview.status="${overview.status}", expected "operational"`)
-      }
     })
 
     await step('delete the explicit monitor: 404 afterward', async () => {

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader } from '@/components/layout/PageContainer'
 import {
   ExternalServiceInfo,
   ProjectResponse,
@@ -52,6 +53,14 @@ import { serviceCreateHref } from '@/lib/service-project-link'
 import type { ServiceLinkChange } from '@/lib/service-link-redeploy'
 import { ServiceLinkRedeployPrompt } from './ServiceLinkRedeployPrompt'
 import { projectServiceResourcePath } from '@/lib/database-provisioning'
+import { linkableDatabases } from '@/lib/database-links'
+import {
+  CONTAINER_CPU_METRIC,
+  containerCpuChartMetric,
+  containerCpuHistoryMetric,
+  withCpuHistory,
+} from '@/lib/container-cpu'
+import { formatCpuUsage } from '@/lib/cpu-format'
 import { serviceBackupsHref } from '@/lib/service-backup-setup'
 import { toast } from 'sonner'
 
@@ -63,11 +72,14 @@ import { toast } from 'sonner'
 function ResourceSparkline({
   serviceId,
   metric,
+  historyMetric,
   label,
   format,
 }: {
   serviceId: number
   metric: string
+  /** Charted before `metric` has readings; see `withCpuHistory`. */
+  historyMetric?: string
   label: string
   format: (value: number) => string
 }) {
@@ -81,10 +93,25 @@ function ResourceSparkline({
     // Metrics disabled on the service → the endpoint 503s; don't retry-spam.
     retry: false,
   })
+  const { data: historyData } = useQuery({
+    ...externalServiceMetricsGetRangeOptions({
+      path: { id: serviceId },
+      query: { metric: historyMetric ?? metric, range: '1h' },
+    }),
+    enabled: historyMetric != null,
+    staleTime: 30_000,
+    refetchInterval: 30_000,
+    retry: false,
+  })
 
-  if (!data?.length) return null
-
-  const values = data.map((p) => p.value)
+  const points = historyMetric
+    ? withCpuHistory(data ?? [], historyData ?? [])
+    : (data ?? [])
+  // Trend glyph only: buckets nothing was sampled in (`null`) are dropped.
+  const values = points
+    .map((p) => p.value)
+    .filter((v): v is number => v != null && Number.isFinite(v))
+  if (values.length === 0) return null
   const last = values[values.length - 1]
 
   return (
@@ -97,7 +124,7 @@ function ResourceSparkline({
   )
 }
 
-function ServiceRow({
+export function ServiceRow({
   service,
   isLinked,
   isBusy,
@@ -126,6 +153,12 @@ function ServiceRow({
     : `/storage/${service.id}`
 
   const goToPrimary = () => navigate(primaryHref)
+  // A cluster's `container.cpu_percent` is one series per member, which a
+  // range query averages; read its busiest member, as its service page does.
+  const cpuMetric = containerCpuChartMetric(
+    CONTAINER_CPU_METRIC,
+    service.topology === 'cluster'
+  )
 
   return (
     <li
@@ -189,9 +222,13 @@ function ServiceRow({
         <>
           <ResourceSparkline
             serviceId={service.id}
-            metric="container.cpu_percent"
+            metric={cpuMetric}
+            historyMetric={containerCpuHistoryMetric(
+              CONTAINER_CPU_METRIC,
+              cpuMetric
+            )}
             label="CPU"
-            format={(v) => `${v.toFixed(1)}%`}
+            format={(v) => formatCpuUsage(v, null)}
           />
           <ResourceSparkline
             serviceId={service.id}
@@ -326,6 +363,9 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [isCreateDropdownOpen, setIsCreateDropdownOpen] = useState(false)
   const [search, setSearch] = useState('')
+  // The server-wide list is loaded only when the operator asks to link an
+  // existing database: by default this page shows this service's own.
+  const [pickerOpen, setPickerOpen] = useState(false)
   const [servicePendingLink, setServicePendingLink] =
     useState<ExternalServiceInfo | null>(null)
   // The last link change, until the operator redeploys or dismisses it: the
@@ -351,6 +391,7 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     isError: servicesError,
   } = useQuery({
     ...listServicesOptions(),
+    enabled: pickerOpen,
     retry: false,
   })
 
@@ -379,7 +420,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   })
 
   const serviceName = (serviceId: number) =>
-    services?.find((item) => item.id === serviceId)?.name ?? 'The service'
+    servicesLinked?.find((link) => link.service.id === serviceId)?.service
+      .name ??
+    services?.find((item) => item.id === serviceId)?.name ??
+    'The service'
 
   const linkService = async (
     serviceId: number,
@@ -440,24 +484,17 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   }
 
   const linkedCount = servicesLinked?.length ?? 0
-  const totalCount = services?.length ?? 0
   const isToggling =
     linkServiceMutation.isPending || unlinkServiceMutation.isPending
 
   const databaseTypes = (
     <section
-      aria-label={
-        services?.length
-          ? 'Create a new database'
-          : 'Create your first database'
-      }
+      aria-label={linkedCount ? 'Create a new database' : 'Create a database'}
       className="space-y-4"
     >
       <div>
         <h2 className="text-lg font-semibold">
-          {services?.length
-            ? 'Create a new database'
-            : 'Create your first database'}
+          {linkedCount ? 'Create a new database' : 'Create a database'}
         </h2>
         <p className="mt-1 text-sm text-muted-foreground">
           Choose a database type to configure a new database linked to{' '}
@@ -524,47 +561,44 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
   )
 
   const header = (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
-      <div>
-        <h1 className="text-xl font-semibold tracking-tight sm:text-2xl">
-          Databases
-        </h1>
-        <p className="mt-1 text-sm text-muted-foreground">
-          Link an existing database or create a new one for this service.
-          {totalCount > 0 ? (
-            <span className="ml-1 tabular-nums">
-              {linkedCount} of {totalCount} linked.
-            </span>
-          ) : null}
-        </p>
-      </div>
-      <CreateServiceButton
-        projectId={project.id}
-        label="Create database"
-        open={isCreateDropdownOpen}
-        onOpenChange={setIsCreateDropdownOpen}
-      />
-    </div>
+    <PageHeader
+      title="Databases"
+      description={
+        <span className="tabular-nums">
+          {linkedCount === 1
+            ? '1 database linked to this service.'
+            : `${linkedCount} databases linked to this service.`}
+        </span>
+      }
+      actions={
+        <div className="flex flex-wrap items-center gap-2">
+          <Button asChild variant="outline" size="sm">
+            <Link to="/storage">All databases on this server</Link>
+          </Button>
+          <CreateServiceButton
+            projectId={project.id}
+            label="Create database"
+            open={isCreateDropdownOpen}
+            onOpenChange={setIsCreateDropdownOpen}
+          />
+        </div>
+      }
+    />
   )
 
-  if (servicesError || linksError) {
+  if (linksError) {
     return (
-      <div className="space-y-6 p-4 md:p-6">
+      <div className="space-y-6">
         {header}
         <Alert variant="destructive">
           <AlertTitle>Databases could not be loaded</AlertTitle>
           <AlertDescription>
-            {servicesError
-              ? 'Could not load the available databases.'
-              : 'Could not determine which databases are linked to this service.'}
+            Could not determine which databases are linked to this service.
             <Button
               variant="outline"
               size="sm"
               className="ml-3"
-              onClick={() => {
-                void refetchServices()
-                void refetchServicesLinked()
-              }}
+              onClick={() => void refetchServicesLinked()}
             >
               Retry databases
             </Button>
@@ -573,10 +607,10 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
       </div>
     )
   }
-  if (isLoadingServices || loadingLinks) {
+  if (loadingLinks) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
+        <div className="space-y-6">
           {header}
           <ul
             role="list"
@@ -598,36 +632,17 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
     )
   }
 
-  if (!services?.length) {
-    return (
-      <div className="flex-1 overflow-auto">
-        <div className="space-y-6 p-4 md:p-6">
-          {header}
-          {databaseTypes}
-        </div>
-      </div>
-    )
-  }
-
-  const linkedServices = services.filter((s) =>
-    servicesLinked?.some((l) => l.service.id === s.id)
-  )
-  const availableServices = services.filter(
-    (s) =>
-      !servicesLinked?.some((l) => l.service.id === s.id) &&
-      `${s.name} ${s.service_type}`.toLowerCase().includes(search.toLowerCase())
+  const linkedServices = (servicesLinked ?? []).map((link) => link.service)
+  const availableServices = linkableDatabases(
+    services ?? [],
+    servicesLinked ?? [],
+    search
   )
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="space-y-8 p-4 md:p-6">
+      <div className="space-y-8">
         {header}
-
-        <p className="text-sm text-muted-foreground">
-          Choose an existing database below, or create a new database of any
-          supported type. Linking makes its connection settings available to
-          this service from its next deployment.
-        </p>
 
         <ServiceLinkRedeployPrompt
           project={project}
@@ -635,14 +650,19 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
           onDismiss={() => setLinkChange(null)}
         />
 
-        {linkedServices.length > 0 ? (
-          <section>
-            <div className="mb-2 flex items-baseline justify-between">
-              <h2 className="text-sm font-medium text-foreground">Linked</h2>
-              <span className="text-xs text-muted-foreground tabular-nums">
-                {linkedServices.length}
-              </span>
-            </div>
+        <section aria-labelledby="linked-databases">
+          <div className="mb-2 flex items-baseline justify-between">
+            <h2
+              id="linked-databases"
+              className="text-sm font-medium text-foreground"
+            >
+              Linked
+            </h2>
+            <span className="text-xs text-muted-foreground tabular-nums">
+              {linkedServices.length}
+            </span>
+          </div>
+          {linkedServices.length > 0 ? (
             <ul
               role="list"
               className="divide-y divide-border rounded-lg border border-border overflow-hidden"
@@ -661,53 +681,95 @@ export function ProjectStorage({ project }: { project: ProjectResponse }) {
                 />
               ))}
             </ul>
-          </section>
-        ) : null}
+          ) : (
+            <p className="rounded-lg border border-dashed px-4 py-6 text-center text-sm text-muted-foreground">
+              No databases are linked to this service yet.
+            </p>
+          )}
+        </section>
 
-        {services.length > linkedServices.length ? (
-          <section>
-            <div className="mb-2 flex items-baseline justify-between">
-              <h2 className="text-sm font-medium text-foreground">
-                Link an existing database
-              </h2>
-              <span className="text-xs text-muted-foreground tabular-nums">
-                {availableServices.length}
-              </span>
-            </div>
-            <Input
-              aria-label="Search existing databases"
-              placeholder="Search by name or database type…"
-              className="mb-3 max-w-md"
-              value={search}
-              onChange={(event) => setSearch(event.target.value)}
-            />
-            {!availableServices.length && (
-              <p className="py-4 text-sm text-muted-foreground">
-                No databases match your search.
-              </p>
-            )}
-            <ul
-              role="list"
-              className="divide-y divide-border rounded-lg border border-border overflow-hidden"
+        <section aria-labelledby="link-existing-database" className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2
+              id="link-existing-database"
+              className="text-sm font-medium text-foreground"
             >
-              {availableServices.map((service) => (
-                <ServiceRow
-                  key={service.id}
-                  service={service}
-                  isLinked={false}
-                  isBusy={isToggling}
-                  projectSlug={project.slug}
-                  onToggle={() => handleServiceToggle(service.id)}
+              Link an existing database
+            </h2>
+            {!pickerOpen && (
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPickerOpen(true)}
+              >
+                Choose from this server
+              </Button>
+            )}
+          </div>
+          {pickerOpen &&
+            (isLoadingServices ? (
+              <div
+                role="status"
+                aria-label="Loading databases on this server"
+                className="h-24 animate-pulse rounded-lg bg-muted"
+              />
+            ) : servicesError ? (
+              <Alert variant="destructive">
+                <AlertTitle>
+                  The databases on this server could not be loaded
+                </AlertTitle>
+                <AlertDescription>
+                  The databases linked above are unaffected.
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="ml-3"
+                    onClick={() => void refetchServices()}
+                  >
+                    Retry
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground">
+                  Showing all databases on this server that this service is not
+                  linked to. Linking makes its connection settings available
+                  from the next deployment.
+                </p>
+                <Input
+                  aria-label="Search existing databases"
+                  placeholder="Search by name or database type…"
+                  className="max-w-md"
+                  value={search}
+                  onChange={(event) => setSearch(event.target.value)}
                 />
-              ))}
-            </ul>
-          </section>
-        ) : (
-          <p className="text-sm text-muted-foreground">
-            All existing databases are linked to this service. You can create
-            another database above.
-          </p>
-        )}
+                {availableServices.length === 0 ? (
+                  <p className="py-4 text-sm text-muted-foreground">
+                    {search
+                      ? 'No databases match your search.'
+                      : 'Every database on this server is already linked to this service.'}
+                  </p>
+                ) : (
+                  <ul
+                    role="list"
+                    className="divide-y divide-border rounded-lg border border-border overflow-hidden"
+                  >
+                    {availableServices.map((service) => (
+                      <ServiceRow
+                        key={service.id}
+                        service={service}
+                        isLinked={false}
+                        isBusy={isToggling}
+                        projectSlug={project.slug}
+                        onToggle={() => handleServiceToggle(service.id)}
+                      />
+                    ))}
+                  </ul>
+                )}
+              </>
+            ))}
+        </section>
         {databaseTypes}
         <ConfirmDeleteDialog
           open={serviceToUnlink !== null}

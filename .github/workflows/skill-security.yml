@@ -6,6 +6,10 @@ name: Skill Security
 on:
   pull_request:
     branches: [main]
+  # "Skill security gate" is a required check, so it has to report in the
+  # merge queue. It scans what the queued change touches, like a pull request.
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
     paths:
@@ -14,6 +18,7 @@ on:
       - "apps/temps-cli/src/commands/docs.ts"
       - "apps/temps-cli/src/commands/docs.test.ts"
       - ".github/workflows/skill-security.yml"
+      - ".github/scripts/test_platform_setup_skill.py"
       - ".github/skill-scanner-requirements.in"
       - ".github/skill-scanner-requirements.txt"
   schedule:
@@ -31,7 +36,7 @@ permissions:
 jobs:
   select-skills:
     name: Select agent skills
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 5
     outputs:
       scan-mode: ${{ steps.select.outputs.scan-mode }}
@@ -46,9 +51,9 @@ jobs:
       - name: Build skill matrix
         id: select
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
           EVENT_NAME: ${{ github.event_name }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -63,6 +68,7 @@ jobs:
               ".github/skill-scanner-requirements.in",
               ".github/skill-scanner-requirements.txt",
               ".github/workflows/skill-security.yml",
+              ".github/scripts/test_platform_setup_skill.py",
           }
           temps_dependency_files = {
               "apps/temps-cli/package.json",
@@ -114,7 +120,7 @@ jobs:
 
           scan_mode = "full"
           skill_paths = []
-          if os.environ["EVENT_NAME"] == "pull_request":
+          if os.environ["EVENT_NAME"] in ("pull_request", "merge_group"):
               changed = subprocess.check_output(
                   [
                       "git",
@@ -178,7 +184,7 @@ jobs:
     name: Scan ${{ matrix.skill-path }}
     needs: select-skills
     if: needs.select-skills.outputs.skill-paths != '[]'
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 15
     strategy:
       fail-fast: false
@@ -194,7 +200,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: "3.13"
 
@@ -225,6 +231,10 @@ jobs:
             --destination "$generated_dir"
           diff -ru skills/temps/references/commands "$generated_dir"
 
+      - name: Test platform setup installer verification
+        if: matrix.skill-path == 'skills/temps-platform-setup'
+        run: python3 .github/scripts/test_platform_setup_skill.py -v
+
       - name: Scan skill
         env:
           SKILL_PATH: ${{ matrix.skill-path }}
@@ -241,7 +251,7 @@ jobs:
       - select-skills
       - skill-security
     if: always()
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     timeout-minutes: 2
     permissions: {}
     env:

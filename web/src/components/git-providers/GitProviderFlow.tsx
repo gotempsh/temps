@@ -12,8 +12,8 @@ import {
   listDomainsOptions,
   listConnectionsQueryKey,
   listGitProvidersOptions,
+  startGithubManifestFlowMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { client } from '@/api/client/client.gen'
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -30,6 +30,15 @@ import { ScrollRegion } from '@/components/ui/scroll-region'
 import { usePlatformCapabilities } from '@/hooks/usePlatformCapabilities'
 import { cn } from '@/lib/utils'
 import { hasNewGitHubInstallation } from '@/lib/git-installation-polling'
+import {
+  createManifestSetupTracker,
+  githubAppManifest,
+  githubAppWindowName,
+  githubWindowUsable,
+  openGithubAppWindow,
+  submitGitHubManifest,
+} from '@/lib/github-app-manifest'
+import { openExternal } from '@/lib/open-external'
 import { isGitHubApp } from '@/lib/provider'
 import { Button as AsyncButton, Callout, Status } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -119,6 +128,14 @@ export function GitProviderFlow({
   const [providerName, setProviderName] = useState('')
   const [gitlabBaseUrl, setGitlabBaseUrl] = useState('https://gitlab.com')
   const [isCreatingApp, setIsCreatingApp] = useState(false)
+  const [manifestSetup] = useState(() => createManifestSetupTracker<Window>())
+  const [githubWindowName] = useState(githubAppWindowName)
+  // Leaving the flow stops a setup that is still waiting for its state.
+  useEffect(() => () => manifestSetup.cancel(), [manifestSetup])
+  const cancelManifestSetup = () => {
+    manifestSetup.cancel()
+    setIsCreatingApp(false)
+  }
   const [copiedCallback, setCopiedCallback] = useState(false)
   const [gitlabClientId, setGitlabClientId] = useState('')
   const [gitlabClientSecret, setGitlabClientSecret] = useState('')
@@ -325,6 +342,13 @@ export function GitProviderFlow({
     ? 'GitHub Apps require HTTPS. Please use a secure connection or provide an HTTPS URL.'
     : ''
 
+  const startManifestFlow = useMutation({
+    ...startGithubManifestFlowMutation(),
+    meta: {
+      errorTitle: 'Failed to start the GitHub App setup',
+    },
+  })
+
   const createGitHubPAT = useMutation({
     ...createGithubPatProviderMutation(),
     meta: {
@@ -430,27 +454,6 @@ export function GitProviderFlow({
     setTimeout(() => setCopiedCallback(false), 2000)
   }
 
-  // GitHub's redirect back to the console carries no session cookie, so the
-  // server binds the manifest `state` to this signed-in browser with an
-  // HttpOnly cookie. Without that binding it refuses to register the App.
-  const requestGitHubManifestState = async (): Promise<string> => {
-    const response = await client.post({
-      url: '/git-providers/github/manifest-state',
-      security: [{ scheme: 'bearer', type: 'http' }],
-    })
-    const data = response.data as { state?: string } | undefined
-    if (!data?.state) {
-      const problem = response.error as
-        { detail?: string; title?: string } | undefined
-      throw new Error(
-        problem?.detail ??
-          problem?.title ??
-          'Could not start the GitHub App setup. Check that you may create git providers.'
-      )
-    }
-    return data.state
-  }
-
   const handleCreateGitHubAppManifest = async () => {
     try {
       // The manifest fixes the App's webhook URL at creation. Without the
@@ -470,7 +473,7 @@ export function GitProviderFlow({
       }
 
       if (!canCreateGitHubApp) {
-        toast.error('GitHub Apps require HTTPS', {
+        toast.error('GitHub apps require HTTPS', {
           description: httpWarningMessage,
           duration: 5000,
         })
@@ -486,64 +489,59 @@ export function GitProviderFlow({
 
       setIsCreatingApp(true)
 
-      const appName = `temps-${Math.random().toString(36).substring(2, 8)}`
-      const source = await requestGitHubManifestState()
-
-      const baseUrl = `${window.location.origin}`
-      const appUrl = `${baseUrl}`
-      const apiUrl = `${baseUrl}/api`
-
-      const manifestData = {
-        name: appName,
-        url: appUrl,
-        hook_attributes: {
-          url: githubEventsUrl,
-          active: true,
-        },
-        redirect_url: `${apiUrl}/webhook/git/github/auth`,
-        callback_urls: [
-          `${apiUrl}/webhook/git/github/auth`,
-          `${apiUrl}/webhook/git/github/callback`,
-        ],
-        description: 'Temps deployment platform',
-        public: true,
-        request_oauth_on_install: true,
-        setup_url: `${apiUrl}/webhook/git/github/install`,
-        default_permissions: {
-          contents: 'write',
-          metadata: 'read',
-          emails: 'read',
-          administration: 'write',
-          pull_requests: 'write',
-          members: 'read',
-        },
-        default_events: ['push', 'pull_request'],
+      // Open GitHub's window now, inside the click, so a popup blocker lets it
+      // through. The manifest is posted into it once the server has issued the
+      // state that GitHub has to hand back to the callback.
+      const { attempt, window: githubWindow } = manifestSetup.begin(() =>
+        openGithubAppWindow(githubWindowName, (url, target) =>
+          window.open(url, target)
+        )
+      )
+      let manifestState: string
+      try {
+        manifestState = (await startManifestFlow.mutateAsync({})).state
+      } catch {
+        // The mutation reports why (see `meta.errorTitle`). An attempt that was
+        // cancelled or replaced meanwhile leaves the loading flag and the
+        // window to whoever owns them now.
+        manifestSetup.closeWindowFor(attempt)
+        if (manifestSetup.isCurrent(attempt)) setIsCreatingApp(false)
+        return
       }
 
-      const form = document.createElement('form')
-      form.method = 'POST'
-      form.action = `https://github.com/settings/apps/new?state=${source}`
-      form.target = '_blank'
+      // The operator went Back, picked another method or left while the state
+      // was being issued: post nothing and watch for nothing.
+      if (!manifestSetup.isCurrent(attempt)) {
+        manifestSetup.closeWindowFor(attempt)
+        return
+      }
+      if (!githubWindowUsable(githubWindow)) {
+        setIsCreatingApp(false)
+        toast.error('Could not open the GitHub window', {
+          description:
+            'The window was blocked or closed. Allow popups for this site and try again.',
+        })
+        return
+      }
 
-      const input = document.createElement('input')
-      input.type = 'hidden'
-      input.name = 'manifest'
-      const manifestJson = JSON.stringify(manifestData)
-      input.value = manifestJson
+      const appName = `temps-${Math.random().toString(36).substring(2, 8)}`
 
-      form.appendChild(input)
-      document.body.appendChild(form)
+      const manifestData = githubAppManifest({
+        name: appName,
+        origin: window.location.origin,
+        eventsUrl: githubEventsUrl,
+      })
 
-      form.submit()
+      submitGitHubManifest(manifestData, manifestState, githubWindowName)
+      manifestSetup.manifestPosted()
       toast.success('Opening GitHub App creation page...', {
         description: 'Complete the setup in the new tab, then return here',
         duration: 5000,
       })
 
       setTimeout(() => {
-        if (document.body.contains(form)) {
-          document.body.removeChild(form)
-        }
+        // A newer attempt started in the meantime owns the loading state.
+        if (!manifestSetup.isCurrent(attempt)) return
         setIsCreatingApp(false)
 
         // Start polling for new installations
@@ -566,7 +564,7 @@ export function GitProviderFlow({
           description: 'Please allow popups for this site and try again.',
         })
       } else {
-        toast.error('Failed to create GitHub App', {
+        toast.error('Failed to create GitHub app', {
           description:
             error instanceof Error
               ? error.message
@@ -580,7 +578,7 @@ export function GitProviderFlow({
     // GitLab doesn't support automatic app creation like GitHub
     // We need to show the user the information and open the settings page
     const gitlabUrl = gitlabBaseUrl || 'https://gitlab.com'
-    window.open(`${gitlabUrl}/-/user_settings/applications`, '_blank')
+    openExternal(`${gitlabUrl}/-/user_settings/applications`)
 
     toast.success('Opening GitLab Applications page...', {
       description: 'Please fill in the form with the information shown below',
@@ -595,7 +593,7 @@ export function GitProviderFlow({
     }
 
     if (!existingGitHubApp.base_url) {
-      toast.error('The GitHub App installation URL is not configured')
+      toast.error('The GitHub app installation URL is not configured')
       return
     }
 
@@ -628,7 +626,15 @@ export function GitProviderFlow({
     setIsWaitingForWebhook(true)
   }
 
+  // Choosing anything but the App stops an App setup that is still waiting
+  // for its state.
+  const chooseMethod = (method: Method) => {
+    if (method !== 'app') cancelManifestSetup()
+    setSelectedMethod(method)
+  }
+
   const handleMethodSelect = (method: Method) => {
+    if (method !== 'app') cancelManifestSetup()
     setSelectedMethod(method)
     if (method === 'pat') {
       setCurrentStep('configure-pat')
@@ -689,7 +695,7 @@ export function GitProviderFlow({
 
   const handleGitLabOAuthSubmit = async () => {
     if (!gitlabClientId || !gitlabClientSecret) {
-      toast.error('Please enter both Client ID and Client Secret')
+      toast.error('Please enter both client ID and client secret')
       return
     }
 
@@ -781,6 +787,8 @@ export function GitProviderFlow({
   }
 
   const handleBack = () => {
+    // A GitHub App setup still waiting for its state must not carry on.
+    cancelManifestSetup()
     if (currentStep === 'provider') {
       onCancel?.()
     } else if (currentStep === 'method') {
@@ -888,9 +896,9 @@ export function GitProviderFlow({
                         {existingGitHubApp && (
                           <Badge
                             variant="outline"
-                            className="text-xs bg-green-50 text-green-700 border-green-200"
+                            className="text-xs bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-900"
                           >
-                            App Ready
+                            App ready
                           </Badge>
                         )}
                       </CardTitle>
@@ -989,7 +997,7 @@ export function GitProviderFlow({
                   <div className="flex items-start gap-2 text-sm">
                     <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
                     <span className="text-muted-foreground text-xs">
-                      Personal Access Tokens
+                      Personal access tokens
                     </span>
                   </div>
                   <div className="flex items-start gap-2 text-sm">
@@ -1070,7 +1078,7 @@ export function GitProviderFlow({
                   <div className="flex items-start gap-2 text-sm">
                     <CheckCircle2 className="h-3.5 w-3.5 text-green-500 flex-shrink-0 mt-0.5" />
                     <span className="text-muted-foreground text-xs">
-                      Personal Access Tokens
+                      Personal access tokens
                     </span>
                   </div>
                   <div className="flex items-start gap-2 text-sm">
@@ -1215,7 +1223,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg">
-                        Other Git Providers
+                        Other Git providers
                       </CardTitle>
                       <CardDescription className="mt-1">
                         Connect any Git repository via clone URL
@@ -1265,7 +1273,7 @@ export function GitProviderFlow({
                       handleProviderSelect('generic')
                     }}
                   >
-                    Select Other
+                    Select other
                     <ArrowRight className="h-4 w-4" />
                   </Button>
                 </div>
@@ -1309,7 +1317,7 @@ export function GitProviderFlow({
                   selectedMethod !== 'existing-app' &&
                     'hover:border-muted-foreground/50 hover:shadow-md'
                 )}
-                onClick={() => setSelectedMethod('existing-app')}
+                onClick={() => chooseMethod('existing-app')}
               >
                 <CardHeader>
                   <div className="flex items-start justify-between">
@@ -1327,10 +1335,10 @@ export function GitProviderFlow({
                       <div className="space-y-2">
                         <div>
                           <CardTitle className="text-lg flex items-center gap-2">
-                            Use Existing GitHub App
+                            Use existing GitHub App
                             <Badge
                               variant="outline"
-                              className="text-xs bg-green-50 text-green-700 border-green-200"
+                              className="text-xs bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400 border-green-200 dark:border-green-900"
                             >
                               Recommended
                             </Badge>
@@ -1367,7 +1375,7 @@ export function GitProviderFlow({
                     </div>
                   </div>
 
-                  <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+                  <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
                     <Sparkles className="h-4 w-4" />
                     <AlertDescription className="text-sm">
                       This GitHub App is already set up. Just install it to your
@@ -1472,7 +1480,7 @@ export function GitProviderFlow({
               </CardHeader>
               <CardContent className="space-y-4">
                 {isLocalMode ? (
-                  <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                  <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription className="space-y-2">
                       <p className="font-medium text-sm">Local mode detected</p>
@@ -1523,7 +1531,7 @@ export function GitProviderFlow({
                 )}
 
                 {!isLocalMode && !isLocalhost && (
-                  <Alert className="border-green-200 bg-green-50/50 dark:bg-green-950/20">
+                  <Alert className="border-green-200 dark:border-green-900 bg-green-50/50 dark:bg-green-950/20">
                     <Sparkles className="h-4 w-4" />
                     <AlertDescription className="text-sm">
                       Click below and we&apos;ll automatically configure
@@ -1574,7 +1582,7 @@ export function GitProviderFlow({
                     {isLocalMode ? (
                       <>
                         <Lock className="mr-2 h-4 w-4" />
-                        Not Available
+                        Not available
                       </>
                     ) : isCreatingApp ? (
                       <>
@@ -1601,7 +1609,7 @@ export function GitProviderFlow({
                 selectedMethod !== 'pat' &&
                   'hover:border-muted-foreground/50 hover:shadow-md'
               )}
-              onClick={() => setSelectedMethod('pat')}
+              onClick={() => chooseMethod('pat')}
             >
               <CardHeader>
                 <div className="flex items-start justify-between">
@@ -1616,7 +1624,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg flex items-center gap-2">
-                        Personal Access Token
+                        Personal access token
                         {isLocalMode && !existingGitHubApp && (
                           <Badge variant="secondary" className="text-xs">
                             Recommended
@@ -1657,9 +1665,8 @@ export function GitProviderFlow({
                     variant="link"
                     className="p-0 h-auto font-normal text-sm"
                     onClick={() =>
-                      window.open(
-                        'https://github.com/settings/tokens/new?description=Temps%20Platform&scopes=repo,read:user,read:org',
-                        '_blank'
+                      openExternal(
+                        'https://github.com/settings/tokens/new?description=Temps%20Platform&scopes=repo,read:user,read:org'
                       )
                     }
                   >
@@ -1673,7 +1680,7 @@ export function GitProviderFlow({
                       handleMethodSelect('pat')
                     }}
                   >
-                    Use Personal Token
+                    Use personal token
                     <ArrowRight className="ml-2 h-4 w-4" />
                   </Button>
                 </div>
@@ -1682,12 +1689,12 @@ export function GitProviderFlow({
           </div>
 
           {isLocalhost && selectedMethod === 'app' && !isLocalMode && (
-            <Card className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+            <Card className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
               <CardContent className="pt-6 space-y-4">
                 <div className="flex items-center gap-2 text-orange-800 dark:text-orange-200">
                   <Settings className="h-5 w-5" />
                   <h3 className="font-medium">
-                    Manual GitHub App Setup Instructions
+                    Manual GitHub App setup instructions
                   </h3>
                 </div>
 
@@ -1698,14 +1705,11 @@ export function GitProviderFlow({
                       variant="outline"
                       size="sm"
                       onClick={() =>
-                        window.open(
-                          'https://github.com/settings/apps/new',
-                          '_blank'
-                        )
+                        openExternal('https://github.com/settings/apps/new')
                       }
                     >
                       <ExternalLink className="mr-2 h-3 w-3" />
-                      Open GitHub Settings
+                      Open GitHub settings
                     </Button>
                   </div>
 
@@ -1848,7 +1852,7 @@ export function GitProviderFlow({
               </CardHeader>
               <CardContent className="space-y-4">
                 {isLocalMode ? (
-                  <Alert className="border-orange-200 bg-orange-50/50 dark:bg-orange-950/20">
+                  <Alert className="border-orange-200 dark:border-orange-900 bg-orange-50/50 dark:bg-orange-950/20">
                     <AlertCircle className="h-4 w-4" />
                     <AlertDescription className="space-y-2">
                       <p className="font-medium text-sm">Local mode detected</p>
@@ -1901,7 +1905,7 @@ export function GitProviderFlow({
                 )}
 
                 {!isLocalMode && selectedMethod === 'gitlab-app' && (
-                  <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+                  <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                     <Info className="h-4 w-4 text-blue-600" />
                     <AlertDescription className="text-sm">
                       <p className="font-medium mb-2">Manual setup required</p>
@@ -1931,7 +1935,7 @@ export function GitProviderFlow({
                     {isLocalMode ? (
                       <>
                         <Lock className="mr-2 h-4 w-4" />
-                        Not Available
+                        Not available
                       </>
                     ) : (
                       <>
@@ -1970,7 +1974,7 @@ export function GitProviderFlow({
                     </div>
                     <div>
                       <CardTitle className="text-lg flex items-center gap-2">
-                        Personal Access Token
+                        Personal access token
                         {isLocalMode && (
                           <Badge variant="secondary" className="text-xs">
                             Recommended
@@ -2011,9 +2015,8 @@ export function GitProviderFlow({
                     variant="link"
                     className="p-0 h-auto font-normal text-sm"
                     onClick={() =>
-                      window.open(
-                        `${gitlabBaseUrl || 'https://gitlab.com'}/-/profile/personal_access_tokens`,
-                        '_blank'
+                      openExternal(
+                        `${gitlabBaseUrl || 'https://gitlab.com'}/-/profile/personal_access_tokens`
                       )
                     }
                   >
@@ -2029,7 +2032,7 @@ export function GitProviderFlow({
                       handleMethodSelect('gitlab-pat')
                     }}
                   >
-                    Use Personal Token
+                    Use personal token
                     <ArrowRight className="ml-2 h-4 w-4" />
                   </Button>
                 </div>
@@ -2074,7 +2077,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="pat">Personal Access Token</Label>
+                <Label htmlFor="pat">Personal access token</Label>
                 <Input
                   id="pat"
                   type="password"
@@ -2096,7 +2099,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2107,7 +2110,7 @@ export function GitProviderFlow({
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
                     >
-                      Create GitHub Token
+                      Create GitHub token
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </div>
@@ -2140,7 +2143,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Provider
+                  Add provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2193,7 +2196,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitlab-pat">Personal Access Token</Label>
+                <Label htmlFor="gitlab-pat">Personal access token</Label>
                 <Input
                   id="gitlab-pat"
                   type="password"
@@ -2219,7 +2222,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2230,7 +2233,7 @@ export function GitProviderFlow({
                       rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 text-primary hover:underline font-medium"
                     >
-                      Create GitLab Token
+                      Create GitLab token
                       <ExternalLink className="h-3 w-3" />
                     </a>
                   </div>
@@ -2265,7 +2268,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add GitLab Provider
+                  Add GitLab provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2285,7 +2288,7 @@ export function GitProviderFlow({
 
           <Card>
             <CardContent className="pt-6 space-y-6">
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <p className="font-medium mb-2">Manual Setup Required</p>
@@ -2417,7 +2420,7 @@ export function GitProviderFlow({
                 className="gap-2"
               >
                 <ExternalLink className="h-4 w-4" />
-                Open GitLab Settings
+                Open GitLab settings
               </Button>
               <Button
                 onClick={() =>
@@ -2507,7 +2510,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription>
                   <div className="space-y-2">
@@ -2550,7 +2553,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add GitLab OAuth Provider
+                  Add GitLab OAuth provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2587,7 +2590,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitea-url">Gitea Base URL</Label>
+                <Label htmlFor="gitea-url">Gitea base URL</Label>
                 <Input
                   id="gitea-url"
                   type="url"
@@ -2602,7 +2605,7 @@ export function GitProviderFlow({
               </div>
 
               <div>
-                <Label htmlFor="gitea-pat">Personal Access Token</Label>
+                <Label htmlFor="gitea-pat">Personal access token</Label>
                 <Input
                   id="gitea-pat"
                   type="password"
@@ -2646,7 +2649,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Gitea Provider
+                  Add Gitea provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2696,7 +2699,7 @@ export function GitProviderFlow({
                   <CardHeader className="pb-3">
                     <div className="flex items-center gap-2">
                       <Key className="h-5 w-5" />
-                      <CardTitle className="text-base">Access Token</CardTitle>
+                      <CardTitle className="text-base">Access token</CardTitle>
                       {bitbucketAuthMethod === 'access_token' && (
                         <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
                       )}
@@ -2720,7 +2723,7 @@ export function GitProviderFlow({
                   <CardHeader className="pb-3">
                     <div className="flex items-center gap-2">
                       <Lock className="h-5 w-5" />
-                      <CardTitle className="text-base">App Password</CardTitle>
+                      <CardTitle className="text-base">App password</CardTitle>
                       {bitbucketAuthMethod === 'app_password' && (
                         <CheckCircle2 className="h-4 w-4 text-primary ml-auto" />
                       )}
@@ -2773,7 +2776,7 @@ export function GitProviderFlow({
                 </p>
               </div>
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Info className="h-4 w-4 text-blue-600" />
                 <AlertDescription className="text-sm">
                   A webhook will be automatically registered on your Bitbucket
@@ -2812,7 +2815,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Bitbucket Provider
+                  Add Bitbucket provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}
@@ -2955,7 +2958,7 @@ export function GitProviderFlow({
                   </div>
 
                   <div>
-                    <Label htmlFor="generic-token">Access Token</Label>
+                    <Label htmlFor="generic-token">Access token</Label>
                     <Input
                       id="generic-token"
                       type="password"
@@ -2971,7 +2974,7 @@ export function GitProviderFlow({
                 </>
               )}
 
-              <Alert className="border-blue-200 bg-blue-50/50 dark:bg-blue-950/20">
+              <Alert className="border-blue-200 dark:border-blue-900 bg-blue-50/50 dark:bg-blue-950/20">
                 <Server className="h-4 w-4 text-blue-600" />
                 <AlertDescription className="text-sm">
                   Webhooks for generic providers are not registered
@@ -3011,7 +3014,7 @@ export function GitProviderFlow({
                 </>
               ) : (
                 <>
-                  Add Provider
+                  Add provider
                   <CheckCircle2 className="ml-2 h-4 w-4" />
                 </>
               )}

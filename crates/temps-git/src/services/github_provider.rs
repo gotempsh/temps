@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::git_provider::{
-    AuthMethod, Branch, Commit, FileContent, GitProviderError, GitProviderService, GitProviderTag,
-    GitProviderType, PullRequest, RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User,
-    WebhookConfig,
+    oauth_token_expiry, AuthMethod, Branch, Commit, FileContent, GitProviderError,
+    GitProviderService, GitProviderTag, GitProviderType, PullRequest, RefreshedOAuthToken,
+    RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User, WebhookConfig,
 };
 use super::github::create_github_app_jwt;
 use async_trait::async_trait;
@@ -332,19 +332,20 @@ impl ScopedTokenRequest {
 #[derive(Deserialize)]
 struct OAuthTokenResponse {
     access_token: String,
-    #[allow(dead_code)]
-    token_type: Option<String>,
-    #[allow(dead_code)]
-    scope: Option<String>,
 }
 
 /// Token refresh response (for GitHub Apps with refresh tokens)
 #[derive(Deserialize)]
 struct RefreshTokenResponse {
-    access_token: String,
+    // GitHub answers a refused refresh with 200 and only `error` set.
+    #[serde(default)]
+    access_token: Option<String>,
     refresh_token: Option<String>,
+    /// Loosely typed on purpose: a malformed lifetime must not fail the parse
+    /// and lose tokens that GitHub has already issued.
+    #[serde(default)]
+    expires_in: Option<serde_json::Value>,
     error: Option<String>,
-    error_description: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -376,8 +377,6 @@ struct GitHubOwner {
 #[derive(Deserialize)]
 struct InstallationRepositoriesResponse {
     repositories: Vec<GitHubRepo>,
-    #[allow(dead_code)]
-    total_count: i32,
 }
 
 #[derive(Deserialize)]
@@ -417,14 +416,18 @@ impl GitHubProvider {
         Ok(octocrab)
     }
 
-    fn get_client(&self) -> reqwest::Client {
+    fn get_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(30))
             // SSRF defense-in-depth: never follow redirects (see gitlab_provider).
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitHub".to_string(),
+                purpose: "API".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Client for streaming archive downloads. Unlike [`get_client`]'s 30s total
@@ -437,7 +440,7 @@ impl GitHubProvider {
     /// 15-minute budget is ample for even very large repositories. Redirects are
     /// still never followed automatically (we validate + follow the one archive
     /// hop manually).
-    fn get_archive_client(&self) -> reqwest::Client {
+    fn get_archive_client(&self) -> Result<reqwest::Client, GitProviderError> {
         super::git_provider::guarded_client_builder()
             .user_agent("Temps-Engine/1.0")
             .timeout(std::time::Duration::from_secs(15 * 60))
@@ -445,7 +448,11 @@ impl GitHubProvider {
             .read_timeout(std::time::Duration::from_secs(60))
             .redirect(reqwest::redirect::Policy::none())
             .build()
-            .expect("Failed to build reqwest archive client with static config")
+            .map_err(|e| GitProviderError::HttpClientBuild {
+                provider: "GitHub".to_string(),
+                purpose: "archive download".to_string(),
+                reason: e.to_string(),
+            })
     }
 
     /// Retry configuration for GitHub API calls.
@@ -490,11 +497,18 @@ impl GitHubProvider {
             .await
     }
 
-    fn get_headers(&self, access_token: &str) -> reqwest::header::HeaderMap {
+    fn get_headers(
+        &self,
+        access_token: &str,
+    ) -> Result<reqwest::header::HeaderMap, GitProviderError> {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert(
             "Authorization",
-            reqwest::header::HeaderValue::from_str(&format!("Bearer {}", access_token)).unwrap(),
+            super::git_provider::credential_header_value(
+                "GitHub",
+                "Authorization",
+                &format!("Bearer {}", access_token),
+            )?,
         );
         headers.insert(
             "Accept",
@@ -504,7 +518,7 @@ impl GitHubProvider {
             "X-GitHub-Api-Version",
             reqwest::header::HeaderValue::from_static("2022-11-28"),
         );
-        headers
+        Ok(headers)
     }
 
     /// SSRF guard for the one redirect we follow manually: the archive-download
@@ -569,10 +583,10 @@ impl GitHubProvider {
         client_id: &str,
         client_secret: &str,
         refresh_token: &str,
-    ) -> Result<(String, Option<String>), GitProviderError> {
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
         info!("Refreshing GitHub access token");
 
-        let client = self.get_client();
+        let client = self.get_client()?;
         let params = [
             ("client_id", client_id.to_string()),
             ("client_secret", client_secret.to_string()),
@@ -580,25 +594,33 @@ impl GitHubProvider {
             ("grant_type", "refresh_token".to_string()),
         ];
 
-        let response = self
-            .send_with_retry(|| {
-                client
-                    .post("https://github.com/login/oauth/access_token")
-                    .header("Accept", "application/json")
-                    .form(&params)
-            })
-            .await?;
+        // Sent once, never through `send_with_retry`: GitHub refresh tokens are
+        // single-use, so a repeat could use up a token the first attempt rotated.
+        let requested_at = chrono::Utc::now();
+        let response = client
+            .post("https://github.com/login/oauth/access_token")
+            .header("Accept", "application/json")
+            .form(&params)
+            .send()
+            .await
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "GitHub token refresh request failed: {}",
+                    error.without_url()
+                ))
+            })?;
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::AuthenticationFailed(format!(
-                "Failed to refresh token: {} - {}",
-                status, error_text
-            )));
+            return Err(if status.is_client_error() {
+                GitProviderError::AuthenticationFailed(format!(
+                    "GitHub refused the token refresh: HTTP {status}"
+                ))
+            } else {
+                GitProviderError::ApiError(format!(
+                    "GitHub refused the token refresh: HTTP {status}"
+                ))
+            });
         }
 
         let token_response: RefreshTokenResponse = response.json().await.map_err(|e| {
@@ -607,14 +629,21 @@ impl GitHubProvider {
 
         if let Some(error) = token_response.error {
             return Err(GitProviderError::AuthenticationFailed(format!(
-                "GitHub refresh error: {} - {}",
-                error,
-                token_response.error_description.unwrap_or_default()
+                "GitHub refused the token refresh: {error}"
             )));
         }
+        let access_token = token_response.access_token.ok_or_else(|| {
+            GitProviderError::ApiError(
+                "GitHub token refresh response had no access token".to_string(),
+            )
+        })?;
 
         debug!("Successfully refreshed GitHub access token");
-        Ok((token_response.access_token, token_response.refresh_token))
+        Ok(RefreshedOAuthToken {
+            access_token,
+            refresh_token: token_response.refresh_token,
+            expires_at: oauth_token_expiry(requested_at, token_response.expires_in.as_ref()),
+        })
     }
 
     /// Generate a GitHub App installation token
@@ -795,8 +824,8 @@ impl GitHubProvider {
 
     /// Validate a GitHub access token by making a simple API call
     async fn validate_token(&self, access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // `/rate_limit` authenticates OAuth, PAT, Actions, and installation
         // credentials without requiring user-profile access. GitHub Apps use
@@ -875,7 +904,7 @@ impl GitProviderService for GitHubProvider {
             } => {
                 if let Some(code) = code {
                     // Exchange authorization code for access token
-                    let client = self.get_client();
+                    let client = self.get_client()?;
                     let params = [
                         ("client_id", client_id.to_string()),
                         ("client_secret", client_secret.to_string()),
@@ -951,6 +980,26 @@ impl GitProviderService for GitHubProvider {
         GitHubProvider::validate_token(self, access_token).await
     }
 
+    async fn refresh_oauth_token(
+        &self,
+        refresh_token: &str,
+    ) -> Result<RefreshedOAuthToken, GitProviderError> {
+        match &self.auth_method {
+            AuthMethod::OAuth {
+                client_id,
+                client_secret,
+                ..
+            } => {
+                self.refresh_access_token(client_id, client_secret, refresh_token)
+                    .await
+            }
+            AuthMethod::PersonalAccessToken { .. } => Err(GitProviderError::AuthenticationFailed(
+                "Personal Access Token is invalid and cannot be refreshed".to_string(),
+            )),
+            _ => Err(GitProviderError::NotImplemented),
+        }
+    }
+
     async fn validate_and_refresh_token(
         &self,
         access_token: &str,
@@ -978,10 +1027,10 @@ impl GitProviderService for GitHubProvider {
                         ..
                     } => {
                         if let Some(refresh_token) = refresh_token {
-                            let (new_access_token, new_refresh_token) = self
+                            let issued = self
                                 .refresh_access_token(client_id, client_secret, refresh_token)
                                 .await?;
-                            Ok((new_access_token, new_refresh_token))
+                            Ok((issued.access_token, issued.refresh_token))
                         } else {
                             Err(GitProviderError::AuthenticationFailed(
                                 "OAuth access token is invalid and no refresh token is available"
@@ -1095,8 +1144,8 @@ impl GitProviderService for GitHubProvider {
         access_token: &str,
         organization: Option<&str>,
     ) -> Result<Vec<Repository>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Check if this is a GitHub App installation token
         // GitHub App installation tokens work with /installation/repositories
@@ -1224,8 +1273,8 @@ impl GitProviderService for GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
@@ -1399,8 +1448,8 @@ impl GitProviderService for GitHubProvider {
         path: &str,
         branch: Option<&str>,
     ) -> Result<FileContent, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Percent-encode the path so model/user-supplied paths can't break out
         // of the Contents API URL (e.g. injecting `?`/`#`/`..%2f`). Encode each
@@ -1463,8 +1512,8 @@ impl GitProviderService for GitHubProvider {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // Percent-encode each path segment individually so `/` separators are
         // preserved but user-supplied characters can't break the URL.
@@ -1562,8 +1611,8 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         reference: &str,
     ) -> Result<Vec<String>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
         let url = format!(
             "{}/repos/{}/{}/git/trees/{}?recursive=1",
             self.api_url,
@@ -1615,8 +1664,8 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         branch: &str,
     ) -> Result<Commit, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/commits/{}",
@@ -1678,8 +1727,9 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         config: WebhookConfig,
     ) -> Result<String, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        validate_github_repository_path(owner, repo)?;
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}/hooks", self.api_url, owner, repo);
 
@@ -1737,8 +1787,10 @@ impl GitProviderService for GitHubProvider {
         repo: &str,
         webhook_id: &str,
     ) -> Result<(), GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        validate_github_repository_path(owner, repo)?;
+        validate_github_webhook_id(owner, repo, webhook_id)?;
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/hooks/{}",
@@ -1761,6 +1813,67 @@ impl GitProviderService for GitHubProvider {
         Ok(())
     }
 
+    async fn update_webhook(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        webhook_id: &str,
+        config: WebhookConfig,
+    ) -> Result<bool, GitProviderError> {
+        validate_github_repository_path(owner, repo)?;
+        validate_github_webhook_id(owner, repo, webhook_id)?;
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
+
+        let url = format!(
+            "{}/repos/{}/{}/hooks/{}",
+            self.api_url, owner, repo, webhook_id
+        );
+
+        #[derive(Serialize)]
+        struct UpdateHookRequest {
+            config: HookConfig,
+            events: Vec<String>,
+            active: bool,
+        }
+
+        #[derive(Serialize)]
+        struct HookConfig {
+            url: String,
+            content_type: String,
+            secret: Option<String>,
+        }
+
+        let request = UpdateHookRequest {
+            config: HookConfig {
+                url: config.url,
+                content_type: "json".to_string(),
+                secret: config.secret,
+            },
+            events: config.events,
+            active: true,
+        };
+
+        let response = self
+            .send_with_retry(|| client.patch(&url).headers(headers.clone()).json(&request))
+            .await?;
+
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(github_response_error(
+                response,
+                format!("update webhook {webhook_id} on {owner}/{repo}"),
+                "Webhooks: write (or classic PAT repo scope) and access to the target repository",
+            )
+            .await);
+        }
+
+        Ok(true)
+    }
+
     async fn verify_webhook_signature(
         &self,
         payload: &[u8],
@@ -1772,8 +1885,8 @@ impl GitProviderService for GitHubProvider {
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/user", self.api_url);
 
@@ -1818,7 +1931,7 @@ impl GitProviderService for GitHubProvider {
         owner: &str,
         repo: &str,
     ) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
+        let client = self.get_client()?;
 
         let url = format!("{}/repos/{}/{}", self.api_url, owner, repo);
 
@@ -1876,8 +1989,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Commit, GitProviderError> {
         // For now, fall back to the reqwest implementation for getting commits
         // as Octocrab doesn't expose a direct get_commit method
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub API endpoint for getting a commit
         let url = format!(
@@ -1953,8 +2066,8 @@ impl GitProviderService for GitHubProvider {
         commit_sha: &str,
     ) -> Result<bool, GitProviderError> {
         // Fall back to the reqwest implementation as Octocrab doesn't have a direct get_commit method
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub API endpoint for getting a commit
         let url = format!(
@@ -1989,8 +2102,8 @@ impl GitProviderService for GitHubProvider {
         branch: &str,
         per_page: u32,
     ) -> Result<Vec<Commit>, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!(
             "{}/repos/{}/{}/commits?sha={}&per_page={}",
@@ -2078,8 +2191,8 @@ impl GitProviderService for GitHubProvider {
 
         // Use the archive client (no total timeout — large tarballs stream for
         // longer than the 30s API timeout, which would otherwise abort mid-body).
-        let client = self.get_archive_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_archive_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // GitHub's tarball endpoint always answers with a 302 redirect to a
         // short-lived signed URL on `codeload.github.com` (or the Enterprise
@@ -2195,7 +2308,7 @@ impl GitProviderService for GitHubProvider {
                 if written >= next_progress_at {
                     // Ignore send errors: a dropped receiver just means nobody is
                     // listening for progress, which must not fail the download.
-                    let _ = tx.send(crate::services::git_provider::ArchiveProgress {
+                    let _ = tx.try_send(crate::services::git_provider::ArchiveProgress {
                         downloaded_bytes: written,
                         total_bytes,
                     });
@@ -2237,8 +2350,8 @@ impl GitProviderService for GitHubProvider {
         description: Option<&str>,
         private: bool,
     ) -> Result<Repository, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         // If owner is specified, create in organization; otherwise create in user account
         let url = if let Some(org) = owner {
@@ -2369,8 +2482,8 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Commit, GitProviderError> {
         use base64::{engine::general_purpose::STANDARD, Engine};
 
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         info!(
             "Pushing {} files to {}/{} on branch {}",
@@ -2713,8 +2826,8 @@ impl GitProviderService for GitHubProvider {
         head_branch: &str,
         base_branch: &str,
     ) -> Result<PullRequest, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
+        let client = self.get_client()?;
+        let headers = self.get_headers(access_token)?;
 
         let url = format!("{}/repos/{}/{}/pulls", self.api_url, owner, repo);
 
@@ -3347,6 +3460,126 @@ mod tag_pagination_tests {
         first_page.assert_async().await;
         failing_page.assert_async().await;
     }
+
+    fn push_webhook_config(secret: &str) -> WebhookConfig {
+        WebhookConfig {
+            url: "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7"
+                .to_string(),
+            secret: Some(secret.to_string()),
+            events: vec!["push".to_string()],
+        }
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_replaces_its_config_in_place() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let patch = server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .match_body(mockito::Matcher::PartialJson(serde_json::json!({
+                "config": {
+                    "url": "https://temps.example.com/api/webhook/git/github/repo-events?project_id=7",
+                    "content_type": "json",
+                    "secret": "new-secret"
+                },
+                "events": ["push"],
+                "active": true
+            })))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"id":42}"#)
+            .create_async()
+            .await;
+
+        let updated = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect("a 200 must update the webhook");
+
+        assert!(updated);
+        patch.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn updating_a_deleted_webhook_reports_it_missing() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let patch = server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Not Found"}"#)
+            .create_async()
+            .await;
+
+        let updated = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect("a 404 means the hook is gone, not a failure");
+
+        assert!(!updated);
+        patch.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_surfaces_other_github_failures() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("PATCH", "/repos/temps/example/hooks/42")
+            .with_status(403)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Must have admin rights to Repository."}"#)
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect_err("a 403 must fail");
+
+        assert!(
+            matches!(error, GitProviderError::PermissionDenied { .. }),
+            "unexpected error: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_a_webhook_rejects_a_non_numeric_id_before_calling_github() {
+        let error = provider("http://127.0.0.1:9".to_string())
+            .update_webhook(
+                "test-token",
+                "temps",
+                "example",
+                "42/../../keys",
+                push_webhook_config("new-secret"),
+            )
+            .await
+            .expect_err("a non-numeric hook ID must be rejected");
+
+        assert!(
+            matches!(error, GitProviderError::InvalidConfiguration(_)),
+            "unexpected error: {error:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -3435,13 +3668,52 @@ mod list_directory_tests {
     }
 }
 
+/// Reject an owner/repository pair that is not a plain GitHub account and
+/// repository name before it is interpolated into a credentialed API path.
+///
+/// A project's `repo_owner`/`repo_name` are user input. URL parsing resolves
+/// `..` segments (also percent-encoded), so a name like `x/../../../user/repos?`
+/// would turn `POST /repos/{owner}/{repo}/hooks` into a request against
+/// another endpoint, made with the connection's token.
+fn validate_github_repository_path(owner: &str, repo: &str) -> Result<(), GitProviderError> {
+    use super::git_provider_manager::{is_safe_name_segment, MAX_REPOSITORY_NAME_LEN};
+
+    let valid = |name: &str| name.len() <= MAX_REPOSITORY_NAME_LEN && is_safe_name_segment(name);
+    if valid(owner) && valid(repo) {
+        Ok(())
+    } else {
+        Err(GitProviderError::InvalidConfiguration(format!(
+            "GitHub repository '{owner}/{repo}' must be an owner and a name of letters, digits, '-', '_' or '.'"
+        )))
+    }
+}
+
+/// Reject a webhook ID that is not a GitHub hook ID (a positive integer)
+/// before it is interpolated into a credentialed API path.
+fn validate_github_webhook_id(
+    owner: &str,
+    repo: &str,
+    webhook_id: &str,
+) -> Result<(), GitProviderError> {
+    if webhook_id.is_empty() || !webhook_id.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(GitProviderError::InvalidConfiguration(format!(
+            "GitHub webhook ID '{webhook_id}' for {owner}/{repo} must be numeric"
+        )));
+    }
+    Ok(())
+}
+
 /// Verify a GitHub `X-Hub-Signature-256` HMAC-SHA256 webhook signature.
 ///
 /// The comparison is **constant-time** (`subtle::ConstantTimeEq`) to avoid a
 /// timing side-channel that could leak the expected signature byte-by-byte
 /// (security review finding #14). Factored out as a free function so the
 /// verification logic can be unit-tested with a known vector.
-fn github_webhook_signature_matches(
+///
+/// An empty secret never matches. HMAC accepts an empty key, so a signature
+/// computed under one is valid HMAC, but it proves nothing: anyone can
+/// compute it. A secret that is not set therefore verifies nothing.
+pub(crate) fn github_webhook_signature_matches(
     payload: &[u8],
     signature: &str,
     secret: &str,
@@ -3450,6 +3722,10 @@ fn github_webhook_signature_matches(
     use sha2::Sha256;
     use subtle::ConstantTimeEq;
 
+    if secret.is_empty() {
+        return Ok(false);
+    }
+
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
         .map_err(|e| format!("Invalid secret key: {}", e))?;
     mac.update(payload);
@@ -3457,9 +3733,50 @@ fn github_webhook_signature_matches(
     Ok(signature.as_bytes().ct_eq(expected.as_bytes()).into())
 }
 
+/// Generate a fresh 32-byte (64 hex chars) secret for a GitHub repository
+/// webhook. Temps registers one per project on non-App GitHub connections and
+/// verifies `X-Hub-Signature-256` against it.
+pub fn generate_github_webhook_secret() -> Result<String, rand::rngs::SysError> {
+    let mut bytes = [0u8; 32];
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(hex::encode(bytes))
+}
+
 #[cfg(test)]
 mod signature_tests {
-    use super::github_webhook_signature_matches;
+    use super::{
+        generate_github_webhook_secret, github_webhook_signature_matches,
+        validate_github_repository_path,
+    };
+
+    #[test]
+    fn webhook_paths_reject_names_that_escape_the_repository() {
+        assert!(validate_github_repository_path("example-owner", "example.repo_1").is_ok());
+        for (owner, repo) in [
+            ("example-owner", "../../orgs/other-org"),
+            ("example-owner", "x/../../../user/repos?"),
+            ("example-owner", "%2e%2e"),
+            ("example-owner", ".."),
+            ("..", "example-repository"),
+            ("example-owner/sub", "example-repository"),
+            ("example-owner", "repo#fragment"),
+            ("example-owner", ""),
+        ] {
+            assert!(
+                validate_github_repository_path(owner, repo).is_err(),
+                "{owner}/{repo} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_webhook_secrets_are_unique_64_char_hex() {
+        let first = generate_github_webhook_secret().unwrap();
+        let second = generate_github_webhook_secret().unwrap();
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+    }
 
     // Known HMAC-SHA256 vector (GitHub's documented example):
     // secret "It's a Secret to Everybody", payload "Hello, World!".
@@ -3484,6 +3801,20 @@ mod signature_tests {
     fn wrong_length_signature_is_rejected() {
         // ct_eq handles unequal lengths without panicking and returns false.
         assert!(!github_webhook_signature_matches(PAYLOAD, "sha256=deadbeef", SECRET).unwrap());
+    }
+
+    #[test]
+    fn empty_secret_never_matches_even_a_signature_made_with_an_empty_key() {
+        use hmac::{Hmac, KeyInit, Mac};
+        use sha2::Sha256;
+
+        let mut mac = Hmac::<Sha256>::new_from_slice(b"").unwrap();
+        mac.update(PAYLOAD);
+        let signed_with_empty_key = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+
+        assert!(!github_webhook_signature_matches(PAYLOAD, &signed_with_empty_key, "").unwrap());
+        // A real secret is unaffected by the guard.
+        assert!(github_webhook_signature_matches(PAYLOAD, VALID, SECRET).unwrap());
     }
 }
 

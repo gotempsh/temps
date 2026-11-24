@@ -5,18 +5,20 @@
 name = "temps-ai-gateway"
 version.workspace = true
 edition.workspace = true
+description = "AI gateway: OpenAI-compatible and native endpoints proxied to configured providers, with provider keys, models, pricing, usage and limits"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
 homepage.workspace = true
 
 [dependencies]
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-core = { path = "../temps-core" }
 temps-config = { path = "../temps-config" }
 temps-ai = { path = "../temps-ai" }
 temps-ai-agent-cli = { path = "../temps-ai-agent-cli" }
-temps-agents = { path = "../temps-agents" }
+temps-sandbox-providers = { path = "../temps-sandbox-providers" }
+temps-ai-cli = { path = "../temps-ai-cli" }
 temps-entities = { path = "../temps-entities" }
 temps-cloud-client = { path = "../temps-cloud-client" }
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
@@ -25,12 +27,11 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 jsonschema = { workspace = true }
 tokio = { workspace = true }
-tokio-stream = "0.1.17"
+tokio-stream = { workspace = true }
 axum = { workspace = true }
 sea-orm = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-anyhow = { workspace = true }
 chrono = { workspace = true }
 reqwest = { workspace = true }
 url = { workspace = true }
@@ -40,20 +41,24 @@ futures-util = { workspace = true }
 async-stream = { workspace = true }
 bytes = { workspace = true }
 uuid = { workspace = true }
-moka = { version = "0.12", features = ["future"] }
+moka = { workspace = true }
+arc-swap = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tempfile = { workspace = true }
 
 [dev-dependencies]
-temps-database = { path = "../temps-database" }
+temps-test-utils = { path = "../temps-test-utils" }
 sea-orm = { workspace = true, features = ["mock"] }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 axum = { workspace = true }
-tower = { workspace = true }
 http-body-util = { workspace = true }
+tower = { workspace = true }
 http = { workspace = true }
-hyper = { workspace = true }
-wiremock = "0.6"
+wiremock = { workspace = true }
 tempfile.workspace = true
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

@@ -354,11 +354,25 @@ impl GatewayService {
         &self,
         key_id: i32,
     ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        Ok(self
+            .discover_model_catalog_for_key(key_id)
+            .await?
+            .into_iter()
+            .map(|model| model.info)
+            .collect())
+    }
+
+    /// Like [`Self::discover_models_for_key`], keeping what the catalogue says
+    /// about each model (modalities, prices, context window, tool support).
+    pub async fn discover_model_catalog_for_key(
+        &self,
+        key_id: i32,
+    ) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
         let key = self.provider_key_service.get_by_id(key_id).await?;
         let api_key = self
             .provider_key_service
             .decrypt_api_key(&key.api_key_encrypted)?;
-        self.discover_models(
+        self.discover_model_catalog(
             &key.provider,
             &api_key,
             key.base_url.as_deref(),
@@ -380,6 +394,23 @@ impl GatewayService {
         base_url: Option<&str>,
         key_trust: Option<KeyTrust>,
     ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+        Ok(self
+            .discover_model_catalog(provider_id, api_key, base_url, key_trust)
+            .await?
+            .into_iter()
+            .map(|model| model.info)
+            .collect())
+    }
+
+    /// Like [`Self::discover_models`], keeping what the catalogue says about
+    /// each model (modalities, prices, context window, tool support).
+    pub async fn discover_model_catalog(
+        &self,
+        provider_id: &str,
+        api_key: &str,
+        base_url: Option<&str>,
+        key_trust: Option<KeyTrust>,
+    ) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
         let provider = self.providers.get(provider_id).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
@@ -388,8 +419,9 @@ impl GatewayService {
         let self_hosted = is_self_hosted(provider_id);
         if self_hosted && base_url.is_none() {
             return Err(AiGatewayError::Validation {
-                message: "A base URL is required to discover models on a self-hosted provider"
-                    .to_string(),
+                message:
+                    "A base URL is required to discover models on an OpenAI-compatible provider"
+                        .to_string(),
             });
         }
         if let Some(base_url) = base_url {
@@ -463,7 +495,7 @@ impl GatewayService {
                 reason: format!("Failed to parse provider model catalog: {error}"),
             }
         })?;
-        parse_model_catalog(provider_id, &body, |id| {
+        parse_model_catalog_details(provider_id, &body, |id| {
             self_hosted || provider.supports_model(id)
         })
     }
@@ -480,18 +512,19 @@ impl GatewayService {
         key_trust: Option<KeyTrust>,
     ) -> Result<SelfHostedListing, AiGatewayError> {
         let models = self
-            .discover_models(OPENAI_COMPATIBLE, api_key, base_url, key_trust)
+            .discover_model_catalog(OPENAI_COMPATIBLE, api_key, base_url, key_trust)
             .await
             .map_err(|error| match error {
                 AiGatewayError::InvalidProviderUrl { .. } => error,
                 other => AiGatewayError::Validation {
                     message: format!(
-                        "Could not list models at the self-hosted server's /models endpoint: {}",
+                        "Could not list models at the OpenAI-compatible server's /models endpoint: {}",
                         other.summary()
                     ),
                 },
             })?;
-        let default_model = choose_self_hosted_default(&models, default_model)?;
+        let ids: Vec<ModelInfo> = models.iter().map(|model| model.info.clone()).collect();
+        let default_model = choose_self_hosted_default(&ids, default_model)?;
         Ok(SelfHostedListing {
             models,
             default_model,
@@ -615,7 +648,7 @@ impl GatewayService {
                     return Err(AiGatewayError::Validation {
                         message: format!(
                             "AI provider key {key_id} cannot serve model '{model}': it is hosted \
-                             by self-hosted provider key {}",
+                             by OpenAI-compatible provider key {}",
                             host.id
                         ),
                     });
@@ -700,7 +733,7 @@ impl GatewayService {
         if is_self_hosted(provider_id) && key_record.base_url.is_none() {
             return Err(AiGatewayError::InvalidProviderUrl {
                 reason: format!(
-                    "self-hosted provider key {} has no base URL configured",
+                    "OpenAI-compatible provider key {} has no base URL configured",
                     key_record.id
                 ),
             });
@@ -909,9 +942,16 @@ impl GatewayService {
     /// blocked destination is reported as `InvalidProviderUrl` with the
     /// trusted-networks hint before anything is sent (#1410).
     ///
-    /// Uses the configured model when supplied, otherwise the vendor's test
-    /// default. Self-hosted providers have no such default: the model must be
-    /// one the administrator picked from the server's own listing.
+    /// Uses the configured model when supplied. Otherwise it tries the
+    /// vendor's low-cost models in order (`low_cost_models`), moving on only
+    /// when the provider refuses the model itself (400, 403, 404), so a key
+    /// restricted to an older cheap model still verifies; an invalid key, a
+    /// rate limit or a network failure stops at once. Self-hosted providers
+    /// have no such default: the model must be one the administrator picked
+    /// from the server's own listing.
+    ///
+    /// Returns the model that answered, so a caller can keep a key that only
+    /// verified on a fallback model from defaulting to one it was refused.
     pub async fn test_provider(
         &self,
         provider_id: &str,
@@ -919,7 +959,7 @@ impl GatewayService {
         base_url: Option<&str>,
         configured_model: Option<&str>,
         key_trust: Option<KeyTrust>,
-    ) -> Result<(), AiGatewayError> {
+    ) -> Result<String, AiGatewayError> {
         let provider = self.providers.get(provider_id).ok_or_else(|| {
             AiGatewayError::ProviderNotConfigured {
                 provider: provider_id.to_string(),
@@ -929,19 +969,18 @@ impl GatewayService {
             validate_provider_url(base_url, key_trust).await?;
         }
 
-        let fallback_model = match provider_id {
-            "openai" => Some("gpt-5-nano"),
-            "anthropic" => Some("claude-haiku-4-5"),
-            "xai" => Some("grok-4.5"),
-            "gemini" => Some("gemini-3.5-flash-lite"),
-            "openrouter" => Some("openai/gpt-4o-mini"),
+        let fallback_models: &[&str] = match provider_id {
+            "openai" | "anthropic" | "xai" | "gemini" | "openrouter" => {
+                crate::providers::low_cost_models(provider_id)
+            }
             OPENAI_COMPATIBLE => {
                 if base_url.is_none() {
                     return Err(AiGatewayError::Validation {
-                        message: "A base URL is required for a self-hosted provider".to_string(),
+                        message: "A base URL is required for an OpenAI-compatible provider"
+                            .to_string(),
                     });
                 }
-                None
+                &[]
             }
             _ => {
                 return Err(AiGatewayError::ProviderNotConfigured {
@@ -949,51 +988,44 @@ impl GatewayService {
                 })
             }
         };
-        let model = match (
-            configured_model.map(str::trim).filter(|m| !m.is_empty()),
-            fallback_model,
-        ) {
-            (Some(model), _) => model,
-            (None, Some(fallback)) => fallback,
-            (None, None) => {
+        let configured = configured_model.map(str::trim).filter(|m| !m.is_empty());
+        let candidates: Vec<&str> = match configured {
+            Some(model) => vec![model],
+            None if !fallback_models.is_empty() => fallback_models.to_vec(),
+            None => {
                 return Err(AiGatewayError::Validation {
-                    message: "Choose a default model from the models the self-hosted server \
+                    message: "Choose a default model from the models the server \
                               lists before verifying it"
                         .to_string(),
                 })
             }
         };
 
-        let request = ChatCompletionRequest {
-            model: model.to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: Some(MessageContent::Text("Say ok".to_string())),
-                name: None,
-                tool_calls: None,
-                tool_call_id: None,
-            }],
-            stream: false,
-            temperature: None,
-            max_tokens: Some(20),
-            top_p: None,
-            stop: None,
-            n: None,
-            tools: None,
-            tool_choice: None,
-            response_format: None,
-            frequency_penalty: None,
-            presence_penalty: None,
-            seed: None,
-            user: None,
-            extra: None,
-        };
-
-        provider
-            .chat_completion(api_key, base_url, &request)
-            .await?;
-
-        Ok(())
+        let mut first_refusal = None;
+        for (index, model) in candidates.iter().enumerate() {
+            match provider
+                .chat_completion(api_key, base_url, &verification_request(model))
+                .await
+            {
+                Ok(_) => return Ok(model.to_string()),
+                Err(error) if model_refused(&error, model) => {
+                    // Status only: an upstream body can echo the credential.
+                    debug!(
+                        provider = provider_id,
+                        model,
+                        status = upstream_status(&error),
+                        remaining = candidates.len() - index - 1,
+                        "Key verification: the provider refused this model"
+                    );
+                    first_refusal.get_or_insert(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        // Every candidate was refused: report the first, the current default.
+        Err(first_refusal.unwrap_or_else(|| AiGatewayError::Validation {
+            message: format!("No model to verify the {provider_id} key with"),
+        }))
     }
 
     /// List all available models from all configured (active) providers
@@ -1022,7 +1054,9 @@ impl GatewayService {
 /// A self-hosted server's model listing and the default model chosen from it.
 #[derive(Debug, Clone)]
 pub struct SelfHostedListing {
-    pub models: Vec<ModelInfo>,
+    /// The listing with what the server said about each model (its name,
+    /// context window, modalities), so the new key's catalog keeps it.
+    pub models: Vec<DiscoveredModel>,
     pub default_model: String,
 }
 
@@ -1034,9 +1068,10 @@ pub(crate) fn choose_self_hosted_default(
 ) -> Result<String, AiGatewayError> {
     if models.is_empty() {
         return Err(AiGatewayError::Validation {
-            message: "The self-hosted server lists no models at /models; load a model on it and \
+            message:
+                "The OpenAI-compatible server lists no models at /models; load a model on it and \
                       try again"
-                .to_string(),
+                    .to_string(),
         });
     }
     let default_model = default_model
@@ -1044,7 +1079,7 @@ pub(crate) fn choose_self_hosted_default(
         .filter(|model| !model.is_empty())
         .ok_or_else(|| AiGatewayError::Validation {
             message: format!(
-                "Choose a default model from the {} models the self-hosted server lists; it is \
+                "Choose a default model from the {} models the server lists; it is \
                  used to verify the connection",
                 models.len()
             ),
@@ -1052,7 +1087,7 @@ pub(crate) fn choose_self_hosted_default(
     if !models.iter().any(|model| model.id == default_model) {
         return Err(AiGatewayError::Validation {
             message: format!(
-                "Model '{default_model}' is not among the {} models the self-hosted server lists",
+                "Model '{default_model}' is not among the {} models the server lists",
                 models.len()
             ),
         });
@@ -1075,15 +1110,31 @@ fn require_tools_capability(
     Ok(())
 }
 
-/// Turn a provider's model listing into catalog entries. `keep` decides which
-/// IDs are kept (vendor adapters filter by name; self-hosted keeps all).
-/// IDs that cannot be stored or routed (empty, over 255 bytes, control
-/// characters) are skipped, and the result is capped at 5,000 models.
+/// [`parse_model_catalog_details`] without the details, for tests that only
+/// look at which IDs were kept.
+#[cfg(test)]
 pub(crate) fn parse_model_catalog(
     provider_id: &str,
     body: &serde_json::Value,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<ModelInfo>, AiGatewayError> {
+    Ok(parse_model_catalog_details(provider_id, body, keep)?
+        .into_iter()
+        .map(|model| model.info)
+        .collect())
+}
+
+/// Turn a provider's model listing into catalog entries, keeping what each
+/// entry says about the model (modalities, prices, context window, tool
+/// support). `keep` decides which IDs are kept (vendor adapters filter by
+/// name; self-hosted keeps all). IDs that cannot be stored or routed (empty,
+/// over 255 bytes, control characters) are skipped, and the result is capped
+/// at 5,000 models.
+pub(crate) fn parse_model_catalog_details(
+    provider_id: &str,
+    body: &serde_json::Value,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<DiscoveredModel>, AiGatewayError> {
     let entries = if provider_id == "gemini" {
         body.get("models")
     } else {
@@ -1095,7 +1146,7 @@ pub(crate) fn parse_model_catalog(
         reason: "Provider model catalog did not contain a model array".to_string(),
     })?;
 
-    let mut models: Vec<ModelInfo> = entries
+    let mut models: Vec<DiscoveredModel> = entries
         .iter()
         .filter(|entry| {
             provider_id != "gemini"
@@ -1127,21 +1178,113 @@ pub(crate) fn parse_model_catalog(
                 .filter(|owner| owner.len() <= 255 && !owner.chars().any(char::is_control))
                 .unwrap_or(provider_id)
                 .to_string();
-            Some(ModelInfo {
-                id: id.to_string(),
-                object: "model".to_string(),
-                owned_by,
+            Some(DiscoveredModel {
+                details: if provider_id == "gemini" {
+                    ModelDetails::from_gemini_catalog_entry(entry)
+                } else {
+                    ModelDetails::from_catalog_entry(entry)
+                },
+                info: ModelInfo {
+                    id: id.to_string(),
+                    object: "model".to_string(),
+                    owned_by,
+                },
             })
         })
         .take(5_000)
         .collect();
-    models.sort_by(|left, right| left.id.cmp(&right.id));
-    models.dedup_by(|left, right| left.id == right.id);
+    models.sort_by(|left, right| left.info.id.cmp(&right.info.id));
+    models.dedup_by(|left, right| left.info.id == right.info.id);
     Ok(models)
+}
+
+/// The one-line chat request that verifies a key against `model`.
+fn verification_request(model: &str) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage {
+            role: "user".to_string(),
+            content: Some(MessageContent::Text("Say ok".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }],
+        stream: false,
+        temperature: None,
+        max_tokens: Some(20),
+        top_p: None,
+        stop: None,
+        n: None,
+        tools: None,
+        tool_choice: None,
+        response_format: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        user: None,
+        extra: None,
+    }
+}
+
+/// Whether the provider refused `model` rather than the key, so another
+/// model may still verify it: an unknown model (404), or a 400/403 whose
+/// message names the model (OpenAI's "project does not have access to model
+/// ..."). A 403 that does not name it (an IP policy, a disabled account)
+/// would refuse every model, so it is not retried.
+fn model_refused(error: &AiGatewayError, model: &str) -> bool {
+    match error {
+        AiGatewayError::UpstreamError { status: 404, .. } => true,
+        AiGatewayError::UpstreamError {
+            status: 400 | 403,
+            message,
+            ..
+        } => {
+            let message = message.to_ascii_lowercase();
+            message.contains(&model.to_ascii_lowercase()) || message.contains("model_not_found")
+        }
+        _ => false,
+    }
+}
+
+/// The upstream HTTP status of `error`, for logs that must not carry its body.
+fn upstream_status(error: &AiGatewayError) -> Option<u16> {
+    match error {
+        AiGatewayError::UpstreamError { status, .. } => Some(*status),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_refusal_of_the_model_itself_moves_on_to_the_next_one() {
+        let upstream = |status: u16, message: &str| AiGatewayError::UpstreamError {
+            model: "gpt-6-luna".into(),
+            status,
+            message: message.into(),
+        };
+        assert!(model_refused(&upstream(404, "not found"), "gpt-6-luna"));
+        assert!(model_refused(
+            &upstream(403, "Project does not have access to model gpt-6-luna"),
+            "gpt-6-luna"
+        ));
+        assert!(model_refused(
+            &upstream(400, r#"{"error":{"code":"model_not_found"}}"#),
+            "gpt-6-luna"
+        ));
+        // A key-wide denial would refuse every model: stop at once.
+        assert!(!model_refused(
+            &upstream(403, "Access denied for this source address"),
+            "gpt-6-luna"
+        ));
+        assert!(!model_refused(
+            &upstream(401, "Invalid API key"),
+            "gpt-6-luna"
+        ));
+        assert!(!model_refused(&upstream(429, "rate limited"), "gpt-6-luna"));
+        assert_eq!(upstream_status(&upstream(403, "x")), Some(403));
+    }
+
     use super::*;
     use axum::{http::StatusCode, routing::post, Json, Router};
     use futures_util::StreamExt;
@@ -1821,6 +1964,25 @@ mod tests {
         let body = serde_json::json!({"models": [{"name": "models/gemini-3.1-pro"}]});
         let models = parse_model_catalog("gemini", &body, |_| true).unwrap();
         assert_eq!(models[0].id, "gemini-3.1-pro");
+    }
+
+    #[test]
+    fn gemini_discovery_never_names_a_model_by_its_resource_path() {
+        let body = serde_json::json!({"models": [
+            {"name": "models/gemini-3.1-pro", "displayName": "Gemini 3.1 Pro"},
+            {"name": "models/gemini-3.1-flash"}
+        ]});
+        let models = parse_model_catalog_details("gemini", &body, |_| true).unwrap();
+        let names: Vec<_> = models
+            .iter()
+            .map(|model| {
+                model
+                    .details
+                    .as_ref()
+                    .and_then(|details| details.name.as_deref())
+            })
+            .collect();
+        assert_eq!(names, vec![None, Some("Gemini 3.1 Pro")]);
     }
 
     #[test]

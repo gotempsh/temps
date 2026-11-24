@@ -1,0 +1,54 @@
+[
+  {
+    "body": {
+      "Cmd": [
+        "sleep",
+        "infinity"
+      ],
+      "Env": [
+        "TASK=golden"
+      ],
+      "HostConfig": {
+        "Binds": [
+          "/tmp/temps-golden-sandbox:/home/temps/workspace",
+          "temps-sandbox-home-v2-901:/home/temps"
+        ],
+        "CapAdd": [
+          "CHOWN",
+          "FOWNER",
+          "DAC_OVERRIDE",
+          "SETUID",
+          "SETGID"
+        ],
+        "CapDrop": [
+          "ALL"
+        ],
+        "Init": true,
+        "Memory": 1073741824,
+        "MemorySwap": 1073741824,
+        "NanoCpus": 1000000000,
+        "NetworkMode": "none",
+        "PidsLimit": 512,
+        "RestartPolicy": {
+          "Name": "unless-stopped"
+        },
+        "SecurityOpt": [
+          "no-new-privileges:true"
+        ],
+        "Tmpfs": {
+          "/run/secrets": "size=1m,mode=0710,gid=1000",
+          "/run/temps-runtime": "size=8m,mode=0700,uid=1000,gid=1000",
+          "/run/temps-source-import": "size=256m,nr_inodes=5001,mode=0700,uid=1000,gid=1000"
+        }
+      },
+      "Image": "alpine:3.20",
+      "Labels": {
+        "sh.temps.sandbox": "true",
+        "sh.temps.sandbox.run_id": "901"
+      },
+      "WorkingDir": "/home/temps/workspace"
+    },
+    "name": "temps-sandbox-901",
+    "platform": null
+  }
+]

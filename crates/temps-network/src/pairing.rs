@@ -10,6 +10,11 @@
 //! key arrives the control plane peers with it (see [`crate::mesh::peers`]);
 //! the node then registers with the pairing's enrollment token, which links
 //! the pairing to the node, and the node takes over the key and address.
+//!
+//! A worker that joins outbound only (ADR 055) creates its own pairing over
+//! HTTPS with a join token ([`create_outbound`]): it has no endpoint, starts
+//! with the worker's key, and is never dialed; the control plane peers with
+//! it and WireGuard learns the worker's address from its first handshake.
 
 use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -19,7 +24,7 @@ use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
-use temps_entities::{node_pairings, nodes};
+use temps_entities::{node_enrollment_tokens, node_pairings, nodes};
 
 use crate::mesh::{check_endpoint_outside_pools, next_mesh_address, MeshError};
 
@@ -50,7 +55,23 @@ pub struct NewPairing {
     pub created_by_user_id: Option<i32>,
 }
 
-/// Mesh addresses held by nodes or pending pairings. Call inside the
+/// A pairing for a worker that joins outbound only (ADR 055): it sent its
+/// WireGuard key with a join token over HTTPS and dials the control plane,
+/// so the pairing has no endpoint and starts with the key.
+pub struct NewOutboundPairing {
+    pub pairing_id: String,
+    pub name: String,
+    pub public_key: String,
+    pub secret_encrypted: String,
+    pub enrollment_token_id: i32,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub created_by_user_id: Option<i32>,
+}
+
+/// Mesh addresses held by nodes or pending pairings, or named by a leaf the
+/// current cluster CA signed (ADR 055: a worker that joined outbound holds a
+/// leaf for its mesh address, which is never revoked, so that address is not
+/// given to another member while the CA lasts). Call inside the
 /// `network_config` row lock.
 pub(crate) async fn taken_addresses<C: sea_orm::ConnectionTrait>(
     db: &C,
@@ -70,6 +91,7 @@ pub(crate) async fn taken_addresses<C: sea_orm::ConnectionTrait>(
             .into_iter()
             .filter_map(|row| row.mesh_address.parse::<Ipv4Addr>().ok()),
     );
+    taken.extend(crate::mesh::certificate_addresses(db).await?);
     Ok(taken)
 }
 
@@ -116,6 +138,148 @@ pub async fn create(
     db: &DatabaseConnection,
     new: NewPairing,
 ) -> Result<node_pairings::Model, MeshError> {
+    insert_pending(
+        db,
+        PendingRow {
+            pairing_id: new.pairing_id,
+            name: new.name,
+            secret_encrypted: new.secret_encrypted,
+            enrollment_token_id: new.enrollment_token_id,
+            expires_at: new.expires_at,
+            created_by_user_id: new.created_by_user_id,
+        },
+        PendingStart::Dial(new.node_endpoint),
+    )
+    .await
+}
+
+/// Create the pairing of a worker that joins outbound only (ADR 055) and
+/// reserve its mesh address. It starts in `key_received` with the worker's
+/// key, which must not belong to the control plane, a node or another
+/// pending pairing ([`MeshError::PublicKeyInUse`]), the same checks
+/// [`record_key`] applies, in the same transaction as the insert.
+pub async fn create_outbound(
+    db: &DatabaseConnection,
+    new: NewOutboundPairing,
+) -> Result<node_pairings::Model, MeshError> {
+    insert_pending(
+        db,
+        PendingRow {
+            pairing_id: new.pairing_id,
+            name: new.name,
+            secret_encrypted: new.secret_encrypted,
+            enrollment_token_id: new.enrollment_token_id,
+            expires_at: new.expires_at,
+            created_by_user_id: new.created_by_user_id,
+        },
+        PendingStart::KeyReceived(new.public_key),
+    )
+    .await
+}
+
+/// Fresh credentials for resuming an outbound enrollment ([`resume_outbound`]).
+pub struct ResumedOutboundPairing {
+    pub name: String,
+    pub public_key: String,
+    pub secret_encrypted: String,
+    pub enrollment_token_id: i32,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    /// Who minted the join token presented now; must be who minted the one
+    /// that started the enrollment.
+    pub created_by_user_id: Option<i32>,
+}
+
+/// Resume the pending outbound enrollment (ADR 055) of the same machine:
+/// same WireGuard key and same name, still `key_received`, never linked to a
+/// node and not expired (ADR 056), presented with a join token minted by the
+/// same user as the one that started it. A public key is not a secret, so
+/// without that last rule anyone holding some other token could cancel a
+/// stranger's pending join by resuming it. Re-running `temps join` after a failed
+/// attempt then continues it instead of being refused for a key in use.
+///
+/// The pairing keeps its id and mesh address and takes the new single-use
+/// token, secret and expiry. The token it held before is revoked in the same
+/// transaction: once the pairing no longer names it, nothing would restrict
+/// it to the reserved mesh address, so it must never outlive the swap.
+/// Returns the resumed pairing; `None` when there is nothing to
+/// resume (the caller creates a pairing, which refuses a key used anywhere
+/// else). Safe because the pairing's token only works over the node API from
+/// the reserved mesh address, which needs this key's private half.
+pub async fn resume_outbound(
+    db: &DatabaseConnection,
+    resumed: ResumedOutboundPairing,
+) -> Result<Option<node_pairings::Model>, MeshError> {
+    if !temps_wireguard::mesh::is_valid_public_key(&resumed.public_key) {
+        return Err(MeshError::InvalidPublicKey);
+    }
+    let txn = db.begin().await?;
+    let cfg = crate::mesh::lock_config(&txn).await?;
+    crate::mesh::settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
+    let Some(pairing) = node_pairings::Entity::find()
+        .filter(node_pairings::Column::PublicKey.eq(resumed.public_key.as_str()))
+        .filter(node_pairings::Column::Status.eq(STATUS_KEY_RECEIVED))
+        .filter(node_pairings::Column::NodeEndpoint.is_null())
+        .filter(node_pairings::Column::NodeId.is_null())
+        .filter(node_pairings::Column::ExpiresAt.gt(chrono::Utc::now()))
+        .one(&txn)
+        .await?
+    else {
+        return Ok(None);
+    };
+    if pairing.name != resumed.name
+        || pairing.created_by_user_id != resumed.created_by_user_id
+        || key_in_use(&txn, &cfg, &resumed.public_key, Some(pairing.id)).await?
+    {
+        return Ok(None);
+    }
+    let previous_token = pairing.enrollment_token_id;
+    let mut active: node_pairings::ActiveModel = pairing.into();
+    active.enrollment_token_id = Set(resumed.enrollment_token_id);
+    active.secret_encrypted = Set(resumed.secret_encrypted);
+    active.expires_at = Set(resumed.expires_at);
+    active.last_error = Set(None);
+    active.updated_at = Set(chrono::Utc::now());
+    let updated = active.update(&txn).await?;
+    let now = chrono::Utc::now();
+    node_enrollment_tokens::Entity::update_many()
+        .col_expr(node_enrollment_tokens::Column::RevokedAt, Expr::value(now))
+        .col_expr(node_enrollment_tokens::Column::UpdatedAt, Expr::value(now))
+        .filter(node_enrollment_tokens::Column::Id.eq(previous_token))
+        .filter(node_enrollment_tokens::Column::RevokedAt.is_null())
+        .exec(&txn)
+        .await?;
+    txn.commit().await?;
+    Ok(Some(updated))
+}
+
+/// The columns every new pairing sets the same way.
+struct PendingRow {
+    pairing_id: String,
+    name: String,
+    secret_encrypted: String,
+    enrollment_token_id: i32,
+    expires_at: chrono::DateTime<chrono::Utc>,
+    created_by_user_id: Option<i32>,
+}
+
+/// How a pairing learns the node's key.
+enum PendingStart {
+    /// The control plane dials the node at this endpoint (ADR 048 D2b).
+    Dial(SocketAddr),
+    /// The node already sent this key (ADR 055).
+    KeyReceived(String),
+}
+
+async fn insert_pending(
+    db: &DatabaseConnection,
+    row: PendingRow,
+    start: PendingStart,
+) -> Result<node_pairings::Model, MeshError> {
+    if let PendingStart::KeyReceived(public_key) = &start {
+        if !temps_wireguard::mesh::is_valid_public_key(public_key) {
+            return Err(MeshError::InvalidPublicKey);
+        }
+    }
     let txn = db.begin().await?;
     let cfg = crate::mesh::lock_config(&txn).await?;
     let settings = crate::mesh::settings_from(&cfg)?.ok_or(MeshError::Disabled)?;
@@ -126,28 +290,44 @@ pub async fn create(
     if pending >= MAX_PENDING as u64 {
         return Err(MeshError::TooManyPairings { limit: MAX_PENDING });
     }
-    check_endpoint_outside_pools(
-        new.node_endpoint,
-        settings.cidr,
-        cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
-    )?;
+    let (node_endpoint, public_key, status, key_received_at) = match start {
+        PendingStart::Dial(endpoint) => {
+            check_endpoint_outside_pools(
+                endpoint,
+                settings.cidr,
+                cfg.compute_pool_cidr.parse::<Ipv4Net>().ok(),
+            )?;
+            (Some(endpoint.to_string()), None, STATUS_WAITING, None)
+        }
+        PendingStart::KeyReceived(public_key) => {
+            if key_in_use(&txn, &cfg, &public_key, None).await? {
+                return Err(MeshError::PublicKeyInUse);
+            }
+            (
+                None,
+                Some(public_key),
+                STATUS_KEY_RECEIVED,
+                Some(chrono::Utc::now()),
+            )
+        }
+    };
     let address = next_mesh_address(settings.cidr, &taken_addresses(&txn).await?)?;
     let now = chrono::Utc::now();
     let model = node_pairings::ActiveModel {
-        pairing_id: Set(new.pairing_id),
-        name: Set(new.name),
-        node_endpoint: Set(new.node_endpoint.to_string()),
+        pairing_id: Set(row.pairing_id),
+        name: Set(row.name),
+        node_endpoint: Set(node_endpoint),
         mesh_address: Set(address.to_string()),
-        secret_encrypted: Set(new.secret_encrypted),
-        enrollment_token_id: Set(new.enrollment_token_id),
-        public_key: Set(None),
-        status: Set(STATUS_WAITING.to_string()),
+        secret_encrypted: Set(row.secret_encrypted),
+        enrollment_token_id: Set(row.enrollment_token_id),
+        public_key: Set(public_key),
+        status: Set(status.to_string()),
         last_error: Set(None),
         last_attempt_at: Set(None),
-        key_received_at: Set(None),
-        expires_at: Set(new.expires_at),
+        key_received_at: Set(key_received_at),
+        expires_at: Set(row.expires_at),
         node_id: Set(None),
-        created_by_user_id: Set(new.created_by_user_id),
+        created_by_user_id: Set(row.created_by_user_id),
         created_at: Set(now),
         updated_at: Set(now),
         ..Default::default()
@@ -156,6 +336,35 @@ pub async fn create(
     .await?;
     txn.commit().await?;
     Ok(model)
+}
+
+/// Whether `public_key` belongs to the control plane, a node, or a pending
+/// pairing other than `except_pairing`. Call inside the `network_config` row
+/// lock (`cfg` is the locked row).
+async fn key_in_use<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    cfg: &temps_entities::network_config::Model,
+    public_key: &str,
+    except_pairing: Option<i32>,
+) -> Result<bool, MeshError> {
+    if cfg.control_plane_wg_public_key.as_deref() == Some(public_key) {
+        return Ok(true);
+    }
+    if nodes::Entity::find()
+        .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
+        .one(txn)
+        .await?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    let mut pending = node_pairings::Entity::find()
+        .filter(node_pairings::Column::PublicKey.eq(public_key))
+        .filter(node_pairings::Column::Status.is_in(PENDING));
+    if let Some(id) = except_pairing {
+        pending = pending.filter(node_pairings::Column::Id.ne(id));
+    }
+    Ok(pending.one(txn).await?.is_some())
 }
 
 /// The most recent pairings, newest first.
@@ -178,6 +387,9 @@ pub async fn get(
 pub async fn due(db: &DatabaseConnection) -> Result<Vec<node_pairings::Model>, MeshError> {
     Ok(node_pairings::Entity::find()
         .filter(node_pairings::Column::Status.eq(STATUS_WAITING))
+        // Outbound pairings (ADR 055) have no endpoint and are never
+        // waiting; the constraint guarantees it, this keeps it explicit.
+        .filter(node_pairings::Column::NodeEndpoint.is_not_null())
         .filter(node_pairings::Column::ExpiresAt.gt(chrono::Utc::now()))
         .order_by_asc(node_pairings::Column::Id)
         .all(db)
@@ -329,20 +541,7 @@ pub async fn record_key(
     }
     let txn = db.begin().await?;
     let cfg = crate::mesh::lock_config(&txn).await?;
-    let in_use = cfg.control_plane_wg_public_key.as_deref() == Some(public_key)
-        || nodes::Entity::find()
-            .filter(nodes::Column::MeshWgPublicKey.eq(public_key))
-            .one(&txn)
-            .await?
-            .is_some()
-        || node_pairings::Entity::find()
-            .filter(node_pairings::Column::PublicKey.eq(public_key))
-            .filter(node_pairings::Column::Status.is_in(PENDING))
-            .filter(node_pairings::Column::Id.ne(id))
-            .one(&txn)
-            .await?
-            .is_some();
-    if in_use {
+    if key_in_use(&txn, &cfg, public_key, Some(id)).await? {
         return Err(MeshError::PublicKeyInUse);
     }
     let now = chrono::Utc::now();
@@ -455,14 +654,16 @@ pub async fn link_node(
         pairing.public_key.as_deref(),
         pairing.status == STATUS_KEY_RECEIVED,
     ) {
-        let endpoint: SocketAddr =
-            pairing
-                .node_endpoint
-                .parse()
-                .map_err(|error: std::net::AddrParseError| MeshError::Corrupt {
-                    what: format!("pairing {} node_endpoint", pairing.id),
-                    reason: error.to_string(),
-                })?;
+        // No endpoint for a node that joined outbound only (ADR 055).
+        let endpoint = pairing
+            .node_endpoint
+            .as_deref()
+            .map(str::parse::<SocketAddr>)
+            .transpose()
+            .map_err(|error| MeshError::Corrupt {
+                what: format!("pairing {} node_endpoint", pairing.id),
+                reason: error.to_string(),
+            })?;
         crate::mesh::register_node_in(&txn, node_id, public_key, endpoint).await?;
     }
     txn.commit().await?;
@@ -548,7 +749,7 @@ mod tests {
             id: 3,
             pairing_id: "pairing-id".into(),
             name: "edge-1".into(),
-            node_endpoint: "203.0.113.10:51820".into(),
+            node_endpoint: Some("203.0.113.10:51820".into()),
             mesh_address: mesh_address.into(),
             secret_encrypted: "secret".into(),
             enrollment_token_id: 9,

@@ -141,6 +141,10 @@ impl AnomalyDetector {
             if recent.len() < self.config.sustained_minutes {
                 continue;
             }
+            // Empty only when `sustained_minutes` is 0; nothing to score then.
+            let Some(latest) = recent.last() else {
+                continue;
+            };
 
             // Find the matching baseline for current time
             let now = chrono::Utc::now();
@@ -171,7 +175,6 @@ impl AnomalyDetector {
                 .count();
 
             if sustained_count >= self.config.sustained_minutes {
-                let latest = recent.last().unwrap();
                 let z_score = (latest.avg_value - baseline.avg_value).abs() / baseline.stddev_value;
 
                 anomalies.push(DetectedAnomaly {
@@ -192,7 +195,6 @@ impl AnomalyDetector {
             if recent.len() >= 10 {
                 let (slope, r_squared) = linear_regression(&recent);
                 if r_squared > self.config.drift_r_squared_threshold && slope.abs() > 0.01 {
-                    let latest = recent.last().unwrap();
                     let z_score =
                         (latest.avg_value - baseline.avg_value).abs() / baseline.stddev_value;
 

@@ -65,7 +65,7 @@ export function ProjectServiceSwitcher({
             <ChevronsUpDown className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
           </button>
         </PopoverTrigger>
-        <PopoverContent className="w-[300px] p-0" align="start" sideOffset={6}>
+        <PopoverContent className="w-[340px] p-0" align="start" sideOffset={6}>
           <Command>
             {services.length >= FILTER_THRESHOLD && (
               <CommandInput placeholder={`Find a service in ${group.name}…`} />
@@ -87,9 +87,15 @@ export function ProjectServiceSwitcher({
                     >
                       <ServiceIcon service={service} size="xs" />
                       <span className="min-w-0 flex-1 truncate">{service.name}</span>
-                      <span className="flex shrink-0 items-center gap-1.5 text-xs text-muted-foreground">
-                        <ServicePresetIcon preset={service.preset} className="size-4 rounded" />
-                        {projectPresetLabel(service.preset)}
+                      {/* Icon only: the label took the width the name needs. */}
+                      <span
+                        title={projectPresetLabel(service.preset)}
+                        className="shrink-0"
+                      >
+                        <ServicePresetIcon
+                          preset={service.preset}
+                          className="size-4 rounded"
+                        />
                       </span>
                       <Check
                         className={isCurrent ? 'size-4' : 'size-4 invisible'}

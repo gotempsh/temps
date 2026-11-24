@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SettingsSurface } from '@temps-sdk/ds'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -10,17 +11,42 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { ClusterDnsCard } from '@/components/settings/ClusterDnsCard'
-import { CiBuilderPanel } from '@/components/nodes/CiBuilderPanel'
+import { ClusterDnsOffNotice } from '@/components/settings/ClusterDnsOffNotice'
+import { ClusterNetworkCard } from '@/components/settings/ClusterNetworkCard'
+import { useClusterNetwork } from '@/hooks/useClusterNetwork'
+import {
+  nodeOverlayStatus,
+  type ClusterNetworkNode,
+} from '@/lib/cluster-network'
+import { AddWorkerNode } from '@/components/nodes/AddWorkerNode'
 import { MeshHubCard } from '@/components/nodes/MeshHubCard'
+import { NetworkIdAction } from '@/components/nodes/NetworkIdAction'
+import { NodeAddressRanges } from '@/components/nodes/NodeAddressRanges'
+import { meshRangeToShow } from '@/lib/node-address-ranges'
+import { RotateClusterCaDialog } from '@/components/nodes/RotateClusterCaDialog'
+import { useClusterCaFingerprint } from '@/hooks/useClusterCaFingerprint'
 import { QueryErrorAlert } from '@/components/nodes/mesh-ui'
 import { Skeleton } from '@/components/ui/skeleton'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import { WorkerNodeRequiredAlert } from '@/components/nodes/WorkerNodeRequiredBanner'
 import { BuilderLimitsPanel } from '@/components/nodes/BuilderLimitsPanel'
+import { WorkerIngressBadge } from '@/components/nodes/WorkerIngressBadge'
 import { WorkerIngressCard } from '@/components/nodes/WorkerIngressCard'
+import { allTunnelsOptions } from '@/lib/tunnel-domains'
+import { RefreshButton } from '@/components/ui/refresh-button'
+import { queryKeyPrefix } from '@/lib/refresh'
+import { workerIngressWay } from '@/lib/worker-ingress'
+import { ingressSetupUrl } from '@/components/nodes/ingress-setup'
 import { NodeSandboxesPanel } from '@/components/nodes/NodeSandboxesPanel'
 import { NodeRoleBadge } from '@/components/nodes/NodeRoleBadge'
+import { NodeLabelsCard } from '@/components/nodes/NodeLabelsCard'
+import { NodeRowActions } from '@/components/nodes/NodeRowActions'
+import { useNodeRemoval } from '@/components/nodes/useNodeRemoval'
 import { NODE_ROLE_BADGE, nodeSchedulingRole } from '@/lib/node-role'
-import { NODE_HOSTS_SANDBOXES_TYPE } from '@/components/nodes/node-eviction'
 import { canManageSandboxPlacement } from '@/components/sandboxes/helpers'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useAuth } from '@/contexts/AuthContext-shared'
@@ -37,10 +63,14 @@ import {
 } from '@/hooks/useNodeCapability'
 import {
   canAddWorkerNode,
+  nodeIsUnreachable,
+  nodeRemoval,
+  nodeRemovalBlocker,
   shouldPromptForFirstWorkerNode,
-  unremovedNodeContainers,
-  type UnremovedNodeContainers,
   WORKER_NODES_URL,
+  macWorkerHost,
+  nodeStatusLabel,
+  nodesAdvancedSection,
 } from '@/lib/worker-nodes'
 import {
   Table,
@@ -52,9 +82,13 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { usePlatformFeatures } from '@/hooks/usePlatformFeatures'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
+  adminListNodesQueryKey,
+  clusterNetworkGetQueryKey,
+  wireguardMeshStatusGetQueryKey,
   adminDrainStatusOptions,
   adminGetNodeOptions,
   adminListNodeContainersOptions,
@@ -67,16 +101,14 @@ import {
 import type {
   NodeInfoResponse,
   NodeContainerResponse,
-  NodePlacementReference,
-  RemoveNodeResponse,
   WireguardMeshStatusResponse,
 } from '@/api/client/types.gen'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   AlertCircle,
   AlertTriangle,
-  ArrowLeft,
   Box,
+  ChevronDown,
   Cpu,
   Globe,
   HardDrive,
@@ -85,22 +117,27 @@ import {
   MemoryStick,
   Pause,
   Play,
+  Plus,
   RefreshCw,
   Server,
   Shield,
-  Tag,
   Terminal,
   Trash2,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { ReadFailure } from '@/components/ui/read-failure'
 import { isForbiddenRead, isVerifiedNotFound } from '@/lib/read-failure'
 import { refetchUnlessRefused } from '@/lib/query-retry'
-import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -113,7 +150,22 @@ import {
 } from '@/components/ui/alert-dialog'
 import { toast } from 'sonner'
 import { client } from '@/api/client/client.gen'
-import { describeUpdatedPlacements } from '@/lib/node-placements'
+import {
+  NodeNetworkPolicySettings,
+  NodeSchedulingResources,
+} from '@/components/nodes/NodeWorkloadSettings'
+import { NodeOverviewAlerts } from '@/components/nodes/NodeOverviewAlerts'
+import { NodeNetworkStatusCard } from '@/components/nodes/NodeNetworkStatusCard'
+import {
+  nodeSections,
+  nodeSectionUrl,
+  resolveNodeSection,
+  type NodeSection,
+} from '@/lib/node-detail'
+import { NodeStateStreamStatus } from '@/components/nodes/NodeStateStreamStatus'
+import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
+import { ServerMonitoring } from '@/components/monitoring/ServerMonitoring'
+import { scrollToElementId } from '@/lib/scroll-to-element'
 
 // ── Helpers ──
 
@@ -129,13 +181,44 @@ const nodeStatusVariant: Record<
   pending: 'warning-subtle',
 }
 
-function StatusBadge({ status }: { status: string }) {
+function StatusBadge({
+  status,
+  capacity,
+}: {
+  status: string
+  /** The node's last heartbeat capacity: says whether it is a Mac. */
+  capacity?: unknown
+}) {
+  const shown = nodeStatusLabel(status, macWorkerHost(capacity))
   return (
     <Badge
-      variant={nodeStatusVariant[status] ?? 'neutral-subtle'}
+      variant={
+        shown.hint
+          ? 'neutral-subtle'
+          : (nodeStatusVariant[status] ?? 'neutral-subtle')
+      }
       className="text-xs capitalize"
+      title={shown.hint ?? undefined}
     >
-      {status}
+      {shown.label}
+    </Badge>
+  )
+}
+
+/**
+ * Marks a Mac worker (ADR 090): fine for development and personal use, and
+ * offline whenever the Mac sleeps.
+ */
+function MacWorkerBadge({ capacity }: { capacity: unknown }) {
+  const mac = macWorkerHost(capacity)
+  if (!mac) return null
+  return (
+    <Badge
+      variant="outline"
+      className="text-[10px]"
+      title={`Containers run in ${mac.dockerApp ?? 'a Docker app'} on a Mac. Suited to development and personal use: it goes offline while the Mac sleeps.`}
+    >
+      Mac · development
     </Badge>
   )
 }
@@ -449,7 +532,7 @@ function JoinTokenSection() {
             ) : (
               <Trash2 className="h-4 w-4 mr-1" />
             )}
-            Revoke Token
+            Revoke token
           </Button>
         </div>
         {confirmTokenDialog}
@@ -484,7 +567,7 @@ function JoinTokenSection() {
             ) : (
               <RefreshCw className="h-4 w-4 mr-1" />
             )}
-            Regenerate Token
+            Regenerate token
           </Button>
           <Button
             variant="destructive"
@@ -497,7 +580,7 @@ function JoinTokenSection() {
             ) : (
               <Trash2 className="h-4 w-4 mr-1" />
             )}
-            Revoke Token
+            Revoke token
           </Button>
         </div>
         {confirmTokenDialog}
@@ -524,7 +607,7 @@ function JoinTokenSection() {
         ) : (
           <Key className="h-4 w-4 mr-1" />
         )}
-        Generate Join Token
+        Generate join token
       </Button>
 
       <WorkerJoinGuide
@@ -551,14 +634,37 @@ function NodeRoleDescription({ labels }: { labels: unknown }) {
 
 // ── Node Table ──
 
+/** A node's cross-node overlay (ADR 056); the cause is in the title. */
+function OverlayBadge({ node }: { node: ClusterNetworkNode | undefined }) {
+  if (!node) {
+    return <span className="text-xs text-muted-foreground">—</span>
+  }
+  const view = nodeOverlayStatus(node)
+  const variant =
+    view.tone === 'ok'
+      ? 'success-subtle'
+      : view.tone === 'warn'
+        ? 'warning-subtle'
+        : 'neutral-subtle'
+  return (
+    <Badge variant={variant} className="text-xs" title={view.description}>
+      {view.tone === 'warn' ? 'Unavailable' : view.label}
+    </Badge>
+  )
+}
+
 function NodeTable({
   nodes,
   mesh,
+  overlay,
 }: {
   nodes: NodeInfoResponse[]
   mesh: WireguardMeshStatusResponse | undefined
+  overlay: ClusterNetworkNode[] | undefined
 }) {
   const navigate = useNavigate()
+  const overlayNodes = new Map(overlay?.map((node) => [node.id, node]))
+  const showOverlay = overlay?.some((node) => node.compute_cidr) ?? false
   const showMesh = mesh !== undefined && mesh.state !== 'disabled'
   const meshNodes = new Map(mesh?.nodes.map((node) => [node.node_id, node]))
   return (
@@ -571,9 +677,14 @@ function NodeTable({
             <TableHead className="hidden sm:table-cell">Arch</TableHead>
             <TableHead className="hidden md:table-cell">Labels</TableHead>
             <TableHead className="hidden lg:table-cell">Resources</TableHead>
-            <TableHead className="hidden md:table-cell">Address</TableHead>
+            <TableHead className="hidden md:table-cell">Node address</TableHead>
+            <TableHead className="hidden sm:table-cell">Ingress</TableHead>
             {showMesh && <TableHead>Mesh</TableHead>}
-            <TableHead>Last Heartbeat</TableHead>
+            {showOverlay && <TableHead>Cross-node</TableHead>}
+            <TableHead>Last heartbeat</TableHead>
+            <TableHead className="text-right">
+              <span className="sr-only">Actions</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
@@ -600,12 +711,13 @@ function NodeTable({
                           {node.role}
                         </Badge>
                         <NodeRoleBadge labels={node.labels} />
+                        <MacWorkerBadge capacity={node.capacity} />
                       </div>
                     </div>
                   </div>
                 </TableCell>
                 <TableCell>
-                  <StatusBadge status={node.status} />
+                  <StatusBadge status={node.status} capacity={node.capacity} />
                 </TableCell>
                 <TableCell className="hidden sm:table-cell">
                   <NodeArchitecture architecture={node.architecture} />
@@ -620,6 +732,9 @@ function NodeTable({
                   <span className="font-mono text-xs text-muted-foreground truncate max-w-[200px] block">
                     {node.private_address}
                   </span>
+                </TableCell>
+                <TableCell className="hidden sm:table-cell">
+                  <WorkerIngressBadge node={node} />
                 </TableCell>
                 {showMesh && (
                   <TableCell>
@@ -653,10 +768,20 @@ function NodeTable({
                     )}
                   </TableCell>
                 )}
+                {showOverlay && (
+                  <TableCell>
+                    <OverlayBadge node={overlayNodes.get(node.id)} />
+                  </TableCell>
+                )}
                 <TableCell>
                   <span className="text-sm text-muted-foreground">
                     {formatRelativeTime(node.last_heartbeat)}
                   </span>
+                </TableCell>
+                <TableCell className="text-right">
+                  {node.role !== 'control-plane' && (
+                    <NodeRowActions node={node} />
+                  )}
                 </TableCell>
               </TableRow>
             )
@@ -697,32 +822,6 @@ function MetricCard({
             className={`h-full rounded-full transition-all ${barColor}`}
             style={{ width: `${Math.min(percent, 100)}%` }}
           />
-        </div>
-      </CardContent>
-    </Card>
-  )
-}
-
-function NodeDetailLabels({ labels }: { labels: unknown }) {
-  if (!labels || typeof labels !== 'object') return null
-  const entries = Object.entries(labels as Record<string, unknown>)
-  if (entries.length === 0) return null
-
-  return (
-    <Card>
-      <CardHeader className="py-3 px-4">
-        <CardTitle className="text-sm flex items-center gap-2">
-          <Tag className="h-4 w-4" />
-          Labels
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="px-4 pb-3">
-        <div className="flex flex-wrap gap-1.5">
-          {entries.map(([key, value]) => (
-            <Badge key={key} variant="secondary" className="text-xs font-mono">
-              {key}={String(value)}
-            </Badge>
-          ))}
         </div>
       </CardContent>
     </Card>
@@ -771,7 +870,7 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
       <CardHeader className="py-3 px-4">
         <CardTitle className="text-sm flex items-center gap-2">
           <Globe className="h-4 w-4" />
-          Edge Analytics
+          Edge analytics
         </CardTitle>
         <CardDescription>
           Cache performance and traffic overview
@@ -792,16 +891,16 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
             {/* Cache metrics */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
               <MiniStat
-                label="Total Requests"
+                label="Total requests"
                 value={overview.total_requests.toLocaleString()}
               />
               <MiniStat
-                label="Cache Hits"
+                label="Cache hits"
                 value={overview.cache_hits.toLocaleString()}
                 accent="green"
               />
               <MiniStat
-                label="Cache Misses"
+                label="Cache misses"
                 value={overview.cache_misses.toLocaleString()}
                 accent="yellow"
               />
@@ -832,16 +931,16 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
             {/* Bandwidth */}
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
               <MiniStat
-                label="Served from Cache"
+                label="Served from cache"
                 value={formatBytes(overview.bytes_from_cache)}
                 accent="green"
               />
               <MiniStat
-                label="From Origin"
+                label="From origin"
                 value={formatBytes(overview.bytes_from_origin)}
               />
               <MiniStat
-                label="Avg Origin Latency"
+                label="Avg origin latency"
                 value={`${overview.avg_origin_latency_ms.toFixed(1)}ms`}
               />
             </div>
@@ -901,7 +1000,10 @@ function MiniStat({
 // ── Node Detail Page (URL-routed) ──
 
 export function NodeDetailPage() {
-  const { nodeId } = useParams<{ nodeId: string }>()
+  const { nodeId, section: segment } = useParams<{
+    nodeId: string
+    section?: string
+  }>()
   const navigate = useNavigate()
   const { setBreadcrumbs } = useBreadcrumbs()
   const id = Number(nodeId)
@@ -910,15 +1012,31 @@ export function NodeDetailPage() {
     ...adminGetNodeOptions({ path: { node_id: id } }),
     enabled: !isNaN(id),
   })
+  const section = resolveNodeSection(segment, nodeData?.role)
+  const sectionTitle = nodeSections(nodeData?.role).find(
+    (link) => link.section === section
+  )?.title
 
   useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Worker Nodes', href: WORKER_NODES_URL },
-      { label: nodeData?.name ?? `Node ${nodeId}` },
-    ])
-  }, [setBreadcrumbs, nodeData?.name, nodeId])
+    const name = nodeData?.name ?? `Node ${nodeId}`
+    setBreadcrumbs(
+      section === 'overview'
+        ? [{ label: 'Worker nodes', href: WORKER_NODES_URL }, { label: name }]
+        : [
+            { label: 'Worker nodes', href: WORKER_NODES_URL },
+            { label: name, href: nodeSectionUrl(id, 'overview') },
+            { label: sectionTitle ?? section },
+          ]
+    )
+  }, [setBreadcrumbs, nodeData?.name, nodeId, id, section, sectionTitle])
 
-  usePageTitle(nodeData?.name ?? 'Node Detail')
+  usePageTitle(
+    nodeData?.name
+      ? section === 'overview'
+        ? nodeData.name
+        : `${sectionTitle} · ${nodeData.name}`
+      : 'Node Detail'
+  )
 
   if (isNaN(id)) {
     return (
@@ -932,71 +1050,33 @@ export function NodeDetailPage() {
 
   return (
     <div className="w-full space-y-6">
-      <NodeDetail nodeId={id} onBack={() => navigate('/settings/nodes')} />
+      <NodeDetail
+        nodeId={id}
+        section={section}
+        onBack={() => navigate('/settings/nodes')}
+      />
     </div>
   )
 }
 
-/**
- * What removing a node affects. Plain inline content only: the dialog wraps it
- * in a paragraph, so the refusal lists are joined into the sentence.
- */
-function removeNodeConsequences(
-  pinnedPlacements: NodePlacementReference[] | null,
-  unremovedContainers: UnremovedNodeContainers | null
-) {
-  if (pinnedPlacements) {
-    const targets = pinnedPlacements
-      .map((placement) =>
-        placement.environment_name
-          ? `${placement.project_name} / ${placement.environment_name}`
-          : `${placement.project_name} (project default)`
-      )
-      .join(', ')
-    return `The node was not removed: it is the only target node of ${targets}. Removing it would leave them with no target, so they could run on any node. Change their target nodes in each environment’s settings, then remove the node.`
-  }
-  if (unremovedContainers) {
-    return (
-      <>
-        Temps could not confirm that {unremovedContainers.count} container(s) it
-        placed on this node are gone, so the node was not removed:{' '}
-        <span className="font-mono text-xs break-all">
-          {unremovedContainers.lines.join(', ')}
-        </span>
-        . Start the agent on the node and try again, or remove them on that host
-        with docker rm -f. If the host is gone for good, remove the node anyway:
-        these containers are then recorded as orphaned and never touched again.
-      </>
-    )
-  }
-  return 'The node must be drained first (no active containers) and host no sandboxes. Containers Temps left on it are removed first, and it is taken out of the target nodes of every environment that lists it.'
-}
-
 function NodeDetail({
   nodeId,
+  section,
   onBack,
 }: {
   nodeId: number
+  section: NodeSection
   onBack: () => void
 }) {
+  const navigate = useNavigate()
   const queryClient = useQueryClient()
   // Draining, removing or reactivating a node changes what this installation
   // can schedule, so the capability every page's banner reads is stale the
   // moment one of those succeeds.
   const invalidateCapability = useInvalidateNodeCapability()
   const [showDrainDialog, setShowDrainDialog] = useState(false)
-  const [showRemoveDialog, setShowRemoveDialog] = useState(false)
   const [showUndrainDialog, setShowUndrainDialog] = useState(false)
   const [drainPending, setDrainPending] = useState(false)
-  const [removePending, setRemovePending] = useState(false)
-  // Containers a removal could not confirm are gone. While set, the remove
-  // dialog lists them and offers to remove the node anyway.
-  const [unremovedContainers, setUnremovedContainers] =
-    useState<UnremovedNodeContainers | null>(null)
-  // Environments pinned only to this node, from a refused removal.
-  const [pinnedPlacements, setPinnedPlacements] = useState<
-    NodePlacementReference[] | null
-  >(null)
   const [undrainPending, setUndrainPending] = useState(false)
   const { handleSensitiveActionError, verificationDialog } =
     useSensitiveActionVerification()
@@ -1021,19 +1101,38 @@ function NodeDetail({
   // admins may list other users' sandboxes, so others see an explanation.
   const { user } = useAuth()
   const canSeeSandboxes = canManageSandboxPlacement(user?.role)
+  // A server that does not serve the sandbox API is not asked (its answer
+  // would be a bare 404); the panel says why instead. Unknown features
+  // (loading, or a server that predates them) still ask, as before.
+  const platformFeatures = usePlatformFeatures()
+  const sandboxesAvailable = platformFeatures.data?.sandboxes !== false
   const [sandboxPage, setSandboxPage] = useState(1)
   const sandboxesQuery = useQuery({
     ...listNodeSandboxesOptions({
       path: { node: String(nodeId) },
       query: { page: sandboxPage, page_size: 20 },
     }),
-    enabled: canSeeSandboxes,
+    enabled: canSeeSandboxes && sandboxesAvailable,
     refetchInterval: 15_000,
   })
   const liveSandboxes = sandboxesQuery.data?.total ?? 0
   const [searchParams, setSearchParams] = useSearchParams()
   const tab =
     searchParams.get('tab') === 'sandboxes' ? 'sandboxes' : 'containers'
+  // The remove flow, shared with the node list's row action.
+  const {
+    requestRemoval,
+    pending: removePending,
+    dialog: removeDialog,
+  } = useNodeRemoval({
+    nodeId,
+    nodeName: node?.name ?? '',
+    onRemoved: onBack,
+    // Live sandboxes block removal and draining doesn't move them: point
+    // straight at the tab that can destroy them.
+    onShowSandboxes: () =>
+      navigate(`${nodeSectionUrl(nodeId, 'overview')}?tab=sandboxes`),
+  })
 
   // Drain status decides whether the node can be removed; the server folds
   // in live sandboxes, which draining does not move. Poll every 5s while
@@ -1083,98 +1182,6 @@ function NodeDetail({
     } finally {
       setDrainPending(false)
       setShowDrainDialog(false)
-    }
-  }
-
-  const handleRemove = async (force = false) => {
-    setRemovePending(true)
-    let keepDialogOpen = false
-    try {
-      const resp = await client.delete({
-        url: '/internal/nodes/{node_id}',
-        path: { node_id: nodeId },
-        query: force ? { force: true } : undefined,
-      })
-      if (resp.error) {
-        if (handleSensitiveActionError(resp.error, () => handleRemove(force))) {
-          return
-        }
-        // Containers Temps placed on the node may still exist: keep the
-        // dialog open with the list so the operator decides whether the
-        // host is gone for good.
-        const pinned = (resp.error as { placements?: unknown }).placements
-        if (Array.isArray(pinned) && pinned.length > 0) {
-          setPinnedPlacements(pinned as NodePlacementReference[])
-          keepDialogOpen = true
-          setShowRemoveDialog(true)
-          return
-        }
-        const unremoved = unremovedNodeContainers(resp.error)
-        if (unremoved && !force) {
-          setUnremovedContainers(unremoved)
-          keepDialogOpen = true
-          setShowRemoveDialog(true)
-          return
-        }
-        // Live sandboxes block removal and draining doesn't move them:
-        // point straight at the tab that can destroy them.
-        const hostsSandboxes =
-          (resp.error as { type?: unknown }).type === NODE_HOSTS_SANDBOXES_TYPE
-        toast.error('Could not remove node', {
-          description: problemDetail(
-            resp.error,
-            'Check your permissions and try again.'
-          ),
-          action: hostsSandboxes
-            ? {
-                label: 'Show sandboxes',
-                onClick: () =>
-                  setSearchParams(
-                    (prev) => {
-                      const next = new URLSearchParams(prev)
-                      next.set('tab', 'sandboxes')
-                      return next
-                    },
-                    { replace: true }
-                  ),
-              }
-            : undefined,
-        })
-        return
-      }
-      const removal = resp.data as RemoveNodeResponse | undefined
-      const orphaned = removal?.orphaned_containers ?? []
-      // Environments whose target nodes listed this node no longer do; say
-      // which, since a rejoined machine gets a new ID and is not targeted.
-      const placements = describeUpdatedPlacements(removal?.placements_updated)
-      if (orphaned.length > 0) {
-        toast.warning('Node removed', {
-          description: [
-            'Some containers could not be removed and were recorded as orphaned. If the host still exists, remove them there with docker rm -f.',
-            placements,
-          ]
-            .filter(Boolean)
-            .join(' '),
-        })
-      } else if (placements) {
-        toast.warning('Node removed', { description: placements })
-      } else {
-        toast.success('Node removed')
-      }
-      queryClient.invalidateQueries({
-        queryKey: adminListNodesOptions().queryKey,
-      })
-      invalidateCapability()
-      onBack()
-    } catch {
-      toast.error('Failed to remove node')
-    } finally {
-      setRemovePending(false)
-      if (!keepDialogOpen) {
-        setShowRemoveDialog(false)
-        setUnremovedContainers(null)
-        setPinnedPlacements(null)
-      }
     }
   }
 
@@ -1243,38 +1250,47 @@ function NodeDetail({
 
   const canDrain = node.status === 'active'
   const canUndrain = node.status === 'draining' || node.status === 'drained'
+  // What the server reports is on the node decides how it can be removed
+  // (ADR 060): an empty node in one step, one with workloads after a drain.
+  const removal = nodeRemoval(node)
+  const removalBlocker = nodeRemovalBlocker(removal)
   // Draining does not move sandboxes; they have to be destroyed first.
-  const remainingSandboxes = drainStatus?.remaining_sandboxes ?? liveSandboxes
-  const removableState =
-    (node.status === 'drained' &&
+  const remainingSandboxes =
+    removal.kind === 'sandboxes'
+      ? removal.sandboxes
+      : (drainStatus?.remaining_sandboxes ?? liveSandboxes)
+  // A server that reports no counts: decide from the drain status as
+  // before. A node the control plane stopped hearing from can be removed
+  // whatever its status: a drain cannot finish without its agent (ADR 057).
+  const legacyRemovableState =
+    removal.kind === 'unknown' &&
+    ((node.status === 'drained' &&
       (drainStatus?.remaining_containers ?? containers.length) === 0) ||
-    node.status === 'offline'
-  const canRemove = removableState && remainingSandboxes === 0
-  const blockedBySandboxes = removableState && remainingSandboxes > 0
+      node.status === 'offline' ||
+      nodeIsUnreachable(node))
+  const canRemove =
+    removal.kind === 'remove' ||
+    (legacyRemovableState && remainingSandboxes === 0)
+  const blockedBySandboxes =
+    removal.kind === 'sandboxes' ||
+    (legacyRemovableState && remainingSandboxes > 0)
 
   return (
     <div className="space-y-6">
       {verificationDialog}
       {/* Header */}
-      <div className="flex items-center gap-3">
-        <Button
-          aria-label="Back"
-          variant="ghost"
-          size="icon"
-          onClick={onBack}
-          className="h-8 w-8"
-        >
-          <ArrowLeft className="h-4 w-4" />
-        </Button>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center">
         <div className="flex-1 min-w-0">
           <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
             <Server className="h-5 w-5 text-muted-foreground" />
             <h3 className="max-w-full min-w-0 text-lg font-semibold truncate">
               {node.name}
             </h3>
-            <StatusBadge status={node.status} />
+            <StatusBadge status={node.status} capacity={node.capacity} />
+            <MacWorkerBadge capacity={node.capacity} />
             <NodeArchitecture architecture={node.architecture} />
             <NodeRoleBadge labels={node.labels} />
+            <WorkerIngressBadge node={node} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
             {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
@@ -1282,7 +1298,7 @@ function NodeDetail({
           </p>
           <NodeRoleDescription labels={node.labels} />
         </div>
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           {canDrain && (
             <Button
               variant="outline"
@@ -1313,11 +1329,16 @@ function NodeDetail({
               <span className="max-sm:sr-only">Undrain</span>
             </Button>
           )}
+          {removal.kind === 'drain-first' && removalBlocker && (
+            <span className="text-xs text-muted-foreground">
+              {removalBlocker}
+            </span>
+          )}
           {canRemove && (
             <Button
               variant="destructive"
               size="sm"
-              onClick={() => setShowRemoveDialog(true)}
+              onClick={requestRemoval}
               disabled={removePending}
             >
               {removePending ? (
@@ -1345,27 +1366,8 @@ function NodeDetail({
         onConfirm={handleDrain}
       />
 
-      {/* Remove confirmation dialog */}
-      <ConfirmDeleteDialog
-        open={showRemoveDialog}
-        onOpenChange={(open) => {
-          setShowRemoveDialog(open)
-          if (!open) {
-            setUnremovedContainers(null)
-            setPinnedPlacements(null)
-          }
-        }}
-        resourceType="node"
-        resourceName={node.name}
-        verb="Remove"
-        confirmLabel={unremovedContainers ? 'Remove anyway' : 'Remove node'}
-        consequences={removeNodeConsequences(
-          pinnedPlacements,
-          unremovedContainers
-        )}
-        isPending={removePending}
-        onConfirm={() => void handleRemove(unremovedContainers !== null)}
-      />
+      {/* Remove confirmation and refusal dialogs */}
+      {removeDialog}
 
       {/* Undrain confirmation dialog */}
       <AlertDialog open={showUndrainDialog} onOpenChange={setShowUndrainDialog}>
@@ -1389,7 +1391,7 @@ function NodeDetail({
               {undrainPending && (
                 <Loader2 className="h-4 w-4 animate-spin mr-1" />
               )}
-              Reactivate Node
+              Reactivate node
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -1449,7 +1451,10 @@ function NodeDetail({
           <AlertDescription>
             Draining does not move sandboxes, so the node can&rsquo;t be removed
             yet. Destroy them on the{' '}
-            <Link to="?tab=sandboxes" className="underline underline-offset-2">
+            <Link
+              to={`${nodeSectionUrl(nodeId, 'overview')}?tab=sandboxes`}
+              className="underline underline-offset-2"
+            >
               Sandboxes tab
             </Link>
             , then remove the node.
@@ -1457,239 +1462,233 @@ function NodeDetail({
         </Alert>
       )}
 
-      {/* Labels */}
-      <NodeDetailLabels labels={node.labels} />
+      {section === 'overview' && (
+        <>
+          <NodeOverviewAlerts node={node} />
+          {/* Metrics */}
+          {metrics && (
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              {metrics.cpu_percent !== undefined && (
+                <MetricCard
+                  icon={<Cpu className="h-4 w-4 text-muted-foreground" />}
+                  label="CPU"
+                  value={formatPercent(metrics.cpu_percent)}
+                  percent={metrics.cpu_percent}
+                />
+              )}
 
-      {node.role === 'worker' && <WorkerIngressCard node={node} />}
-      {node.role === 'worker' && (
+              {metrics.memory_total_bytes != null &&
+                metrics.memory_used_bytes != null && (
+                  <MetricCard
+                    icon={
+                      <MemoryStick className="h-4 w-4 text-muted-foreground" />
+                    }
+                    label="Memory"
+                    value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
+                    percent={
+                      (metrics.memory_used_bytes / metrics.memory_total_bytes) *
+                      100
+                    }
+                  />
+                )}
+
+              {metrics.disk_total_bytes != null &&
+                metrics.disk_used_bytes != null && (
+                  <MetricCard
+                    icon={
+                      <HardDrive className="h-4 w-4 text-muted-foreground" />
+                    }
+                    label="Disk"
+                    value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
+                    percent={
+                      (metrics.disk_used_bytes / metrics.disk_total_bytes) * 100
+                    }
+                  />
+                )}
+            </div>
+          )}
+
+          {/* Workload on this node: deployment containers and sandboxes */}
+          <Tabs
+            value={tab}
+            onValueChange={(value) =>
+              setSearchParams(
+                (prev) => {
+                  const next = new URLSearchParams(prev)
+                  if (value === 'containers') next.delete('tab')
+                  else next.set('tab', value)
+                  return next
+                },
+                { replace: true }
+              )
+            }
+          >
+            <TabsList>
+              <TabsTrigger
+                value="containers"
+                icon={Box}
+                count={containersLoading ? undefined : containers.length}
+              >
+                Containers
+              </TabsTrigger>
+              <TabsTrigger
+                value="sandboxes"
+                icon={Terminal}
+                count={sandboxesQuery.data?.total}
+              >
+                Sandboxes
+              </TabsTrigger>
+            </TabsList>
+            <TabsContent value="containers">
+              <Card>
+                <CardContent className="px-0 pb-0 pt-0">
+                  {containersLoading ? (
+                    <div className="flex items-center justify-center py-8">
+                      <Loader2 className="h-5 w-5 animate-spin" />
+                    </div>
+                  ) : containers.length === 0 ? (
+                    <div className="flex flex-col items-center justify-center py-8 text-center px-4">
+                      <Box className="h-8 w-8 text-muted-foreground mb-2" />
+                      <p className="text-sm text-muted-foreground">
+                        No containers running on this node.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="overflow-x-auto">
+                      <Table>
+                        <TableHeader>
+                          <TableRow>
+                            <TableHead>Container</TableHead>
+                            <TableHead>Status</TableHead>
+                            <TableHead className="hidden md:table-cell">
+                              Service
+                            </TableHead>
+                            <TableHead className="hidden md:table-cell">
+                              Environment
+                            </TableHead>
+                            <TableHead className="hidden lg:table-cell">
+                              Image
+                            </TableHead>
+                          </TableRow>
+                        </TableHeader>
+                        <TableBody>
+                          {containers.map((c: NodeContainerResponse) => (
+                            <TableRow key={c.container_id}>
+                              <TableCell>
+                                <span className="font-mono text-xs truncate max-w-[200px] block">
+                                  {c.container_name}
+                                </span>
+                              </TableCell>
+                              <TableCell>
+                                <Badge
+                                  variant={
+                                    c.status === 'running'
+                                      ? 'success-subtle'
+                                      : 'secondary'
+                                  }
+                                  className="text-xs"
+                                >
+                                  {c.status}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="hidden md:table-cell">
+                                <span className="text-sm">
+                                  {c.project_name}
+                                </span>
+                              </TableCell>
+                              <TableCell className="hidden md:table-cell">
+                                <Badge variant="outline" className="text-xs">
+                                  {c.environment_name}
+                                </Badge>
+                              </TableCell>
+                              <TableCell className="hidden lg:table-cell">
+                                <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
+                                  {c.image_name}
+                                </span>
+                              </TableCell>
+                            </TableRow>
+                          ))}
+                        </TableBody>
+                      </Table>
+                    </div>
+                  )}
+                </CardContent>
+              </Card>
+            </TabsContent>
+            <TabsContent value="sandboxes">
+              <NodeSandboxesPanel
+                nodeId={nodeId}
+                nodeName={node.name}
+                canSee={canSeeSandboxes}
+                query={sandboxesQuery}
+                page={sandboxPage}
+                onPageChange={setSandboxPage}
+                sandboxesAvailable={sandboxesAvailable}
+                sandboxesLocal={platformFeatures.data?.sandboxes_local}
+              />
+            </TabsContent>
+          </Tabs>
+        </>
+      )}
+
+      {section === 'monitoring' && (
+        <>
+          {/* History and alerts. Always rendered: with no samples yet, or no
+              metrics store, ServerMonitoring explains what is missing. */}
+          <ServerMonitoring
+            nodeId={nodeId}
+            embedded
+            rangeParamName="metrics_range"
+          />
+          <NodeAlertRules nodeId={nodeId} />
+
+          {/* Edge Analytics (only for edge nodes) */}
+          {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
+        </>
+      )}
+
+      {section === 'networking' && (
+        <>
+          <NodeNetworkStatusCard node={node} />
+          {node.role === 'worker' && <WorkerIngressCard node={node} />}
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeNetworkPolicySettings
+              key={`policy-${node.id}`}
+              nodeId={node.id}
+              nodeName={node.name}
+            />
+          )}
+        </>
+      )}
+
+      {section === 'builds' && node.role === 'worker' && (
         <BuilderLimitsPanel key={node.id} node={node} />
       )}
 
-      {/* Metrics */}
-      {metrics && (
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-          {metrics.cpu_percent !== undefined && (
-            <MetricCard
-              icon={<Cpu className="h-4 w-4 text-muted-foreground" />}
-              label="CPU"
-              value={formatPercent(metrics.cpu_percent)}
-              percent={metrics.cpu_percent}
+      {section === 'scheduling' && (
+        <>
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeSchedulingResources
+              key={`resources-${node.id}`}
+              nodeId={node.id}
             />
           )}
-
-          {metrics.memory_total_bytes != null &&
-            metrics.memory_used_bytes != null && (
-              <MetricCard
-                icon={<MemoryStick className="h-4 w-4 text-muted-foreground" />}
-                label="Memory"
-                value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
-                percent={
-                  (metrics.memory_used_bytes / metrics.memory_total_bytes) * 100
-                }
-              />
-            )}
-
-          {metrics.disk_total_bytes != null &&
-            metrics.disk_used_bytes != null && (
-              <MetricCard
-                icon={<HardDrive className="h-4 w-4 text-muted-foreground" />}
-                label="Disk"
-                value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
-                percent={
-                  (metrics.disk_used_bytes / metrics.disk_total_bytes) * 100
-                }
-              />
-            )}
-        </div>
-      )}
-
-      {/* Edge Analytics (only for edge nodes) */}
-      {node.role === 'edge' && <EdgeAnalyticsSection nodeId={nodeId} />}
-
-      {/* Workload on this node: deployment containers and sandboxes */}
-      <Tabs
-        value={tab}
-        onValueChange={(value) =>
-          setSearchParams(
-            (prev) => {
-              const next = new URLSearchParams(prev)
-              if (value === 'containers') next.delete('tab')
-              else next.set('tab', value)
-              return next
-            },
-            { replace: true }
-          )
-        }
-      >
-        <TabsList>
-          <TabsTrigger
-            value="containers"
-            count={containersLoading ? undefined : containers.length}
-          >
-            <Box className="h-4 w-4" />
-            Containers
-          </TabsTrigger>
-          <TabsTrigger value="sandboxes" count={sandboxesQuery.data?.total}>
-            <Terminal className="h-4 w-4" />
-            Sandboxes
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="containers">
-          <Card>
-            <CardContent className="px-0 pb-0 pt-0">
-              {containersLoading ? (
-                <div className="flex items-center justify-center py-8">
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                </div>
-              ) : containers.length === 0 ? (
-                <div className="flex flex-col items-center justify-center py-8 text-center px-4">
-                  <Box className="h-8 w-8 text-muted-foreground mb-2" />
-                  <p className="text-sm text-muted-foreground">
-                    No containers running on this node.
-                  </p>
-                </div>
-              ) : (
-                <div className="overflow-x-auto">
-                  <Table>
-                    <TableHeader>
-                      <TableRow>
-                        <TableHead>Container</TableHead>
-                        <TableHead>Status</TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Service
-                        </TableHead>
-                        <TableHead className="hidden md:table-cell">
-                          Environment
-                        </TableHead>
-                        <TableHead className="hidden lg:table-cell">
-                          Image
-                        </TableHead>
-                      </TableRow>
-                    </TableHeader>
-                    <TableBody>
-                      {containers.map((c: NodeContainerResponse) => (
-                        <TableRow key={c.container_id}>
-                          <TableCell>
-                            <span className="font-mono text-xs truncate max-w-[200px] block">
-                              {c.container_name}
-                            </span>
-                          </TableCell>
-                          <TableCell>
-                            <Badge
-                              variant={
-                                c.status === 'running'
-                                  ? 'success-subtle'
-                                  : 'secondary'
-                              }
-                              className="text-xs"
-                            >
-                              {c.status}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="hidden md:table-cell">
-                            <span className="text-sm">{c.project_name}</span>
-                          </TableCell>
-                          <TableCell className="hidden md:table-cell">
-                            <Badge variant="outline" className="text-xs">
-                              {c.environment_name}
-                            </Badge>
-                          </TableCell>
-                          <TableCell className="hidden lg:table-cell">
-                            <span className="font-mono text-xs text-muted-foreground truncate max-w-[250px] block">
-                              {c.image_name}
-                            </span>
-                          </TableCell>
-                        </TableRow>
-                      ))}
-                    </TableBody>
-                  </Table>
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </TabsContent>
-        <TabsContent value="sandboxes">
-          <NodeSandboxesPanel
-            nodeId={nodeId}
-            nodeName={node.name}
-            canSee={canSeeSandboxes}
-            query={sandboxesQuery}
-            page={sandboxPage}
-            onPageChange={setSandboxPage}
+          <NodeLabelsCard
+            labels={node.labels}
+            showChangeHint={node.role === 'worker'}
           />
-        </TabsContent>
-      </Tabs>
+          {(node.role === 'worker' || node.role === 'control-plane') && (
+            <NodeStateStreamStatus />
+          )}
+        </>
+      )}
     </div>
   )
 }
 
-const ROTATE_CLUSTER_CA_CONFIRMATION = 'ROTATE CLUSTER CA'
-
 function ClusterTrustCard() {
-  const queryClient = useQueryClient()
   const [dialogOpen, setDialogOpen] = useState(false)
-  const [confirmation, setConfirmation] = useState('')
-  const [rotationPending, setRotationPending] = useState(false)
-  const { handleSensitiveActionError, verificationDialog } =
-    useSensitiveActionVerification()
-  const settingsQuery = useQuery(getSettingsOptions())
-  const fingerprint =
-    settingsQuery.data?.multi_node.cluster_ca_fingerprint ?? null
-
-  const closeDialog = () => {
-    setDialogOpen(false)
-    setConfirmation('')
-  }
-
-  const rotateClusterCa = async () => {
-    if (!fingerprint || confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION) return
-
-    setRotationPending(true)
-    try {
-      const response = await client.post({
-        url: '/settings/cluster-ca/rotate' as never,
-        body: {
-          expected_fingerprint: fingerprint,
-          confirmation,
-        } as never,
-      })
-      if (response.error) {
-        if (
-          handleSensitiveActionError(response.error, () => {
-            void rotateClusterCa()
-          })
-        ) {
-          // Avoid stacking two modal focus traps while the MFA step-up dialog
-          // is active. Keep the typed confirmation for the one-shot retry.
-          setDialogOpen(false)
-          return
-        }
-        const problem = response.error as {
-          detail?: string
-          title?: string
-        }
-        toast.error(
-          problem.detail ?? problem.title ?? 'Failed to rotate the cluster CA'
-        )
-        return
-      }
-
-      const result = response.data as
-        | { new_fingerprint?: string; revoked_enrollment_tokens?: number }
-        | undefined
-      toast.success(
-        `Cluster CA rotated. ${result?.revoked_enrollment_tokens ?? 0} enrollment token(s) revoked.`
-      )
-      closeDialog()
-      await queryClient.invalidateQueries({
-        queryKey: getSettingsOptions().queryKey,
-      })
-    } catch {
-      toast.error('Failed to rotate the cluster CA')
-    } finally {
-      setRotationPending(false)
-    }
-  }
+  const { fingerprint, isLoading } = useClusterCaFingerprint()
 
   return (
     <>
@@ -1708,7 +1707,7 @@ function ClusterTrustCard() {
           <div className="rounded-md border bg-muted/30 p-4">
             <p className="text-sm font-medium">Active CA fingerprint</p>
             <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
-              {settingsQuery.isLoading
+              {isLoading
                 ? 'Loading…'
                 : (fingerprint ??
                   'Initializing cluster trust… restart the control plane if this persists.')}
@@ -1720,78 +1719,25 @@ function ClusterTrustCard() {
             <AlertDescription>
               Rotation immediately invalidates worker trust and outstanding
               enrollment tokens. Every worker must be re-enrolled. Only a full
-              Admin using a fresh MFA-verified browser session can proceed.
+              Admin in a browser session can proceed, and an Admin with MFA
+              re-verifies it first.
             </AlertDescription>
           </Alert>
           <Button
             variant="destructive"
             onClick={() => setDialogOpen(true)}
-            disabled={!fingerprint || settingsQuery.isLoading}
+            disabled={!fingerprint || isLoading}
           >
             Rotate cluster CA
           </Button>
         </CardContent>
       </Card>
 
-      <AlertDialog
+      <RotateClusterCaDialog
         open={dialogOpen}
-        onOpenChange={(open) => {
-          setDialogOpen(open)
-          if (!open) setConfirmation('')
-        }}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>Rotate the cluster CA?</AlertDialogTitle>
-            <AlertDialogDescription>
-              This disconnects every existing worker until it is re-enrolled
-              against the new fingerprint. Verify the fingerprint below through
-              a trusted operator channel before continuing.
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <div className="space-y-3">
-            <p className="break-all rounded-md border bg-muted/30 p-3 font-mono text-xs">
-              {fingerprint}
-            </p>
-            <label className="space-y-2 text-sm font-medium">
-              <span>
-                Type{' '}
-                <span className="font-mono">
-                  {ROTATE_CLUSTER_CA_CONFIRMATION}
-                </span>
-              </span>
-              <Input
-                autoComplete="off"
-                value={confirmation}
-                onChange={(event) => setConfirmation(event.target.value)}
-                placeholder={ROTATE_CLUSTER_CA_CONFIRMATION}
-              />
-            </label>
-          </div>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={rotationPending} onClick={closeDialog}>
-              Cancel
-            </AlertDialogCancel>
-            <AlertDialogAction
-              className="bg-destructive text-white hover:bg-destructive/90"
-              disabled={
-                rotationPending ||
-                confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION
-              }
-              onClick={(event) => {
-                event.preventDefault()
-                void rotateClusterCa()
-              }}
-            >
-              {rotationPending && (
-                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-              )}
-              Rotate and disconnect workers
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
-      {verificationDialog}
+        onOpenChange={setDialogOpen}
+        description="This disconnects every existing worker until it is re-enrolled against the new fingerprint. Verify the fingerprint below through a trusted operator channel before continuing."
+      />
     </>
   )
 }
@@ -1820,14 +1766,38 @@ export function NodesPage() {
     isFetching: meshFetching,
   } = useWireguardMesh()
   const stranded = strandedPublicNodes(mesh)
+  const { data: clusterNetwork } = useClusterNetwork()
+  const overlayDown = (clusterNetwork?.nodes ?? []).filter(
+    (node) => nodeOverlayStatus(node).tone === 'warn'
+  )
   const invalidateCapability = useInvalidateNodeCapability()
   const nodes = data?.nodes ?? []
+  const { data: tunnels } = useQuery(allTunnelsOptions())
+  // Without local workloads the control plane serves no app traffic, so a
+  // cluster whose workers all lack a way in serves nobody.
+  const activeWorkers = nodes.filter(
+    (node) => node.role !== 'control-plane' && node.status === 'active'
+  )
+  const noWayIn =
+    capability?.local_workloads === false &&
+    tunnels !== undefined &&
+    activeWorkers.length > 0 &&
+    activeWorkers.every(
+      (node) => workerIngressWay(node, tunnels).kind === 'none'
+    )
   const nodeCount = nodes.length
+  // The list always includes this server itself; only workers count here.
+  const workerCount = nodes.filter(
+    (node) => node.role !== 'control-plane'
+  ).length
   // "No nodes" means two very different things. With local workloads the
   // control plane runs everything itself and worker nodes are optional
   // scale-out; without them nothing can run at all and this page is the
   // onboarding step the operator must complete.
-  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, nodeCount)
+  const needsFirstNode = shouldPromptForFirstWorkerNode(capability, workerCount)
+  // A cluster with no worker yet opens on adding one; otherwise it is a click.
+  const [addingChosen, setAdding] = useState<boolean | null>(null)
+  const adding = addingChosen ?? workerCount === 0
 
   // This list polls, so it is the first thing in the console to learn that a
   // worker finished `temps join` (or dropped out). Re-read the capability
@@ -1838,10 +1808,29 @@ export function NodesPage() {
   }, [nodeCount, invalidateCapability])
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Worker Nodes' }])
+    setBreadcrumbs([{ label: 'Worker nodes' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Worker Nodes')
+  usePageTitle('Worker nodes')
+
+  // A link to one of the advanced cards (search, other pages) opens the
+  // section and brings the card into view. A toggle by hand wins until the
+  // link changes.
+  const { hash } = useLocation()
+  const linkedSection = nodesAdvancedSection(hash)
+  const [advancedToggle, setAdvancedToggle] = useState<{
+    hash: string
+    open: boolean
+  } | null>(null)
+  const advancedOpen =
+    advancedToggle?.hash === hash ? advancedToggle.open : linkedSection !== null
+  useEffect(() => {
+    if (!linkedSection) return
+    const frame = requestAnimationFrame(() =>
+      scrollToElementId(linkedSection, { behavior: 'smooth' })
+    )
+    return () => cancelAnimationFrame(frame)
+  }, [linkedSection, isLoading])
 
   if (isLoading) {
     return (
@@ -1853,91 +1842,211 @@ export function NodesPage() {
 
   if (error) {
     return (
-      <div className="space-y-6">
-        <Card>
-          <CardHeader>
-            <CardTitle>Worker Nodes</CardTitle>
-            <CardDescription>
-              Distribute container deployments across multiple servers.
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <ReadFailure
-              resource="Worker nodes"
-              error={error}
-              onRetry={
-                isForbiddenRead(error) ? undefined : () => void refetchNodes()
-              }
-              retrying={nodesFetching}
-            />
-          </CardContent>
-        </Card>
-      </div>
+      <SettingsSurface>
+        <div className="space-y-6">
+          <PageHeader
+            title="Worker nodes"
+            description={
+              <>Distribute container deployments across multiple servers.</>
+            }
+          />
+          <Card>
+            <CardContent>
+              <ReadFailure
+                resource="Worker nodes"
+                error={error}
+                onRetry={
+                  isForbiddenRead(error) ? undefined : () => void refetchNodes()
+                }
+                retrying={nodesFetching}
+              />
+            </CardContent>
+          </Card>
+        </div>
+      </SettingsSurface>
     )
   }
 
   return (
-    <div className="space-y-6">
-      <Card>
-        <CardHeader>
-          <CardTitle>Worker Nodes</CardTitle>
-          <CardDescription>
-            Distribute container deployments across multiple servers. Worker
-            nodes run the Temps agent and receive containers from the control
-            plane.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-6">
-          <JoinTokenSection />
+    <SettingsSurface>
+      <div className="space-y-6">
+        <PageHeader
+          title="Worker nodes"
+          description={
+            <>
+              Distribute container deployments across multiple servers. Worker
+              nodes run the Temps agent and receive containers from the control
+              plane.
+            </>
+          }
+          actions={
+            <RefreshButton
+              queryKeys={[
+                queryKeyPrefix(adminListNodesQueryKey),
+                allTunnelsOptions().queryKey,
+                // The mesh and overlay badges and network warnings in the table.
+                wireguardMeshStatusGetQueryKey(),
+                clusterNetworkGetQueryKey(),
+              ]}
+            />
+          }
+        />
+        <Card>
+          <CardContent className="space-y-6">
+            {adding ? (
+              <AddWorkerNode otherWays={<JoinTokenSection />} />
+            ) : (
+              <Button onClick={() => setAdding(true)}>
+                <Plus className="mr-1 h-4 w-4" />
+                Add a worker node
+              </Button>
+            )}
 
-          {stranded.length > 0 && (
-            <Alert className="border-amber-500/30 bg-amber-500/5">
-              <AlertTriangle className="h-4 w-4 text-amber-500" />
-              <AlertTitle className="text-amber-700 dark:text-amber-400">
-                {stranded.map((node) => node.name).join(', ')} joined with a
-                public address
-              </AlertTitle>
-              <AlertDescription className="text-amber-700 dark:text-amber-300">
-                {mesh?.state === 'starting'
-                  ? 'They move onto the WireGuard mesh as soon as it is up.'
-                  : 'Without the WireGuard mesh they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Enable it under “Over the internet” above.'}
-              </AlertDescription>
-            </Alert>
-          )}
+            <NodeStateStreamStatus />
+            {noWayIn && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  Visitors can&apos;t reach your apps yet
+                </AlertTitle>
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    No worker takes traffic from the internet. Deployments run,
+                    but their domains don&apos;t answer until a worker does,
+                    through a tunnel (no public IP needed) or open ports on a
+                    public IP.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button asChild size="sm">
+                      <Link to={ingressSetupUrl()}>Set up ingress</Link>
+                    </Button>
+                    <Button asChild size="sm" variant="outline">
+                      <Link
+                        to={`/settings/nodes/${activeWorkers[0].id}#public-ingress`}
+                      >
+                        Open {activeWorkers[0].name}
+                      </Link>
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
 
-          {needsFirstNode ? (
-            <div className="border-t pt-6">
-              <WorkerNodeRequiredAlert
-                reason={capability?.reason}
-                showSetupAction={false}
-                canManageNodes={canAddWorkerNode(capability)}
+            {workerCount > 0 && (
+              <ClusterDnsOffNotice title="Apps can't reach a database on another node">
+                Cluster DNS is off, so containers can&apos;t resolve{' '}
+                <code>*.temps.local</code> names. Deployments linked to a
+                managed service on a different node are blocked, and a database
+                cluster spanning nodes can&apos;t be reached by its apps.
+              </ClusterDnsOffNotice>
+            )}
+
+            {stranded.length > 0 && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  {stranded.map((node) => node.name).join(', ')} joined with a
+                  public address
+                </AlertTitle>
+                <AlertDescription className="text-amber-700 dark:text-amber-300">
+                  {mesh?.state === 'starting'
+                    ? 'They move onto the WireGuard mesh as soon as it is up.'
+                    : 'Without the private network they cannot reach the control plane or other nodes privately, so cross-node networking does not work for them. Turn it on under “Add a worker node” above.'}
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {overlayDown.length > 0 && (
+              <Alert className="border-amber-500/30 bg-amber-500/5">
+                <AlertTriangle className="h-4 w-4 text-amber-500" />
+                <AlertTitle className="text-amber-700 dark:text-amber-400">
+                  Cross-node network unavailable on{' '}
+                  {overlayDown.map((node) => node.name).join(', ')}
+                </AlertTitle>
+                <AlertDescription className="space-y-2 text-amber-700 dark:text-amber-300">
+                  <p>
+                    Their deployments keep working; containers on them cannot
+                    reach containers on other nodes, and managed-service members
+                    spanning hosts are not placed there.
+                  </p>
+                  <ul className="list-disc space-y-1 pl-4">
+                    {overlayDown.map((node) => (
+                      <li key={node.id} className="break-words">
+                        <span className="font-medium">{node.name}:</span>{' '}
+                        {nodeOverlayStatus(node).description}
+                      </li>
+                    ))}
+                  </ul>
+                  <NetworkIdAction status={clusterNetwork} />
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {needsFirstNode ? (
+              <div className="border-t pt-6">
+                <WorkerNodeRequiredAlert
+                  reason={capability?.reason}
+                  showSetupAction={false}
+                  canManageNodes={canAddWorkerNode(capability)}
+                />
+              </div>
+            ) : nodes.length === 0 ? (
+              <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
+                <Server className="h-12 w-12 text-muted-foreground mb-4" />
+                <p className="text-sm font-medium">No worker nodes</p>
+                <p className="text-sm text-muted-foreground mt-1 max-w-md">
+                  All deployments run on this server. Add worker nodes to
+                  distribute containers across multiple machines.
+                </p>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <NodeAddressRanges
+                  meshCidr={meshRangeToShow(mesh)?.cidr}
+                  meshReady={meshRangeToShow(mesh)?.ready}
+                  computeCidr={clusterNetwork?.compute_pool_cidr}
+                  subnetPrefixLen={clusterNetwork?.subnet_prefix_len}
+                />
+                <NodeTable
+                  nodes={nodes}
+                  mesh={mesh}
+                  overlay={clusterNetwork?.nodes}
+                />
+              </div>
+            )}
+          </CardContent>
+        </Card>
+
+        <Collapsible
+          open={advancedOpen}
+          onOpenChange={(open) => setAdvancedToggle({ hash, open })}
+        >
+          <CollapsibleTrigger className="group inline-flex items-center gap-1 text-sm font-medium text-muted-foreground hover:text-foreground">
+            <ChevronDown className="h-4 w-4 transition-transform group-data-[state=open]:rotate-180" />
+            Advanced: mesh hub, cluster network, DNS and trust
+          </CollapsibleTrigger>
+          <CollapsibleContent className="mt-6 space-y-6">
+            <div id="mesh-hub" className="scroll-mt-20">
+              <MeshHubCard
+                mesh={mesh}
+                isLoading={meshLoading}
+                error={meshError}
+                onRetry={() => void refetchMesh()}
+                retrying={meshFetching}
               />
             </div>
-          ) : nodes.length === 0 ? (
-            <div className="flex flex-col items-center justify-center py-12 text-center border-t pt-6">
-              <Server className="h-12 w-12 text-muted-foreground mb-4" />
-              <p className="text-sm font-medium">No worker nodes</p>
-              <p className="text-sm text-muted-foreground mt-1 max-w-md">
-                All deployments run on this server. Add worker nodes to
-                distribute containers across multiple machines.
-              </p>
+            <div id="cluster-network" className="scroll-mt-20">
+              <ClusterNetworkCard />
             </div>
-          ) : (
-            <NodeTable nodes={nodes} mesh={mesh} />
-          )}
-        </CardContent>
-      </Card>
-
-      <MeshHubCard
-        mesh={mesh}
-        isLoading={meshLoading}
-        error={meshError}
-        onRetry={() => void refetchMesh()}
-        retrying={meshFetching}
-      />
-      <CiBuilderPanel />
-      <ClusterDnsCard />
-      <ClusterTrustCard />
-    </div>
+            <div id="cluster-dns" className="scroll-mt-20">
+              <ClusterDnsCard />
+            </div>
+            <div id="cluster-trust" className="scroll-mt-20">
+              <ClusterTrustCard />
+            </div>
+          </CollapsibleContent>
+        </Collapsible>
+      </div>
+    </SettingsSurface>
   )
 }

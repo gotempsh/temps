@@ -204,16 +204,18 @@ impl WebhookEventListener {
         };
         let service_ids: std::collections::BTreeSet<i32> =
             service_backups.iter().map(|sb| sb.service_id).collect();
-        let service_id = match service_ids.len() {
-            0 => {
+        let mut distinct_ids = service_ids.iter();
+        let service_id = match (distinct_ids.next(), distinct_ids.next()) {
+            (None, _) => {
                 debug!(
                     "Backup {} has no external_service_backups row; skipping backup webhook",
                     backup_id
                 );
                 return None;
             }
-            1 => *service_ids.iter().next().expect("checked len == 1 above"),
-            count => {
+            (Some(&service_id), None) => service_id,
+            (Some(_), Some(_)) => {
+                let count = service_ids.len();
                 debug!(
                     "Backup {} has {} distinct producer services; webhook project resolution \
                      requires exactly one, so skipping",

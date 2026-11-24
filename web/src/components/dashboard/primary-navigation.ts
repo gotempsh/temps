@@ -3,6 +3,7 @@
 
 import {
   Activity,
+  Workflow,
   BarChart3,
   Boxes,
   Cpu,
@@ -16,9 +17,10 @@ import {
   Mail,
   Network,
   Puzzle,
+  Radio,
+  Rocket,
   ScrollText,
   ShieldAlert,
-  Sparkles,
   type LucideIcon,
 } from 'lucide-react'
 
@@ -77,15 +79,7 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
   {
     label: 'Applications',
     items: [
-      // Experimental: the badge and page header carry the maturity promise
-      // (see `featureKeyForPath`), so the entry stays discoverable without
-      // presenting a prototype as a finished product.
-      {
-        title: 'AI workspace',
-        url: '/ai-first',
-        icon: Sparkles,
-        featureKey: 'ai-chat',
-      },
+      { title: 'Get started', url: '/get-started', icon: Rocket },
       {
         title: 'Projects',
         url: '/projects',
@@ -96,6 +90,8 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
           path.startsWith('/projects/') ||
           path.startsWith('/p/'),
       },
+      { title: 'Workflows', url: '/workflows', icon: Workflow },
+      { title: 'Vault', url: '/vault', icon: ShieldAlert },
       { title: 'Git connections', url: '/git-providers', icon: GitBranch },
       { title: 'Domains', url: '/domains', icon: Globe },
       {
@@ -147,6 +143,12 @@ export const primaryPlatformGroups: PlatformNavGroup[] = [
         featureKey: 'alerts-metric-alerts',
       },
       { title: 'Proxy', url: '/proxy', icon: Activity },
+      {
+        title: 'Status pages',
+        url: '/status-pages',
+        icon: Radio,
+        featureKey: 'status-pages',
+      },
     ],
   },
   {

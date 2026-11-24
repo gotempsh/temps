@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use temps_core::AuditOperation;
 
@@ -79,11 +78,9 @@ impl AuditOperation for CustomDomainReassignmentRequestedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        // AuditOperation's shared contract currently returns anyhow::Result;
-        // preserve the serialization source while adding operation context.
-        serde_json::to_string(self).map_err(|error| {
-            anyhow::anyhow!("Failed to serialize domain reassignment request: {error}")
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        serde_json::to_string(self).map_err(|source| {
+            temps_core::AuditError::serialize("domain reassignment request", source)
         })
     }
 }
@@ -115,10 +112,9 @@ impl AuditOperation for CustomDomainReassignedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        // AuditOperation's shared contract currently returns anyhow::Result.
+    fn serialize(&self) -> temps_core::AuditResult<String> {
         serde_json::to_string(self)
-            .map_err(|error| anyhow::anyhow!("Failed to serialize domain reassignment: {error}"))
+            .map_err(|source| temps_core::AuditError::serialize("domain reassignment", source))
     }
 }
 
@@ -151,9 +147,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -163,6 +158,13 @@ pub struct ProjectDeletedAudit {
     pub project_id: i32,
     pub project_name: String,
     pub project_slug: String,
+    /// What removing the project's built images did: removed, kept for
+    /// safety, failed, and runtimes that could not be asked. `None` when the
+    /// images could not be read, see `image_plan_error`.
+    pub images: Option<temps_core::ProjectImageCleanupReport>,
+    /// Why the project's built images could not be read before its rows
+    /// were deleted; they are then left for the nightly sweep.
+    pub image_plan_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -208,6 +210,23 @@ pub struct ProjectSettingsUpdatedFields {
     /// because the new value alone can't answer "how much rollback history
     /// did this just cost" during an incident review.
     pub previous_image_retention_hours: Option<i32>,
+    /// New per-project log ingestion budget in lines/s. `Some(None)` records
+    /// a return to the platform default (`null`); `Some(Some(0))` lifting the
+    /// limit. Absent when the update did not touch it, so an untouched field
+    /// never reads as a reset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_lines_per_sec: Option<Option<i32>>,
+    /// New per-project log ingestion budget in KiB/s, same encoding.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub log_ingest_kib_per_sec: Option<Option<i32>>,
+    /// New value of `serves_own_temps_api`, when the update set it. Audited
+    /// because it moves `/api/_temps` and `/api/otel` traffic on the
+    /// project's domains away from this instance's analytics and OTLP ingest.
+    pub serves_own_temps_api: Option<bool>,
+    /// The Shield mode stored after an update that changed it (ADR 066),
+    /// including one made through the legacy `attack_mode` field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shield_mode: Option<temps_shield::ShieldMode>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {
@@ -227,9 +246,8 @@ impl AuditOperation for ProjectCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -250,9 +268,8 @@ impl AuditOperation for ProjectUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -273,9 +290,8 @@ impl AuditOperation for ProjectDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -296,9 +312,8 @@ impl AuditOperation for ProjectSettingsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -328,15 +343,62 @@ impl AuditOperation for DeploymentConfigUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn deleted(
+        images: Option<temps_core::ProjectImageCleanupReport>,
+        image_plan_error: Option<String>,
+    ) -> ProjectDeletedAudit {
+        ProjectDeletedAudit {
+            context: AuditContext {
+                user_id: 7,
+                ip_address: None,
+                user_agent: "test-agent".to_string(),
+            },
+            project_id: 11,
+            project_name: "example".to_string(),
+            project_slug: "example".to_string(),
+            images,
+            image_plan_error,
+        }
+    }
+
+    /// The deletion audit says what happened to the project's images, and
+    /// tells a cleanup that never ran apart from one that found nothing.
+    #[test]
+    fn project_deletion_audit_records_the_image_cleanup_outcome() {
+        let ran = AuditOperation::serialize(&deleted(
+            Some(temps_core::ProjectImageCleanupReport {
+                removed: 3,
+                skipped: 1,
+                failed: 0,
+                unreachable_runtimes: 1,
+            }),
+            None,
+        ))
+        .expect("audit should serialize");
+        assert!(ran.contains("\"removed\":3"), "{ran}");
+        assert!(ran.contains("\"unreachable_runtimes\":1"), "{ran}");
+        assert!(ran.contains("\"image_plan_error\":null"), "{ran}");
+
+        let never_ran = AuditOperation::serialize(&deleted(
+            None,
+            Some("Failed to read the images built for project 11".to_string()),
+        ))
+        .expect("audit should serialize");
+        assert!(never_ran.contains("\"images\":null"), "{never_ran}");
+        assert!(
+            never_ran.contains("Failed to read the images built for project 11"),
+            "{never_ran}"
+        );
+    }
 
     #[test]
     fn compose_settings_audit_records_change_without_secret_values() {
@@ -361,6 +423,10 @@ mod tests {
                 compose_configuration_updated: Some(true),
                 image_retention_hours: None,
                 previous_image_retention_hours: None,
+                log_ingest_lines_per_sec: None,
+                log_ingest_kib_per_sec: None,
+                serves_own_temps_api: None,
+                shield_mode: None,
             },
         };
 
@@ -369,5 +435,33 @@ mod tests {
         assert!(serialized.contains("\"compose_configuration_updated\":true"));
         assert!(!serialized.contains("composeOverride"));
         assert!(!serialized.contains("environment"));
+        assert!(
+            !serialized.contains("log_ingest_"),
+            "an untouched budget is absent, not null: {serialized}"
+        );
+    }
+
+    #[test]
+    fn a_log_budget_reset_is_recorded_as_null() {
+        let fields = ProjectSettingsUpdatedFields {
+            name: None,
+            previous_name: None,
+            slug: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            performance_metrics_enabled: None,
+            compose_configuration_updated: None,
+            image_retention_hours: None,
+            previous_image_retention_hours: None,
+            log_ingest_lines_per_sec: Some(None),
+            log_ingest_kib_per_sec: Some(Some(0)),
+            serves_own_temps_api: None,
+            shield_mode: None,
+        };
+        let json = serde_json::to_string(&fields).expect("fields serialize");
+        assert!(json.contains("\"log_ingest_lines_per_sec\":null"), "{json}");
+        assert!(json.contains("\"log_ingest_kib_per_sec\":0"), "{json}");
     }
 }

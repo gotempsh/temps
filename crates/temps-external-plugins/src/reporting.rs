@@ -50,7 +50,7 @@ pub async fn consent(db: &sea_orm::DatabaseConnection) -> Result<bool, Reporting
             source,
         })?;
     Ok(row.is_some_and(|row| {
-        temps_core::AppSettings::from_json(row.data).plugin_installation_reporting_enabled
+        temps_config::AppSettings::from_json(row.data).plugin_installation_reporting_enabled
     }))
 }
 

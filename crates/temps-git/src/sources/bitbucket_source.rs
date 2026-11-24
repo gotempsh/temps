@@ -7,17 +7,18 @@
 //! `/2.0/repositories/{workspace}/{repo_slug}/src/{commit}/{path}`.
 //! Bitbucket returns file content directly (not base64 encoded).
 
-use anyhow::Result;
 use async_trait::async_trait;
 use serde::Deserialize;
 use std::sync::Arc;
-use temps_presets::source::ProjectSource;
+use temps_presets::source::{ProjectSource, ProjectSourceError, ProjectSourceResult};
 use tracing::{debug, warn};
 
 use crate::services::git_provider::AuthMethod;
 
 /// Bitbucket Cloud API base URL — always HTTPS, never user-supplied.
 const API_BASE: &str = "https://api.bitbucket.org/2.0";
+
+const LIST_FILES: &str = "list the repository tree";
 
 /// Bitbucket-backed `ProjectSource`.
 ///
@@ -33,6 +34,8 @@ pub struct BitbucketSource {
     workspace: String,
     repo: String,
     reference: String,
+    /// [`API_BASE`] in production; only tests point it elsewhere.
+    api_base: String,
 }
 
 impl BitbucketSource {
@@ -57,6 +60,22 @@ impl BitbucketSource {
             workspace,
             repo,
             reference,
+            api_base: API_BASE.to_string(),
+        }
+    }
+
+    fn location(&self) -> String {
+        format!(
+            "Bitbucket repository {}/{} at '{}'",
+            self.workspace, self.repo, self.reference
+        )
+    }
+
+    fn transport_error(&self, operation: String, error: reqwest::Error) -> ProjectSourceError {
+        ProjectSourceError::Transport {
+            location: self.location(),
+            operation,
+            reason: error.without_url().to_string(),
         }
     }
 
@@ -77,7 +96,7 @@ impl BitbucketSource {
     fn src_url(&self, path: &str) -> String {
         format!(
             "{}/repositories/{}/{}/src/{}/{}",
-            API_BASE,
+            self.api_base,
             self.workspace,
             self.repo,
             urlencoding::encode(&self.reference),
@@ -116,7 +135,8 @@ impl ProjectSource for BitbucketSource {
             Err(e) => {
                 warn!(
                     "Failed to check Bitbucket file existence for {}: {}",
-                    path, e
+                    path,
+                    e.without_url()
                 );
                 false
             }
@@ -149,14 +169,15 @@ impl ProjectSource for BitbucketSource {
             Err(e) => {
                 warn!(
                     "Failed to check Bitbucket directory existence for {}: {}",
-                    path, e
+                    path,
+                    e.without_url()
                 );
                 false
             }
         }
     }
 
-    async fn read_file(&self, path: &str) -> Result<String> {
+    async fn read_file(&self, path: &str) -> ProjectSourceResult<String> {
         debug!(
             "Reading file from Bitbucket {}/{}/{} @ {}",
             self.workspace, self.repo, path, self.reference
@@ -168,13 +189,14 @@ impl ProjectSource for BitbucketSource {
             .apply_auth(self.client.get(&url))
             .send()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to fetch file from Bitbucket: {}", e))?;
+            .map_err(|e| self.transport_error(format!("fetch '{path}'"), e))?;
 
         if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "Bitbucket API error: {} - File: {}",
-                response.status(),
-                path
+            return Err(ProjectSourceError::from_status(
+                self.location(),
+                format!("fetch '{path}'"),
+                Some(path),
+                response.status().as_u16(),
             ));
         }
 
@@ -182,12 +204,12 @@ impl ProjectSource for BitbucketSource {
         let content = response
             .text()
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to read Bitbucket file content: {}", e))?;
+            .map_err(|e| self.transport_error(format!("read '{path}'"), e))?;
 
         Ok(content.replace("\r\n", "\n"))
     }
 
-    async fn list_files(&self) -> Result<Vec<String>> {
+    async fn list_files(&self) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Listing files in Bitbucket {}/{} @ {}",
             self.workspace, self.repo, self.reference
@@ -197,7 +219,7 @@ impl ProjectSource for BitbucketSource {
         // We use a large max_depth to get all files in a single request where possible.
         let url = format!(
             "{}/repositories/{}/{}/src/{}/?max_depth=100&pagelen=100",
-            API_BASE,
+            self.api_base,
             self.workspace,
             self.repo,
             urlencoding::encode(&self.reference)
@@ -211,21 +233,26 @@ impl ProjectSource for BitbucketSource {
                 .apply_auth(self.client.get(&current_url))
                 .send()
                 .await
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to fetch file listing from Bitbucket: {}", e)
-                })?;
+                .map_err(|e| self.transport_error(LIST_FILES.to_string(), e))?;
 
             if !response.status().is_success() {
-                return Err(anyhow::anyhow!(
-                    "Bitbucket API error listing files: {}",
-                    response.status()
+                return Err(ProjectSourceError::from_status(
+                    self.location(),
+                    LIST_FILES.to_string(),
+                    None,
+                    response.status().as_u16(),
                 ));
             }
 
-            let page: BitbucketDirPage = response
-                .json()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to parse Bitbucket file listing: {}", e))?;
+            let page: BitbucketDirPage =
+                response
+                    .json()
+                    .await
+                    .map_err(|e| ProjectSourceError::InvalidResponse {
+                        location: self.location(),
+                        operation: LIST_FILES.to_string(),
+                        reason: e.without_url().to_string(),
+                    })?;
 
             for entry in page.values {
                 if entry.entry_type == "commit_file" {
@@ -240,7 +267,7 @@ impl ProjectSource for BitbucketSource {
         Ok(all_files)
     }
 
-    async fn find_files(&self, pattern: &str) -> Result<Vec<String>> {
+    async fn find_files(&self, pattern: &str) -> ProjectSourceResult<Vec<String>> {
         debug!(
             "Finding files matching pattern '{}' in Bitbucket {}/{} @ {}",
             pattern, self.workspace, self.repo, self.reference
@@ -249,7 +276,8 @@ impl ProjectSource for BitbucketSource {
         let all_files = self.list_files().await?;
 
         let regex_pattern = glob_to_regex(pattern);
-        let re = regex::Regex::new(&regex_pattern)?;
+        let re = regex::Regex::new(&regex_pattern)
+            .map_err(|e| ProjectSourceError::invalid_pattern(pattern, e))?;
 
         let matched: Vec<String> = all_files.into_iter().filter(|f| re.is_match(f)).collect();
 
@@ -312,6 +340,61 @@ mod tests {
             "myrepo".to_string(),
             reference.to_string(),
         )
+    }
+
+    #[tokio::test]
+    async fn statuses_become_typed_errors_without_the_token() {
+        let mut server = mockito::Server::new_async().await;
+        let _file = server
+            .mock("GET", "/repositories/myworkspace/myrepo/src/main/a.json")
+            .with_status(404)
+            .create_async()
+            .await;
+        let _tree = server
+            .mock(
+                "GET",
+                "/repositories/myworkspace/myrepo/src/main/?max_depth=100&pagelen=100",
+            )
+            .with_status(429)
+            .create_async()
+            .await;
+        let mut source = make_source("main");
+        source.api_base = server.url();
+
+        let error = source.read_file("a.json").await.expect_err("404");
+        assert!(
+            matches!(&error, ProjectSourceError::NotFound { path, .. } if path == "a.json"),
+            "{error:?}"
+        );
+        assert!(!error.to_string().contains("test-token"));
+
+        let error = source.list_files().await.expect_err("429");
+        assert!(
+            matches!(error, ProjectSourceError::RateLimited { status: 429, .. }),
+            "{error:?}"
+        );
+        assert!(error.is_retryable());
+    }
+
+    #[tokio::test]
+    async fn a_listing_that_is_not_json_is_an_invalid_response() {
+        let mut server = mockito::Server::new_async().await;
+        let _tree = server
+            .mock(
+                "GET",
+                "/repositories/myworkspace/myrepo/src/main/?max_depth=100&pagelen=100",
+            )
+            .with_body("<html>")
+            .create_async()
+            .await;
+        let mut source = make_source("main");
+        source.api_base = server.url();
+
+        let error = source.list_files().await.expect_err("not JSON");
+        assert!(
+            matches!(error, ProjectSourceError::InvalidResponse { .. }),
+            "{error:?}"
+        );
     }
 
     #[test]

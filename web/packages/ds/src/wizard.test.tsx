@@ -62,3 +62,20 @@ describe('Wizard', () => {
     )
   })
 })
+
+test('standalone wizards center the form without constraining full-width selections', () => {
+  expect(
+    renderToStaticMarkup(
+      <Wizard title="Setup" currentStep="provider" steps={steps}>
+        Fields
+      </Wizard>
+    )
+  ).toContain('mx-auto max-w-5xl')
+  expect(
+    renderToStaticMarkup(
+      <Wizard fullWidth title="Catalog" currentStep="provider" steps={steps}>
+        Choices
+      </Wizard>
+    )
+  ).not.toContain('max-w-5xl')
+})

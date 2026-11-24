@@ -18,6 +18,7 @@ import {
   phaseStates,
   pickActiveRun,
   restoreGate,
+  restoreRequestFailure,
   runPollInterval,
   runTrackingProblemCopy,
   sectionState,
@@ -483,5 +484,68 @@ describe('download phase', () => {
 
   test('download has a readable label', () => {
     expect(phaseLabel('download')).toBe('Download backup')
+  })
+})
+
+describe('waiting for the node', () => {
+  // A worker node at its limit of backups and restores: the server keeps the
+  // run in `waiting_for_node` and retries; without it in PHASES every step
+  // would show as pending.
+  test('a run waiting for its node shows that step active', () => {
+    const states = phaseStates(
+      { phase: 'waiting_for_node', status: 'running' },
+      true
+    )
+    expect(states.find((s) => s.id === 'prepare')?.state).toBe('done')
+    expect(states.find((s) => s.id === 'waiting_for_node')?.state).toBe(
+      'active'
+    )
+    expect(states.find((s) => s.id === 'restore')?.state).toBe('pending')
+    expect(phaseLabel('waiting_for_node')).toBe('Wait for the node')
+  })
+})
+
+describe('a restore whose outcome is unknown', () => {
+  // The worker node is unreachable (or has no record of the restore): the
+  // server holds the run in `outcome_unknown`, between writing and verifying.
+  test('shows the outcome step active after the write steps', () => {
+    const states = phaseStates(
+      { phase: 'outcome_unknown', status: 'running' },
+      true
+    )
+    expect(states.find((s) => s.id === 'restore')?.state).toBe('done')
+    expect(states.find((s) => s.id === 'outcome_unknown')?.state).toBe('active')
+    expect(states.find((s) => s.id === 'verify')?.state).toBe('pending')
+    expect(phaseLabel('outcome_unknown')).toBe(
+      'Confirm the outcome with the node'
+    )
+  })
+})
+
+describe('restore request errors', () => {
+  test('preserves the API action for both preview and start', () => {
+    const detail = 'Re-enter the source credentials on this server.'
+    for (const operation of ['plan', 'start'] as const) {
+      expect(
+        restoreRequestFailure(
+          { title: 'S3 credentials unavailable', detail },
+          operation,
+          true
+        )
+      ).toBe(detail)
+    }
+  })
+  test('an uncertain start directs the operator to history before retrying', () => {
+    const problem = {
+      title: 'Internal Server Error',
+      detail: 'The restore operation could not be completed',
+    }
+    expect(restoreRequestFailure(problem, 'start', true)).toContain(
+      'Check the restore history'
+    )
+    expect(restoreRequestFailure(problem, 'start', true)).toContain('S3 source')
+    expect(restoreRequestFailure(problem, 'plan', false)).toContain(
+      'retry the preview'
+    )
   })
 })

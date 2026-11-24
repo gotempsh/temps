@@ -201,7 +201,7 @@ impl ClientOutcomeService {
                 FROM recent ORDER BY bucket DESC,id DESC LIMIT $3 OFFSET $4
             ) SELECT COALESCE(jsonb_agg(to_jsonb(page) ORDER BY bucket DESC,id DESC),'[]'::jsonb) AS items,
                 (SELECT count(*) FROM recent) AS total FROM page
-        "#,[project_id.into(),(days as i32).into(),(page_size as i64).into(),(((page-1)*page_size) as i64).into()])).await?.ok_or_else(||ErrorTrackingError::Validation("Client outcome query returned no result".into()))?;
+        "#,[project_id.into(),(days as i32).into(),(page_size as i64).into(),(temps_core::config::page_offset(page, page_size) as i64).into()])).await?.ok_or_else(||ErrorTrackingError::Validation("Client outcome query returned no result".into()))?;
         let items = serde_json::from_value(row.try_get("", "items")?).map_err(|_| {
             ErrorTrackingError::Validation("Invalid stored client outcome schema".into())
         })?;
@@ -232,7 +232,7 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn client_outcomes_batch_concurrency_units_scope_and_retention() {
-        let test_db = temps_database::test_utils::TestDatabase::with_migrations()
+        let test_db = temps_test_utils::TestDatabase::with_migrations()
             .await
             .unwrap();
         let db = test_db.connection_arc();

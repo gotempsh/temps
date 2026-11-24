@@ -5,19 +5,20 @@ use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
 use sea_orm::{
     sea_query::{Expr, LockType, Query},
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
+    ActiveEnum, ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend,
     DatabaseTransaction, EntityTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement,
     TransactionTrait,
 };
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
+use temps_config::deployment_config::DeploymentConfigExt;
 use temps_core::{Job, JobQueue, JobReceiver};
 use temps_database::DbConnection;
 use temps_entities::{
     deployments, environments,
     prelude::{DeploymentConfigSnapshot, DeploymentMetadata, GitPushEvent},
-    types::PipelineStatus,
+    types::{JobStatus, PipelineStatus},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, error, info, trace, warn};
@@ -806,7 +807,7 @@ impl JobProcessorService {
 
     pub async fn run(&mut self) -> Result<(), JobProcessorError> {
         debug!("Starting job processor service for deployments");
-        self.reconcile_interrupted_workflows().await?;
+        Self::reconcile_interrupted_workflows(self.db.as_ref()).await?;
         debug!("Job processor initialized and ready to receive jobs");
 
         loop {
@@ -1119,19 +1120,21 @@ impl JobProcessorService {
     /// workflow side effects. A deployment already selected as the current
     /// environment generation remains serving; only its stale running job rows
     /// are closed.
-    async fn reconcile_interrupted_workflows(&mut self) -> Result<(), JobProcessorError> {
-        let result = self
-            .db
+    ///
+    /// A job the restart killed did not finish its work, so it closes as
+    /// `Failure`: nothing reading job status may take it for a completed step.
+    async fn reconcile_interrupted_workflows(db: &DbConnection) -> Result<(), JobProcessorError> {
+        let result = db
             .execute(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 r#"
 WITH interrupted AS (
     UPDATE deployment_jobs
-    SET status = 3,
+    SET status = $3,
         finished_at = now(),
         updated_at = now(),
         error_message = COALESCE(error_message, $1)
-    WHERE status = 2
+    WHERE status = $4
     RETURNING deployment_id
 ), affected AS (
     SELECT DISTINCT deployment_id FROM interrupted
@@ -1150,6 +1153,8 @@ WHERE d.id = a.deployment_id
                 [
                     CONTROL_PLANE_RESTART_JOB_REASON.into(),
                     CONTROL_PLANE_RESTART_FAILED_REASON.into(),
+                    JobStatus::Failure.to_value().into(),
+                    JobStatus::Running.to_value().into(),
                 ],
             ))
             .await
@@ -1184,7 +1189,6 @@ WHERE d.id = a.deployment_id
         durable_job_id: Option<uuid::Uuid>,
     ) -> Result<(), JobProcessorError> {
         use chrono::Utc;
-        use sea_orm::PaginatorTrait;
 
         // Resolve the project.
         let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
@@ -1245,18 +1249,19 @@ WHERE d.id = a.deployment_id
         }
 
         for environment in environments {
-            let deployment_number = deployments::Entity::find()
-                .filter(deployments::Column::ProjectId.eq(project.id))
-                .count(db.as_ref())
+            let deployment_slug =
+                temps_entities::project_deployment_counters::allocate_deployment_slug(
+                    db.as_ref(),
+                    project.id,
+                    &project.slug,
+                )
                 .await
                 .map_err(|error| {
                     JobProcessorError::DatabaseError(format!(
-                        "count deployments for project {}: {error}",
+                        "allocate the next deployment number for project {}: {error}",
                         project.id
                     ))
-                })?
-                + 1;
-            let deployment_slug = format!("{}-{}", project.slug, deployment_number);
+                })?;
 
             let metadata = DeploymentMetadata {
                 external_image_ref: Some(job.image_ref.clone()),
@@ -1795,8 +1800,7 @@ WHERE d.id = a.deployment_id
     /// `pub` — also called directly by the manual-deploy HTTP handlers
     /// (`handlers::remote_deployments::{deploy_from_image,
     /// deploy_from_image_upload, deploy_from_static}`) and by embedding
-    /// binaries that create deployments in-process (e.g. vibetemps' Ship
-    /// It), all of which run outside the job-queue dispatch loop and would
+    /// binaries that create deployments in-process, all of which run outside the job-queue dispatch loop and would
     /// otherwise skip the gate entirely.
     pub async fn gate_check_then_run(
         db: &Arc<DbConnection>,
@@ -2209,46 +2213,20 @@ async fn find_environments_for_branch(
             return Ok(vec![existing_preview]);
         }
 
-        // Check if a soft-deleted preview environment exists for this branch — restore it
-        if let Some(deleted_preview) = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project.id))
-            .filter(environments::Column::Branch.eq(branch_name))
-            .filter(environments::Column::DeletedAt.is_not_null())
-            .one(db.as_ref())
-            .await
-            .map_err(|e| format!("Database error finding deleted preview environment: {}", e))?
-        {
-            info!(
-                "Restoring soft-deleted preview environment {} for branch '{}'",
-                deleted_preview.id, branch_name
-            );
-            let deleted_preview_id = deleted_preview.id;
-            let subdomain = deleted_preview.subdomain.clone();
-            let txn = db
-                .begin()
-                .await
-                .map_err(|error| format!("Failed to begin preview restore: {error}"))?;
-            if environments::claim_subdomain(&txn, &subdomain, &[deleted_preview_id])
-                .await
-                .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
-                .is_some()
-            {
-                return Err(format!("Preview subdomain '{subdomain}' is already in use"));
-            }
-            let mut active_env: environments::ActiveModel = deleted_preview.into();
-            active_env.deleted_at = Set(None);
-            active_env.updated_at = Set(chrono::Utc::now());
-            active_env.current_deployment_id = Set(None);
-            let restored = active_env
-                .update(&txn)
-                .await
-                .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
-            txn.commit()
-                .await
-                .map_err(|error| format!("Failed to commit preview restore: {error}"))?;
-            return Ok(vec![restored]);
-        }
-
+        // A soft-deleted environment for this branch is deliberately NOT
+        // revived here. Reviving reused the old row id, and with it every
+        // `env_var_environments` / `secret_environments` link of the deleted
+        // incarnation -- links that soft delete keeps on purpose, because a
+        // variable left with no links at all would apply to every
+        // environment. The lookup also matched any deleted environment on
+        // the branch, so a push could bring back a deleted staging or
+        // protected environment and hand its scoped secrets to the pushed
+        // code. A push is unattended, so it gets a fresh preview whose
+        // links come from the project's current `include_in_preview`
+        // policy. The deleted row and its links stay as they are, out of
+        // reach of any deployment. An operator who wants the old
+        // environment back can still re-create it explicitly
+        // (`EnvironmentService::create_environment`).
         // Create new preview environment for this branch
         return create_preview_environment(db, project, branch_name, &slugified_branch)
             .await
@@ -2559,7 +2537,7 @@ async fn process_git_push_event(
     }
 
     use chrono::Utc;
-    use sea_orm::{EntityTrait, PaginatorTrait};
+    use sea_orm::EntityTrait;
 
     // Fetch commit info once — it's the same for every environment receiving this push.
     let commit_info =
@@ -2616,40 +2594,34 @@ async fn process_git_push_event(
             );
         }
 
-        // Get the next deployment number for this project.
-        let deployment_count = match deployments::Entity::find()
-            .filter(deployments::Column::ProjectId.eq(project.id))
-            .paginate(db.as_ref(), 1)
-            .num_items()
-            .await
-        {
-            Ok(count) => count,
-            Err(e) => {
-                error!(
-                    "Failed to count deployments for project {}: {}",
-                    project.id, e
-                );
-                return Err(JobProcessorError::DatabaseError(format!(
-                    "count deployments for project {}: {e}",
-                    project.id
-                )));
-            }
-        };
-        let deployment_number = deployment_count + 1;
-
-        let env_slug = if environment.is_preview {
+        // The slug is also the container name: allocate its number from the
+        // project's atomic counter so concurrent deployments never share one.
+        let slug_prefix = if environment.is_preview {
             let sanitized_branch = job
                 .branch
                 .as_ref()
                 .map(|b| b.replace(['/', '_', '.'], "-").to_lowercase())
                 .unwrap_or_else(|| "unknown".to_string());
-            format!(
-                "{}-{}-{}",
-                project.slug, sanitized_branch, deployment_number
-            )
+            format!("{}-{}", project.slug, sanitized_branch)
         } else {
-            format!("{}-{}", project.slug, deployment_number)
+            project.slug.clone()
         };
+        let env_slug = temps_entities::project_deployment_counters::allocate_deployment_slug(
+            db.as_ref(),
+            project.id,
+            &slug_prefix,
+        )
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to allocate the next deployment number for project {}: {}",
+                project.id, e
+            );
+            JobProcessorError::DatabaseError(format!(
+                "allocate the next deployment number for project {}: {e}",
+                project.id
+            ))
+        })?;
 
         let merged_config = if let Some(project_config) = &project.deployment_config {
             if let Some(env_config) = &environment.deployment_config {
@@ -2729,6 +2701,9 @@ async fn process_git_push_event(
             deployment_config: sea_orm::Set(deployment_config_snapshot),
             upload_request_id: sea_orm::Set(None),
             docker_socket_mounted: sea_orm::Set(false),
+            // The deploy job records the image's user once it has checked it.
+            runs_as_root: sea_orm::Set(false),
+            image_user: sea_orm::Set(None),
             created_at: sea_orm::Set(Utc::now()),
             updated_at: sea_orm::Set(Utc::now()),
         };
@@ -2971,10 +2946,10 @@ mod tests {
     use mockall::mock;
     use sea_orm::{ActiveModelTrait, PaginatorTrait, Set};
     use temps_core::QueueError;
-    use temps_database::test_utils::TestDatabase;
+    use temps_deployment_logs::LogService;
     use temps_entities::preset::Preset;
     use temps_entities::upstream_config::UpstreamList;
-    use temps_logs::LogService;
+    use temps_test_utils::TestDatabase;
 
     #[tokio::test]
     async fn test_acquire_failover_recovery_permit_ordinary_job_bypasses_occupied_slot() {
@@ -3090,6 +3065,8 @@ mod tests {
             promoted_from_deployment_id: None,
             upload_request_id: None,
             docker_socket_mounted: false,
+            runs_as_root: false,
+            image_user: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -4106,6 +4083,120 @@ mod tests {
         );
     }
 
+    /// A job killed by a control-plane restart did not finish, so reconcile
+    /// must close it as `Failure`. `Success` here told every status reader that
+    /// an interrupted deployment step had completed.
+    #[tokio::test]
+    async fn test_reconcile_closes_interrupted_jobs_as_failed() {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping interrupted job reconcile test");
+            return;
+        }
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("create test database");
+        let db = test_db.connection_arc();
+        let (project_id, environment_id) = setup_git_push_test_data(db.as_ref())
+            .await
+            .expect("seed project and environment");
+        let deployment = generation_model(
+            project_id,
+            environment_id,
+            "interrupted",
+            "running",
+            "interrupted-commit",
+            Utc::now(),
+        )
+        .insert(db.as_ref())
+        .await
+        .expect("insert running deployment");
+
+        let insert_job = |job_id: &'static str, status: JobStatus, error: Option<&'static str>| {
+            temps_entities::deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set("BuildImageJob".to_string()),
+                name: Set(job_id.to_string()),
+                log_id: Set(format!("reconcile-{job_id}")),
+                status: Set(status),
+                error_message: Set(error.map(str::to_string)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+        };
+        let running = insert_job("running", JobStatus::Running, None)
+            .await
+            .expect("insert running job");
+        let running_with_error = insert_job(
+            "running_with_error",
+            JobStatus::Running,
+            Some("the job's own failure"),
+        )
+        .await
+        .expect("insert running job with an error");
+        let finished = insert_job("finished", JobStatus::Success, None)
+            .await
+            .expect("insert finished job");
+        let pending = insert_job("pending", JobStatus::Pending, None)
+            .await
+            .expect("insert pending job");
+
+        JobProcessorService::reconcile_interrupted_workflows(db.as_ref())
+            .await
+            .expect("reconcile interrupted workflows");
+
+        let reload =
+            |id: i32| temps_entities::deployment_jobs::Entity::find_by_id(id).one(db.as_ref());
+
+        let running = reload(running.id)
+            .await
+            .expect("reload running job")
+            .expect("running job still exists");
+        assert_eq!(running.status, JobStatus::Failure);
+        assert!(running.finished_at.is_some());
+        assert_eq!(
+            running.error_message.as_deref(),
+            Some(CONTROL_PLANE_RESTART_JOB_REASON)
+        );
+
+        let running_with_error = reload(running_with_error.id)
+            .await
+            .expect("reload running job with an error")
+            .expect("running job with an error still exists");
+        assert_eq!(running_with_error.status, JobStatus::Failure);
+        assert_eq!(
+            running_with_error.error_message.as_deref(),
+            Some("the job's own failure"),
+            "an error the job recorded itself must survive the reconcile"
+        );
+
+        let finished = reload(finished.id)
+            .await
+            .expect("reload finished job")
+            .expect("finished job still exists");
+        assert_eq!(finished.status, JobStatus::Success);
+        assert_eq!(finished.error_message, None);
+
+        let pending = reload(pending.id)
+            .await
+            .expect("reload pending job")
+            .expect("pending job still exists");
+        assert_eq!(pending.status, JobStatus::Pending);
+        assert_eq!(pending.finished_at, None);
+
+        let deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await
+            .expect("reload deployment")
+            .expect("deployment still exists");
+        assert_eq!(deployment.state, "failed");
+        assert_eq!(
+            deployment.cancelled_reason.as_deref(),
+            Some(CONTROL_PLANE_RESTART_FAILED_REASON)
+        );
+    }
+
     #[tokio::test]
     async fn test_failed_restart_durable_image_delivery_creates_fresh_generation() {
         if !database_integration_tests_available().await {
@@ -4718,7 +4809,6 @@ mod tests {
         }
     }
 
-    #[allow(dead_code)]
     async fn setup_test_data(db: &DbConnection) -> Result<(i32, i32), Box<dyn std::error::Error>> {
         // Create test project
         let project = temps_entities::projects::ActiveModel {
@@ -5096,14 +5186,14 @@ mod tests {
             )
             .await?;
 
-        // Verify jobs were created (nextjs project should create 10 jobs including
+        // Verify jobs were created (nextjs project should create 11 jobs including
         // persist_static_assets, configure_crons, configure_metric_alerts,
-        // configure_agents, scan_vulnerabilities, and capture_source_maps)
+        // configure_agents, deployment_workflows, scan_vulnerabilities, and capture_source_maps)
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert_eq!(
             jobs.len(),
-            10,
-            "Expected 10 jobs but got {}: {:?}",
+            11,
+            "Expected 11 jobs but got {}: {:?}",
             jobs.len(),
             job_ids
         );
@@ -5114,6 +5204,7 @@ mod tests {
         assert!(job_ids.contains(&"deploy_container".to_string()));
         assert!(job_ids.contains(&"persist_static_assets".to_string()));
         assert!(job_ids.contains(&"mark_deployment_complete".to_string()));
+        assert!(job_ids.contains(&"deployment_workflows".to_string()));
         assert!(job_ids.contains(&"configure_crons".to_string()));
         assert!(job_ids.contains(&"configure_metric_alerts".to_string()));
         assert!(job_ids.contains(&"scan_vulnerabilities".to_string()));
@@ -5800,6 +5891,111 @@ mod tests {
             .await?
             .expect("row still exists");
         assert!(still_deleted.deleted_at.is_some());
+
+        Ok(())
+    }
+
+    /// A push to a branch whose preview was deleted gets a fresh preview:
+    /// the deleted row's variable links stay with the deleted row instead of
+    /// being handed to the pushed code, and no link is dropped (which would
+    /// widen a variable to every environment).
+    #[tokio::test]
+    async fn test_push_creates_fresh_preview_instead_of_reviving_deleted_one(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars, environments};
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Preview Revival Test".to_string()),
+            slug: Set("preview-revival".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            preset: Set(Preset::NextJs),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            enable_preview_environments: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deleted_preview = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("feature-x".to_string()),
+            slug: Set("feature-x".to_string()),
+            host: Set(String::new()),
+            branch: Set(Some("feature-x".to_string())),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("preview-revival-feature-x".to_string()),
+            is_preview: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            deleted_at: Set(Some(Utc::now())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let new_var = |key: &str, include_in_preview: bool| env_vars::ActiveModel {
+            project_id: Set(project.id),
+            key: Set(key.to_string()),
+            value: Set("value".to_string()),
+            include_in_preview: Set(include_in_preview),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        // Scoped only to the deleted incarnation.
+        let stale = new_var("OLD_PREVIEW_TOKEN", false)
+            .insert(db.as_ref())
+            .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(stale.id),
+            environment_id: Set(deleted_preview.id),
+            created_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        // What the project currently says every preview receives.
+        let policy = new_var("PREVIEW_API_URL", true).insert(db.as_ref()).await?;
+
+        let found = find_environments_for_branch(db.clone(), &project, Some("feature-x")).await?;
+        assert_eq!(found.len(), 1);
+        let preview = &found[0];
+        assert_ne!(
+            preview.id, deleted_preview.id,
+            "the deleted row must not be revived"
+        );
+        assert!(preview.is_preview);
+
+        let linked: Vec<i32> = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvironmentId.eq(preview.id))
+            .all(db.as_ref())
+            .await?
+            .into_iter()
+            .map(|link| link.env_var_id)
+            .collect();
+        assert_eq!(linked, vec![policy.id], "only the preview policy is linked");
+
+        let old = environments::Entity::find_by_id(deleted_preview.id)
+            .one(db.as_ref())
+            .await?
+            .expect("deleted row still exists");
+        assert!(old.deleted_at.is_some());
+        let stale_links = env_var_environments::Entity::find()
+            .filter(env_var_environments::Column::EnvVarId.eq(stale.id))
+            .all(db.as_ref())
+            .await?;
+        assert_eq!(
+            stale_links.len(),
+            1,
+            "the stale variable keeps its link, so it never becomes global"
+        );
 
         Ok(())
     }

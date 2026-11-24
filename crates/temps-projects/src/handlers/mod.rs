@@ -5,6 +5,7 @@ pub(crate) mod audit;
 pub mod custom_domains;
 #[allow(clippy::module_inception)]
 mod handlers;
+pub mod ingest_setup;
 pub mod operations;
 mod preset_configs;
 pub mod templates;
@@ -16,3 +17,5 @@ pub use preset_configs::*;
 pub use types::*;
 
 pub mod compose_security;
+pub mod container_security;
+pub mod identical_builds;

@@ -13,6 +13,7 @@ use temps_entities::{ai_provider_keys, ai_provider_models};
 
 use crate::error::AiGatewayError;
 use crate::services::{GatewayService, ProviderKeyService};
+use crate::types::DiscoveredModel;
 
 pub const MODEL_SOURCE_DISCOVERED: &str = "discovered";
 pub const MODEL_SOURCE_MANUAL: &str = "manual";
@@ -89,6 +90,18 @@ impl ProviderModelService {
         if models.is_empty() {
             return Ok(());
         }
+        // A key whose catalog was ever discovered has a real inventory: the
+        // bootstrap list is only a guess at what an unknown key serves, and
+        // inserting it would offer, and pick as defaults, models that key may
+        // not be entitled to until the next refresh succeeds.
+        let discovered = ai_provider_models::Entity::find()
+            .filter(ai_provider_models::Column::ProviderKeyId.eq(key.id))
+            .filter(ai_provider_models::Column::Source.eq(MODEL_SOURCE_DISCOVERED))
+            .one(self.db.as_ref())
+            .await?;
+        if discovered.is_some() {
+            return Ok(());
+        }
         let rows = models
             .into_iter()
             .map(|model| ai_provider_models::ActiveModel {
@@ -121,7 +134,7 @@ impl ProviderModelService {
     ) -> Result<Vec<ai_provider_models::Model>, AiGatewayError> {
         let discovered = self
             .gateway
-            .discover_models_for_key(provider_key_id)
+            .discover_model_catalog_for_key(provider_key_id)
             .await?;
         self.apply_discovered(provider_key_id, discovered).await
     }
@@ -133,7 +146,7 @@ impl ProviderModelService {
     pub async fn apply_discovered(
         &self,
         provider_key_id: i32,
-        discovered: Vec<crate::types::ModelInfo>,
+        discovered: Vec<DiscoveredModel>,
     ) -> Result<Vec<ai_provider_models::Model>, AiGatewayError> {
         let existing = self.list_for_key(provider_key_id).await?;
         let manual_ids: HashSet<&str> = existing
@@ -158,27 +171,41 @@ impl ProviderModelService {
             .exec(&transaction)
             .await?;
 
-        for model in discovered {
+        for discovered_model in discovered {
+            let DiscoveredModel {
+                info: model,
+                details,
+            } = discovered_model;
+            let metadata = details
+                .as_ref()
+                .and_then(|details| serde_json::to_value(details).ok());
+            // The catalogue's own name when it gives one, else the id.
+            let display_name = details
+                .as_ref()
+                .and_then(|details| details.name.clone())
+                .unwrap_or_else(|| model.id.clone());
             if manual_ids.contains(model.id.as_str()) {
                 continue;
             }
             if let Some(existing) = existing_by_id.get(model.id.as_str()) {
                 let mut active: ai_provider_models::ActiveModel = (*existing).clone().into();
-                active.display_name = Set(model.id.clone());
+                active.display_name = Set(display_name);
                 active.source = Set(MODEL_SOURCE_DISCOVERED.to_string());
                 active.is_available = Set(true);
                 active.owned_by = Set(Some(model.owned_by));
+                active.metadata = Set(metadata);
                 active.last_seen_at = Set(Some(now));
                 active.update(&transaction).await?;
             } else {
                 ai_provider_models::ActiveModel {
                     provider_key_id: Set(provider_key_id),
-                    model_id: Set(model.id.clone()),
-                    display_name: Set(model.id),
+                    model_id: Set(model.id),
+                    display_name: Set(display_name),
                     source: Set(MODEL_SOURCE_DISCOVERED.to_string()),
                     is_available: Set(true),
                     is_enabled: Set(true),
                     owned_by: Set(Some(model.owned_by)),
+                    metadata: Set(metadata),
                     last_seen_at: Set(Some(now)),
                     ..Default::default()
                 }
@@ -480,6 +507,64 @@ mod tests {
             service.add_manual(2, "claude-haiku-4-5", None).await,
             Err(AiGatewayError::Validation { .. })
         ));
+    }
+
+    fn insert_statements(db: DatabaseConnection) -> usize {
+        db.into_transaction_log()
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| statement.sql.starts_with("INSERT"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seeding_skips_a_key_with_a_discovered_catalog() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![model("gpt-5-nano", true, true)]])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db.clone(), keys, gateway);
+
+        service
+            .seed_bootstrap(&provider_key(7))
+            .await
+            .expect("skipping the seed is not an error");
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the test holds the only connection");
+        assert_eq!(insert_statements(db), 0);
+    }
+
+    #[tokio::test]
+    async fn bootstrap_seeding_fills_a_key_without_a_discovered_catalog() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<ai_provider_models::Model>::new()])
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db.clone(), keys, gateway);
+
+        service
+            .seed_bootstrap(&provider_key(7))
+            .await
+            .expect("a key without a discovered catalog is seeded");
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("the test holds the only connection");
+        assert_eq!(insert_statements(db), 1);
     }
 
     #[tokio::test]

@@ -51,7 +51,19 @@ const isGitHubApp = (provider: ProviderResponse) =>
 export function GitSources() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const navigate = useNavigate()
-  const { feedback, clearFeedback } = useFeedback()
+  const { feedback, clearFeedback, showError } = useFeedback()
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.hash.slice(1))
+    if (params.get('reauthorize_error') !== 'invalid_state') return
+    window.history.replaceState(
+      null,
+      '',
+      window.location.pathname + window.location.search
+    )
+    showError(
+      'Reauthorization could not be completed. The authorization was already used, is invalid, or the connection was removed. Start Reauthorize again from the connection.'
+    )
+  }, [showError])
   const queryClient = useQueryClient()
   const [providerToDelete, setProviderToDelete] =
     useState<ProviderResponse | null>(null)
@@ -157,16 +169,16 @@ export function GitSources() {
   }
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Git Providers' }])
+    setBreadcrumbs([{ label: 'Git providers' }])
   }, [setBreadcrumbs])
 
-  usePageTitle('Git Providers')
+  usePageTitle('Git providers')
 
   return (
     <div className="flex-1 overflow-auto">
       <PageContainer>
         <PageHeader
-          title="Git Providers"
+          title="Git providers"
           description="Manage your Git providers for repository access and deployments"
           actions={
             <>
@@ -182,7 +194,7 @@ export function GitSources() {
               <CreateActionButton
                 size="sm"
                 onClick={() => navigate('/git-providers/add')}
-                label="Add Git Provider"
+                label="Add Git provider"
               />
             </>
           }
@@ -222,7 +234,7 @@ export function GitSources() {
           >
             <Button onClick={() => navigate('/git-providers/add')}>
               <Plus className="mr-2 h-4 w-4" />
-              Add Git Provider
+              Add Git provider
             </Button>
           </EmptyPlaceholder>
         ) : (
@@ -300,7 +312,7 @@ export function GitSources() {
                       }}
                     >
                       <Trash2 className="h-4 w-4 mr-2" />
-                      Remove Provider
+                      Remove provider
                     </DropdownMenuItem>
                   </DropdownMenuContent>
                 </DropdownMenu>

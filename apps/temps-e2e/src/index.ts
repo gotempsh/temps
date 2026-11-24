@@ -12,10 +12,12 @@ import { tlsScenarioCommand } from './commands/tls-scenario.ts'
 import { dns01WildcardScenarioCommand } from './commands/dns01-wildcard-scenario.ts'
 import { emailScenarioCommand } from './commands/email-scenario.ts'
 import { cliScenarioCommand } from './commands/cli-scenario.ts'
+import { edgeRulesScenarioCommand } from './commands/edge-rules-scenario.ts'
 import { kvScenarioCommand } from './commands/kv-scenario.ts'
 import { blobScenarioCommand } from './commands/blob-scenario.ts'
 import { flagsScenarioCommand } from './commands/flags-scenario.ts'
 import { backupRestoreScenarioCommand } from './commands/backup-restore-scenario.ts'
+import { postgresCrossServerRecoveryScenario } from './commands/postgres-cross-server-recovery-scenario.ts'
 import { pitrScenarioCommand } from './commands/pitr-scenario.ts'
 import { auditScenarioCommand } from './commands/audit-scenario.ts'
 import { managedServicesScenarioCommand } from './commands/managed-services-scenario.ts'
@@ -59,6 +61,11 @@ function connection(): { url?: string; apiKey?: string } {
   const o = program.opts<{ url?: string; apiKey?: string }>()
   return { url: o.url, apiKey: o.apiKey }
 }
+
+program
+  .command('postgres-cross-server-recovery-scenario')
+  .description('Recover an older PostgreSQL snapshot across two disposable Temps servers sharing MinIO (requires TEMPS_BIN and Docker)')
+  .action(postgresCrossServerRecoveryScenario)
 
 program
   .command('ping')
@@ -169,6 +176,20 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await cliScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('edge-rules-scenario')
+  .description(
+    'Edge rules through the real CLI against a deployed app: a new rule starts log-only and is counted, enforce blocks with its body while / and ACME pass, apply adds a live redirect and is idempotent, delete restores the app',
+  )
+  .option('--image <ref>', 'public Docker image to deploy (must answer 200 on any path)', 'traefik/whoami:latest')
+  .option('--port <port>', 'container port the image listens on', '80')
+  .option('--keep', 'do not tear down created resources')
+  .option('--deploy-timeout <ms>', 'max wait for deploy to go healthy', '300000')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await edgeRulesScenarioCommand({ ...opts, connection: connection() })
   })
 
 program

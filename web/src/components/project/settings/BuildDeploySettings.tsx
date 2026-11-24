@@ -7,7 +7,9 @@ import { DeployDefaultsCard } from './DeployDefaultsCard'
 import { DeploymentSourceCard } from './DeploymentSourceCard'
 import { HostingCard } from './HostingCard'
 import { EnvironmentPortOverrideCard } from './EnvironmentPortOverrideCard'
+import { IdenticalBuildsCard } from './IdenticalBuildsCard'
 import { ImageRetentionCard } from './ImageRetentionCard'
+import { LogIngestionCard } from './LogIngestionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
 import { ServiceTemplateRuntimeCard } from './ServiceTemplateRuntimeCard'
 
@@ -56,6 +58,10 @@ export function BuildDeploySettings({
           ) : (
             <BuildSettings project={project} refetch={refetch} embedded />
           )}
+          {project.project_type !== 'service' &&
+            project.hosting !== 'external' && (
+              <IdenticalBuildsCard projectId={project.id} />
+            )}
         </div>
       )}
 
@@ -64,6 +70,7 @@ export function BuildDeploySettings({
           <DeployDefaultsCard project={project} refetch={refetch} />
           <EnvironmentPortOverrideCard project={project} />
           <ImageRetentionCard project={project} refetch={refetch} />
+          <LogIngestionCard project={project} refetch={refetch} />
         </div>
       )}
 

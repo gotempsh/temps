@@ -5,14 +5,17 @@
 name = "temps-flags"
 version.workspace = true
 edition.workspace = true
+description = "Feature flags: per-project flags with per-environment values, evaluation and bucketing, changed without a redeploy"
 license.workspace = true
 authors.workspace = true
 
 [dependencies]
 # Internal crates
 temps-core = { path = "../temps-core" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
+temps-routes = { path = "../temps-routes" }
+temps-geo = { path = "../temps-geo" }
 
 # Web framework
 axum.workspace = true
@@ -22,7 +25,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 # Error handling & logging
-anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
@@ -40,6 +42,17 @@ sea-orm.workspace = true
 sha2.workspace = true
 hex.workspace = true
 
+# `matches` conditions: linear-time, size-limited patterns
+regex.workspace = true
+
+# Evaluation endpoints: lock-free flag cache, bounded loads, implicit context
+arc-swap.workspace = true
+tokio = { workspace = true, features = ["sync"] }
+woothee.workspace = true
+
 [dev-dependencies]
-tokio = { workspace = true, features = ["test-util", "macros"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
 async-trait.workspace = true
+
+[lints]
+workspace = true

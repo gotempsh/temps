@@ -12,6 +12,13 @@
 //! - Email sending with storage
 //! - Provider credential encryption
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod dns;
 pub mod errors;
 pub mod handlers;

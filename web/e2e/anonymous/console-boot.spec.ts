@@ -31,7 +31,9 @@ test.describe('console boot', () => {
     await expectAppMounted(page)
 
     // A specific piece of app-rendered content, not just "something rendered".
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Sign in', exact: true })
+    ).toBeVisible()
     await expect(page.getByLabel('Email')).toBeVisible()
     await expect(page.getByLabel('Password')).toBeVisible()
 
@@ -70,7 +72,9 @@ test.describe('console boot', () => {
     // URL untouched. Asserting on a redirect here would be asserting on
     // behaviour the console does not have -- what matters is that the guarded
     // content is withheld and the user is given a way in.
-    await expect(page.getByRole('button', { name: 'Sign in' })).toBeVisible()
+    await expect(
+      page.getByRole('button', { name: 'Sign in', exact: true })
+    ).toBeVisible()
     await expect(
       page.getByRole('heading', { name: 'Projects', exact: true }),
       'protected content must not render for a signed-out visitor'

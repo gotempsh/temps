@@ -46,15 +46,19 @@ impl temps_core::plugin::TempsPlugin for ScreenshotsPlugin {
             debug!("Registering screenshot service");
 
             let config_service = context.require_service::<ConfigService>();
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
             // Always create the screenshot service, even if disabled
             // This is required because DeploymentsPlugin depends on it
-            let screenshot_service = ScreenshotService::new(config_service.clone())
-                .await
-                .map_err(|e| PluginError::PluginRegistrationFailed {
-                    plugin_name: "screenshots".to_string(),
-                    error: format!("Failed to create screenshot service: {}", e),
-                })?;
+            let screenshot_service = ScreenshotService::new_with_audit(
+                config_service.clone(),
+                Some(audit_service.as_ref()),
+            )
+            .await
+            .map_err(|e| PluginError::PluginRegistrationFailed {
+                plugin_name: "screenshots".to_string(),
+                error: format!("Failed to create screenshot service: {}", e),
+            })?;
 
             // Check if screenshots are enabled (for logging purposes only)
             let screenshots_enabled = config_service

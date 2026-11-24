@@ -2,83 +2,42 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Regression tests for the Temps skill validator."""
-
-from __future__ import annotations
-
 import tempfile
 import unittest
 from pathlib import Path
-
-from validate_skill import GUARDED_SKILLS, check_integrity_pins
-
-
-GUARD = """```bash
-expected_temps_cli_integrity='{pin}'
-actual_temps_cli_integrity="$(npm view @temps-sdk/cli@9.9.9 dist.integrity)"
-```
-"""
+from validate_skill import CLI_SKILLS, check_cli_references
 
 
-def write_skills(root: Path, pins: dict[str, str]) -> None:
-    for skill, pin in pins.items():
-        skill_root = root / skill
-        skill_root.mkdir(parents=True)
-        (skill_root / "SKILL.md").write_text(GUARD.format(pin=pin), encoding="utf-8")
-
-
-class IntegrityPinTests(unittest.TestCase):
-    def test_accepts_skills_pinning_the_published_artifact(self) -> None:
+class CliReferenceTests(unittest.TestCase):
+    def test_latest_and_source_attribution_are_allowed_but_fixed_invocations_fail(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_skills(root, {skill: "sha512-current" for skill in GUARDED_SKILLS})
+            for skill in CLI_SKILLS:
+                (root / skill).mkdir()
+                (root / skill / 'SKILL.md').write_text(
+                    'Generated from: @temps-sdk/cli@1.2.3\nbunx @temps-sdk/cli@latest --help')
+            self.assertEqual(check_cli_references(root), [])
+            (root / 'temps/SKILL.md').write_text('npx @temps-sdk/cli@1.2.3 --help')
+            self.assertEqual(len(check_cli_references(root)), 1)
 
-            self.assertEqual(check_integrity_pins(root, "sha512-current"), [])
-
-    def test_rejects_a_pin_left_behind_by_a_version_bump(self) -> None:
+    def test_beta_is_allowed_but_mixing_channels_fails(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            write_skills(
-                root,
-                {
-                    "temps": "sha512-previous",
-                    "temps-cli": "sha512-current",
-                },
-            )
-
-            errors = check_integrity_pins(root, "sha512-current")
-
+            for skill in CLI_SKILLS:
+                (root / skill).mkdir()
+                (root / skill / 'SKILL.md').write_text(
+                    'Generated from: @temps-sdk/cli@0.2.0-beta.1\nbunx @temps-sdk/cli@beta --help')
+            self.assertEqual(check_cli_references(root), [])
+            (root / 'temps/SKILL.md').write_text('npx @temps-sdk/cli@latest --help')
+            errors = check_cli_references(root)
             self.assertEqual(len(errors), 1)
-            self.assertIn("temps/SKILL.md", errors[0])
-            self.assertIn("sha512-previous", errors[0])
+            self.assertIn('mix channels', errors[0])
+            (root / 'temps/SKILL.md').write_text('npx @temps-sdk/cli@beta.1 --help')
+            self.assertIn('stale CLI invocation pin', check_cli_references(root)[0])
 
-    def test_rejects_a_skill_with_no_guard_at_all(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            for skill in GUARDED_SKILLS:
-                (root / skill).mkdir(parents=True)
-                (root / skill / "SKILL.md").write_text("no guard", encoding="utf-8")
-
-            errors = check_integrity_pins(root, "sha512-current")
-
-            self.assertEqual(len(errors), 1)
-            self.assertIn("no expected_temps_cli_integrity guard", errors[0])
-
-    def test_reports_a_missing_guarded_skill(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            write_skills(root, {GUARDED_SKILLS[0]: "sha512-current"})
-
-            errors = check_integrity_pins(root, "sha512-current")
-
-            self.assertEqual(len(errors), 1)
-            self.assertIn(f"skills/{GUARDED_SKILLS[1]}", errors[0])
-
-    def test_the_checked_in_skills_pin_the_published_artifact(self) -> None:
-        skills_root = Path(__file__).resolve().parents[2]
-
-        self.assertEqual(check_integrity_pins(skills_root), [])
+    def test_checked_in_skills(self):
+        self.assertEqual(check_cli_references(Path(__file__).resolve().parents[2]), [])
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

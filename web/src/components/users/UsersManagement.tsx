@@ -47,12 +47,14 @@ import {
   MoreHorizontal,
   Plus,
   Shield,
+  ShieldOff,
   Trash2,
   UserPlus,
 } from 'lucide-react'
 import { useState } from 'react'
 import { Link, useNavigate } from 'react-router'
 import { toast } from 'sonner'
+import { ResetMfaDialog, ResetMfaTarget } from './ResetMfaDialog'
 import { ResetPasswordDialog, ResetPasswordTarget } from './ResetPasswordDialog'
 import { RolePermissionDetails } from './RolePermissionDetails'
 
@@ -95,6 +97,9 @@ export function UsersManagement({
     useState<RouteUserWithRoles | null>(null)
   const [userToResetPassword, setUserToResetPassword] =
     useState<ResetPasswordTarget | null>(null)
+  const [userToResetMfa, setUserToResetMfa] = useState<ResetMfaTarget | null>(
+    null
+  )
   const { user: currentUser } = useAuth()
   // Creating a user needs `users:write`, which only instance administrators
   // hold; offering it to anyone else just leads to a refusal.
@@ -225,6 +230,10 @@ export function UsersManagement({
         user={userToResetPassword}
         onClose={() => setUserToResetPassword(null)}
       />
+      <ResetMfaDialog
+        user={userToResetMfa}
+        onClose={() => setUserToResetMfa(null)}
+      />
       <PageHeader
         title="Users"
         description="Manage user access and roles"
@@ -234,7 +243,7 @@ export function UsersManagement({
           canManageUsers ? (
             <CreateActionButton
               onClick={() => navigate('/settings/users/new')}
-              label="Add User"
+              label="Add user"
               icon={<UserPlus className="h-4 w-4" />}
             />
           ) : undefined
@@ -278,7 +287,7 @@ export function UsersManagement({
       >
         <DialogContent className="max-h-[90vh] overflow-y-auto sm:max-w-2xl">
           <DialogHeader>
-            <DialogTitle>Manage User Role</DialogTitle>
+            <DialogTitle>Manage user role</DialogTitle>
             <p className="text-sm text-muted-foreground">
               Select a role for{' '}
               {userToManageRoles?.user.name || userToManageRoles?.user.username}
@@ -423,7 +432,7 @@ export function UsersManagement({
             canManageUsers ? (
               <Button onClick={() => navigate('/settings/users/new')}>
                 <Plus className="mr-2 h-4 w-4" />
-                Add User
+                Add user
               </Button>
             ) : undefined
           }
@@ -513,7 +522,7 @@ export function UsersManagement({
                             onClick={() => setUserToManageRoles(user)}
                           >
                             <Shield className="mr-2 h-4 w-4" />
-                            Manage Roles
+                            Manage roles
                           </DropdownMenuItem>
                           {currentUser?.id === user.user.id ? (
                             <DropdownMenuItem
@@ -536,6 +545,28 @@ export function UsersManagement({
                             >
                               <KeyRound className="mr-2 h-4 w-4" />
                               Reset password
+                            </DropdownMenuItem>
+                          )}
+                          {currentUser?.id !== user.user.id && (
+                            <DropdownMenuItem
+                              // Kept visible when there is nothing to reset,
+                              // so admins learn the recovery path exists.
+                              disabled={
+                                !user.user.mfa_enabled || !!user.user.deleted_at
+                              }
+                              onClick={() =>
+                                setUserToResetMfa({
+                                  id: user.user.id,
+                                  name:
+                                    user.user.name || user.user.username || '',
+                                  email: user.user.email || '',
+                                })
+                              }
+                            >
+                              <ShieldOff className="mr-2 h-4 w-4" />
+                              {user.user.mfa_enabled
+                                ? 'Reset MFA'
+                                : 'Reset MFA (not enrolled)'}
                             </DropdownMenuItem>
                           )}
                           <DropdownMenuSeparator />

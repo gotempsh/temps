@@ -41,12 +41,12 @@ pub use provider::{
 pub use service::{
     AiError, AiRequest, AiResponse, AiRouteMetadata, AiService, CredentialVerificationDiagnostic,
     CredentialVerificationStage, NativeSessionExport, NativeSessionExportRequest,
-    RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest, RuntimeProcessResponse,
-    RuntimeProcessSnapshot,
+    ProviderFailureKind, RuntimeProcessLogLine, RuntimeProcessOperation, RuntimeProcessRequest,
+    RuntimeProcessResponse, RuntimeProcessSnapshot,
 };
 pub use streaming::{
-    ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse, ChatTurnStream,
-    ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
+    ChatImage, ChatMessage, ChatStreamDelta, ChatTool, ChatTurnRequest, ChatTurnResponse,
+    ChatTurnStream, ContextUsageSource, ContextWindowUsage, HarnessMcpServer, HarnessWorkspace,
     InteractionExecutor, PermissionDecision, PermissionKind, PermissionRequest, SandboxAttachment,
     SensitiveEnvironment, TokenStream, ToolCall, ToolExecutor, TurnServices,
 };

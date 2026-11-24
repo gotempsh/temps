@@ -106,6 +106,11 @@ jobs:
           bun install --frozen-lockfile
           bun run typecheck
 
+      - name: Recover an S3-only PostgreSQL snapshot on a second Temps server
+        if: matrix.shard == 'recovery'
+        working-directory: apps/temps-e2e
+        run: bun run e2e postgres-cross-server-recovery-scenario
+
       - name: Start registry and external-service fixtures
         run: |
           docker run -d --name temps-e2e-registry -p 5111:5000 registry:2
@@ -128,10 +133,17 @@ jobs:
           fi
           printf 'TEMPS_E2E_MARIADB_IMAGE=%s\n' "$MARIADB_IMAGE_ID" >> "$GITHUB_ENV"
 
+      # The services shard's KV scenario and the recovery shard create Redis
+      # from the default image; build it from this checkout when its tag is
+      # not published yet (a change moving the default).
+      - name: Make the default Redis image available
+        if: matrix.shard == 'services' || matrix.shard == 'recovery'
+        run: .github/scripts/ensure-default-redis-image.sh
+
       - name: Test recovery scenario contracts
         if: matrix.shard == 'recovery'
         working-directory: apps/temps-e2e
-        run: bun test src/lib/mariadb-image.test.ts src/lib/mongosh.test.ts
+        run: bun test src/commands/postgres-cross-server-recovery-scenario.test.ts src/lib/mariadb-image.test.ts src/lib/mongosh.test.ts
 
       - name: Prepare Temps instance
         # Authenticate public GitHub API requests made by the git-deploy

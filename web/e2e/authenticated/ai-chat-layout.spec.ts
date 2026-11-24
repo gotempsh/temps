@@ -14,9 +14,13 @@ import { expect, expectAppMounted, test } from '../fixtures'
  * available). With a banner up it overflowed by ~90px and the composer was cut
  * in half.
  *
- * The assertion is on the scroll container rather than on a screenshot because
- * this is a layout invariant, not an appearance one: the page must never make
- * the shell's content area scroll, at any viewport, with or without banners.
+ * The assertion is on the content slot rather than on a screenshot because this
+ * is a layout invariant, not an appearance one: the page must never overflow
+ * the shell's content area, at any viewport, with or without banners. `/chat`
+ * is a focus mode whose slot clips (`overflow: hidden`) instead of scrolling,
+ * so an overflow there would not scroll at all -- it would cut the composer
+ * off -- which is why the slot's own bounds are checked against the viewport
+ * too.
  */
 test.describe('AI chat layout', () => {
   test('fits the content area without making the shell scroll', async ({
@@ -33,27 +37,32 @@ test.describe('AI chat layout', () => {
     ).toBeVisible()
 
     const overflow = await page.evaluate(() => {
-      // The shell's page-content slot: the only scroller between <main> and the
-      // routed page. If it can scroll, the page overflowed it.
-      const scroller = Array.from(document.querySelectorAll('main > div')).find(
-        (element) => getComputedStyle(element).overflowY === 'auto'
+      // The shell's page-content slot: the only box between <main> and the
+      // routed page that bounds it. It scrolls on console pages and clips in
+      // focus mode; either way, content taller than it overflowed.
+      const slot = Array.from(document.querySelectorAll('main > div')).find(
+        (element) =>
+          ['auto', 'hidden'].includes(getComputedStyle(element).overflowY)
       ) as HTMLElement | undefined
 
-      if (!scroller) return null
+      if (!slot) return null
       return {
-        scrollHeight: scroller.scrollHeight,
-        clientHeight: scroller.clientHeight,
+        scrollHeight: slot.scrollHeight,
+        clientHeight: slot.clientHeight,
+        bottom: slot.getBoundingClientRect().bottom,
+        viewportHeight: window.innerHeight,
       }
     })
 
-    expect(
-      overflow,
-      'the shell content scroller should be findable'
-    ).not.toBeNull()
+    expect(overflow, 'the shell content slot should be findable').not.toBeNull()
     expect(
       overflow!.scrollHeight,
       'the AI chat page must not overflow the shell content area -- when it does, the bottom-anchored composer falls below the fold'
     ).toBeLessThanOrEqual(overflow!.clientHeight)
+    expect(
+      overflow!.bottom,
+      'the content slot must end inside the viewport, or its bottom rows are off screen'
+    ).toBeLessThanOrEqual(overflow!.viewportHeight)
 
     expect(consoleErrors).toEqual([])
   })

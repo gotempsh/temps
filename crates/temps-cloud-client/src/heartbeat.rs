@@ -21,6 +21,16 @@
 //! exponential backoff — never a tight loop, never a panic, never a blocking
 //! call on any other path.
 //!
+//! An *established* connection that drops is different: proxies in front of
+//! the backend close idle-looking WebSockets now and then, and the console
+//! marks an instance degraded once heartbeats stop for a few minutes. So a
+//! connection that stayed up for [`STABLE_CONNECTION_INTERVAL`] resets the
+//! backoff and reconnects after [`RECONNECT_AFTER_DROP`], instead of carrying
+//! an old outage's doubled delay forward. The drop is logged at warn level
+//! and the recovery at info level, with how long it took, so a flapping
+//! channel is visible in the instance's own logs rather than only in the
+//! console.
+//!
 //! # Protocol
 //!
 //! `GET {backend}/v1/management`, upgraded to a WebSocket and authenticated
@@ -57,13 +67,41 @@ use tokio_tungstenite::{
 use uuid::Uuid;
 
 use temps_cloud_protocol::{
-    truncate_status_text, Capability, Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport,
-    StatusRequest, StatusSelfUpdate, PROTOCOL_VERSION,
+    truncate_status_text, Capability, ConsoleLogout, ConsoleLogoutAck, ConsoleLogoutRejected,
+    Envelope, Heartbeat, HeartbeatAck, Hello, StatusReport, StatusRequest, StatusSelfUpdate,
+    CONSOLE_LOGOUT_ACK_KIND, CONSOLE_LOGOUT_KIND, CONSOLE_LOGOUT_REJECTED_KIND,
+    MAX_CONSOLE_LOGOUT_REJECTION_CHARS, PROTOCOL_VERSION,
 };
 
 use crate::link::CloudLink;
 use crate::status_provider::StatusProvider;
 use crate::BackendUrl;
+
+/// Applies a `console_logout` frame (ADR-094): verifies the logout token
+/// against the backend-managed OIDC provider's keys and ends that user's
+/// sessions. Implemented by the host, which owns authentication; this crate
+/// only carries the frame and the answer.
+#[async_trait::async_trait]
+pub trait ConsoleLogoutSink: Send + Sync {
+    async fn apply(&self, logout_token: &str) -> ConsoleLogoutOutcome;
+}
+
+/// What [`ConsoleLogoutSink::apply`] did with one token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleLogoutOutcome {
+    /// Verified; `sessions_ended` sessions (possibly zero) are gone.
+    Applied { jti: Uuid, sessions_ended: u32 },
+    /// Refused for `reason`. The backend stops re-sending it; the host's
+    /// own session re-check still applies.
+    Rejected { jti: Uuid, reason: String },
+    /// Not even a request id could be read. Nothing to answer.
+    Unreadable,
+}
+
+/// Bound on one [`ConsoleLogoutSink::apply`], which runs on this loop like
+/// [`StatusProvider::snapshot`] does, for the same reason. On a timeout no
+/// answer is sent and the backend sends the token again later.
+pub const CONSOLE_LOGOUT_APPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 type WsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 type WsWrite = SplitSink<WsStream, Message>;
@@ -123,6 +161,18 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(8);
 /// so recovery — or enrollment — is noticed without a restart.
 const MAX_RECONNECT_INTERVAL: Duration = Duration::from_secs(15 * 60);
 
+/// First retry after an established connection drops. Far below
+/// [`HEARTBEAT_INTERVAL`]: the backend is very likely still up (a proxy closed
+/// the socket), and every second spent waiting is a second without
+/// heartbeats. Further failures double from here, as for any other outage.
+const RECONNECT_AFTER_DROP: Duration = Duration::from_secs(5);
+
+/// A handshake alone does not show the backend has recovered: a connection
+/// must stay up this long before its drop resets the backoff. Otherwise a
+/// backend that accepts and immediately closes would be retried every
+/// [`RECONNECT_AFTER_DROP`] forever. Matches `console_proxy`'s threshold.
+const STABLE_CONNECTION_INTERVAL: Duration = Duration::from_secs(30);
+
 /// What a connection cycle did, so the caller knows how to schedule the next
 /// attempt. Mirrors the shape of `temps-cloud::backup_mirror`'s
 /// `SweepOutcome`/`next_sweep_interval`: a fresh instance starts at the base
@@ -135,6 +185,10 @@ enum CycleOutcome {
     /// A connection attempt, the handshake, or an established connection
     /// ended (or never started) for a reason retrying can plausibly fix.
     Disconnected,
+    /// A connection that stayed up for [`STABLE_CONNECTION_INTERVAL`] ended.
+    /// The backend was healthy until moments ago, so the outage backoff
+    /// starts over.
+    Connected,
     /// Shutdown was requested. The caller must stop, not reconnect.
     Cancelled,
 }
@@ -142,6 +196,7 @@ enum CycleOutcome {
 fn next_reconnect_interval(current: Duration, outcome: CycleOutcome) -> Duration {
     match outcome {
         CycleOutcome::Cancelled => Duration::ZERO,
+        CycleOutcome::Connected => RECONNECT_AFTER_DROP,
         CycleOutcome::NotLinked | CycleOutcome::Disconnected if current.is_zero() => {
             HEARTBEAT_INTERVAL
         }
@@ -166,8 +221,21 @@ fn next_reconnect_interval(current: Duration, outcome: CycleOutcome) -> Duration
 /// change beyond the capability appearing in `Hello`.
 pub async fn run(
     link: Arc<CloudLink>,
+    cancel: watch::Receiver<bool>,
+    status_provider: Option<Arc<dyn StatusProvider>>,
+) {
+    run_with_console_logout(link, cancel, status_provider, None).await;
+}
+
+/// [`run`], also applying `console_logout` frames through `console_logout`
+/// (ADR-094). With a sink, the `Hello` advertises
+/// [`Capability::ConsoleSessionLogout`]; without one it does not, and the
+/// backend never sends the frame.
+pub async fn run_with_console_logout(
+    link: Arc<CloudLink>,
     mut cancel: watch::Receiver<bool>,
     status_provider: Option<Arc<dyn StatusProvider>>,
+    console_logout: Option<Arc<dyn ConsoleLogoutSink>>,
 ) {
     tracing::info!("Cloud heartbeat sender started");
     // Approximates process uptime: this task is spawned once, unconditionally,
@@ -176,6 +244,7 @@ pub async fn run(
     // process-start timestamp just for this one field.
     let started_at = Instant::now();
     let mut retry_in = Duration::ZERO;
+    let mut outage = Outage::default();
     loop {
         tokio::select! {
             biased;
@@ -192,7 +261,7 @@ pub async fn run(
                     continue;
                 }
                 tracing::debug!("Cloud heartbeat connection cycle starting");
-                let outcome = connection_cycle(&link, &mut cancel, status_provider.as_ref(), started_at).await;
+                let outcome = connection_cycle_with(&link, &mut cancel, status_provider.as_ref(), console_logout.as_ref(), started_at, &mut outage).await;
                 tracing::debug!(outcome = ?outcome, "Cloud heartbeat connection cycle finished");
                 if outcome == CycleOutcome::Cancelled {
                     tracing::info!("Cloud heartbeat sender stopped after shutdown request");
@@ -204,13 +273,65 @@ pub async fn run(
     }
 }
 
+/// A lost connection, carried across connection cycles so its recovery is
+/// reported once, with how long it took and how many attempts failed.
+#[derive(Debug, Default)]
+struct Outage {
+    /// When the last established connection dropped (or the first attempt
+    /// failed). `None` while connected or before any attempt.
+    since: Option<Instant>,
+    failed_attempts: u32,
+}
+
+impl Outage {
+    fn attempt_failed(&mut self) {
+        self.since.get_or_insert_with(Instant::now);
+        self.failed_attempts = self.failed_attempts.saturating_add(1);
+    }
+
+    fn connection_dropped(&mut self) {
+        self.since = Some(Instant::now());
+        self.failed_attempts = 0;
+    }
+
+    /// Clear the outage, returning how long it lasted and how many attempts
+    /// failed, or `None` if there was none to recover from.
+    fn recovered(&mut self) -> Option<(Duration, u32)> {
+        let since = self.since.take()?;
+        Some((since.elapsed(), std::mem::take(&mut self.failed_attempts)))
+    }
+}
+
+/// Promote the drop of a long-lived connection to [`CycleOutcome::Connected`]
+/// so the next attempt is not delayed by an earlier outage's backoff.
+fn connection_outcome(outcome: CycleOutcome, connected_for: Duration) -> CycleOutcome {
+    if outcome == CycleOutcome::Disconnected && connected_for >= STABLE_CONNECTION_INTERVAL {
+        CycleOutcome::Connected
+    } else {
+        outcome
+    }
+}
+
 /// Connect, negotiate, then send heartbeats until the connection drops or
 /// shutdown is requested.
+#[cfg(test)]
 async fn connection_cycle(
     link: &Arc<CloudLink>,
     cancel: &mut watch::Receiver<bool>,
     status_provider: Option<&Arc<dyn StatusProvider>>,
     started_at: Instant,
+    outage: &mut Outage,
+) -> CycleOutcome {
+    connection_cycle_with(link, cancel, status_provider, None, started_at, outage).await
+}
+
+async fn connection_cycle_with(
+    link: &Arc<CloudLink>,
+    cancel: &mut watch::Receiver<bool>,
+    status_provider: Option<&Arc<dyn StatusProvider>>,
+    console_logout: Option<&Arc<dyn ConsoleLogoutSink>>,
+    started_at: Instant,
+    outage: &mut Outage,
 ) -> CycleOutcome {
     let (base_url, token) = match link.linked_credential() {
         Ok(credential) => credential,
@@ -227,6 +348,7 @@ async fn connection_cycle(
         Ok(backend) => backend,
         Err(error) => {
             tracing::warn!(%error, "Cloud heartbeat sender could not parse the managed backend URL");
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
@@ -238,34 +360,58 @@ async fn connection_cycle(
                 %error,
                 "Cloud heartbeat connection failed; local operation is unaffected"
             );
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
 
-    let negotiated = match handshake(link, &mut write, &mut read).await {
+    let negotiated = match handshake(link, &mut write, &mut read, console_logout.is_some()).await {
         Ok(negotiated) => negotiated,
         Err(error) => {
             tracing::warn!(%error, "Cloud heartbeat handshake failed; will retry");
             let _ = write.close().await;
+            outage.attempt_failed();
             return CycleOutcome::Disconnected;
         }
     };
-    tracing::info!(
-        instance_status_reporting = negotiated.contains(&Capability::InstanceStatusReporting),
-        "Cloud heartbeat connection established and negotiated"
-    );
+    let instance_status_reporting = negotiated.contains(&Capability::InstanceStatusReporting);
+    match outage.recovered() {
+        Some((down_for, failed_attempts)) => tracing::info!(
+            instance_status_reporting,
+            down_for_secs = down_for.as_secs(),
+            failed_attempts,
+            "Cloud heartbeat connection recovered after {}s and {failed_attempts} failed attempt(s)",
+            down_for.as_secs()
+        ),
+        None => tracing::info!(
+            instance_status_reporting,
+            "Cloud heartbeat connection established and negotiated"
+        ),
+    }
 
-    heartbeat_loop(
+    let connected_at = Instant::now();
+    let outcome = heartbeat_loop(
         link,
         instance_id,
         &negotiated,
         status_provider,
+        console_logout,
         started_at,
         &mut write,
         &mut read,
         cancel,
     )
-    .await
+    .await;
+    let connected_for = connected_at.elapsed();
+    if outcome == CycleOutcome::Disconnected {
+        outage.connection_dropped();
+        tracing::warn!(
+            connected_for_secs = connected_for.as_secs(),
+            "Cloud heartbeat connection dropped after {}s; reconnecting. Local operation is unaffected",
+            connected_for.as_secs()
+        );
+    }
+    connection_outcome(outcome, connected_for)
 }
 
 async fn connect(backend: &BackendUrl, token: &str) -> Result<(WsWrite, WsRead), HeartbeatError> {
@@ -318,6 +464,7 @@ async fn handshake(
     link: &CloudLink,
     write: &mut WsWrite,
     read: &mut WsRead,
+    console_logout: bool,
 ) -> Result<Vec<Capability>, HeartbeatError> {
     let server_hello = tokio::time::timeout(HANDSHAKE_TIMEOUT, read.next())
         .await
@@ -331,10 +478,16 @@ async fn handshake(
         Capability::ManagedAiInference,
         Capability::InstanceStatusReporting,
     ];
+    // Advertised, not negotiated: the frame authenticates itself, so the
+    // backend only needs to know this instance will act on it.
+    let mut advertised = our_capabilities.clone();
+    if console_logout {
+        advertised.push(Capability::ConsoleSessionLogout);
+    }
     let hello = Hello {
         protocol_version: PROTOCOL_VERSION,
         agent_version: link.agent_version().to_string(),
-        capabilities: our_capabilities.clone(),
+        capabilities: advertised,
     };
     send_envelope(write, "hello", &hello).await?;
 
@@ -422,6 +575,7 @@ async fn send_status_report(
         deployment_count: snapshot.deployment_count,
         service_count: snapshot.service_count,
         project_count: snapshot.project_count,
+        worker_node_count: snapshot.worker_node_count,
         resources: snapshot.resources,
         self_update: snapshot.self_update.map(cap_self_update_text),
     };
@@ -441,6 +595,7 @@ async fn heartbeat_loop(
     instance_id: Uuid,
     negotiated: &[Capability],
     status_provider: Option<&Arc<dyn StatusProvider>>,
+    console_logout: Option<&Arc<dyn ConsoleLogoutSink>>,
     started_at: Instant,
     write: &mut WsWrite,
     read: &mut WsRead,
@@ -540,6 +695,14 @@ async fn heartbeat_loop(
                                 }
                             }
                         }
+                        else if let Some(logout) = decode_console_logout(&message) {
+                            if let Some(sink) = console_logout {
+                                if let Err(error) = apply_console_logout(write, sink, &logout).await {
+                                    tracing::debug!(%error, "Cloud console logout answer failed; will reconnect");
+                                    return CycleOutcome::Disconnected;
+                                }
+                            }
+                        }
                         // Any other frame kind (a future addition, a ping the
                         // client library already answered) is ignored: this
                         // channel's only obligation is to keep heartbeats
@@ -597,6 +760,72 @@ fn decode_heartbeat_ack(message: &Message) -> Option<HeartbeatAck> {
 
 fn decode_status_request(message: &Message) -> Option<StatusRequest> {
     decode_envelope(message)?.decode::<StatusRequest>("status_request")
+}
+
+fn decode_console_logout(message: &Message) -> Option<ConsoleLogout> {
+    decode_envelope(message)?.decode::<ConsoleLogout>(CONSOLE_LOGOUT_KIND)
+}
+
+/// Apply one logout through `sink`, bounded, and answer it. An `Err` is a
+/// failed send, which ends the connection like any other.
+async fn apply_console_logout(
+    write: &mut WsWrite,
+    sink: &Arc<dyn ConsoleLogoutSink>,
+    logout: &ConsoleLogout,
+) -> Result<(), HeartbeatError> {
+    let outcome = match tokio::time::timeout(
+        CONSOLE_LOGOUT_APPLY_TIMEOUT,
+        sink.apply(&logout.logout_token),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            tracing::warn!(
+                timeout_secs = CONSOLE_LOGOUT_APPLY_TIMEOUT.as_secs(),
+                "applying a Cloud console logout timed out; Cloud will send it again"
+            );
+            return Ok(());
+        }
+    };
+    match outcome {
+        ConsoleLogoutOutcome::Applied {
+            jti,
+            sessions_ended,
+        } => {
+            tracing::info!(
+                request_id = %jti,
+                sessions_ended,
+                "ended a user's Temps Cloud console sessions on Cloud's signed request"
+            );
+            send_envelope(
+                write,
+                CONSOLE_LOGOUT_ACK_KIND,
+                &ConsoleLogoutAck {
+                    jti,
+                    sessions_ended,
+                },
+            )
+            .await
+        }
+        ConsoleLogoutOutcome::Rejected { jti, reason } => {
+            let reason: String = reason
+                .chars()
+                .take(MAX_CONSOLE_LOGOUT_REJECTION_CHARS)
+                .collect();
+            tracing::warn!(request_id = %jti, reason = %reason, "refused a Cloud console logout");
+            send_envelope(
+                write,
+                CONSOLE_LOGOUT_REJECTED_KIND,
+                &ConsoleLogoutRejected { jti, reason },
+            )
+            .await
+        }
+        ConsoleLogoutOutcome::Unreadable => {
+            tracing::warn!("ignored an unreadable Cloud console logout frame");
+            Ok(())
+        }
+    }
 }
 
 fn is_close(message: &Message) -> bool {
@@ -672,6 +901,63 @@ mod tests {
     }
 
     #[test]
+    fn a_stable_connection_resets_the_backoff() {
+        // An outage has already pushed the delay to the ceiling...
+        let d = next_reconnect_interval(MAX_RECONNECT_INTERVAL, CycleOutcome::Disconnected);
+        assert_eq!(d, MAX_RECONNECT_INTERVAL);
+        // ...then a connection stayed up and a proxy closed it.
+        let outcome = connection_outcome(CycleOutcome::Disconnected, STABLE_CONNECTION_INTERVAL);
+        assert_eq!(outcome, CycleOutcome::Connected);
+        let d = next_reconnect_interval(d, outcome);
+        assert_eq!(
+            d, RECONNECT_AFTER_DROP,
+            "the old outage must not delay this reconnect"
+        );
+        // A failed attempt from here backs off again, starting low.
+        assert_eq!(
+            next_reconnect_interval(d, CycleOutcome::Disconnected),
+            RECONNECT_AFTER_DROP * 2
+        );
+    }
+
+    #[test]
+    fn a_short_lived_connection_keeps_backing_off() {
+        // A backend that accepts and closes straight away must not be
+        // retried every few seconds forever.
+        let mut d = HEARTBEAT_INTERVAL;
+        for _ in 0..20 {
+            let outcome = connection_outcome(CycleOutcome::Disconnected, Duration::from_secs(1));
+            assert_eq!(outcome, CycleOutcome::Disconnected);
+            d = next_reconnect_interval(d, outcome);
+        }
+        assert_eq!(d, MAX_RECONNECT_INTERVAL);
+    }
+
+    #[test]
+    fn only_a_disconnect_is_promoted_to_connected() {
+        for outcome in [CycleOutcome::Cancelled, CycleOutcome::NotLinked] {
+            assert_eq!(connection_outcome(outcome, MAX_RECONNECT_INTERVAL), outcome);
+        }
+    }
+
+    #[test]
+    fn an_outage_reports_its_recovery_once() {
+        let mut outage = Outage::default();
+        assert!(outage.recovered().is_none(), "nothing to recover from yet");
+
+        outage.connection_dropped();
+        outage.attempt_failed();
+        outage.attempt_failed();
+        let (_, failed_attempts) = outage.recovered().expect("an outage was recorded");
+        assert_eq!(failed_attempts, 2);
+        assert!(outage.recovered().is_none(), "recovery is reported once");
+
+        // A first connection that never succeeded is an outage too.
+        outage.attempt_failed();
+        assert_eq!(outage.recovered().map(|(_, n)| n), Some(1));
+    }
+
+    #[test]
     fn cancellation_never_schedules_a_reconnect() {
         assert_eq!(
             next_reconnect_interval(MAX_RECONNECT_INTERVAL, CycleOutcome::Cancelled),
@@ -699,6 +985,14 @@ mod tests {
         /// "report again on request" path without waiting out
         /// `STATUS_REPORT_INTERVAL`.
         nudge_after_first_status_report: Arc<AtomicBool>,
+        /// Set once the instance's `Hello` arrives: whether it advertised
+        /// `console_session_logout`.
+        client_advertised_console_logout: Arc<Mutex<Option<bool>>>,
+        /// When set, the server sends this `console_logout` token right
+        /// after the instance's `Hello`.
+        console_logout_token: Arc<Mutex<Option<String>>>,
+        console_logout_acks: Arc<Mutex<Vec<ConsoleLogoutAck>>>,
+        console_logout_rejections: Arc<Mutex<Vec<ConsoleLogoutRejected>>>,
     }
 
     async fn management_socket(state: State<Stub>, ws: WebSocketUpgrade) -> impl IntoResponse {
@@ -738,7 +1032,46 @@ mod tests {
             let Ok(envelope) = serde_json::from_str::<Envelope>(&text) else {
                 continue;
             };
-            if let Some(heartbeat) = envelope.decode::<Heartbeat>("heartbeat") {
+            if let Some(client_hello) = envelope.decode::<Hello>("hello") {
+                *stub
+                    .client_advertised_console_logout
+                    .lock()
+                    .expect("advertised lock") = Some(
+                    client_hello
+                        .capabilities
+                        .contains(&Capability::ConsoleSessionLogout),
+                );
+                let token = stub
+                    .console_logout_token
+                    .lock()
+                    .expect("console logout token lock")
+                    .clone();
+                if let Some(logout_token) = token {
+                    let frame = Envelope::new(CONSOLE_LOGOUT_KIND, &ConsoleLogout { logout_token })
+                        .expect("console logout must encode");
+                    if socket
+                        .send(AxumMessage::Text(
+                            serde_json::to_string(&frame).unwrap().into(),
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            } else if let Some(ack) = envelope.decode::<ConsoleLogoutAck>(CONSOLE_LOGOUT_ACK_KIND) {
+                stub.console_logout_acks
+                    .lock()
+                    .expect("acks lock")
+                    .push(ack);
+            } else if let Some(rejected) =
+                envelope.decode::<ConsoleLogoutRejected>(CONSOLE_LOGOUT_REJECTED_KIND)
+            {
+                stub.console_logout_rejections
+                    .lock()
+                    .expect("rejections lock")
+                    .push(rejected);
+            } else if let Some(heartbeat) = envelope.decode::<Heartbeat>("heartbeat") {
                 stub.last_pending_spool_bytes
                     .store(heartbeat.pending_spool_bytes, Ordering::SeqCst);
                 let count = stub.heartbeats_received.fetch_add(1, Ordering::SeqCst) + 1;
@@ -871,7 +1204,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -920,7 +1260,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -955,7 +1302,13 @@ mod tests {
         let mut cancel = cancel_rx;
         let outcome = tokio::time::timeout(
             Duration::from_secs(5),
-            connection_cycle(&link, &mut cancel, None, Instant::now()),
+            connection_cycle(
+                &link,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            ),
         )
         .await
         .expect("the cycle must end once the server closes the socket");
@@ -978,7 +1331,14 @@ mod tests {
         // Never configured or enrolled.
         let (_cancel_tx, cancel_rx) = watch::channel(false);
         let mut cancel = cancel_rx;
-        let outcome = connection_cycle(&link, &mut cancel, None, Instant::now()).await;
+        let outcome = connection_cycle(
+            &link,
+            &mut cancel,
+            None,
+            Instant::now(),
+            &mut Outage::default(),
+        )
+        .await;
         assert_eq!(outcome, CycleOutcome::NotLinked);
     }
 
@@ -1031,6 +1391,7 @@ mod tests {
         StatusSnapshot {
             deployment_count: 3,
             service_count: 5,
+            worker_node_count: None,
             project_count: 2,
             resources: None,
             self_update: None,
@@ -1061,6 +1422,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1109,7 +1471,14 @@ mod tests {
         let mut cancel = cancel_rx;
         let link_for_cycle = link.clone();
         let cycle = tokio::spawn(async move {
-            connection_cycle(&link_for_cycle, &mut cancel, None, Instant::now()).await
+            connection_cycle(
+                &link_for_cycle,
+                &mut cancel,
+                None,
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1160,6 +1529,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1220,6 +1590,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1339,6 +1710,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1412,6 +1784,7 @@ mod tests {
                 &mut cancel,
                 Some(&provider),
                 Instant::now(),
+                &mut Outage::default(),
             )
             .await
         });
@@ -1436,5 +1809,153 @@ mod tests {
                  even after a snapshot timeout",
             )
             .expect("connection cycle must not panic");
+    }
+
+    const REQUEST_ID: Uuid = Uuid::from_u128(0x0112);
+
+    /// Records the tokens it is handed and answers with a fixed outcome.
+    struct RecordingLogoutSink {
+        tokens: Mutex<Vec<String>>,
+        reject: bool,
+    }
+
+    #[async_trait]
+    impl ConsoleLogoutSink for RecordingLogoutSink {
+        async fn apply(&self, logout_token: &str) -> ConsoleLogoutOutcome {
+            self.tokens
+                .lock()
+                .expect("tokens lock")
+                .push(logout_token.to_string());
+            if self.reject {
+                ConsoleLogoutOutcome::Rejected {
+                    jti: REQUEST_ID,
+                    reason: "x".repeat(MAX_CONSOLE_LOGOUT_REJECTION_CHARS * 2),
+                }
+            } else {
+                ConsoleLogoutOutcome::Applied {
+                    jti: REQUEST_ID,
+                    sessions_ended: 2,
+                }
+            }
+        }
+    }
+
+    async fn run_console_logout_cycle(
+        stub: &Stub,
+        sink: Option<Arc<dyn ConsoleLogoutSink>>,
+        done: impl Fn(&Stub) -> bool,
+    ) -> bool {
+        let Some(backend_url) = serve(stub.clone()).await else {
+            return false;
+        };
+        let (link, _directory) = linked_test_link(&backend_url).await;
+        let (cancel_tx, cancel_rx) = watch::channel(false);
+        let mut cancel = cancel_rx;
+        let cycle = tokio::spawn(async move {
+            connection_cycle_with(
+                &link,
+                &mut cancel,
+                None,
+                sink.as_ref(),
+                Instant::now(),
+                &mut Outage::default(),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done(stub) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the console logout exchange must complete promptly");
+        cancel_tx.send(true).expect("send shutdown signal");
+        tokio::time::timeout(Duration::from_secs(5), cycle)
+            .await
+            .expect("connection cycle must stop promptly on cancellation")
+            .expect("connection cycle must not panic");
+        true
+    }
+
+    #[tokio::test]
+    async fn a_console_logout_is_applied_and_acknowledged_when_a_sink_is_registered() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("signed.logout.token".into()))),
+            ..Default::default()
+        };
+        let sink = Arc::new(RecordingLogoutSink {
+            tokens: Mutex::new(Vec::new()),
+            reject: false,
+        });
+        let as_sink: Arc<dyn ConsoleLogoutSink> = sink.clone();
+        if !run_console_logout_cycle(&stub, Some(as_sink), |stub| {
+            !stub.console_logout_acks.lock().unwrap().is_empty()
+        })
+        .await
+        {
+            return;
+        }
+        assert_eq!(
+            *stub.client_advertised_console_logout.lock().unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            *sink.tokens.lock().unwrap(),
+            vec!["signed.logout.token".to_string()]
+        );
+        let acks = stub.console_logout_acks.lock().unwrap();
+        assert_eq!(acks[0].jti, REQUEST_ID);
+        assert_eq!(acks[0].sessions_ended, 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_console_logout_is_answered_with_a_bounded_reason() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("forged.logout.token".into()))),
+            ..Default::default()
+        };
+        let sink: Arc<dyn ConsoleLogoutSink> = Arc::new(RecordingLogoutSink {
+            tokens: Mutex::new(Vec::new()),
+            reject: true,
+        });
+        if !run_console_logout_cycle(&stub, Some(sink), |stub| {
+            !stub.console_logout_rejections.lock().unwrap().is_empty()
+        })
+        .await
+        {
+            return;
+        }
+        let rejections = stub.console_logout_rejections.lock().unwrap();
+        assert_eq!(rejections[0].jti, REQUEST_ID);
+        assert_eq!(
+            rejections[0].reason.chars().count(),
+            MAX_CONSOLE_LOGOUT_REJECTION_CHARS
+        );
+        assert!(stub.console_logout_acks.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_the_capability_is_not_advertised_and_the_frame_is_ignored() {
+        let stub = Stub {
+            console_logout_token: Arc::new(Mutex::new(Some("signed.logout.token".into()))),
+            ..Default::default()
+        };
+        if !run_console_logout_cycle(&stub, None, |stub| {
+            stub.client_advertised_console_logout
+                .lock()
+                .unwrap()
+                .is_some()
+                && stub.heartbeats_received.load(Ordering::SeqCst) > 0
+        })
+        .await
+        {
+            return;
+        }
+        assert_eq!(
+            *stub.client_advertised_console_logout.lock().unwrap(),
+            Some(false)
+        );
+        assert!(stub.console_logout_acks.lock().unwrap().is_empty());
+        assert!(stub.console_logout_rejections.lock().unwrap().is_empty());
     }
 }

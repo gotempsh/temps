@@ -77,6 +77,28 @@ describe('terminal conversation tool receipts', () => {
     expect(tool).not.toHaveProperty('result')
   })
 
+  test('keeps the next steps saved on an answer', () => {
+    const [answer, plain] = mapConversationDetail({
+      messages: [
+        {
+          cursor: 'm1_2',
+          role: 'assistant',
+          content: 'Deployed.',
+          next_steps: ['Show the logs'],
+        },
+        {
+          cursor: 'm1_3',
+          role: 'assistant',
+          content: 'Done.',
+          next_steps: null,
+        },
+      ],
+      turn_status: 'idle',
+    })
+    expect(answer.next_steps).toEqual(['Show the logs'])
+    expect(plain.next_steps).toBeUndefined()
+  })
+
   test('does not finalize a running or unknown-status snapshot', () => {
     for (const turn_status of ['running', undefined]) {
       const [message] = mapConversationDetail({ messages, turn_status })
@@ -441,9 +463,9 @@ describe('live connection state', () => {
     const active = renderToStaticMarkup(
       createElement(AssistantBody, { ...props, streaming: true })
     )
+    // The work trace the tools fold into carries the activity in its header.
     expect(active).toContain('role="status"')
-    expect(active.match(/ai-activity-pixel/g)).toHaveLength(9)
-    expect(active).toContain('animation-delay:270ms')
+    expect(active).toContain('ai-trace-sparkle')
     expect(active).toContain('ai-activity-shimmer')
     expect(active).toContain('Working on your project')
 
@@ -451,7 +473,19 @@ describe('live connection state', () => {
       createElement(AssistantBody, { ...props, streaming: false })
     )
     expect(completed).not.toContain('role="status"')
+    expect(completed).not.toContain('ai-trace-sparkle')
     expect(completed).not.toContain('ai-activity-pixel')
+
+    // Before the first token or step, the pixel wave holds the place.
+    const waiting = renderToStaticMarkup(
+      createElement(AssistantBody, {
+        ...props,
+        message: { role: 'assistant' as const, content: '' },
+        streaming: true,
+      })
+    )
+    expect(waiting.match(/ai-activity-pixel/g)).toHaveLength(9)
+    expect(waiting).toContain('animation-delay:270ms')
   })
 
   test('keeps elapsed activity time anchored to the server across remounts', () => {
@@ -514,6 +548,58 @@ describe('live connection state', () => {
     expect(
       appendLiveUserTurn([], { content: 'ship it', turn_id: 'turn-1' })
     ).toHaveLength(2)
+  })
+
+  test('does not repeat a user turn a snapshot already stored', () => {
+    // The refreshed history replaced the optimistic turn before the echo came.
+    const stored = [
+      {
+        server_cursor: 'cursor-271',
+        role: 'user',
+        content: 'and use a sidebar for that please',
+        created_at: '2026-10-18T17:54:09.545100Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(stored, {
+        content: 'and use a sidebar for that please',
+        created_at: '2026-10-18T17:54:09.545100+00:00',
+        turn_id: 'turn-2',
+      })
+    ).toBe(stored)
+  })
+
+  test('still appends the same words sent again later', () => {
+    const stored = [
+      {
+        server_cursor: 'cursor-1',
+        role: 'user',
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(stored, {
+        content: 'continue',
+        created_at: '2026-10-18T17:59:41.002Z',
+        turn_id: 'turn-3',
+      })
+    ).toHaveLength(3)
+    // An unsaved local message is not the stored one, even at the same time.
+    const local = [
+      {
+        role: 'user',
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+      },
+    ]
+    expect(
+      appendLiveUserTurn(local, {
+        content: 'continue',
+        created_at: '2026-10-18T17:54:09.545Z',
+        turn_id: 'turn-4',
+      })
+    ).toHaveLength(3)
   })
 
   test('preserves attachment metadata on a live user turn', () => {

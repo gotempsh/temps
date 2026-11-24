@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::ErrorBuilder, problemdetails::Problem, AuditContext, AuditLogger,
     AuditOperation, CloudTelemetryActivationTrigger, RequestMetadata, TelemetryActivationOutcome,
@@ -171,8 +171,8 @@ impl AuditOperation for CloudTelemetryActivationStartedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -189,8 +189,8 @@ impl AuditOperation for CloudLinkAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -217,9 +217,17 @@ fn problem(error: CloudServiceError) -> Problem {
         // The reason is the operator's to act on ("Cloud did not answer the
         // plan's retention", "backup plugin not enabled"), so it is returned
         // rather than hidden behind a 500.
-        CloudServiceError::ManagedBackupSchedule(_) => StatusCode::CONFLICT,
+        CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::Lookup { .. }
+            | temps_core::ManagedBackupScheduleError::Create { .. }
+            | temps_core::ManagedBackupScheduleError::Release { .. },
+        ) => StatusCode::CONFLICT,
+        CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::NotAuthorized { .. },
+        ) => StatusCode::FORBIDDEN,
         CloudServiceError::Client(
             temps_cloud_client::CloudError::Rejected { .. }
+            | temps_cloud_client::CloudError::RouteUnavailable { .. }
             | temps_cloud_client::CloudError::InvalidAcknowledgement { .. }
             | temps_cloud_client::CloudError::InvalidBackupTarget { .. },
         ) => StatusCode::BAD_GATEWAY,
@@ -304,6 +312,7 @@ async fn update_cloud_features(
             request.backups_enabled,
             request.notifications_enabled,
             request.console_access_enabled,
+            temps_core::BackupScheduleAuthority::from_instance_admin(auth.is_instance_admin()),
         )
         .await
         .map_err(problem)?;
@@ -335,7 +344,10 @@ async fn enroll_cloud(
     }
     let (result, backup_outcome, enrollment) = state
         .service
-        .enroll(&request.enrollment_code)
+        .enroll(
+            &request.enrollment_code,
+            temps_core::BackupScheduleAuthority::from_instance_admin(auth.is_instance_admin()),
+        )
         .await
         .map_err(problem)?;
     record_enrollment_audit(
@@ -567,7 +579,9 @@ async fn reconcile_cloud_backup_source(
     permission_guard!(auth, BackupsWrite);
     let result = state
         .service
-        .reconcile_managed_backup_source()
+        .reconcile_managed_backup_source(temps_core::BackupScheduleAuthority::from_instance_admin(
+            auth.is_instance_admin(),
+        ))
         .await
         .map_err(problem)?;
     audit(
@@ -582,6 +596,30 @@ async fn reconcile_cloud_backup_source(
     Ok(Json(result))
 }
 
+/// The managed schedule backs up every database and the control plane, so
+/// `settings:write` + `backups:write` is not enough on its own: a
+/// `Role::Custom` user or API key holding both could otherwise provision it
+/// (NV1). Deployment tokens are refused outright. The service re-checks.
+fn require_managed_schedule_admin(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+    deny_deployment_token!(auth);
+    if auth.is_instance_admin() {
+        return Ok(());
+    }
+    tracing::error!(
+        user_id = auth.user_id(),
+        user_role = %auth.effective_role,
+        "non-admin caller denied creating the Temps Cloud managed backup schedule"
+    );
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .title("Instance Administrator Required")
+        .detail(
+            "Only an instance administrator may create the Temps Cloud nightly backup \
+             schedule: it backs up every database and the control plane",
+        )
+        .value("user_role", auth.effective_role.to_string())
+        .build())
+}
+
 /// Create the nightly schedule for the Temps Cloud destination unless one
 /// already targets it (ADR-044). Answers the same shape as the reconcile so
 /// the console can swap it into the status it already holds.
@@ -592,7 +630,7 @@ async fn reconcile_cloud_backup_source(
     responses(
         (status = 200, description = "The managed destination's setup with the schedule that targets it, created when none did", body = ManagedBackupSetup),
         (status = 401, description = "Authentication required", body = temps_core::ProblemDetails),
-        (status = 403, description = "Insufficient permissions", body = temps_core::ProblemDetails),
+        (status = 403, description = "Insufficient permissions, a deployment token, or a caller that is not an instance administrator: the schedule backs up every database and the control plane", body = temps_core::ProblemDetails),
         (status = 409, description = "No schedule could be set up; the detail says why (Cloud did not answer the plan's retention, the backup plugin is not enabled)", body = temps_core::ProblemDetails),
         (status = 500, description = "Database or link state failure", body = temps_core::ProblemDetails)
     ),
@@ -605,9 +643,12 @@ async fn ensure_cloud_backup_schedule(
 ) -> Result<Json<ManagedBackupSetup>, Problem> {
     permission_guard!(auth, SettingsWrite);
     permission_guard!(auth, BackupsWrite);
+    require_managed_schedule_admin(&auth)?;
     let result = state
         .service
-        .ensure_managed_backup_schedule()
+        .ensure_managed_backup_schedule(temps_core::BackupScheduleAuthority::from_instance_admin(
+            auth.is_instance_admin(),
+        ))
         .await
         .map_err(problem)?;
     audit(
@@ -765,8 +806,8 @@ impl AuditOperation for CloudBackendUrlBootstrappedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -834,6 +875,12 @@ pub const CLOUD_CONSOLE_OIDC_BOOTSTRAPPED: &str = "CLOUD_CONSOLE_OIDC_BOOTSTRAPP
 pub const CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP: &str =
     "CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP";
 
+/// Audit action recorded when consuming `cloud-oidc.json` turned
+/// `cloud.telemetry_enabled` on: the file Temps Cloud drops on a hosted plane
+/// asks for telemetry export, and its presence is the operator's consent (see
+/// [`crate::TelemetryConsent`]). Carries the before/after feature switches.
+pub const CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP: &str = "CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP";
+
 /// Audit action recorded when consuming `cloud-oidc.json` *failed after
 /// attempting to turn console access on*. The bootstrap as a whole failed, but
 /// the settings row may have been written and the compensating write may have
@@ -865,8 +912,8 @@ impl AuditOperation for CloudConsoleAccessBootstrapFailedAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -934,8 +981,8 @@ impl AuditOperation for CloudConsoleOidcBootstrapAudit {
     fn user_agent(&self) -> &str {
         &self.context.user_agent
     }
-    fn serialize(&self) -> anyhow::Result<String> {
-        serde_json::to_string(self).map_err(Into::into)
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -976,6 +1023,28 @@ pub async fn record_console_oidc_bootstrap_outcome_audit(
             audit,
             actor,
             CLOUD_CONSOLE_ACCESS_ENABLED_BY_BOOTSTRAP,
+            Some(*previous),
+            Some(*new),
+        )
+        .await;
+    }
+}
+
+/// Record that the bootstrap file turned telemetry export on. Nothing is
+/// written for the other [`crate::TelemetryConsent`] outcomes: they changed no
+/// setting (a failed write is logged by the caller, and the settings
+/// transaction it attempted either committed -- and the link then blocks
+/// outbound -- or rolled back).
+pub async fn record_telemetry_bootstrap_audit(
+    audit: &dyn AuditLogger,
+    actor: CloudEnrollmentActor,
+    telemetry: &crate::TelemetryConsent,
+) {
+    if let crate::TelemetryConsent::GrantedByBootstrap { previous, new } = telemetry {
+        write_cloud_link_audit(
+            audit,
+            actor,
+            CLOUD_TELEMETRY_ENABLED_BY_BOOTSTRAP,
             Some(*previous),
             Some(*new),
         )
@@ -1077,13 +1146,19 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for RecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .push(operation.operation_type());
             if self.fail {
-                anyhow::bail!("audit store is unavailable");
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit store is unavailable",
+                ));
             }
             Ok(())
         }
@@ -1350,6 +1425,85 @@ mod tests {
         assert!(!may_start_activation(&token, first_enrollment()));
     }
 
+    /// NV1: a custom grant holding exactly the two permissions the ensure
+    /// endpoint checks is still refused the managed schedule, because that
+    /// schedule backs up every database and the control plane.
+    #[test]
+    fn a_custom_settings_and_backups_writer_is_denied_the_managed_schedule() {
+        let key = temps_auth::AuthContext::new_api_key(
+            test_user(),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::BackupsWrite,
+            ]),
+            "ops-automation".to_string(),
+            7,
+        );
+        assert!(key.has_permission(&temps_auth::Permission::SettingsWrite));
+        assert!(key.has_permission(&temps_auth::Permission::BackupsWrite));
+        let denied = require_managed_schedule_admin(&key)
+            .expect_err("a non-admin custom key must not provision the managed schedule");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+
+        for role in [temps_auth::Role::Custom, temps_auth::Role::User] {
+            let denied = require_managed_schedule_admin(&principal(role.clone()))
+                .expect_err("only an instance administrator may provision it");
+            assert_eq!(denied.status_code, StatusCode::FORBIDDEN, "{role}");
+        }
+    }
+
+    #[test]
+    fn an_instance_admin_may_provision_the_managed_schedule() {
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                require_managed_schedule_admin(&principal(role.clone())).is_ok(),
+                "{role} must be allowed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_deployment_token_is_denied_the_managed_schedule() {
+        let token = temps_auth::AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "deploy-token".to_string(),
+            Vec::new(),
+        );
+        let denied = require_managed_schedule_admin(&token).expect_err("tokens are refused");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+        let body = serde_json::to_value(&denied.body).expect("problem serialises");
+        assert_eq!(
+            body["type"],
+            "https://temps.sh/probs/deployment-token-not-allowed"
+        );
+    }
+
+    /// The service refuses a scoped caller even if a future handler forgets
+    /// the check, and the refusal maps to 403 rather than the 409 the other
+    /// schedule errors use.
+    #[test]
+    fn a_refused_managed_schedule_is_a_403() {
+        let problem = problem(CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::NotAuthorized { s3_source_id: 3 },
+        ));
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        let still_conflict = problem_status(CloudServiceError::ManagedBackupSchedule(
+            temps_core::ManagedBackupScheduleError::Create {
+                s3_source_id: 3,
+                reason: "the backup plugin is not enabled on this instance".to_string(),
+            },
+        ));
+        assert_eq!(still_conflict, StatusCode::CONFLICT);
+    }
+
+    fn problem_status(error: CloudServiceError) -> StatusCode {
+        problem(error).status_code
+    }
+
     #[test]
     fn the_started_audit_records_the_spend_and_names_the_purchase_trigger() {
         let event = CloudTelemetryActivationStartedAudit {
@@ -1492,7 +1646,10 @@ mod tests {
 
     #[temps_core::async_trait::async_trait]
     impl AuditLogger for ActorRecordingAudit {
-        async fn create_audit_log(&self, operation: &dyn AuditOperation) -> anyhow::Result<()> {
+        async fn create_audit_log(
+            &self,
+            operation: &dyn AuditOperation,
+        ) -> temps_core::AuditResult<()> {
             self.recorded
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

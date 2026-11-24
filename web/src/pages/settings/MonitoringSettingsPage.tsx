@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageHeader, SaveRow } from '@temps-sdk/ds'
 import { SettingsLoadFailure } from '@/components/settings/SettingsLoadFailure'
 import { isForbiddenRead } from '@/lib/read-failure'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -43,7 +44,6 @@ import {
   HardDrive,
   Info,
   Loader2,
-  Save,
   Timer,
 } from 'lucide-react'
 import { forwardRef, useEffect, type ComponentProps } from 'react'
@@ -66,7 +66,7 @@ interface MonitoringFormData {
  */
 type ContainerLogBudgetFormData = Pick<
   ContainerLogSettings,
-  'cache_mb' | 'head_buffer_mb'
+  'cache_mb' | 'head_buffer_mb' | 'ingest_lines_per_sec' | 'ingest_kib_per_sec'
 >
 
 /**
@@ -110,6 +110,8 @@ const RETENTION_DEFAULTS: ObservabilityRetentionSettings = {
 const CONTAINER_LOG_BUDGET_DEFAULTS: ContainerLogBudgetFormData = {
   cache_mb: 2048,
   head_buffer_mb: 8,
+  ingest_lines_per_sec: 250,
+  ingest_kib_per_sec: 256,
 }
 
 // `null` means "use the server default" for both knobs, which is also what
@@ -126,7 +128,7 @@ const BYTES_PER_ROW = 100
 // Approximate number of metrics tracked per monitored service
 const METRICS_PER_SERVICE = 15
 
-type DurationUnit = 'hours' | 'days' | 'years' | 'MiB'
+type DurationUnit = 'hours' | 'days' | 'years' | 'MiB' | 'lines/s' | 'KiB/s'
 
 interface DurationInputProps extends ComponentProps<'input'> {
   unit: DurationUnit
@@ -300,11 +302,11 @@ export function MonitoringSettingsPage() {
   useEffect(() => {
     setBreadcrumbs([
       { label: 'Settings', href: '/settings' },
-      { label: 'Metrics Monitoring' },
+      { label: 'Metrics monitoring' },
     ])
   }, [setBreadcrumbs])
 
-  usePageTitle('Metrics Monitoring')
+  usePageTitle('Metrics monitoring')
 
   useEffect(() => {
     if (settings?.monitoring) {
@@ -323,6 +325,12 @@ export function MonitoringSettingsPage() {
           head_buffer_mb:
             settings.container_logs?.head_buffer_mb ??
             CONTAINER_LOG_BUDGET_DEFAULTS.head_buffer_mb,
+          ingest_lines_per_sec:
+            settings.container_logs?.ingest_lines_per_sec ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.ingest_lines_per_sec,
+          ingest_kib_per_sec:
+            settings.container_logs?.ingest_kib_per_sec ??
+            CONTAINER_LOG_BUDGET_DEFAULTS.ingest_kib_per_sec,
         },
         geo: {
           refresh_interval_hours: settings.geo?.refresh_interval_hours ?? null,
@@ -418,9 +426,10 @@ export function MonitoringSettingsPage() {
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
+      <PageHeader title="Metrics monitoring" />
       {/* Overview — metrics collection is always on, controlled per-service */}
       <SettingsSection
-        title="Metrics Collection"
+        title="Metrics collection"
         icon={BarChart2}
         description="Collect resource and performance metrics from databases, containers, and nodes for alerting and dashboards. Enable monitoring per service from its detail page — these settings tune how the collected data is sampled and retained."
       >
@@ -491,7 +500,7 @@ export function MonitoringSettingsPage() {
           once, then compress closed Timescale chunks. ClickHouse compresses
           parts automatically and therefore has no age-based policy. */}
       <SettingsSection
-        title="Telemetry Compression"
+        title="Telemetry compression"
         icon={Archive}
         description="Reduce storage used by immutable proxy request logs and OpenTelemetry spans after their active ingest window closes."
       >
@@ -601,7 +610,7 @@ export function MonitoringSettingsPage() {
 
       {/* Scrape interval */}
       <SettingsSection
-        title="Scrape Interval"
+        title="Scrape interval"
         icon={Timer}
         description="How often the MetricsScraper collects data from all sources. Lower values give higher resolution but increase storage usage."
       >
@@ -634,7 +643,7 @@ export function MonitoringSettingsPage() {
 
       {/* Retention spans every observability signal, not only resource metrics. */}
       <SettingsSection
-        title="Data Retention"
+        title="Data retention"
         icon={HardDrive}
         description="Control how long resource metrics, proxy request logs, traces, OpenTelemetry logs, and OpenTelemetry metrics remain available."
       >
@@ -1044,6 +1053,69 @@ export function MonitoringSettingsPage() {
                 )}
               </div>
 
+              <div
+                id="container-log-ingest-budget"
+                className="space-y-3 rounded-lg border p-4"
+              >
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="container-log-ingest-lines">
+                    Container log ingestion budget
+                  </Label>
+                  <code className="rounded bg-muted px-2 py-0.5 text-[11px] text-muted-foreground">
+                    per container
+                  </code>
+                </div>
+                <p className="min-h-10 text-xs leading-5 text-muted-foreground">
+                  The most each container may store. Lines over it are dropped,
+                  a notice is written into that container&apos;s log, and it is
+                  listed as throttled on the Logs page. Up to 10 seconds of
+                  budget may arrive at once, so short bursts pass intact.
+                </p>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <DurationInput
+                    id="container-log-ingest-lines"
+                    unit="lines/s"
+                    min={0}
+                    max={1000000}
+                    {...register('container_logs.ingest_lines_per_sec', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 0, message: 'Min 0 (no limit)' },
+                      max: { value: 1000000, message: 'Max 1,000,000' },
+                    })}
+                  />
+                  <DurationInput
+                    id="container-log-ingest-kib"
+                    unit="KiB/s"
+                    min={0}
+                    max={1048576}
+                    aria-label="Container log ingestion budget in KiB per second"
+                    {...register('container_logs.ingest_kib_per_sec', {
+                      valueAsNumber: true,
+                      required: true,
+                      min: { value: 0, message: 'Min 0 (no limit)' },
+                      max: { value: 1048576, message: 'Max 1 GiB/s' },
+                    })}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Applied to running containers within a minute of saving. 0
+                  disables that limit; defaults 250 lines/s and 256 KiB/s. A
+                  project or managed service can override it in its own
+                  settings.
+                </p>
+                {errors.container_logs?.ingest_lines_per_sec && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.ingest_lines_per_sec.message}
+                  </p>
+                )}
+                {errors.container_logs?.ingest_kib_per_sec && (
+                  <p className="text-xs text-destructive">
+                    {errors.container_logs.ingest_kib_per_sec.message}
+                  </p>
+                )}
+              </div>
+
               <div className="space-y-3 rounded-lg border p-4">
                 <div className="flex items-center justify-between gap-3">
                   <Label htmlFor="retention-otel-metrics">
@@ -1091,7 +1163,7 @@ export function MonitoringSettingsPage() {
           long they live is a privacy decision the operator must be able to
           see and make, not a behaviour buried in a background job. */}
       <SettingsSection
-        title="Analytics Data Retention"
+        title="Analytics data retention"
         icon={BarChart2}
         description="Control how long page views, error events, visitors and stored IP addresses are kept. Policies are reconciled hourly; databases and background cleanup remove expired data asynchronously."
       >
@@ -1120,7 +1192,7 @@ export function MonitoringSettingsPage() {
           and audit entries, so how fresh its database is decides how correct
           every one of those reads. */}
       <SettingsSection
-        title="Geolocation Database"
+        title="Geolocation database"
         icon={Globe}
         description="Keep the MaxMind GeoLite2 city database current. With a free MaxMind license key Temps downloads the latest build itself; without one it falls back to the copy shipped with the repository, which is only as current as the release."
       >
@@ -1247,28 +1319,7 @@ export function MonitoringSettingsPage() {
         </div>
       </SettingsSection>
 
-      {isDirty && (
-        <div className="sticky bottom-0 bg-background border-t pt-4 pb-2">
-          <div className="flex justify-between items-center">
-            <p className="text-sm text-muted-foreground">
-              You have unsaved changes
-            </p>
-            <Button type="submit" disabled={isSubmitting}>
-              {isSubmitting ? (
-                <>
-                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                  Saving...
-                </>
-              ) : (
-                <>
-                  <Save className="mr-2 h-4 w-4" />
-                  Save Changes
-                </>
-              )}
-            </Button>
-          </div>
-        </div>
-      )}
+      <SaveRow sticky dirty={isDirty} saving={isSubmitting} />
     </form>
   )
 }

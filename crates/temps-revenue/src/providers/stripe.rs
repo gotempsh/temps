@@ -18,7 +18,8 @@ use sha2::Sha256;
 use subtle::ConstantTimeEq;
 
 use super::{
-    NormalizedEvent, NormalizedEventType, ProviderError, RevenueProvider, SubscriptionStatus,
+    minor_units_from_f64, NormalizedEvent, NormalizedEventType, ProviderError, RevenueProvider,
+    SubscriptionStatus,
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -480,7 +481,9 @@ fn compute_subscription_mrr(subscription: &serde_json::Value) -> Option<i64> {
         total += monthly * quantity;
     }
 
-    Some(total.round() as i64)
+    // Out of range means "MRR unknown": the projection keeps the stored
+    // value rather than recording a saturated one.
+    minor_units_from_f64(total)
 }
 
 impl NormalizedEvent {
@@ -564,7 +567,10 @@ fn invoice_mrr_realized_events(
         }
 
         let seconds = delta.num_seconds() as f64;
-        let mrr = ((amount as f64) * SECONDS_PER_MRR_MONTH / seconds).round() as i64;
+        let Some(mrr) = minor_units_from_f64((amount as f64) * SECONDS_PER_MRR_MONTH / seconds)
+        else {
+            continue;
+        };
 
         let (price_id, product_id) = extract_price_and_product(line.get("price"));
         let subscription_ref = line

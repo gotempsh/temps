@@ -2398,6 +2398,10 @@ mod tests {
             first_utm_source: None,
             first_utm_medium: None,
             first_utm_campaign: None,
+            user_id: None,
+            identity_source: None,
+            identified_at: None,
+            trait_sources: None,
         }
     }
 

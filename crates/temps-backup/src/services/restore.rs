@@ -29,11 +29,26 @@ pub enum RestoreError {
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
+    #[error("Failed to record restore for service {service_id}, backup {backup} on S3 source {s3_source_id}: {source}")]
+    RecordRunFailed {
+        service_id: i32,
+        backup: String,
+        s3_source_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+
     #[error("Backup {backup_id} not found")]
     BackupNotFound { backup_id: i32 },
 
     #[error("Backup {backup_id} is being deleted and cannot be restored")]
     BackupDeleting { backup_id: i32 },
+
+    #[error(
+        "Backup {backup_id} is in state '{state}' and cannot be restored: only a completed \
+         backup holds a full snapshot. Wait for it to finish, or pick a completed backup."
+    )]
+    BackupNotRestorable { backup_id: i32, state: String },
 
     #[error("External service {service_id} not found")]
     ServiceNotFound { service_id: i32 },
@@ -49,6 +64,15 @@ pub enum RestoreError {
 
     #[error("Validation error: {message}")]
     Validation { message: String },
+
+    #[error(
+        "Cannot read the restore options of service {service_id} ('{service_name}'): {reason}"
+    )]
+    CapabilitiesUnavailable {
+        service_id: i32,
+        service_name: String,
+        reason: String,
+    },
 
     #[error("Cannot reserve restored service name '{name}': {reason}")]
     ServiceNameConflict { name: String, reason: String },
@@ -135,6 +159,30 @@ pub enum RestoreError {
         reason: String,
     },
 
+    #[error("Cannot decrypt the {field} of S3 source {s3_source_id} for restore run {run_id} on service {service_id}. Re-enter the source credentials on this server.")]
+    RestoreSourceCredentials {
+        field: &'static str,
+        s3_source_id: i32,
+        run_id: i32,
+        service_id: i32,
+    },
+
+    #[error("Could not read the WAL-G snapshot identity for backup {backup_id} on S3 source {s3_source_id}. Check the source credentials and read access to the repository.")]
+    SnapshotLookupFailed {
+        backup_id: String,
+        s3_source_id: i32,
+        #[source]
+        source: crate::execution::engine_v2::BackupError,
+    },
+
+    #[error("Backup {location} has no valid WAL-G repository in S3 source {s3_source_id} for restore run {run_id} on service {service_id}")]
+    WalgRepositoryUnavailable {
+        location: String,
+        s3_source_id: i32,
+        run_id: i32,
+        service_id: i32,
+    },
+
     #[error("Encryption error: {reason}")]
     Encryption { reason: String },
 
@@ -143,6 +191,23 @@ pub enum RestoreError {
 
     #[error("Internal error: {reason}")]
     Internal { reason: String },
+}
+
+mod worker_mariadb;
+mod worker_mongodb;
+mod worker_outcome;
+pub use worker_outcome::ManagerWorkerRestoreResume;
+mod worker_redis;
+mod worker_walg;
+
+fn use_recorded_snapshot(backup: &mut temps_entities::backups::Model) {
+    if let Ok(metadata) = serde_json::from_str(&backup.metadata) {
+        if let Some(location) =
+            crate::engines::walg_size::recorded_location(&backup.s3_location, &metadata)
+        {
+            backup.s3_location = location;
+        }
+    }
 }
 
 fn selected_walg_target_user_data(
@@ -348,7 +413,7 @@ impl RestoreRequestMode {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct RestoreRunView {
     pub id: i32,
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub source_service_id: i32,
     pub target_service_id: Option<i32>,
     pub target_service_name: Option<String>,
@@ -395,7 +460,7 @@ impl RestoreRunSourceBackup {
     fn from_run(run: &temps_entities::restore_runs::Model) -> Self {
         let token = run.resume_token.as_ref();
         Self {
-            id: (run.source_backup_id > 0).then_some(run.source_backup_id),
+            id: run.source_backup_id,
             backup_id: None,
             s3_source_id: token
                 .and_then(|t| t.get("s3_source_id"))
@@ -481,7 +546,9 @@ pub struct RestorePlan {
     /// Backup we'll read from.
     pub source_backup: PlanSourceBackup,
     /// How the restore will be performed: "walg_restore", "pg_dump_restore",
-    /// "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
+    /// "mariadb_physical_restore", "mariadb_dump_restore",
+    /// "mongodump_restore", "redis_rdb_restore", "s3_mirror_restore", or
+    /// "unsupported".
     pub strategy: String,
     /// Ordered list of human-readable actions the orchestrator will take.
     pub steps: Vec<String>,
@@ -519,7 +586,8 @@ pub struct PlanSourceBackup {
     /// True when the original row's `s3_location` was empty and we resolved
     /// a location by probing S3. The UI shows this as a warning.
     pub location_was_resolved: bool,
-    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
+    /// "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "mongodump",
+    /// "redis_rdb", "s3_mirror", "unknown".
     pub format: String,
     pub size_bytes: Option<i64>,
     pub created_at: Option<String>,
@@ -537,6 +605,13 @@ pub struct RestoreService {
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Cancellation signals for the restore workers this service spawned.
     cancellations: super::restore_cancel::RestoreCancellations,
+    /// The workload plane, once `temps serve` starts it. In-place restores
+    /// of a database on a worker node run as a job through it (ADR-055
+    /// Phase 9); an empty slot refuses them with the reason.
+    workload_plane: Arc<temps_workload_plane::PlaneSlot>,
+    /// Derives the S3 credential a restore on a worker node receives
+    /// (ADR-102).
+    worker_credentials: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
 }
 
 impl RestoreService {
@@ -545,13 +620,39 @@ impl RestoreService {
         external_service_manager: Arc<ExternalServiceManager>,
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
+        // Without the shared scoper a worker restore still never receives a
+        // source's own credential: this one scopes through STS and refuses
+        // a managed source (it has no Cloud minter).
+        let worker_credentials = Arc::new(
+            temps_providers::worker_s3_scope::WorkerCredentialScoper::new(
+                encryption_service.clone(),
+            ),
+        );
         Self {
             db,
             external_service_manager,
             encryption_service,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             cancellations: super::restore_cancel::RestoreCancellations::default(),
+            workload_plane: Arc::new(temps_workload_plane::PlaneSlot::new()),
+            worker_credentials,
         }
+    }
+
+    /// Derive worker restores' S3 credentials with `scoper`, the process's
+    /// shared one (it holds the Temps Cloud minter).
+    pub fn with_worker_credentials(
+        mut self,
+        scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
+    ) -> Self {
+        self.worker_credentials = scoper;
+        self
+    }
+
+    /// Restore databases on worker nodes through `plane` (ADR-055 Phase 9).
+    pub fn with_workload_plane(mut self, plane: Arc<temps_workload_plane::PlaneSlot>) -> Self {
+        self.workload_plane = plane;
+        self
     }
 
     /// Report restore outcomes as anonymous `restore_succeeded` /
@@ -600,10 +701,11 @@ impl RestoreService {
         let (backup_row, backup_location, backup_engine_hint, s3_source_id, backup_id_opt) =
             match &selector {
                 BackupSelector::Id(id) => {
-                    let backup = temps_entities::backups::Entity::find_by_id(*id)
+                    let mut backup = temps_entities::backups::Entity::find_by_id(*id)
                         .one(self.db.as_ref())
                         .await?
                         .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+                    use_recorded_snapshot(&mut backup);
                     let engine = self.resolve_backup_engine(&backup).await?;
                     (
                         Some(backup.clone()),
@@ -665,6 +767,17 @@ impl RestoreService {
         // plan matches reality.
         let mut resolved_location = backup_location.clone();
         let mut location_was_resolved = false;
+        if let Some(row) = &backup_row {
+            if needs_walg_identity_lookup(row, &target.service_type) {
+                let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(RestoreError::S3SourceNotFound { s3_source_id })?;
+                resolved_location =
+                    resolve_tracked_walg_snapshot(row, &source, &self.encryption_service).await?;
+                location_was_resolved = true;
+            }
+        }
         if resolved_location.is_empty() {
             let origin_and_uuid = backup_row.as_ref().and_then(|b| {
                 serde_json::from_str::<serde_json::Value>(&b.metadata)
@@ -711,10 +824,10 @@ impl RestoreService {
                             endpoint: s3_source.endpoint.clone(),
                             bucket_name: s3_source.bucket_name.clone(),
                             bucket_path: s3_source.bucket_path.clone(),
-                            force_path_style: s3_source.force_path_style.unwrap_or(true),
+                            force_path_style: s3_source.effective_path_style(true).force_path_style,
                         };
                         let client = build_s3_client(&creds);
-                        if let Ok(Some(loc)) = resolve_backup_location_from_s3(
+                        match resolve_backup_location_from_s3(
                             &client,
                             &s3_source,
                             &target.service_type,
@@ -723,18 +836,23 @@ impl RestoreService {
                         )
                         .await
                         {
-                            resolved_location = loc;
-                            location_was_resolved = true;
+                            Ok(Some(loc)) => {
+                                resolved_location = loc;
+                                location_was_resolved = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => errors.push(format!("Could not locate backup {backup_uuid} on S3 source {s3_source_id}: {error}")),
+
                         }
                     }
                 }
             }
-            if resolved_location.is_empty() {
+            if resolved_location.is_empty() && errors.is_empty() {
                 errors.push(
                     "This backup has no s3_location and no matching object was found on the S3 source."
                         .into(),
                 );
-            } else {
+            } else if !resolved_location.is_empty() {
                 warnings.push(format!(
                     "Backup row has an empty s3_location; orchestrator will auto-resolve to: {}",
                     resolved_location
@@ -742,44 +860,10 @@ impl RestoreService {
             }
         }
 
-        // Strategy classification.
-        //
-        // MariaDB is classified FIRST and entirely on its own terms. Its
-        // logical dump object is named `dump.sql.gz`, so the generic
-        // `.sql.gz` arm below would label it `pg_dump_restore` and the plan
-        // would describe a `pg_restore` that never runs. Its physical base is
-        // a WAL-G repository (or, in older buckets, a `base.mbstream.gz`
-        // object), neither of which matches a generic arm — both would land
-        // in `unsupported` even though they are the engine's PITR format.
+        // Strategy classification: see `classify_restore_strategy`.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
         let engine_lower = target.service_type.to_ascii_lowercase();
-        let strategy = if target_is_mariadb {
-            // Same predicate the MariaDB engine itself dispatches on, so the
-            // preview cannot promise a restore shape the executor won't take.
-            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
-                &resolved_location,
-            ) {
-                "mariadb_physical_restore"
-            } else if resolved_location.ends_with(".sql.gz") {
-                "mariadb_dump_restore"
-            } else {
-                "unsupported"
-            }
-        } else if resolved_location.starts_with("s3://") {
-            "walg_restore"
-        } else if resolved_location.ends_with(".sql.gz")
-            || resolved_location.ends_with(".pgdump.gz")
-        {
-            "pg_dump_restore"
-        } else if engine_lower == "redis"
-            && temps_providers::externalsvc::redis::classify_redis_backup_location(
-                &resolved_location,
-            ) == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip
-        {
-            "redis_rdb_restore"
-        } else {
-            "unsupported"
-        };
+        let strategy = classify_restore_strategy(&engine_lower, &resolved_location);
 
         // PITR needs a continuous change stream anchored to the base backup:
         // WAL-G's WAL archive for Postgres, archived binary logs for MariaDB's
@@ -792,10 +876,10 @@ impl RestoreService {
                         .into(),
                 );
             } else {
-                errors.push(
-                    "PITR requires a WAL-G backup. The selected backup is pg_dump; choose a WAL-G backup or a different mode."
-                        .into(),
-                );
+                errors.push(format!(
+                    "PITR requires a WAL-G backup. The selected backup is {}; choose a WAL-G backup or a different mode.",
+                    restore_format(strategy).replace('_', " ")
+                ));
             }
         }
 
@@ -803,14 +887,10 @@ impl RestoreService {
         // (the backup's recorded producer ids), not by name: a service that
         // was deleted and re-created under the same name is a different
         // service.
-        let origin_service_name = backup_row
-            .as_ref()
-            .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-            .and_then(|v| {
-                v.get("service_name")
-                    .and_then(|s| s.as_str())
-                    .map(String::from)
-            });
+        let origin_service_name = match backup_row.as_ref() {
+            Some(backup) => backup_origin_service_name(self.db.as_ref(), backup).await,
+            None => None,
+        };
         let origin_binding = self
             .resolve_origin_binding(target_service_id, &selector)
             .await?;
@@ -862,24 +942,28 @@ impl RestoreService {
             && engine_preserves_source_credentials
             && matches!(
                 strategy,
-                "walg_restore" | "pg_dump_restore" | "mariadb_physical_restore"
+                "walg_restore"
+                    | "pg_dump_restore"
+                    | "mariadb_physical_restore"
+                    | "mongodump_restore"
             )
         {
-            let origin_still_known = backup_row
-                .as_ref()
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
-                .is_some()
-                || temps_entities::external_service_backups::Entity::find()
-                    .filter(
-                        temps_entities::external_service_backups::Column::BackupId
-                            .eq(backup_row.as_ref().map(|b| b.id).unwrap_or(0)),
-                    )
-                    .one(self.db.as_ref())
-                    .await
+            let origin_still_known = if let Some(backup) = &backup_row {
+                serde_json::from_str::<serde_json::Value>(&backup.metadata)
                     .ok()
-                    .flatten()
-                    .is_some();
+                    .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
+                    .is_some()
+                    || temps_entities::external_service_backups::Entity::find()
+                        .filter(
+                            temps_entities::external_service_backups::Column::BackupId
+                                .eq(backup.id),
+                        )
+                        .one(self.db.as_ref())
+                        .await?
+                        .is_some()
+            } else {
+                false
+            };
 
             if origin_still_known {
                 if let Some(origin) = origin_service_name.as_ref() {
@@ -890,6 +974,13 @@ impl RestoreService {
                         ));
                     }
                 }
+            } else if strategy == "walg_restore" {
+                warnings.push(
+                    physical_postgres_login_warning(
+                        target.topology == "cluster" && target.service_type == "postgres",
+                    )
+                    .into(),
+                );
             } else {
                 warnings.push(
                     "Password change (origin unknown): after restore, the database will expect the password from the original backup's service, which this Temps no longer tracks. You may need to reset the password manually via `ALTER USER` after the restore completes."
@@ -905,77 +996,95 @@ impl RestoreService {
         let mut steps: Vec<String> = Vec::new();
         let mut destructive = false;
 
-        match engine_lower.as_str() {
-            "postgres" => {
-                build_postgres_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "redis" => {
-                build_redis_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "mongodb" => {
-                if let Some(warning) = build_mongodb_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                ) {
-                    warnings.push(warning.into());
+        // A service on a worker node is restored there, by a job or its
+        // agent: describe what actually runs, and refuse what it cannot do,
+        // as `start_restore` will.
+        if let Some(worker) = worker_restore_plan(
+            &target,
+            &resolved_location,
+            &mode,
+            &container_name,
+            origin_binding.cross_service,
+        ) {
+            steps = worker.steps;
+            destructive = true;
+            errors.extend(worker.refusal);
+        } else {
+            match engine_lower.as_str() {
+                "postgres" => {
+                    build_postgres_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
                 }
-            }
-            "mariadb" => {
-                build_mariadb_steps(
-                    strategy,
-                    &mode,
-                    &container_name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            "s3" | "rustfs" | "blob" | "minio" => {
-                build_object_store_steps(
-                    strategy,
-                    &mode,
-                    &target.name,
-                    &resolved_location,
-                    &mut steps,
-                    &mut destructive,
-                    &mut errors,
-                );
-            }
-            other => {
-                errors.push(format!(
+                "redis" => {
+                    build_redis_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                    if origin_binding.cross_service && matches!(mode, RestoreRequestMode::InPlace) {
+                        steps.push(redis_bookkeeping_step());
+                    }
+                }
+                "mongodb" => {
+                    if let Some(warning) = build_mongodb_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    ) {
+                        warnings.push(warning.into());
+                    }
+                }
+                "mariadb" => {
+                    build_mariadb_steps(
+                        strategy,
+                        &mode,
+                        &container_name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                }
+                "s3" | "rustfs" | "blob" | "minio" => {
+                    build_object_store_steps(
+                        strategy,
+                        &mode,
+                        &target.name,
+                        &resolved_location,
+                        &mut steps,
+                        &mut destructive,
+                        &mut errors,
+                    );
+                }
+                other => {
+                    errors.push(format!(
                     "Restore plan preview is not implemented for engine '{}'. The orchestrator may still run, but the step-by-step preview below will be generic.",
                     other
                 ));
-                steps.push(format!("Target: {}", container_name));
-                steps.push(format!(
-                    "Strategy: {} (details depend on the '{}' engine)",
-                    strategy, other
-                ));
-                steps.push("Dispatch restore via the engine's trait implementation".into());
-                if matches!(mode, RestoreRequestMode::InPlace) {
-                    destructive = true;
+                    steps.push(format!("Target: {}", container_name));
+                    steps.push(format!(
+                        "Strategy: {} (details depend on the '{}' engine)",
+                        strategy, other
+                    ));
+                    steps.push("Dispatch restore via the engine's trait implementation".into());
+                    if matches!(mode, RestoreRequestMode::InPlace) {
+                        destructive = true;
+                    }
                 }
             }
         }
@@ -995,16 +1104,7 @@ impl RestoreService {
                 origin_service_name,
                 location: resolved_location,
                 location_was_resolved,
-                format: match strategy {
-                    "walg_restore" => "walg".into(),
-                    "pg_dump_restore" => "pg_dump".into(),
-                    // Match the engine keys the MariaDB backup engines
-                    // register under, so the plan's `format` lines up with
-                    // `classify_backup_format` and the backup list UI.
-                    "mariadb_physical_restore" => "mariadb_physical".into(),
-                    "mariadb_dump_restore" => "mariadb_dump".into(),
-                    _ => "unknown".into(),
-                },
+                format: restore_format(strategy).into(),
                 size_bytes: backup_row.as_ref().and_then(|b| b.size_bytes),
                 created_at: backup_row.as_ref().map(|b| b.started_at.to_rfc3339()),
             },
@@ -1043,36 +1143,84 @@ impl RestoreService {
         ),
         RestoreError,
     > {
+        self.capabilities_of(service_id, true).await
+    }
+
+    /// The restore modes of `service_id`, and with `read_window` the PITR
+    /// window its archive covers where that is read from the archive
+    /// (admission needs the modes only).
+    async fn capabilities_of(
+        &self,
+        service_id: i32,
+        read_window: bool,
+    ) -> Result<
+        (
+            temps_providers::externalsvc::RestoreCapabilities,
+            RestoreServiceIdentity,
+        ),
+        RestoreError,
+    > {
         let service = self.load_service(service_id).await?;
+        let identity = RestoreServiceIdentity {
+            id: service.id,
+            name: service.name.clone(),
+            service_type: service.service_type.clone(),
+        };
+        // A PostgreSQL on a worker node restores WAL-G backups on its node
+        // in place and to a point in time, through its agent, with the
+        // window its archive covers (see `worker_walg`).
+        if crate::engines::workload_job::takes_job_path(&service) {
+            let capabilities = worker_walg::capabilities(
+                &self.db,
+                &self.encryption_service,
+                &service,
+                read_window,
+            )
+            .await;
+            return Ok((capabilities, identity));
+        }
+        // A MongoDB or a Redis on a worker node restores with the control
+        // plane's own restore on its node, in place (see `worker_mongodb`,
+        // `worker_redis`).
+        if worker_mongodb::takes_path(&service) {
+            return Ok((worker_mongodb::capabilities(), identity));
+        }
+        // A MariaDB on a worker node is restored by the control plane's own
+        // MariaDB restore on its node (see `worker_mariadb`).
+        if worker_mariadb::takes_mariadb_path(&service) {
+            return Ok((worker_mariadb::capabilities(), identity));
+        }
+        // The other services on a worker node are restored on that node, in
+        // place only (see `agent_restore_supported`). Their engine is not on
+        // this host, which may have no Docker at all.
+        if worker_redis::takes_redis_path(&service)
+            || crate::engines::worker_agent::takes_agent_path(&service)
+        {
+            return Ok((worker_restore_capabilities(), identity));
+        }
         let service_type =
             ServiceType::from_str(&service.service_type).map_err(|e| RestoreError::Validation {
                 message: format!("Invalid service type '{}': {}", service.service_type, e),
             })?;
+        let unavailable = |reason: String| RestoreError::CapabilitiesUnavailable {
+            service_id,
+            service_name: service.name.clone(),
+            reason,
+        };
         let service_config = self
             .external_service_manager
             .get_service_config(service_id)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: e.to_string(),
-            })?;
+            .map_err(|e| unavailable(format!("loading its configuration failed: {e}")))?;
         let instance = self
             .external_service_manager
             .resolve_service_instance(&service.name, service_type)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: format!("get service instance: {}", e),
-            })?;
+            .map_err(|e| unavailable(format!("its engine is not available here: {e}")))?;
         let capabilities = instance
             .restore_capabilities(service_config)
             .await
-            .map_err(|e| RestoreError::ExternalService {
-                reason: format!("Failed to read restore capabilities: {}", e),
-            })?;
-        let identity = RestoreServiceIdentity {
-            id: service.id,
-            name: service.name,
-            service_type: service.service_type,
-        };
+            .map_err(|e| unavailable(format!("its engine could not answer: {e}")))?;
         Ok((capabilities, identity))
     }
 
@@ -1104,10 +1252,16 @@ impl RestoreService {
             backup_started_at,
         ) = match &selector {
             BackupSelector::Id(id) => {
-                let backup = temps_entities::backups::Entity::find_by_id(*id)
+                let mut backup = temps_entities::backups::Entity::find_by_id(*id)
                     .one(self.db.as_ref())
                     .await?
                     .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+                use_recorded_snapshot(&mut backup);
+                // Reject before any engine or capability work: a pending,
+                // running or failed backup points at a partial (or empty)
+                // snapshot, and an in-place restore from it would wipe the
+                // target. Admission re-checks this under the row lock.
+                ensure_backup_restorable(&backup)?;
 
                 // Fail closed: a backup some service produced must have a
                 // known engine, otherwise the compatibility check below
@@ -1148,14 +1302,9 @@ impl RestoreService {
                         message: "backup_location cannot be empty".into(),
                     });
                 }
-                // Orphan restores (backup discovered by S3 scan, produced
-                // by another Temps instance) have no DB row and thus no
-                // known `started_at` to validate a PITR target against —
-                // we can't range-check what we don't know. The engine
-                // (Postgres, via `restore_pitr`) still protects against a
-                // target the WAL can't reach: it FATALs out of recovery
-                // rather than promoting, which the container health
-                // check surfaces as a failed restore run.
+                // A backup found in S3 has no row here, so no recorded
+                // start. A PostgreSQL time target is checked below against
+                // the start the selected WAL-G snapshot records instead.
                 (
                     None,
                     location.clone(),
@@ -1168,6 +1317,11 @@ impl RestoreService {
 
         // Target service: where the restored data goes.
         let target = self.load_service(target_service_id).await?;
+
+        // ADR-055 Phase 9: a database on a worker node is restored by a job
+        // on its node, which applies a dump in place. Refuse anything else
+        // now, not after the run started.
+        worker_restore_admitted(&target, &backup_location, &mode)?;
 
         // Engine-compat guard: refuse to restore a postgres backup onto a
         // redis target, etc.
@@ -1184,7 +1338,7 @@ impl RestoreService {
 
         // Capabilities come from the TARGET — we're going to run the
         // restore logic on its service instance.
-        let caps = self.get_capabilities(target_service_id).await?;
+        let (caps, _) = self.capabilities_of(target_service_id, false).await?;
         match &mode {
             RestoreRequestMode::InPlace => {
                 if !caps.restore_in_place {
@@ -1229,7 +1383,24 @@ impl RestoreService {
                         message: "new_service_name is required when to_new_service=true".into(),
                     });
                 }
-                validate_pitr_recovery_target(recovery_target, backup_started_at)?;
+                if resolved_backup_id.is_none()
+                    && target.service_type.eq_ignore_ascii_case("postgres")
+                {
+                    let snapshot_started_at =
+                        if matches!(recovery_target, RecoveryTarget::Time { .. }) {
+                            self.untracked_snapshot_start(&backup_location, s3_source_id)
+                                .await?
+                        } else {
+                            None
+                        };
+                    validate_untracked_pitr_target(
+                        recovery_target,
+                        snapshot_started_at,
+                        &backup_location,
+                    )?;
+                } else {
+                    validate_pitr_recovery_target(recovery_target, backup_started_at)?;
+                }
             }
         }
 
@@ -1263,8 +1434,7 @@ impl RestoreService {
         };
 
         // Persist the backup selector + target service. For orphan backups
-        // (no DB id) we use id=0 as a sentinel since the column is
-        // non-null; the worker keys off resume_token to find the location.
+        // (no DB id), the worker uses resume_token to find the location.
         let resume_token = serde_json::json!({
             "backup_location": backup_location,
             "engine_hint": backup_engine_hint,
@@ -1277,7 +1447,7 @@ impl RestoreService {
         let log_id = uuid::Uuid::new_v4().to_string();
         let run_active = temps_entities::restore_runs::ActiveModel {
             id: NotSet,
-            source_backup_id: Set(resolved_backup_id.unwrap_or(0)),
+            source_backup_id: NotSet,
             // `source_service_id` historically meant "service we're
             // operating on". Orchestration now always points at the
             // TARGET — the worker re-discovers the backup from the
@@ -1301,6 +1471,7 @@ impl RestoreService {
             updated_at: NotSet,
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
+            restored_login_encrypted: Set(None),
         };
         let run = insert_restore_run(
             self.db.as_ref(),
@@ -1309,7 +1480,18 @@ impl RestoreService {
             target_service_id,
             mode.is_destructive(),
         )
-        .await?;
+        .await
+        .map_err(|error| match error {
+            RestoreError::Database(source) => RestoreError::RecordRunFailed {
+                service_id: target_service_id,
+                backup: resolved_backup_id
+                    .map(|id| id.to_string())
+                    .unwrap_or(backup_location),
+                s3_source_id,
+                source,
+            },
+            other => other,
+        })?;
 
         // Spawn the worker — it owns Arc clones and updates the row as it goes.
         let run_id = run.id;
@@ -1317,12 +1499,24 @@ impl RestoreService {
         let mgr = self.external_service_manager.clone();
         let enc = self.encryption_service.clone();
         let telemetry = self.telemetry.clone();
+        let plane = self.workload_plane.clone();
+        let scoper = self.worker_credentials.clone();
         // Registered before the worker starts so a cancellation that arrives
         // immediately still reaches it.
         let registration = self.cancellations.register(run_id);
         tokio::spawn(async move {
-            if let Err(e) =
-                run_restore_worker(db, mgr, enc, telemetry, run_id, mode, registration).await
+            if let Err(e) = run_restore_worker(
+                db,
+                mgr,
+                enc,
+                plane,
+                scoper,
+                telemetry,
+                run_id,
+                mode,
+                registration,
+            )
+            .await
             {
                 error!("Restore run {} failed: {}", run_id, e);
             }
@@ -1573,11 +1767,7 @@ async fn views_with_source_backups(
     db: &DatabaseConnection,
     runs: Vec<temps_entities::restore_runs::Model>,
 ) -> Result<Vec<RestoreRunView>, RestoreError> {
-    let backup_ids: BTreeSet<i32> = runs
-        .iter()
-        .map(|run| run.source_backup_id)
-        .filter(|id| *id > 0)
-        .collect();
+    let backup_ids: BTreeSet<i32> = runs.iter().filter_map(|run| run.source_backup_id).collect();
     let backups: BTreeMap<i32, temps_entities::backups::Model> = if backup_ids.is_empty() {
         BTreeMap::new()
     } else {
@@ -1592,8 +1782,9 @@ async fn views_with_source_backups(
     Ok(runs
         .into_iter()
         .map(|run| {
-            let source_backup = backups
-                .get(&run.source_backup_id)
+            let source_backup = run
+                .source_backup_id
+                .and_then(|id| backups.get(&id))
                 .map(RestoreRunSourceBackup::from_backup);
             let mut view = RestoreRunView::from(run);
             if let Some(source_backup) = source_backup {
@@ -1647,12 +1838,9 @@ fn engines_compatible(a: &str, b: &str) -> bool {
 /// generically-worded, failure — not silent corruption — so it's
 /// intentionally left alone here.
 ///
-/// `backup_started_at` is `None` for orphan restores (backup discovered by
-/// S3 scan, produced by another Temps instance) — there's no DB row and
-/// thus no known start time to validate against, so we can't range-check
-/// what we don't know; those still fall back on Postgres's own FATAL/crash
-/// loop for a too-early target too (untested here, but the same "PG stops
-/// at the earliest reachable point without erroring" behavior applies).
+/// `backup_started_at` is `None` when the start is unknown; the range check
+/// is then skipped. PostgreSQL backups this server does not track go through
+/// [`validate_untracked_pitr_target`], which refuses a time target instead.
 fn validate_pitr_recovery_target(
     target: &RecoveryTarget,
     backup_started_at: Option<chrono::DateTime<Utc>>,
@@ -1694,6 +1882,52 @@ fn validate_pitr_recovery_target(
 /// That predicate must be the layout-agnostic one: testing only the legacy
 /// `base.mbstream.gz` object reintroduces the same class of bug, because a
 /// MariaDB WAL-G repository is a physical base the engine can and does replay.
+/// What an in-place physical PostgreSQL restore of a backup whose origin this
+/// server no longer tracks needs from the operator, and what happens if it
+/// fails. A single server keeps its original data until the restored one
+/// passes verification and puts it back otherwise; a cluster restore removes
+/// every member's data before seeding the primary, so nothing is put back.
+fn physical_postgres_login_warning(is_cluster: bool) -> &'static str {
+    if is_cluster {
+        "This physical PostgreSQL backup contains the original roles and passwords. \
+         Configure the destination service with the original database name, username and \
+         password before restoring. An in-place cluster restore removes every member's data \
+         before the backup is seeded and cannot put it back if a later step fails: take a \
+         fresh backup first, or restore into a new service."
+    } else {
+        "This physical PostgreSQL backup contains the original roles and passwords. \
+         Configure the destination service with the original database name, username and \
+         password before restoring. Temps uses that login to verify recovery and puts the \
+         original data back if verification fails."
+    }
+}
+
+/// Check a point-in-time target for a PostgreSQL backup this server does not
+/// track, against the start time its selected WAL-G snapshot records.
+///
+/// PostgreSQL given a target earlier than its base backup does not fail: it
+/// stops at the earliest consistent point and reports success, so the run
+/// would complete without honouring the requested time. A time target whose
+/// snapshot start is unknown is therefore refused, not accepted unchecked.
+/// Transaction, LSN and named targets are not affected.
+fn validate_untracked_pitr_target(
+    target: &RecoveryTarget,
+    snapshot_started_at: Option<chrono::DateTime<Utc>>,
+    location: &str,
+) -> Result<(), RestoreError> {
+    if matches!(target, RecoveryTarget::Time { .. }) && snapshot_started_at.is_none() {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "A point-in-time restore to a time needs the start time of the selected \
+                 backup, and {location} does not record one. Select an individual WAL-G \
+                 snapshot from the list, or recover to a transaction ID, LSN or named \
+                 restore point instead."
+            ),
+        });
+    }
+    validate_pitr_recovery_target(target, snapshot_started_at)
+}
+
 fn validate_pitr_backup_location(
     target_service_type: &str,
     backup_location: &str,
@@ -1718,6 +1952,402 @@ fn validate_pitr_backup_location(
         });
     }
     Ok(())
+}
+
+/// The service that produced `backup`: its producer link, or for a
+/// control-plane backup row the `service_id` its metadata records. `None`
+/// when neither names one (an orphan from another Temps, a deleted producer).
+async fn backup_origin_service_id(
+    db: &DatabaseConnection,
+    backup: &temps_entities::backups::Model,
+) -> Option<i32> {
+    temps_entities::external_service_backups::Entity::find()
+        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup.id))
+        .one(db)
+        .await
+        .ok()
+        .flatten()
+        .map(|b| b.service_id)
+        .or_else(|| {
+            serde_json::from_str::<serde_json::Value>(&backup.metadata)
+                .ok()
+                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
+                .and_then(|id| i32::try_from(id).ok())
+        })
+}
+
+/// The name of the service that produced `backup`, for a restore plan: the
+/// producer the restore itself binds to ([`backup_origin_service_id`]), else
+/// the name its metadata recorded. `None` when neither is known.
+async fn backup_origin_service_name(
+    db: &DatabaseConnection,
+    backup: &temps_entities::backups::Model,
+) -> Option<String> {
+    if let Some(service_id) = backup_origin_service_id(db, backup).await {
+        if let Ok(Some(service)) = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(db)
+            .await
+        {
+            return Some(service.name);
+        }
+    }
+    serde_json::from_str::<serde_json::Value>(&backup.metadata)
+        .ok()
+        .and_then(|v| {
+            v.get("service_name")
+                .and_then(|s| s.as_str())
+                .map(String::from)
+        })
+}
+
+/// How a backup at `location` is restored into a `service_type` service
+/// (lowercase): the strategy a restore plan reports, from the location alone,
+/// the same way the engines dispatch on it.
+///
+/// MariaDB is classified FIRST and entirely on its own terms. Its logical
+/// dump object is named `dump.sql.gz`, so the generic `.sql.gz` arm below
+/// would label it `pg_dump_restore` and the plan would describe a
+/// `pg_restore` that never runs. Its physical base is a WAL-G repository
+/// (or, in older buckets, a `base.mbstream.gz` object), neither of which
+/// matches a generic arm. MongoDB and the object stores are classified
+/// before the generic arms too: a MongoDB object that is not a WAL-G
+/// prefix is a `mongodump --archive` (the MongoDB engine's dump, also what a
+/// worker's agent writes), and an object-store location that is not a
+/// WAL-G prefix is a bucket-mirror prefix.
+fn classify_restore_strategy(service_type: &str, location: &str) -> &'static str {
+    match service_type {
+        "mariadb" => {
+            // Same predicate the MariaDB engine itself dispatches on, so the
+            // preview cannot promise a restore shape the executor won't take.
+            if temps_providers::externalsvc::mariadb::MariaDbService::is_physical_base_backup_location(
+                location,
+            ) {
+                "mariadb_physical_restore"
+            } else if location.ends_with(".sql.gz") {
+                "mariadb_dump_restore"
+            } else {
+                "unsupported"
+            }
+        }
+        _ if location.starts_with("s3://") => "walg_restore",
+        "mongodb" if !location.trim().is_empty() => "mongodump_restore",
+        "s3" | "rustfs" | "blob" | "minio" if !location.trim().is_empty() => "s3_mirror_restore",
+        _ if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") => "pg_dump_restore",
+        "redis" | "kv"
+            if temps_providers::externalsvc::redis::classify_redis_backup_location(location)
+                == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip =>
+        {
+            "redis_rdb_restore"
+        }
+        _ => "unsupported",
+    }
+}
+
+/// The backup format a restore strategy reads, as a restore plan reports it.
+/// The MariaDB values match the engine keys its backup engines register
+/// under, so the plan lines up with `classify_backup_format` and the backup
+/// list.
+fn restore_format(strategy: &str) -> &'static str {
+    match strategy {
+        "walg_restore" => "walg",
+        "pg_dump_restore" => "pg_dump",
+        "mariadb_physical_restore" => "mariadb_physical",
+        "mariadb_dump_restore" => "mariadb_dump",
+        "mongodump_restore" => "mongodump",
+        "redis_rdb_restore" => "redis_rdb",
+        "s3_mirror_restore" => "s3_mirror",
+        _ => "unknown",
+    }
+}
+
+/// What restoring into a service on a worker node runs, for a restore plan.
+struct WorkerRestorePlan {
+    steps: Vec<String>,
+    /// Why `start_restore` would refuse it.
+    refusal: Option<String>,
+}
+
+/// The plan of a restore into `target` when it runs on a worker node: a job
+/// on the node (PostgreSQL) or the node's agent (the other engines), both
+/// reached through the agent. `None` for a target on the control plane.
+fn worker_restore_plan(
+    target: &temps_entities::external_services::Model,
+    location: &str,
+    mode: &RestoreRequestMode,
+    container: &str,
+    cross_service: bool,
+) -> Option<WorkerRestorePlan> {
+    let node = crate::engines::workload_job::worker_node(target)?;
+    if worker_walg::takes_walg_path(target, location) {
+        return Some(WorkerRestorePlan {
+            steps: worker_walg::steps(node, location, mode, container, cross_service),
+            refusal: worker_walg::walg_restore_supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    if worker_mariadb::takes_mariadb_path(target) {
+        let (steps, mut refusals) = worker_mariadb::steps(node, location, mode, container);
+        refusals.extend(
+            worker_mariadb::restore_supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        );
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: (!refusals.is_empty()).then(|| refusals.join(" ")),
+        });
+    }
+    if crate::engines::workload_job::takes_job_path(target) {
+        let mut steps = vec![
+            format!(
+                "Run a restore job on worker node {node}, through its agent, next to database \
+                 container {container}"
+            ),
+            format!(
+                "The job reads {location} from S3 and checks that it decompresses completely; \
+                 nothing is applied if it does not"
+            ),
+        ];
+        if cross_service {
+            steps.push(
+                "Give the job's login the password the dump restores, before applying it".into(),
+            );
+        }
+        steps.push(format!(
+            "Apply the dump in place into {container} with psql, stopping at the first error \
+             (existing data is overwritten)"
+        ));
+        if cross_service {
+            steps.push(
+                "Update the service's stored credentials to the restored login's password".into(),
+            );
+        }
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: job_restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    if worker_mongodb::takes_path(target) {
+        let (steps, mut errors) = worker_mongodb::steps(
+            node,
+            classify_restore_strategy(&target.service_type, location),
+            mode,
+            container,
+            location,
+        );
+        errors.extend(
+            worker_mongodb::supported(target, mode)
+                .err()
+                .map(|e| e.to_string()),
+        );
+        return Some(WorkerRestorePlan {
+            steps,
+            refusal: (!errors.is_empty()).then(|| errors.join("; ")),
+        });
+    }
+    if worker_redis::takes_redis_path(target) {
+        return Some(WorkerRestorePlan {
+            steps: worker_redis::steps(node, location, mode, container, cross_service),
+            refusal: worker_redis::restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    if crate::engines::worker_agent::takes_agent_path(target) {
+        use crate::engines::worker_agent::{worker_service_kind, WorkerServiceKind};
+        use temps_providers::externalsvc::worker_data::DumpEngine;
+        let applies = match worker_service_kind(&target.service_type) {
+            Some(WorkerServiceKind::Storage) => format!(
+                "The agent mirrors each bucket under {location} into {container} with \
+                 `rc mirror --overwrite --remove`: missing objects are added, changed ones \
+                 overwritten, and objects the backup does not have are deleted"
+            ),
+            // MongoDB, Redis and MariaDB take `worker_mongodb`, `worker_redis` and
+            // `worker_mariadb` above.
+            Some(WorkerServiceKind::Dump(DumpEngine::Mongodb)) | None => {
+                format!(
+                "The agent applies {location} in place with {}'s own restore (existing data is \
+                 overwritten)",
+                target.service_type
+            )
+            }
+        };
+        return Some(WorkerRestorePlan {
+            steps: vec![
+                format!(
+                    "Restore on worker node {node}, through its agent, into container {container}"
+                ),
+                applies,
+            ],
+            refusal: agent_restore_supported(target, location, mode)
+                .err()
+                .map(|e| e.to_string()),
+        });
+    }
+    None
+}
+
+/// The credentials a cross-service restore of `backup` leaves in `target`'s
+/// data, which the target's stored config is patched to once the restore
+/// succeeds: the same reconciliation, under the same per-engine gates
+/// ([`credential_propagation_gates`]), as a restore on the control plane.
+///
+/// `None` when the backup is the target's own, when its data carries no
+/// credentials, or when the origin is unknown or its config unreadable (the
+/// restore then keeps the target's credentials, as on the control plane;
+/// the restore plan warns about it).
+async fn origin_credentials_to_reconcile(
+    db: &DatabaseConnection,
+    mgr: &ExternalServiceManager,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+) -> Option<RestoredServiceCredentials> {
+    let (preserves_source_credentials, _) =
+        credential_propagation_gates(&target.service_type, &backup.s3_location);
+    if !preserves_source_credentials {
+        return None;
+    }
+    let origin_id = backup_origin_service_id(db, backup).await?;
+    if origin_id == target.id {
+        return None;
+    }
+    match mgr.get_service_config(origin_id).await {
+        Ok(origin) => {
+            RestoredServiceCredentials::from_origin(&target.service_type, &origin.parameters)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to read origin service {} config; the restore of backup {} into service \
+                 {} keeps the target's credentials, which may not match the restored data: {}",
+                origin_id, backup.id, target.id, e
+            );
+            None
+        }
+    }
+}
+
+/// [`origin_credentials_to_reconcile`] for a restore that runs on a worker
+/// node, recorded on the run before the restore is sent: the node's restore
+/// can outlive this process, and the one that settles it after a restart
+/// patches the target to this login ([`resumed_origin_credentials`]), not to
+/// whatever the origin's login has become since (another restore into the
+/// origin, a password reset).
+///
+/// Encrypted, as it carries passwords; "none to reconcile" is recorded too.
+/// A run whose login cannot be recorded is not started: nothing has been
+/// sent yet, and a restart could otherwise patch the target to a login its
+/// data does not answer to.
+async fn capture_origin_credentials(
+    db: &DatabaseConnection,
+    enc: &temps_core::EncryptionService,
+    mgr: &ExternalServiceManager,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+) -> Result<Option<RestoredServiceCredentials>, RestoreError> {
+    let origin = origin_credentials_to_reconcile(db, mgr, backup, target).await;
+    record_restored_login(db, enc, run_id, origin.as_ref()).await?;
+    Ok(origin)
+}
+
+/// Store `origin` (or "none") encrypted on restore run `run_id`.
+async fn record_restored_login(
+    db: &DatabaseConnection,
+    enc: &temps_core::EncryptionService,
+    run_id: i32,
+    origin: Option<&RestoredServiceCredentials>,
+) -> Result<(), RestoreError> {
+    let plain = serde_json::to_string(&origin).map_err(|e| RestoreError::Internal {
+        reason: format!("restore run {run_id}: serializing the restored login: {e}"),
+    })?;
+    let sealed = enc
+        .encrypt_string(&plain)
+        .map_err(|e| RestoreError::Encryption {
+            reason: format!("restore run {run_id}: encrypting the restored login: {e}"),
+        })?;
+    let updated = temps_entities::restore_runs::Entity::update_many()
+        .col_expr(
+            temps_entities::restore_runs::Column::RestoredLoginEncrypted,
+            sea_orm::sea_query::Expr::value(sealed),
+        )
+        .filter(temps_entities::restore_runs::Column::Id.eq(run_id))
+        .exec(db)
+        .await?;
+    if updated.rows_affected == 0 {
+        return Err(RestoreError::RestoreRunNotFound {
+            restore_run_id: run_id,
+        });
+    }
+    Ok(())
+}
+
+/// The login a resumed worker restore patches its target to: the one
+/// recorded on the run when it started ([`capture_origin_credentials`]).
+/// `None` when it recorded that there is none to reconcile.
+///
+/// A run from before the login was recorded (or one whose record cannot be
+/// read) falls back to `current`, the origin's login now, the only one
+/// there is; that is logged, since the origin may have changed since.
+async fn resumed_origin_credentials<F>(
+    enc: &temps_core::EncryptionService,
+    run: &temps_entities::restore_runs::Model,
+    current: F,
+) -> Option<RestoredServiceCredentials>
+where
+    F: std::future::Future<Output = Option<RestoredServiceCredentials>>,
+{
+    let Some(sealed) = run.restored_login_encrypted.as_deref() else {
+        warn!(
+            "Restore run {} recorded no restored login (it started before Temps recorded one);              it settles with the origin's current login",
+            run.id
+        );
+        return current.await;
+    };
+    let recorded = enc
+        .decrypt_string(sealed)
+        .map_err(|e| e.to_string())
+        .and_then(|plain| {
+            serde_json::from_str::<Option<RestoredServiceCredentials>>(&plain)
+                .map_err(|e| e.to_string())
+        });
+    match recorded {
+        Ok(origin) => origin,
+        Err(e) => {
+            error!(
+                "Restore run {}: its recorded restored login cannot be read ({e}); it settles                  with the origin's current login, which may have changed since",
+                run.id
+            );
+            current.await
+        }
+    }
+}
+
+/// Patch `target`'s stored credentials to the ones its restored data now
+/// expects. A failure is logged, never fatal: the data is restored, and the
+/// operator can reset the password.
+async fn reconcile_restored_credentials(
+    db: &DatabaseConnection,
+    enc: &Arc<temps_core::EncryptionService>,
+    target_id: i32,
+    credentials: Option<&RestoredServiceCredentials>,
+) {
+    let Some(credentials) = credentials else {
+        return;
+    };
+    match patch_service_credentials(db, enc, target_id, credentials).await {
+        Ok(()) => info!(
+            "Updated target service {} config credentials to match restored data",
+            target_id
+        ),
+        Err(e) => error!(
+            "Restore on service {} succeeded but patching stored credentials failed; the \
+             service's UI-shown credentials will be stale until someone updates them. Error: {}",
+            target_id, e
+        ),
+    }
 }
 
 /// Which credential-reconciliation steps a restore needs, as
@@ -1765,12 +2395,27 @@ fn credential_propagation_gates(target_service_type: &str, backup_location: &str
     }
 }
 
+/// The origin's login an offline restore (PostgreSQL, a physical MariaDB
+/// base) runs with, merged over the target's configuration: the restored
+/// auth catalog (`pg_authid`, `mysql.user`) answers to it. `root_password`
+/// is MariaDB's admin credential, the one the binary-log replay and every
+/// post-restore admin exec use; PostgreSQL configs have no such key.
+fn origin_login_merge(origin: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+    ["password", "root_password", "username", "database"]
+        .into_iter()
+        .filter_map(|key| Some((key.to_string(), origin.get(key)?.clone())))
+        .collect()
+}
+
 /// Worker: marks the run through phases, dispatches to the trait, and
 /// persists target_service_id (when applicable) on success.
+#[allow(clippy::too_many_arguments)]
 async fn run_restore_worker(
     db: Arc<DatabaseConnection>,
     mgr: Arc<ExternalServiceManager>,
     enc: Arc<temps_core::EncryptionService>,
+    plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     run_id: i32,
     mode: RestoreRequestMode,
@@ -1787,6 +2432,8 @@ async fn run_restore_worker(
         db.clone(),
         mgr,
         enc,
+        plane,
+        scoper,
         run_id,
         mode,
         registration.token(),
@@ -1856,35 +2503,22 @@ async fn run_restore_worker(
     // The worker is done with its cancellation token.
     drop(registration);
     let persisted = persist_terminal_state(&db, run_id, &result, TERMINAL_WRITE_RETRY).await;
-    match (&result, &persisted) {
-        (Ok(_), Ok(())) => info!("Restore run {} completed successfully", run_id),
-        (Err(RestoreError::Cancelled { message, .. }), Ok(())) => {
-            info!("Restore run {} cancelled: {}", run_id, message)
+    let outcome = match persisted {
+        Ok(disposition) => disposition.worker_outcome(run_id, result),
+        Err(error) => {
+            error!(run_id, %error, "Could not persist the restore outcome; startup reconciliation will retry");
+            Some(Err(error))
         }
-        (Err(e), Ok(())) => error!("Restore run {} failed: {}", run_id, e),
-        (_, Err(e)) => error!(
-            "Restore run {} finished but its terminal state could not be recorded: {}. \
-             It stays active until the next restart reconciles it as interrupted.",
-            run_id, e
-        ),
-    }
-
-    // A cancellation is the operator's decision, not a restore failure, so
-    // it is not reported as one.
-    if matches!(result, Err(RestoreError::Cancelled { .. })) && persisted.is_ok() {
-        return Ok(());
-    }
-
-    // Reported only once the run's final state is persisted: a restore whose
-    // completion could not be recorded is not a success.
-    let outcome = match (&result, &persisted) {
-        (Err(e), _) | (Ok(_), Err(e)) => Err(e.to_string()),
-        (Ok(_), Ok(())) => Ok(()),
     };
-    telemetry.report(restore_outcome_event(mode_label, elapsed, outcome));
-
-    persisted?;
-    result.map(|_| ())
+    let Some(outcome) = outcome else {
+        return Ok(());
+    };
+    telemetry.report(restore_outcome_event(
+        mode_label,
+        elapsed,
+        outcome.as_ref().map(|_| ()).map_err(ToString::to_string),
+    ));
+    outcome
 }
 
 /// Anonymous restore outcome: the restore mode, a duration band and, on
@@ -1903,19 +2537,13 @@ fn restore_outcome_event(
     event.with("mode", mode).with_duration(elapsed)
 }
 
-async fn run_restore_inner(
-    db: Arc<DatabaseConnection>,
-    mgr: Arc<ExternalServiceManager>,
-    enc: Arc<temps_core::EncryptionService>,
-    run_id: i32,
-    mode: RestoreRequestMode,
-    cancel: tokio_util::sync::CancellationToken,
-) -> Result<Option<i32>, RestoreError> {
-    let run = load_run_for_update(&db, run_id).await?;
-
-    // Resolve backup identity. `source_backup_id == 0` is the sentinel
-    // for orphan-backup restores, where everything we need lives in
-    // `resume_token` (backup_location + s3_source_id + engine_hint).
+/// The backup `run` restores: its row, or for an orphan-backup restore
+/// (`source_backup_id` is null) one synthesised from its `resume_token`.
+async fn run_backup_model(
+    db: &DatabaseConnection,
+    run: &temps_entities::restore_runs::Model,
+) -> Result<temps_entities::backups::Model, RestoreError> {
+    // Orphan runs carry their location, S3 source and engine in the resume token.
     let resume: serde_json::Value = run
         .resume_token
         .clone()
@@ -1930,13 +2558,13 @@ async fn run_restore_inner(
         .and_then(|v| v.as_i64())
         .map(|v| v as i32);
 
-    let mut backup_model: temps_entities::backups::Model = if run.source_backup_id > 0 {
-        temps_entities::backups::Entity::find_by_id(run.source_backup_id)
-            .one(db.as_ref())
+    Ok(if let Some(backup_id) = run.source_backup_id {
+        let mut backup = temps_entities::backups::Entity::find_by_id(backup_id)
+            .one(db)
             .await?
-            .ok_or(RestoreError::BackupNotFound {
-                backup_id: run.source_backup_id,
-            })?
+            .ok_or(RestoreError::BackupNotFound { backup_id })?;
+        use_recorded_snapshot(&mut backup);
+        backup
     } else {
         // Orphan: synthesize a `backups::Model` for the trait context.
         // The trait only reads `s3_location` + `s3_source_id` off it;
@@ -1966,7 +2594,26 @@ async fn run_restore_inner(
             expires_at: None,
             tags: "[]".to_string(),
         }
-    };
+    })
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's owned dependencies, one per argument"
+)]
+async fn run_restore_inner(
+    db: Arc<DatabaseConnection>,
+    mgr: Arc<ExternalServiceManager>,
+    enc: Arc<temps_core::EncryptionService>,
+    plane: Arc<temps_workload_plane::PlaneSlot>,
+    scoper: Arc<temps_providers::worker_s3_scope::WorkerCredentialScoper>,
+    run_id: i32,
+    mode: RestoreRequestMode,
+    cancel: tokio_util::sync::CancellationToken,
+) -> Result<Option<i32>, RestoreError> {
+    let run = load_run_for_update(&db, run_id).await?;
+
+    let mut backup_model = run_backup_model(db.as_ref(), &run).await?;
 
     let s3_source = temps_entities::s3_sources::Entity::find_by_id(backup_model.s3_source_id)
         .one(db.as_ref())
@@ -1985,6 +2632,94 @@ async fn run_restore_inner(
             .ok_or(RestoreError::ServiceNotFound {
                 service_id: run.source_service_id,
             })?;
+
+    if run.source_backup_id.is_some()
+        && needs_walg_identity_lookup(&backup_model, &target_service.service_type)
+    {
+        backup_model.s3_location =
+            resolve_tracked_walg_snapshot(&backup_model, &s3_source, &enc).await?;
+    }
+
+    // A restore into a service on a worker node writes there: a PostgreSQL
+    // WAL-G, MariaDB, MongoDB or Redis restore is the control plane's own
+    // engine run by the node's agent (ADR-099), a PostgreSQL dump is applied
+    // by a job on the node (ADR-055 Phase 9), and every other service is
+    // restored by the agent's generic restore. Each records its outcome
+    // (under the run's operation id, or as the run's job). The same
+    // classification decides, after a restart, which runs are resumed from
+    // their node instead of interrupted (`worker_outcome::restore_placement`).
+    use temps_providers::remote_service_client::WorkerRestoreEngine;
+    use worker_outcome::RestorePlacement;
+    let worker_deps = WorkerRestoreDeps {
+        db: &db,
+        enc: &enc,
+        scoper: &scoper,
+        mgr: &mgr,
+    };
+    match worker_outcome::restore_placement(&target_service, &backup_model.s3_location) {
+        RestorePlacement::Node(WorkerRestoreEngine::PostgresWalg) => {
+            return worker_walg::run(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mariadb) => {
+            return worker_mariadb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
+                .await;
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mongodb) => {
+            return worker_mongodb::run(worker_deps, run_id, &backup_model, &target_service, &mode)
+                .await;
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Redis) => {
+            return worker_redis::run(
+                &db,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Data) => {
+            return run_agent_restore(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        RestorePlacement::Job => {
+            return run_job_restore(
+                &db,
+                &enc,
+                &scoper,
+                &mgr,
+                &plane,
+                run_id,
+                &backup_model,
+                &target_service,
+                &mode,
+            )
+            .await;
+        }
+        // Every other target is restored by this process's own Docker.
+        RestorePlacement::ControlPlane => {}
+    }
 
     let service_type = ServiceType::from_str(&target_service.service_type).map_err(|e| {
         RestoreError::Validation {
@@ -2019,20 +2754,7 @@ async fn run_restore_inner(
 
     let live_target_config = source_config.clone();
 
-    let origin_service_id: Option<i32> = temps_entities::external_service_backups::Entity::find()
-        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup_model.id))
-        .one(db.as_ref())
-        .await
-        .ok()
-        .flatten()
-        .map(|b| b.service_id)
-        .or_else(|| {
-            // Fallback: control-plane backup row's metadata stores it.
-            serde_json::from_str::<serde_json::Value>(&backup_model.metadata)
-                .ok()
-                .and_then(|v| v.get("service_id").and_then(|id| id.as_i64()))
-                .map(|id| id as i32)
-        });
+    let origin_service_id = backup_origin_service_id(db.as_ref(), &backup_model).await;
 
     // Whether the RESTORED DATA carries source-side credentials that the
     // target's stored config must be reconciled with.
@@ -2101,6 +2823,18 @@ async fn run_restore_inner(
     let (engine_preserves_source_credentials, engine_wants_pre_restore_credential_merge) =
         credential_propagation_gates(&target_service.service_type, &backup_model.s3_location);
 
+    // Redis keeps Temps' own bookkeeping (`_temps:*` in database 0) in the
+    // data: another service's backup must not bring its database mappings
+    // and owners into the target. The restore keeps the target's.
+    if matches!(mode, RestoreRequestMode::InPlace)
+        && worker_redis::is_redis(&target_service.service_type)
+        && worker_redis::keeps_target_bookkeeping(origin_service_id, target_service.id)
+    {
+        temps_providers::externalsvc::redis::restore_swap::keep_target_bookkeeping(
+            &mut source_config,
+        );
+    }
+
     let mut origin_credentials_for_post_restore_patch = None;
     if engine_preserves_source_credentials {
         if let Some(origin_id) = origin_service_id {
@@ -2113,22 +2847,8 @@ async fn run_restore_inner(
                             // The restore replaces the auth catalog wholesale
                             // (pg_authid / mysql.user), so the merged creds are
                             // exactly what the restored server will expect.
-                            if let (Some(target_params), Some(origin_params)) = (
-                                source_config.parameters.as_object_mut(),
-                                origin_cfg.parameters.as_object(),
-                            ) {
-                                // `root_password` is MariaDB's admin credential
-                                // — the one `mariadb-binlog` replay and every
-                                // post-restore admin exec authenticate with —
-                                // and it lives in the restored `mysql.user`
-                                // table just like `password` does. Postgres
-                                // configs have no such key, so the lookup is a
-                                // no-op there rather than a behavior change.
-                                for key in ["password", "root_password", "username", "database"] {
-                                    if let Some(v) = origin_params.get(key).cloned() {
-                                        target_params.insert(key.to_string(), v);
-                                    }
-                                }
+                            if let Some(target_params) = source_config.parameters.as_object_mut() {
+                                target_params.extend(origin_login_merge(&origin_cfg.parameters));
                             }
                             info!(
                                 "Merged origin service ({}) credentials into restore config for target service {}",
@@ -2190,25 +2910,21 @@ async fn run_restore_inner(
         })?;
 
     // Decrypt S3 credentials once.
-    let decrypted_access_key =
-        enc.decrypt_string(&s3_source.access_key_id)
-            .map_err(|e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt access key: {}", e),
-            })?;
-    let decrypted_secret_key =
-        enc.decrypt_string(&s3_source.secret_key)
-            .map_err(|e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt secret key: {}", e),
-            })?;
-
-    // `None` for every long-lived operator-configured credential, so nothing
-    // about those restores changes.
+    let credential_error = |field| RestoreError::RestoreSourceCredentials {
+        field,
+        s3_source_id: s3_source.id,
+        run_id,
+        service_id: target_service.id,
+    };
+    let decrypted_access_key = enc
+        .decrypt_string(&s3_source.access_key_id)
+        .map_err(|_| credential_error("access key"))?;
+    let decrypted_secret_key = enc
+        .decrypt_string(&s3_source.secret_key)
+        .map_err(|_| credential_error("secret key"))?;
     let decrypted_session_token =
-        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source).map_err(
-            |e| RestoreError::Encryption {
-                reason: format!("Failed to decrypt session token: {}", e),
-            },
-        )?;
+        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source)
+            .map_err(|_| credential_error("session token"))?;
 
     let s3_credentials = S3Credentials {
         access_key_id: decrypted_access_key.clone(),
@@ -2218,7 +2934,7 @@ async fn run_restore_inner(
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
         bucket_path: s3_source.bucket_path.clone(),
-        force_path_style: s3_source.force_path_style.unwrap_or(true),
+        force_path_style: s3_source.effective_path_style(true).force_path_style,
     };
 
     // Build a plaintext copy of the source row. The original model carries
@@ -2524,26 +3240,17 @@ async fn run_restore_inner(
         Some(new_id)
     } else {
         // In-place / PITR-in-place: the restored auth catalog carries the
-        // origin's credentials. PostgreSQL also inherits its role/database.
+        // origin's credentials. PostgreSQL also inherits its role/database,
+        // MongoDB its root username.
         // Reconcile the encrypted login while retaining the target's endpoint
         // and physical ownership so UI/env vars/CLI match restored data.
-        if let Some(credentials) = origin_credentials_for_post_restore_patch.as_ref() {
-            if let Err(e) =
-                patch_service_credentials(&db, &enc, target_service.id, credentials).await
-            {
-                // Don't fail the restore over a config patch — data is
-                // restored, user can reset password manually. Log loudly.
-                error!(
-                    "Restore on service {} succeeded but patching stored credentials failed; the service's UI-shown credentials will be stale until someone updates them. Error: {}",
-                    target_service.id, e
-                );
-            } else {
-                info!(
-                    "Updated target service {} config credentials to match restored data",
-                    target_service.id
-                );
-            }
-        }
+        reconcile_restored_credentials(
+            &db,
+            &enc,
+            target_service.id,
+            origin_credentials_for_post_restore_patch.as_ref(),
+        )
+        .await;
         None
     };
 
@@ -2607,15 +3314,22 @@ async fn await_new_service_provision<T>(
 /// Map an engine error to a [`RestoreError`], keeping the one outcome the
 /// worker must act on rather than report: a staged download that could not be
 /// confirmed stopped.
-fn engine_error(run_id: i32, error: anyhow::Error, context: &str) -> RestoreError {
-    match error.downcast_ref::<temps_providers::externalsvc::StagedRestoreStillRunning>() {
-        Some(still_running) => RestoreError::StagedRestoreStillRunning {
-            restore_run_id: run_id,
-            target: still_running.target.clone(),
-            reason: still_running.reason.clone(),
-        },
-        None => RestoreError::ExternalService {
-            reason: format!("{}: {}", context, error),
+fn engine_error(
+    run_id: i32,
+    error: temps_providers::externalsvc::EngineError,
+    context: &str,
+) -> RestoreError {
+    use temps_providers::externalsvc::EngineError;
+    match error {
+        EngineError::StagedRestoreStillRunning(still_running) => {
+            RestoreError::StagedRestoreStillRunning {
+                restore_run_id: run_id,
+                target: still_running.target,
+                reason: still_running.reason,
+            }
+        }
+        other => RestoreError::ExternalService {
+            reason: format!("{}: {}", context, other),
         },
     }
 }
@@ -2709,10 +3423,20 @@ async fn cancel_new_service(
 }
 
 /// Credentials inherited from a restored authentication catalog. PostgreSQL
-/// physical backups also carry the origin's role and database; other engines
-/// retain their existing login-identity behavior.
+/// physical backups also carry the origin's role and database. A MongoDB
+/// dump carries the origin's users (`admin.system.users`, which
+/// `mongorestore --drop` puts in place of the target's), so the target then
+/// answers to the origin's root username as well as its password; its
+/// database is the target's own. Other engines retain their existing
+/// login-identity behavior.
+///
+/// Serialized only into a run's encrypted `restored_login_encrypted`
+/// ([`capture_origin_credentials`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct RestoredServiceCredentials {
-    password: String,
+    /// `None` when the restore keeps the target's own password (a logical
+    /// PostgreSQL restore by a job, [`Self::into_database_only`]).
+    password: Option<String>,
     root_password: Option<String>,
     username: Option<String>,
     database: Option<String>,
@@ -2721,13 +3445,14 @@ struct RestoredServiceCredentials {
 impl RestoredServiceCredentials {
     fn from_origin(service_type: &str, parameters: &serde_json::Value) -> Option<Self> {
         let postgres = service_type == "postgres";
+        let restores_username = postgres || service_type == "mongodb";
         Some(Self {
-            password: parameters.get("password")?.as_str()?.to_string(),
+            password: Some(parameters.get("password")?.as_str()?.to_string()),
             root_password: parameters
                 .get("root_password")
                 .and_then(|v| v.as_str())
                 .map(String::from),
-            username: postgres
+            username: restores_username
                 .then(|| {
                     parameters
                         .get("username")
@@ -2746,11 +3471,27 @@ impl RestoredServiceCredentials {
         })
     }
 
+    /// What a logical PostgreSQL restore by a job leaves to reconcile: the
+    /// database the origin's data was restored into. The job keeps the
+    /// target's login and its password through the dump (the dump's own role
+    /// passwords are those of backup time, which Temps does not know), so
+    /// neither changes. `None` when the origin names no database.
+    fn into_database_only(self) -> Option<Self> {
+        Some(Self {
+            password: None,
+            root_password: None,
+            username: None,
+            database: Some(self.database?),
+        })
+    }
+
     fn apply(&self, parameters: &mut serde_json::Map<String, serde_json::Value>) {
-        parameters.insert(
-            "password".to_string(),
-            serde_json::Value::String(self.password.clone()),
-        );
+        if let Some(password) = &self.password {
+            parameters.insert(
+                "password".to_string(),
+                serde_json::Value::String(password.clone()),
+            );
+        }
         if parameters.contains_key("root_password") {
             if let Some(password) = &self.root_password {
                 parameters.insert(
@@ -2894,10 +3635,26 @@ async fn reserve_restore_service_name(
         })
 }
 
+/// Only a `completed` backup may be restored. `deleting` keeps its own error
+/// so the console can say why; every other state (`pending`, `running`,
+/// `failed`) has no complete snapshot behind its `s3_location`.
+fn ensure_backup_restorable(backup: &temps_entities::backups::Model) -> Result<(), RestoreError> {
+    match backup.state.as_str() {
+        "completed" => Ok(()),
+        "deleting" => Err(RestoreError::BackupDeleting {
+            backup_id: backup.id,
+        }),
+        state => Err(RestoreError::BackupNotRestorable {
+            backup_id: backup.id,
+            state: state.to_string(),
+        }),
+    }
+}
+
 /// The checks and insert of [`insert_restore_run`], inside its transaction.
 async fn lock_and_insert_restore_run(
     transaction: &sea_orm::DatabaseTransaction,
-    run_active: temps_entities::restore_runs::ActiveModel,
+    mut run_active: temps_entities::restore_runs::ActiveModel,
     resolved_backup_id: Option<i32>,
     target_service_id: i32,
     destructive: bool,
@@ -2915,9 +3672,7 @@ async fn lock_and_insert_restore_run(
             .one(transaction)
             .await?
             .ok_or(RestoreError::BackupNotFound { backup_id })?;
-        if backup.state == "deleting" {
-            return Err(RestoreError::BackupDeleting { backup_id });
-        }
+        ensure_backup_restorable(&backup)?;
     }
     // Deletion takes this same short source lock and refuses active runs,
     // so its cascade cannot remove a clone's durable name reservation.
@@ -2953,6 +3708,7 @@ async fn lock_and_insert_restore_run(
             });
         }
     }
+    run_active.source_backup_id = Set(resolved_backup_id);
     Ok(run_active.insert(transaction).await?)
 }
 
@@ -3059,6 +3815,40 @@ impl TerminalWriteRetry {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TerminalDisposition {
+    WorkerResult,
+    Cancelled,
+    AlreadySettled,
+}
+
+impl TerminalDisposition {
+    /// Only the worker that recorded an outcome reports it to telemetry.
+    fn worker_outcome(
+        self,
+        run_id: i32,
+        result: Result<Option<i32>, RestoreError>,
+    ) -> Option<Result<(), RestoreError>> {
+        match self {
+            Self::Cancelled => {
+                info!(run_id, "Restore cancelled");
+                None
+            }
+            Self::AlreadySettled => {
+                warn!(run_id, "Restore was already settled");
+                None
+            }
+            Self::WorkerResult => {
+                match &result {
+                    Ok(_) => info!(run_id, "Restore completed"),
+                    Err(error) => error!(run_id, %error, "Restore failed"),
+                }
+                Some(result.map(|_| ()))
+            }
+        }
+    }
+}
+
 /// Record a run's terminal outcome. Only an active (`pending`/`running`) row
 /// is updated, so a run already reconciled as `interrupted` is never
 /// overwritten with an outcome nobody observed end to end.
@@ -3067,8 +3857,11 @@ async fn persist_terminal_state(
     run_id: i32,
     result: &Result<Option<i32>, RestoreError>,
     retry: TerminalWriteRetry,
-) -> Result<(), RestoreError> {
-    use sea_orm::sea_query::Expr;
+) -> Result<TerminalDisposition, RestoreError> {
+    use sea_orm::{
+        sea_query::{Expr, Query},
+        ConnectionTrait, QueryTrait,
+    };
     use temps_entities::restore_runs::{Column, Entity};
 
     let now = Utc::now();
@@ -3087,27 +3880,49 @@ async fn persist_terminal_state(
             .col_expr(Column::Status, Expr::value("cancelled"))
             .col_expr(Column::ErrorMessage, Expr::value(Some(message.clone()))),
         Err(e) => update
-            .col_expr(Column::Status, Expr::value("failed"))
-            .col_expr(Column::Phase, Expr::value("failed"))
-            .col_expr(Column::ErrorMessage, Expr::value(Some(e.to_string()))),
+            .col_expr(
+                Column::Status,
+                Expr::case(Column::CancelRequestedAt.is_not_null(), "cancelled")
+                    .finally("failed")
+                    .into(),
+            )
+            .col_expr(
+                Column::Phase,
+                Expr::case(
+                    Column::CancelRequestedAt.is_not_null(),
+                    Expr::col(Column::Phase),
+                )
+                .finally("failed")
+                .into(),
+            )
+            .col_expr(
+                Column::ErrorMessage,
+                Expr::case(
+                    Column::CancelRequestedAt.is_not_null(),
+                    "Restore cancelled at the operator's request.",
+                )
+                .finally(e.to_string())
+                .into(),
+            ),
     };
-    let update = update
+    let mut update = update
         .filter(Column::Id.eq(run_id))
-        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES));
-
+        .filter(Column::Status.is_in(ACTIVE_RESTORE_STATUSES))
+        .into_query();
+    update.returning(Query::returning().column(Column::Status));
+    let statement = db.get_database_backend().build(&update);
     let mut delay = retry.base_delay;
     let mut attempt = 1;
     loop {
-        match update.clone().exec(db).await {
-            Ok(outcome) => {
-                if outcome.rows_affected == 0 {
-                    warn!(
-                        "Restore run {} was no longer active when its outcome was recorded; \
-                         leaving its stored status unchanged",
-                        run_id
-                    );
-                }
-                return Ok(());
+        match db.query_one(statement.clone()).await {
+            Ok(None) => return Ok(TerminalDisposition::AlreadySettled),
+            Ok(Some(row)) => {
+                let status: String = row.try_get("", "status")?;
+                return Ok(if status == "cancelled" {
+                    TerminalDisposition::Cancelled
+                } else {
+                    TerminalDisposition::WorkerResult
+                });
             }
             Err(e) if attempt < retry.attempts => {
                 warn!(
@@ -3168,6 +3983,464 @@ async fn load_run_for_update(
         .ok_or(RestoreError::RestoreRunNotFound {
             restore_run_id: run_id,
         })
+}
+
+/// Refuse, at admission, a restore that the worker path its target takes
+/// ([`worker_outcome::restore_placement`], the classification the run and
+/// the startup reconciliation use too) cannot do. Every worker path refuses
+/// a restore into a new service (or to a point in time elsewhere), so such
+/// a run always writes in this process.
+fn worker_restore_admitted(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    use temps_providers::remote_service_client::WorkerRestoreEngine;
+    use worker_outcome::RestorePlacement;
+    match worker_outcome::restore_placement(target, backup_location) {
+        RestorePlacement::Node(WorkerRestoreEngine::PostgresWalg) => {
+            worker_walg::walg_restore_supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mariadb) => {
+            worker_mariadb::restore_supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Mongodb) => {
+            worker_mongodb::supported(target, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Redis) => {
+            worker_redis::restore_supported(target, backup_location, mode)
+        }
+        RestorePlacement::Node(WorkerRestoreEngine::Data) => {
+            agent_restore_supported(target, backup_location, mode)
+        }
+        RestorePlacement::Job => job_restore_supported(target, backup_location, mode),
+        RestorePlacement::ControlPlane => Ok(()),
+    }
+}
+
+/// Whether a restore of `backup_location` onto `target`, a database whose
+/// backups and restores run as jobs on its worker node, is one a job can do:
+/// an in-place apply of a `pg_dumpall` dump.
+fn job_restore_supported(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    let node = crate::engines::workload_job::worker_node(target).unwrap_or_default();
+    if !matches!(mode, RestoreRequestMode::InPlace) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Database {} ('{}') runs on worker node {node}, where restores run as a job that \
+                 applies a dump in place; restore mode '{}' is not available there yet. Restore \
+                 in place",
+                target.id,
+                target.name,
+                mode.as_str()
+            ),
+        });
+    }
+    if !crate::engines::workload_job::restore_takes_job_path(target, backup_location) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Database {} ('{}') runs on worker node {node}, where a restore applies a \
+                 pg_dumpall dump (`.sql.gz`) or a WAL-G backup (`s3://…`); backup \
+                 '{backup_location}' is neither",
+                target.id, target.name
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// What a service on a worker node can restore: in place, from any backup in
+/// the format its node applies, its own or another service's (confirmed as
+/// a cross-service restore, like on the control plane). Restoring into a new
+/// service, or to a point in time, is refused explicitly at admission.
+fn worker_restore_capabilities() -> temps_providers::externalsvc::RestoreCapabilities {
+    temps_providers::externalsvc::RestoreCapabilities {
+        restore_in_place: true,
+        restore_to_new_service: false,
+        pitr: false,
+        earliest_pitr_time: None,
+        latest_pitr_time: None,
+    }
+}
+
+/// Refuse what a restore by a worker's agent cannot do: anything but in
+/// place, or a backup in another format than the worker backup writes.
+fn agent_restore_supported(
+    target: &temps_entities::external_services::Model,
+    backup_location: &str,
+    mode: &RestoreRequestMode,
+) -> Result<(), RestoreError> {
+    let node = crate::engines::workload_job::worker_node(target).unwrap_or_default();
+    if !matches!(mode, RestoreRequestMode::InPlace) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Service {} ('{}') runs on worker node {node}, where restores run on the node and \
+                 apply a backup in place; restore mode '{}' is not available there yet. Restore \
+                 in place",
+                target.id,
+                target.name,
+                mode.as_str()
+            ),
+        });
+    }
+    if !crate::engines::worker_agent::restore_location_matches(target, backup_location) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Service {} ('{}', {}) runs on worker node {node}, where restores apply the \
+                 backups taken on the node; backup '{backup_location}' is in another format",
+                target.id, target.name, target.service_type
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// What a worker engine's restore takes from the restore service: the
+/// database, the encryption service (the restored login is patched into
+/// the target's stored configuration), the credential scoper (ADR-102) and
+/// the manager that reaches the node's agent.
+pub(super) struct WorkerRestoreDeps<'a> {
+    pub db: &'a Arc<DatabaseConnection>,
+    pub enc: &'a Arc<temps_core::EncryptionService>,
+    pub scoper: &'a temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    pub mgr: &'a Arc<ExternalServiceManager>,
+}
+
+/// The S3 source a restore on worker `node_id` receives (ADR-102): a
+/// read-only credential for `backup`'s own location (its WAL-G repository,
+/// or its object's directory) and for `extra_prefixes` (a point-in-time
+/// recovery's binary logs), never the source's own. A location outside the
+/// source's bucket, with no directory of its own, or whose grant would span
+/// more than one service's backups
+/// ([`within_one_service`](crate::engines::worker_agent::within_one_service)),
+/// is refused.
+pub(super) async fn worker_read_destination(
+    db: &Arc<DatabaseConnection>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target_id: i32,
+    node_id: i32,
+    extra_prefixes: &[String],
+) -> Result<temps_providers::remote_service_client::WorkerS3Destination, RestoreError> {
+    use crate::engines::worker_agent;
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    let Some(read_prefix) =
+        worker_agent::restore_read_prefix(&backup.s3_location, &s3_source.bucket_name)
+    else {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} is at '{}', which is not a backup location inside bucket '{}' of S3 \
+                 source {}",
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
+            ),
+        });
+    };
+    // However the row's location reads, the grant spans one service's
+    // backups at most.
+    if let Some(wide) = std::iter::once(&read_prefix)
+        .chain(extra_prefixes)
+        .find(|prefix| !worker_agent::within_one_service(prefix, &s3_source.bucket_path))
+    {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} at '{}' would need read access to '{wide}' in S3 source {}, which is \
+                 not inside one service's backups under '{}'; a restore on worker node \
+                 {node_id} is refused rather than given it",
+                backup.id, backup.s3_location, backup.s3_source_id, s3_source.bucket_path
+            ),
+        });
+    }
+    let mut grant = temps_providers::worker_s3_scope::WorkerS3Grant::job(
+        target_id,
+        node_id,
+        read_prefix,
+        temps_core::ScopedS3Access::Read,
+        "restore",
+    );
+    grant.prefixes.extend(extra_prefixes.iter().cloned());
+    worker_agent::scoped_destination(scoper, db.as_ref(), backup.s3_source_id, grant, "restore")
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })
+}
+
+/// Restore `backup` in place into `target`, a MongoDB, Redis, MariaDB or
+/// storage service on a worker node, through the node's agent, which runs the
+/// engine's own restore there.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore task's dependencies and the run's inputs"
+)]
+async fn run_agent_restore(
+    db: &Arc<DatabaseConnection>,
+    enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    mgr: &Arc<ExternalServiceManager>,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+    mode: &RestoreRequestMode,
+) -> Result<Option<i32>, RestoreError> {
+    use crate::engines::{worker_agent, workload_job};
+    agent_restore_supported(target, &backup.s3_location, mode)?;
+    let node_id = workload_job::worker_node(target).ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: service {} left its worker node",
+            target.id
+        ),
+    })?;
+    // A backup of another service is admitted as on the control plane (the
+    // destructive restore was confirmed at `start_restore`); a dump that
+    // carries its origin's users (MongoDB) leaves the target with the
+    // origin's credentials, which its stored config is patched to below.
+    let origin_credentials =
+        capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
+    let location = backup
+        .s3_location
+        .strip_prefix(&bucket_prefix)
+        .unwrap_or(&backup.s3_location)
+        .trim_start_matches('/')
+        .to_string();
+    // The worker can read this one backup and nothing else (ADR-102).
+    let read_prefix = match worker_agent::worker_service_kind(&target.service_type) {
+        Some(worker_agent::WorkerServiceKind::Storage) => {
+            temps_providers::worker_s3_scope::as_prefix(&location)
+        }
+        _ => temps_providers::worker_s3_scope::key_directory(&location),
+    };
+    let mint = || async {
+        worker_agent::scoped_destination(
+            scoper,
+            db.as_ref(),
+            backup.s3_source_id,
+            temps_providers::worker_s3_scope::WorkerS3Grant::job(
+                target.id,
+                node_id,
+                read_prefix.clone(),
+                temps_core::ScopedS3Access::Read,
+                "restore",
+            ),
+            "restore",
+        )
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })
+    };
+    let destination = mint().await?;
+
+    // The last safe point: once the node starts writing, the run can no
+    // longer be cancelled.
+    super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "restore").await?;
+    info!(
+        run_id,
+        service_id = target.id,
+        node_id,
+        backup_id = backup.id,
+        "restoring service {} in place on its node",
+        target.id
+    );
+    // A node already running its maximum of backups and restores is waited
+    // for, visibly and cancellably, instead of failing the run.
+    // A try after a wait gets a credential minted after it.
+    // The node records the restore's outcome under the run's operation id:
+    // a request that goes unanswered (or a restart of this process) is
+    // settled from it, never by guessing (see `worker_outcome`).
+    let operation_id = worker_outcome::operation_id(run_id);
+    let answered = crate::node_busy::retry_while_node_busy_with_fresh_credential(
+        &crate::node_busy::NodeBusyPolicy::DEFAULT,
+        destination,
+        mint,
+        |destination| {
+            mgr.restore_worker_service(
+                target.id,
+                destination,
+                location.clone(),
+                Some(operation_id.clone()),
+            )
+        },
+        |wait| wait_for_node_slot(db.as_ref(), run_id, "restore", wait),
+    )
+    .await?;
+    worker_outcome::WorkerRestoreRun {
+        db,
+        run_id,
+        node_id,
+        target_id: target.id,
+        engine: temps_providers::remote_service_client::WorkerRestoreEngine::Data,
+        reconcile: origin_credentials.as_ref().map(|origin| (enc, origin)),
+    }
+    .finish(mgr, answered)
+    .await
+}
+
+/// Restore `backup` in place into `target`, a database on a worker node, by
+/// a job on that node (ADR-055 Phase 9): `wal-g st cat | gunzip | psql`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the restore worker's shared handles and the run's own inputs, as run_restore_worker"
+)]
+async fn run_job_restore(
+    db: &Arc<DatabaseConnection>,
+    enc: &Arc<temps_core::EncryptionService>,
+    scoper: &temps_providers::worker_s3_scope::WorkerCredentialScoper,
+    mgr: &Arc<ExternalServiceManager>,
+    plane: &temps_workload_plane::PlaneSlot,
+    run_id: i32,
+    backup: &temps_entities::backups::Model,
+    target: &temps_entities::external_services::Model,
+    mode: &RestoreRequestMode,
+) -> Result<Option<i32>, RestoreError> {
+    use crate::engines::workload_job;
+    job_restore_supported(target, &backup.s3_location, mode)?;
+    let node_id = workload_job::worker_node(target).ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: database {} left its worker node",
+            target.id
+        ),
+    })?;
+    // A backup of another database is admitted as on the control plane (the
+    // destructive restore was confirmed at `start_restore`). Its dump carries
+    // the origin's roles and their passwords; see below.
+    let origin_credentials =
+        capture_origin_credentials(db, enc, mgr, run_id, backup, target).await?;
+    let plane = plane.get().ok_or_else(|| RestoreError::Internal {
+        reason: format!(
+            "restore run {run_id}: database {} is on worker node {node_id}, and restoring it \
+             needs the workload plane, which this process does not run",
+            target.id
+        ),
+    })?;
+    let config_json = enc
+        .decrypt_string(target.config.as_deref().unwrap_or("{}"))
+        .map_err(|e| RestoreError::Encryption {
+            reason: format!("decrypting the config of database {}: {e}", target.id),
+        })?;
+    let parameters: serde_json::Value =
+        serde_json::from_str(&config_json).unwrap_or_else(|_| serde_json::json!({}));
+    let (job_target, password) = workload_job::pg_target(target, node_id, &parameters);
+    // The dump runs `ALTER ROLE` for every role it holds, with the password
+    // each had when the backup was taken. The job keeps its login on the
+    // target's own password through it (`restore_script`), so the target's
+    // stored password stays the one that works, and only the database the
+    // restored data lives in is reconciled below.
+    let restored_database = origin_credentials.and_then(|origin| origin.into_database_only());
+    let s3_source = crate::engines::v2_common::load_s3_source(db.as_ref(), backup.s3_source_id)
+        .await
+        .map_err(|e| RestoreError::ExternalService {
+            reason: format!("restore run {run_id}: {e}"),
+        })?;
+
+    // `wal-g st cat` reads keys relative to the bucket (`WALG_S3_PREFIX`).
+    let bucket_prefix = format!("s3://{}/", s3_source.bucket_name);
+    let object_key = backup
+        .s3_location
+        .strip_prefix(&bucket_prefix)
+        .unwrap_or(&backup.s3_location)
+        .trim_start_matches('/')
+        .to_string();
+    if object_key.starts_with("s3://") {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} is at '{}', outside bucket '{}' of S3 source {}",
+                backup.id, backup.s3_location, s3_source.bucket_name, backup.s3_source_id
+            ),
+        });
+    }
+    // The job can read this one dump's directory and nothing else.
+    let s3 = workload_job::s3_target(
+        scoper,
+        db.as_ref(),
+        backup.s3_source_id,
+        temps_providers::worker_s3_scope::WorkerS3Grant::job(
+            target.id,
+            node_id,
+            temps_providers::worker_s3_scope::key_directory(&object_key),
+            temps_core::ScopedS3Access::Read,
+            "restore",
+        ),
+        "restore",
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
+
+    // The last safe point: once the job starts writing, the run can no
+    // longer be cancelled (`restore` is not a cancellable phase).
+    super::restore_cancel::enter_phase_unless_cancelled(db.as_ref(), run_id, "restore").await?;
+    info!(
+        run_id,
+        service_id = target.id,
+        node_id,
+        backup_id = backup.id,
+        "restoring database {} in place by a job on its node",
+        target.id
+    );
+    workload_job::run_database_job(
+        &plane,
+        &job_target,
+        workload_job::JobPurpose::Restore {
+            restore_run_id: run_id,
+        },
+        workload_job::restore_script(&job_target, &object_key),
+        workload_job::restore_env(&password, &s3),
+        // Past the safe point: nothing may interrupt the apply.
+        &tokio_util::sync::CancellationToken::new(),
+    )
+    .await
+    .map_err(|e| RestoreError::ExternalService {
+        reason: format!("restore run {run_id}: {e}"),
+    })?;
+    reconcile_restored_credentials(db, enc, target.id, restored_database.as_ref()).await;
+    if let Err(e) = update_phase(db.as_ref(), run_id, "verify").await {
+        warn!("Restore run {run_id}: recording the verify phase failed: {e}");
+    }
+    Ok(None)
+}
+
+/// The wait hook of a restore run whose worker node is busy
+/// ([`crate::node_busy`]): the run shows `waiting_for_node` (cancellable,
+/// nothing ran), checked every few seconds for a cancel while it sleeps, then
+/// re-enters `resume_phase` unless it was cancelled.
+pub(super) async fn wait_for_node_slot(
+    db: &DatabaseConnection,
+    run_id: i32,
+    resume_phase: &str,
+    wait: crate::node_busy::NodeWait,
+) -> Result<(), RestoreError> {
+    use super::restore_cancel::{enter_phase_unless_cancelled, WAITING_FOR_NODE_PHASE};
+    const CANCEL_CHECK: std::time::Duration = std::time::Duration::from_secs(5);
+    warn!(
+        run_id,
+        "restore run {run_id} waits for a slot: {}",
+        wait.describe()
+    );
+    let deadline = tokio::time::Instant::now() + wait.delay;
+    loop {
+        enter_phase_unless_cancelled(db, run_id, WAITING_FOR_NODE_PHASE).await?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            break;
+        }
+        tokio::time::sleep(CANCEL_CHECK.min(deadline - now)).await;
+    }
+    enter_phase_unless_cancelled(db, run_id, resume_phase).await
 }
 
 async fn update_phase(
@@ -3324,7 +4597,7 @@ fn build_postgres_steps(
             RestoreRequestMode::InPlace => {
                 *destructive = true;
                 steps.push(format!(
-                    "Fetch WAL-G base backup into {}'s shared volume (wal-g backup-fetch LATEST)",
+                    "Fetch the selected WAL-G base backup into {}'s shared volume",
                     container_name
                 ));
                 steps.push(
@@ -3456,7 +4729,29 @@ fn build_mariadb_steps(
     // The physical restore sequence, shared by in-place, new-service, and the
     // base half of PITR. Kept in one place so the three previews can't drift
     // from each other (they all run `physical_restore_into_container`).
+    let walg = temps_providers::externalsvc::mariadb::MariaDbService::is_walg_repository_location(
+        resolved_location,
+    );
     let physical_sequence = |target: &str, steps: &mut Vec<String>| {
+        if walg {
+            steps.push(format!(
+                "Disable {target}'s restart policy and stop it so the datadir volume is free"
+            ));
+            steps.push(format!(
+                "A helper sharing {target}'s volume runs `wal-g backup-fetch` from {resolved_location} into a staging directory on the volume and prepares it with `mariadb-backup --prepare`; nothing in the live datadir is touched yet"
+            ));
+            steps.push(
+                "Swap the prepared base in, keeping the original datadir aside on the same volume"
+                    .into(),
+            );
+            steps.push(format!(
+                "Start {target} on the restored datadir, give it back its restart policy, and wait until it answers"
+            ));
+            steps.push(format!(
+                "On success delete the kept original; if anything after the swap fails, put the original back and start {target} on it as it was"
+            ));
+            return;
+        }
         steps.push(format!(
             "Download {} from S3 and gunzip it to a raw mbstream on the host",
             resolved_location
@@ -3620,6 +4915,32 @@ fn build_mariadb_steps(
     }
 }
 
+/// The in-place swap every Redis restore ends with, here or on a worker
+/// (`restore_swap` in the Redis provider).
+fn push_redis_swap_steps(container_name: &str, steps: &mut Vec<String>) {
+    steps.push(
+        "Move the current dump.rdb and appendonlydir aside on the same volume, move the staged RDB in, and write the Redis 7+ appendonlydir manifest that loads it as the base file"
+            .into(),
+    );
+    steps.push(format!(
+        "Start {} with its own restart policy and wait for it to answer. Redis keeps its EXISTING requirepass (auth is not part of the dump).",
+        container_name
+    ));
+    steps.push(
+        "Delete the kept original once the restored server answers; if any step fails, the original is moved back and started as it was"
+            .into(),
+    );
+}
+
+/// The step a Redis restore of another service's backup adds: Temps' own
+/// `_temps:*` keys stay the target's.
+fn redis_bookkeeping_step() -> String {
+    "Keep the target's own Temps bookkeeping (`_temps:*` keys in database 0: database \
+     mappings, owners, import claims) instead of the backup's: they are read before the \
+     restore and written back after it"
+        .into()
+}
+
 /// Redis restore plan. RDB dumps via WAL-G stream, or legacy tar. Redis
 /// auth (`requirepass`) is NOT inside the data, so the container's
 /// existing password is preserved across the restore — no credential
@@ -3642,18 +4963,10 @@ fn build_redis_steps(
                     container_name
                 ));
                 steps.push(format!(
-                    "Run `wal-g backup-fetch LATEST` inside a helper container to stream the RDB base file onto {}'s volume",
+                    "Run `wal-g backup-fetch LATEST` inside a helper container to stage the RDB base file beside {}'s data; nothing is replaced until it is whole",
                     container_name
                 ));
-                steps.push(
-                    "Write an appendonlydir manifest pointing at the restored RDB as the base file (Redis 7+ multi-part AOF layout)"
-                        .into(),
-                );
-                steps.push(format!(
-                    "Start {}. Redis loads the RDB on boot and accepts connections with the EXISTING requirepass (auth is not part of the dump).",
-                    container_name
-                ));
-                steps.push("Wait for container to report healthy".into());
+                push_redis_swap_steps(container_name, steps);
             }
             RestoreRequestMode::NewService { name, .. } => {
                 steps.push(format!(
@@ -3682,16 +4995,10 @@ fn build_redis_steps(
                     resolved_location
                 ));
                 steps.push(format!(
-                    "Stop {} and install the RDB into its data volume",
+                    "Stop {} and stage the RDB beside its data; nothing is replaced until it is whole",
                     container_name
                 ));
-                steps.push(
-                    "Rebuild the Redis 7+ appendonlydir manifest from the restored RDB".into(),
-                );
-                steps.push(format!(
-                    "Restart {} and wait for it to report healthy",
-                    container_name
-                ));
+                push_redis_swap_steps(container_name, steps);
             }
             RestoreRequestMode::NewService { name, .. } => {
                 steps.push(format!(
@@ -3745,18 +5052,26 @@ fn build_mongodb_steps(
     destructive: &mut bool,
     errors: &mut Vec<String>,
 ) -> Option<&'static str> {
-    let _ = resolved_location; // wal-g reads from WALG_S3_PREFIX, not a single key
+    // A WAL-G backup is fetched from WALG_S3_PREFIX, not a single key; a
+    // mongodump archive is one object, downloaded and replayed by a sidecar.
+    let archive = strategy == "mongodump_restore";
+    let fetch = |into: &str| {
+        if archive {
+            format!(
+                "Download the mongodump archive {resolved_location} and run `mongorestore \
+                 --archive --gzip --drop` against {into} from a one-shot sidecar"
+            )
+        } else {
+            format!(
+                "Run `wal-g backup-fetch LATEST` inside {into}; WAL-G decompresses the archived \
+                 mongodump stream and pipes it to `mongorestore --archive --drop`"
+            )
+        }
+    };
     match mode {
         RestoreRequestMode::InPlace => {
             *destructive = true;
-            steps.push(format!(
-                "Run `wal-g backup-fetch LATEST` inside {}",
-                container_name
-            ));
-            steps.push(
-                "WAL-G decompresses the archived mongodump stream and pipes it to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch(container_name));
             steps.push(format!(
                 "mongorestore replaces ALL databases on {}, including `admin.system.users` — target's root user takes on the source's password",
                 container_name
@@ -3772,10 +5087,7 @@ fn build_mongodb_steps(
                 name
             ));
             steps.push("Start the new container and wait for mongod to initialize".into());
-            steps.push(
-                "Run `wal-g backup-fetch LATEST` inside the new container; WAL-G pipes the mongodump stream to `mongorestore --archive --drop`"
-                    .into(),
-            );
+            steps.push(fetch("the new container"));
             steps.push(
                 "Because mongorestore replays `admin.system.users`, the new service's root user is the SOURCE's credentials, not the freshly-generated ones"
                     .into(),
@@ -3790,7 +5102,9 @@ fn build_mongodb_steps(
             );
         }
     }
-    if matches!(mode, RestoreRequestMode::NewService { .. }) && strategy == "walg_restore" {
+    if matches!(mode, RestoreRequestMode::NewService { .. })
+        && matches!(strategy, "walg_restore" | "mongodump_restore")
+    {
         Some("MongoDB clone credentials: the archive replaces admin users with those from the backup. The new service's displayed password may differ from the restored password; verify the backup's credentials or reset the database password before linking applications. This clone path does not automatically reconcile stored credentials.")
     } else {
         None
@@ -3839,9 +5153,91 @@ fn build_object_store_steps(
     let _ = strategy;
 }
 
+// Even a UUID-marked repository may contain several attempts for one row.
+fn needs_walg_identity_lookup(backup: &temps_entities::backups::Model, engine: &str) -> bool {
+    engine == "postgres" && backup.s3_location.trim_end_matches('/').ends_with("/walg")
+}
+
+impl RestoreService {
+    /// The start time recorded by the WAL-G snapshot `location` selects in
+    /// S3 source `s3_source_id`. `Ok(None)` when `location` names no single
+    /// snapshot (a repository root restores the latest) or the snapshot's
+    /// sentinel does not record a start.
+    async fn untracked_snapshot_start(
+        &self,
+        location: &str,
+        s3_source_id: i32,
+    ) -> Result<Option<chrono::DateTime<Utc>>, RestoreError> {
+        if temps_providers::externalsvc::postgres::walg_snapshot(location).is_none() {
+            return Ok(None);
+        }
+        let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(RestoreError::S3SourceNotFound { s3_source_id })?;
+        let key = location
+            .strip_prefix(&format!("s3://{}/", source.bucket_name))
+            .ok_or_else(|| RestoreError::Validation {
+                message: format!(
+                    "Backup {location} is outside S3 source {s3_source_id}. Select a snapshot from the correct S3 source."
+                ),
+            })?;
+        let lookup_error = |error| RestoreError::SnapshotLookupFailed {
+            backup_id: location.to_string(),
+            s3_source_id,
+            source: error,
+        };
+        let client = crate::engines::v2_common::build_s3_client(
+            &source,
+            &self.encryption_service,
+            "temps-backup",
+        )
+        .map_err(lookup_error)?;
+        crate::engines::walg_size::load_snapshot_start_time(&client, &source.bucket_name, key)
+            .await
+            .map_err(lookup_error)
+    }
+}
+
+async fn resolve_tracked_walg_snapshot(
+    backup: &temps_entities::backups::Model,
+    source: &temps_entities::s3_sources::Model,
+    enc: &Arc<temps_core::EncryptionService>,
+) -> Result<String, RestoreError> {
+    let key = backup
+        .s3_location
+        .strip_prefix(&format!("s3://{}/", source.bucket_name))
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "Backup {} is outside S3 source {}. Select a snapshot from the correct S3 source.",
+                backup.backup_id, source.id
+            ),
+        })?;
+    let lookup_error = |error| match error {
+        crate::execution::engine_v2::BackupError::PermanentFailure { reason } => {
+            RestoreError::Validation { message: reason }
+        }
+        error => RestoreError::SnapshotLookupFailed {
+            backup_id: backup.backup_id.clone(),
+            s3_source_id: source.id,
+            source: error,
+        },
+    };
+    let client = crate::engines::v2_common::build_s3_client(source, enc, "temps-backup")
+        .map_err(lookup_error)?;
+    crate::engines::walg_size::find_snapshot(&client, &source.bucket_name, key, &backup.backup_id)
+        .await
+        .map_err(lookup_error)?
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "No WAL-G snapshot in {} identifies backup {}. Search the S3 bucket and select the individual snapshot to restore.",
+                backup.s3_location, backup.backup_id
+            ),
+        })
+}
+
 /// Probe an S3 source for a backup belonging to `<engine>/<origin_service>/`.
-/// Prefers a WAL-G prefix (cheap continuous-archive restore) and falls
-/// back to the newest dump-style object. Returns `Ok(None)` when nothing
+/// Looks for a matching WAL-G snapshot or an object under the backup UUID. Returns `Ok(None)` when nothing
 /// plausible is found; `Err` only on unexpected S3 failures.
 ///
 /// This is the repair path for `backups` rows whose `s3_location` was
@@ -3855,7 +5251,7 @@ async fn resolve_backup_location_from_s3(
     engine: &str,
     origin_service_name: &str,
     backup_uuid: &str,
-) -> Result<Option<String>, anyhow::Error> {
+) -> Result<Option<String>, crate::execution::engine_v2::BackupError> {
     let bucket = &s3_source.bucket_name;
     // Mirror the path convention backup_external_service writes to:
     //   external_services/<engine>/<svc>/...
@@ -3869,29 +5265,41 @@ async fn resolve_backup_location_from_s3(
         )
     };
 
-    // 1) WAL-G: look for `<service_prefix>walg/basebackups_005/*_backup_stop_sentinel.json`.
-    //    Presence means a complete WAL-G backup exists; the restore path
-    //    is the `walg/` prefix, not the sentinel itself.
-    let walg_prefix = format!("{}walg/", service_prefix);
-    let basebackups = format!("{}basebackups_005/", walg_prefix);
-    let resp = s3_client
-        .list_objects_v2()
-        .bucket(bucket)
-        .prefix(&basebackups)
-        .max_keys(10)
-        .send()
-        .await?;
-    let has_walg = resp.contents().iter().any(|o| {
-        o.key()
-            .map(|k| k.ends_with("_backup_stop_sentinel.json"))
-            .unwrap_or(false)
-    });
-    if has_walg {
-        return Ok(Some(format!(
-            "s3://{}/{}",
-            bucket,
-            walg_prefix.trim_end_matches('/')
-        )));
+    // A PostgreSQL repository can contain backups made by several servers.
+    // A missing location is repairable only when a sentinel identifies this row.
+    let walg_prefix = format!("{service_prefix}walg");
+    let mut walg_error = None;
+    if engine == "postgres" {
+        match crate::engines::walg_size::find_snapshot(s3_client, bucket, &walg_prefix, backup_uuid)
+            .await
+        {
+            Ok(Some(location)) => return Ok(Some(location)),
+            Ok(None) => {}
+            Err(error) => walg_error = Some(error),
+        }
+    } else {
+        let mut pages = s3_client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(format!("{walg_prefix}/basebackups_005/"))
+            .delimiter("/")
+            .into_paginator()
+            .send();
+        while let Some(page) = pages.next().await {
+            if page
+                .map_err(|error| crate::execution::engine_v2::BackupError::Failed {
+                    reason: format!(
+                        "Could not list {walg_prefix} for backup {backup_uuid}: {error}"
+                    ),
+                })?
+                .contents()
+                .iter()
+                .filter_map(|object| object.key())
+                .any(|key| key.ends_with("_backup_stop_sentinel.json"))
+            {
+                return Ok(Some(format!("s3://{bucket}/{walg_prefix}")));
+            }
+        }
     }
 
     // 2) pg_dump / rdb / mongodump / mariadb — every non-WAL-G engine writes
@@ -3916,7 +5324,17 @@ async fn resolve_backup_location_from_s3(
         if let Some(ct) = continuation.clone() {
             req = req.continuation_token(ct);
         }
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(page) => page,
+            Err(_) if walg_error.is_some() => break,
+            Err(error) => {
+                return Err(crate::execution::engine_v2::BackupError::Failed {
+                    reason: format!(
+                        "Could not list {service_prefix} for backup {backup_uuid}: {error}"
+                    ),
+                })
+            }
+        };
         for obj in resp.contents() {
             let key = match obj.key() {
                 Some(k) => k.to_string(),
@@ -3956,7 +5374,11 @@ async fn resolve_backup_location_from_s3(
         }
     }
 
-    Ok(best.map(|(k, _)| k))
+    match (best, walg_error) {
+        (Some((key, _)), _) => Ok(Some(key)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -4027,6 +5449,51 @@ mod tests {
         foreign
             .require_confirmation(7, &selector, &pitr(true), false)
             .expect("PITR into a new service has no data to overwrite");
+    }
+
+    #[test]
+    fn untracked_postgres_time_targets_need_the_snapshot_start() {
+        let location =
+            "s3://backups-bucket/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        let started = chrono::DateTime::parse_from_rfc3339("2026-11-22T03:50:53Z")
+            .expect("timestamp")
+            .with_timezone(&Utc);
+        let time = |offset_minutes: i64| RecoveryTarget::Time {
+            time: started + chrono::Duration::minutes(offset_minutes),
+        };
+
+        let unknown = validate_untracked_pitr_target(&time(10), None, location)
+            .expect_err("a time target without a known start is refused");
+        assert!(
+            matches!(&unknown, RestoreError::Validation { message } if message.contains(location)),
+            "{unknown:?}"
+        );
+        assert!(
+            validate_untracked_pitr_target(&time(-1), Some(started), location).is_err(),
+            "a target before the snapshot started is refused"
+        );
+        assert!(validate_untracked_pitr_target(&time(0), Some(started), location).is_ok());
+        assert!(validate_untracked_pitr_target(&time(10), Some(started), location).is_ok());
+        assert!(
+            validate_untracked_pitr_target(
+                &RecoveryTarget::Lsn {
+                    lsn: "0/3000060".into()
+                },
+                None,
+                location
+            )
+            .is_ok(),
+            "non-time targets do not depend on the start"
+        );
+    }
+
+    #[test]
+    fn physical_restore_warning_promises_rollback_only_where_it_exists() {
+        let single = physical_postgres_login_warning(false);
+        assert!(single.contains("puts the original data back"));
+        let cluster = physical_postgres_login_warning(true);
+        assert!(cluster.contains("cannot put it back"), "{cluster}");
+        assert!(!cluster.contains("puts the original data back"));
     }
 
     #[test]
@@ -4233,7 +5700,10 @@ mod tests {
             })
             .unwrap();
         let parameters: serde_json::Value = serde_json::from_str(&ciphertext).unwrap();
-        assert_eq!(parameters["password"], credentials.password);
+        assert_eq!(
+            parameters["password"].as_str(),
+            credentials.password.as_deref()
+        );
         assert_eq!(parameters["username"], "origin_role");
         assert_eq!(parameters["database"], "origin_db");
         assert_eq!(parameters["container_name"], "operator-owned-target");
@@ -4248,24 +5718,98 @@ mod tests {
             "username": "origin_role",
             "database": "origin_db"
         });
-        for engine in ["mongodb", "mariadb"] {
-            let mut target = serde_json::json!({
-                "password": "synthetic-target-password",
-                "root_password": "synthetic-target-root-password",
-                "username": "target_role",
-                "database": "target_db"
-            })
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "root_password": "synthetic-target-root-password",
+            "username": "target_role",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("mariadb", &origin)
+            .unwrap()
+            .apply(&mut target);
+        assert_eq!(target["password"], origin["password"]);
+        assert_eq!(target["root_password"], origin["root_password"]);
+        assert_eq!(target["username"], "target_role");
+        assert_eq!(target["database"], "target_db");
+    }
+
+    /// A cross-service MongoDB restore puts the origin's users in place of
+    /// the target's, so the target's stored login takes the origin's root
+    /// username with its password: the origin's password under the target's
+    /// old username authenticates as nobody. The database stays the
+    /// target's.
+    #[test]
+    fn a_mongodb_restore_takes_the_origins_username_with_its_password() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-password",
+            "username": "origin_admin",
+            "database": "origin_db"
+        });
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_admin",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("mongodb", &origin)
+            .unwrap()
+            .apply(&mut target);
+        assert_eq!(target["password"], "synthetic-origin-password");
+        assert_eq!(target["username"], "origin_admin");
+        assert_eq!(target["database"], "target_db");
+
+        // An origin whose config names no username leaves the target's.
+        let mut target = serde_json::json!({ "username": "target_admin" })
             .as_object()
             .unwrap()
             .clone();
-            RestoredServiceCredentials::from_origin(engine, &origin)
-                .unwrap()
-                .apply(&mut target);
-            assert_eq!(target["password"], origin["password"]);
-            assert_eq!(target["root_password"], origin["root_password"]);
-            assert_eq!(target["username"], "target_role");
-            assert_eq!(target["database"], "target_db");
-        }
+        RestoredServiceCredentials::from_origin(
+            "mongodb",
+            &serde_json::json!({ "password": "synthetic-origin-password" }),
+        )
+        .unwrap()
+        .apply(&mut target);
+        assert_eq!(target["username"], "target_admin");
+    }
+
+    /// A logical PostgreSQL restore by a job keeps the target's login and
+    /// password (the dump's are those of backup time, which may no longer be
+    /// the origin's): only the database the origin's data lives in is
+    /// reconciled, so the stored password keeps working.
+    #[test]
+    fn a_job_restore_reconciles_only_the_restored_database() {
+        let origin = serde_json::json!({
+            "password": "synthetic-origin-current-password",
+            "username": "origin_role",
+            "database": "origin_db"
+        });
+        let mut target = serde_json::json!({
+            "password": "synthetic-target-password",
+            "username": "target_role",
+            "database": "target_db"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        RestoredServiceCredentials::from_origin("postgres", &origin)
+            .and_then(RestoredServiceCredentials::into_database_only)
+            .expect("the origin names its database")
+            .apply(&mut target);
+        assert_eq!(target["password"], "synthetic-target-password");
+        assert_eq!(target["username"], "target_role");
+        assert_eq!(target["database"], "origin_db");
+
+        assert!(RestoredServiceCredentials::from_origin(
+            "postgres",
+            &serde_json::json!({ "password": "p" })
+        )
+        .and_then(RestoredServiceCredentials::into_database_only)
+        .is_none());
     }
 
     #[test]
@@ -4859,11 +6403,11 @@ mod tests {
     /// keeps the run active), never as a plain failure or a cancellation.
     #[test]
     fn engine_error_keeps_an_unconfirmed_stop_typed() {
-        let still_running =
-            anyhow::Error::new(temps_providers::externalsvc::StagedRestoreStillRunning {
-                target: "postgres-orders".into(),
-                reason: "docker unreachable".into(),
-            });
+        use temps_providers::externalsvc::{EngineError, StagedRestoreStillRunning};
+        let still_running = EngineError::from(StagedRestoreStillRunning {
+            target: "postgres-orders".into(),
+            reason: "docker unreachable".into(),
+        });
         match engine_error(7, still_running, "in-place restore failed") {
             RestoreError::StagedRestoreStillRunning {
                 restore_run_id,
@@ -4877,8 +6421,13 @@ mod tests {
             other => panic!("expected StagedRestoreStillRunning, got {other:?}"),
         }
         assert!(matches!(
-            engine_error(7, anyhow::anyhow!("disk full"), "in-place restore failed"),
-            RestoreError::ExternalService { ref reason } if reason == "in-place restore failed: disk full"
+            engine_error(
+                7,
+                EngineError::engine_failure("restore", "disk full"),
+                "in-place restore failed",
+            ),
+            RestoreError::ExternalService { ref reason }
+                if reason == "in-place restore failed: restore: disk full"
         ));
     }
 
@@ -4887,7 +6436,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut model = temps_entities::restore_runs::Model {
             id: 9,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 2,
             target_service_id: None,
             target_service_name: None,
@@ -4907,6 +6456,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         };
         let view: RestoreRunView = model.clone().into();
         assert!(view.cancellable);
@@ -4926,7 +6476,7 @@ mod tests {
         let now = chrono::Utc::now();
         let model = temps_entities::restore_runs::Model {
             id: 42,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 2,
             target_service_id: None,
             target_service_name: Some("clone".into()),
@@ -4946,6 +6496,7 @@ mod tests {
             updated_at: now,
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         };
         let v: RestoreRunView = model.into();
         assert_eq!(v.id, 42);
@@ -4985,17 +6536,17 @@ mod tests {
     async fn run_views_name_their_source_backup_in_one_query() {
         let tracked = temps_entities::restore_runs::Model {
             id: 1,
-            source_backup_id: 5,
+            source_backup_id: Some(5),
             ..crashed_run_row()
         };
         let deleted = temps_entities::restore_runs::Model {
             id: 2,
-            source_backup_id: 6,
+            source_backup_id: Some(6),
             ..crashed_run_row()
         };
         let raw = temps_entities::restore_runs::Model {
             id: 3,
-            source_backup_id: 0,
+            source_backup_id: None,
             resume_token: Some(serde_json::json!({
                 "backup_location": "s3://bucket/base_000000010000000000000002",
                 "engine_hint": "postgres",
@@ -5037,7 +6588,7 @@ mod tests {
     async fn run_views_skip_the_backup_lookup_for_raw_location_restores() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         let raw = temps_entities::restore_runs::Model {
-            source_backup_id: 0,
+            source_backup_id: None,
             ..crashed_run_row()
         };
         let views = views_with_source_backups(&db, vec![raw])
@@ -5045,6 +6596,90 @@ mod tests {
             .expect("views");
         assert_eq!(views[0].source_backup, RestoreRunSourceBackup::default());
         assert!(db.into_transaction_log().is_empty());
+    }
+
+    fn busy_wait(delay: std::time::Duration) -> crate::node_busy::NodeWait {
+        crate::node_busy::NodeWait {
+            attempt: 1,
+            delay,
+            waited: std::time::Duration::ZERO,
+            node: "worker-1".to_string(),
+            detail: "this node already runs 2 backups or restores".to_string(),
+        }
+    }
+
+    /// A run whose node is busy shows `waiting_for_node`, then goes back to
+    /// the phase it was about to enter.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_shows_it_then_resumes_its_phase() {
+        let entered = || sea_orm::MockExecResult {
+            last_insert_id: 0,
+            rows_affected: 1,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([entered(), entered()])
+            .into_connection();
+        wait_for_node_slot(&db, 7, "restore", busy_wait(std::time::Duration::ZERO))
+            .await
+            .expect("the wait ends in the restore phase");
+        let phases: Vec<String> = db
+            .into_transaction_log()
+            .into_iter()
+            .map(|statement| format!("{statement:?}"))
+            .collect();
+        assert_eq!(phases.len(), 2, "{phases:?}");
+        assert!(phases[0].contains("waiting_for_node"), "{}", phases[0]);
+        assert!(phases[1].contains("\"restore\""), "{}", phases[1]);
+    }
+
+    /// A cancel requested while the run waits for its node stops it there:
+    /// nothing ran on the node.
+    #[tokio::test]
+    async fn a_run_waiting_for_its_node_stops_when_cancelled() {
+        let now = Utc::now();
+        let cancelled = temps_entities::restore_runs::Model {
+            id: 7,
+            source_backup_id: Some(3),
+            source_service_id: 11,
+            target_service_id: Some(11),
+            target_service_name: None,
+            mode: "in_place".to_string(),
+            status: "running".to_string(),
+            phase: "waiting_for_node".to_string(),
+            recovery_target: None,
+            parameter_overrides: serde_json::json!({}),
+            resume_token: None,
+            log_id: "log".to_string(),
+            error_message: None,
+            attempt: 1,
+            started_at: Some(now),
+            finished_at: None,
+            created_by: 1,
+            created_at: now,
+            updated_at: now,
+            cancel_requested_at: Some(now),
+            cancel_requested_by: Some(1),
+            restored_login_encrypted: None,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_exec_results([sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results([vec![cancelled]])
+            .into_connection();
+        let error = wait_for_node_slot(
+            &db,
+            7,
+            "restore",
+            busy_wait(std::time::Duration::from_secs(60)),
+        )
+        .await
+        .expect_err("a cancelled run does not wait");
+        assert!(
+            matches!(&error, RestoreError::RestoreCancelled { restore_run_id: 7, phase } if phase == "waiting_for_node"),
+            "{error:?}"
+        );
     }
 
     // ---- MockDatabase-backed validation tests ---------------------------
@@ -5188,6 +6823,93 @@ mod tests {
             matches!(err, RestoreError::BackupNotFound { backup_id: 999 }),
             "got {:?}",
             err
+        );
+    }
+
+    #[test]
+    fn only_completed_backups_are_restorable() {
+        assert!(ensure_backup_restorable(&tracked_backup(7)).is_ok());
+        assert!(matches!(
+            ensure_backup_restorable(&temps_entities::backups::Model {
+                state: "deleting".into(),
+                ..tracked_backup(7)
+            }),
+            Err(RestoreError::BackupDeleting { backup_id: 7 })
+        ));
+        for state in ["pending", "running", "failed"] {
+            let backup = temps_entities::backups::Model {
+                state: state.into(),
+                ..tracked_backup(7)
+            };
+            match ensure_backup_restorable(&backup) {
+                Err(RestoreError::BackupNotRestorable {
+                    backup_id: 7,
+                    state: rejected,
+                }) => assert_eq!(rejected, state),
+                other => panic!("state '{state}' must not be restorable, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn start_restore_rejects_a_running_backup_before_touching_the_target() {
+        // Only the backup lookup is mocked: reaching the target-service
+        // lookup would exhaust the mock and fail with a different error.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![temps_entities::backups::Model {
+                    state: "running".into(),
+                    ..tracked_backup(42)
+                }]])
+                .into_connection(),
+        );
+        if Docker::connect_with_local_defaults().is_err() {
+            eprintln!("Docker not available, skipping");
+            return;
+        }
+        let svc = build_restore_service(db);
+
+        let err = svc
+            .start_restore(1, BackupSelector::Id(42), RestoreRequestMode::InPlace, 1)
+            .await
+            .expect_err("a running backup must not be restorable");
+        assert!(
+            matches!(
+                &err,
+                RestoreError::BackupNotRestorable { backup_id: 42, state } if state == "running"
+            ),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_rejects_a_backup_that_failed_after_the_precheck() {
+        // The pre-check in `start_restore` reads without a lock; a backup
+        // can fail between it and admission, so admission re-checks under
+        // the row lock and must refuse before inserting the run.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![temps_entities::backups::Model {
+                state: "failed".into(),
+                ..tracked_backup(42)
+            }]])
+            .into_connection();
+        let txn = db.begin().await.unwrap();
+
+        let err = lock_and_insert_restore_run(
+            &txn,
+            <temps_entities::restore_runs::ActiveModel as Default>::default(),
+            Some(42),
+            3,
+            true,
+        )
+        .await
+        .expect_err("a failed backup must not be admitted");
+        assert!(
+            matches!(
+                &err,
+                RestoreError::BackupNotRestorable { backup_id: 42, state } if state == "failed"
+            ),
+            "got {err:?}"
         );
     }
 
@@ -5474,6 +7196,7 @@ mod tests {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -5505,10 +7228,11 @@ mod tests {
     /// resolves to its own artifact rather than the newer one winning.
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
+    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         // ---- Arrange: real RustFS + real objects at real key shapes --------
         let Some((port, _s3_guard)) = boot_location_test_s3().await else {
-            return;
+            return Ok(());
         };
         let bucket = "restore-location-test";
         let s3_source = location_test_s3_source(port, bucket);
@@ -5524,8 +7248,79 @@ mod tests {
         });
         if let Err(e) = s3_client.create_bucket().bucket(bucket).send().await {
             eprintln!("Could not create RustFS bucket, skipping: {e}");
-            return;
+            return Ok(());
         }
+
+        // Two servers may write base backups below the same service name.
+        let base_key = "external_services/postgres/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json";
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key.replace("base_0001", "base_0000"))
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"{invalid"))
+            .send()
+            .await?;
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(
+                br#"{"UserData":{"temps_backup_id":"backup-a"}}"#,
+            ))
+            .send()
+            .await?;
+        for (backup_id, expected) in [
+            ("backup-a", Some(format!("s3://{bucket}/{base_key}"))),
+            ("backup-b", None),
+        ] {
+            let repaired = resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                "postgres",
+                "service-a",
+                backup_id,
+            )
+            .await?;
+            assert_eq!(repaired, expected);
+        }
+
+        // An unreadable, unrelated sentinel must not hide an exact UUID-scoped dump.
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key.replace("base_0001", "base_0003"))
+            .body(vec![b'x'; 1024 * 1024 + 1].into())
+            .send()
+            .await?;
+        let dump = "external_services/postgres/service-a/backup-c/dump.sql.gz";
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(dump)
+            .body(vec![1u8].into())
+            .send()
+            .await?;
+        assert_eq!(
+            resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                "postgres",
+                "service-a",
+                "backup-c"
+            )
+            .await?
+            .as_deref(),
+            Some(dump)
+        );
+        assert!(resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "postgres",
+            "service-a",
+            "missing"
+        )
+        .await
+        .is_err_and(|error| error.to_string().contains("exceeds")));
 
         let physical_service = "orders-physical";
         let logical_service = "orders-logical";
@@ -5555,7 +7350,7 @@ mod tests {
                 .await
             {
                 eprintln!("Could not seed object {key}, skipping: {e}");
-                return;
+                return Ok(());
             }
         }
 
@@ -5636,7 +7431,7 @@ mod tests {
             .await
         {
             eprintln!("Could not seed object {older_physical_key}, skipping: {e}");
-            return;
+            return Ok(());
         }
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         if let Err(e) = s3_client
@@ -5648,7 +7443,7 @@ mod tests {
             .await
         {
             eprintln!("Could not seed object {newer_logical_key}, skipping: {e}");
-            return;
+            return Ok(());
         }
 
         let resolved_for_older = resolve_backup_location_from_s3(
@@ -5683,6 +7478,7 @@ mod tests {
             resolved_for_newer, newer_logical_key,
             "resolving the newer logical backup's own uuid must return its own artifact"
         );
+        Ok(())
     }
 
     // ---- Active-run guard and interrupted-run reconciliation (real Postgres)
@@ -5744,7 +7540,7 @@ mod tests {
     ) -> temps_entities::restore_runs::ActiveModel {
         temps_entities::restore_runs::ActiveModel {
             id: NotSet,
-            source_backup_id: Set(backup_id),
+            source_backup_id: Set(Some(backup_id)),
             source_service_id: Set(service_id),
             target_service_id: Set(None),
             target_service_name: Set(target_service_name.map(String::from)),
@@ -5764,20 +7560,22 @@ mod tests {
             updated_at: NotSet,
             cancel_requested_at: Set(None),
             cancel_requested_by: Set(None),
+            restored_login_encrypted: Set(None),
         }
     }
 
     #[tokio::test]
-    async fn interrupted_restore_releases_the_service_only_after_fencing() {
+    async fn interrupted_restore_releases_the_service_only_after_fencing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if Docker::connect_with_local_defaults().is_err() {
             println!("Docker not available, skipping");
-            return;
+            return Ok(());
         }
-        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");
-                return;
+                return Ok(());
             }
         };
         let db = test_db.db.clone();
@@ -5950,10 +7748,14 @@ mod tests {
             fail: true,
             calls: Default::default(),
         };
-        let report =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &failing)
-                .await
-                .expect("reconcile");
+        let report = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &failing,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile");
         assert_eq!(report.deferred, vec![active.id]);
         assert!(insert_restore_run(
             db.as_ref(),
@@ -5972,10 +7774,14 @@ mod tests {
             fail: false,
             calls: Default::default(),
         };
-        let report =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
-                .await
-                .expect("reconcile");
+        let report = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &fence,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile");
         assert_eq!(report.interrupted, vec![active.id]);
         assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let interrupted = load_run_for_update(db.as_ref(), active.id)
@@ -5992,10 +7798,14 @@ mod tests {
         assert!(message.contains("may be partially restored"), "{message}");
 
         // Reconciling again (another restart) changes nothing.
-        let again =
-            crate::services::reconcile_interrupted_restores(db.as_ref(), &[active.id], &fence)
-                .await
-                .expect("reconcile again");
+        let again = crate::services::reconcile_interrupted_restores(
+            db.as_ref(),
+            &[active.id],
+            &fence,
+            &crate::services::restore_reconcile::NoWorkerRestores,
+        )
+        .await
+        .expect("reconcile again");
         assert_eq!(again, crate::services::RestoreReconcileReport::default());
         assert_eq!(fence.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
         let unchanged = load_run_for_update(db.as_ref(), active.id)
@@ -6044,31 +7854,54 @@ mod tests {
             .error_message
             .unwrap_or_default()
             .contains("stopped unexpectedly during phase 'prepare'"));
+
+        let mut cancelled = new_run(service.id, backup.id, user.id, "in_place", None);
+        cancelled.cancel_requested_at = Set(Some(Utc::now()));
+        let cancelled = cancelled.insert(db.as_ref()).await?;
+        let disposition = persist_terminal_state(
+            db.as_ref(),
+            cancelled.id,
+            &Err(RestoreError::Validation {
+                message: "Snapshot unavailable".into(),
+            }),
+            TERMINAL_WRITE_RETRY,
+        )
+        .await?;
+        assert_eq!(disposition, TerminalDisposition::Cancelled);
+        let terminal = load_run_for_update(db.as_ref(), cancelled.id).await?;
+        assert_eq!(terminal.status, "cancelled");
+        assert_eq!(terminal.phase, cancelled.phase);
+        assert!(terminal
+            .error_message
+            .unwrap_or_default()
+            .contains("operator"));
+        Ok(())
     }
 
     #[tokio::test]
     async fn terminal_write_is_retried_then_reported() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors(vec![
+            .append_query_errors(vec![
                 sea_orm::DbErr::Custom("connection reset".into()),
                 sea_orm::DbErr::Custom("connection reset".into()),
             ])
-            .append_exec_results(vec![sea_orm::MockExecResult {
-                last_insert_id: 0,
-                rows_affected: 1,
-            }])
+            .append_query_results([[BTreeMap::from([(
+                "status",
+                sea_orm::Value::from("completed"),
+            )])]])
             .into_connection();
         let fast = TerminalWriteRetry {
             attempts: 3,
             base_delay: std::time::Duration::from_millis(1),
             max_delay: std::time::Duration::from_millis(2),
         };
-        persist_terminal_state(&db, 9, &Ok(None), fast)
+        let disposition = persist_terminal_state(&db, 9, &Ok(None), fast)
             .await
             .expect("third attempt succeeds");
+        assert_eq!(disposition, TerminalDisposition::WorkerResult);
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
-            .append_exec_errors(vec![
+            .append_query_errors(vec![
                 sea_orm::DbErr::Custom("down".into()),
                 sea_orm::DbErr::Custom("down".into()),
             ])
@@ -6081,6 +7914,32 @@ mod tests {
             .await
             .expect_err("gives up after the configured attempts");
         assert!(matches!(err, RestoreError::Database(_)));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lookup_failure_reports_only_the_outcome_recorded_by_this_worker(
+    ) -> Result<(), RestoreError> {
+        for status in [Some("cancelled"), Some("failed"), None] {
+            let rows: Vec<_> = status
+                .into_iter()
+                .map(|s| BTreeMap::from([("status", sea_orm::Value::from(s))]))
+                .collect();
+            let db = MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([rows])
+                .into_connection();
+            let lookup = Err(RestoreError::BackupNotFound { backup_id: 42 });
+            let disposition = persist_terminal_state(&db, 9, &lookup, TERMINAL_WRITE_RETRY).await?;
+            let outcome = disposition.worker_outcome(9, lookup);
+            if status == Some("failed") {
+                assert!(matches!(
+                    outcome,
+                    Some(Err(RestoreError::BackupNotFound { backup_id: 42 }))
+                ));
+            } else {
+                assert!(outcome.is_none());
+            }
+        }
+        Ok(())
     }
 
     /// Fence double for the crash path; `fail` simulates an unreachable daemon.
@@ -6109,6 +7968,34 @@ mod tests {
             }
             Ok(Default::default())
         }
+    }
+
+    #[tokio::test]
+    async fn orphan_run_inserts_null_backup_id() -> Result<(), RestoreError> {
+        let mut row = crashed_run_row();
+        row.source_backup_id = None;
+        row.resume_token = Some(
+            serde_json::json!({"s3_source_id": 4, "backup_location": "service-a/backup.sql.gz"}),
+        );
+        let mut active: temps_entities::restore_runs::ActiveModel = row.clone().into();
+        active.source_backup_id = NotSet;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![crashed_run_service()]])
+            .append_query_results([vec![row]])
+            .into_connection();
+        let run = insert_restore_run(&db, active, None, 3, false).await?;
+        assert_eq!(run.source_backup_id, None);
+        let statements = db.into_transaction_log();
+        assert!(statements[0].statements().iter().any(|statement| {
+            statement.sql.contains("INSERT INTO \"restore_runs\"")
+                && statement.values.as_ref().is_some_and(|values| {
+                    values
+                        .0
+                        .iter()
+                        .any(|value| matches!(value, sea_orm::Value::Int(None)))
+                })
+        }));
+        Ok(())
     }
 
     #[tokio::test]
@@ -6174,7 +8061,7 @@ mod tests {
     fn crashed_run_row() -> temps_entities::restore_runs::Model {
         temps_entities::restore_runs::Model {
             id: 11,
-            source_backup_id: 1,
+            source_backup_id: Some(1),
             source_service_id: 3,
             target_service_id: None,
             target_service_name: None,
@@ -6194,7 +8081,643 @@ mod tests {
             updated_at: Utc::now(),
             cancel_requested_at: None,
             cancel_requested_by: None,
+            restored_login_encrypted: None,
         }
+    }
+
+    fn worker_postgres() -> temps_entities::external_services::Model {
+        temps_entities::external_services::Model {
+            id: 11,
+            name: "orders".to_string(),
+            service_type: "postgres".to_string(),
+            node_id: Some(4),
+            workload_mode:
+                temps_entities::external_service_workload_mode::ServiceWorkloadMode::Enforce,
+            ..crashed_run_service()
+        }
+    }
+
+    /// ADR-055 Phase 9: a database on a worker restores by a job, in place,
+    /// from a `pg_dumpall` dump. Anything else is refused with the reason.
+    #[test]
+    fn a_worker_database_restores_only_in_place_from_a_dump() {
+        let target = worker_postgres();
+        let key = "external_services/postgres/orders/u/dump.sql.gz";
+        assert!(job_restore_supported(&target, key, &RestoreRequestMode::InPlace).is_ok());
+
+        let new_service = RestoreRequestMode::NewService {
+            name: "copy".into(),
+            parameter_overrides: serde_json::json!({}),
+        };
+        match job_restore_supported(&target, key, &new_service) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains("worker node 4"), "{message}");
+                assert!(message.contains("in place"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+
+        match job_restore_supported(
+            &target,
+            "s3://bucket/base_000001",
+            &RestoreRequestMode::InPlace,
+        ) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains(".sql.gz"), "{message}");
+            }
+            other => panic!("expected a validation error, got {other:?}"),
+        }
+    }
+
+    /// A database on the control plane never takes the job path: its
+    /// restore is unchanged. One on a worker restores by a job in every
+    /// workload mode, since the local restore drives this host's Docker,
+    /// where its container is not.
+    #[test]
+    fn a_control_plane_database_keeps_the_local_restore() {
+        use crate::engines::workload_job::takes_job_path;
+        let mut local = worker_postgres();
+        local.node_id = None;
+        assert!(!takes_job_path(&local));
+        let mut legacy = worker_postgres();
+        legacy.workload_mode = Default::default();
+        assert!(takes_job_path(&legacy));
+        assert!(takes_job_path(&worker_postgres()));
+    }
+
+    /// Storage services on a worker restore in place through the node's
+    /// agent, from their own backup format; another mode is refused
+    /// explicitly, naming the node, never silently. (MongoDB, Redis and
+    /// MariaDB run the control plane's own restores on the node:
+    /// `worker_mongodb`, `worker_redis`, `worker_mariadb`.)
+    #[test]
+    fn a_worker_service_restores_only_in_place_from_its_own_format() {
+        let mariadb = temps_entities::external_services::Model {
+            service_type: "mariadb".to_string(),
+            node_id: Some(4),
+            ..crashed_run_service()
+        };
+        assert!(!crate::engines::worker_agent::takes_agent_path(&mariadb));
+        assert!(worker_mariadb::takes_mariadb_path(&mariadb));
+
+        let cases = [("rustfs", "external_services/s3/cache/u")];
+        for (service_type, key) in cases {
+            let target = temps_entities::external_services::Model {
+                service_type: service_type.to_string(),
+                node_id: Some(4),
+                ..crashed_run_service()
+            };
+            assert!(crate::engines::worker_agent::takes_agent_path(&target));
+            assert!(
+                agent_restore_supported(&target, key, &RestoreRequestMode::InPlace).is_ok(),
+                "{service_type}"
+            );
+            let new_service = RestoreRequestMode::NewService {
+                name: "copy".into(),
+                parameter_overrides: serde_json::json!({}),
+            };
+            match agent_restore_supported(&target, key, &new_service) {
+                Err(RestoreError::Validation { message }) => {
+                    assert!(message.contains("worker node 4"), "{message}");
+                    assert!(message.contains("in place"), "{message}");
+                    assert!(message.contains("new_service"), "{message}");
+                }
+                other => panic!("{service_type}: expected a refusal, got {other:?}"),
+            }
+        }
+        let mariadb = temps_entities::external_services::Model {
+            service_type: "mariadb".to_string(),
+            node_id: Some(4),
+            ..crashed_run_service()
+        };
+        match agent_restore_supported(
+            &mariadb,
+            "external_services/mongodb/x/dump.archive",
+            &RestoreRequestMode::InPlace,
+        ) {
+            Err(RestoreError::Validation { message }) => {
+                assert!(message.contains("another format"), "{message}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// A service on a worker reports in-place restore only, without asking
+    /// this host's Docker; the local services keep their engines' answer.
+    #[test]
+    fn worker_services_restore_in_place_only() {
+        let capabilities = worker_restore_capabilities();
+        assert!(capabilities.restore_in_place);
+        assert!(!capabilities.restore_to_new_service);
+        assert!(!capabilities.pitr);
+        assert!(!crate::engines::worker_agent::takes_agent_path(
+            &crashed_run_service()
+        ));
+    }
+
+    /// A RestoreService on a control-plane-profile server: no Docker.
+    fn control_plane_restore_service(
+        rows: Vec<temps_entities::external_services::Model>,
+    ) -> RestoreService {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(rows.into_iter().map(|row| vec![row]))
+                .into_connection(),
+        );
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let enc = Arc::new(EncryptionService::new(key).unwrap());
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
+        let mgr = Arc::new(temps_providers::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            enc.clone(),
+            handle,
+            false,
+            dns_registry,
+        ));
+        RestoreService::new(db, mgr, enc)
+    }
+
+    /// The restore page of a database on a worker node, read from a server
+    /// that runs no containers: answered without an engine, for every worker
+    /// engine; in place only, and to a point in time for PostgreSQL and
+    /// MariaDB (their control-plane restores run on the node). Before, the
+    /// engine lookup needed this server's Docker and the page failed with a
+    /// generic 500.
+    #[tokio::test]
+    async fn a_worker_service_reports_its_restore_options_on_a_control_plane_profile() {
+        for service_type in ["postgres", "mongodb", "redis", "mariadb", "s3"] {
+            let mut service = crashed_run_service();
+            service.id = 5;
+            service.service_type = service_type.to_string();
+            service.node_id = Some(2);
+            let restore = control_plane_restore_service(vec![service]);
+            let (capabilities, identity) = restore
+                .get_capabilities_with_identity(5)
+                .await
+                .unwrap_or_else(|e| panic!("{service_type}: {e}"));
+            assert_eq!(identity.id, 5);
+            assert!(capabilities.restore_in_place, "{service_type}");
+            assert!(!capabilities.restore_to_new_service, "{service_type}");
+            assert_eq!(
+                capabilities.pitr,
+                matches!(service_type, "postgres" | "mariadb"),
+                "{service_type}"
+            );
+        }
+    }
+
+    /// A service whose engine this server cannot build (a control-plane
+    /// service with no Docker here) gets a 503 that names it and says why,
+    /// never the generic 500.
+    #[tokio::test]
+    async fn restore_options_that_cannot_be_read_are_a_specific_problem() {
+        let mut service = crashed_run_service();
+        service.id = 5;
+        service.config = Some(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .unwrap()
+            .encrypt_string(r#"{"port":"6379","password":"p"}"#)
+            .unwrap(),
+        );
+        // The capability lookup, then the configuration load's own reads.
+        let restore = control_plane_restore_service(vec![service; 4]);
+        let error = restore
+            .get_capabilities_with_identity(5)
+            .await
+            .expect_err("no engine can answer without Docker");
+        assert!(
+            matches!(
+                &error,
+                RestoreError::CapabilitiesUnavailable { service_id: 5, service_name, .. }
+                    if service_name == "cache"
+            ),
+            "{error}"
+        );
+        let rendered = error.to_string();
+        let problem = temps_core::problemdetails::Problem::from(error);
+        assert_eq!(problem.status_code.as_u16(), 503);
+        assert!(rendered.contains("service 5 ('cache')"), "{rendered}");
+        assert!(rendered.contains("not available here"), "{rendered}");
+    }
+
+    /// The origin credentials a restore of backup 4, taken from service 5,
+    /// leaves in worker service 7 of `service_type`, read through a manager
+    /// on a server without Docker. `origin_config` is the origin's stored
+    /// config (`None`: the origin row is gone).
+    async fn worker_origin_credentials(
+        service_type: &str,
+        backup_location: &str,
+        producer: i32,
+        origin_config: Option<&str>,
+    ) -> Option<RestoredServiceCredentials> {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let enc = Arc::new(EncryptionService::new(key).unwrap());
+        let mut origin = crashed_run_service();
+        origin.id = 5;
+        origin.service_type = service_type.to_string();
+        origin.node_id = Some(1);
+        origin.config = origin_config.map(|config| enc.encrypt_string(config).unwrap());
+        let mut db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_producer_row(1, 4, producer)]]);
+        db = if origin_config.is_some() {
+            db.append_query_results(vec![vec![origin.clone()], vec![origin.clone()]])
+        } else {
+            db.append_query_results(vec![Vec::<temps_entities::external_services::Model>::new()])
+        };
+        let db = Arc::new(db.into_connection());
+        let handle = Arc::new(temps_core::DockerHandle::disabled(
+            temps_core::PROFILE_CONTROL_PLANE,
+            temps_core::CONTROL_PLANE_DOCKER_REASON,
+        ));
+        let dns_registry = Arc::new(temps_providers::DnsRegistry::new(db.clone()));
+        let mgr = temps_providers::ExternalServiceManager::new_with_handle(
+            db.clone(),
+            enc,
+            handle,
+            false,
+            dns_registry,
+        );
+        let mut target = crashed_run_service();
+        target.id = 7;
+        target.service_type = service_type.to_string();
+        target.node_id = Some(1);
+        let mut backup = tracked_backup(4);
+        backup.s3_location = backup_location.to_string();
+        origin_credentials_to_reconcile(db.as_ref(), &mgr, &backup, &target).await
+    }
+
+    /// A restore into a worker service of another service's backup is
+    /// reconciled as on the control plane: the restored data's login
+    /// (Postgres: role and database too; MongoDB: the admin password)
+    /// becomes the target's stored credentials.
+    #[tokio::test]
+    async fn a_cross_service_restore_into_a_worker_takes_the_origins_login() {
+        let postgres = worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            5,
+            Some(r#"{"password":"origin-pw","username":"app","database":"shop"}"#),
+        )
+        .await
+        .expect("a Postgres dump carries its origin's roles");
+        assert_eq!(postgres.password.as_deref(), Some("origin-pw"));
+        assert_eq!(postgres.username.as_deref(), Some("app"));
+        assert_eq!(postgres.database.as_deref(), Some("shop"));
+
+        let mongo = worker_origin_credentials(
+            "mongodb",
+            "mongodb/a/1/dump.archive.gz",
+            5,
+            Some(r#"{"password":"origin-pw","username":"admin"}"#),
+        )
+        .await
+        .expect("a mongodump carries admin.system.users");
+        assert_eq!(mongo.password.as_deref(), Some("origin-pw"));
+        assert_eq!(
+            mongo.username.as_deref(),
+            Some("admin"),
+            "the restored users answer to the origin's root username"
+        );
+        assert_eq!(mongo.database, None, "the database stays the target's");
+    }
+
+    /// What carries no credentials, or is the target's own, changes none;
+    /// an origin that is gone keeps the target's, as on the control plane.
+    #[tokio::test]
+    async fn a_restore_without_foreign_credentials_keeps_the_targets() {
+        let config = Some(r#"{"password":"origin-pw"}"#);
+        // A logical MariaDB dump excludes the `mysql` schema; Redis and
+        // storage have no auth in their data. Neither reads the origin.
+        assert!(
+            worker_origin_credentials("mariadb", "mariadb/a/1/dump.sql.gz", 5, config)
+                .await
+                .is_none()
+        );
+        assert!(
+            worker_origin_credentials("redis", "redis/a/1/dump.rdb.gz", 5, config)
+                .await
+                .is_none()
+        );
+        // The target's own backup.
+        assert!(worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            7,
+            config
+        )
+        .await
+        .is_none());
+        // The origin was deleted.
+        assert!(worker_origin_credentials(
+            "postgres",
+            "external_services/postgres/a/1/dump.sql.gz",
+            5,
+            None
+        )
+        .await
+        .is_none());
+    }
+
+    /// A restore plan names the service that produced the backup from its
+    /// producer link, the origin the restore itself binds to, even when the
+    /// backup's metadata records no name. Before, the plan said "an unknown
+    /// service" for a backup that was linked to a live one.
+    #[tokio::test]
+    async fn a_plan_names_the_backups_producer_from_its_link() {
+        let mut origin = crashed_run_service();
+        origin.id = 5;
+        origin.name = "orders-old".to_string();
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![make_producer_row(1, 4, 5)]])
+            .append_query_results(vec![vec![origin]])
+            .into_connection();
+        let mut backup = tracked_backup(4);
+        backup.metadata = "{}".to_string();
+        assert_eq!(
+            backup_origin_service_name(&db, &backup).await.as_deref(),
+            Some("orders-old")
+        );
+
+        // No producer: the name the metadata recorded, if any.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![
+                Vec::<temps_entities::external_service_backups::Model>::new(),
+            ])
+            .into_connection();
+        backup.metadata = r#"{"service_name":"orders-gone"}"#.to_string();
+        assert_eq!(
+            backup_origin_service_name(&db, &backup).await.as_deref(),
+            Some("orders-gone")
+        );
+    }
+
+    /// The plan of a restore into a worker's service describes what runs
+    /// there (a job or the agent on the node), never the control plane's
+    /// host-side steps, and refuses what `start_restore` refuses.
+    #[test]
+    fn a_worker_restore_plan_describes_the_job_on_its_node() {
+        let mut database = crashed_run_service();
+        database.service_type = "postgres".to_string();
+        database.name = "orders".to_string();
+        database.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &database,
+            "external_services/postgres/orders-old/u/dump.sql.gz",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            true,
+        )
+        .expect("a worker database");
+        let text = plan.steps.join("\n");
+        assert!(
+            text.contains("restore job on worker node 2, through its agent"),
+            "{text}"
+        );
+        assert!(text.contains("password the dump restores"), "{text}");
+        assert!(
+            !text.contains("on the host") && !text.contains("sidecar"),
+            "{text}"
+        );
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+
+        // A WAL-G backup is restored on the node by the control plane's
+        // WAL-G restore, which the plan describes; into a new service it is
+        // refused in the plan as at start.
+        let walg = worker_restore_plan(
+            &database,
+            "s3://backups/external_services/postgres/orders/walg",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(walg.refusal.is_none(), "{:?}", walg.refusal);
+        assert!(
+            walg.steps.join("\n").contains("wal-g backup-fetch"),
+            "{:?}",
+            walg.steps
+        );
+        let walg_copy = worker_restore_plan(
+            &database,
+            "s3://backups/external_services/postgres/orders/walg",
+            &RestoreRequestMode::NewService {
+                name: "orders-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(walg_copy
+            .refusal
+            .is_some_and(|r| r.contains("worker node 2") && r.contains("new_service")));
+        let copy = worker_restore_plan(
+            &database,
+            "external_services/postgres/orders/u/dump.sql.gz",
+            &RestoreRequestMode::NewService {
+                name: "orders-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "postgres-orders",
+            false,
+        )
+        .expect("a worker database");
+        assert!(copy.refusal.is_some_and(|r| r.contains("new_service")));
+
+        let mut cache = crashed_run_service();
+        cache.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &cache,
+            "external_services/redis/cache/u/dump.rdb.gz",
+            &RestoreRequestMode::InPlace,
+            "redis-cache",
+            false,
+        )
+        .expect("a worker cache");
+        assert!(plan.steps[0].contains("worker node 2, through its agent"));
+        assert!(
+            plan.steps
+                .iter()
+                .any(|s| s.contains("original is moved back")),
+            "a worker Redis restore is the control plane's: {:?}",
+            plan.steps
+        );
+        assert!(plan.refusal.is_none());
+
+        // A control-plane target keeps the control plane's steps.
+        database.node_id = None;
+        assert!(worker_restore_plan(
+            &database,
+            "external_services/postgres/orders/u/dump.sql.gz",
+            &RestoreRequestMode::InPlace,
+            "postgres-orders",
+            false,
+        )
+        .is_none());
+    }
+
+    /// The restore plan names what each backup is and how it is applied,
+    /// for the formats worker nodes and the control plane write: a
+    /// mongodump archive and a bucket mirror are not "unsupported"/"unknown".
+    #[test]
+    fn a_plan_classifies_every_backup_format_the_engines_write() {
+        for (engine, location, strategy, format) in [
+            (
+                "postgres",
+                "s3://b/external_services/postgres/orders/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "postgres",
+                "external_services/postgres/orders/u/dump.sql.gz",
+                "pg_dump_restore",
+                "pg_dump",
+            ),
+            (
+                "mongodb",
+                "external_services/mongodb/docs/2026/01/01/u/dump.archive",
+                "mongodump_restore",
+                "mongodump",
+            ),
+            (
+                "mongodb",
+                "s3://b/external_services/mongodb/docs/walg",
+                "walg_restore",
+                "walg",
+            ),
+            (
+                "redis",
+                "external_services/redis/cache/u/dump.rdb.gz",
+                "redis_rdb_restore",
+                "redis_rdb",
+            ),
+            (
+                "mariadb",
+                "external_services/mariadb/shop/u/dump.sql.gz",
+                "mariadb_dump_restore",
+                "mariadb_dump",
+            ),
+            (
+                "s3",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "rustfs",
+                "external_services/s3/files/2026/01/01/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            (
+                "blob",
+                "external_services/blob/files/u",
+                "s3_mirror_restore",
+                "s3_mirror",
+            ),
+            ("redis", "legacy-backup.tar", "unsupported", "unknown"),
+            ("mongodb", "", "unsupported", "unknown"),
+        ] {
+            let classified = classify_restore_strategy(engine, location);
+            assert_eq!(classified, strategy, "{engine} {location}");
+            assert_eq!(restore_format(classified), format, "{engine} {location}");
+        }
+    }
+
+    /// A mongodump archive is planned as the archive restore the MongoDB
+    /// engine runs, never as a WAL-G fetch.
+    #[test]
+    fn a_mongodump_archive_plan_describes_mongorestore_not_walg() {
+        for mode in [
+            RestoreRequestMode::InPlace,
+            RestoreRequestMode::NewService {
+                name: "docs-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+        ] {
+            let (mut steps, mut destructive, mut errors) = (Vec::new(), false, Vec::new());
+            build_mongodb_steps(
+                "mongodump_restore",
+                &mode,
+                "temps-mongodb-docs",
+                "external_services/mongodb/docs/u/dump.archive",
+                &mut steps,
+                &mut destructive,
+                &mut errors,
+            );
+            let text = steps.join("\n");
+            assert!(errors.is_empty(), "{errors:?}");
+            assert!(!text.contains("wal-g"), "{text}");
+            assert!(text.contains("dump.archive"), "{text}");
+            assert!(
+                text.contains("mongorestore --archive --gzip --drop"),
+                "{text}"
+            );
+        }
+    }
+
+    /// On a worker, the plan says what runs on the node for each engine:
+    /// the control plane's own MongoDB restore and the exact bucket mirror.
+    #[test]
+    fn a_worker_restore_plan_names_the_engines_restore() {
+        let mut docs = crashed_run_service();
+        docs.service_type = "mongodb".to_string();
+        docs.name = "docs".to_string();
+        docs.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &docs,
+            "external_services/mongodb/docs/u/dump.archive",
+            &RestoreRequestMode::InPlace,
+            "temps-mongodb-docs",
+            false,
+        )
+        .expect("a worker MongoDB");
+        let text = plan.steps.join("\n");
+        assert!(
+            text.contains("mongorestore --archive --gzip --drop"),
+            "{text}"
+        );
+        assert!(!text.contains("wal-g"), "{text}");
+        assert!(text.contains("control plane's MongoDB restore"), "{text}");
+        assert!(text.contains("worker node 2"), "{text}");
+        assert!(plan.refusal.is_none(), "{:?}", plan.refusal);
+        let refused = worker_restore_plan(
+            &docs,
+            "external_services/mongodb/docs/u/dump.archive",
+            &RestoreRequestMode::NewService {
+                name: "docs-copy".to_string(),
+                parameter_overrides: serde_json::Value::Null,
+            },
+            "temps-mongodb-docs",
+            false,
+        )
+        .expect("a worker MongoDB")
+        .refusal
+        .expect("a new service is refused on a worker");
+        assert!(refused.contains("Restore in place"), "{refused}");
+
+        let mut files = crashed_run_service();
+        files.service_type = "s3".to_string();
+        files.name = "files".to_string();
+        files.node_id = Some(2);
+        let plan = worker_restore_plan(
+            &files,
+            "external_services/s3/files/u",
+            &RestoreRequestMode::InPlace,
+            "files",
+            false,
+        )
+        .expect("a worker storage service");
+        let text = plan.steps.join("\n");
+        assert!(text.contains("--overwrite --remove"), "{text}");
+        assert!(text.contains("deleted"), "{text}");
     }
 
     fn crashed_run_service() -> temps_entities::external_services::Model {
@@ -6219,10 +8742,17 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             container_name: None,
-            ai_data_access: false,
             created_by_user_id: None,
             continuous_archive_s3_source_id: None,
             continuous_archive_pinned_at: None,
+            workload_mode: Default::default(),
+            log_ingest_lines_per_sec: None,
+            log_ingest_kib_per_sec: None,
+            healthcheck_interval_secs: None,
+            healthcheck_start_interval_secs: None,
+            healthcheck_start_period_secs: None,
+            healthcheck_timeout_secs: None,
+            healthcheck_retries: None,
         }
     }
 

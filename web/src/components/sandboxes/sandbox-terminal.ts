@@ -11,7 +11,8 @@
  *
  * The socket cannot report an HTTP status for a refused upgrade (permission,
  * stopped sandbox, terminal cap), so a connection that closes before `ready`
- * is described by its likely causes rather than by a status code.
+ * reports that no error details were received. Server error events retain
+ * their diagnostic message; transport failures never imply a permission or cap.
  */
 
 export type TerminalStatus =
@@ -101,15 +102,10 @@ export function computeTerminalSize(
 /** Why the terminal cannot be attached right now, or `null` when it can. */
 export function terminalUnavailableReason(sandbox: {
   status: string
-  node_id: number | null
-  node_name: string
   lifecycle?: string
 }): string | null {
   if (sandbox.status === 'destroyed') {
     return 'This sandbox has been destroyed.'
-  }
-  if (sandbox.node_id != null) {
-    return `Terminals are not available yet for sandboxes on worker nodes. This sandbox runs on ${sandbox.node_name}; create one on the control plane to use a terminal.`
   }
   if (sandbox.status === 'stopped' && sandbox.lifecycle !== 'workspace') {
     return 'This sandbox is stopped. Resume it to open a terminal.'
@@ -118,7 +114,7 @@ export function terminalUnavailableReason(sandbox: {
 }
 
 export const TERMINAL_REFUSED_HINT =
-  'The terminal could not be opened. It needs the sandboxes:exec permission and a running sandbox, and each account can hold up to 4 terminals at once.'
+  'The terminal connection failed before it was ready. No error details were received. Try reconnecting.'
 
 interface SocketLike {
   binaryType: string

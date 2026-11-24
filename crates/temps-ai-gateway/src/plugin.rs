@@ -17,8 +17,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
     services::{
-        GatewayService, ProviderKeyService, ProviderModelService, ProviderPreferenceService,
-        StructuredOutputService, UsageService,
+        CodingAgentService, GatewayService, ModelCatalogService, ProviderKeyService,
+        ProviderModelService, ProviderPreferenceService, StructuredOutputService, UsageService,
     },
 };
 
@@ -224,15 +224,14 @@ fn parse_opencode_native_auth(
 /// other credential is already the bearer.
 async fn resolve_relay_bearer(
     provider_id: &str,
-    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    format: temps_ai_cli::catalog::CredentialFormat,
     credential: String,
 ) -> Result<String, temps_ai::AiError> {
     /// Long enough to cover a normal workspace turn without a mid-turn expiry.
     const MIN_TOKEN_VALIDITY: Duration = Duration::from_secs(30 * 60);
-    if provider_id == "claude_cli"
-        && format == temps_agents::ai_cli::catalog::CredentialFormat::OauthToken
+    if provider_id == "claude_cli" && format == temps_ai_cli::catalog::CredentialFormat::OauthToken
     {
-        return temps_agents::ai_cli::credential_snapshot::resolve_claude_oauth(
+        return temps_ai_cli::credential_snapshot::resolve_claude_oauth(
             &credential,
             MIN_TOKEN_VALIDITY,
         )
@@ -243,10 +242,8 @@ async fn resolve_relay_bearer(
             reason: error.to_string(),
         });
     }
-    if provider_id == "codex_cli"
-        && format == temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile
-    {
-        return temps_agents::ai_cli::credential_snapshot::resolve_codex_auth(
+    if provider_id == "codex_cli" && format == temps_ai_cli::catalog::CredentialFormat::ConfigFile {
+        return temps_ai_cli::credential_snapshot::resolve_codex_auth(
             &credential,
             MIN_TOKEN_VALIDITY,
         )
@@ -261,30 +258,30 @@ async fn resolve_relay_bearer(
 
 fn sandbox_harness_credentials(
     provider_id: &str,
-    format: temps_agents::ai_cli::catalog::CredentialFormat,
+    format: temps_ai_cli::catalog::CredentialFormat,
     credential: String,
     internal_api_url: String,
 ) -> Result<temps_ai_agent_cli::SandboxHarnessCredentials, temps_ai::AiError> {
     match (provider_id, format) {
-        ("claude_cli", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
+        ("claude_cli", temps_ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::anthropic_api_key(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("claude_cli", temps_agents::ai_cli::catalog::CredentialFormat::OauthToken) => Ok(
+        ("claude_cli", temps_ai_cli::catalog::CredentialFormat::OauthToken) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::claude_oauth_token(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("codex_cli", temps_agents::ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
+        ("codex_cli", temps_ai_cli::catalog::CredentialFormat::ApiKey) => Ok(
             temps_ai_agent_cli::SandboxHarnessCredentials::openai_api_key(
                 credential,
                 internal_api_url,
             ),
         ),
-        ("codex_cli", temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
+        ("codex_cli", temps_ai_cli::catalog::CredentialFormat::ConfigFile) => {
             let auth = serde_json::from_str::<CodexAuthFile>(&credential).map_err(|error| {
                 temps_ai::AiError::Provider {
                     purpose: "chat.application.credentials".to_string(),
@@ -320,15 +317,15 @@ fn sandbox_harness_credentials(
                 internal_api_url,
             ))
         }
-        ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile) => {
+        ("opencode", temps_ai_cli::catalog::CredentialFormat::ConfigFile) => {
             let (contents, providers) = parse_opencode_native_auth(&credential)?;
             Ok(temps_ai_agent_cli::SandboxHarnessCredentials::opencode_auth_json(contents, providers, internal_api_url))
         }
-        ("opencode", temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
+        ("opencode", temps_ai_cli::catalog::CredentialFormat::OpenAiCompatible) => {
             // Re-validated on every use: a stored row is not trusted to still
             // name a public HTTPS endpoint just because it did when saved.
             let endpoint =
-                temps_agents::ai_cli::openai_compatible::OpenAiCompatibleCredential::parse(
+                temps_ai_cli::openai_compatible::OpenAiCompatibleCredential::parse(
                     &credential,
                 )
                 .map_err(|error| temps_ai::AiError::Provider {
@@ -406,6 +403,44 @@ mod opencode_auth_tests {
     }
 }
 
+/// Upgrade-safe catalog bootstrap: keys created before the model inventory
+/// migration would otherwise advertise zero models until an administrator
+/// manually pressed Refresh. Static adapter models are inserted synchronously
+/// and live discovery replaces their availability metadata in the background
+/// without delaying boot.
+async fn bootstrap_provider_models(
+    provider_key_service: &Arc<ProviderKeyService>,
+    provider_model_service: &Arc<ProviderModelService>,
+) {
+    match provider_key_service.list_active().await {
+        Ok(keys) => {
+            for key in keys {
+                if let Err(error) = provider_model_service.seed_bootstrap(&key).await {
+                    tracing::warn!(
+                        provider_key_id = key.id,
+                        %error,
+                        "Could not seed the upgraded AI model catalog"
+                    );
+                }
+                let models = provider_model_service.clone();
+                tokio::spawn(async move {
+                    if let Err(error) = models.refresh(key.id).await {
+                        tracing::warn!(
+                            provider_key_id = key.id,
+                            %error,
+                            "Background AI model catalog refresh failed; bootstrap models remain available"
+                        );
+                    }
+                });
+            }
+        }
+        Err(error) => tracing::warn!(
+            %error,
+            "Could not enumerate provider keys for model catalog bootstrap"
+        ),
+    }
+}
+
 impl TempsPlugin for AiGatewayPlugin {
     fn name(&self) -> &'static str {
         "ai_gateway"
@@ -440,38 +475,19 @@ impl TempsPlugin for AiGatewayPlugin {
             ));
             context.register_service(provider_model_service.clone());
 
-            // Upgrade-safe catalog bootstrap: keys created before the model
-            // inventory migration would otherwise advertise zero models until
-            // an administrator manually pressed Refresh. Static adapter models
-            // are inserted synchronously and live discovery replaces their
-            // availability metadata in the background without delaying boot.
-            match provider_key_service.list_active().await {
-                Ok(keys) => {
-                    for key in keys {
-                        if let Err(error) = provider_model_service.seed_bootstrap(&key).await {
-                            tracing::warn!(
-                                provider_key_id = key.id,
-                                %error,
-                                "Could not seed the upgraded AI model catalog"
-                            );
-                        }
-                        let models = provider_model_service.clone();
-                        tokio::spawn(async move {
-                            if let Err(error) = models.refresh(key.id).await {
-                                tracing::warn!(
-                                    provider_key_id = key.id,
-                                    %error,
-                                    "Background AI model catalog refresh failed; bootstrap models remain available"
-                                );
-                            }
-                        });
-                    }
-                }
-                Err(error) => tracing::warn!(
-                    %error,
-                    "Could not enumerate provider keys for model catalog bootstrap"
-                ),
-            }
+            // ADR 113: the runtime model catalog. Its background task first
+            // applies the stored catalog (so a restart without network keeps
+            // it), then refreshes it and rediscovers provider keys' models on
+            // the configured interval.
+            let model_catalog_service = Arc::new(ModelCatalogService::new(
+                db.clone(),
+                provider_key_service.clone(),
+                provider_model_service.clone(),
+            ));
+            context.register_service(model_catalog_service.clone());
+            model_catalog_service.clone().spawn_background();
+
+            bootstrap_provider_models(&provider_key_service, &provider_model_service).await;
 
             // ADR-022: register the general AI foundation so any feature can get
             // text or typed/structured output from the configured model through
@@ -482,10 +498,17 @@ impl TempsPlugin for AiGatewayPlugin {
             // host harnesses receive the same scoped tools through the
             // turn-local MCP bridge. Chat and feature code never branches on
             // provider transport.
-            let gateway_ai_service = Arc::new(crate::services::GatewayAiService::new(
-                gateway_service.clone(),
-                db.clone(),
-            ));
+            //
+            // Chat turns stream through this service rather than the HTTP
+            // gateway handler, so it needs the usage service to record tokens
+            // for them; otherwise assistant traffic would be invisible in
+            // AI Gateway usage and spend views.
+            let usage_service = Arc::new(UsageService::new(db.clone()));
+            context.register_service(usage_service.clone());
+            let gateway_ai_service = Arc::new(
+                crate::services::GatewayAiService::new(gateway_service.clone(), db.clone())
+                    .with_usage_service(usage_service.clone()),
+            );
 
             // One AgentCliAiService per catalog entry (Claude Code, Codex,
             // OpenCode), built once here rather than per-request — each is
@@ -497,7 +520,7 @@ impl TempsPlugin for AiGatewayPlugin {
             let ai_cli_scratch_dir = config_service.get_data_subdir("ai-cli-scratch");
             let application_workspace_root = config_service.get_data_subdir("ai-applications");
             let sandbox_provider =
-                context.get_service::<dyn temps_agents::sandbox::SandboxProvider>();
+                context.get_service::<dyn temps_sandbox_providers::SandboxProvider>();
             let sandbox_model_relay = Arc::new(
                 temps_ai_agent_cli::SandboxModelRelayService::new().map_err(|error| {
                     PluginError::InitializationFailed(format!(
@@ -546,10 +569,15 @@ impl TempsPlugin for AiGatewayPlugin {
                                     provider_id
                                 ),
                                 })?;
-                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
-                            .ok_or_else(|| temps_ai::AiError::Provider {
-                                purpose: "chat.application.credentials".to_string(),
-                                reason: format!("unknown development harness '{}'", provider_id),
+                        let provider =
+                            temps_ai_cli::find_provider(&provider_id).ok_or_else(|| {
+                                temps_ai::AiError::Provider {
+                                    purpose: "chat.application.credentials".to_string(),
+                                    reason: format!(
+                                        "unknown development harness '{}'",
+                                        provider_id
+                                    ),
+                                }
                             })?;
                         let auth_type = if provider_config.auth_type.is_empty() {
                             provider.default_flavor().id
@@ -586,7 +614,7 @@ impl TempsPlugin for AiGatewayPlugin {
                     let auth_type = auth_type.to_string();
                     let credential = credential.to_string();
                     Box::pin(async move {
-                        let provider = temps_agents::ai_cli::find_provider(&provider_id)
+                        let provider = temps_ai_cli::find_provider(&provider_id)
                             .ok_or_else(|| temps_ai::AiError::Provider {
                                 purpose: "provider.credentials.verify".to_string(),
                                 reason: format!("unknown development harness '{provider_id}'"),
@@ -617,9 +645,9 @@ impl TempsPlugin for AiGatewayPlugin {
 
             let mut agent_cli_services: HashMap<String, Arc<dyn temps_ai::AiService>> =
                 HashMap::new();
-            for registration in temps_agents::ai_cli::PROVIDER_CATALOG {
-                if let Some(provider) = temps_agents::ai_cli::create_provider(registration.id) {
-                    let provider: Arc<dyn temps_agents::ai_cli::AiCliProvider> = provider.into();
+            for registration in temps_ai_cli::PROVIDER_CATALOG {
+                if let Some(provider) = temps_ai_cli::create_provider(registration.id) {
+                    let provider: Arc<dyn temps_ai_cli::AiCliProvider> = provider.into();
                     let mut svc = temps_ai_agent_cli::AgentCliAiService::new(
                         provider,
                         ai_cli_scratch_dir.clone(),
@@ -661,9 +689,6 @@ impl TempsPlugin for AiGatewayPlugin {
             // Browser-supplied generic prompts are intentionally restricted to
             // tool-less gateway APIs. Host subscription CLIs can inspect the
             // host and are reserved for server-authored, purpose-specific jobs.
-            let usage_service = Arc::new(UsageService::new(db.clone()));
-            context.register_service(usage_service.clone());
-
             let structured_output_service = Arc::new(StructuredOutputService::new(
                 gateway_ai_service as Arc<dyn temps_ai::AiService>,
                 usage_service.clone(),
@@ -671,6 +696,13 @@ impl TempsPlugin for AiGatewayPlugin {
             context.register_service(structured_output_service.clone());
 
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+            let coding_agent_service = Arc::new(CodingAgentService::new(
+                db.clone(),
+                ai_service.clone(),
+                audit_service.clone(),
+            ));
+            context.register_service(coding_agent_service.clone());
+            coding_agent_service.clone().spawn_background();
             let project_access_checker =
                 context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
@@ -686,6 +718,8 @@ impl TempsPlugin for AiGatewayPlugin {
                 provider_key_service,
                 provider_model_service,
                 provider_preference_service,
+                model_catalog_service,
+                coding_agent_service,
                 usage_service,
                 audit_service,
                 telemetry,
@@ -710,6 +744,8 @@ impl TempsPlugin for AiGatewayPlugin {
         let routes = handlers::configure_admin_routes()
             .merge(handlers::configure_usage_routes())
             .merge(handlers::configure_limits_routes())
+            .merge(handlers::configure_model_catalog_routes())
+            .merge(handlers::configure_coding_agent_routes())
             .merge(handlers::configure_pricing_routes())
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_native_routes())
@@ -732,6 +768,12 @@ impl TempsPlugin for AiGatewayPlugin {
         schema.merge(limits_schema);
         let pricing_schema = <handlers::pricing::AiGatewayPricingApiDoc as OpenApiTrait>::openapi();
         schema.merge(pricing_schema);
+        let catalog_schema =
+            <handlers::model_catalog::AiGatewayModelCatalogApiDoc as OpenApiTrait>::openapi();
+        schema.merge(catalog_schema);
+        let coding_agents_schema =
+            <handlers::coding_agents::AiCodingAgentsApiDoc as OpenApiTrait>::openapi();
+        schema.merge(coding_agents_schema);
         let provider_status_schema =
             <handlers::provider_status::AiProviderStatusApiDoc as OpenApiTrait>::openapi();
         schema.merge(provider_status_schema);
@@ -772,7 +814,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -789,7 +831,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "opencode",
-            temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+            temps_ai_cli::catalog::CredentialFormat::OpenAiCompatible,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -806,7 +848,7 @@ mod tests {
             .to_string();
             let Err(error) = sandbox_harness_credentials(
                 "opencode",
-                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                temps_ai_cli::catalog::CredentialFormat::OpenAiCompatible,
                 credential,
                 "http://temps.internal".to_string(),
             ) else {
@@ -826,7 +868,7 @@ mod tests {
         for provider in ["claude_cli", "codex_cli"] {
             assert!(sandbox_harness_credentials(
                 provider,
-                temps_agents::ai_cli::catalog::CredentialFormat::OpenAiCompatible,
+                temps_ai_cli::catalog::CredentialFormat::OpenAiCompatible,
                 credential.clone(),
                 "http://temps.internal".to_string(),
             )
@@ -843,7 +885,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )
@@ -860,7 +902,7 @@ mod tests {
 
         assert!(sandbox_harness_credentials(
             "codex_cli",
-            temps_agents::ai_cli::catalog::CredentialFormat::ConfigFile,
+            temps_ai_cli::catalog::CredentialFormat::ConfigFile,
             credential,
             "http://temps.internal".to_string(),
         )

@@ -5,10 +5,12 @@ use clap::{Args, Subcommand};
 use colored::Colorize;
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::info;
+
+use super::backup_restore_sql::{self, BackupRowCheck, RestoreTarget};
 
 /// `server_config_encryption` written by servers before F-009: AES-256-GCM keyed by
 /// an unsalted SHA-256 of the S3 secret. Still accepted so old recovery sets restore.
@@ -143,9 +145,9 @@ struct ListBackupsArgs {
 
 #[derive(Args)]
 struct RestoreBackupArgs {
-    /// Database connection URL to restore to (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database connection URL to restore to. Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
+    database_url: Option<String>,
 
     /// Temps data directory whose recovery secrets will be restored
     #[arg(long, env = "TEMPS_DATA_DIR")]
@@ -228,9 +230,9 @@ struct RestoreServiceArgs {
     #[arg(long, env = "TEMPS_ENCRYPTION_KEY", hide_env_values = true)]
     encryption_key: String,
 
-    /// Database URL for the temps database (needed to query service config) (set via TEMPS_DATABASE_URL env var; not accepted as a flag to prevent credentials leaking into process listings)
+    /// Database URL for the temps database (needed to query service config). Prefer TEMPS_DATABASE_URL (or TEMPS_DATABASE_URL_FILE / the systemd credential temps_database_url): the flag form puts the password in the process command line
     #[arg(long, env = "TEMPS_DATABASE_URL", hide_env_values = true)]
-    database_url: String,
+    database_url: Option<String>,
 
     /// S3 region
     #[arg(long, env = "S3_REGION", default_value = "us-east-1")]
@@ -376,6 +378,13 @@ impl BackupCommand {
     }
 
     fn execute_restore(args: RestoreBackupArgs) -> anyhow::Result<()> {
+        // A restore overwrites what it targets, so the target must be this
+        // command's own configuration, never a discovered service.
+        let database_url = crate::database_url_source::resolve_database_url(
+            args.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         info!("Restoring backup from S3: {}", args.backup_id);
 
         // Create tokio runtime for async operations
@@ -513,16 +522,14 @@ impl BackupCommand {
             )?;
         }
 
-        if !args.database_url.starts_with("postgres://")
-            && !args.database_url.starts_with("postgresql://")
-        {
+        if !database_url.starts_with("postgres://") && !database_url.starts_with("postgresql://") {
             return Err(anyhow::anyhow!(
                 "Only PostgreSQL databases are supported. Database URL must start with postgres:// or postgresql://"
             ));
         }
 
         rt.block_on(Self::validate_restore_dry_run(
-            &args.database_url,
+            &database_url,
             &s3_client,
             &args.bucket_name,
             backup,
@@ -593,7 +600,7 @@ impl BackupCommand {
         println!(
             "{} {}",
             "Target Database:".bright_white(),
-            Self::redact_database_url(&args.database_url).bright_white()
+            Self::redact_database_url(&database_url).bright_white()
         );
         println!();
         println!(
@@ -711,7 +718,7 @@ impl BackupCommand {
 
         println!("{}", "Restoring PostgreSQL database...".bright_white());
         let is_plain_sql = backup_key.ends_with(".sql.gz") || backup_key.ends_with(".sql");
-        Self::restore_postgres(&args.database_url, &final_backup_path, is_plain_sql)?;
+        Self::restore_postgres(&rt, &database_url, &final_backup_path, is_plain_sql)?;
         drop(decompressed_backup);
 
         // The PostgreSQL restore is the primary mutation the operator
@@ -720,7 +727,7 @@ impl BackupCommand {
         // services or materialize secrets in the wrong storage model.
         let restored_db = rt
             .block_on(sea_orm::Database::connect(temps_database::connect_options(
-                &args.database_url,
+                &database_url,
             )))
             .map_err(|error| {
                 anyhow::anyhow!(
@@ -738,7 +745,7 @@ impl BackupCommand {
         // Restore external services only after the restored database's durable
         // installation mode has accepted this recovery configuration.
         rt.block_on(Self::restore_external_services(
-            &args.database_url,
+            &database_url,
             &s3_client,
             &s3_credentials,
             &metadata,
@@ -853,29 +860,6 @@ impl BackupCommand {
             .version()
             .await
             .map_err(|error| anyhow::anyhow!("Docker is not reachable: {}", error))?;
-
-        let restore_tool =
-            if backup.location.ends_with(".sql.gz") || backup.location.ends_with(".sql") {
-                "psql"
-            } else {
-                "pg_restore"
-            };
-        let tool_status = std::process::Command::new(restore_tool)
-            .arg("--version")
-            .status()
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "{} is required for this backup format but could not be executed: {}",
-                    restore_tool,
-                    error
-                )
-            })?;
-        if !tool_status.success() {
-            return Err(anyhow::anyhow!(
-                "{} --version exited unsuccessfully",
-                restore_tool
-            ));
-        }
 
         println!(
             "{}",
@@ -1300,71 +1284,25 @@ impl BackupCommand {
     }
 
     fn restore_postgres(
+        rt: &tokio::runtime::Runtime,
         database_url: &str,
         backup_file: &Path,
         is_plain_sql: bool,
     ) -> anyhow::Result<()> {
-        use url::Url;
+        let target = RestoreTarget::from_database_url(database_url)?;
+        let server_major = rt.block_on(Self::begin_restoring_mode(database_url))?;
 
-        let url = Url::parse(database_url)
-            .map_err(|e| anyhow::anyhow!("Failed to parse database URL: {}", e))?;
-
-        let host = url.host_str().unwrap_or("localhost");
-        let port = url.port().unwrap_or(5432);
-        let database = url.path().trim_start_matches('/');
-        let username = url.username();
-        let password = url.password();
-
-        let tool = if is_plain_sql { "psql" } else { "pg_restore" };
-        let mut cmd = std::process::Command::new(tool);
-        if is_plain_sql {
-            // Current control-plane backups are pg_dumpall globals followed
-            // by a plain pg_dump stream. `pg_restore` cannot read that format.
-            cmd.arg("--no-password")
-                .arg("--set=ON_ERROR_STOP=on")
-                .arg("--host")
-                .arg(host)
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--username")
-                .arg(username)
-                .arg("--dbname")
-                .arg(database)
-                .arg("--file")
-                .arg(backup_file);
-        } else {
-            cmd.arg("--verbose")
-                .arg("--clean")
-                .arg("--if-exists")
-                .arg("--no-owner")
-                .arg("--no-acl")
-                .arg("--dbname")
-                .arg(database)
-                .arg("--host")
-                .arg(host)
-                .arg("--port")
-                .arg(port.to_string())
-                .arg("--username")
-                .arg(username)
-                .arg(backup_file);
-        }
-
-        if let Some(pwd) = password {
-            cmd.env("PGPASSWORD", pwd);
-        }
-
-        println!("{}", format!("Running {}...", tool).bright_white());
-        let output = cmd.output().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to execute {}: {}. Make sure the PostgreSQL client tools are installed and in PATH",
-                tool,
-                e,
-            )
-        })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(anyhow::anyhow!("{} failed: {}", tool, stderr));
+        let restored = Self::replay_backup(rt, &target, backup_file, is_plain_sql, server_major);
+        // Whatever happened, the database doesn't stay in restoring mode: its
+        // background jobs are stopped there.
+        let ended = rt.block_on(Self::end_restoring_mode(database_url));
+        match (restored, ended) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(error)) => return Err(error),
+            (Err(error), Ok(())) => return Err(error),
+            (Err(error), Err(ended_error)) => {
+                return Err(anyhow::anyhow!("{}. In addition, {}", error, ended_error));
+            }
         }
 
         println!(
@@ -1372,6 +1310,159 @@ impl BackupCommand {
             "✓ PostgreSQL database restored successfully".bright_green()
         );
         Ok(())
+    }
+
+    /// Prepare the target and return its major version. The connection is closed
+    /// before returning: the setting outlives it, on the database.
+    async fn begin_restoring_mode(database_url: &str) -> anyhow::Result<u32> {
+        use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+        let db = Database::connect(temps_database::connect_options(database_url))
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to connect to the database to restore into: {}",
+                    error
+                )
+            })?;
+        let major: i32 = db
+            .query_one(Statement::from_string(
+                DatabaseBackend::Postgres,
+                "SELECT current_setting('server_version_num')::int / 10000 AS major".to_string(),
+            ))
+            .await
+            .and_then(|row| match row {
+                Some(row) => row.try_get("", "major"),
+                None => Err(sea_orm::DbErr::RecordNotFound(
+                    "server_version_num".to_string(),
+                )),
+            })
+            .map_err(|error| anyhow::anyhow!("Failed to read the target's version: {}", error))?;
+        db.execute_unprepared(backup_restore_sql::BEGIN_RESTORING_MODE_SQL)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("Failed to put the target in restoring mode: {}", error)
+            })?;
+        u32::try_from(major)
+            .map_err(|error| anyhow::anyhow!("Unexpected server version {}: {}", major, error))
+    }
+
+    async fn end_restoring_mode(database_url: &str) -> anyhow::Result<()> {
+        use sea_orm::{ConnectionTrait, Database};
+
+        let failed = |error: sea_orm::DbErr| {
+            anyhow::anyhow!(
+                "the target may still be in TimescaleDB restoring mode, with background jobs \
+                 stopped. Run `SELECT timescaledb_post_restore();` on it: {}",
+                error
+            )
+        };
+        let db = Database::connect(temps_database::connect_options(database_url))
+            .await
+            .map_err(failed)?;
+        db.execute_unprepared(backup_restore_sql::END_RESTORING_MODE_SQL)
+            .await
+            .map_err(failed)?;
+        Ok(())
+    }
+
+    /// Replay the file with the host's client tools if they can read it, and in a
+    /// container otherwise: a host that can take a backup only needs Docker.
+    fn replay_backup(
+        rt: &tokio::runtime::Runtime,
+        target: &RestoreTarget,
+        backup_file: &Path,
+        is_plain_sql: bool,
+        server_major: u32,
+    ) -> anyhow::Result<()> {
+        // Holds the filtered copy until the tool has read it.
+        let filtered = is_plain_sql
+            .then(|| Self::filter_globals(backup_file, &target.username))
+            .transpose()?;
+        let input = filtered
+            .as_ref()
+            .map_or(backup_file, |filtered| filtered.path());
+
+        let input_arg = input.to_string_lossy();
+        let (tool, args) = target.tool_command(is_plain_sql, &input_arg);
+        if !backup_restore_sql::host_tool_can_restore(tool, server_major) {
+            println!(
+                "{}",
+                format!("Running {tool} in a postgres:{server_major} container...").bright_white()
+            );
+            return rt.block_on(backup_restore_sql::run_tool_in_container(
+                target,
+                is_plain_sql,
+                input,
+                server_major,
+            ));
+        }
+
+        println!("{}", format!("Running {}...", tool).bright_white());
+        let mut cmd = tokio::process::Command::new(tool);
+        cmd.args(&args)
+            .kill_on_drop(true)
+            .envs(target.tls_env.iter().map(|(name, value)| (*name, value)));
+        if let Some(password) = &target.password {
+            cmd.env("PGPASSWORD", password);
+        }
+        let output = rt
+            .block_on(backup_restore_sql::within_restore_deadline(
+                backup_restore_sql::RESTORE_TOOL_TIMEOUT,
+                tool,
+                cmd.output(),
+            ))?
+            .map_err(|error| anyhow::anyhow!("Failed to execute {}: {}", tool, error))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("{} failed: {}", tool, stderr));
+        }
+        Ok(())
+    }
+
+    fn filter_globals(
+        backup_file: &Path,
+        connecting_role: &str,
+    ) -> anyhow::Result<tempfile::NamedTempFile> {
+        let input = std::fs::File::open(backup_file).map_err(|error| {
+            anyhow::anyhow!("Failed to open backup {}: {}", backup_file.display(), error)
+        })?;
+        let temporary = tempfile::Builder::new()
+            .prefix("temps-restore-")
+            .suffix(".sql")
+            .tempfile()
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create a temporary file for the restore: {}",
+                    error
+                )
+            })?;
+        let mut output = BufWriter::new(temporary.as_file());
+        let removed = backup_restore_sql::filter_protected_roles(
+            BufReader::new(input),
+            &mut output,
+            connecting_role,
+        )
+        .map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to prepare backup {}: {}",
+                backup_file.display(),
+                error
+            )
+        })?;
+        output.flush().map_err(|error| {
+            anyhow::anyhow!(
+                "Failed to prepare backup {}: {}",
+                backup_file.display(),
+                error
+            )
+        })?;
+        drop(output);
+        info!(
+            removed,
+            "Left the target's own roles out of the restored globals"
+        );
+        Ok(temporary)
     }
 
     fn extract_encryption_key(server_config: &str) -> anyhow::Result<String> {
@@ -1619,7 +1710,7 @@ impl BackupCommand {
         metadata: &BackupMetadata,
         encryption_key: &str,
     ) -> anyhow::Result<()> {
-        use sea_orm::{Database, EntityTrait};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, EntityTrait};
         use temps_core::EncryptionService;
         use temps_entities::{backups, external_services};
 
@@ -1736,15 +1827,54 @@ impl BackupCommand {
                         ext_backup.metadata.service_name
                     )
                 })?;
-            if backup_model.state != "completed"
-                || backup_model.s3_location != ext_backup.s3_location
-            {
-                return Err(anyhow::anyhow!(
-                    "Recovery manifest backup identity mismatch for service '{}' (backup row {})",
-                    ext_backup.metadata.service_name,
-                    ext_backup.backup_id
-                ));
-            }
+            let backup_model = match backup_restore_sql::check_backup_row(
+                &backup_model,
+                &ext_backup.s3_location,
+                &ext_backup.backup_type,
+            ) {
+                BackupRowCheck::Matches => backup_model,
+                BackupRowCheck::TakeFromManifest => {
+                    let metadata = backup_restore_sql::metadata_with_walg_selector(
+                        &backup_model.metadata,
+                        &backup_model.backup_id,
+                    )
+                    .map_err(|error| {
+                        anyhow::anyhow!(
+                            "Cannot restore service '{}' from the recovery manifest: {}",
+                            ext_backup.metadata.service_name,
+                            error
+                        )
+                    })?;
+                    let mut row: backups::ActiveModel = backup_model.into();
+                    row.metadata = Set(metadata);
+                    row.state = Set(ext_backup.state.clone());
+                    row.s3_location = Set(ext_backup.s3_location.clone());
+                    row.size_bytes = Set(ext_backup.size_bytes);
+                    row.finished_at = Set(Some(chrono::Utc::now()));
+                    row.update(db.as_ref()).await.map_err(|error| {
+                        anyhow::anyhow!(
+                            "Failed to record backup row {} for service '{}' from the recovery \
+                             manifest: {}",
+                            ext_backup.backup_id,
+                            ext_backup.metadata.service_name,
+                            error
+                        )
+                    })?
+                }
+                BackupRowCheck::Conflict => {
+                    return Err(anyhow::anyhow!(
+                        "Recovery manifest backup identity mismatch for service '{}' (backup row \
+                         {}): the restored row says state '{}' at '{}', the manifest says '{}' at \
+                         '{}'",
+                        ext_backup.metadata.service_name,
+                        ext_backup.backup_id,
+                        backup_model.state,
+                        backup_model.s3_location,
+                        ext_backup.state,
+                        ext_backup.s3_location
+                    ));
+                }
+            };
 
             // A clean disaster-recovery host has the service rows from the
             // restored control plane but no containers yet. `start_service`
@@ -1868,6 +1998,7 @@ impl BackupCommand {
             managed_by_cloud: false,
             lifecycle_reconcile_failed_at: None,
             lifecycle_reconcile_generation: 0,
+            worker_credentials: "scoped".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             backing_service_id: None,
@@ -1914,6 +2045,13 @@ impl BackupCommand {
     }
 
     fn execute_restore_service(args: RestoreServiceArgs) -> anyhow::Result<()> {
+        // A restore overwrites what it targets, so the target must be this
+        // command's own configuration, never a discovered service.
+        let database_url = crate::database_url_source::resolve_database_url(
+            args.database_url.as_deref(),
+            crate::database_url_source::UrlDiscovery::ThisProcess,
+        )?
+        .into_url();
         info!(
             "Restoring external service from backup: {}",
             args.service_name
@@ -2060,7 +2198,7 @@ impl BackupCommand {
         println!("{}", "Connecting to temps database...".bright_white());
         let db = rt
             .block_on(Database::connect(temps_database::connect_options(
-                &args.database_url,
+                &database_url,
             )))
             .map_err(|e| anyhow::anyhow!("Failed to connect to temps database: {}", e))?;
 

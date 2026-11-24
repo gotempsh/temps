@@ -45,6 +45,8 @@ const VIEWER: &[Permission] = &[
     Permission::SessionMetricsRead,
     Permission::FunnelRead,
     Permission::DeploymentTokensRead,
+    Permission::EdgeRulesRead,
+    Permission::WorkflowsRead,
 ];
 
 /// `viewer` plus the ability to ship code and manage what shipping it
@@ -59,6 +61,10 @@ const DEPLOYER_ADDITIONS: &[Permission] = &[
     Permission::PipelinesWrite,
     Permission::PipelinesExecute,
     Permission::StacksWrite,
+    // Durable workflows (ADR-106): start, operate and signal runs.
+    Permission::WorkflowRunsCreate,
+    Permission::WorkflowRunsWrite,
+    Permission::WorkflowEventsCreate,
 ];
 
 /// `deployer` plus full operational control of a project — every
@@ -104,6 +110,14 @@ const ADMIN_ADDITIONS: &[Permission] = &[
     Permission::DeploymentTokensCreate,
     Permission::DeploymentTokensDelete,
     Permission::OtelWrite,
+    // Edge rules decide who reaches the project (ADR-089), like its domains
+    // and IP rules: project configuration, not something a deploy needs.
+    Permission::EdgeRulesWrite,
+    // Workflow settings, credentials, run deletion and reading decrypted
+    // payloads (ADR-106) are project administration.
+    Permission::WorkflowsWrite,
+    Permission::WorkflowRunsDelete,
+    Permission::WorkflowPayloadsRead,
 ];
 
 /// `admin` plus the one thing only an owner can do: delete the project.
@@ -181,6 +195,25 @@ mod tests {
     }
 
     #[test]
+    fn edge_rules_are_read_by_every_role_and_written_by_admins() {
+        for role in [
+            TeamRole::Viewer,
+            TeamRole::Deployer,
+            TeamRole::Admin,
+            TeamRole::Owner,
+        ] {
+            assert!(
+                as_set(role).contains(&Permission::EdgeRulesRead),
+                "{role:?}"
+            );
+        }
+        assert!(!as_set(TeamRole::Viewer).contains(&Permission::EdgeRulesWrite));
+        assert!(!as_set(TeamRole::Deployer).contains(&Permission::EdgeRulesWrite));
+        assert!(as_set(TeamRole::Admin).contains(&Permission::EdgeRulesWrite));
+        assert!(as_set(TeamRole::Owner).contains(&Permission::EdgeRulesWrite));
+    }
+
+    #[test]
     fn owner_includes_project_delete() {
         assert!(as_set(TeamRole::Owner).contains(&Permission::ProjectsDelete));
     }
@@ -221,6 +254,30 @@ mod tests {
                     "project role {role:?} must never hold instance-admin permission {s}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn workflow_permissions_follow_the_team_tiers() {
+        let viewer = as_set(TeamRole::Viewer);
+        let deployer = as_set(TeamRole::Deployer);
+        let admin = as_set(TeamRole::Admin);
+        assert!(viewer.contains(&Permission::WorkflowsRead));
+        assert!(!viewer.contains(&Permission::WorkflowRunsCreate));
+        for permission in [
+            Permission::WorkflowRunsCreate,
+            Permission::WorkflowRunsWrite,
+            Permission::WorkflowEventsCreate,
+        ] {
+            assert!(deployer.contains(&permission), "{permission}");
+        }
+        for permission in [
+            Permission::WorkflowsWrite,
+            Permission::WorkflowRunsDelete,
+            Permission::WorkflowPayloadsRead,
+        ] {
+            assert!(!deployer.contains(&permission), "{permission}");
+            assert!(admin.contains(&permission), "{permission}");
         }
     }
 }

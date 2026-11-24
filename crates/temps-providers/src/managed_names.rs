@@ -658,10 +658,12 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ServiceNameRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerRestoreConflict { .. }
         | ExternalServiceError::ServiceContainerConflict { .. }
-        | ExternalServiceError::AmbiguousServiceName { .. } => error_builder::conflict()
+        | ExternalServiceError::AmbiguousServiceName { .. }
+        | ExternalServiceError::SandboxNamespaceConflict { .. } => error_builder::conflict()
             .title(title)
             .detail(error.to_string())
             .build(),
+        ExternalServiceError::Engine { source, .. } => Problem::from(source.as_ref()),
         // Every remaining variant is a failure to create the service that the
         // operator cannot fix through the container-name setting; they are
         // listed so a new `ExternalServiceError` has to be given a response
@@ -669,6 +671,8 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         ExternalServiceError::ServiceNotFound { .. }
         | ExternalServiceError::ServiceNotFoundByName { .. }
         | ExternalServiceError::ServiceNotFoundBySlug { .. }
+        | ExternalServiceError::ClusterMemberNotFound { .. }
+        | ExternalServiceError::NodeNotFound { .. }
         | ExternalServiceError::InitializationFailed { .. }
         | ExternalServiceError::UpgradeRejected { .. }
         | ExternalServiceError::EncryptionFailed { .. }
@@ -690,6 +694,7 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::ClusterNotSettled { .. }
         | ExternalServiceError::ClusterBusy { .. }
         | ExternalServiceError::LockTimeout { .. }
+        | ExternalServiceError::HealthcheckSettingsBusy { .. }
         | ExternalServiceError::DeletionFailed { .. }
         | ExternalServiceError::ServiceHasLinkedProjects { .. }
         | ExternalServiceError::EnvironmentVariableNotFound { .. }
@@ -699,12 +704,19 @@ pub fn enable_failure_problem(kind: ManagedServiceKind, error: &ExternalServiceE
         | ExternalServiceError::DockerError { .. }
         | ExternalServiceError::DuplicateServiceType { .. }
         | ExternalServiceError::InternalError { .. }
+        | ExternalServiceError::AgentUnanswered { .. }
+        | ExternalServiceError::NodeBusy { .. }
         | ExternalServiceError::DockerUnavailable { .. }
         | ExternalServiceError::LocalWorkloadsDisabled { .. }
         | ExternalServiceError::ControlPlaneAddressRequired { .. }
         | ExternalServiceError::ControlPlaneMemberUnreachable { .. }
         | ExternalServiceError::ClusterPortsUnavailable { .. }
-        | ExternalServiceError::ClusterMemberLimitExceeded { .. } => error_builder::internal_server_error()
+        | ExternalServiceError::ClusterMemberLimitExceeded { .. }
+        | ExternalServiceError::InvalidHealthcheck { .. }
+        | ExternalServiceError::HealthcheckUnsupported { .. }
+        | ExternalServiceError::HealthcheckDefaultConflictsWithService { .. }
+        | ExternalServiceError::NoSandboxAccessEngine { .. }
+        | ExternalServiceError::SandboxAccessUnsupported { .. } => error_builder::internal_server_error()
             .title(title)
             .detail(format!(
                 "Could not create the {} service: {error}",

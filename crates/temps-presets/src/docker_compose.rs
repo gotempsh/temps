@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::Path;
+use crate::compose_security::ComposeSecurityCheckExt;
 use temps_entities::compose_security::{ComposeSecurityCheck, ComposeSecurityPolicy};
 
 pub struct DockerComposePreset;

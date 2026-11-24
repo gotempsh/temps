@@ -5,7 +5,7 @@ use aws_sdk_s3::Client as S3Client;
 use serde::Deserialize;
 use tokio::io::AsyncReadExt;
 
-use temps_backup_core::engine_v2::BackupError;
+use crate::execution::engine_v2::BackupError;
 
 const WROTE_BACKUP_MARKER: &str = "Wrote backup with name ";
 const MAX_SENTINEL_SIZE_BYTES: usize = 1024 * 1024;
@@ -36,20 +36,125 @@ pub(crate) async fn load_backup_size_bytes(
     stderr: &str,
     backup_uuid: &str,
 ) -> Result<i64, BackupError> {
-    let backup_name =
-        backup_name_from_push_output(stdout, stderr).ok_or_else(|| BackupError::Failed {
-            reason: "wal-g backup-push succeeded but did not report the written backup name"
-                .to_string(),
-        })?;
+    let backup_name = pushed_snapshot_name(stdout, stderr)?;
     let sentinel_key = format!(
         "{}basebackups_005/{}_backup_stop_sentinel.json",
         walg_key_prefix, backup_name
     );
 
+    let body = read_sentinel(client, bucket, &sentinel_key).await?;
+    size_from_sentinel(&body, backup_uuid, &format!("s3://{bucket}/{sentinel_key}"))
+}
+
+/// Legacy or externally written WAL-G snapshots may carry arbitrary user data.
+pub(crate) fn sentinel_backup_id(bytes: &[u8]) -> Result<Option<String>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Marker {
+        #[serde(rename = "UserData")]
+        user_data: Option<serde_json::Value>,
+    }
+    let marker: Marker = serde_json::from_slice(bytes)?;
+    Ok(marker
+        .user_data
+        .and_then(|data| data.get("temps_backup_id")?.as_str().map(str::to_owned)))
+}
+
+/// Only an exact UUID in a valid stop sentinel can identify a tracked snapshot.
+pub(crate) async fn find_snapshot(
+    client: &S3Client,
+    bucket: &str,
+    repository_key: &str,
+    backup_id: &str,
+) -> Result<Option<String>, BackupError> {
+    let prefix = format!("{}/basebackups_005/", repository_key.trim_end_matches('/'));
+    let mut pages = client
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(&prefix)
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    let mut unreadable = None;
+    let mut matched = None;
+    while let Some(page) = pages.next().await {
+        let page = page.map_err(|error| BackupError::Failed {
+            reason: format!("Could not list {prefix} for backup {backup_id}: {error}"),
+        })?;
+        for key in page
+            .contents()
+            .iter()
+            .filter_map(|object| object.key())
+            .filter(|key| temps_providers::externalsvc::postgres::walg_snapshot(key).is_some())
+        {
+            let bytes = match read_sentinel(client, bucket, key).await {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    tracing::warn!(key, backup_id, %error, "Skipping unreadable WAL-G stop sentinel");
+                    unreadable.get_or_insert(error);
+                    continue;
+                }
+            };
+            match sentinel_backup_id(&bytes) {
+                Ok(Some(id)) if id == backup_id => {
+                    if matched.is_some() {
+                        return Err(BackupError::PermanentFailure { reason: format!("Multiple WAL-G snapshots identify backup {backup_id} in {prefix}. Select the individual snapshot from S3.") });
+                    }
+                    matched = Some(format!("s3://{bucket}/{key}"));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(key, backup_id, %error, "Skipping malformed WAL-G stop sentinel")
+                }
+            }
+        }
+    }
+    match unreadable {
+        Some(error) => Err(error),
+        None => Ok(matched),
+    }
+}
+
+/// When WAL-G started the base backup a stop sentinel describes. WAL-G
+/// records `StartTime` in its version-2 sentinel; older sentinels omit it, and
+/// Go's zero time means it was never set. Either is `None`: unknown, not early.
+pub(crate) fn sentinel_start_time(
+    bytes: &[u8],
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct Started {
+        #[serde(rename = "StartTime")]
+        start_time: Option<chrono::DateTime<chrono::Utc>>,
+    }
+    let started: Started = serde_json::from_slice(bytes)?;
+    Ok(started
+        .start_time
+        .filter(|time| chrono::Datelike::year(time) > 1))
+}
+
+/// Read the start time of the base backup whose stop sentinel is
+/// `sentinel_key` in `bucket`. `Ok(None)` when the sentinel does not record it.
+pub(crate) async fn load_snapshot_start_time(
+    client: &S3Client,
+    bucket: &str,
+    sentinel_key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, BackupError> {
+    let bytes = read_sentinel(client, bucket, sentinel_key).await?;
+    sentinel_start_time(&bytes).map_err(|error| BackupError::Failed {
+        reason: format!(
+            "WAL-G stop-sentinel s3://{bucket}/{sentinel_key} is not valid JSON: {error}"
+        ),
+    })
+}
+
+pub(crate) async fn read_sentinel(
+    client: &S3Client,
+    bucket: &str,
+    sentinel_key: &str,
+) -> Result<Vec<u8>, BackupError> {
     let response = client
         .get_object()
         .bucket(bucket)
-        .key(&sentinel_key)
+        .key(sentinel_key)
         .send()
         .await
         .map_err(|error| BackupError::Failed {
@@ -94,7 +199,7 @@ pub(crate) async fn load_backup_size_bytes(
             ),
         });
     }
-    size_from_sentinel(&body, backup_uuid, &format!("s3://{bucket}/{sentinel_key}"))
+    Ok(body)
 }
 
 fn size_from_sentinel(
@@ -126,6 +231,29 @@ fn size_from_sentinel(
     }
 }
 
+pub(crate) fn pushed_snapshot_name<'a>(
+    stdout: &'a str,
+    stderr: &'a str,
+) -> Result<&'a str, BackupError> {
+    backup_name_from_push_output(stdout, stderr)
+        .filter(|name| name.starts_with("base_"))
+        .ok_or_else(|| BackupError::Failed {
+            reason: "wal-g backup-push succeeded but did not report a valid base backup name"
+                .into(),
+        })
+}
+
+/// Expand the per-attempt name recorded alongside the shared repository.
+pub(crate) fn recorded_location(repository: &str, metadata: &serde_json::Value) -> Option<String> {
+    let name = metadata.get("walg_snapshot_name")?.as_str()?;
+    let location = format!(
+        "{}/basebackups_005/{name}_backup_stop_sentinel.json",
+        repository.trim_end_matches('/')
+    );
+    let (root, parsed) = temps_providers::externalsvc::postgres::walg_snapshot(&location)?;
+    (root == repository.trim_end_matches('/') && parsed == name).then_some(location)
+}
+
 fn backup_name_from_push_output<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
     stdout
         .lines()
@@ -146,6 +274,24 @@ fn backup_name_from_push_output<'a>(stdout: &'a str, stderr: &'a str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_with_one_uuid_keep_the_completed_attempt_location() -> Result<(), BackupError> {
+        let repo = "s3://backups-bucket/service-a/walg";
+        for name in ["base_001", "base_002"] {
+            let output = format!("Wrote backup with name {name} to storage default");
+            let name = pushed_snapshot_name("", &output)?;
+            let metadata =
+                serde_json::json!({"walg_snapshot_name": name, "temps_backup_id":"backup-a"});
+            assert_eq!(
+                recorded_location(repo, &metadata),
+                Some(format!(
+                    "{repo}/basebackups_005/{name}_backup_stop_sentinel.json"
+                ))
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_backup_name_from_push_output_stderr_returns_backup_name() {
@@ -318,6 +464,51 @@ mod tests {
         assert_eq!(
             path_receiver.await.expect("captured S3 request path"),
             "/backups/tenant/postgres/service/walg/basebackups_005/base_0001_backup_stop_sentinel.json"
+        );
+    }
+
+    #[test]
+    fn sentinel_start_time_is_read_and_unknown_when_absent_or_unset() {
+        let v2 = br#"{"StartTime":"2026-11-22T03:50:53.123456Z","UserData":{}}"#;
+        assert_eq!(
+            sentinel_start_time(v2).expect("valid sentinel"),
+            Some(
+                chrono::DateTime::parse_from_rfc3339("2026-11-22T03:50:53.123456Z")
+                    .expect("timestamp")
+                    .with_timezone(&chrono::Utc)
+            )
+        );
+        assert_eq!(
+            sentinel_start_time(br#"{"UserData":{}}"#).expect("valid"),
+            None
+        );
+        assert_eq!(
+            sentinel_start_time(br#"{"StartTime":"0001-01-01T00:00:00Z"}"#).expect("valid"),
+            None
+        );
+        assert!(sentinel_start_time(b"not json").is_err());
+    }
+
+    #[tokio::test]
+    async fn snapshot_start_time_reads_the_selected_sentinel() {
+        let body = br#"{"StartTime":"2026-11-22T03:50:53Z","CompressedSize":1}"#.to_vec();
+        let Some((client, path_receiver)) = spawn_s3_stub(body).await else {
+            return;
+        };
+        let started = load_snapshot_start_time(
+            &client,
+            "backups-bucket",
+            "service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json",
+        )
+        .await
+        .expect("sentinel should be read");
+        assert_eq!(
+            started.map(|time| time.to_rfc3339()),
+            Some("2026-11-22T03:50:53+00:00".to_string())
+        );
+        assert_eq!(
+            path_receiver.await.expect("captured S3 request path"),
+            "/backups-bucket/service-a/walg/basebackups_005/base_0001_backup_stop_sentinel.json"
         );
     }
 

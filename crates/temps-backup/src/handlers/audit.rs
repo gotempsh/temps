@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use anyhow::Result;
 use serde::Serialize;
 use std::collections::HashMap;
 pub use temps_core::AuditContext;
@@ -16,6 +15,8 @@ pub struct S3SourceCreatedAudit {
     pub source_id: i32,
     pub name: String,
     pub bucket_name: String,
+    /// `scoped` or `allow_full` (ADR-102).
+    pub worker_credentials: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -109,7 +110,7 @@ pub struct RestoreRunAudit {
     pub source_service_id: i32,
     pub source_service_name: String,
     pub service_type: String,
-    pub source_backup_id: i32,
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     pub target_service_name: Option<String>,
     /// Services recorded as having produced the backup (empty when unknown).
@@ -130,8 +131,8 @@ pub struct RestoreRunCancelledAudit {
     pub service_id: i32,
     pub service_name: String,
     pub service_type: String,
-    /// `0` for a restore from a raw S3 location.
-    pub source_backup_id: i32,
+    /// Local backup row, when the backup is tracked on this server.
+    pub source_backup_id: Option<i32>,
     pub mode: String,
     /// Name of the service a new-service restore would have created.
     pub target_service_name: Option<String>,
@@ -197,9 +198,8 @@ impl AuditOperation for S3SourceCreatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -220,9 +220,8 @@ impl AuditOperation for S3SourceUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -243,9 +242,8 @@ impl AuditOperation for S3SourceDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -267,9 +265,8 @@ impl AuditOperation for BackupScheduleUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -290,9 +287,8 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -313,9 +309,8 @@ impl AuditOperation for BackupRunAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -336,9 +331,8 @@ impl AuditOperation for BackupDeletedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -359,9 +353,8 @@ impl AuditOperation for BackupRetentionCleanupAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -382,9 +375,8 @@ impl AuditOperation for ExternalServiceBackupRunAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -417,9 +409,8 @@ impl AuditOperation for ScheduleServicesAttachedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -451,9 +442,8 @@ impl AuditOperation for ScheduleServiceDetachedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -489,9 +479,8 @@ impl AuditOperation for ScheduleRunNowAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -512,9 +501,8 @@ impl AuditOperation for RestoreRunAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -535,9 +523,8 @@ impl AuditOperation for RestoreRunCancelledAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
@@ -558,8 +545,53 @@ impl AuditOperation for PgUpgradeMutationAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> Result<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn orphan_restore_start_and_cancellation_audit_a_null_source() -> Result<(), serde_json::Error>
+    {
+        let context = AuditContext {
+            user_id: 1,
+            ip_address: None,
+            user_agent: "test".into(),
+        };
+        let start = RestoreRunAudit {
+            context: context.clone(),
+            restore_run_id: 3,
+            source_service_id: 4,
+            source_service_name: "service-a".into(),
+            service_type: "postgres".into(),
+            source_backup_id: None,
+            mode: "in_place".into(),
+            target_service_name: None,
+            backup_origin_service_ids: vec![],
+            cross_service: true,
+            cross_service_confirmed: true,
+        };
+        let cancel = RestoreRunCancelledAudit {
+            context,
+            restore_run_id: 3,
+            service_id: 4,
+            service_name: "service-a".into(),
+            service_type: "postgres".into(),
+            source_backup_id: None,
+            mode: "in_place".into(),
+            target_service_name: None,
+            phase: "prepare".into(),
+        };
+        for audit in [serde_json::to_value(start)?, serde_json::to_value(cancel)?] {
+            assert_eq!(
+                audit.get("source_backup_id"),
+                Some(&serde_json::Value::Null)
+            );
+        }
+        Ok(())
     }
 }

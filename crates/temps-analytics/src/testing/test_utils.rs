@@ -6,6 +6,7 @@ use sea_orm::{Database, DatabaseConnection};
 use std::sync::Arc;
 use temps_entities::upstream_config::UpstreamList;
 use temps_migrations::{Migrator, MigratorTrait};
+use temps_test_containers::TestContainerExt;
 use testcontainers::{
     core::{ContainerPort, WaitFor},
     runners::AsyncRunner,
@@ -37,7 +38,7 @@ async fn connect_with_retries(database_url: &str) -> anyhow::Result<DatabaseConn
 
 /// Test database setup with unique container per test
 pub struct TestDatabase {
-    #[allow(dead_code)]
+    #[allow(dead_code)] // held so the container is stopped on drop
     container: ContainerAsync<GenericImage>,
     pub db: Arc<DatabaseConnection>,
     pub database_url: String,
@@ -88,6 +89,7 @@ impl TestDatabase {
             // Docker-backed tests concurrently, so give real headroom under
             // contention instead of racing the default.
             .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await?;
 

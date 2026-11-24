@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useCallback, useEffect, type ReactNode } from 'react'
+import { useCallback, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { ProjectSelect } from '@/components/project/ProjectSelect'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
@@ -10,6 +10,7 @@ import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { EmptyState } from '@/components/ui/empty-state'
+import { RefreshButton } from '@/components/ui/refresh-button'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
@@ -19,14 +20,16 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { ResponsivePagination } from '@/components/ui/responsive-pagination'
-import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useServiceScope } from '@/contexts/ServiceScopeContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useScopedBreadcrumbs } from '@/hooks/useScopedBreadcrumbs'
 import {
   OBSERVABILITY_PAGE_SIZE,
   observationError,
 } from '@/lib/global-observability'
-import { Inbox, RefreshCw, Search, X } from 'lucide-react'
+import { Inbox, Search, X } from 'lucide-react'
 import type { GlobalView } from '@/hooks/useGlobalView'
+import type { QueryKey } from '@tanstack/react-query'
 import { useUrlBoundText } from '@temps-sdk/ds'
 
 export function FilterSelect({
@@ -68,6 +71,21 @@ export function ProjectScope({
   view: GlobalView
   disabled?: boolean
 }) {
+  const scope = useServiceScope()
+  if (scope) {
+    // Inside a project the picker lists only the project's services.
+    return (
+      <FilterSelect
+        label={`Service in ${scope.label}`}
+        value={view.projectId ? String(view.projectId) : ''}
+        onChange={(id) => view.patch({ project_id: id })}
+        disabled={disabled || scope.services.length === 0}
+        options={scope.services.map(
+          (service) => [String(service.id), service.name] as const
+        )}
+      />
+    )
+  }
   return (
     <ProjectSelect
       ariaLabel="Service scope"
@@ -81,12 +99,24 @@ export function ProjectScope({
   )
 }
 
+/** The one explicit way from a project's page to the server-wide one. */
+export function ServerWideLink({
+  scope,
+}: {
+  scope: { serverWide: { title: string; url: string } }
+}) {
+  return (
+    <Button asChild variant="outline" size="sm">
+      <Link to={scope.serverWide.url}>{scope.serverWide.title}</Link>
+    </Button>
+  )
+}
+
 export function GlobalPage({
   title,
   description,
   view,
-  fetching,
-  refresh,
+  refreshQueryKeys,
   searchLabel,
   filters,
   filterNotice,
@@ -96,8 +126,8 @@ export function GlobalPage({
   title: string
   description: string
   view: GlobalView
-  fetching: boolean
-  refresh: () => void
+  /** The queries this page shows, refetched by its Refresh. */
+  refreshQueryKeys: readonly QueryKey[]
   searchLabel: string
   filters?: ReactNode
   /** Explains a filter's effect (cost, completeness) under the filter row. */
@@ -112,27 +142,21 @@ export function GlobalPage({
     [patchView]
   )
   const [searchText, setSearchText] = useUrlBoundText(view.search, commitSearch)
-  const { setBreadcrumbs } = useBreadcrumbs()
-  useEffect(() => setBreadcrumbs([{ label: title }]), [title, setBreadcrumbs])
+  const scope = useServiceScope()
+  useScopedBreadcrumbs(title)
   return (
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title={title}
         description={description}
         actions={
-          <Button
-            variant="outline"
-            disabled={fetching}
-            onClick={() => {
-              if (view.range !== 'custom') view.setRange(view.range)
-              else refresh()
-            }}
-          >
-            <RefreshCw
-              className={fetching ? 'size-4 animate-spin' : 'size-4'}
+          <div className="flex items-center gap-2">
+            {scope && <ServerWideLink scope={scope} />}
+            <RefreshButton
+              queryKeys={refreshQueryKeys}
+              onRefresh={view.advance}
             />
-            Refresh
-          </Button>
+          </div>
         }
       />
       <div
@@ -189,6 +213,7 @@ export function QueryContent({
   empty,
   title,
   retry,
+  setup,
   children,
 }: {
   loading: boolean
@@ -196,6 +221,12 @@ export function QueryContent({
   empty: boolean
   title: string
   retry: () => void
+  /**
+   * How to start sending this data, shown instead of the generic empty state
+   * when the view is unfiltered. A filtered view keeps the "change the
+   * filters" message: there, data may exist outside the filter.
+   */
+  setup?: ReactNode
   children: ReactNode
 }) {
   if (loading)
@@ -222,6 +253,7 @@ export function QueryContent({
         </AlertDescription>
       </Alert>
     )
+  if (empty && setup) return <>{setup}</>
   if (empty)
     return (
       <div className="rounded-lg border bg-card text-card-foreground">
@@ -254,7 +286,7 @@ export function GlobalPagination({
       pageSize={OBSERVABILITY_PAGE_SIZE}
       total={total}
       totalPages={Math.max(1, Math.ceil(total / OBSERVABILITY_PAGE_SIZE))}
-      onPageChange={view.setPage}
+      onPageChange={(page) => view.setPage(page)}
     />
   )
 }

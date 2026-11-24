@@ -65,6 +65,7 @@ impl MigrationTrait for Migration {
 mod tests {
     use super::*;
     use sea_orm::{ConnectionTrait, Database, DatabaseConnection, DbBackend, Statement};
+    use temps_test_containers::TestContainerExt;
     use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
 
     #[test]
@@ -113,6 +114,7 @@ mod tests {
                 "timescaledb.max_background_workers=0",
             ])
             .with_startup_timeout(std::time::Duration::from_secs(120))
+            .with_test_labels()
             .start()
             .await
         {

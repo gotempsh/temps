@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { describe, expect, test } from 'bun:test'
-import { buildInstantiateRequest, parseDatabase, parseServiceNames, parseVariable, resolveTarget } from './create.js'
+import { buildInstantiateRequest, parseDatabase, parseServiceNames, parseVariable, resolveSecretFiles, resolveTarget } from './create.js'
+import { registerTemplatesCommands } from './index.js'
+import { runWithApi } from '../../lib/mock-api.js'
 
 const single = { name: 'Plausible', kind: 'app' as const, databases: ['postgres'], service_definitions: [{ name: 'plausible' }] }
 const multi = {
@@ -102,5 +104,55 @@ describe('buildInstantiateRequest', () => {
       private: true,
       automatic_deploy: true,
     })
+  })
+})
+
+describe('--secret-file', () => {
+  const SECRET = 's3cr3t-test-value'
+
+  async function secretPath(contents: string): Promise<string> {
+    const { mkdtemp, writeFile, chmod } = await import('node:fs/promises')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const path = join(await mkdtemp(join(tmpdir(), 'temps-template-secret-')), 'secret.txt')
+    await writeFile(path, contents)
+    await chmod(path, 0o600)
+    return path
+  }
+
+  test('a malformed --secret entry is rejected without echoing it', () => {
+    expect(() => parseVariable(SECRET, new Set(), true)).toThrow('A --secret entry is not [service:]KEY=VALUE')
+    try {
+      parseVariable(SECRET, new Set(), true)
+    } catch (err) {
+      expect((err as Error).message).not.toContain(SECRET)
+    }
+  })
+
+  test('reads each KEY=PATH into a KEY=VALUE entry, keeping the service prefix', async () => {
+    const path = await secretPath(`${SECRET}\n`)
+    expect(await resolveSecretFiles([`backend:API_KEY=${path}`], false)).toEqual([`backend:API_KEY=${SECRET}\n`])
+    expect(await resolveSecretFiles([`API_KEY=${path}`], true)).toEqual([`API_KEY=${SECRET}`])
+  })
+
+  test('rejects an entry without a path, and more than one stdin entry', async () => {
+    await expect(resolveSecretFiles(['API_KEY='], false)).rejects.toThrow('is not [service:]KEY=PATH')
+    await expect(resolveSecretFiles(['A=-', 'B=-'], false)).rejects.toThrow('Only one --secret-file entry can read stdin')
+  })
+
+  test('templates create sends the file content as a secret variable', async () => {
+    const path = await secretPath(SECRET)
+    const run = await runWithApi(registerTemplatesCommands,
+      ['templates', 'create', 'plausible', '--standalone', '--secret-file', `API_KEY=${path}`, '--no-wait', '--json'],
+      {
+        'GET /templates/plausible': single,
+        'POST /templates/plausible/instantiate': { id: 1, status: 'pending', template_slug: 'plausible' },
+      })
+    const sent = run.bodies.find((b) => b.request === 'POST /templates/plausible/instantiate')
+    expect(sent).toBeDefined()
+    expect((sent!.body as { environment_variables: unknown[] }).environment_variables).toEqual([
+      { name: 'API_KEY', value: SECRET, is_secret: true, service: null },
+    ])
+    expect(run.stderr).not.toContain(SECRET)
   })
 })

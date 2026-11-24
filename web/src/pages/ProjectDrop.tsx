@@ -17,6 +17,7 @@ import { DropLeftOutNotice } from '@/components/drop/DropLeftOutNotice'
 import { DetectedPresetGrid } from '@/components/drop/DetectedPresetGrid'
 import { DropNoProjectFound } from '@/components/drop/DropNoProjectFound'
 import { DropZone } from '@/components/drop/DropZone'
+import { UploadQueueNotice } from '@/components/drop/UploadQueueNotice'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Label } from '@/components/ui/label'
@@ -44,7 +45,12 @@ import {
 import { cn } from '@/lib/utils'
 import { FolderOpen, Loader2, UploadCloud, X } from 'lucide-react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
+import {
+  initialUploadEnvironment,
+  pendingUploadEnvironments,
+  projectUploadSearch,
+} from '@/lib/project-deploy-action'
 
 type Stage =
   'idle' | 'packing' | 'detecting' | 'saving' | 'uploading' | 'deploying'
@@ -114,6 +120,14 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const [candidateIndex, setCandidateIndex] = useState('0')
   const [environments, setEnvironments] = useState<EnvironmentResponse[]>([])
   const [environmentId, setEnvironmentId] = useState('')
+  const [searchParams, setSearchParams] = useSearchParams()
+  const requestedEnvironment = searchParams.get('environment')
+  const pendingIds = searchParams.getAll('pending')
+  // The deploy this page just started, while more environments are waiting.
+  const [startedDeploy, setStartedDeploy] = useState<{
+    environmentName: string
+    href: string
+  } | null>(null)
   const detectionRunRef = useRef(0)
   const detectionAbortRef = useRef<AbortController | null>(null)
 
@@ -124,6 +138,11 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
   const hasRootIndex = htmlPages.some((p) => p.toLowerCase() === 'index.html')
   const isArchive = files.length === 1 && isDropArchive(files[0].file.name)
   const candidate = inspection?.candidates[Number(candidateIndex)]
+  const stillToDeploy = pendingUploadEnvironments(
+    environments,
+    pendingIds,
+    Number(environmentId)
+  )
 
   // Environments are needed before the first deploy; production is the sane
   // default so the common case is zero clicks.
@@ -134,11 +153,8 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
         if (cancelled) return
         const list = result.data || []
         setEnvironments(list)
-        const preferred =
-          list.find((e) => e.name.toLowerCase() === 'production') ||
-          list.find((e) => !e.is_preview) ||
-          list[0]
-        if (preferred) setEnvironmentId(String(preferred.id))
+        const initial = initialUploadEnvironment(list, requestedEnvironment)
+        if (initial) setEnvironmentId(String(initial.id))
       })
       .catch((caught) => {
         if (!cancelled) setError(dropErrorMessage(caught))
@@ -146,7 +162,7 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     return () => {
       cancelled = true
     }
-  }, [project.id])
+  }, [project.id, requestedEnvironment])
 
   useEffect(
     () => () => {
@@ -231,6 +247,36 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
     }
   }
 
+  // With environments still waiting, stay here on the next one, keeping the
+  // files: the same source usually goes to all of them.
+  const afterDeployStarted = (deployedTo: number, href: string) => {
+    const remaining = pendingUploadEnvironments(
+      environments,
+      pendingIds,
+      deployedTo
+    )
+    const next = remaining[0]
+    if (!next) {
+      navigate(href)
+      return
+    }
+    setStartedDeploy({
+      environmentName:
+        environments.find(({ id }) => id === deployedTo)?.name ??
+        'the environment',
+      href,
+    })
+    setEnvironmentId(String(next.id))
+    setSearchParams(
+      projectUploadSearch(
+        next.id,
+        remaining.map(({ id }) => id)
+      ),
+      { replace: true }
+    )
+    setStage('idle')
+  }
+
   const run = async () => {
     if (!sourceUploadsSupported) return
     if (files.length === 0 || isBusy || !environmentId) return
@@ -278,7 +324,10 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
           path: { project_id: project.id, environment_id: targetEnvironment },
           body: { static_bundle_id: bundle.id },
         })
-        navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+        afterDeployStarted(
+          targetEnvironment,
+          `/projects/${project.slug}/deployments?autoRefresh=true`
+        )
         return
       }
 
@@ -290,7 +339,10 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
       })
       const deployment = response.data
       if (!deployment) throw new Error('Source deployment returned no result')
-      navigate(`/projects/${project.slug}/deployments/${deployment.id}`)
+      afterDeployStarted(
+        targetEnvironment,
+        `/projects/${project.slug}/deployments/${deployment.id}`
+      )
     } catch (caught) {
       setError(dropErrorMessage(caught))
       setStage('idle')
@@ -324,6 +376,13 @@ export function ProjectDrop({ project }: { project: ProjectResponse }) {
           and environment variables stay as configured.
         </p>
       </header>
+
+      <UploadQueueNotice
+        started={startedDeploy}
+        next={environments.find(({ id }) => String(id) === environmentId)}
+        after={stillToDeploy}
+        pending={pendingIds.length > 0}
+      />
 
       <div className="grid gap-6">
         <>

@@ -1,11 +1,12 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
 import { LogCollectionNotice } from '@/components/observability/LogCollectionNotice'
+import { LogIngestBudgetWarning } from '@/components/observability/LogIngestBudgetNotice'
 import {
   AttrPredicateChips,
   LogAttributeSidebar,
@@ -14,14 +15,19 @@ import { useGlobalView } from '@/hooks/useGlobalView'
 import { useQueries } from '@tanstack/react-query'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { LogLevel, LogSourceKind } from '@/api/client/types.gen'
-import { QueryContent } from '@/components/observability/GlobalPage'
+import {
+  QueryContent,
+  ServerWideLink,
+} from '@/components/observability/GlobalPage'
+import { useScopedBreadcrumbs } from '@/hooks/useScopedBreadcrumbs'
+import { useServiceScope } from '@/contexts/ServiceScopeContext'
+import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { DateTimeRange } from '@/components/ui/date-time-range'
 import { Button } from '@/components/ui/button'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
 import { facetProjectLabels, positiveInteger } from '@/lib/global-observability'
-import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   EXPLORER_FACET_FIELDS,
@@ -32,17 +38,57 @@ import {
   useGlobalLogSearch,
   type GlobalLogFilters,
 } from '@/hooks/useGlobalLogs'
-import { RefreshCw, Play, Pause, Loader2 } from 'lucide-react'
+import { LogIngestKeys } from '@/components/observability/LogIngestKeys'
+import {
+  SavedLogSearches,
+  SavedSearchNotShown,
+} from '@/components/observability/SavedLogSearches'
+import {
+  savedQueryFromParams,
+  savedRangeFromWindow,
+  viewFromSavedSearch,
+} from '@/lib/saved-log-search'
+import { RefreshCw, Loader2 } from 'lucide-react'
 import { Callout, HelpPopover } from '@temps-sdk/ds'
 
 const LEVELS: LogLevel[] = ['TRACE', 'DEBUG', 'INFO', 'WARN', 'ERROR']
 
+/** The filter params alone, so a moving time window does not count as a change. */
+function filterKey(params: URLSearchParams): string {
+  const kept = new URLSearchParams()
+  for (const key of [
+    'project_id',
+    'source',
+    'level',
+    'env',
+    'node_id',
+    'deploy_id',
+    'q',
+  ])
+    if (params.get(key)) kept.set(key, params.get(key) ?? '')
+  for (const predicate of params.getAll('attr')) kept.append('attr', predicate)
+  return kept.toString()
+}
+
 export default function GlobalLogs() {
   const view = useGlobalView()
   usePageTitle('Logs')
-  const { setBreadcrumbs } = useBreadcrumbs()
-  useEffect(() => setBreadcrumbs([{ label: 'Logs' }]), [setBreadcrumbs])
+  useScopedBreadcrumbs('Logs')
+  const scope = useServiceScope()
+  // Inside a project, "no service picked" means every service in it: the
+  // log search takes a list of services, so the server does the scoping.
+  const scopeProjects = useMemo(
+    () => scope?.services.map((service) => String(service.id)) ?? [],
+    [scope]
+  )
   const [follow, setFollow] = useState(false)
+  // The saved search last opened, and the filters it holds that this page
+  // has no control for. Cleared as soon as the filters change by hand.
+  const [openedSearch, setOpenedSearch] = useState<{
+    name: string
+    notShown: string[]
+    key: string
+  } | null>(null)
   const source: LogSourceKind =
     view.params.get('source') === 'application'
       ? 'application'
@@ -101,7 +147,12 @@ export default function GlobalLogs() {
       envs: env ? [env] : [],
       node_ids: node ? [node] : [],
       deploy_id: deploy,
-      projects: source !== 'service' && projectId ? [String(projectId)] : [],
+      projects:
+        source === 'service'
+          ? []
+          : projectId
+            ? [String(projectId)]
+            : scopeProjects,
       levels: level ? [level] : [],
       text: text || undefined,
       attrs: attrs.length ? attrs : undefined,
@@ -114,6 +165,7 @@ export default function GlobalLogs() {
       node,
       deploy,
       projectId,
+      scopeProjects,
       level,
       text,
       attrs,
@@ -136,6 +188,37 @@ export default function GlobalLogs() {
   const filter = (patch: Record<string, string | undefined>) => {
     setFollow(false)
     view.patch(patch)
+  }
+  const openSavedSearch = (
+    saved: Parameters<typeof viewFromSavedSearch>[0] & { name: string }
+  ) => {
+    setFollow(false)
+    const opened = viewFromSavedSearch(saved)
+    view.advance()
+    const apply = (current: URLSearchParams) => {
+      const next = new URLSearchParams(current)
+      for (const [key, value] of Object.entries({
+        ...opened.patch,
+        range: opened.window.preset,
+        from:
+          opened.window.preset === 'custom' ? opened.window.from : undefined,
+        to: opened.window.preset === 'custom' ? opened.window.to : undefined,
+      })) {
+        if (value) next.set(key, value)
+        else next.delete(key)
+      }
+      next.delete('attr')
+      for (const predicate of opened.attrs) next.append('attr', predicate)
+      return next
+    }
+    // Every filter the key reads comes from the search itself, so the key
+    // of the page it opens is known before the URL changes.
+    setOpenedSearch({
+      name: saved.name,
+      notShown: opened.notShown,
+      key: filterKey(apply(new URLSearchParams())),
+    })
+    view.update(apply)
   }
   const lines = search.error ? [] : search.lines
 
@@ -194,6 +277,17 @@ export default function GlobalLogs() {
         error={search.error}
         empty={!lines.length}
         retry={search.retry}
+        setup={
+          !text &&
+          !level &&
+          !node &&
+          !deploy &&
+          !env &&
+          attrs.length === 0 &&
+          source === 'collected' ? (
+            <ObservabilitySetupGuide kind="logs" projectId={projectId} />
+          ) : undefined
+        }
       >
         {null}
       </QueryContent>
@@ -219,7 +313,29 @@ export default function GlobalLogs() {
     <PageContainer innerClassName="space-y-6">
       <PageHeader
         title="Logs"
-        description={`${view.projectId ? 'Selected service' : 'All services'} · application and database logs`}
+        description={
+          view.projectId
+            ? 'Container logs from the selected service, newest first.'
+            : scope
+              ? `Container logs from every service in ${scope.label}, newest first.`
+              : 'Container logs from every service and database, newest first.'
+        }
+        actions={
+          <div className="flex items-center gap-2">
+            {scope && <ServerWideLink scope={scope} />}
+            <LogIngestKeys projectId={projectId} />
+            <SavedLogSearches
+              projectId={projectId}
+              currentQuery={savedQueryFromParams(view.params)}
+              currentRange={savedRangeFromWindow({
+                from: view.from,
+                to: view.to,
+                preset: view.range,
+              })}
+              onOpen={openSavedSearch}
+            />
+          </div>
+        }
       />
       <LogCollectionNotice
         collection={capabilities.data?.collection}
@@ -227,6 +343,13 @@ export default function GlobalLogs() {
         statusUpdatedAt={capabilities.dataUpdatedAt || undefined}
         onRetry={() => void capabilities.refetch()}
       />
+      {scope && source === 'service' && (
+        <Callout tone="info" title="Showing all on this server">
+          Database logs are not filtered by project yet, so this shows every
+          database on this server.
+        </Callout>
+      )}
+      <LogIngestBudgetWarning projectLabels={projectLabels} />
       <LogExplorer
         lines={lines}
         environmentLabels={environmentLabels}
@@ -264,99 +387,108 @@ export default function GlobalLogs() {
         }
         toolbar={
           <div role="region" aria-label="Logs filters" className="space-y-2">
-            <LogQueryInput
-              params={view.params}
-              text={view.search}
-              environmentLabels={environmentLabels}
-              filters={filters}
-              onChange={filter}
-            />
+            {/* One row: what to find, when, and whether to keep following.
+                The search takes the room; the rest keep their width. */}
+            <div className="flex flex-col gap-2 lg:flex-row lg:items-center">
+              <div className="min-w-0 flex-1">
+                <LogQueryInput
+                  params={view.params}
+                  text={view.search}
+                  environmentLabels={environmentLabels}
+                  filters={filters}
+                  onChange={filter}
+                />
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <DateTimeRange
+                  value={{ from: view.from, to: view.to, preset: view.range }}
+                  onChange={(range) => {
+                    setFollow(false)
+                    view.setTimeRange(range)
+                  }}
+                />
+                <Button
+                  size="sm"
+                  variant={following ? 'secondary' : 'outline'}
+                  className="h-9 gap-2"
+                  aria-pressed={following}
+                  disabled={!!search.error || !followable}
+                  title={
+                    followable
+                      ? following
+                        ? `New lines are added every ${GLOBAL_LOG_FOLLOW_INTERVAL_MS / 1000}s. Select to stop.`
+                        : 'Keep adding new lines as they arrive'
+                      : 'Following needs a live time range — pick a preset such as 1h.'
+                  }
+                  onClick={() => setFollow(!follow)}
+                >
+                  <span
+                    aria-hidden="true"
+                    className={`size-2 rounded-full ${following ? 'animate-pulse bg-green-500' : 'border border-muted-foreground'}`}
+                  />
+                  Live
+                </Button>
+                <Button
+                  size="icon"
+                  variant="outline"
+                  className="size-9"
+                  aria-label="Refresh"
+                  title="Refresh"
+                  disabled={search.isFetching}
+                  onClick={refresh}
+                >
+                  <RefreshCw
+                    className={`size-4 ${search.isFetching ? 'animate-spin' : ''}`}
+                  />
+                </Button>
+                <HelpPopover label="About log search">
+                  <p>
+                    Search messages or use project: (service), env:, source:,
+                    and level: filters.
+                  </p>
+                  <p>Times are in UTC.</p>
+                </HelpPopover>
+              </div>
+            </div>
+            {openedSearch && openedSearch.key === filterKey(view.params) && (
+              <SavedSearchNotShown
+                name={openedSearch.name}
+                notShown={openedSearch.notShown}
+              />
+            )}
             {attrs.length > 0 && (
               <AttrPredicateChips predicates={attrs} onRemove={removeAttr} />
             )}
-            <div className="flex flex-wrap items-center gap-2">
-              <DateTimeRange
-                value={{ from: view.from, to: view.to, preset: view.range }}
-                onChange={(range) => {
-                  setFollow(false)
-                  view.setTimeRange(range)
+            {([
+              'level',
+              'project_id',
+              'source',
+              'env',
+              'node_id',
+              'deploy_id',
+            ].some((key) => view.params.has(key)) ||
+              view.search ||
+              attrs.length > 0) && (
+              <Button
+                variant="ghost"
+                size="sm"
+                className="h-6 px-1 text-xs underline"
+                onClick={() => {
+                  filter({
+                    q: undefined,
+                    level: undefined,
+                    project_id: undefined,
+                    source: undefined,
+                    env: undefined,
+                    node_id: undefined,
+                    deploy_id: undefined,
+                    attr: undefined,
+                  })
                 }}
-              />
-              <span className="text-[11px] text-muted-foreground">UTC</span>
-              <HelpPopover label="About log search">
-                <p>
-                  Search messages or use project: (service), env:, source:, and
-                  level: filters.
-                </p>
-                <p>
-                  Counts and groups describe the loaded page. Times are in UTC.
-                </p>
-              </HelpPopover>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 gap-1.5 px-1 text-xs"
-                aria-pressed={following}
-                disabled={!!search.error || !followable}
-                title={
-                  followable
-                    ? undefined
-                    : 'Following needs a live time range — pick a preset such as 1h.'
-                }
-                onClick={() => setFollow(!follow)}
               >
-                {following ? (
-                  <Pause className="size-3" />
-                ) : (
-                  <Play className="size-3" />
-                )}
-                {following
-                  ? `Following · ${GLOBAL_LOG_FOLLOW_INTERVAL_MS / 1000}s`
-                  : 'Paused'}
+                Clear filters
               </Button>
-              <Button
-                size="sm"
-                variant="ghost"
-                className="h-6 gap-1.5 px-1 text-xs"
-                disabled={search.isFetching}
-                onClick={refresh}
-              >
-                <RefreshCw
-                  className={`size-3 ${search.isFetching ? 'animate-spin' : ''}`}
-                />
-                Refresh
-              </Button>
-              {([
-                'level',
-                'project_id',
-                'source',
-                'env',
-                'node_id',
-                'deploy_id',
-              ].some((key) => view.params.has(key)) ||
-                view.search ||
-                attrs.length > 0) && (
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="h-6 px-1 text-xs underline"
-                  onClick={() => {
-                    filter({
-                      q: undefined,
-                      level: undefined,
-                      project_id: undefined,
-                      source: undefined,
-                      env: undefined,
-                      node_id: undefined,
-                      deploy_id: undefined,
-                      attr: undefined,
-                    })
-                  }}
-                >
-                  Clear filters
-                </Button>
-              )}
-            </div>
+            )}
             {following && search.followError && (
               <Alert variant="warning">
                 <AlertTitle>Following stopped updating</AlertTitle>
@@ -370,37 +502,28 @@ export default function GlobalLogs() {
           </div>
         }
         footer={
-          <div className="flex flex-wrap items-center justify-between gap-2 py-3 text-xs text-muted-foreground">
-            <span>
-              {search.isPending
-                ? 'Loading logs…'
-                : search.error
-                  ? 'Logs could not be loaded'
-                  : `${lines.length} loaded ${lines.length === 1 ? 'line' : 'lines'} · newest first${
-                      following && search.followedCount
-                        ? ` · ${search.followedCount} new while following`
-                        : ''
-                    }`}
-            </span>
-            {!search.error && !search.isPending && (
-              <div className="flex items-center gap-2">
-                {search.hasMore ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
-                    className="h-7 text-xs"
-                    disabled={search.isLoadingMore}
-                    onClick={search.loadMore}
-                  >
-                    {search.isLoadingMore && (
-                      <Loader2 className="mr-1.5 size-3 animate-spin" />
-                    )}
-                    Load older lines
-                  </Button>
-                ) : (
-                  lines.length > 0 && <span>End of results for this range</span>
+          <div className="flex flex-wrap items-center justify-center gap-2 py-3 text-xs text-muted-foreground">
+            {/* The line count is above the list; down here is only the way
+                to older lines, or the sign that there are none. */}
+            {search.isPending ? (
+              <span>Loading logs…</span>
+            ) : search.error ? (
+              <span>Logs could not be loaded</span>
+            ) : search.hasMore ? (
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-7 text-xs"
+                disabled={search.isLoadingMore}
+                onClick={search.loadMore}
+              >
+                {search.isLoadingMore && (
+                  <Loader2 className="mr-1.5 size-3 animate-spin" />
                 )}
-              </div>
+                Load older lines
+              </Button>
+            ) : (
+              lines.length > 0 && <span>End of results for this range</span>
             )}
           </div>
         }

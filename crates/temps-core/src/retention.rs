@@ -25,6 +25,54 @@
 //! `deployment_gate_slot`, adapted to a lock-free `ArcSwap` since `resolve`
 //! must stay synchronous).
 
+use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
+
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+
+    /// Retain collected container logs (chunk objects on disk/S3, their
+    /// manifest rows, and the ClickHouse line index when configured) for
+    /// this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub container_logs_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+            container_logs_days: 30,
+        }
+    }
+}
+
+/// Bounds every `AnalyticsRetentionSettings` window is validated against.
+pub const MIN_ANALYTICS_RETENTION_DAYS: u32 = 1;
+pub const MAX_ANALYTICS_RETENTION_DAYS: u32 = 3650;
+
 /// Which ClickHouse table a retention-days resolution is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum RetentionTable {
@@ -155,7 +203,7 @@ impl SettingsRetentionResolver {
     }
 
     /// Start from `settings`.
-    pub fn from_settings(settings: &crate::ObservabilityRetentionSettings) -> Self {
+    pub fn from_settings(settings: &ObservabilityRetentionSettings) -> Self {
         let resolver = Self::new();
         resolver.apply(settings);
         resolver
@@ -164,7 +212,7 @@ impl SettingsRetentionResolver {
     /// Load new settings. Values are clamped to the range the settings API
     /// accepts, so a row written from a hand-edited settings row still gets a
     /// sane TTL.
-    pub fn apply(&self, settings: &crate::ObservabilityRetentionSettings) {
+    pub fn apply(&self, settings: &ObservabilityRetentionSettings) {
         use std::sync::atomic::Ordering::Relaxed;
         self.spans
             .store(clamp_retention_days(settings.otel_spans_days), Relaxed);
@@ -362,12 +410,8 @@ mod tests {
         );
     }
 
-    fn retention(
-        spans: u32,
-        metrics: u32,
-        proxy_logs: u32,
-    ) -> crate::ObservabilityRetentionSettings {
-        crate::ObservabilityRetentionSettings {
+    fn retention(spans: u32, metrics: u32, proxy_logs: u32) -> ObservabilityRetentionSettings {
+        ObservabilityRetentionSettings {
             otel_spans_days: spans,
             otel_metrics_days: metrics,
             proxy_logs_days: proxy_logs,
@@ -387,9 +431,8 @@ mod tests {
         }
         // The settings defaults and the table defaults must agree, or a fresh
         // instance would stamp rows differently from the DDL DEFAULT.
-        let from_default_settings = SettingsRetentionResolver::from_settings(
-            &crate::ObservabilityRetentionSettings::default(),
-        );
+        let from_default_settings =
+            SettingsRetentionResolver::from_settings(&ObservabilityRetentionSettings::default());
         for table in [
             RetentionTable::Spans,
             RetentionTable::Metrics,

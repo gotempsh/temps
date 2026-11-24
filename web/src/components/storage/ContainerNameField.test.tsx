@@ -21,7 +21,7 @@ function render(
 ) {
   return renderToStaticMarkup(
     <ContainerNameField
-      serviceName="KV Store"
+      serviceName="KV store"
       settings={settings}
       isLoading={false}
       canManage

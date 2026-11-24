@@ -213,6 +213,36 @@ Authenticated clients use Temps endpoints under `/api/projects/{project_id}/cron
 
 ---
 
+## Server and Worker Resource Usage
+
+The machine running the control plane and every worker node report CPU, memory and disk usage, and the console draws them the same way.
+
+- **Control plane**: **Monitoring → Server**. The node sampler also records network and block I/O and Docker disk usage.
+- **Worker**: **Settings → Nodes**, then open the worker. The **Resource usage** section shows CPU, memory and disk over 1 hour, 6 hours, 24 hours or 7 days. Samples arrive with the agent's heartbeat, about every 30 seconds, so a newly joined worker fills in within a minute. Network and block I/O are not reported by workers.
+
+Workers do not need an agent upgrade for this: the control plane stores the capacity figures that every `temps agent` heartbeat already carries. An agent that includes this release also measures CPU over the heartbeat interval rather than at a single instant, so older agents report a CPU figure that is usually close to zero.
+
+### Alerts on disk, memory and CPU
+
+Each node (the control plane or a worker) can have one alert rule per metric on `node.cpu_percent`, `node.memory_percent` and `node.disk_percent`, with a threshold between 0 and 100. Add them from the **Alert rules** card on the node, or press **Add recommended alerts** to create CPU above 90%, memory above 90% and disk above 85%, each for 5 minutes as a warning. Nothing is created until you press it. A firing rule raises an alarm like any other metric alert and notifies through your configured notification routes.
+
+```bash
+# Current values and history for a worker (node id 3)
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/latest"
+curl -H "Authorization: Bearer $TEMPS_API_TOKEN" \
+  "https://your-temps-instance.com/api/nodes/3/metrics?metric=node.disk_percent&range=24h"
+
+# Alert when the worker's disk is more than 90% full for 10 minutes
+curl -X POST -H "Authorization: Bearer $TEMPS_API_TOKEN" -H "Content-Type: application/json" \
+  "https://your-temps-instance.com/api/nodes/3/metrics/alert-rules" \
+  -d '{"name":"Disk almost full","metric_name":"node.disk_percent","comparator":">","threshold":90,"severity":"critical","for_duration_secs":600}'
+```
+
+Removing a worker also removes its alert rules. The control plane's own rules are re-seeded on every start, so deleting one is refused; disable it instead.
+
+---
+
 ## Health Checks
 
 Configure health checks to automatically monitor your application's availability:
@@ -251,6 +281,68 @@ def health():
   application state (database connectivity, critical services) but avoid
   expensive operations.
 </Note>
+
+---
+
+## Monitor URLs, ports, certificates and DNS outside Temps {{ anchor: true, id: 'target-monitors' }}
+
+An uptime monitor does not need a Temps environment. Point one at a third-party API, a site hosted elsewhere, a database port or a domain, and it records uptime, opens incidents, sends your alert notifications and can be shown on a [status page](/docs/status-pages) like any other monitor.
+
+Open your project, then **Monitoring → Uptime → Monitor outside Temps**, pick what to check and enter the target:
+
+| Check | Target | Up when | Degraded when |
+| --- | --- | --- | --- |
+| **HTTP** | a full URL | the status is one you expect (default any 2xx or 3xx) and, if set, a keyword is in, or absent from, the first 256 KiB of the body | the answer is slower than the threshold you set |
+| **TCP port** | `host:port` | a connection opens within the timeout | the connection is slower than the threshold you set |
+| **TLS certificate** | `host`, or `host:port` (default 443) | the certificate chain is publicly trusted, matches the host and is valid | it expires within the warning period (default 14 days) |
+| **DNS record** | a host name | the A, AAAA, CNAME, MX, TXT or NS record exists and, if you list values, one answer matches | — |
+
+- **HTTP requests.** Choose the method, the expected statuses (`200`, `204`, or a class such as `2xx`) and request headers and a body, for example an `Authorization` header for an API that needs one. Headers and body are **stored encrypted** and never shown again: the console and API only list the header names. Redirects are not followed, so a `301` is judged as a `301`. Response bodies are read only for the keyword and never stored.
+- **Only public targets.** A target must be a public address, or a name that resolves to one, when you save it, and it is resolved and checked again on every probe, so a monitor cannot be pointed at a private, loopback or link-local address. A DNS check never reports a private address it receives, only that the answer is non-public.
+- **Limits.** Up to 50 such monitors per project, each checked at most every 30 seconds (default 60) with a timeout of 0.5 to 30 seconds. They share the scheduler with environment monitors, so adding them does not add resident processes.
+- **Alerts.** An outage opens an incident and notifies through your project's alert channels. Deployment alarms do not apply, since no deployment is involved.
+
+ICMP ping, domain registration expiry and scripted browser checks are not available.
+
+### Check from more than one place {{ anchor: true, id: 'probe-locations' }}
+
+A check from one place cannot tell a target that is down from a network path that is. In a cluster, switch on **Check from worker nodes too** on a monitor: each check then also runs from up to four online worker nodes at the same time, one per `region` label first, each through its own network and resolver.
+
+- **Down only when most agree.** The monitor is down when more than half of the locations that answered say down, and degraded when more than half say down or degraded. A tie is not a majority: with this server and one worker, both must agree. A location that does not answer (an unreachable node, or an agent too old for the check) is listed and not counted.
+- **What each location saw** is on the monitor's page under **Locations**, and in `temps monitors show`. The check recorded in the uptime history names the failing locations when the verdict is down or degraded.
+- **The same rules everywhere.** A worker validates the check as this server does and refuses targets that are not public from where it stands. Request headers and a body travel only encrypted to that node's key; a node that cannot receive them encrypted is skipped for that monitor.
+- **Without worker nodes** the switch says so and links to **Settings → Nodes**; checks run from this server only. Monitors of Temps environments are checked from this server.
+
+A single-server install cannot learn that it is unreachable from outside. Point an external checker at one of your public URLs for that.
+
+### From the CLI
+
+```bash
+# An API that must answer 200 with "ok" in the body, degraded above 800 ms
+temps monitors add-target --project-id 4 --kind http --name "Payments API" \
+  --target https://api.example.com/health --expect-status 200 --keyword ok \
+  --degraded-after-ms 800 --header-file ./payments-headers.txt
+
+# A database port, a certificate warned 30 days ahead, and a CNAME
+temps monitors add-target --project-id 4 --kind tcp --name "Database" --target db.example.com:5432
+temps monitors add-target --project-id 4 --kind tls --name "Shop certificate" --target shop.example.com --warn-days 30
+temps monitors add-target --project-id 4 --kind dns --name "Docs CNAME" --target docs.example.com \
+  --record CNAME --expect edge.example.net
+
+# Check from the cluster's worker nodes too, and see where from
+temps monitors update-target --project-id 4 --monitor-id 31 --from-nodes
+temps monitors locations --project-id 4
+
+# Pause one; change its check (the check flags replace the whole check)
+temps monitors update-target --project-id 4 --monitor-id 31 --pause
+temps monitors update-target --project-id 4 --monitor-id 31 --kind http --expect-status 2xx
+```
+
+The header file holds one `Name: value` per line, so secrets stay out of your shell history. Update keeps the stored headers and body unless you pass `--header-file` or `--body-file`.
+
+### From the API
+
+`POST /api/projects/{project_id}/monitors/targets` creates a monitor and `PATCH /api/projects/{project_id}/monitors/{monitor_id}/target` changes one; listing, history and deletion use the existing monitor endpoints. `GET /api/projects/{project_id}/monitors/probe-locations` lists where checks would run from, with `configured: false` and the reason when no worker node is online. Creating needs `status_page:create` and changing needs `status_page:write` on the project; both are audit-logged with the target host only.
 
 ---
 
@@ -306,6 +398,10 @@ Restart and Redeploy ask for confirmation first.
 ### Firing metric alerts
 
 When a metric alert rule fires, the Metrics page lists it above the charts. Click the row to open the chart of the metric that fired, with the rule's filters applied. **View alarm** opens the alarm the rule raised, where you can acknowledge or silence it. Rules that alert per series link to the alarm of the first firing series, and other rules open the project's alarm list. **Edit rule** opens the rule.
+
+### Alerts on log lines
+
+A metric alert rule can also count the log lines a saved search matches, for example error lines that mention a failed payment, and fire when the count crosses a threshold within a window of up to one hour. It raises alarms and notifications like any other rule. See [Alerts on Logs](/docs/logs#alerts-on-logs).
 
 ---
 

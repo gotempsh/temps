@@ -276,7 +276,7 @@ function VisitorPopoverContent({
       <Button size="sm" className="w-full" asChild>
         <Link to={journeyUrl}>
           <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-          View Visitor Journey
+          View visitor journey
         </Link>
       </Button>
     </div>
@@ -450,9 +450,9 @@ function RecentVisitorItem({ visitor, projectSlug }: RecentVisitorItemProps) {
 const GLOBE_QUICK_FILTERS = [
   { label: 'Today', value: 'today' },
   { label: 'Yesterday', value: 'yesterday' },
-  { label: 'Last 7 Days', value: '7days' },
-  { label: 'Last 15 Days', value: '15days' },
-  { label: 'Last 30 Days', value: '30days' },
+  { label: 'Last 7 days', value: '7days' },
+  { label: 'Last 15 days', value: '15days' },
+  { label: 'Last 30 days', value: '30days' },
   { label: 'Custom', value: 'custom' },
 ] as const
 
@@ -634,7 +634,7 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
           <div>
             <h2 className="text-xl font-semibold flex items-center gap-2">
               <GlobeIcon className="h-5 w-5" />
-              Visitor Globe
+              Visitor globe
             </h2>
             <p className="text-sm text-muted-foreground">
               {visitorsData?.filtered_count ?? 0} visitors &middot;{' '}

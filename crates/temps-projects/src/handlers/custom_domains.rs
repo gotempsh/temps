@@ -223,16 +223,14 @@ pub async fn list_custom_domains_for_project(
 
     let total = custom_domains.len();
 
-    let mut domain_responses = Vec::new();
-    for domain in custom_domains {
-        let domain_with_info = state
-            .custom_domain_service
-            .get_domain_with_info(domain)
-            .await?;
-        domain_responses.push(CustomDomainResponse::from(CustomDomainWithInfo::from(
-            domain_with_info,
-        )));
-    }
+    let domain_responses = state
+        .custom_domain_service
+        .domains_with_info(custom_domains)
+        .await?
+        .into_iter()
+        .map(CustomDomainWithInfo::from)
+        .map(CustomDomainResponse::from)
+        .collect();
 
     Ok((
         StatusCode::OK,
@@ -744,9 +742,12 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn AuditOperation,
-        ) -> Result<(), temps_core::anyhow::Error> {
+        ) -> temps_core::AuditResult<()> {
             if self.fail_requested && operation.operation_type().ends_with("REQUESTED") {
-                return Err(temps_core::anyhow::anyhow!("audit unavailable"));
+                return Err(temps_core::AuditError::write(
+                    operation.operation_type(),
+                    "audit unavailable",
+                ));
             }
             self.operations
                 .lock()
@@ -756,13 +757,11 @@ mod tests {
         }
     }
 
-    async fn test_database() -> Option<temps_database::test_utils::TestDatabase> {
-        match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_database() -> Option<temps_test_utils::TestDatabase> {
+        match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(database) => Some(database),
             Err(error)
-                if temps_database::test_utils::is_container_runtime_unavailable(
-                    &error.to_string(),
-                ) =>
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
             {
                 println!("Docker not available, skipping");
                 None
@@ -911,10 +910,18 @@ mod tests {
             ),
         )
         .await;
-        assert!(matches!(
-            result,
-            Err(CustomDomainError::AuditIntentFailed { .. })
-        ));
+        let error = result.expect_err("a failed audit intent must stop the reassignment");
+        assert!(matches!(error, CustomDomainError::AuditIntentFailed { .. }));
+        let problem = Problem::from(error);
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.body["title"], "Domain Reassignment Audit Failed");
+        assert_eq!(
+            problem.body["detail"],
+            format!(
+                "Custom domain {} could not be reassigned from project {} to project {} because the required audit record could not be persisted; no ownership change was made",
+                domain.id, source_project.id, target_project.id
+            )
+        );
         let persisted = service
             .get_custom_domain(domain.id)
             .await

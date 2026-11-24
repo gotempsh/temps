@@ -30,6 +30,11 @@ pub struct Deployment {
     pub deployment_config: Option<DeploymentConfigSnapshot>,
     /// Deployment metadata (build info, git event, etc.)
     pub metadata: Option<DeploymentMetadata>,
+    /// Whether the deployment's image runs as root (uid 0), as the deploy
+    /// pipeline recorded it.
+    pub runs_as_root: bool,
+    /// The `USER` the deployment's image declares, as written.
+    pub image_user: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -64,7 +69,15 @@ pub struct DeploymentEnvironment {
     pub id: i32,
     pub name: String,
     pub slug: String,
+    /// Best first: the primary address (ADR 068 D4) when it is known.
     pub domains: Vec<String>,
+    /// The primary address as a URL; `None` while it is unknown or there is
+    /// none.
+    pub primary_url: Option<String>,
+    /// Why nobody can reach the environment, when reachability is sure.
+    pub no_address_reason: Option<String>,
+    /// ADR 068 D5, for the environment's current deployment.
+    pub reachability_warning: Option<temps_core::environment_address::ReachabilityWarning>,
 }
 
 #[derive(Debug, Serialize)]

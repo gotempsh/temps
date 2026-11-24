@@ -251,6 +251,94 @@ fn ms_to_dt(ms: i64) -> DateTime<Utc> {
     Utc.timestamp_millis_opt(ms).single().unwrap_or_default()
 }
 
+/// How far back from a source's newest sample the latest-value reads look.
+/// Same window as the TimescaleDB store's `LATEST_WINDOW`.
+const LATEST_WINDOW: &str = "INTERVAL 15 MINUTE";
+
+/// Lookbacks tried, narrowest first, to find a source's newest sample.
+///
+/// The sort key is `(source_kind, source_id, name, time, labels)`, so `time`
+/// is not ordered within a source and an unbounded `max(time)` reads the
+/// `time` column of every row the source has stored, up to the 90-day TTL
+/// (issue #1616: ~23M rows per node poll). A constant lower bound lets
+/// ClickHouse skip old parts by their `time` min/max and old granules by the
+/// primary key, so a live source is answered from the first tier. Only a
+/// source silent for over 7 days reaches the unbounded tier.
+const NEWEST_SAMPLE_LOOKBACKS: [Option<&str>; 4] = [
+    Some("INTERVAL 15 MINUTE"),
+    Some("INTERVAL 1 DAY"),
+    Some("INTERVAL 7 DAY"),
+    None,
+];
+
+/// `max(time)` of a source, restricted to `lookback` before now when given.
+/// Binds: `source_kind`, `source_id`.
+fn newest_sample_sql(lookback: Option<&str>) -> String {
+    let bound = lookback
+        .map(|interval| format!(" AND time > now64(3) - {interval}"))
+        .unwrap_or_default();
+    format!(
+        "SELECT toUnixTimestamp64Milli(max(time)) AS max_ms \
+         FROM service_metrics \
+         WHERE source_kind = ? AND source_id = ?{bound}"
+    )
+}
+
+/// Lower time bound for the latest-value reads: [`LATEST_WINDOW`] before the
+/// source's newest sample, passed as a literal so ClickHouse prunes on it.
+/// Binds: the newest sample's Unix-ms (from [`newest_sample_sql`]).
+fn latest_window_bound() -> String {
+    format!("time > fromUnixTimestamp64Milli(?) - {LATEST_WINDOW}")
+}
+
+/// Most-recent value per metric name. `name_filter` is empty or
+/// ` AND name IN (...)` of validated names.
+/// Binds: `source_kind`, `source_id`, newest sample ms.
+fn latest_sql(name_filter: &str) -> String {
+    format!(
+        "SELECT name, value \
+         FROM service_metrics FINAL \
+         WHERE source_kind = ? AND source_id = ?{name_filter} \
+           AND {bound} \
+         ORDER BY name, length(JSONExtractKeys(labels)) ASC, time DESC \
+         LIMIT 1 BY name",
+        bound = latest_window_bound(),
+    )
+}
+
+/// Most-recent value per `(name, label_value)`. `list` is a quoted list of
+/// validated names.
+/// Binds: label key, `source_kind`, `source_id`, newest sample ms, label key.
+fn latest_by_label_sql(list: &str) -> String {
+    format!(
+        "SELECT name, JSONExtractString(labels, ?) AS label_value, value \
+         FROM service_metrics FINAL \
+         WHERE source_kind = ? AND source_id = ? \
+           AND {bound} \
+           AND name IN ({list}) \
+           AND JSONHas(labels, ?) \
+         ORDER BY name, label_value, time DESC \
+         LIMIT 1 BY name, label_value",
+        bound = latest_window_bound(),
+    )
+}
+
+/// Fewest label keys across a metric's most-recent 64 rows. `name` must be
+/// validated.
+/// Binds: `source_kind`, `source_id`, newest sample ms.
+fn min_label_key_count_sql(name: &str) -> String {
+    format!(
+        "SELECT min(k) AS min_keys FROM ( \
+           SELECT toInt64(length(JSONExtractKeys(labels))) AS k \
+           FROM service_metrics \
+           WHERE source_kind = ? AND source_id = ? AND name = '{name}' \
+             AND {bound} \
+           ORDER BY time DESC LIMIT 64 \
+         )",
+        bound = latest_window_bound(),
+    )
+}
+
 // ── Store ───────────────────────────────────────────────────────────────────
 
 /// ClickHouse-backed [`MetricsStore`].
@@ -565,29 +653,27 @@ impl MetricsStore for ClickhouseMetricsStore {
         // PERF: time-bounded so partition pruning and primary-key range
         // pruning apply — `FINAL` over an unbounded WHERE dedup-merges up to
         // the full TTL (90 days) of rows for the source on every request.
-        // Anchoring on the source's own max(time) (cheap: single column,
-        // primary-key prefix filter) keeps values visible when the scraper is
-        // paused/stale. With no rows, max(time) is epoch and the query is
-        // empty either way.
-        let sql = format!(
-            "SELECT name, value \
-             FROM service_metrics FINAL \
-             WHERE source_kind = ? AND source_id = ?{name_filter} \
-               AND time > (SELECT max(time) FROM service_metrics \
-                            WHERE source_kind = ? AND source_id = ?) \
-                          - INTERVAL 15 MINUTE \
-             ORDER BY name, length(JSONExtractKeys(labels)) ASC, time DESC \
-             LIMIT 1 BY name",
-            name_filter = name_filter,
-        );
+        // Anchoring on the source's own newest sample keeps values visible
+        // when the scraper is paused/stale; the anchor is looked up first and
+        // bound as a literal (see `NEWEST_SAMPLE_LOOKBACKS` for why a
+        // subquery anchor scans the source's whole history).
+        let Some(newest_ms) = self
+            .newest_sample_ms(filter.source_kind.as_str(), filter.source_id)
+            .await
+            .map_err(|e| MetricsError::ClickHouse {
+                operation: "query_latest".to_string(),
+                reason: e.to_string(),
+            })?
+        else {
+            return Ok(HashMap::new());
+        };
 
         let rows = self
             .client
-            .query(&sql)
+            .query(&latest_sql(&name_filter))
             .bind(filter.source_kind.as_str())
             .bind(filter.source_id)
-            .bind(filter.source_kind.as_str())
-            .bind(filter.source_id)
+            .bind(newest_ms)
             .fetch_all::<ChLatestRow>()
             .await
             .map_err(|e| MetricsError::ClickHouse {
@@ -646,29 +732,25 @@ impl MetricsStore for ClickhouseMetricsStore {
         // label_key is bound (?) into JSONExtractString / JSONHas — never
         // interpolated.
         // PERF: time-bounded for the same reason as `query_latest` — see the
-        // comment there for the max(time) anchor rationale.
-        let sql = format!(
-            "SELECT name, JSONExtractString(labels, ?) AS label_value, value \
-             FROM service_metrics FINAL \
-             WHERE source_kind = ? AND source_id = ? \
-               AND time > (SELECT max(time) FROM service_metrics \
-                            WHERE source_kind = ? AND source_id = ?) \
-                          - INTERVAL 15 MINUTE \
-               AND name IN ({list}) \
-               AND JSONHas(labels, ?) \
-             ORDER BY name, label_value, time DESC \
-             LIMIT 1 BY name, label_value",
-            list = list,
-        );
+        // comment there for the newest-sample anchor rationale.
+        let Some(newest_ms) = self
+            .newest_sample_ms(filter.source_kind.as_str(), filter.source_id)
+            .await
+            .map_err(|e| MetricsError::ClickHouse {
+                operation: "query_latest_by_label".to_string(),
+                reason: e.to_string(),
+            })?
+        else {
+            return Ok(Vec::new());
+        };
 
         let rows = self
             .client
-            .query(&sql)
+            .query(&latest_by_label_sql(&list))
             .bind(&filter.label_key)
             .bind(filter.source_kind.as_str())
             .bind(filter.source_id)
-            .bind(filter.source_kind.as_str())
-            .bind(filter.source_id)
+            .bind(newest_ms)
             .bind(&filter.label_key)
             .fetch_all::<ChLabelledRow>()
             .await
@@ -689,36 +771,21 @@ impl MetricsStore for ClickhouseMetricsStore {
 
     /// Timestamp of the most-recent row for a source, or `None` if none exist.
     ///
-    /// No status table (unlike TimescaleDB): `max(time)` directly. An empty set
-    /// yields `max_ms = 0`, which we map to `None`.
+    /// No status table (unlike TimescaleDB): `max(time)` over widening
+    /// lookbacks (see [`NEWEST_SAMPLE_LOOKBACKS`]).
     async fn latest_timestamp(
         &self,
         source_kind: SourceKind,
         source_id: i32,
     ) -> Result<Option<DateTime<Utc>>, MetricsError> {
-        // FINAL is unnecessary for a pure max(time) and would add cost; the
-        // newest timestamp is identical pre/post merge.
-        let row = self
-            .client
-            .query(
-                "SELECT toUnixTimestamp64Milli(max(time)) AS max_ms \
-                 FROM service_metrics \
-                 WHERE source_kind = ? AND source_id = ?",
-            )
-            .bind(source_kind.as_str())
-            .bind(source_id)
-            .fetch_one::<ChMaxTimeRow>()
+        let newest_ms = self
+            .newest_sample_ms(source_kind.as_str(), source_id)
             .await
             .map_err(|e| MetricsError::ClickHouse {
                 operation: "latest_timestamp".to_string(),
                 reason: e.to_string(),
             })?;
-
-        if row.max_ms == 0 {
-            Ok(None)
-        } else {
-            Ok(Some(ms_to_dt(row.max_ms)))
-        }
+        Ok(newest_ms.map(ms_to_dt))
     }
 
     /// Prune rows older than `older_than`.
@@ -761,26 +828,28 @@ impl ClickhouseMetricsStore {
         // Time-bounded so partition/primary-key pruning applies (see
         // query_latest); without it the ORDER BY time DESC sort reads the
         // metric's full history before the LIMIT.
-        let sql = format!(
-            "SELECT min(k) AS min_keys FROM ( \
-               SELECT toInt64(length(JSONExtractKeys(labels))) AS k \
-               FROM service_metrics \
-               WHERE source_kind = ? AND source_id = ? AND name = '{nm}' \
-                 AND time > (SELECT max(time) FROM service_metrics \
-                              WHERE source_kind = ? AND source_id = ?) \
-                            - INTERVAL 15 MINUTE \
-               ORDER BY time DESC LIMIT 64 \
-             )",
-            nm = name,
-        );
+        let newest_ms = match self.newest_sample_ms(source_kind, source_id).await {
+            Ok(Some(ms)) => ms,
+            Ok(None) => return None,
+            Err(error) => {
+                warn!(
+                    operation = "min_label_key_count",
+                    source_kind,
+                    source_id,
+                    metric_name = name,
+                    reason = %error,
+                    "ClickHouse newest-sample query failed; range query will use all label series"
+                );
+                return None;
+            }
+        };
 
         match self
             .client
-            .query(&sql)
+            .query(&min_label_key_count_sql(name))
             .bind(source_kind)
             .bind(source_id)
-            .bind(source_kind)
-            .bind(source_id)
+            .bind(newest_ms)
             .fetch_one::<MinKeysRow>()
             .await
         {
@@ -799,6 +868,32 @@ impl ClickhouseMetricsStore {
                 None
             }
         }
+    }
+
+    /// Unix-ms of a source's newest sample, or `None` if it has no rows.
+    ///
+    /// Tries [`NEWEST_SAMPLE_LOOKBACKS`] narrowest first so a live source
+    /// never pays for its full history. `FINAL` is unnecessary: the newest
+    /// timestamp is identical pre/post merge. An empty set yields
+    /// `max_ms = 0`, which means "widen the lookback".
+    async fn newest_sample_ms(
+        &self,
+        source_kind: &str,
+        source_id: i32,
+    ) -> Result<Option<i64>, ::clickhouse::error::Error> {
+        for lookback in NEWEST_SAMPLE_LOOKBACKS {
+            let row = self
+                .client
+                .query(&newest_sample_sql(lookback))
+                .bind(source_kind)
+                .bind(source_id)
+                .fetch_one::<ChMaxTimeRow>()
+                .await?;
+            if row.max_ms != 0 {
+                return Ok(Some(row.max_ms));
+            }
+        }
+        Ok(None)
     }
 }
 
@@ -939,6 +1034,285 @@ mod tests {
             values[0].1, 10.0,
             "labelled rows must not blend into aggregate series"
         );
+    }
+
+    /// Seed `days` of history for one source: `names` series, one sample
+    /// every 15 s, newest at `newest_age_secs` before now. The value of every
+    /// series' newest sample is 1000.0; older samples count down from there.
+    async fn seed_history(
+        store: &ClickhouseMetricsStore,
+        source_kind: &str,
+        source_id: i32,
+        names: u64,
+        days: u64,
+        newest_age_secs: u64,
+    ) {
+        let samples = days * 86_400 / 15;
+        store
+            .client()
+            .query(&format!(
+                "INSERT INTO service_metrics (time, source_kind, source_id, name, value, kind, labels) \
+                 SELECT now64(3) - toIntervalSecond({newest_age_secs} + intDiv(number, {names}) * 15), \
+                        ?, ?, concat('node.series_', toString(number % {names})), \
+                        1000.0 - intDiv(number, {names}), 'gauge', '{{}}' \
+                 FROM numbers({total})",
+                total = samples * names,
+            ))
+            .bind(source_kind)
+            .bind(source_id)
+            .execute()
+            .await
+            .expect("seed metric history");
+    }
+
+    /// Rows ClickHouse read for every `service_metrics` query that finished
+    /// since `since_us` (server clock, microseconds).
+    async fn rows_read_since(store: &ClickhouseMetricsStore, since_us: i64) -> u64 {
+        #[derive(::clickhouse::Row, Deserialize)]
+        struct ReadRows {
+            rows: u64,
+        }
+        store
+            .client()
+            .query("SYSTEM FLUSH LOGS")
+            .execute()
+            .await
+            .expect("flush query log");
+        store
+            .client()
+            .query(
+                "SELECT toUInt64(sum(read_rows)) AS rows FROM system.query_log \
+                 WHERE type = 'QueryFinish' \
+                   AND toUnixTimestamp64Micro(event_time_microseconds) >= ? \
+                   AND query LIKE '%FROM service_metrics%' \
+                   AND query NOT LIKE '%system.query_log%'",
+            )
+            .bind(since_us)
+            .fetch_one::<ReadRows>()
+            .await
+            .expect("read query log")
+            .rows
+    }
+
+    async fn server_now_us(store: &ClickhouseMetricsStore) -> i64 {
+        #[derive(::clickhouse::Row, Deserialize)]
+        struct Now {
+            us: i64,
+        }
+        store
+            .client()
+            .query("SELECT toUnixTimestamp64Micro(now64(6)) AS us")
+            .fetch_one::<Now>()
+            .await
+            .expect("read server clock")
+            .us
+    }
+
+    /// Regression for #1616: the latest-value reads anchored their time bound
+    /// on an unbounded `max(time)` subquery, which reads the `time` column of
+    /// every row the source ever wrote (the sort key puts `name` before
+    /// `time`), so a node poll scanned the full 90-day history every time.
+    #[tokio::test]
+    async fn clickhouse_latest_reads_do_not_scan_full_source_history() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        const NAMES: u64 = 20;
+        const DAYS: u64 = 30;
+        seed_history(&store, "node", 0, NAMES, DAYS, 0).await;
+        // Merge into one part per month, as an aged production table is.
+        store
+            .client()
+            .query("OPTIMIZE TABLE service_metrics FINAL")
+            .execute()
+            .await
+            .expect("merge seeded parts");
+        let history_rows = NAMES * DAYS * 86_400 / 15;
+
+        let wanted = vec!["node.series_0".to_string(), "node.series_7".to_string()];
+        let since = server_now_us(&store).await;
+        let latest = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: 0,
+                names: wanted.clone(),
+            })
+            .await
+            .expect("query latest node metrics");
+        let read = rows_read_since(&store, since).await;
+
+        assert_eq!(latest.len(), 2, "both requested series present: {latest:?}");
+        for name in &wanted {
+            assert_eq!(latest.get(name), Some(&1000.0), "newest sample of {name}");
+        }
+        // Pruned reads touch a granule or two (8192 rows) per series; the bug
+        // read every row the source ever wrote.
+        assert!(
+            read < history_rows / 5,
+            "query_latest read {read} of {history_rows} history rows"
+        );
+
+        let since = server_now_us(&store).await;
+        let all = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: 0,
+                names: vec![],
+            })
+            .await
+            .expect("query every latest node metric");
+        let read = rows_read_since(&store, since).await;
+        assert_eq!(all.len() as u64, NAMES);
+        assert!(
+            read < history_rows / 5,
+            "query_latest (all names) read {read} of {history_rows} history rows"
+        );
+
+        let since = server_now_us(&store).await;
+        assert_eq!(
+            store.min_label_key_count("node", 0, "node.series_3").await,
+            Some(0)
+        );
+        let read = rows_read_since(&store, since).await;
+        assert!(
+            read < history_rows / 5,
+            "min_label_key_count read {read} of {history_rows} history rows"
+        );
+
+        let since = server_now_us(&store).await;
+        let newest = store
+            .latest_timestamp(SourceKind::Node, 0)
+            .await
+            .expect("latest node timestamp")
+            .expect("node has samples");
+        let read = rows_read_since(&store, since).await;
+        assert!((Utc::now() - newest).num_minutes() < 5, "newest = {newest}");
+        assert!(
+            read < history_rows / 5,
+            "latest_timestamp read {read} of {history_rows} history rows"
+        );
+    }
+
+    /// The bound is anchored on the source's own newest sample, not on now(),
+    /// so a paused scraper still shows its last values; a source with no rows
+    /// returns nothing.
+    #[tokio::test]
+    async fn clickhouse_latest_reads_still_see_a_stale_source() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        // Last sample 3 days ago: past the 15-minute and 1-day lookbacks.
+        seed_history(&store, "node", 5, 3, 2, 3 * 86_400).await;
+
+        let latest = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: 5,
+                names: vec![],
+            })
+            .await
+            .expect("query latest for a stale node");
+        assert_eq!(latest.len(), 3, "{latest:?}");
+        assert!(latest.values().all(|v| *v == 1000.0), "{latest:?}");
+
+        let newest = store
+            .latest_timestamp(SourceKind::Node, 5)
+            .await
+            .expect("latest stale node timestamp")
+            .expect("stale node has samples");
+        let age = Utc::now() - newest;
+        assert!(
+            age.num_hours() >= 71 && age.num_hours() <= 73,
+            "newest = {newest}"
+        );
+        assert_eq!(
+            store.min_label_key_count("node", 5, "node.series_1").await,
+            Some(0)
+        );
+
+        let labelled = store
+            .query_latest_by_label(LatestByLabelQuery {
+                source_kind: SourceKind::Node,
+                source_id: 5,
+                names: vec!["node.series_1".to_string()],
+                label_key: "mount".to_string(),
+            })
+            .await
+            .expect("query latest by label for a stale node");
+        assert!(labelled.is_empty(), "seeded rows carry no labels");
+
+        let empty = store
+            .query_latest(LatestQuery {
+                source_kind: SourceKind::Node,
+                source_id: 99,
+                names: vec![],
+            })
+            .await
+            .expect("query latest for a node with no rows");
+        assert!(empty.is_empty());
+        assert_eq!(
+            store
+                .latest_timestamp(SourceKind::Node, 99)
+                .await
+                .expect("latest timestamp for a node with no rows"),
+            None
+        );
+    }
+
+    /// #1616: the latest-value reads must not derive their time bound from a
+    /// subquery. `max(time)` per source reads the source's whole history, and
+    /// a bound ClickHouse cannot see as a constant prunes nothing.
+    #[test]
+    fn latest_value_sql_takes_the_time_bound_as_a_literal() {
+        let cases = [
+            (
+                "query_latest",
+                latest_sql(" AND name IN ('node.cpu_percent')"),
+            ),
+            ("query_latest (all)", latest_sql("")),
+            (
+                "query_latest_by_label",
+                latest_by_label_sql("'pg.database_size_bytes'"),
+            ),
+            (
+                "min_label_key_count",
+                min_label_key_count_sql("pg.connections_active"),
+            ),
+        ];
+        for (operation, sql) in cases {
+            assert!(
+                !sql.contains("max(time)"),
+                "{operation} must not anchor on a max(time) subquery: {sql}"
+            );
+            assert!(
+                sql.contains("time > fromUnixTimestamp64Milli(?) - INTERVAL 15 MINUTE"),
+                "{operation} must bound time from the bound newest sample: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn newest_sample_lookups_are_bounded_until_the_last_tier() {
+        let (last, bounded) = NEWEST_SAMPLE_LOOKBACKS
+            .split_last()
+            .expect("at least one lookback");
+        assert_eq!(*last, None, "the last tier keeps stale sources visible");
+        assert_eq!(
+            bounded.first().copied().flatten(),
+            Some(LATEST_WINDOW),
+            "a live source is answered from the latest window itself"
+        );
+        for lookback in bounded {
+            let sql = newest_sample_sql(*lookback);
+            let interval = lookback.expect("only the last tier is unbounded");
+            assert!(
+                sql.ends_with(&format!(" AND time > now64(3) - {interval}")),
+                "{sql}"
+            );
+        }
+        assert!(!newest_sample_sql(None).contains("time >"));
     }
 
     #[test]

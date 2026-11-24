@@ -99,8 +99,14 @@ const PSEUDO_FILE_SYSTEMS: &[&str] = &[
 ];
 
 fn collect_raw_disks() -> Vec<RawDisk> {
-    Disks::new_with_refreshed_list()
-        .list()
+    let disks = match Disks::new_with_refreshed_list() {
+        Ok(disks) => disks,
+        Err(error) => {
+            tracing::warn!(%error, "Could not list mounted disks; reporting no disk information");
+            return Vec::new();
+        }
+    };
+    disks
         .iter()
         .map(|disk| RawDisk {
             device: disk.name().to_string_lossy().to_string(),

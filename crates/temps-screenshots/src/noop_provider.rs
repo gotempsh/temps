@@ -17,7 +17,7 @@ use crate::provider::ScreenshotProvider;
 /// Use this provider when screenshot functionality is not needed or when
 /// running in environments without Chrome/browser support.
 ///
-/// Enable via environment variable: `TEMPS_SCREENSHOT_PROVIDER=noop`
+/// Selected by the `screenshots.provider = "noop"` setting.
 pub struct NoopScreenshotProvider;
 
 impl NoopScreenshotProvider {
@@ -43,7 +43,7 @@ impl ScreenshotProvider for NoopScreenshotProvider {
         // Return an error indicating screenshots are disabled
         // This is more honest than returning empty data
         Err(ScreenshotError::CaptureFailed(
-            "Screenshot provider is disabled (noop mode). Set TEMPS_SCREENSHOT_PROVIDER to 'local' or 'remote' to enable.".to_string()
+            "Screenshot provider is disabled (noop mode). Select the 'local' or 'remote' provider in Settings > Screenshots to enable it.".to_string()
         ))
     }
 

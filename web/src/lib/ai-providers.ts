@@ -5,8 +5,10 @@ export type { AiProviderId } from './ai-providers-shared'
 export type { AiProviderMeta } from './ai-providers-shared'
 export { AI_PROVIDERS } from './ai-providers-shared'
 export { getAiProvider } from './ai-providers-shared'
+export { providerFromAddParam } from './ai-providers-shared'
 export { aiProviderName } from './ai-providers-shared'
 export { aiProviderModels } from './ai-providers-shared'
+export { providerKeyEndpoint } from './ai-providers-shared'
 export {
   SELF_HOSTED_PROVIDER_ID,
   isSelfHostedProvider,

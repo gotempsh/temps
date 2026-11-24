@@ -10,18 +10,48 @@
 //! deployment provider seeds from a failure diagnosis). Built on the `temps-ai`
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
+pub mod application_link;
 pub mod applications;
+pub mod ask_user;
+pub mod attachment_upload_handlers;
+pub mod attachment_uploads;
+pub mod attachments;
 pub mod audit;
+pub mod autofix;
+pub mod autofix_handlers;
+pub mod blueprint;
+pub mod blueprint_handlers;
+pub mod chat_operations;
+pub mod chat_operations_handlers;
+pub mod chat_resources;
+pub mod chat_resources_handlers;
+pub mod compaction;
+pub mod compaction_handlers;
 pub mod git_bindings;
 pub mod git_bindings_handlers;
+pub mod goals;
+pub mod goals_handlers;
 pub mod handlers;
+pub mod harness;
 pub mod pending_actions;
 pub mod plugin;
 pub mod provider;
 pub mod providers;
+pub mod sandbox_deploy;
+pub mod sandbox_files;
+pub mod sandbox_files_handlers;
+pub mod sandbox_link;
+pub mod sandbox_link_handlers;
+pub mod secret_slot_handlers;
+pub mod secret_slots;
 mod sensitive;
 pub mod service;
+pub mod suggestion_handlers;
+pub mod suggestions;
 pub mod thread_kind;
+pub mod usage;
+pub mod watches;
+pub mod workspace_chats;
 
 pub use applications::{ApplicationError, ApplicationService, ApplicationWorkspaceService};
 pub use git_bindings::{GitBindingError, GitBindingService};
@@ -31,6 +61,7 @@ pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
 pub use providers::application::ApplicationChatProvider;
+pub use providers::assistant::{AssistantChatProvider, ASSISTANT_CONTEXT_ID_PREFIX};
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::global::GlobalChatProvider;
 pub use providers::project::ProjectChatProvider;
@@ -39,12 +70,19 @@ pub use service::{ChatStreamEvent, ConversationService, HarnessMcpError, Pending
 /// Errors from the conversation layer. All map cleanly to HTTP at the handler.
 #[derive(Debug, thiserror::Error)]
 pub enum ChatError {
-    #[error("conversation '{0}' not found")]
-    NotFound(String),
+    #[error("conversation '{conversation_id}' not found")]
+    NotFound { conversation_id: String },
     #[error("project {0} not found")]
     ProjectNotFound(i32),
-    #[error("no AI context provider registered for type '{0}'")]
-    NoProvider(String),
+    #[error("no AI context provider registered for type '{context_type}'")]
+    NoProvider { context_type: String },
+    #[error(
+        "Watch preparation timed out for turn '{turn_id}' in conversation '{conversation_id}'"
+    )]
+    WatchPreparationTimeout {
+        conversation_id: String,
+        turn_id: String,
+    },
     #[error("AI is not configured for this project")]
     AiUnavailable,
     #[error("context not found or not accessible")]
@@ -115,8 +153,8 @@ pub enum ToolAuthorizationRefreshError {
     PrincipalInactive,
     #[error("deployment credentials cannot execute conversation tools")]
     UnsupportedCredential,
-    #[error("stored API-key role '{0}' is invalid")]
-    InvalidRole(String),
+    #[error("stored API-key role '{role}' is invalid")]
+    InvalidRole { role: String },
     #[error("stored API-key permissions are invalid")]
     InvalidPermissions,
     #[error("permission to execute in the harness workspace has been revoked")]
@@ -190,6 +228,12 @@ impl ChatError {
                 code: "proposal_not_staged",
                 title: "Proposal was not staged",
                 detail: "The AI described a proposal but did not submit it to Temps, so no approval card exists and no change was made. Retry the request to create a fresh proposal.".to_string(),
+                retryable: true,
+            },
+            Self::WatchPreparationTimeout { .. } => PublicChatFailure {
+                code: "watch_preparation_timeout",
+                title: "Watch preparation timed out",
+                detail: "The watch is still pending. Temps will retry it when chat dependencies are available.".to_string(),
                 retryable: true,
             },
             Self::Db(_) | Self::ProjectLookup { .. } => PublicChatFailure {

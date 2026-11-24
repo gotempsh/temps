@@ -17,6 +17,7 @@ import {
   type OidcFieldErrors,
   problemMessage,
 } from '@/components/settings/oidc-provider-constants'
+import { PageHeader } from '@/components/layout/PageContainer'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -52,7 +53,7 @@ function createFormToRequest(form: OidcProviderFormValues) {
 }
 
 export function CreateOidcProviderPage() {
-  usePageTitle('Add SSO Provider')
+  usePageTitle('Add SSO provider')
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -144,15 +145,11 @@ export function CreateOidcProviderPage() {
         >
           <ArrowLeft className="h-4 w-4" />
         </Button>
-        <div className="space-y-1">
-          <h1 className="text-2xl font-semibold tracking-tight">
-            Add SSO Provider
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Connect an OpenID Connect provider, then choose how new users gain
-            access. Client secrets are encrypted at rest.
-          </p>
-        </div>
+        <PageHeader
+          className="min-w-0 flex-1"
+          title="Add SSO provider"
+          description="Connect an OpenID Connect provider, then choose how new users gain access. Client secrets are encrypted at rest."
+        />
       </div>
 
       <Card>

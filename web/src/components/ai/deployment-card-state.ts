@@ -3,7 +3,18 @@
 
 import type { DeploymentResponse } from '@/api/client'
 
-const ACTIVE_DEPLOYMENT_STATUSES = new Set(['pending', 'running'])
+// The deployment states the server writes, grouped the way it groups them for
+// operations (`DEPLOYMENT_STATES` in crates/temps-projects/src/services/operations.rs).
+const ACTIVE_DEPLOYMENT_STATUSES = new Set([
+  'pending',
+  'creating',
+  'running',
+  'in_progress',
+  'built',
+  'ready',
+  'deploying',
+])
+const READY_DEPLOYMENT_STATUSES = new Set(['completed', 'deployed', 'success'])
 const FAILED_DEPLOYMENT_STATUSES = new Set(['failed', 'cancelled'])
 
 export interface DeploymentReference {
@@ -139,6 +150,71 @@ export function isActiveDeploymentStatus(status: string): boolean {
 
 export function isFailedDeploymentStatus(status: string): boolean {
   return FAILED_DEPLOYMENT_STATUSES.has(status)
+}
+
+/** A deployment that finished and can serve its URL. */
+export function isReadyDeploymentStatus(status: string): boolean {
+  return READY_DEPLOYMENT_STATUSES.has(status)
+}
+
+export interface DeploymentStatusPresentation {
+  label: string
+  className: string
+}
+
+const MUTED = 'text-muted-foreground'
+
+/**
+ * The label and colour for a deployment state. Only states that have not
+ * started yet read "Queued": a finished deployment that a newer one replaced
+ * or stopped must never look like it is still waiting, and a state this
+ * console does not know is shown as the server named it.
+ */
+export function deploymentStatusPresentation(
+  status: string
+): DeploymentStatusPresentation {
+  if (isReadyDeploymentStatus(status)) {
+    return { label: 'Ready', className: 'text-green-700 dark:text-green-400' }
+  }
+  if (isFailedDeploymentStatus(status)) {
+    return {
+      label: status === 'failed' ? 'Failed' : 'Cancelled',
+      className: 'text-destructive',
+    }
+  }
+  if (isActiveDeploymentStatus(status)) {
+    return {
+      label: status === 'pending' ? 'Queued' : 'Deploying',
+      className: 'text-blue-600 dark:text-blue-400',
+    }
+  }
+  switch (status) {
+    case 'paused':
+      return {
+        label: 'Paused',
+        className: 'text-amber-700 dark:text-amber-400',
+      }
+    case 'superseded':
+      return { label: 'Replaced', className: MUTED }
+    case 'stopped':
+      return { label: 'Stopped', className: MUTED }
+    default:
+      return {
+        label: status
+          ? status.charAt(0).toUpperCase() + status.slice(1).replace(/_/g, ' ')
+          : 'Unknown',
+        className: MUTED,
+      }
+  }
+}
+
+/**
+ * Why a deployment URL is not a link: it will be once the deployment is
+ * live, or it is not being served at all.
+ */
+export function deploymentUrlNote(status: string): string | null {
+  if (isReadyDeploymentStatus(status)) return null
+  return isActiveDeploymentStatus(status) ? 'once live' : 'not serving'
 }
 
 export function deploymentPollingInterval(

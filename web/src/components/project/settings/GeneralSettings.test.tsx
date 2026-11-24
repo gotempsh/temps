@@ -5,7 +5,8 @@ import { expect, test } from 'bun:test'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { renderToStaticMarkup } from 'react-dom/server'
 import { MemoryRouter } from 'react-router'
-import type { ProjectResponse } from '@/api/client'
+import type { ProjectResponse, UserResponse } from '@/api/client'
+import { AuthContext } from '@/contexts/AuthContext-shared'
 import { GeneralSettings } from './GeneralSettings'
 
 const project = {
@@ -16,17 +17,32 @@ const project = {
   source_type: 'git',
   cross_project_trace_sharing: true,
   error_source_context_enabled: false,
+  serves_own_temps_api: false,
 } as unknown as ProjectResponse
 
-function render(): string {
+function render(role?: string): string {
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false, staleTime: Infinity } },
   })
   return renderToStaticMarkup(
     <QueryClientProvider client={client}>
-      <MemoryRouter>
-        <GeneralSettings project={project} refetch={() => undefined} />
-      </MemoryRouter>
+      <AuthContext.Provider
+        value={
+          role === undefined
+            ? undefined
+            : {
+                user: { id: 1, role } as unknown as UserResponse,
+                isLoading: false,
+                error: null,
+                logout: async () => {},
+                refetch: () => {},
+              }
+        }
+      >
+        <MemoryRouter>
+          <GeneralSettings project={project} refetch={() => undefined} />
+        </MemoryRouter>
+      </AuthContext.Provider>
     </QueryClientProvider>
   )
 }
@@ -73,7 +89,7 @@ test('service name and slug inputs are named by their visible labels', () => {
   expect(labelFor(markup, slugInput?.id ?? '')).toBe('Service slug')
 })
 
-test('both settings switches are named by their labels', () => {
+test('the settings switches are named by their labels', () => {
   const markup = render()
 
   expect(markup).toContain('id="cross-project-trace-sharing"')
@@ -85,6 +101,18 @@ test('both settings switches are named by their labels', () => {
   expect(labelFor(markup, 'error-source-context')).toBe(
     'Source code in stack traces'
   )
+  expect(markup).toContain('id="serves-own-temps-api"')
+  expect(labelFor(markup, 'serves-own-temps-api')).toBe(
+    'App serves its own Temps API'
+  )
+})
+
+test('the Temps API routing switch is off by default and says what it moves', () => {
+  const markup = render()
+  const tag = /<button\b[^>]*id="serves-own-temps-api"[^>]*>/.exec(markup)?.[0]
+  expect(tag).toContain('aria-checked="false"')
+  expect(markup).toContain('<code>/api/_temps</code>')
+  expect(markup).toContain('<code>/api/otel</code>')
 })
 
 test('every switch on the page is reachable through a label or a name', () => {
@@ -99,4 +127,33 @@ test('every switch on the page is reachable through a label or a name', () => {
       (id !== undefined && labelFor(markup, id) !== undefined)
     expect(named).toBe(true)
   }
+})
+
+/** The tag of the "Delete service" button. */
+function deleteButton(markup: string): string | undefined {
+  return /<button\b[^>]*>(?:(?!<\/button>)[\s\S])*Delete service<\/button>/.exec(
+    markup
+  )?.[0]
+}
+
+test('an admin can delete the service and sees no restriction note', () => {
+  const markup = render('admin')
+  expect(deleteButton(markup)).toBeTruthy()
+  expect(deleteButton(markup)).not.toContain('disabled=""')
+  expect(markup).not.toContain('data-admin-only-note')
+})
+
+test.each(['user', 'reader', 'platform_admin'])(
+  'a %s cannot delete the service and is told why before typing anything',
+  (role) => {
+    const markup = render(role)
+    expect(deleteButton(markup)).toContain('disabled=""')
+    expect(markup).toContain('data-admin-only-note')
+    expect(markup).toContain('Only administrators can delete a service.')
+    expect(markup).toContain(`Your role is &quot;${role}&quot;.`)
+  }
+)
+
+test('the delete button stays disabled while the session is unknown', () => {
+  expect(deleteButton(render())).toContain('disabled=""')
 })

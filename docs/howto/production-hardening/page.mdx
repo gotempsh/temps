@@ -89,7 +89,7 @@ At the firewall, allow inbound TCP 80 and 443 and SSH from your own addresses. W
 
 Without further configuration, anyone who can reach the server can load the login page. Two controls narrow that down, and they can be combined:
 
-- **Admin access gate.** An allowlist of client IPs or CIDR ranges and of `Host` header values for the admin surface. Configure it under **Settings → Security → Admin access gate**, or with `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_ALLOWED_HOSTS` and `TEMPS_ADMIN_TRUST_FORWARDED_FOR` (when any of these is set, the console setting is read-only). Requests that fail the gate get a `404`, so the console cannot be fingerprinted. The console refuses to save rules that would lock out the admin saving them.
+- **Admin access gate.** By default the console answers on any address and any `Host` header, including the server's bare IP. The gate is an allowlist of client IPs or CIDR ranges and of `Host` header values for the admin surface ([how to set it](/docs/admin-listener#admin-gate)). Configure it under **Settings → Security → Admin access gate**, or with `TEMPS_ADMIN_ALLOWED_IPS`, `TEMPS_ADMIN_ALLOWED_HOSTS` and `TEMPS_ADMIN_TRUST_FORWARDED_FOR` (when any of these is set, the console setting is read-only). Requests that fail the gate get a `404`, so the console cannot be fingerprinted. The console refuses to save rules that would lock out the admin saving them.
 - **Admin listener.** `TEMPS_CONSOLE_ADMIN_ADDRESS` moves login, the dashboard and the management API to a separate bind address, such as loopback behind an SSH tunnel or a VPN interface, while SDK ingest endpoints stay public.
 
 See [Admin Listener](/docs/admin-listener) for the routes on each side and tested recipes. Authentication endpoints (login, MFA verification, password reset, SSO callbacks) are also rate-limited to 10 requests per minute per IP.
@@ -151,7 +151,8 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
 
 ## Secure accounts {{ anchor: true, id: 'accounts' }}
 
-- **MFA.** Any account, `admin` or `user`, can enroll a TOTP authenticator from its **Account** page and receives eight single-use recovery codes. A recovery code works in place of an authenticator code, including at sign-in, so keep them somewhere other than the phone: an admin cannot remove another account's MFA. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **MFA.** Any account, `admin` or `user`, can enroll a TOTP authenticator from its **Account** page and receives eight single-use recovery codes. A recovery code works in place of an authenticator code, including at sign-in, so keep them somewhere other than the phone. Users with MFA must verify again for sensitive actions such as creating API keys, assigning roles, resetting passwords, deleting backups or restoring services. The API answers `428` with `STEP_UP_REQUIRED` until they do. A verification lasts five minutes.
+- **Lost authenticator and recovery codes.** An admin can remove another account's MFA from **Settings → Users**: open the user's menu and choose **Reset MFA** (`DELETE /api/users/{user_id}/mfa`). The user's authenticator and recovery codes stop working, every session they have is signed out, and they sign in with their password and enroll again. Their password, roles and API keys are unchanged, and the reset is recorded in the audit log as `ADMIN_MFA_RESET`. An admin cannot reset their own MFA this way. If you are the only admin, run `temps reset-admin-password --clear-mfa` on the server instead (see [Troubleshooting](/docs/troubleshooting)).
 - **Require MFA for admins.** Once every admin has enrolled, turn on `require_mfa_for_admins`. Password logins by Admin users without MFA are then rejected. The setting is not in the console yet. Set it through the settings API with an admin API key:
 
   ```bash
@@ -161,7 +162,7 @@ A backup you have never restored is a hope, not a backup. Before you rely on it:
     -d '{"require_mfa_for_admins": true}'
   ```
 
-  It applies to password logins only. SSO logins rely on your identity provider's MFA.
+  It applies to password logins only. SSO logins rely on your identity provider's MFA. While it is on, an admin whose MFA was reset cannot sign in with a password until they enroll again: they have to sign in through SSO, or you turn the setting off until they have enrolled. `temps reset-admin-password --clear-mfa` turns it off for you.
 - **Single sign-on.** To manage access from an identity provider, add an OIDC provider under **Settings → Authentication**.
 - **Least privilege.** Accounts are either `admin` or `user`. Give admin only to the people who run the instance, use [Teams](/docs/teams) to limit which projects `user` accounts can change, and remove accounts when people leave. See [Manage team access](/docs/manage-team-access).
 - **Initial admin.** For unattended installs, supply the first admin password through `TEMPS_ADMIN_PASSWORD_FILE` rather than a command-line flag. It must be 8 to 128 characters and contain an uppercase letter, a lowercase letter, a digit and a special character.
@@ -232,10 +233,14 @@ Temps does not expose a Prometheus `/metrics` endpoint for the control plane its
 
 ## Verify release artifacts {{ anchor: true, id: 'release-verification' }}
 
-Releases produced by the current publishing workflow attach GitHub build-provenance and SPDX SBOM attestations to binary tarballs. Verify a downloaded tarball before installing it:
+`temps upgrade`, the console's **Update now** and the install script verify each release tarball's Sigstore signature before installing it. The signature is pinned to the release workflow of `gotempsh/temps` at the exact tag. A release without a signature is refused unless you pass `--allow-unsigned`. Only releases from before signing was introduced lack one. The install script can only check the signature when `cosign` or an authenticated `gh` is installed; on a bare server it warns that the origin was not verified. Install `cosign` on hosts where you run the installer, and never pass `--allow-unsigned` to install a current release. See [Verify release downloads](/docs/installation#release-signature-verification) for exactly what is checked.
+
+Releases produced by the current publishing workflow also attach GitHub build-provenance and SPDX SBOM attestations to binary tarballs. Verify a tarball you downloaded by hand before installing it:
 
 ```bash
-gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps
+tag=v0.1.0   # the release you downloaded
+gh attestation verify temps-linux-amd64.tar.gz --repo gotempsh/temps \
+  --cert-identity "https://github.com/gotempsh/temps/.github/workflows/release.yml@refs/tags/$tag"
 ```
 
 The main `ghcr.io/gotempsh/temps` image includes BuildKit SBOM and provenance attestations for each platform. Its published multi-platform manifest is signed using GitHub Actions' OIDC identity. Resolve the digest and verify that the signing identity belongs to the release workflow:
@@ -249,3 +254,25 @@ cosign verify "ghcr.io/gotempsh/temps@$digest" \
 ```
 
 Pin deployments to the verified digest to avoid a floating tag changing between verification and use. This does not retrofit signatures onto older releases, or cover the separately published sandbox, daemon and preview-gateway images.
+
+## Resolve client IPs behind a reverse proxy
+
+Open **Settings → Security → Trusted proxy addresses and CIDRs** when a load
+balancer or reverse proxy sits in front of Temps. Add only addresses or ranges
+belonging to proxies you control, one per line (maximum 64). For example, use
+`10.20.0.0/16` for a private load-balancer network. Do not trust all Internet
+addresses; `/0` ranges are rejected. Leave the list empty for direct connections.
+
+Configure every trusted proxy to append the connection's source address to
+`X-Forwarded-For`, or to overwrite it with that address. Temps walks the chain
+right to left and stops at the first address outside the trusted ranges. A
+client-supplied prefix cannot override that address. A malformed traversed hop
+falls back to the socket peer; `X-Real-IP` is considered only if XFF is absent.
+Trusted proxies must overwrite `X-Real-IP` if they use that fallback.
+
+The resolved address feeds application forwarding headers, analytics, proxy
+logs and IP access rules. The CIDRs live in database settings, changes are
+audited, and processes refresh them within a few seconds without a restart.
+The separate **Trust forwarded client IP from loopback** switch supports a
+same-host reverse proxy. Existing Cloudflare and Bunny peer-range checks also
+continue to apply. No environment variable configures this trust list.

@@ -160,7 +160,7 @@ export function UpgradeServiceDialog({
               name="docker_image"
               render={() => (
                 <FormItem>
-                  <FormLabel>New Docker Image</FormLabel>
+                  <FormLabel>New Docker image</FormLabel>
                   <Select
                     value={selectValue}
                     onValueChange={handleSelectChange}
@@ -259,7 +259,7 @@ export function UpgradeServiceDialog({
                 {upgradeService.isPending && (
                   <Loader2 className="h-4 w-4 mr-2 animate-spin" />
                 )}
-                Upgrade Service
+                Upgrade service
               </Button>
             </DialogFooter>
           </form>

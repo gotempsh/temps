@@ -30,6 +30,8 @@ import {
 import type { ProjectGroupResponse } from '@/api/client'
 import { ConfirmDeleteDialog } from '@/components/ui/confirm-delete-dialog'
 import { Button } from '@/components/ui/button'
+import { PageHeader } from '@/components/layout/PageContainer'
+import { SaveRow } from '@temps-sdk/ds'
 import {
   Form,
   FormControl,
@@ -44,7 +46,7 @@ import { Textarea } from '@/components/ui/textarea'
 import { SettingsSection } from '@/components/ui/settings-section'
 import { SectionNavLayout } from '@/components/layout/SectionNavLayout'
 import { getErrorMessage } from '@/utils/errorHandling'
-import { groupHref, serviceCount } from '@/lib/terminology'
+import { groupHref, groupSettingsHref, serviceCount } from '@/lib/terminology'
 import { useInvalidateGroups } from './useProjectGroups'
 import { DisconnectRepositoryDialog } from './DisconnectRepositoryDialog'
 import { GroupRoutesSettings } from './GroupRoutesSettings'
@@ -245,14 +247,12 @@ export function GroupSettingsPanel({
         key: p.key,
         title: p.title,
         icon: p.icon,
-        to: { search: `?tab=settings&section=${p.key}` },
+        to: { search: `?section=${p.key}` },
         active: p.key === page,
       }))}
     >
       <div className="min-w-0 space-y-4">
-        <h1 className="text-xl font-semibold tracking-tight">
-          {SETTINGS_PAGES.find((p) => p.key === page)?.title}
-        </h1>
+        <PageHeader title={SETTINGS_PAGES.find((p) => p.key === page)?.title} />
         {/* Keyed so each page opens with its own sections' default state. */}
         <div key={page} className="space-y-4">
           {content[page]}
@@ -331,7 +331,7 @@ function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
       await invalidate()
       toast.success('Project updated')
       if (updated.slug !== group.slug) {
-        navigate(`${groupHref(updated.slug)}?tab=settings&section=general`, {
+        navigate(groupSettingsHref(updated.slug, 'general'), {
           replace: true,
         })
       }
@@ -408,9 +408,7 @@ function GroupIdentityForm({ group }: { group: ProjectGroupResponse }) {
             {form.formState.errors.root.message}
           </p>
         )}
-        <Button type="submit" disabled={!dirty || update.isPending}>
-          {update.isPending ? 'Saving…' : 'Save changes'}
-        </Button>
+        <SaveRow dirty={dirty} saving={update.isPending} />
       </form>
     </Form>
   )

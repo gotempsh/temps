@@ -1997,7 +1997,7 @@ async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): P
   newline()
   header(`${icons.info} ${options.metric} — Service ${id} (${options.range ?? '24h'})`)
 
-  if (points.length === 0) {
+  if (!points.some((p) => p.value != null)) {
     info('No data points in this time range')
     newline()
     return
@@ -2005,7 +2005,8 @@ async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): P
 
   const columns: TableColumn<MetricDataPoint>[] = [
     { header: 'Time', accessor: (p) => formatLogTs(p.time) },
-    { header: 'Value', accessor: (p) => p.value.toString(), align: 'right' },
+    // `null`: no sample in this bucket (collection or the server was down).
+    { header: 'Value', accessor: (p) => (p.value == null ? '—' : p.value.toString()), align: 'right' },
   ]
 
   printTable(points, columns)

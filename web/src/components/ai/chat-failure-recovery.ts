@@ -20,3 +20,24 @@ export function isHarnessFailure(code: string) {
     code === 'invalid_workspace_credential'
   )
 }
+
+/**
+ * Where a failed chat's provider is configured. A chat on the AI gateway
+ * (`gateway`, or one gateway key as `gateway_key:<id>`) is set up under AI
+ * Gateway; only a host harness has a page of its own under Harnesses.
+ */
+export function chatProviderSettingsHref(provider: string) {
+  if (isGatewayChatProvider(provider)) return '/ai-gateway'
+  return `/agent-sandbox/providers/${encodeURIComponent(provider)}`
+}
+
+/** Where to pick a different provider after this one ran out of quota. */
+export function chatProvidersHref(provider: string) {
+  return isGatewayChatProvider(provider)
+    ? '/ai-gateway'
+    : '/agent-sandbox/providers'
+}
+
+function isGatewayChatProvider(provider: string) {
+  return provider === 'gateway' || provider.startsWith('gateway_key:')
+}

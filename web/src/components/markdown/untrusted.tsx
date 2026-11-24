@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ExternalLink, ImageOff } from 'lucide-react'
+import type { ComponentPropsWithoutRef, ReactNode } from 'react'
 import type { Components } from 'react-markdown'
 import { cn } from '@/lib/utils'
 
@@ -77,41 +78,97 @@ export const untrustedMarkdownImage: Pick<Components, 'img'> = {
  * external link keeps the opened page away from `window.opener` and off the
  * referrer.
  */
-export const untrustedMarkdownLink: Pick<Components, 'a'> = {
-  a({ node: _node, className, href, children, ...props }) {
-    const raw = typeof href === 'string' ? href : ''
-    const { external, host } = (() => {
-      try {
-        const url = new URL(raw, window.location.href)
-        return {
-          external: url.origin !== window.location.origin,
-          host: url.host,
-        }
-      } catch {
-        // Unparsable: treat as external and show nothing extra.
-        return { external: true, host: '' }
+function UntrustedAnchor({
+  href,
+  className,
+  children,
+  ...props
+}: ComponentPropsWithoutRef<'a'>) {
+  const raw = typeof href === 'string' ? href : ''
+  const { external, host } = (() => {
+    try {
+      const url = new URL(raw, window.location.href)
+      return {
+        external: url.origin !== window.location.origin,
+        host: url.host,
       }
-    })()
+    } catch {
+      // Unparsable: treat as external and show nothing extra.
+      return { external: true, host: '' }
+    }
+  })()
 
-    return (
-      <a
-        {...props}
-        href={raw}
-        target="_blank"
-        rel="noopener noreferrer nofollow"
-        className={cn(
-          'font-medium text-primary underline underline-offset-2 hover:text-primary/80 break-all',
-          className
-        )}
-      >
-        {children}
-        {external && host && (
-          <span className="ml-1 inline-flex items-center gap-0.5 text-[10px] font-normal text-muted-foreground">
-            <ExternalLink className="size-2.5 shrink-0" />
-            {host}
-          </span>
-        )}
-      </a>
-    )
+  return (
+    <a
+      {...props}
+      href={raw}
+      target="_blank"
+      rel="noopener noreferrer nofollow"
+      className={cn(
+        'font-medium text-primary underline underline-offset-2 hover:text-primary/80 break-all',
+        className
+      )}
+    >
+      {children}
+      {external && host && (
+        <span className="ml-1 inline-flex items-center gap-0.5 text-[10px] font-normal text-muted-foreground">
+          <ExternalLink className="size-2.5 shrink-0" />
+          {host}
+        </span>
+      )}
+    </a>
+  )
+}
+
+export const untrustedMarkdownLink: Pick<Components, 'a'> = {
+  a({ node: _node, ...props }) {
+    return <UntrustedAnchor {...props} />
   },
+}
+
+/** A whole inline code span that is nothing but one web address. */
+const BARE_URL = /^https?:\/\/[^\s<>"'`]+$/i
+
+/** The address a code span consists of, if it is exactly one `http(s)` URL. */
+export function inlineCodeUrl(
+  className: string | undefined,
+  children: ReactNode
+): string | null {
+  if (className) return null
+  const text = Array.isArray(children) ? children.join('') : children
+  if (typeof text !== 'string') return null
+  return BARE_URL.test(text) ? text : null
+}
+
+/**
+ * `code` override: models often wrap an address in backticks (`` `http://…` ``),
+ * which Markdown renders as inert code. A span that is exactly one URL becomes
+ * the same labelled, `noopener` link as any other model-written link, so the
+ * host is visible before the click. Fenced blocks have a language class or
+ * span lines and are left to the code-block renderer.
+ */
+export const untrustedMarkdownInlineUrl: Pick<Components, 'code'> = {
+  code: UntrustedInlineCode,
+}
+
+/** The `code` renderer behind {@link untrustedMarkdownInlineUrl}, reusable by one that adds its own cases. */
+export function UntrustedInlineCode({
+  node: _node,
+  className,
+  children,
+  ...props
+}: ComponentPropsWithoutRef<'code'> & { node?: unknown }) {
+  const url = inlineCodeUrl(className, children)
+  if (!url) {
+    return (
+      <code className={className} {...props}>
+        {children}
+      </code>
+    )
+  }
+  return (
+    <UntrustedAnchor href={url}>
+      <code className="break-all">{url}</code>
+    </UntrustedAnchor>
+  )
 }

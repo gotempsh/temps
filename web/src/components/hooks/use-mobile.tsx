@@ -24,3 +24,24 @@ function getServerSnapshot() {
 export function useIsMobile() {
   return React.useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot)
 }
+
+const DESKTOP_BREAKPOINT = 1024
+
+function subscribeDesktop(onStoreChange: () => void) {
+  const mediaQuery = window.matchMedia(`(min-width: ${DESKTOP_BREAKPOINT}px)`)
+  mediaQuery.addEventListener('change', onStoreChange)
+  return () => mediaQuery.removeEventListener('change', onStoreChange)
+}
+
+function getDesktopSnapshot() {
+  return window.innerWidth >= DESKTOP_BREAKPOINT
+}
+
+/** Matches Tailwind's `lg` breakpoint. */
+export function useIsDesktop() {
+  return React.useSyncExternalStore(
+    subscribeDesktop,
+    getDesktopSnapshot,
+    getServerSnapshot
+  )
+}

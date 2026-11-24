@@ -56,7 +56,14 @@ import {
   Loader2,
   Search,
 } from 'lucide-react'
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
 
 const ansiConverter = new AnsiToHtml({
   fg: 'var(--foreground)',
@@ -357,8 +364,11 @@ function HistoryLogRow({
 
 export default function HistoryLogViewer({
   project,
+  modeSwitch,
 }: {
   project: ProjectResponse
+  /** Live/History switch, shown first in the scope row. */
+  modeSwitch?: ReactNode
 }) {
   'use no memo'
   // One URL-state instance for `q` and `deploy_id`, so writes to either compose
@@ -914,6 +924,7 @@ export default function HistoryLogViewer({
           {/* Row 1 — scope selectors: environment, service, time range. These
             answer where/what/when, so they live together on the first row. */}
           <div className="flex flex-wrap items-center gap-2">
+            {modeSwitch}
             <Select value={selectedEnv} onValueChange={setSelectedEnv}>
               <SelectTrigger className="w-full sm:w-[200px]">
                 <SelectValue placeholder="All environments" />

@@ -20,6 +20,7 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
+import { DiscordHelpLink } from '@/components/support/DiscordHelpLink'
 import {
   Card,
   CardContent,
@@ -29,6 +30,7 @@ import {
 } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import type { LucideIcon } from 'lucide-react'
+import { AppLoadingScreen } from './AppLoadingScreen'
 
 type ErrorCategory = 'network' | 'timeout' | 'forbidden' | 'server'
 
@@ -213,14 +215,7 @@ export const ProtectedLayout = ({
   const loginElement = loginPage ?? <Login />
 
   if (isLoading) {
-    return (
-      <div className="flex items-center justify-center h-dvh">
-        <div className="text-center space-y-2">
-          <div className="h-8 w-8 animate-spin rounded-full border-4 border-primary border-t-transparent mx-auto" />
-          <p className="text-sm text-muted-foreground">Loading...</p>
-        </div>
-      </div>
-    )
+    return <AppLoadingScreen />
   }
 
   if (error) {
@@ -318,7 +313,11 @@ export const ProtectedLayout = ({
               </Button>
             </div>
 
-            <div className="flex flex-wrap items-center justify-between gap-2 border-t pt-4 text-xs text-muted-foreground">
+            <p className="border-t pt-4 text-sm text-muted-foreground">
+              Need help with Temps? <DiscordHelpLink />
+            </p>
+
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
               <span>
                 Still not working? Check the{' '}
                 <a
@@ -333,7 +332,7 @@ export const ProtectedLayout = ({
                 .
               </span>
               <a
-                href="https://github.com/temps-sh/temps/issues"
+                href="https://github.com/gotempsh/temps/issues"
                 target="_blank"
                 rel="noreferrer"
                 className="inline-flex items-center gap-1 font-medium text-foreground underline-offset-4 hover:underline"

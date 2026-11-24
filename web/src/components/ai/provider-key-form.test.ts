@@ -10,6 +10,8 @@ import {
   providerKeyFormSchema,
   selectProviderKeyFormProvider,
   providerKeyFormToRequest,
+  switchToOpenAiCompatible,
+  vendorHasCustomBaseUrl,
   type ProviderKeyFormValues,
 } from './provider-key-form'
 import { selfHostedDiscoverySignature } from './self-hosted-provider'
@@ -71,7 +73,7 @@ describe('provider key form', () => {
     expect(issues(selfHosted())).toEqual([])
     expect(issues(selfHosted({ base_url: '' }))[0]).toContain('base_url')
     expect(issues(selfHosted({ discovery: null }))[0]).toContain(
-      'Load the models'
+      'Temps has not listed the models'
     )
     expect(issues(selfHosted({ default_model: 'gpt-5-nano' }))[0]).toContain(
       'Pick a default model'
@@ -82,7 +84,7 @@ describe('provider key form', () => {
     const values = selfHosted()
     expect(
       issues({ ...values, base_url: 'http://10.0.0.6:8000/v1' })[0]
-    ).toContain('Load the models')
+    ).toContain('Temps has not listed the models')
   })
 
   test('only self-hosted requests carry the self-hosted fields', () => {
@@ -115,7 +117,7 @@ describe('provider key form', () => {
 describe('provider choice inside the add-key dialog', () => {
   const openai = { id: 'openai', name: 'OpenAI' }
   const anthropic = { id: 'anthropic', name: 'Anthropic' }
-  const names = ['OpenAI', 'Anthropic', 'Self-hosted (OpenAI-compatible)']
+  const names = ['OpenAI', 'Anthropic', 'OpenAI-compatible']
 
   test('submit stays disabled until a provider is chosen', () => {
     expect(canSubmitProviderKeyForm(EMPTY_PROVIDER_KEY_FORM)).toBe(false)
@@ -194,5 +196,56 @@ describe('provider choice inside the add-key dialog', () => {
     expect(selectProviderKeyFormProvider(current, openai, 0, names)).toBe(
       current
     )
+  })
+})
+
+describe('a custom base URL on a vendor provider', () => {
+  const names = ['OpenAI', 'Anthropic', 'OpenAI-compatible']
+  const typed: ProviderKeyFormValues = {
+    ...EMPTY_PROVIDER_KEY_FORM,
+    provider: 'openai',
+    display_name: 'OpenAI',
+    api_key: 'sk-test',
+    base_url: 'https://api.example.com/v1',
+  }
+
+  test('is flagged only for a vendor with a non-blank base URL', () => {
+    expect(vendorHasCustomBaseUrl(typed)).toBe(true)
+    expect(vendorHasCustomBaseUrl({ ...typed, base_url: '   ' })).toBe(false)
+    expect(
+      vendorHasCustomBaseUrl({ ...typed, provider: 'openai_compatible' })
+    ).toBe(false)
+    expect(vendorHasCustomBaseUrl({ ...typed, provider: '' })).toBe(false)
+  })
+
+  test('switching to OpenAI-compatible keeps the key and base URL', () => {
+    const switched = switchToOpenAiCompatible(
+      typed,
+      'OpenAI-compatible',
+      0,
+      names
+    )
+    expect(switched).toEqual({
+      ...EMPTY_PROVIDER_KEY_FORM,
+      provider: 'openai_compatible',
+      display_name: 'OpenAI-compatible',
+      api_key: 'sk-test',
+      base_url: 'https://api.example.com/v1',
+    })
+  })
+
+  test('switching keeps a typed display name and numbers a pre-filled one', () => {
+    expect(
+      switchToOpenAiCompatible(
+        { ...typed, display_name: 'Hosted models' },
+        'OpenAI-compatible',
+        2,
+        names
+      ).display_name
+    ).toBe('Hosted models')
+    expect(
+      switchToOpenAiCompatible(typed, 'OpenAI-compatible', 2, names)
+        .display_name
+    ).toBe('OpenAI-compatible (key 3)')
   })
 })

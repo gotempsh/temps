@@ -8,7 +8,6 @@
 //! instance-wide defaults, which override the built-in default. In every
 //! request/response a `null` limit inherits and `0` means unlimited.
 
-use anyhow::Result as AnyhowResult;
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -18,8 +17,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_authz::RequireAuth;
+use temps_authz::{permission_guard, project_access_guard, project_scope_guard};
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use tracing::error;
@@ -178,15 +177,14 @@ impl AuditOperation for AiGatewayLimitsUpdatedAudit {
         &self.context.user_agent
     }
 
-    fn serialize(&self) -> AnyhowResult<String> {
-        serde_json::to_string(self)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {e}"))
+    fn serialize(&self) -> temps_core::AuditResult<String> {
+        temps_core::serialize_audit_operation(self)
     }
 }
 
 async fn audit_limits_change(
     app_state: &AiGatewayAppState,
-    auth: &temps_auth::AuthContext,
+    auth: &temps_authz::AuthContext,
     metadata: &RequestMetadata,
     scope: String,
     settings: LimitSettings,
@@ -213,7 +211,18 @@ async fn audit_limits_change(
 /// Limits and spend are an operator view over every project. `AiGatewayRead`
 /// is held by ordinary users and readers, and would expose other projects'
 /// limits and month-to-date spend, so reads require an administrator.
-fn require_limits_reader(auth: &temps_auth::AuthContext) -> Result<(), Problem> {
+fn require_limits_reader(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, SystemAdmin);
+    Ok(())
+}
+
+/// Limit writers need the same operator standing as readers. `AiGatewayWrite`
+/// alone is grantable to a custom role or API key that is meant to be confined
+/// to one project, and a limit write on any project (or the instance default
+/// every project inherits) would let it raise its own spend cap or zero
+/// another project's.
+fn require_limits_writer(auth: &temps_authz::AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, AiGatewayWrite);
     permission_guard!(auth, SystemAdmin);
     Ok(())
 }
@@ -287,7 +296,7 @@ async fn update_instance_limits(
     axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Json(body): Json<LimitSettingsBody>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
 
     let saved = app_state
         .limits_service
@@ -363,7 +372,9 @@ async fn update_project_limits(
     Path(project_id): Path<i32>,
     Json(body): Json<LimitSettingsBody>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let saved = app_state
         .limits_service
@@ -377,8 +388,8 @@ async fn update_project_limits(
         saved,
     )
     .await;
-    // Only the saved settings: this endpoint needs `AiGatewayWrite`, while the
-    // month-to-date spend in `ProjectLimitsResponse` is admin-only.
+    // Only the saved settings: the month-to-date spend lives in
+    // `ProjectLimitsResponse`, served by the read endpoint.
     Ok(Json(LimitSettingsBody::from(saved)))
 }
 
@@ -401,7 +412,9 @@ async fn reset_project_limits(
     axum::extract::Extension(metadata): axum::extract::Extension<RequestMetadata>,
     Path(project_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, AiGatewayWrite);
+    require_limits_writer(&auth)?;
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, app_state.project_access_checker);
 
     let cleared = app_state
         .limits_service
@@ -422,8 +435,8 @@ async fn reset_project_limits(
 mod tests {
     use super::*;
     use axum::http::StatusCode;
-    use temps_auth::permissions::Role;
-    use temps_auth::AuthContext;
+    use temps_authz::permissions::Role;
+    use temps_authz::AuthContext;
     use temps_entities::users;
 
     fn test_auth(role: Role) -> AuthContext {
@@ -456,6 +469,33 @@ mod tests {
     #[test]
     fn administrators_may_read_limits() {
         assert!(require_limits_reader(&test_auth(Role::Admin)).is_ok());
+    }
+
+    #[test]
+    fn administrators_may_write_limits() {
+        assert!(require_limits_writer(&test_auth(Role::Admin)).is_ok());
+    }
+
+    #[test]
+    fn non_administrators_cannot_write_limits() {
+        for role in [Role::User, Role::Reader] {
+            let err = require_limits_writer(&test_auth(role))
+                .expect_err("limit writes span every project");
+            assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        }
+    }
+
+    /// F8: a custom grant of `ai_gateway:write` without `system:admin` (the
+    /// shape of a project-confined custom role or API key) must not be able to
+    /// rewrite any project's limits.
+    #[test]
+    fn custom_ai_gateway_write_without_system_admin_cannot_write_limits() {
+        let mut auth = test_auth(Role::Reader);
+        auth.custom_permissions = Some(vec![temps_authz::permissions::Permission::AiGatewayWrite]);
+        assert!(auth.has_permission(&temps_authz::permissions::Permission::AiGatewayWrite));
+        let err = require_limits_writer(&auth)
+            .expect_err("ai_gateway:write alone is not an operator grant");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 
     #[test]

@@ -8,6 +8,13 @@
 //! - Deploying containers to various runtimes
 //! - Managing container lifecycle (start, stop, pause, etc.)
 //! - Extracting files from images
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -16,6 +23,21 @@ use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use temps_core::UtcDateTime;
 use thiserror::Error;
+
+pub use temps_docker_util::image_removal::{
+    ImageRemovalOutcome, ImageRemovalRequest, ImageRemovalStatus, LabelledImage, LabelledImages,
+    ListCursor, OwnerGuard, MAX_IMAGE_REMOVAL_BATCH, MAX_LABELLED_IMAGES,
+};
+
+/// The image label naming the Temps install that built an image (see
+/// `temps_docker_housekeeping::services::image_ownership`). A node lists
+/// images by it and [`IMAGE_PROJECT_LABEL`]:
+/// [`ContainerDeployer::list_owned_images`].
+pub const IMAGE_OWNER_LABEL: &str = "sh.temps.image.instance";
+
+/// The image label naming the project an image was built for, local to the
+/// install named by [`IMAGE_OWNER_LABEL`].
+pub const IMAGE_PROJECT_LABEL: &str = "sh.temps.image.project_id";
 
 /// Backpressure-aware byte stream used when importing an OCI image.
 ///
@@ -31,7 +53,9 @@ pub mod build_timings;
 pub mod build_verification;
 pub mod compose;
 pub mod compose_interpolation;
+pub mod compose_protocol;
 mod compose_remote;
+pub mod compose_translation;
 pub mod runner_protocol;
 
 /// Callback function type for processing build logs in real-time
@@ -54,6 +78,8 @@ pub mod platform;
 pub mod plugin;
 pub mod readiness;
 pub mod remote;
+pub mod replica_aware;
+pub mod resolver_coverage;
 pub mod s3_static_deployer;
 pub mod static_deployer;
 pub mod static_ingestion;
@@ -263,8 +289,36 @@ pub enum DeployerError {
         reason: String,
     },
 
+    /// A container with the requested name already exists and is labelled as
+    /// belonging to a different deployment. The deployer replaces stale
+    /// containers of the *same* deployment (a retried deploy), but never
+    /// removes another deployment's container to take its name.
+    ///
+    /// Boxed so this rarely-built variant does not enlarge every
+    /// `Result<_, DeployerError>` (and the error types that wrap it).
+    #[error(transparent)]
+    ContainerNameOwnedByAnotherDeployment(Box<ContainerNameConflict>),
+
     #[error("Other error: {0}")]
     Other(String),
+
+    /// Images on `location` could not be checked or removed, as a worker
+    /// node's agent reported it (its answer is all there is to keep).
+    /// Nothing is removed when this is returned: per-image failures are
+    /// reported in the outcomes instead.
+    #[error("Cannot remove images on {location}: {reason}")]
+    ImageRemoval { location: String, reason: String },
+
+    /// The Docker daemon at `location` failed to `operation`, with its
+    /// error kept whole. Nothing is removed when this is returned.
+    #[error("Cannot {operation} on {location}: {source}")]
+    ImageInventory {
+        location: String,
+        operation: &'static str,
+        /// Boxed: the Docker error is large and this variant is rare.
+        #[source]
+        source: Box<temps_docker_util::DockerUtilError>,
+    },
 
     /// The local Docker daemon is unavailable in this process. Returned when
     /// a deployment is requested on a control-plane node that runs no
@@ -272,6 +326,60 @@ pub enum DeployerError {
     /// `temps join`.
     #[error(transparent)]
     DockerUnavailable(#[from] temps_core::DockerUnavailable),
+
+    /// The file capabilities of `path` in container `container_id` could
+    /// not be read on `location`. Diagnostic only: the deploy that asked
+    /// has already failed for its own reason.
+    #[error(transparent)]
+    FileCapabilities(Box<FileCapabilitiesError>),
+}
+
+/// Why the file capabilities of a path in a container could not be read.
+/// Boxed in [`DeployerError::FileCapabilities`] to keep the error small.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "Cannot read the file capabilities of '{path}' in container {container_id} on {location}: {reason}"
+)]
+pub struct FileCapabilitiesError {
+    pub container_id: String,
+    pub path: String,
+    pub location: String,
+    pub reason: String,
+}
+
+impl DeployerError {
+    /// A [`DeployerError::FileCapabilities`] for `path` in `container_id`.
+    pub fn file_capabilities(
+        container_id: &str,
+        path: &str,
+        location: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self::FileCapabilities(Box::new(FileCapabilitiesError {
+            container_id: container_id.to_string(),
+            path: path.to_string(),
+            location: location.into(),
+            reason: reason.into(),
+        }))
+    }
+}
+
+/// Why a deploy refused to replace an existing container of the same name:
+/// it is labelled as another deployment's. See
+/// [`DeployerError::ContainerNameOwnedByAnotherDeployment`].
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error(
+    "Container name '{container_name}' is already used by container {existing_container_id} \
+     of deployment {existing_deployment_id}; refusing to replace it with a container for \
+     deployment {requested_deployment}"
+)]
+pub struct ContainerNameConflict {
+    pub container_name: String,
+    pub existing_container_id: String,
+    pub existing_deployment_id: String,
+    /// The requesting deployment's ID, or `<none>` for a request that
+    /// carries no deployment label.
+    pub requested_deployment: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +394,47 @@ pub struct BuildRequest {
     pub build_args_buildkit: HashMap<String, String>,
     pub platform: Option<String>,
     pub log_path: PathBuf,
+    /// Labels to stamp on the built image, on top of `built-by=temps`. Temps
+    /// records which install, project and deployment built it here
+    /// (`sh.temps.image.*`), so housekeeping can tell its own images from anyone
+    /// else's after the database rows that named them are gone.
+    #[serde(default)]
+    pub labels: HashMap<String, String>,
+    /// Values served to the Dockerfile's `RUN --mount=type=secret` steps. Never
+    /// serialized, so they cannot travel over the worker build protocol.
+    ///
+    /// When this is not empty the whole build runs on BuildKit's default network,
+    /// including through [`ImageBuilder::build_image`], which otherwise uses the
+    /// host network: secrets are only available on a solve that cannot be granted
+    /// host networking.
+    #[serde(skip)]
+    pub build_secrets: BuildSecrets,
+}
+
+/// Values for BuildKit secret mounts, by secret id.
+///
+/// `Debug` prints names only, so a logged [`BuildRequest`] cannot expose them.
+#[derive(Clone, Default)]
+pub struct BuildSecrets(std::collections::BTreeMap<String, String>);
+
+impl BuildSecrets {
+    pub fn new(secrets: std::collections::BTreeMap<String, String>) -> Self {
+        Self(secrets)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &String)> {
+        self.0.iter()
+    }
+}
+
+impl std::fmt::Debug for BuildSecrets {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_set().entries(self.0.keys()).finish()
+    }
 }
 
 /// Build request with optional log callback for real-time log streaming
@@ -349,6 +498,10 @@ pub struct ImageConfig {
     /// `USER`, when the image sets one.
     #[serde(default)]
     pub user: Option<String>,
+    /// The image sets a `USER` longer than `MAX_IMAGE_CONFIG_USER_BYTES`,
+    /// which `user` leaves out: the user it runs as is unknown, not root.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub user_omitted: bool,
     /// `ENV` entries as `NAME=value`. Values are whatever the Dockerfile
     /// baked in; callers must not persist or log them.
     #[serde(default)]
@@ -377,14 +530,14 @@ impl ImageConfig {
         exposed_ports.dedup();
         exposed_ports.truncate(MAX_IMAGE_CONFIG_PORTS);
 
-        let user = user
-            .map(str::trim)
-            .filter(|user| !user.is_empty() && user.len() <= MAX_IMAGE_CONFIG_USER_BYTES)
-            .map(str::to_string);
+        let user = user.map(str::trim).filter(|user| !user.is_empty());
+        let user_omitted = user.is_some_and(|user| user.len() > MAX_IMAGE_CONFIG_USER_BYTES);
+        let user = user.filter(|_| !user_omitted).map(str::to_string);
 
         Self {
             exposed_ports,
             user,
+            user_omitted,
             env: bounded_strings(
                 env,
                 MAX_IMAGE_CONFIG_ENV_ENTRIES,
@@ -413,6 +566,15 @@ fn bounded_strings(items: &[String], max_entries: usize, max_bytes: usize) -> Ve
         kept.push(item.clone());
     }
     kept
+}
+
+/// Body of a worker agent's `POST /agent/containers/{id}/stop`. Every field is
+/// optional so an empty body (older control planes) keeps the default stop.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct StopContainerRequest {
+    /// Seconds between SIGTERM and SIGKILL; the agent's default (10) when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_seconds: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
@@ -449,6 +611,9 @@ pub struct DeployRequest {
     #[schema(value_type = String)]
     pub log_path: PathBuf,
     pub command: Option<Vec<String>>,
+    /// Exec-form ENTRYPOINT override. None inherits; an empty vector clears it.
+    #[serde(default)]
+    pub entrypoint: Option<Vec<String>>,
     /// Docker log rotation config (max-size, max-file). If None, uses Docker daemon defaults.
     pub log_config: Option<ContainerLogConfig>,
     /// Docker labels to apply to the container.
@@ -489,6 +654,18 @@ pub struct DeployRequest {
     /// socket is mounted.
     #[serde(default)]
     pub control_plane_grants_socket: bool,
+    /// Linux capabilities the project allowed back on top of the hardened
+    /// host config (`projects.allowed_capabilities`), read when the deploy
+    /// job was built. Only allow-listed values are representable, so a
+    /// request cannot carry `SYS_ADMIN` or `privileged`.
+    ///
+    /// `#[serde(default)]`: a request from a control plane built before
+    /// this field is fully hardened. An agent built before it ignores the
+    /// field and starts the container without the capability, so the
+    /// image fails exactly as it did before the opt-in (and is diagnosed
+    /// the same way) rather than running with anything extra.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_capabilities: Vec<temps_workload::ContainerCapability>,
 }
 
 /// Docker container log rotation configuration
@@ -599,6 +776,22 @@ pub enum ContainerStatus {
     Dead,
 }
 
+/// Label naming the runtime a replica runs on when it is not a Docker
+/// container (`firecracker` for a microVM). Set only on the container info
+/// the workload plane builds for its replicas; a container without it is a
+/// Docker container.
+pub const RUNTIME_LABEL: &str = "sh.temps.runtime";
+
+/// The runtime a container runs on: [`RUNTIME_LABEL`] when present, `docker`
+/// otherwise.
+pub fn container_runtime(labels: &HashMap<String, String>) -> &str {
+    labels
+        .get(RUNTIME_LABEL)
+        .map(String::as_str)
+        .filter(|runtime| !runtime.is_empty())
+        .unwrap_or("docker")
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ContainerInfo {
     pub container_id: String,
@@ -698,6 +891,13 @@ pub struct ContainerStats {
     pub network_rx_bytes: u64,
     /// Network bytes transmitted
     pub network_tx_bytes: u64,
+    /// Cumulative bytes read from block devices. `None` when the runtime
+    /// does not report it, so a chart shows "unknown" rather than zero.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_read_bytes: Option<u64>,
+    /// Cumulative bytes written to block devices.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub block_write_bytes: Option<u64>,
     /// Container restart count from Docker. Lets the UI render
     /// "Restarted 3×" so a restart loop is visible at a glance.
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -724,6 +924,8 @@ impl Default for ContainerStats {
             memory_percent: None,
             network_rx_bytes: 0,
             network_tx_bytes: 0,
+            block_read_bytes: None,
+            block_write_bytes: None,
             restart_count: None,
             started_at: None,
             timestamp: chrono::Utc::now(),
@@ -1042,6 +1244,34 @@ pub trait ImageBuilder: Send + Sync {
     /// Inspect an image and return its metadata including architecture
     async fn inspect_image(&self, image_name: &str) -> Result<ImageInfo, BuilderError>;
 
+    /// Every platform `image_name` can run on from this builder's local store.
+    ///
+    /// A multi-platform image (a manifest list or OCI index) pulled for
+    /// several architectures holds a runnable image for each, while
+    /// [`Self::inspect_image`] only reports the one the daemon picks for its
+    /// own architecture. The default answers with that one platform; a
+    /// builder whose store can list an image's manifests overrides it.
+    async fn image_platforms(&self, image_name: &str) -> Result<Vec<String>, BuilderError> {
+        Ok(vec![self.inspect_image(image_name).await?.platform])
+    }
+
+    /// Every platform the registry index behind `image_name` offers.
+    ///
+    /// For an image a worker pulls from its registry itself, this — not
+    /// [`Self::image_platforms`] — is what it can run: pulling a
+    /// multi-platform tag here downloads only this daemon's architecture, so
+    /// the local store holds one runnable platform of an index that may offer
+    /// many (#1892). `credentials` authenticate a private registry. An empty
+    /// result means "unknown"; the default, for builders that cannot reach a
+    /// registry, always answers that.
+    async fn registry_image_platforms(
+        &self,
+        _image_name: &str,
+        _credentials: Option<remote::RemotePullCredentials>,
+    ) -> Result<Vec<String>, BuilderError> {
+        Ok(Vec::new())
+    }
+
     /// The identity of the image `image_name` currently resolves to.
     ///
     /// `id` is whatever the daemon reports as the image ID: the config digest
@@ -1156,6 +1386,22 @@ pub trait ContainerDeployer: Send + Sync {
     /// Stop a running container
     async fn stop_container(&self, container_id: &str) -> Result<(), DeployerError>;
 
+    /// Stop a running container, giving it `grace` between SIGTERM and
+    /// SIGKILL to finish in-flight work. Used when a superseded deployment is
+    /// torn down, where the project's stop timeout applies.
+    ///
+    /// Every deployer that stops real containers overrides this. The default
+    /// is for test doubles and deployers without a grace period to honour; it
+    /// stops the container the way [`Self::stop_container`] does.
+    async fn stop_container_with_grace(
+        &self,
+        container_id: &str,
+        grace: std::time::Duration,
+    ) -> Result<(), DeployerError> {
+        let _ = grace;
+        self.stop_container(container_id).await
+    }
+
     /// Pause a running container
     async fn pause_container(&self, container_id: &str) -> Result<(), DeployerError>;
 
@@ -1180,6 +1426,26 @@ pub trait ContainerDeployer: Send + Sync {
     /// Get container logs
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError>;
 
+    /// The Linux file capabilities (`security.capability`) set on `path` in
+    /// container `container_id`'s filesystem, following symlinks. Works on a
+    /// stopped or crash-looping container and never downloads the file.
+    ///
+    /// `Ok(None)`: the file has none. `Err`: they could not be read, which
+    /// is what this default says for a runtime that cannot look; callers
+    /// treat that as "unknown", never as "none".
+    async fn file_capabilities(
+        &self,
+        container_id: &str,
+        path: &str,
+    ) -> Result<Option<temps_workload::FileCapabilities>, DeployerError> {
+        Err(DeployerError::file_capabilities(
+            container_id,
+            path,
+            "this runtime",
+            "it cannot read files from containers",
+        ))
+    }
+
     /// Stream container logs
     async fn stream_container_logs(
         &self,
@@ -1191,6 +1457,46 @@ pub trait ContainerDeployer: Send + Sync {
     /// Default implementation returns true (assumes image exists) for backward compatibility.
     async fn image_exists(&self, _image_name: &str) -> Result<bool, DeployerError> {
         Ok(true)
+    }
+
+    /// Remove each requested image that no container on this runtime uses,
+    /// running or stopped, judged by image ID (see
+    /// [`temps_docker_util::image_removal`]). One outcome per request, in
+    /// order; at most [`MAX_IMAGE_REMOVAL_BATCH`] requests per call.
+    ///
+    /// A request whose image or containers cannot be read is reported
+    /// `Failed` in its outcome and nothing is removed for it. The call fails
+    /// as a whole, removing nothing, only when the runtime cannot be reached,
+    /// the batch is too large, or the runtime cannot remove images at all,
+    /// which is what this default says.
+    async fn remove_unused_images(
+        &self,
+        _requests: &[ImageRemovalRequest],
+    ) -> Result<Vec<ImageRemovalOutcome>, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support removing images".to_string(),
+        })
+    }
+
+    /// The images on this runtime that the Temps install `owner` built for
+    /// its project `project_id` (labelled [`IMAGE_OWNER_LABEL`]`=owner` and
+    /// [`IMAGE_PROJECT_LABEL`]`=project_id`) after `after`, oldest first and
+    /// bounded by [`MAX_LABELLED_IMAGES`], with where the next page starts,
+    /// each with a container created from it if there is one. Only labels
+    /// under the image ownership prefix are kept. Asking for one project's
+    /// images keeps the daemon's answer, which Docker cannot limit, to that
+    /// project. This default says the runtime cannot list images.
+    async fn list_owned_images(
+        &self,
+        _owner: &str,
+        _project_id: i32,
+        _after: Option<&ListCursor>,
+    ) -> Result<LabelledImages, DeployerError> {
+        Err(DeployerError::ImageRemoval {
+            location: "this container runtime".to_string(),
+            reason: "it does not support listing images".to_string(),
+        })
     }
 }
 
@@ -1303,7 +1609,14 @@ mod tests {
             &[],
         );
         assert_eq!(config.user, None);
-        assert_eq!(ImageConfig::from_raw(&[], Some("  "), &[], &[]).user, None);
+        assert!(config.user_omitted, "a dropped USER is not an unset USER");
+        let unset = ImageConfig::from_raw(&[], Some("  "), &[], &[]);
+        assert_eq!((unset.user, unset.user_omitted), (None, false));
+        let kept = ImageConfig::from_raw(&[], Some(" app "), &[], &[]);
+        assert_eq!(
+            (kept.user.as_deref(), kept.user_omitted),
+            (Some("app"), false)
+        );
     }
 
     /// The image configuration is added to a wire type older agents already
@@ -1539,6 +1852,8 @@ mod tests {
         build_args.insert("ENV".to_string(), "production".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-image:latest".to_string(),
             context_path: context_path.clone(),
@@ -1583,10 +1898,12 @@ mod tests {
             restart_policy: RestartPolicy::Always,
             log_path,
             command: Some(vec!["node".to_string(), "server.js".to_string()]),
+            entrypoint: None,
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         assert_eq!(request.image_name, "test-image:latest");
@@ -1772,6 +2089,8 @@ mod tests {
     #[test]
     fn test_serde_serialization() {
         let request = BuildRequest {
+            labels: Default::default(),
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test:latest".to_string(),
             context_path: PathBuf::from("/tmp/build"),
@@ -1844,6 +2163,8 @@ CMD ["echo", "Hello from container"]
         build_args.insert("RUST_VERSION".to_string(), "1.70".to_string());
 
         let request = BuildRequest {
+            labels: Default::default(),
+            build_secrets: Default::default(),
             cache_from: Vec::new(),
             image_name: "test-app:v1.0".to_string(),
             context_path: temp_dir.path().to_path_buf(),
@@ -1911,10 +2232,12 @@ CMD ["echo", "Hello from container"]
             restart_policy: RestartPolicy::Always,
             log_path: temp_dir.path().join("deploy.log"),
             command: None, // No custom command, use default from image
+            entrypoint: None,
             log_config: Some(ContainerLogConfig::app_default()),
             labels: HashMap::new(),
             project_slug: None,
             control_plane_grants_socket: false,
+            allowed_capabilities: Vec::new(),
         };
 
         assert_eq!(request.environment_vars.len(), 3);
@@ -2107,6 +2430,32 @@ CMD ["echo", "Hello from container"]
             ),
             "{text}"
         );
+    }
+
+    #[test]
+    fn build_secrets_never_reach_debug_output_or_the_wire() {
+        let request = BuildRequest {
+            labels: Default::default(),
+            build_secrets: BuildSecrets::new(
+                [("API_KEY".to_string(), "secret-value-1725".to_string())].into(),
+            ),
+            cache_from: Vec::new(),
+            image_name: "test".to_string(),
+            context_path: PathBuf::new(),
+            dockerfile_path: None,
+            build_args: HashMap::new(),
+            build_args_buildkit: HashMap::new(),
+            platform: None,
+            log_path: PathBuf::new(),
+        };
+        let debug = format!("{request:?}");
+        assert!(debug.contains("API_KEY"), "{debug}");
+        assert!(!debug.contains("secret-value-1725"), "{debug}");
+        let serialized = serde_json::to_string(&request).unwrap();
+        assert!(!serialized.contains("secret-value-1725"), "{serialized}");
+        assert!(!serialized.contains("API_KEY"), "{serialized}");
+        let restored: BuildRequest = serde_json::from_str(&serialized).unwrap();
+        assert!(restored.build_secrets.is_empty());
     }
 }
 

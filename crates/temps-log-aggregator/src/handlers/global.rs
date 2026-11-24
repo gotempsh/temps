@@ -22,16 +22,14 @@ use crate::{
     chunk::wal::DEFERRED_DIR,
     error::LogAggregatorError,
     handlers::types::LogAggregatorAppState,
-    index::analytics::{AggregateRow, AttrOp, AttrPredicate, GroupKey, HistogramBucket, Metric},
+    index::analytics::{AggregateRow, AttrPredicate, GroupKey, HistogramBucket},
     services::global_search::{
         owner_key, GlobalLogFacetsRequest, GlobalLogFacetsResponse, GlobalLogSearchRequest,
         GlobalLogSearchResponse, GlobalLogSource,
     },
     services::search::to_search_line,
-    services::{CollectionStatus, RecoveryState},
-    store::{
-        encode_cursor, resolve_log_access_scope, FacetField, FacetValue, LogAccessScope, LogQuery,
-    },
+    services::{CollectionStatus, RecoveryState, ThrottledLogSource, BURST_SECONDS},
+    store::{encode_cursor, resolve_log_access_scope, FacetValue, LogAccessScope, LogQuery},
     types::LogLevel,
 };
 use axum::{extract::State, http::StatusCode, Json};
@@ -41,7 +39,7 @@ use axum_extra::extract::Query;
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use temps_auth::{permission_guard, AuthContext, RequireAuth};
+use temps_authz::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 
 /// Backstop deadline. The store's own per-request time/byte budget is tighter
@@ -225,6 +223,49 @@ pub const ANALYTICS_SETUP_PATH: &str = "/settings/metrics-monitoring";
 pub struct GlobalLogCapabilities {
     pub analytics: AnalyticsCapability,
     pub collection: LogCollectionCapability,
+}
+
+/// Settings page and section that configure the ingestion budget.
+pub const INGEST_BUDGET_SETUP_PATH: &str =
+    "/settings/metrics-monitoring#container-log-ingest-budget";
+
+/// The per-container log ingestion budget and the containers over it now.
+/// A throttled container has lines dropped (not stored, not indexed), so it
+/// is reported here for the console to name it rather than leave a gap in
+/// its history unexplained.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct LogIngestBudgetStatus {
+    /// Lines per second each container may store; `0` = no line limit.
+    pub lines_per_sec: u32,
+    /// Bytes per second each container may store; `0` = no byte limit.
+    pub bytes_per_sec: u64,
+    /// Seconds of budget a container may send at once before it is held to
+    /// the rate.
+    pub burst_seconds: u64,
+    /// Console path where an administrator changes the budget.
+    pub setup_path: String,
+    /// Containers that dropped lines in the last minute, noisiest first,
+    /// limited to the projects and services the caller can read.
+    pub throttled: Vec<ThrottledLogSource>,
+}
+
+/// The throttled containers `scope` may read about. An external-service
+/// container carries the `project_id = 0` sentinel and is decided by its
+/// service, never by that sentinel.
+fn visible_throttled(
+    throttled: Vec<ThrottledLogSource>,
+    scope: &LogAccessScope,
+) -> Vec<ThrottledLogSource> {
+    throttled
+        .into_iter()
+        .filter(
+            |source| match (source.external_service_id, source.project_id) {
+                (Some(service_id), _) => scope.allows_external_service(service_id),
+                (None, Some(project_id)) => scope.allows_project(project_id),
+                (None, None) => false,
+            },
+        )
+        .collect()
 }
 
 /// How many deferred generations the response itemizes. The counts cover
@@ -412,6 +453,39 @@ pub struct AnalyticsCapability {
     pub forget_backlog: u64,
 }
 
+/// The ingestion budget and the containers dropping lines over it, for the
+/// warnings on the log views. Reads only in-memory state, so the console can
+/// poll it from every log view; the caller's access scope is resolved only
+/// when some container is throttled.
+#[utoipa::path(get, path="/logs/ingest-budget", tag="Logs",
+    responses(
+        (status=200, description="Budget and throttled containers the caller can read", body=LogIngestBudgetStatus),
+        (status=401, description="Unauthorized", body=ProblemDetails),
+        (status=403, description="Insufficient permissions", body=ProblemDetails),
+        (status=500, description="The caller's log access could not be resolved", body=ProblemDetails)
+    ),
+    security(("bearer_auth"=[])))]
+pub async fn log_ingest_budget(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<LogAggregatorAppState>>,
+) -> Result<Json<LogIngestBudgetStatus>, Problem> {
+    permission_guard!(auth, LogsRead);
+    let limits = state.ingest_budget.limits();
+    let throttled = state.ingest_budget.throttled_sources();
+    let throttled = if throttled.is_empty() || auth.is_instance_admin() {
+        throttled
+    } else {
+        visible_throttled(throttled, &scope_for(&auth, &state).await?)
+    };
+    Ok(Json(LogIngestBudgetStatus {
+        lines_per_sec: limits.lines_per_sec,
+        bytes_per_sec: limits.bytes_per_sec,
+        burst_seconds: BURST_SECONDS,
+        setup_path: INGEST_BUDGET_SETUP_PATH.to_string(),
+        throttled,
+    }))
+}
+
 #[utoipa::path(get, path="/logs/global/capabilities", tag="Logs",
     responses((status=200,body=GlobalLogCapabilities),(status=403,body=ProblemDetails)),
     security(("bearer_auth"=[])))]
@@ -537,136 +611,13 @@ async fn build_analytics_query(
     Ok(query)
 }
 
-/// Parse repeatable `attr=<key><op><value>` query parameters (and
-/// `attr=<key>?` for "exists") into index predicates.
-pub(crate) fn parse_attr_predicates(
-    raws: &[String],
-) -> Result<Vec<AttrPredicate>, LogAggregatorError> {
-    raws.iter().map(|s| parse_attr_predicate(s)).collect()
-}
-
-fn attr_filter_error(raw: &str) -> LogAggregatorError {
-    LogAggregatorError::Validation {
-        message: format!(
-            "invalid attribute filter {raw:?}: expected <key><op><value> with op in =, !=, ^= \
-             (prefix), >, < or <key>? for \"exists\""
-        ),
-    }
-}
-
-fn parse_attr_predicate(raw: &str) -> Result<AttrPredicate, LogAggregatorError> {
-    if let Some(key) = raw.strip_suffix('?') {
-        if key.is_empty() {
-            return Err(attr_filter_error(raw));
-        }
-        return Ok(AttrPredicate {
-            key: key.to_string(),
-            op: AttrOp::Exists,
-            value: None,
-        });
-    }
-    // Two-character operators first: `!=`/`^=` both contain `=`, so checking
-    // the single-`=` case first would split them in the wrong place.
-    for (token, op) in [("!=", AttrOp::Neq), ("^=", AttrOp::Prefix)] {
-        if let Some(idx) = raw.find(token) {
-            let (key, rest) = (&raw[..idx], &raw[idx + token.len()..]);
-            if key.is_empty() {
-                return Err(attr_filter_error(raw));
-            }
-            return Ok(AttrPredicate {
-                key: key.to_string(),
-                op,
-                value: Some(rest.to_string()),
-            });
-        }
-    }
-    for (ch, op) in [('=', AttrOp::Eq), ('>', AttrOp::Gt), ('<', AttrOp::Lt)] {
-        if let Some(idx) = raw.find(ch) {
-            let (key, rest) = (&raw[..idx], &raw[idx + 1..]);
-            if key.is_empty() {
-                return Err(attr_filter_error(raw));
-            }
-            return Ok(AttrPredicate {
-                key: key.to_string(),
-                op,
-                value: Some(rest.to_string()),
-            });
-        }
-    }
-    Err(attr_filter_error(raw))
-}
-
-/// Parse one `group_by`/`keys` item: a label facet name (`env`, `service`,
-/// `level`, `stream`, `project`, `external_service`, `node`, `deploy`,
-/// `container`) or `attr:<name>` for an attribute.
-fn parse_group_key(raw: &str) -> Result<GroupKey, LogAggregatorError> {
-    let raw = raw.trim();
-    if let Some(attr) = raw.strip_prefix("attr:") {
-        if attr.is_empty() {
-            return Err(LogAggregatorError::Validation {
-                message: "attr: group key needs a name, e.g. attr:worker".to_string(),
-            });
-        }
-        return Ok(GroupKey::Attr(attr.to_string()));
-    }
-    let field: FacetField = serde_json::from_value(serde_json::Value::String(raw.to_string()))
-        .map_err(|_| LogAggregatorError::Validation {
-            message: format!(
-                "unknown group key {raw:?}; expected one of env, service, level, stream, \
-                 project, external_service, node, deploy, container, or attr:<name>"
-            ),
-        })?;
-    Ok(GroupKey::Label(field))
-}
-
-/// Parse a comma-separated list of group keys.
-fn parse_group_keys(raw: &str) -> Result<Vec<GroupKey>, LogAggregatorError> {
-    let keys: Result<Vec<GroupKey>, LogAggregatorError> = raw
-        .split(',')
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(parse_group_key)
-        .collect();
-    let keys = keys?;
-    if keys.is_empty() {
-        return Err(LogAggregatorError::Validation {
-            message: "at least one group-by key is required".to_string(),
-        });
-    }
-    Ok(keys)
-}
-
-/// Parse a `metric` parameter: `count`, or `<fn>:<attr>` for
-/// `count_distinct`, `avg`, `p50`, `p95`, `p99`, `max`, `sum`.
-fn parse_metric(raw: &str) -> Result<Metric, LogAggregatorError> {
-    let invalid = || LogAggregatorError::Validation {
-        message: format!(
-            "invalid metric {raw:?}; expected count, or one of count_distinct, avg, p50, p95, \
-             p99, max, sum followed by :<attr>"
-        ),
-    };
-    if raw == "count" {
-        return Ok(Metric::Count);
-    }
-    let (name, attr) = raw.split_once(':').ok_or_else(invalid)?;
-    if attr.is_empty() {
-        return Err(invalid());
-    }
-    Ok(match name {
-        "count_distinct" => Metric::CountDistinct(attr.to_string()),
-        "avg" => Metric::Avg(attr.to_string()),
-        "p50" => Metric::P50(attr.to_string()),
-        "p95" => Metric::P95(attr.to_string()),
-        "p99" => Metric::P99(attr.to_string()),
-        "max" => Metric::Max(attr.to_string()),
-        "sum" => Metric::Sum(attr.to_string()),
-        _ => return Err(invalid()),
-    })
-}
-
-/// Upper bound on any of these endpoints' `limit`/`max_groups`, regardless of
-/// what the caller asks for.
-const MAX_ANALYTICS_LIMIT: u32 = 1000;
+// The wire form of an attribute predicate is parsed next to the predicate
+// type itself (`crate::index::analytics`), so services that build a query
+// without an HTTP request — the log-alert series source — parse it the same
+// way these handlers do.
+pub(crate) use crate::index::analytics::{
+    parse_attr_predicates, parse_group_key, parse_group_keys, parse_metric, MAX_ANALYTICS_LIMIT,
+};
 
 #[derive(Debug, serde::Serialize, utoipa::ToSchema)]
 pub struct AttributeKeysResponse {
@@ -811,10 +762,31 @@ pub(crate) async fn global_log_histogram(
     let group_by = extra.group_by.as_deref().map(parse_group_key).transpose()?;
     let bucket_secs = extra.bucket_secs.unwrap_or(60).clamp(1, 86_400 * 7);
     let max_groups = extra.max_groups.unwrap_or(8).clamp(1, 50);
-    let buckets = state
+    let indexed = state
         .line_index
         .histogram(&query, &attrs, bucket_secs, group_by.as_ref(), max_groups)
         .await?;
+    // The index holds sealed chunks only; the newest minutes are still in
+    // head buffers. Count those too, or a live chart ends in an empty tail.
+    // Attribute groups are left to the index: a head line has no indexed
+    // attribute columns to group by the same way.
+    let head_group = match group_by.as_ref() {
+        Some(GroupKey::Attr(_)) => None,
+        Some(GroupKey::Label(field)) => Some(Some(*field)),
+        None => Some(None),
+    };
+    let unsealed = match head_group {
+        Some(field) => {
+            let mut head_query = query.clone();
+            head_query.attrs = attrs.clone();
+            state
+                .store
+                .unsealed_histogram(&head_query, bucket_secs, field)
+                .await?
+        }
+        None => Vec::new(),
+    };
+    let buckets = crate::index::analytics::merge_histogram(indexed, unsealed, max_groups);
     Ok(Json(HistogramResponse { buckets }))
 }
 
@@ -876,6 +848,10 @@ pub(crate) async fn global_log_aggregate(
 #[cfg(test)]
 mod attr_parser_tests {
     use super::*;
+    // Imported here rather than at module level: the predicate parser moved
+    // next to its type, so only these tests still name the operator enum.
+    use crate::index::analytics::{parse_attr_predicate, AttrOp, Metric};
+    use crate::store::FacetField;
 
     #[test]
     fn parses_all_operators() {
@@ -1139,5 +1115,77 @@ mod collection_tests {
         assert!(capability.collecting);
         assert_eq!(capability.deferred_count, 0);
         assert!(capability.deferred_dir.is_none());
+    }
+}
+
+#[cfg(test)]
+mod ingest_budget_tests {
+    use super::*;
+    use crate::services::IngestDropReason;
+
+    fn throttled(
+        container_id: &str,
+        project_id: Option<i32>,
+        external_service_id: Option<i32>,
+    ) -> ThrottledLogSource {
+        ThrottledLogSource {
+            container_id: container_id.into(),
+            service: "svc".into(),
+            project_id,
+            external_service_id,
+            env: "1".into(),
+            deploy_id: None,
+            node_id: None,
+            node_name: None,
+            offered_lines_per_sec: 1_000,
+            offered_bytes_per_sec: 80_000,
+            dropped_lines: 10,
+            dropped_bytes: 800,
+            reason: IngestDropReason::LinesPerSec,
+            lines_per_sec_limit: 250,
+            bytes_per_sec_limit: 256 * 1024,
+            limit_overridden: false,
+            throttled_since: Utc::now(),
+            last_dropped_at: Utc::now(),
+        }
+    }
+
+    fn ids(sources: &[ThrottledLogSource]) -> Vec<&str> {
+        sources.iter().map(|s| s.container_id.as_str()).collect()
+    }
+
+    // A member sees only throttled containers of the projects and services
+    // they can read; another tenant's noisy container is not disclosed.
+    #[test]
+    fn members_see_only_throttled_containers_they_can_read() {
+        let all = vec![
+            throttled("mine", Some(1), None),
+            throttled("theirs", Some(2), None),
+            throttled("my-db", None, Some(7)),
+            throttled("their-db", None, Some(8)),
+        ];
+        let scope = LogAccessScope::Allowed {
+            project_ids: vec![1],
+            external_service_ids: vec![7],
+        };
+        assert_eq!(ids(&visible_throttled(all, &scope)), ["mine", "my-db"]);
+    }
+
+    // An external-service container must not become visible through the
+    // `project_id = 0` sentinel, even to a scope that somehow lists project 0.
+    #[test]
+    fn external_service_is_not_matched_by_the_project_sentinel() {
+        let all = vec![throttled("their-db", None, Some(8))];
+        let scope = LogAccessScope::Allowed {
+            project_ids: vec![0],
+            external_service_ids: vec![],
+        };
+        assert!(visible_throttled(all, &scope).is_empty());
+    }
+
+    #[test]
+    fn administrators_see_every_throttled_container() {
+        let all = vec![throttled("a", Some(1), None), throttled("b", None, Some(7))];
+        assert_eq!(visible_throttled(all, &LogAccessScope::All).len(), 2);
     }
 }

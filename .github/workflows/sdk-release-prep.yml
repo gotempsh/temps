@@ -1,0 +1,252 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: SDK Release Prep
+
+# Prepares SDK releases for a server tag so nobody picks versions by hand.
+# `sdk_release.py prepare` derives each catalog package's next version from
+# the Conventional Commits that touched it since its last package tag, bumps
+# the manifests and lockfiles, and records the selection for the tag in
+# .github/releases/prepared.json. A PR carries that change to main; the
+# release.yml run for the server tag then tests, publishes and tags exactly
+# the versions it lists.
+#
+# Hook point: beta and stable tags go on the merge commit of a
+# `release/v<version>` PR carrying the scripts/release.sh bump commit.
+# Pushing that branch runs this workflow for v<version> (or dispatch it with
+# the tag). Merge the SDK PR before the release PR so the tag contains it;
+# release.sh stops on a stale selection and asks before releasing without one.
+# Nightly tags never publish SDKs, so nightly-release.yml does not run this.
+#
+# Least privilege: `prepare` installs and builds the SDKs (third-party code)
+# with a read-only token; `pull-request` pushes and opens the PR without
+# running any package code. Neither job has registry credentials or an OIDC
+# token, and nothing here can publish.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Server tag to prepare SDK releases for (vX.Y.Z or vX.Y.Z-beta.N)"
+        required: true
+        type: string
+  push:
+    branches:
+      - "release/v*"
+
+permissions: {}
+
+concurrency:
+  group: sdk-release-prep-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Prepare and dry-build SDK releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      target: ${{ steps.target.outputs.tag }}
+      base: ${{ steps.base.outputs.sha }}
+      digest: ${{ steps.digest.outputs.digest }}
+      changed: ${{ steps.prepare.outputs.changed }}
+    steps:
+      - name: Resolve the target server tag
+        id: target
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == "push" ]]; then
+            tag="${REF_NAME#release/}"
+          else
+            tag="$INPUT_TAG"
+          fi
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z.-]*)?$ ]]; then
+            echo "::error::The target is not a server release tag (vX.Y.Z or vX.Y.Z-beta.N)."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      # Full history and tags: versions derive from package tags and commits.
+      - name: Check out main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record the base commit
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      # Preparation reads main. A release branch merges into the tag, so an SDK
+      # commit only on that branch would ship unversioned; it must land on main.
+      - name: Prepare SDK versions from Conventional Commits
+        id: prepare
+        env:
+          TARGET: ${{ steps.target.outputs.tag }}
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          candidate=()
+          if [[ "$EVENT" == "push" ]]; then
+            git fetch -q --no-tags origin "+refs/heads/${REF_NAME}:refs/remotes/origin/${REF_NAME}"
+            candidate=(--candidate "refs/remotes/origin/${REF_NAME}")
+          fi
+          python3 scripts/sdk_release.py prepare --tag "$TARGET" "${candidate[@]}" --summary "$RUNNER_TEMP/sdk-prep.md"
+          cat "$RUNNER_TEMP/sdk-prep.md" >> "$GITHUB_STEP_SUMMARY"
+
+      # The PR job re-derives the change and must arrive at these exact bytes.
+      - name: Fingerprint the prepared change
+        id: digest
+        run: echo "digest=$(git diff --binary HEAD | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Validate the catalog and the prepared selection
+        run: python3 scripts/sdk_release.py validate
+
+      # Commit locally (never pushed from this job) so the dry build packages
+      # the prepared tree at HEAD, exactly as release.yml will at the tag.
+      - name: Commit the prepared versions locally
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.tag }}
+        run: |
+          git -c user.name='github-actions[bot]' \
+            -c user.email='41898282+github-actions[bot]@users.noreply.github.com' \
+            commit -q -s -a -m "chore(release): prepare SDKs for ${TARGET}"
+
+      - name: Install Bun
+        if: contains(fromJSON(steps.prepare.outputs.kinds), 'npm')
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.2
+          no-cache: true
+      - name: Install Node
+        if: contains(fromJSON(steps.prepare.outputs.kinds), 'npm')
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          package-manager-cache: false
+      - name: Install uv
+        if: contains(fromJSON(steps.prepare.outputs.kinds), 'pypi')
+        uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: false
+      - name: Install Go
+        if: contains(fromJSON(steps.prepare.outputs.kinds), 'go')
+        uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7.1.0
+        with:
+          go-version-file: sdks/go/workflows/go.mod
+          cache: false
+      - name: Install Rust toolchain
+        if: contains(fromJSON(steps.prepare.outputs.kinds), 'crate')
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable branch; version pinned below
+        with:
+          # Keep in sync with rust-toolchain.toml.
+          toolchain: 1.99.1
+
+      - name: Dry-build the selected SDKs
+        if: steps.prepare.outputs.changed == 'true'
+        env:
+          TARGET: ${{ steps.target.outputs.tag }}
+        run: python3 scripts/sdk_release.py build --tag "$TARGET" --output "$RUNNER_TEMP/sdk-artifacts"
+
+  pull-request:
+    name: Open or update the SDK release PR
+    needs: prepare
+    if: needs.prepare.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - name: Check out the prepared base commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ needs.prepare.outputs.base }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Re-derive the dry-built change
+        env:
+          TARGET: ${{ needs.prepare.outputs.target }}
+          EXPECTED: ${{ needs.prepare.outputs.digest }}
+        run: |
+          set -euo pipefail
+          python3 scripts/sdk_release.py prepare --tag "$TARGET" \
+            --summary "$RUNNER_TEMP/sdk-prep.md" --changed-files "$RUNNER_TEMP/sdk-prep-files.txt"
+          actual="$(git diff --binary HEAD | sha256sum | cut -d' ' -f1)"
+          if [[ "$actual" != "$EXPECTED" ]]; then
+            echo "::error::A registry or package tag changed since the dry build; re-run this workflow."
+            exit 1
+          fi
+
+      - name: Commit, push and open or update the PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ needs.prepare.outputs.target }}
+          BASE: ${{ needs.prepare.outputs.base }}
+          REPOSITORY: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          COMPARE_URL: ${{ github.server_url }}/${{ github.repository }}/compare
+        run: |
+          set -euo pipefail
+          branch="sdk-release-prep/${TARGET}"
+          bot_email='41898282+github-actions[bot]@users.noreply.github.com'
+          git config user.name 'github-actions[bot]'
+          git config user.email "$bot_email"
+          git switch -q -c "$branch"
+          git add --pathspec-from-file="$RUNNER_TEMP/sdk-prep-files.txt"
+          if ! git diff --quiet; then
+            echo "::error::prepare changed files it did not report:"
+            git diff --stat
+            exit 1
+          fi
+          git commit -q -s -F - <<EOF
+          chore(release): prepare SDKs for ${TARGET}
+
+          Versions derived by scripts/sdk_release.py prepare from the
+          Conventional Commits since each package's last release. The
+          release.yml run for ${TARGET} publishes them.
+          EOF
+
+          # Only ever replace this workflow's own commits on the branch.
+          lease="refs/heads/${branch}:"
+          remote="$(git ls-remote --heads origin "refs/heads/${branch}" | cut -f1)"
+          if [[ -n "$remote" ]]; then
+            git fetch -q origin "refs/heads/${branch}"
+            others="$(git log --format='%ae' "${BASE}..FETCH_HEAD" | grep -vxF "$bot_email" || true)"
+            if [[ -n "$others" ]]; then
+              echo "::error::${branch} has commits from people; rebase them onto a fresh run by hand."
+              exit 1
+            fi
+            lease="refs/heads/${branch}:${remote}"
+          fi
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::${auth}"
+          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic ${auth}" \
+            push -q --force-with-lease="$lease" origin "HEAD:refs/heads/${branch}"
+
+          title="chore(release): prepare SDKs for ${TARGET}"
+          body="$RUNNER_TEMP/pr-body.md"
+          {
+            cat "$RUNNER_TEMP/sdk-prep.md"
+            echo
+            echo "Opened by the [SDK Release Prep](${RUN_URL}) workflow. Merge it before the release PR for \`${TARGET}\` so the tag contains it."
+            echo
+            echo "CI for a PR the workflow token opens or pushes to waits for approval: select **Approve workflows to run** in the merge box before merging."
+          } > "$body"
+          number="$(gh pr list --repo "$REPOSITORY" --head "$branch" --base main --state open --json number --jq '.[0].number // empty')"
+          if [[ -n "$number" ]]; then
+            gh pr edit "$number" --repo "$REPOSITORY" --title "$title" --body-file "$body"
+          elif ! gh pr create --repo "$REPOSITORY" --base main --head "$branch" --title "$title" --body-file "$body"; then
+            echo "::error::Pushed ${branch}, but this repository does not let GitHub Actions open pull requests. Allow it under Settings > Actions > General, or open ${COMPARE_URL}/main...${branch} by hand."
+            exit 1
+          fi

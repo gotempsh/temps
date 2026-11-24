@@ -3,6 +3,7 @@
 
 import type { ReactNode } from 'react'
 import type { LucideIcon } from 'lucide-react'
+import { Link } from 'react-router'
 import { Button } from '@temps-sdk/ui'
 import { cn } from './lib/cn'
 
@@ -43,7 +44,7 @@ interface NotSetUpPageStateProps extends PageStateBaseProps {
   requirement: string
   /** A concrete example of what the feature would do once configured. */
   example: ReactNode
-  /** Link straight to the settings page that configures it. */
+  /** Console path of the settings page that configures it. */
   settingsHref: string
   settingsLabel?: string
 }
@@ -60,19 +61,26 @@ export function PageState(props: PageStateProps) {
       className={cn(
         'flex flex-col items-center justify-center rounded-lg text-center animate-in fade-in-50',
         compact ? 'min-h-60 gap-3 p-6' : 'min-h-[25rem] gap-4 p-8',
-        className,
+        className
       )}
     >
       <div
         className={cn(
           'flex items-center justify-center rounded-full bg-muted',
-          compact ? 'size-14' : 'size-20',
+          compact ? 'size-14' : 'size-20'
         )}
       >
-        <Icon className={cn('text-muted-foreground', compact ? 'size-7' : 'size-10')} />
+        <Icon
+          className={cn(
+            'text-muted-foreground',
+            compact ? 'size-7' : 'size-10'
+          )}
+        />
       </div>
       <div className="max-w-md space-y-2">
-        <h3 className={cn('font-semibold', compact ? 'text-base' : 'text-lg')}>{title}</h3>
+        <h3 className={cn('font-semibold', compact ? 'text-base' : 'text-lg')}>
+          {title}
+        </h3>
         {props.variant === 'not-set-up' ? (
           <div className="space-y-2 text-left sm:text-center">
             <p className="text-sm text-muted-foreground">{props.requirement}</p>
@@ -87,7 +95,10 @@ export function PageState(props: PageStateProps) {
       </div>
       {props.variant === 'not-set-up' ? (
         <Button asChild>
-          <a href={props.settingsHref}>{props.settingsLabel ?? 'Open settings'}</a>
+          {/* A router link: a plain `<a>` would reload the whole console. */}
+          <Link to={props.settingsHref}>
+            {props.settingsLabel ?? 'Open settings'}
+          </Link>
         </Button>
       ) : (
         props.action

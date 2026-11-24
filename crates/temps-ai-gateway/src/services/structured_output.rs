@@ -197,6 +197,7 @@ impl Drop for UsageRecorder {
                     status,
                     true,
                     false,
+                    crate::types::PromptTokensDetails::default(),
                     &context,
                 )
                 .await
@@ -1065,6 +1066,8 @@ mod tests {
             model: "model-a".to_string(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_write_tokens: 0,
             latency_ms: 0,
             estimated_cost_microcents: 0,
             status: 200,
@@ -1076,6 +1079,7 @@ mod tests {
             trace_id: None,
             project_id: Some(7),
             token_id: Some(5),
+            price_known: None,
         }
     }
 

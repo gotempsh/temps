@@ -9,13 +9,14 @@ import { getActiveContext, getContext, listContexts } from '../../config/context
 import { credentials, getApiUrl, requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, getWebUrl, setupClient } from '../../lib/api-client.js'
 import { header, icons, info, keyValue, newline, success, warning } from '../../ui/output.js'
-import { promptCheckbox, promptConfirm, promptSearch, promptSelect, promptText } from '../../ui/prompts.js'
+import { promptConfirm, promptSearch, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { CLIENT_ADAPTERS, getClientAdapter, listClientIds } from './clients/index.js'
 import { TOKEN_ENV_VAR as CODEX_TOKEN_ENV_VAR } from './clients/codex.js'
 import { buildMcpUrl, isValidGroupKey, parseMcpUrl, TOOL_GROUPS } from './groups.js'
 import { probeMcpEndpoint } from './probe.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 /**
  * The scheme+host+port a URL resolves to, for comparing whether two URLs
@@ -215,7 +216,9 @@ interface AddOptions {
 export function registerMcpCommands(program: Command): void {
   const mcp = program
     .command('mcp')
-    .description('Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)')
+    .description(
+      'Configure this Temps instance as an MCP server for AI clients (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed)',
+    )
 
   mcp
     .command('enable')
@@ -229,20 +232,23 @@ export function registerMcpCommands(program: Command): void {
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .action(disableAction)
 
-  mcp
+  const addCommand = mcp
     .command('add [client]')
-    .description(`Configure an AI client to connect to this Temps instance over MCP. Clients: ${listClientIds().join(', ')}`)
-    .option('-g, --groups <groups>', 'Comma-separated tool groups to enable (default: all)')
+    .description(
+      `Configure an AI client to connect to this Temps instance over MCP. Clients: ${listClientIds().join(', ')}`,
+    )
+    .option(
+      '-g, --groups <groups>',
+      'Legacy tool-group filter (optional; does not restrict temps/temps_write permissions)',
+    )
     .option('-w, --write', 'Enable write tools (deploy, delete, restart, etc). Default: read-only')
     .option('-k, --api-key <key>', 'Use this API key instead of creating or prompting for one')
     .option('-u, --url <url>', URL_OPTION_DESCRIPTION)
     .option('-y, --yes', 'Skip prompts and confirmation (uses defaults; requires --api-key or an existing login)')
     .action(addAction)
+  addCredentialSources(addCommand, [{ flag: 'api-key', what: 'the API key' }])
 
-  mcp
-    .command('remove [client]')
-    .description('Remove the Temps MCP server from an AI client')
-    .action(removeAction)
+  mcp.command('remove [client]').description('Remove the Temps MCP server from an AI client').action(removeAction)
 
   mcp
     .command('status')
@@ -276,7 +282,9 @@ async function setMcpServerEnabled(enabled: boolean, urlOverride?: string): Prom
 async function enableAction(options: { url?: string }): Promise<void> {
   await setMcpServerEnabled(true, options.url)
   success('MCP server enabled.')
-  info('Run `bunx @temps-sdk/cli mcp add <client>` to connect an AI client (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed).')
+  info(
+    'Run `bunx @temps-sdk/cli mcp add <client>` to connect an AI client (Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, Zed).',
+  )
 }
 
 async function disableAction(options: { url?: string }): Promise<void> {
@@ -335,17 +343,10 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
       warning(`Unknown tool group(s): ${invalid.join(', ')}. Available: ${TOOL_GROUPS.map((g) => g.key).join(', ')}`)
       return
     }
-  } else if (options.yes) {
-    groups = TOOL_GROUPS.map((g) => g.key)
   } else {
-    groups = await promptCheckbox({
-      message: 'Which tool groups should be available?',
-      choices: TOOL_GROUPS.map((g) => ({
-        name: `${g.label} (${g.categories.length} categories)`,
-        value: g.key,
-      })),
-    })
-    if (groups.length === 0) groups = TOOL_GROUPS.map((g) => g.key)
+    // The virtual CLI discovers operations through --help; no group selection
+    // is needed. Keep explicit --groups for older clients and servers.
+    groups = []
   }
 
   const write =
@@ -353,13 +354,13 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
     (options.yes
       ? false
       : await promptConfirm({
-          message:
-            'Allow write tools (deploy, delete, restart, etc)? A Temps instance controls real infrastructure -- ' +
-            'even with this on, every write requires an explicit confirmation in the AI client before it executes.',
+          message: 'Enable temps_write? Writes are proposed first and require confirm_action before execution.',
           default: false,
         }))
 
   let apiKey = options.apiKey
+  // Whether this command minted the key: only then may it be shown, once.
+  let mintedKey = false
   if (!apiKey) {
     const wantsNewKey = options.yes
       ? false
@@ -384,6 +385,7 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
         return data
       })
       apiKey = created.api_key
+      mintedKey = true
       newline()
       success(`Created API key "${created.name}" (${created.key_prefix}...)`)
     } else {
@@ -402,8 +404,9 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   header(`Configure ${adapter.label}`)
   keyValue('Target', await adapter.describeTarget())
   keyValue('URL', url)
-  keyValue('Groups', groups.length === TOOL_GROUPS.length ? 'all' : groups.join(', '))
-  keyValue('Write tools', write ? 'enabled' : 'disabled (read-only)')
+  keyValue('Primary tools', write ? 'temps, temps_write, confirm_action' : 'temps (read-only)')
+  if (options.groups) keyValue('Legacy groups', groups.join(', '))
+  info('Start with temps --help. Available operations follow the API key permissions.')
   newline()
 
   if (!options.yes) {
@@ -434,9 +437,23 @@ async function addAction(clientArg: string | undefined, options: AddOptions): Pr
   // fail to authenticate.
   if (adapter.id === 'codex') {
     newline()
-    warning(`Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`)
-    info(`  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`)
+    warning(
+      `Codex reads its bearer token from the ${CODEX_TOKEN_ENV_VAR} environment variable at connect time -- export it in your shell profile, or every codex session will fail to authenticate to Temps:`,
+    )
+    info(codexTokenExportLine(apiKey, mintedKey))
   }
+}
+
+/**
+ * The shell line that exports Codex's bearer token. A key this command just
+ * minted is shown, exactly once, because there is no other way to get it; a
+ * key the user supplied (e.g. with --api-key-file) or one reused from a saved
+ * context is never printed, so it cannot end up in captured output or CI logs.
+ */
+export function codexTokenExportLine(apiKey: string, minted: boolean): string {
+  return minted
+    ? `  export ${CODEX_TOKEN_ENV_VAR}='Bearer ${apiKey}'`
+    : `  export ${CODEX_TOKEN_ENV_VAR}='Bearer <your Temps API key>'`
 }
 
 async function removeAction(clientArg: string | undefined): Promise<void> {
@@ -470,22 +487,17 @@ interface StatusRow {
   label: string
   detected: string
   installed: string
-  groups: string
+  access: string
 }
 
-/**
- * Summarizes which tool groups + write mode a client's configured URL grants,
- * for the "Tool groups" status column. Returns "-" when the client isn't
- * configured, or when its URL wasn't built by this CLI (an entry hand-edited
- * or written by another tool -- e.g. the legacy @temps-sdk/mcp package --
- * doesn't carry the groups/write query params this parses).
- */
-function formatGroups(url: string | null): string {
+/** Shows connection access without presenting legacy groups as permissions. */
+export function formatMcpAccess(url: string | null): string {
   if (!url) return '-'
   const parsed = parseMcpUrl(url)
   if (!parsed) return '-'
-  const label = parsed.groups.length === TOOL_GROUPS.length ? 'All' : `${parsed.groups.length}/${TOOL_GROUPS.length}`
-  return parsed.write ? `${label} (write)` : label
+  const access = parsed.write ? 'Read/write (confirmation)' : 'Read-only'
+  const legacyGroups = new URL(url).searchParams.get('groups')
+  return legacyGroups ? `${access}; legacy groups: ${parsed.groups.join(', ')}` : access
 }
 
 async function statusAction(options: { url?: string }): Promise<void> {
@@ -494,7 +506,10 @@ async function statusAction(options: { url?: string }): Promise<void> {
 
   header('Temps MCP status')
   newline()
-  keyValue('This instance', probe.supported ? `${icons.success} enabled (${mcpBaseUrl})` : `${icons.bullet} disabled (${mcpBaseUrl})`)
+  keyValue(
+    'This instance',
+    probe.supported ? `${icons.success} enabled (${mcpBaseUrl})` : `${icons.bullet} disabled (${mcpBaseUrl})`,
+  )
   if (!probe.supported) {
     info('Run `bunx @temps-sdk/cli mcp enable` as an admin to turn it on.')
   }
@@ -508,7 +523,7 @@ async function statusAction(options: { url?: string }): Promise<void> {
         label: adapter.label,
         detected: detected ? `${icons.success} detected` : `${icons.bullet} not detected`,
         installed: installed ? `${icons.success} configured` : `${icons.bullet} not configured`,
-        groups: formatGroups(url),
+        access: formatMcpAccess(url),
       }
     }),
   )
@@ -517,7 +532,7 @@ async function statusAction(options: { url?: string }): Promise<void> {
     { header: 'Client', key: 'label' },
     { header: 'On this machine', key: 'detected' },
     { header: 'Temps MCP server', key: 'installed' },
-    { header: 'Tool groups', key: 'groups' },
+    { header: 'Access', key: 'access' },
   ]
 
   printTable(rows, columns)

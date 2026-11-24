@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
+import type { ShieldMode } from '@/api/client/types.gen'
 import {
   updateProjectDeploymentConfigMutation,
   updateProjectSettingsMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
+import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
+import { SHIELD_MODES } from '@/lib/shield'
+import { ShieldEntriesPanel } from '@/components/shield/ShieldEntriesPanel'
+import { ShieldWouldHaveCounts } from './ShieldWouldHaveCounts'
 import { Button } from '@/components/ui/button'
 import { SettingsSection } from '@/components/ui/settings-section'
+import { SaveRow } from '@temps-sdk/ds'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -22,7 +27,7 @@ import { Separator } from '@/components/ui/separator'
 import { Switch } from '@/components/ui/switch'
 import {
   Bot,
-  InfoIcon,
+  ListChecks,
   ScanSearch,
   Shield,
   ShieldCheck,
@@ -32,6 +37,8 @@ import { useEffect, useRef } from 'react'
 import { useForm, Controller, useWatch } from 'react-hook-form'
 import { toast } from 'sonner'
 import { useMutation } from '@tanstack/react-query'
+
+/** Sections other pages link to, such as an environment's Shield tab. */
 
 interface ProjectSecuritySettingsProps {
   project: ProjectResponse
@@ -61,7 +68,7 @@ interface SecurityConfig {
 
 interface FormData {
   security: SecurityConfig
-  attack_mode?: boolean
+  shield_mode: ShieldMode
   ai_alert_summaries_enabled?: boolean
   ai_api_traffic_summary_enabled?: boolean
   vulnerability_scanning_enabled?: boolean
@@ -81,7 +88,7 @@ export function ProjectSecuritySettings({
   const updateProjectSettings = useMutation({
     ...updateProjectSettingsMutation(),
     meta: {
-      errorTitle: 'Failed to update attack mode',
+      errorTitle: 'Failed to update service settings',
     },
   })
 
@@ -94,7 +101,7 @@ export function ProjectSecuritySettings({
     formState: { isDirty, isSubmitting },
   } = useForm<FormData>({
     defaultValues: {
-      attack_mode: project.attack_mode ?? false,
+      shield_mode: project.shield_mode ?? 'log',
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
@@ -139,7 +146,7 @@ export function ProjectSecuritySettings({
   // `defaultValues` are only read on mount, but this component stays mounted
   // when the route switches between two projects' settings pages. Without
   // this reset the form would still hold the previous project's toggles, and
-  // Save would apply the old project's attack mode / AI / vulnerability
+  // Save would apply the old project's Shield mode / AI / vulnerability
   // scanning choices to the newly-selected project.
   //
   // Keyed on the project *identity*, not its values: a plain refetch of the
@@ -151,7 +158,7 @@ export function ProjectSecuritySettings({
     }
     syncedProjectId.current = project.id
     reset({
-      attack_mode: project.attack_mode ?? false,
+      shield_mode: project.shield_mode ?? 'log',
       ai_alert_summaries_enabled: project.ai_alert_summaries_enabled ?? false,
       ai_api_traffic_summary_enabled:
         project.ai_api_traffic_summary_enabled ?? false,
@@ -194,7 +201,6 @@ export function ProjectSecuritySettings({
   }, [project, reset])
 
   const securityConfig = useWatch({ control, name: 'security' })
-  const attackMode = useWatch({ control, name: 'attack_mode' })
   const aiAlertSummariesEnabled = useWatch({
     control,
     name: 'ai_alert_summaries_enabled',
@@ -212,15 +218,15 @@ export function ProjectSecuritySettings({
     if (!project?.id) return
 
     try {
-      // Collect changed project-level toggles (attack mode + AI opt-ins).
+      // Collect changed project-level settings (Shield mode + AI opt-ins).
       const projectSettings: {
-        attack_mode?: boolean
+        shield_mode?: ShieldMode
         ai_alert_summaries_enabled?: boolean
         ai_api_traffic_summary_enabled?: boolean
         vulnerability_scanning_enabled?: boolean
       } = {}
-      if (data.attack_mode !== project.attack_mode) {
-        projectSettings.attack_mode = data.attack_mode
+      if (data.shield_mode !== project.shield_mode) {
+        projectSettings.shield_mode = data.shield_mode
       }
       if (
         (data.ai_alert_summaries_enabled ?? false) !==
@@ -270,6 +276,8 @@ export function ProjectSecuritySettings({
         }
       )
 
+      // What was just saved is the new baseline: Save goes back to disabled.
+      reset(data)
       refetch()
     } catch (error) {
       // Error already handled by toast.promise
@@ -329,67 +337,68 @@ export function ProjectSecuritySettings({
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="space-y-6">
-      <Alert>
-        <InfoIcon className="h-4 w-4" />
-        <AlertTitle>Configuration Inheritance</AlertTitle>
-        <AlertDescription>
-          Service-level security settings override global settings. Leave fields
-          empty to inherit from global configuration.
-        </AlertDescription>
-      </Alert>
-
-      {/* Attack Mode Card */}
+      {/* Shield Card (ADR 066): replaces the Attack Mode card */}
       <SettingsSection
-        title="Attack Mode"
-        description="Enable CAPTCHA protection to defend against DDoS attacks and bot traffic"
+        id="shield"
+        title="Shield"
+        description="How this service acts on Shield's verdicts. Environments follow this mode unless they set their own."
         icon={Shield}
       >
         <div className="space-y-4">
-          <div className="flex items-center justify-between">
-            <div className="space-y-0.5">
-              <Label htmlFor="attack-mode">Enable Attack Mode</Label>
-              <p className="text-sm text-muted-foreground">
-                Require CAPTCHA verification for all visitors to this service
-              </p>
-            </div>
-            <Switch
-              id="attack-mode"
-              checked={attackMode ?? false}
-              onCheckedChange={(checked) =>
-                setValue('attack_mode', checked, { shouldDirty: true })
-              }
-            />
-          </div>
-          {attackMode && (
-            <>
-              <Separator />
-              <Alert>
-                <InfoIcon className="h-4 w-4" />
-                <AlertTitle>Attack Mode Active</AlertTitle>
-                <AlertDescription>
-                  All visitors will be required to complete a CAPTCHA challenge
-                  before accessing your application. Sessions are valid for 24
-                  hours.
-                </AlertDescription>
-              </Alert>
-            </>
-          )}
+          <Controller
+            control={control}
+            name="shield_mode"
+            render={({ field }) => (
+              <RadioGroup
+                value={field.value}
+                onValueChange={(value) => field.onChange(value as ShieldMode)}
+                aria-label="Shield mode"
+                className="gap-0 divide-y rounded-lg border"
+              >
+                {SHIELD_MODES.map((mode) => (
+                  <div key={mode.value} className="flex items-start gap-3 p-3">
+                    <RadioGroupItem
+                      id={`shield-mode-${mode.value}`}
+                      value={mode.value}
+                      className="mt-0.5"
+                    />
+                    <div className="min-w-0 space-y-0.5">
+                      <Label htmlFor={`shield-mode-${mode.value}`}>
+                        {mode.label}
+                      </Label>
+                      <p className="text-sm text-muted-foreground">
+                        {mode.description}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </RadioGroup>
+            )}
+          />
+          <Separator />
+          <ShieldWouldHaveCounts
+            projectId={project.id}
+            projectSlug={project.slug}
+          />
         </div>
-        <div className="mt-6">
-          <Button
-            type="submit"
-            disabled={
-              !isDirty || isSubmitting || updateDeploymentConfig.isPending
-            }
-          >
-            Save Attack Mode Settings
-          </Button>
-        </div>
+      </SettingsSection>
+
+      {/* Saved as they change, apart from the form's Save row. */}
+      <SettingsSection
+        id="shield-entries"
+        title="Shield entries"
+        description="Challenge addresses and act on TLS fingerprints in every environment"
+        icon={ListChecks}
+      >
+        <ShieldEntriesPanel
+          scope={{ kind: 'project', projectId: project.id }}
+        />
       </SettingsSection>
 
       {/* AI Assistance Card */}
       <SettingsSection
-        title="AI Assistance"
+        id="ai-assistance"
+        title="AI assistance"
         description="Configure AI summaries and assistance for this service"
         icon={Bot}
       >
@@ -435,23 +444,19 @@ export function ProjectSecuritySettings({
             />
           </div>
         </div>
-        <div className="mt-6">
-          <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save AI Settings
-          </Button>
-        </div>
       </SettingsSection>
 
       {/* Vulnerability Scanning Card */}
       <SettingsSection
-        title="Vulnerability Scanning"
+        id="vulnerability-scanning"
+        title="Vulnerability scanning"
         description="Automatically scan deployed images for known vulnerabilities after every deployment and daily"
         icon={ScanSearch}
       >
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="vulnerability-scanning">
+              <Label htmlFor="vulnerability-scanning-enabled">
                 Enable vulnerability scanning
               </Label>
               <p className="text-sm text-muted-foreground">
@@ -461,7 +466,7 @@ export function ProjectSecuritySettings({
               </p>
             </div>
             <Switch
-              id="vulnerability-scanning"
+              id="vulnerability-scanning-enabled"
               checked={vulnerabilityScanningEnabled ?? false}
               onCheckedChange={(checked) =>
                 setValue('vulnerability_scanning_enabled', checked, {
@@ -471,23 +476,19 @@ export function ProjectSecuritySettings({
             />
           </div>
         </div>
-        <div className="mt-6">
-          <Button type="submit" disabled={!isDirty || isSubmitting}>
-            Save Vulnerability Scanning Settings
-          </Button>
-        </div>
       </SettingsSection>
 
       {/* Security Headers Card */}
       <SettingsSection
-        title="Security Headers"
+        id="security-headers"
+        title="Security headers"
         description="Configure service HTTP security headers that override global settings"
         icon={ShieldCheck}
       >
         <div className="space-y-4">
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
-              <Label htmlFor="security-enabled">Enable Security Headers</Label>
+              <Label htmlFor="security-enabled">Enable security headers</Label>
               <p className="text-sm text-muted-foreground">
                 Apply security headers to HTTP responses
               </p>
@@ -505,7 +506,7 @@ export function ProjectSecuritySettings({
             <>
               <Separator />
               <div className="space-y-2">
-                <Label htmlFor="security-preset">Security Preset</Label>
+                <Label htmlFor="security-preset">Security preset</Label>
                 <Controller
                   name="security.headers.preset"
                   control={control}
@@ -547,7 +548,7 @@ export function ProjectSecuritySettings({
               {securityConfig?.headers?.preset === 'custom' && (
                 <>
                   <div className="space-y-2">
-                    <Label htmlFor="csp">Content Security Policy</Label>
+                    <Label htmlFor="csp">Content security policy</Label>
                     <Input
                       id="csp"
                       placeholder="Inherit from global or enter custom CSP"
@@ -590,21 +591,12 @@ export function ProjectSecuritySettings({
             </>
           )}
         </div>
-        <div className="mt-6">
-          <Button
-            type="submit"
-            disabled={
-              !isDirty || isSubmitting || updateDeploymentConfig.isPending
-            }
-          >
-            Save Security Configuration
-          </Button>
-        </div>
       </SettingsSection>
 
       {/* Rate Limiting Card */}
       <SettingsSection
-        title="Rate Limiting"
+        id="rate-limiting"
+        title="Rate limiting"
         description="Configure service rate limits that override global settings"
         icon={TrafficCone}
       >
@@ -612,7 +604,7 @@ export function ProjectSecuritySettings({
           <div className="flex items-center justify-between">
             <div className="space-y-0.5">
               <Label htmlFor="rate-limiting-enabled">
-                Enable Rate Limiting
+                Enable rate limiting
               </Label>
               <p className="text-sm text-muted-foreground">
                 Limit requests per IP address
@@ -633,7 +625,7 @@ export function ProjectSecuritySettings({
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-minute">
-                    Max Requests Per Minute
+                    Max requests per minute
                   </Label>
                   <Input
                     id="max-requests-per-minute"
@@ -651,7 +643,7 @@ export function ProjectSecuritySettings({
 
                 <div className="space-y-2">
                   <Label htmlFor="max-requests-per-hour">
-                    Max Requests Per Hour
+                    Max requests per hour
                   </Label>
                   <Input
                     id="max-requests-per-hour"
@@ -705,7 +697,7 @@ export function ProjectSecuritySettings({
                       size="sm"
                       onClick={handleAddWhitelistIp}
                     >
-                      Add Whitelist IP
+                      Add whitelist IP
                     </Button>
                   </div>
                 </div>
@@ -744,7 +736,7 @@ export function ProjectSecuritySettings({
                       size="sm"
                       onClick={handleAddBlacklistIp}
                     >
-                      Add Blacklist IP
+                      Add blacklist IP
                     </Button>
                   </div>
                 </div>
@@ -753,6 +745,16 @@ export function ProjectSecuritySettings({
           )}
         </div>
       </SettingsSection>
+
+      <SaveRow
+        sticky
+        dirty={isDirty}
+        saving={
+          isSubmitting ||
+          updateDeploymentConfig.isPending ||
+          updateProjectSettings.isPending
+        }
+      />
     </form>
   )
 }

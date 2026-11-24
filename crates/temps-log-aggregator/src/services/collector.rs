@@ -32,7 +32,9 @@ use tracing::{debug, error, info, warn};
 
 use crate::error::{LogAggregatorError, RetryClass};
 use crate::parser::{parse_docker_timestamp, parse_log_line};
-use crate::services::{ChunkWriterService, LogMetadataService};
+use crate::services::{
+    Admission, ChunkWriterService, IngestBudget, IngestSource, LogMetadataService, STATS_WINDOW,
+};
 use crate::types::{ContainerContext, LogLine, LogStream};
 
 /// Docker label keys set by temps.sh at container creation
@@ -72,6 +74,8 @@ pub struct CollectorService {
     docker: Arc<temps_core::DockerHandle>,
     chunk_writer: Arc<ChunkWriterService>,
     metadata_service: Arc<LogMetadataService>,
+    /// Per-container ingestion budget every stream is held to.
+    ingest_budget: Arc<IngestBudget>,
     /// DB handle used to resolve an imported external service's
     /// `temps.service_name` label to its `external_services.id`, and to verify
     /// a project-labelled container names a deployment this instance owns.
@@ -106,6 +110,7 @@ impl CollectorService {
         docker: Arc<temps_core::DockerHandle>,
         chunk_writer: Arc<ChunkWriterService>,
         metadata_service: Arc<LogMetadataService>,
+        ingest_budget: Arc<IngestBudget>,
         tail_capacity: usize,
     ) -> Self {
         let (tail_tx, _) = broadcast::channel(tail_capacity);
@@ -113,6 +118,7 @@ impl CollectorService {
             docker,
             chunk_writer,
             metadata_service,
+            ingest_budget,
             db: None,
             tail_tx,
             active_streams: Mutex::new(HashMap::new()),
@@ -186,6 +192,7 @@ impl CollectorService {
             .require()
             .map_err(LogAggregatorError::DockerUnavailable)?;
         let chunk_writer = self.chunk_writer.clone();
+        let ingest_budget = self.ingest_budget.clone();
         let tail_tx = self.tail_tx.clone();
         let container_id_owned = container_id.to_string();
         let outcome = self
@@ -194,6 +201,7 @@ impl CollectorService {
                     Self::stream_container_logs(
                         docker,
                         chunk_writer,
+                        ingest_budget,
                         tail_tx,
                         container_id_owned,
                         ctx,
@@ -739,6 +747,7 @@ impl CollectorService {
     async fn stream_container_logs(
         docker: Arc<Docker>,
         chunk_writer: Arc<ChunkWriterService>,
+        ingest_budget: Arc<IngestBudget>,
         tail_tx: broadcast::Sender<LogLine>,
         container_id: String,
         ctx: ContainerContext,
@@ -752,12 +761,30 @@ impl CollectorService {
         let mut consecutive_errors: u32 = 0;
         let mut retry_delay = std::time::Duration::from_secs(1);
         let max_retry_delay = std::time::Duration::from_secs(30);
+        // Lives as long as this task, across reconnects, so a container
+        // cannot reset its budget by breaking its stream.
+        let mut limiter = ingest_budget.limiter(IngestSource {
+            ctx: ctx.clone(),
+            node_id: None,
+            node_name: None,
+        });
 
         let options = Self::build_log_options(last_seen_ts);
         let mut stream = docker.logs(&container_id, Some(options));
 
         loop {
-            match stream.next().await {
+            // Quiet for a whole stats window: explain what the last one
+            // dropped now rather than with a next line that may never come.
+            let next = match tokio::time::timeout(STATS_WINDOW, stream.next()).await {
+                Ok(next) => next,
+                Err(_) => {
+                    if let Some(notice) = limiter.flush() {
+                        write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+                    }
+                    continue;
+                }
+            };
+            match next {
                 Some(Ok(output)) => {
                     // Reset error state on success
                     consecutive_errors = 0;
@@ -776,13 +803,28 @@ impl CollectorService {
                     };
 
                     let (ts, msg) = parse_docker_timestamp(&raw);
-                    let line = parse_log_line(msg, ts, stream_type, &ctx);
+                    // Update last seen timestamp for reconnection, whether or
+                    // not the line is kept: a dropped line is not re-fetched.
+                    last_seen_ts = ts.timestamp();
 
-                    // Update last seen timestamp for reconnection
-                    last_seen_ts = line.ts.timestamp();
+                    // Judged by when Docker stamped the line, so a replayed
+                    // backlog is held to the rate it was produced at.
+                    let admission = limiter.admit(msg.len(), ts);
+                    if let Some(notice) = limiter.take_drop_notice() {
+                        write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+                    }
+                    // An over-budget line still reaches anyone tailing live,
+                    // but is not parsed at all when nobody is.
+                    if admission != Admission::Admit && tail_tx.receiver_count() == 0 {
+                        continue;
+                    }
+                    let line = parse_log_line(msg, ts, stream_type, &ctx);
 
                     // Send to live tail subscribers (ignore errors if no subscribers)
                     let _ = tail_tx.send(line.clone());
+                    if admission != Admission::Admit {
+                        continue;
+                    }
 
                     // Buffer the line. The writer owns sealing (object write +
                     // manifest commit) itself now — nothing left to do here.
@@ -848,6 +890,27 @@ impl CollectorService {
                 }
             }
         }
+        if let Some(notice) = limiter.flush() {
+            write_drop_notice(&chunk_writer, &tail_tx, notice).await;
+        }
+    }
+}
+
+/// Write an ingestion-budget drop notice where the container's own lines
+/// go: to anyone tailing live, and to storage.
+pub(crate) async fn write_drop_notice(
+    chunk_writer: &Arc<ChunkWriterService>,
+    tail_tx: &broadcast::Sender<LogLine>,
+    notice: LogLine,
+) {
+    let _ = tail_tx.send(notice.clone());
+    let container_id = notice.container_id.clone();
+    if let Err(e) = chunk_writer.write_line(notice).await {
+        error!(
+            container_id = %container_id,
+            error = %e,
+            "Failed to write log drop notice to chunk buffer"
+        );
     }
 }
 
@@ -886,7 +949,8 @@ mod tests {
                 .await
                 .unwrap();
         let metadata = Arc::new(LogMetadataService::new(db.clone()));
-        CollectorService::new(handle, chunk_writer, metadata, 16).with_db(db)
+        let budget = Arc::new(IngestBudget::new(crate::services::IngestLimits::UNLIMITED));
+        CollectorService::new(handle, chunk_writer, metadata, budget, 16).with_db(db)
     }
 
     fn member(service_id: i32, container_name: &str) -> temps_entities::service_members::Model {
@@ -1247,6 +1311,7 @@ mod tests {
                 Arc::new(temps_core::DockerHandle::available(docker)),
                 chunk_writer,
                 Arc::new(LogMetadataService::new(db.clone())),
+                Arc::new(IngestBudget::new(crate::services::IngestLimits::UNLIMITED)),
                 16,
             )
             .with_db(db),

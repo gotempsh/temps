@@ -22,34 +22,17 @@ import { Link } from 'react-router'
 import {
   deploymentPollingInterval,
   deploymentReference,
+  deploymentStatusPresentation,
   isActiveDeploymentStatus,
   isFailedDeploymentStatus,
+  isReadyDeploymentStatus,
   matchingDeployment,
 } from './deployment-card-state'
 
-function statusPresentation(status: string) {
-  if (status === 'completed') {
-    return {
-      label: 'Ready',
-      className: 'text-green-700 dark:text-green-400',
-    }
-  }
-  if (isFailedDeploymentStatus(status)) {
-    return {
-      label: status === 'failed' ? 'Failed' : 'Cancelled',
-      className: 'text-destructive',
-    }
-  }
-  if (status === 'paused') {
-    return { label: 'Paused', className: 'text-amber-700 dark:text-amber-400' }
-  }
-  return {
-    label: status === 'running' ? 'Deploying' : 'Queued',
-    className: 'text-blue-600 dark:text-blue-400',
-  }
-}
+/** Kept under its old name for the chat panels that import it from here. */
+export const statusPresentation = deploymentStatusPresentation
 
-function JobStatusIcon({ status }: { status: string }) {
+export function JobStatusIcon({ status }: { status: string }) {
   if (status === 'success') {
     return (
       <CheckCircle2 className="size-3.5 text-green-600 dark:text-green-400" />
@@ -205,7 +188,7 @@ export function GeneratedDeploymentCard({
                   />
                 ))}
               </span>
-            ) : deployment?.status === 'completed' ? (
+            ) : isReadyDeploymentStatus(deployment?.status ?? '') ? (
               <CheckCircle2 className="size-4" />
             ) : isFailedDeploymentStatus(deployment?.status ?? '') ? (
               <XCircle className="size-4" />
@@ -272,7 +255,7 @@ export function GeneratedDeploymentCard({
               <ArrowRight aria-hidden="true" />
             </Link>
           </Button>
-          {deployment.status === 'completed' && deployment.url && (
+          {isReadyDeploymentStatus(deployment.status) && deployment.url && (
             <Button asChild size="sm" variant="ghost" className="h-8">
               <a
                 href={deployment.url}

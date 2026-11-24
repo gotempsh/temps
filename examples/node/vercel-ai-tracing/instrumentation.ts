@@ -18,7 +18,7 @@
 import { NodeSDK } from "@opentelemetry/sdk-node";
 import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-node";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
-import { Resource } from "@opentelemetry/resources";
+import { resourceFromAttributes } from "@opentelemetry/resources";
 
 let sdk: NodeSDK | null = null;
 
@@ -47,7 +47,7 @@ export function setupTracing(opts?: {
   });
 
   sdk = new NodeSDK({
-    resource: new Resource({
+    resource: resourceFromAttributes({
       "service.name": serviceName,
       "service.version": "1.0.0",
       "deployment.environment": "development",

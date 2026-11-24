@@ -245,6 +245,21 @@ pub trait OtelStorage: Send + Sync {
     /// Get all spans for a single trace ID.
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>>;
 
+    /// The first `max_spans` spans of a trace by start time, for background
+    /// readers that must not load a huge trace whole (ADR 111, D2). Backends
+    /// that can bound the read in their query override this; the default
+    /// truncates [`Self::get_trace`].
+    async fn get_trace_spans(
+        &self,
+        project_id: i32,
+        trace_id: &str,
+        max_spans: usize,
+    ) -> StorageResult<Vec<SpanRecord>> {
+        let mut spans = self.get_trace(project_id, trace_id).await?;
+        spans.truncate(max_spans);
+        Ok(spans)
+    }
+
     /// Fetch a trace in a bounded window. Local backends filter their existing
     /// trace lookup; the Cloud router applies the bounds in SQL.
     async fn get_trace_in_window(
@@ -285,6 +300,18 @@ pub trait OtelStorage: Send + Sync {
     /// Returns the number of pairs submitted (duplicates included — both
     /// backends dedupe internally).
     async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64>;
+
+    /// [`Self::record_trace_refs`] for several projects at once, as
+    /// `(project_id, trace_ids)` pairs. The default records each project in
+    /// turn; backends where every call is its own insert (ClickHouse, where
+    /// each insert is a new part to merge) override it to write one insert.
+    async fn record_trace_refs_batch(&self, refs: &[(i32, Vec<String>)]) -> StorageResult<u64> {
+        let mut submitted = 0;
+        for (project_id, trace_ids) in refs {
+            submitted += self.record_trace_refs(trace_ids, *project_id).await?;
+        }
+        Ok(submitted)
+    }
 
     /// Return every `(project_id, first_seen)` pair recorded for
     /// `trace_id`, at most one entry per project (earliest `first_seen`

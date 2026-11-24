@@ -26,12 +26,18 @@ use sea_orm::{
 use tokio::sync::Mutex;
 
 use crate::oidc_errors::OidcError;
+
+mod cloud_sessions;
 use crate::oidc_types::{
     derive_provider_slug, role_mapping_to_response, CreateOidcProviderRequest,
     CreateOidcRoleMappingRequest, OidcProviderSummary, OidcRoleMappingResponse,
     UpdateOidcProviderRequest,
 };
 use crate::user_service::UserService;
+pub use cloud_sessions::{
+    CloudLogoutApplied, CloudLogoutRefusal, CloudSessionCheck, CloudSessionStatus,
+    CLOUD_SESSION_CHECK_INTERVAL, CLOUD_SESSION_STALE_AFTER,
+};
 use temps_core::EncryptionService;
 use temps_entities::oidc_login_states;
 use temps_entities::oidc_providers;
@@ -148,7 +154,10 @@ impl reqwest::dns::Resolve for BlocklistResolver {
 /// `jwks_uri` or `token_endpoint` at `http://127.0.0.1:6379/` would otherwise
 /// be fetched no matter what the issuer pre-check decided.
 struct OidcHttpClient {
-    inner: reqwest::Client,
+    /// `Err` holds why the client could not be built at service init (the
+    /// platform TLS / cert store is unusable). Every IdP call then fails with
+    /// that reason instead of the whole server panicking at startup.
+    inner: Result<reqwest::Client, String>,
 }
 
 impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
@@ -166,7 +175,12 @@ impl<'c> AsyncHttpClient<'c> for OidcHttpClient {
             );
             return Box::pin(std::future::ready(Err(HttpClientError::Other(reason))));
         }
-        self.inner.call(request)
+        match &self.inner {
+            Ok(client) => client.call(request),
+            Err(reason) => Box::pin(std::future::ready(Err(HttpClientError::Other(format!(
+                "OIDC HTTP client is unavailable because it failed to build at startup: {reason}"
+            ))))),
+        }
     }
 }
 
@@ -283,11 +297,10 @@ impl OidcService {
         //     malicious IdP could otherwise 302 us to an internal
         //     URL on first request.
         //
-        // We `expect` here because failure of `ClientBuilder::build`
-        // means the platform's rustls / native cert store is broken,
-        // which is unrecoverable at the service layer. If this fires
-        // in production it's an "install OS certs" problem, not a
-        // runtime concern.
+        // A failure of `ClientBuilder::build` means the platform's rustls /
+        // native cert store is broken. That is an "install OS certs"
+        // problem, so it is logged here and every OIDC request then fails
+        // with the reason, rather than taking the whole server down.
         // `BlocklistResolver` re-validates every resolved IP at connect time,
         // closing the TOCTOU window between `assert_issuer_host_allowed`
         // (which runs before the HTTP attempt) and the actual TCP connect
@@ -299,7 +312,13 @@ impl OidcService {
             .redirect(reqwest::redirect::Policy::none())
             .dns_resolver(Arc::new(BlocklistResolver))
             .build()
-            .expect("OIDC reqwest client should build; OS TLS / cert store is unusable");
+            .map_err(|e| {
+                tracing::error!(
+                    error = %e,
+                    "Failed to build the OIDC HTTP client; OS TLS / cert store is unusable, OIDC logins will fail"
+                );
+                e.to_string()
+            });
         let http_client = OidcHttpClient { inner: http_client };
 
         Self {
@@ -405,7 +424,7 @@ impl OidcService {
             .await?;
         let encrypted_secret = self
             .encryption_service
-            .encrypt_string(&request.client_secret)
+            .encrypt_string(request.client_secret.expose())
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: request.issuer_url.clone(),
                 reason: format!("failed to encrypt client secret: {e}"),
@@ -470,7 +489,7 @@ impl OidcService {
         if let Some(client_secret) = request.client_secret {
             let encrypted_secret = self
                 .encryption_service
-                .encrypt_string(&client_secret)
+                .encrypt_string(client_secret.expose())
                 .map_err(|e| OidcError::DiscoveryFailed {
                     issuer: "local".into(),
                     reason: format!("failed to encrypt client secret: {e}"),
@@ -554,11 +573,20 @@ impl OidcService {
             ))
             .await?;
 
+        // The Temps-login ingress grants those sessions minted would keep
+        // opening protected environments for up to twelve hours otherwise.
+        // Same user set as the session delete above (pending MFA challenges
+        // never mint a grant, so the `mfa_pending_origin` arm has no
+        // counterpart here).
+        let grants_revoked =
+            crate::ingress_grants::revoke_for_oidc_provider(conn, provider_id).await?;
+
         tracing::info!(
             target: "temps_auth::oidc",
             provider_id = provider_id,
             sessions_revoked = result.rows_affected(),
-            "Revoked SSO sessions for provider"
+            ingress_grants_revoked = grants_revoked,
+            "Revoked SSO sessions and ingress login grants for provider"
         );
 
         Ok(())
@@ -692,8 +720,10 @@ impl OidcService {
 
         txn.execute(Statement::from_sql_and_values(
             DatabaseBackend::Postgres,
+            // The column holds the token's digest, never the token (see
+            // `auth_service::stored_session_token`).
             "DELETE FROM sessions WHERE session_token = $1",
-            vec![session_token.into()],
+            vec![crate::auth_service::stored_session_token(session_token).into()],
         ))
         .await?;
         txn.commit().await?;
@@ -835,6 +865,7 @@ impl OidcService {
                 active.client_id = Set(client_id);
                 active.client_secret_encrypted = Set(encrypted_secret);
                 active.enabled = Set(true);
+                active.trust_idp_email = Set(false);
                 let updated = active.update(&txn).await?;
                 self.discovery_cache.lock().await.remove(&provider_id);
                 updated
@@ -867,11 +898,10 @@ impl OidcService {
                     group_claim: Set(CLOUD_MANAGED_OIDC_ROLE_CLAIM.to_string()),
                     role_claim: Set(CLOUD_MANAGED_OIDC_ROLE_CLAIM.to_string()),
                     default_role: Set(RoleType::User.as_str().to_string()),
-                    // Reaching this exchange already required operator-level
-                    // access to the Cloud account this instance is enrolled
-                    // under (ADR-045 §4's documented carve-out for
-                    // admin-controlled IdPs).
-                    trust_idp_email: Set(true),
+                    // Cloud must supply verified email provenance, even for
+                    // returning subjects. Enrollment and instance roles are
+                    // separate evidence and cannot substitute for it.
+                    trust_idp_email: Set(false),
                     managed_by_cloud: Set(true),
                     admin_only_role_required: Set(true),
                     ..Default::default()
@@ -1161,13 +1191,13 @@ impl OidcService {
             .await?;
 
         let row = row.ok_or_else(|| OidcError::StateNotFound {
-            state: state.to_string(),
+            state: "<redacted>".into(),
         })?;
 
-        if row.expires_at < Utc::now() {
+        if row.expires_at <= Utc::now() {
             let age_secs = (Utc::now() - row.expires_at).num_seconds().abs();
             return Err(OidcError::StateExpired {
-                state: state.to_string(),
+                state: "<redacted>".into(),
                 age_secs,
             });
         }
@@ -1287,6 +1317,14 @@ impl OidcService {
         raw_claims: &serde_json::Value,
     ) -> Result<OidcResolvedUser, OidcError> {
         let provider = self.get_provider(provider_id).await?;
+        // A persisted older managed row may still carry the former trust
+        // exception until reconnect. Enforce this at use, before the existing
+        // subject fast path, role mutation, linking or JIT provisioning.
+        if provider.managed_by_cloud && claims.email_verified() != Some(true) {
+            return Err(OidcError::EmailNotVerified {
+                email: "<redacted>".into(),
+            });
+        }
         let mappings = self.load_role_mappings(provider_id).await?;
         let group_claim_name = claim_name_or_default(&provider.group_claim, "groups");
         // SECURITY (fixed post-audit): `admin_only_role_required` providers
@@ -2446,6 +2484,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2506,6 +2545,7 @@ mod tests {
             trust_idp_email: false,
             managed_by_cloud: false,
             admin_only_role_required: false,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -2543,6 +2583,7 @@ mod tests {
             trust_idp_email: true,
             managed_by_cloud: true,
             admin_only_role_required: true,
+            cloud_sessions_confirmed_at: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2737,9 +2778,8 @@ mod tests {
     // testcontainers); skips gracefully rather than failing the run when
     // Docker is unavailable, per CLAUDE.md.
 
-    async fn test_oidc_service() -> Option<(temps_database::test_utils::TestDatabase, OidcService)>
-    {
-        let db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+    async fn test_oidc_service() -> Option<(temps_test_utils::TestDatabase, OidcService)> {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("Docker not available, skipping test: {e}");
@@ -2775,7 +2815,7 @@ mod tests {
 
         assert!(provider.managed_by_cloud);
         assert!(provider.admin_only_role_required);
-        assert!(provider.trust_idp_email);
+        assert!(!provider.trust_idp_email);
         assert!(provider.jit_provisioning);
         assert_eq!(provider.template, CLOUD_MANAGED_OIDC_TEMPLATE);
         assert_eq!(provider.role_claim, CLOUD_MANAGED_OIDC_ROLE_CLAIM);
@@ -2994,11 +3034,31 @@ mod tests {
         .insert(db.db.as_ref())
         .await
         .expect("test session must insert");
+        let grant = crate::ingress_grants::test_support::live_grant(&db.db, user.id).await;
+        let local_user = users::ActiveModel {
+            name: Set("Local User".to_string()),
+            email: Set("local-user@example.com".to_string()),
+            email_verified: Set(true),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .expect("local user must insert");
+        let local_grant =
+            crate::ingress_grants::test_support::live_grant(&db.db, local_user.id).await;
 
         assert!(service
             .revoke_managed_cloud_provider()
             .await
             .expect("revoke must succeed"));
+        assert!(
+            crate::ingress_grants::test_support::is_revoked(&db.db, grant).await,
+            "an ingress grant minted from a session of the revoked provider must end with it"
+        );
+        assert!(
+            !crate::ingress_grants::test_support::is_revoked(&db.db, local_grant).await,
+            "users who do not sign in through the provider keep their grants"
+        );
 
         let remaining = sessions::Entity::find()
             .filter(sessions::Column::UserId.eq(user.id))
@@ -3090,7 +3150,7 @@ mod tests {
                 name: "Shadow Provider".to_string(),
                 issuer_url: "https://cloud.example.com".to_string(),
                 client_id: "shadow-client".to_string(),
-                client_secret: "shadow-secret".to_string(),
+                client_secret: "shadow-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -3140,7 +3200,7 @@ mod tests {
                 name: "Keycloak".to_string(),
                 issuer_url: "https://keycloak.example.com/realms/temps".to_string(),
                 client_id: "keycloak-client".to_string(),
-                client_secret: "keycloak-secret".to_string(),
+                client_secret: "keycloak-secret".into(),
                 scopes: "openid email profile".to_string(),
                 jit_provisioning: true,
                 enabled: true,
@@ -3226,7 +3286,7 @@ mod tests {
             name: name.to_string(),
             issuer_url: issuer_url.to_string(),
             client_id: "ordinary-client".to_string(),
-            client_secret: "ordinary-secret".to_string(),
+            client_secret: "ordinary-secret".into(),
             scopes: "openid email profile".to_string(),
             jit_provisioning: true,
             enabled: true,
@@ -3504,10 +3564,11 @@ mod tests {
         .await
         .expect("test user must insert");
 
-        // A live provider: the login keeps its session.
+        // A live provider: the login keeps its session. The rows store the
+        // token's digest, the way `create_session` writes them.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("live-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("live-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3520,7 +3581,10 @@ mod tests {
             .await
             .expect("a login completing against a live provider must keep its session");
         assert!(sessions::Entity::find()
-            .filter(sessions::Column::SessionToken.eq("live-session"))
+            .filter(
+                sessions::Column::SessionToken
+                    .eq(crate::auth_service::stored_session_token("live-session"))
+            )
             .one(db.db.as_ref())
             .await
             .expect("query must succeed")
@@ -3535,7 +3599,7 @@ mod tests {
         // revocation already deleted everything it could see.
         sessions::ActiveModel {
             user_id: Set(user.id),
-            session_token: Set("raced-session".to_string()),
+            session_token: Set(crate::auth_service::stored_session_token("raced-session")),
             expires_at: Set(Utc::now() + ChronoDuration::hours(1)),
             mfa_pending: Set(false),
             ..Default::default()
@@ -3554,7 +3618,10 @@ mod tests {
         ));
         assert!(
             sessions::Entity::find()
-                .filter(sessions::Column::SessionToken.eq("raced-session"))
+                .filter(
+                    sessions::Column::SessionToken
+                        .eq(crate::auth_service::stored_session_token("raced-session"))
+                )
                 .one(db.db.as_ref())
                 .await
                 .expect("query must succeed")
@@ -3884,5 +3951,176 @@ mod tests {
                 .oidc_subject,
             None
         );
+    }
+
+    #[tokio::test]
+    async fn managed_cloud_requires_verified_email_for_new_and_returning_subjects() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "managed-verification-test",
+        ));
+        let service = OidcService::new(
+            db.db.clone(),
+            encryption.clone(),
+            Arc::new(UserService::new(db.db.clone(), encryption)),
+        );
+        service.user_service.initialize_roles().await.unwrap();
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        assert!(!provider.trust_idp_email);
+        let claims = |verified: Option<bool>| -> CoreIdTokenClaims {
+            let mut value = serde_json::json!({
+                "iss": "https://idp.example.test", "sub": "stable-cloud-user-fixture",
+                "aud": "cloud-client-id", "iat": Utc::now().timestamp(),
+                "exp": (Utc::now() + ChronoDuration::minutes(2)).timestamp(),
+                "email": "member@example.test", "name": "Cloud member"
+            });
+            if let Some(flag) = verified {
+                value["email_verified"] = flag.into();
+            }
+            serde_json::from_value(value).unwrap()
+        };
+        let owner = serde_json::json!({CLOUD_MANAGED_OIDC_ROLE_CLAIM: "owner"});
+        for evidence in [None, Some(false)] {
+            assert!(matches!(
+                service
+                    .resolve_user(provider.id, &claims(evidence), &owner)
+                    .await,
+                Err(OidcError::EmailNotVerified { .. })
+            ));
+        }
+        assert_eq!(
+            users::Entity::find().count(db.db.as_ref()).await.unwrap(),
+            0
+        );
+        let user = service
+            .resolve_user(provider.id, &claims(Some(true)), &owner)
+            .await
+            .unwrap()
+            .user;
+        assert!(user.email_verified);
+        // Simulate a row written by an older binary before it reconnects.
+        let mut legacy: oidc_providers::ActiveModel = provider.clone().into();
+        legacy.trust_idp_email = Set(true);
+        legacy.update(db.db.as_ref()).await.unwrap();
+        for evidence in [None, Some(false)] {
+            assert!(
+                matches!(
+                    service
+                        .resolve_user(provider.id, &claims(evidence), &owner)
+                        .await,
+                    Err(OidcError::EmailNotVerified { .. })
+                ),
+                "an existing subject or legacy trust flag cannot bypass evidence"
+            );
+        }
+        let viewer = serde_json::json!({CLOUD_MANAGED_OIDC_ROLE_CLAIM: "viewer"});
+        assert!(matches!(
+            service
+                .resolve_user(provider.id, &claims(Some(true)), &viewer)
+                .await,
+            Err(OidcError::InsufficientRole { .. })
+        ));
+        assert_eq!(
+            users::Entity::find().count(db.db.as_ref()).await.unwrap(),
+            1
+        );
+        let updated = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        assert!(
+            !updated.trust_idp_email,
+            "reconnect migrates the legacy exception"
+        );
+        let returning = service
+            .resolve_user(provider.id, &claims(Some(true)), &owner)
+            .await
+            .unwrap();
+        assert_eq!(returning.user.id, user.id);
+        println!("PASS: real Postgres managed Cloud identity requires verified email for new/returning subjects, rejects viewer roles, reuses stable identity and removes the legacy trust exception on reconnect");
+    }
+    #[tokio::test]
+    async fn login_state_is_single_use_expires_at_its_deadline_and_redacts_state() {
+        let db = match temps_test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {error}");
+                return;
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        };
+        let encryption = Arc::new(temps_core::EncryptionService::new_from_password(
+            "login-state-test",
+        ));
+        let service = OidcService::new(
+            db.db.clone(),
+            encryption.clone(),
+            Arc::new(UserService::new(db.db.clone(), encryption)),
+        );
+        let provider = service
+            .upsert_managed_cloud_provider(managed_config("https://idp.example.test"))
+            .await
+            .unwrap();
+        let state = "single-use-attempt-fixture";
+        oidc_login_states::ActiveModel {
+            state: Set(state.into()),
+            nonce: Set("nonce-fixture".into()),
+            pkce_verifier: Set("verifier-fixture".into()),
+            provider_id: Set(provider.id),
+            expires_at: Set(Utc::now() + ChronoDuration::minutes(10)),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let (a, b) = tokio::join!(
+            service.consume_login_state(state),
+            service.consume_login_state(state)
+        );
+        assert_eq!(
+            usize::from(a.is_ok()) + usize::from(b.is_ok()),
+            1,
+            "a login attempt completes exactly once"
+        );
+        let failure = a.err().or_else(|| b.err()).unwrap();
+        assert!(matches!(failure, OidcError::StateNotFound { .. }));
+        assert!(!format!("{failure:?}").contains(state));
+        assert!(!failure.to_string().contains(state));
+        let problem: temps_core::problemdetails::Problem = failure.into();
+        assert!(!format!("{problem:?}").contains(state));
+
+        // A state whose deadline is now is already expired.
+        let expired = "expired-attempt-fixture";
+        oidc_login_states::ActiveModel {
+            state: Set(expired.into()),
+            nonce: Set("nonce-fixture".into()),
+            pkce_verifier: Set("verifier-fixture".into()),
+            provider_id: Set(provider.id),
+            expires_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let error = service.consume_login_state(expired).await.err().unwrap();
+        assert!(matches!(error, OidcError::StateExpired { .. }));
+        assert!(!format!("{error:?}").contains(expired));
+        assert!(!error.to_string().contains(expired));
+        let problem: temps_core::problemdetails::Problem = error.into();
+        assert!(!format!("{problem:?}").contains(expired));
     }
 }

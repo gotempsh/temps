@@ -2,13 +2,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use super::AuthState;
+
+mod user_errors;
 use crate::audit::{
-    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerificationRequestedAudit,
+    AdminMfaResetAudit, AdminPasswordResetAudit, ConcurrentSessionDetectedAudit,
     EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit, MfaDisabledAudit,
     MfaEnabledAudit, MfaSetupStartedAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
     PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
-    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserEmailMarkedVerifiedAudit,
-    UserRestoredAudit, UserUpdatedAudit,
+    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
 use crate::context::AuthContext;
@@ -26,7 +27,6 @@ use axum::{
     Json, Router,
 };
 use cookie;
-use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::HashMap;
@@ -41,9 +41,9 @@ use utoipa::{OpenApi, ToSchema};
 use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
-    MfaSetupResponse, MfaVerificationRequest, ResetUserPasswordResponse, RouteRole, RouteUser,
-    RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest,
-    UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
+    MfaSetupResponse, MfaVerificationRequest, ResetUserMfaResponse, ResetUserPasswordResponse,
+    RouteRole, RouteUser, RouteUserWithRoles, SetupMfaRequest, StepUpResponse, TokenRenewalRequest,
+    UpdateSelfRequest, UpdateUserRequest, UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -293,13 +293,14 @@ pub async fn logout(
 
     match auth_state.auth_service.logout(user.id, &headers).await {
         Ok(_) => {
+            // Both names: the browser may hold the host-only cookie this
+            // release issues or an unprefixed one from before it, and a
+            // sign-out that leaves either behind means the next request
+            // still presents a dead session.
             let mut headers = HeaderMap::new();
-            headers.insert(
-                SET_COOKIE,
-                "session=; Max-Age=0; Path=/; HttpOnly; Secure; SameSite=Strict"
-                    .parse()
-                    .unwrap(),
-            );
+            for value in crate::auth_cookies::clearing_values(crate::auth_cookies::SESSION) {
+                headers.append(SET_COOKIE, value);
+            }
             (StatusCode::OK, headers, Json(json!({"status": "success"}))).into_response()
         }
         Err(e) => {
@@ -332,19 +333,12 @@ pub async fn verify_mfa_challenge(
     headers: HeaderMap,
     Json(verification): Json<MfaVerificationRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    // Extract and decrypt MFA session from cookie
-    let encrypted_mfa_session = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|cookie_str| Cookie::split_parse(cookie_str).filter_map(Result::ok))
-        .find_map(|cookie| {
-            if cookie.name() == "mfa_session" {
-                Some(cookie.value().to_string())
-            } else {
-                None
-            }
-        });
+    // Extract and decrypt MFA session from cookie, host-only name first.
+    let encrypted_mfa_session = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::MFA_SESSION,
+        metadata.is_secure,
+    );
     let encrypted_mfa_session = match encrypted_mfa_session {
         Some(session) => session,
         None => {
@@ -490,13 +484,13 @@ pub async fn verify_mfa_challenge(
                 .create_session_cookie(&session_token_encrypted, metadata.is_secure);
 
             // // Clear the MFA session cookie
-            let clear_mfa_cookie = Cookie::build(("mfa_session", ""))
-                .http_only(true)
-                .path("/")
-                .max_age(cookie::time::Duration::seconds(0))
-                .same_site(cookie::SameSite::Strict)
-                .secure(metadata.is_secure)
-                .build();
+            let clear_mfa_cookie = crate::auth_cookies::builder(
+                crate::auth_cookies::MFA_SESSION,
+                "",
+                metadata.is_secure,
+            )
+            .max_age(cookie::time::Duration::seconds(0))
+            .build();
             let clear_cookie_header = match clear_mfa_cookie.to_string().parse() {
                 Ok(cookie_header) => cookie_header,
                 Err(error) => {
@@ -723,8 +717,8 @@ pub async fn verify_step_up(
         reset_password,
         change_required_password,
         verify_email,
-        resend_email_verification,
-        mark_user_email_verified,
+        crate::email_verification_handlers::resend_email_verification,
+        crate::email_verification_handlers::mark_user_email_verified,
         list_users,
         create_user,
         delete_user,
@@ -762,7 +756,7 @@ pub async fn verify_step_up(
             RequiredPasswordChangeResponse,
             AuthResponse,
             EmailStatusResponse,
-            VerificationEmailSentResponse,
+            crate::email_verification_handlers::VerificationEmailSentResponse,
             crate::oidc_types::OidcProviderSummary,
             RouteUser,
             RouteRole,
@@ -800,10 +794,19 @@ pub async fn verify_step_up(
 )]
 pub struct AuthApiDoc;
 
+/// Per-IP budget for the OIDC login start and callback routes, which take no
+/// credentials (see `configure_routes`). The credential routes keep the default
+/// of 10 a minute.
+const OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE: u32 = 120;
+
 pub fn configure_routes() -> Router<Arc<AuthState>> {
     use crate::rate_limit::{auth_rate_limit_middleware, AuthRateLimitConfig, AuthRateLimiter};
 
     let rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig::default());
+    let oidc_rate_limiter = AuthRateLimiter::new(AuthRateLimitConfig {
+        max_requests: OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE,
+        ..Default::default()
+    });
 
     // Auth-sensitive routes that are rate limited to prevent brute force attacks.
     // These are the public-facing endpoints that accept credentials or tokens.
@@ -816,19 +819,35 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             post(crate::cli_device_handler::cli_device_start),
         )
         .route("/auth/password-reset/request", post(request_password_reset))
-        .route("/auth/resend-verification", post(resend_email_verification))
+        .route(
+            "/auth/resend-verification",
+            post(crate::email_verification_handlers::resend_email_verification),
+        )
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
             "/auth/password-change-required",
             post(change_required_password),
         )
+        // `Extension` must be added last (outermost) so it runs before
+        // `auth_rate_limit_middleware` on the way in — Axum composes
+        // `.layer()` calls like an onion, and the layer added last wraps
+        // everything before it, seeing the request first.
+        .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
+        .layer(axum::Extension(rate_limiter));
+
+    // OIDC login start and callback take no credentials: the start routes only
+    // redirect to the identity provider and the callback checks a signed
+    // `state`, so there is nothing to brute-force. They get a larger budget of
+    // their own because behind a container bridge or gateway every browser
+    // shares one peer IP, and ten redirects a minute would lock out everyone.
+    // Same layer order as above.
+    let oidc_login_routes = Router::new()
         .route(
             "/auth/oidc/login/{slug}",
             get(crate::oidc_handler::start_oidc_login_by_slug),
         )
         // Fixed address for the Cloud-managed provider (Cloud's "Open
-        // console" links here); rate-limited with the slug route because it
-        // is the same login start.
+        // console" links here); same login start as the slug route.
         .route(
             "/auth/oidc/cloud/login",
             get(crate::oidc_handler::start_managed_cloud_login),
@@ -837,12 +856,8 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             "/auth/oidc/callback",
             get(crate::oidc_handler::oidc_callback),
         )
-        // `Extension` must be added last (outermost) so it runs before
-        // `auth_rate_limit_middleware` on the way in — Axum composes
-        // `.layer()` calls like an onion, and the layer added last wraps
-        // everything before it, seeing the request first.
         .layer(axum::middleware::from_fn(auth_rate_limit_middleware))
-        .layer(axum::Extension(rate_limiter));
+        .layer(axum::Extension(oidc_rate_limiter));
 
     // Device polling runs every few seconds for the whole login, so it has
     // its own budget instead of the brute-force limiter above; see
@@ -893,13 +908,15 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}/restore", post(restore_user))
         .route(
             "/users/{user_id}/verify-email",
-            post(mark_user_email_verified),
+            post(crate::email_verification_handlers::mark_user_email_verified),
         )
         .route("/users/{user_id}/password", post(reset_user_password))
+        .route("/users/{user_id}/mfa", delete(reset_user_mfa))
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
 
     rate_limited_auth_routes
+        .merge(oidc_login_routes)
         .merge(device_poll_routes)
         .merge(authenticated_routes)
 }
@@ -1157,14 +1174,13 @@ pub async fn login(
                             )
                     })?;
 
-                let password_change_cookie =
-                    Cookie::build(("password_change_session", encrypted_token))
-                        .http_only(true)
-                        .path("/")
-                        .max_age(cookie::time::Duration::minutes(15))
-                        .same_site(cookie::SameSite::Strict)
-                        .secure(metadata.is_secure)
-                        .build();
+                let password_change_cookie = crate::auth_cookies::builder(
+                    crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+                    encrypted_token,
+                    metadata.is_secure,
+                )
+                .max_age(cookie::time::Duration::minutes(15))
+                .build();
                 let cookie_header =
                     password_change_cookie
                         .to_string()
@@ -1241,13 +1257,13 @@ pub async fn login(
 
                         // Create MFA cookie
                         let mut headers = HeaderMap::new();
-                        let mfa_cookie = cookie::Cookie::build(("mfa_session", encrypted_token))
-                            .http_only(true)
-                            .path("/")
-                            .max_age(cookie::time::Duration::minutes(5))
-                            .same_site(cookie::SameSite::Strict)
-                            .secure(metadata.is_secure)
-                            .build();
+                        let mfa_cookie = crate::auth_cookies::builder(
+                            crate::auth_cookies::MFA_SESSION,
+                            encrypted_token,
+                            metadata.is_secure,
+                        )
+                        .max_age(cookie::time::Duration::minutes(5))
+                        .build();
                         let cookie_header = match mfa_cookie.to_string().parse() {
                             Ok(cookie_header) => cookie_header,
                             Err(error) => {
@@ -1674,19 +1690,16 @@ pub async fn change_required_password(
     headers: HeaderMap,
     Json(request): Json<RequiredPasswordChangeRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    let encrypted_token = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|cookie_header| Cookie::split_parse(cookie_header).filter_map(Result::ok))
-        .find_map(|cookie| {
-            (cookie.name() == "password_change_session").then(|| cookie.value().to_string())
-        })
-        .ok_or_else(|| {
-            problem_new(StatusCode::UNAUTHORIZED)
-                .with_title("Password Change Session Required")
-                .with_detail("Log in again to restart the required password change.")
-        })?;
+    let encrypted_token = crate::auth_cookies::read(
+        &headers,
+        crate::auth_cookies::PASSWORD_CHANGE_SESSION,
+        metadata.is_secure,
+    )
+    .ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Password Change Session Required")
+            .with_detail("Log in again to restart the required password change.")
+    })?;
 
     let token = state
         .cookie_crypto
@@ -1712,21 +1725,11 @@ pub async fn change_required_password(
     // Prepare the response cookie before changing the password. If header
     // construction fails, the temporary credential remains usable and the
     // user can safely retry instead of being locked out.
-    let clear_cookie = Cookie::build(("password_change_session", ""))
-        .http_only(true)
-        .path("/")
-        .max_age(cookie::time::Duration::seconds(0))
-        .same_site(cookie::SameSite::Strict)
-        .secure(metadata.is_secure)
-        .build();
-    let cookie_header = clear_cookie.to_string().parse().map_err(|error| {
-        error!(error = %error, "Failed to clear required password-change cookie");
-        problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Password Change Failed")
-            .with_detail("Could not prepare the password change. Please try again.")
-    })?;
     let mut response_headers = HeaderMap::new();
-    response_headers.append(SET_COOKIE, cookie_header);
+    for value in crate::auth_cookies::clearing_values(crate::auth_cookies::PASSWORD_CHANGE_SESSION)
+    {
+        response_headers.append(SET_COOKIE, value);
+    }
 
     let requires_mfa_enrollment = state
         .auth_service
@@ -1855,241 +1858,6 @@ pub async fn verify_email(
     }
 }
 
-/// Response of `POST /auth/resend-verification`.
-#[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct VerificationEmailSentResponse {
-    /// Address the verification link was sent to.
-    pub email: String,
-    pub message: String,
-}
-
-/// Email a fresh verification link to the signed-in user's address.
-///
-/// Needs an email provider: without one the request is refused with a 409
-/// that tells the user to ask an administrator, who can verify the address
-/// from the user's page. `GET /auth/email-status` reports up front whether a
-/// provider is configured.
-#[utoipa::path(
-    post,
-    path = "/auth/resend-verification",
-    responses(
-        (status = 200, description = "Verification email sent", body = VerificationEmailSentResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Only a user account can verify an email address"),
-        (status = 409, description = "No email provider is configured, or the address is already verified"),
-        (status = 429, description = "A verification email was sent recently, or too many requests"),
-        (status = 502, description = "The email provider could not deliver the email"),
-        (status = 500, description = "Internal server error")
-    ),
-    tag = "Authentication",
-    security(("bearer_auth" = []))
-)]
-pub async fn resend_email_verification(
-    State(state): State<Arc<AuthState>>,
-    RequireAuth(auth): RequireAuth,
-    Extension(metadata): Extension<RequestMetadata>,
-) -> Result<Json<VerificationEmailSentResponse>, Problem> {
-    // Self-service on the caller's own account, like changing one's own
-    // password: any real user may do it, deployment tokens may not.
-    let user = auth.require_user().map_err(|msg| {
-        problem_new(StatusCode::FORBIDDEN)
-            .with_title("User Required")
-            .with_detail(msg)
-    })?;
-    let user_id = user.id;
-
-    let email = state
-        .auth_service
-        .resend_email_verification(user_id)
-        .await?;
-
-    let audit = EmailVerificationRequestedAudit {
-        context: AuditContext {
-            user_id,
-            ip_address: Some(metadata.ip_address.to_string()),
-            user_agent: metadata.user_agent.as_str().to_string(),
-        },
-        email: email.clone(),
-    };
-    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
-
-    Ok(Json(VerificationEmailSentResponse {
-        message: format!("A verification link was sent to {email}."),
-        email,
-    }))
-}
-
-/// Mark a user's email address as verified (admin only).
-///
-/// For instances without an email provider, or a user who cannot receive the
-/// link. SSO sign-in is only linked onto an existing account whose address is
-/// verified, so this is how an administrator vouches for an address.
-#[utoipa::path(
-    tag = "Users",
-    post,
-    path = "/users/{user_id}/verify-email",
-    responses(
-        (status = 200, description = "Email address marked verified", body = RouteUserWithRoles),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Forbidden - requires the users:manage permission"),
-        (status = 404, description = "User not found"),
-        (status = 409, description = "User is deleted"),
-        (status = 500, description = "Internal server error")
-    ),
-    params(
-        ("user_id" = i32, Path, description = "User ID")
-    ),
-    security(
-        ("bearer_auth" = [])
-    )
-)]
-async fn mark_user_email_verified(
-    State(app_state): State<Arc<AuthState>>,
-    RequireAuth(auth): RequireAuth,
-    Extension(metadata): Extension<RequestMetadata>,
-    Path(user_id): Path<i32>,
-) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, UsersManage);
-
-    let updated = app_state.user_service.mark_email_verified(user_id).await?;
-    info!(
-        admin_id = auth.user_id(),
-        user_id, "Administrator marked a user's email address verified"
-    );
-
-    let audit = UserEmailMarkedVerifiedAudit {
-        context: AuditContext {
-            user_id: auth.user_id(),
-            ip_address: Some(metadata.ip_address.to_string()),
-            user_agent: metadata.user_agent.as_str().to_string(),
-        },
-        target_user_id: user_id,
-        username: updated.name.clone(),
-        email: updated.email.clone(),
-    };
-    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-        error!("Failed to create audit log: {}", e);
-    }
-
-    let user = app_state.user_service.get_user_with_roles(user_id).await?;
-    Ok(Json(RouteUserWithRoles::from(user)).into_response())
-}
-
-impl From<UserServiceError> for Problem {
-    fn from(err: UserServiceError) -> Self {
-        match err {
-            UserServiceError::DatabaseConnection(msg) => {
-                error!("Database connection error: {}", msg);
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Database connection error")
-                    .with_detail(msg)
-            }
-            UserServiceError::Database { reason } => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Database error")
-                .with_detail(reason),
-            UserServiceError::NotFound(msg) => problem_new(StatusCode::NOT_FOUND)
-                .with_title("User not found")
-                .with_detail(msg),
-            UserServiceError::RoleNotFound(msg) => problem_new(StatusCode::NOT_FOUND)
-                .with_title("Role not found")
-                .with_detail(msg),
-            UserServiceError::Mfa(msg) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("MFA error")
-                .with_detail(msg),
-            UserServiceError::InvalidMfaCode => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Invalid MFA code")
-                .with_detail("The provided MFA code is invalid"),
-            UserServiceError::MfaNotSetup(user_id) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("MFA not setup")
-                .with_detail(format!("MFA is not setup for user {}", user_id)),
-            UserServiceError::MfaAlreadyEnabled(user_id) => problem_new(StatusCode::CONFLICT)
-                .with_title("MFA already enabled")
-                .with_detail(format!(
-                    "MFA is already enabled for user {}. Disable it with current MFA verification before setting it up again.",
-                    user_id
-                )),
-            UserServiceError::AlreadyDeleted(user_id) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("User already deleted")
-                .with_detail(format!("User {} is already deleted", user_id)),
-            UserServiceError::NotDeleted(user_id) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("User not deleted")
-                .with_detail(format!("User {} is not deleted", user_id)),
-            UserServiceError::RoleAlreadyAssigned(role, user_id) => {
-                problem_new(StatusCode::BAD_REQUEST)
-                    .with_title("Role already assigned")
-                    .with_detail(format!(
-                        "Role {} is already assigned to user {}",
-                        role, user_id
-                    ))
-            }
-            UserServiceError::RoleNotAssigned(role, user_id) => {
-                problem_new(StatusCode::BAD_REQUEST)
-                    .with_title("Role not assigned")
-                    .with_detail(format!("Role {} is not assigned to user {}", role, user_id))
-            }
-            UserServiceError::Validation(msg) => problem_new(StatusCode::BAD_REQUEST)
-                .with_title("Validation error")
-                .with_detail(msg),
-            UserServiceError::Encryption(msg) => {
-                error!("Encryption error: {}", msg);
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Error")
-                    .with_detail("An unexpected error occurred. Please try again.")
-            }
-            UserServiceError::Io(e) => {
-                error!("IO error: {}", e);
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Error")
-                    .with_detail("An unexpected error occurred. Please try again.")
-            }
-            UserServiceError::Serialization(e) => {
-                error!("Serialization error: {}", e);
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Error")
-                    .with_detail("An unexpected error occurred. Please try again.")
-            }
-            UserServiceError::Internal(msg) => {
-                error!("Internal error: {}", msg);
-                problem_new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Error")
-                    .with_detail("An unexpected error occurred. Please try again.")
-            }
-            UserServiceError::CurrentPasswordRequired { .. } => {
-                problem_new(StatusCode::BAD_REQUEST)
-                    .with_title("Current Password Required")
-                    .with_detail("Provide your current password to enroll MFA.")
-            }
-            UserServiceError::InvalidCurrentPassword { .. } => {
-                problem_new(StatusCode::UNAUTHORIZED)
-                    .with_title("Invalid Current Password")
-                    .with_detail("The current password you entered is incorrect.")
-            }
-            UserServiceError::MfaLocked {
-                retry_after_seconds,
-                ..
-            } => mfa_locked_problem(retry_after_seconds),
-            UserServiceError::PasswordResetOnDeletedUser { user_id } => {
-                problem_new(StatusCode::CONFLICT)
-                    .with_title("User Deleted")
-                    .with_detail(format!(
-                        "User {} is deleted. Restore the user before resetting their password.",
-                        user_id
-                    ))
-            }
-            UserServiceError::EmailVerificationOnDeletedUser { user_id } => {
-                problem_new(StatusCode::CONFLICT)
-                    .with_title("User Deleted")
-                    .with_detail(format!(
-                        "User {} is deleted. Restore the user before verifying their email address.",
-                        user_id
-                    ))
-            }
-        }
-    }
-}
-
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -2101,13 +1869,14 @@ impl From<UserServiceError> for Problem {
         update_user,
         restore_user,
         reset_user_password,
+        reset_user_mfa,
         update_self,
         setup_mfa,
         verify_and_enable_mfa,
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, ResetUserPasswordResponse, ResetUserMfaResponse, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -2896,6 +2665,116 @@ async fn reset_user_password(
         .into_response())
 }
 
+/// Remove another user's second factor (admin only).
+///
+/// The recovery path for a user who lost both their authenticator and their
+/// recovery codes: their TOTP secret, recovery codes and second-factor
+/// lockout state are deleted and every session they have is revoked, so they
+/// can sign in with their password alone and enroll again. Their password,
+/// roles and API keys are left alone.
+///
+/// Gated exactly like `POST /users/{user_id}/password`: `users:manage`, not
+/// on yourself (use `DELETE /users/me/mfa`, which takes a code), and a recent
+/// step-up for an MFA-enrolled administrator. When the instance has no other
+/// admin to ask, `temps reset-admin-password --clear-mfa` does the same
+/// offline.
+#[utoipa::path(
+    tag = "Users",
+    delete,
+    path = "/users/{user_id}/mfa",
+    responses(
+        (status = 200, description = "MFA removed and the user's sessions revoked", body = ResetUserMfaResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "users:manage required, or attempted to reset your own MFA (use DELETE /users/me/mfa)"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is deleted, or has no MFA enrolled"),
+        (status = 428, description = "Recent identity verification (step-up) required"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("user_id" = i32, Path, description = "User ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn reset_user_mfa(
+    State(app_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(user_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // `users:manage` gate (+ no self-target) lives in authorize_admin_target.
+    // Removing your own factor goes through DELETE /users/me/mfa, which
+    // requires a current code; without that, a stolen admin session could
+    // strip its own account's MFA.
+    if let Err(denied) = authorize_admin_target(&auth, user_id) {
+        error!(
+            "Denied MFA reset by user {} for target {}: {:?}",
+            auth.user_id(),
+            user_id,
+            denied
+        );
+        return Err(temps_core::error_builder::forbidden().build());
+    }
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::ResetUserMfa { user_id },
+    )
+    .await?;
+
+    let cleared = app_state.user_service.admin_reset_mfa(user_id).await?;
+
+    info!(
+        "Admin {} removed the MFA of user {} ({} session(s) revoked)",
+        auth.user_id(),
+        user_id,
+        cleared.sessions_revoked
+    );
+
+    // Tell the caller when instance policy will refuse this user's password
+    // sign-in until they re-enroll, rather than letting them find out from a
+    // failed login. The reset itself has already committed, so a failed
+    // lookup is logged and reported as "not blocked" instead of failing it.
+    let password_sign_in_blocked = match app_state
+        .auth_service
+        .requires_mfa_enrollment(user_id)
+        .await
+    {
+        Ok(blocked) => blocked,
+        Err(error) => {
+            error!(
+                "Failed to evaluate require_mfa_for_admins for user {} after an MFA reset: {}",
+                user_id, error
+            );
+            false
+        }
+    };
+
+    let audit = AdminMfaResetAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        target_user_id: user_id,
+        username: cleared.user.name.clone(),
+        sessions_revoked: cleared.sessions_revoked,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(ResetUserMfaResponse {
+        mfa_enabled: cleared.user.mfa_enabled,
+        sessions_revoked: cleared.sessions_revoked,
+        password_sign_in_blocked,
+    })
+    .into_response())
+}
+
 /// Authorize a self-service MFA request (`/users/me/mfa/*`) and return the
 /// caller's own user row.
 ///
@@ -3024,19 +2903,12 @@ async fn change_password_self(
     // plaintext token (that's what the sessions table stores). Missing /
     // undecryptable cookie just means we don't know which session is
     // "current" — fine, the service falls back to revoking everything.
-    let current_session_token: Option<String> = headers
-        .get_all("Cookie")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|s| Cookie::split_parse(s).filter_map(Result::ok))
-        .find_map(|c| {
-            if c.name() == "session" {
-                Some(c.value().to_string())
-            } else {
-                None
-            }
-        })
-        .and_then(|enc| app_state.cookie_crypto.decrypt(&enc).ok());
+    let current_session_token: Option<String> = crate::auth_cookies::read_sealed(
+        &headers,
+        crate::auth_cookies::SESSION,
+        metadata.is_secure,
+        &app_state.cookie_crypto,
+    );
 
     match app_state
         .auth_service
@@ -3205,6 +3077,16 @@ async fn disable_mfa(
 
 #[cfg(test)]
 mod tests {
+    /// The OIDC login start/callback routes carry no credentials and live
+    /// behind a shared proxy IP, so they get a bigger budget than the
+    /// brute-force limiter on the credential routes, which must stay strict.
+    #[test]
+    fn oidc_login_budget_is_larger_than_the_credential_budget() {
+        let credentials = crate::rate_limit::AuthRateLimitConfig::default().max_requests;
+        assert_eq!(credentials, 10, "credential routes must stay at 10/min");
+        assert!(super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE > credentials);
+    }
+
     use super::{
         assign_role, authorize_admin_target, authorize_role_assignment, bounded_audit_identity,
         create_user, delete_user, login, normalized_login_email, parse_user_roles,
@@ -3289,7 +3171,7 @@ mod tests {
         async fn create_audit_log(
             &self,
             _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
+        ) -> temps_core::AuditResult<()> {
             Ok(())
         }
     }
@@ -3320,8 +3202,9 @@ mod tests {
         async fn create_audit_log(
             &self,
             operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            let data = serde_json::from_str(&operation.serialize()?)?;
+        ) -> temps_core::AuditResult<()> {
+            let data = serde_json::from_str(&operation.serialize()?)
+                .expect("audit operation serializes to valid JSON");
             self.events
                 .lock()
                 .expect("recorded audit mutex is not poisoned")
@@ -3340,9 +3223,12 @@ mod tests {
     impl AuditLogger for FailingAuditLogger {
         async fn create_audit_log(
             &self,
-            _operation: &dyn temps_core::audit::AuditOperation,
-        ) -> anyhow::Result<()> {
-            anyhow::bail!("audit storage unavailable")
+            operation: &dyn temps_core::audit::AuditOperation,
+        ) -> temps_core::AuditResult<()> {
+            return Err(temps_core::AuditError::write(
+                operation.operation_type(),
+                "audit storage unavailable",
+            ));
         }
     }
 
@@ -3586,7 +3472,12 @@ mod tests {
     async fn invalid_credentials_are_audited_with_normalized_identity() {
         let audit = Arc::new(RecordingAuditLogger::default());
         let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // The email matches nothing...
             .append_query_results([Vec::<users::Model>::new()])
+            // ...and the per-account throttle is read anyway, against an id
+            // no row has, so its cost cannot tell an unknown address from a
+            // real one.
+            .append_query_results([Vec::<temps_entities::user_login_guards::Model>::new()])
             .into_connection();
         let state = auth_state_with_audit(db, audit.clone());
 
@@ -3617,10 +3508,14 @@ mod tests {
             .cookie_crypto
             .encrypt(session_token)
             .expect("test MFA session encrypts");
+        // `request_metadata()` describes an https console, which issues and
+        // reads only the host-only name. Through the shared helper so the
+        // fixture cannot drift from what the server looks for.
+        let name = crate::auth_cookies::issued_name(crate::auth_cookies::MFA_SESSION, true);
         let mut headers = HeaderMap::new();
         headers.insert(
             axum::http::header::COOKIE,
-            format!("mfa_session={encrypted}")
+            format!("{name}={encrypted}")
                 .parse()
                 .expect("test cookie header is valid"),
         );
@@ -4131,7 +4026,8 @@ mod tests {
             let mut enabled = pending.clone();
             enabled.mfa_enabled = true;
             // Lock the user, read the (empty) guard, upsert it, persist
-            // `mfa_enabled`, then revoke the user's other sessions.
+            // `mfa_enabled`, then revoke the user's other sessions and their
+            // ingress login grants.
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results([vec![pending]])
                 .append_query_results([Vec::<temps_entities::user_mfa_guards::Model>::new()])
@@ -4144,6 +4040,10 @@ mod tests {
                     sea_orm::MockExecResult {
                         last_insert_id: 0,
                         rows_affected: 2,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
                     },
                 ])
                 .into_connection();
@@ -4373,6 +4273,63 @@ mod tests {
         );
     }
 
+    /// Regression: the OIDC login start and callback shared the 10-per-minute
+    /// brute-force limiter, so behind a container bridge (one peer IP for every
+    /// browser) a few redirects locked the whole console out of SSO. Through
+    /// the real router: the callback takes its own 120-a-minute budget, is
+    /// still limited past it, and spending it leaves `/auth/login` untouched.
+    #[tokio::test]
+    async fn test_oidc_login_routes_have_their_own_budget() {
+        use tower::ServiceExt;
+
+        let app = super::configure_routes().with_state(admin_owner_state());
+        let peer: std::net::SocketAddr = "203.0.113.3:12345".parse().unwrap();
+        // No `RequestMetadata` extension and no body, so an allowed request is
+        // rejected by an extractor before the mock database is touched; only
+        // the rate-limit decision is under test.
+        let send = |app: axum::Router, method: &'static str, uri: &'static str| async move {
+            let mut request = axum::http::Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("{}"))
+                .unwrap();
+            request
+                .extensions_mut()
+                .insert(axum::extract::ConnectInfo(peer));
+            app.oneshot(request).await.unwrap().status()
+        };
+
+        for i in 0..super::OIDC_LOGIN_MAX_REQUESTS_PER_MINUTE {
+            let status = send(app.clone(), "GET", "/auth/oidc/callback").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "OIDC callback {i} was rate limited within its own budget"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "GET", "/auth/oidc/callback").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the OIDC routes must still be limited past their budget"
+        );
+
+        // The OIDC requests must not have spent the credential budget.
+        for i in 0..10 {
+            let status = send(app.clone(), "POST", "/auth/login").await;
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "login {i} was rate limited by OIDC traffic from the same IP"
+            );
+        }
+        assert_eq!(
+            send(app.clone(), "POST", "/auth/login").await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "credential routes keep the 10-a-minute limit"
+        );
+    }
+
     /// Regression: `/auth/cli/device/poll` used to share the 10-per-minute
     /// brute-force limiter, so `temps login` (polling every 2 s) got a 429
     /// about 20 s in, and the polls spent the login budget of the browser
@@ -4569,17 +4526,15 @@ mod tests {
         use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
         use axum::http::StatusCode;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::types::RoleType;
         use temps_entities::users;
+        use temps_test_utils::TestDatabase;
 
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     None
@@ -4766,16 +4721,14 @@ mod tests {
         use axum::http::StatusCode;
         use chrono::Utc;
         use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
-        use temps_database::test_utils::TestDatabase;
         use temps_entities::users;
+        use temps_test_utils::TestDatabase;
 
         async fn test_db() -> Option<TestDatabase> {
             match TestDatabase::with_migrations().await {
                 Ok(db) => Some(db),
                 Err(error)
-                    if temps_database::test_utils::is_container_runtime_unavailable(
-                        &error.to_string(),
-                    ) =>
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
                 {
                     println!("Docker not available, skipping test: {error}");
                     None
@@ -4819,6 +4772,301 @@ mod tests {
                 .map(|n| format!("{n:06}"))
                 .find(|candidate| !valid.contains(candidate))
                 .unwrap()
+        }
+
+        /// Give `user_id` the admin role (seeding the role table if needed).
+        async fn make_admin(
+            state: &crate::state::AuthState,
+            db: &DatabaseConnection,
+            user_id: i32,
+        ) {
+            use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+            state.user_service.initialize_roles().await.unwrap();
+            let admin_role = temps_entities::roles::Entity::find()
+                .filter(
+                    temps_entities::roles::Column::Name
+                        .eq(temps_entities::types::RoleType::Admin.as_str()),
+                )
+                .one(db)
+                .await
+                .unwrap()
+                .expect("admin role seeded");
+            state
+                .user_service
+                .assign_role_to_user(user_id, admin_role.id)
+                .await
+                .unwrap();
+        }
+
+        async fn set_password(
+            db: &DatabaseConnection,
+            user: users::Model,
+            password: &str,
+        ) -> users::Model {
+            let hash = argon2::Argon2::default()
+                .hash_password(password.as_bytes())
+                .unwrap()
+                .to_string();
+            let mut update: users::ActiveModel = user.into();
+            update.password_hash = Set(Some(hash));
+            update.update(db).await.unwrap()
+        }
+
+        /// Turn MFA on for a user whose sessions were opened beforehand
+        /// (`session_cookie` refuses to mint one for an enrolled account).
+        async fn enable_mfa(db: &DatabaseConnection, user: users::Model) -> users::Model {
+            let mut update: users::ActiveModel = user.into();
+            update.mfa_enabled = Set(true);
+            update.update(db).await.unwrap()
+        }
+
+        async fn login(
+            app: &axum::Router,
+            email: &str,
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            send(
+                app,
+                "POST",
+                "/auth/login",
+                None,
+                Some(serde_json::json!({ "email": email, "password": password })),
+            )
+            .await
+        }
+
+        /// Issue #1590: a user who lost both their authenticator and their
+        /// recovery codes had no way back in, because nothing let an admin
+        /// remove another account's second factor.
+        #[tokio::test]
+        async fn admin_mfa_reset_lets_a_user_who_lost_every_factor_sign_in_again() {
+            use sea_orm::EntityTrait;
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let admin =
+                insert_user(&db, &format!("admin-{}@example.com", uuid::Uuid::new_v4())).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+
+            let (target, _secret) = mfa_user(&db, false, &["482915", "730264"]).await;
+            let target = set_password(&db, target, "Recover-Me-2026!").await;
+            let target_session = session_cookie(&state, target.id).await;
+            let target = enable_mfa(&db, target).await;
+            // A lockout left over from guessing at the lost factor.
+            temps_entities::user_mfa_guards::ActiveModel {
+                user_id: Set(target.id),
+                last_totp_step: Set(Some(1)),
+                failed_attempts: Set(10),
+                locked_until: Set(Some(Utc::now() + chrono::Duration::hours(1))),
+                updated_at: Set(Utc::now()),
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+
+            // Before: the password only leads to a code prompt the user
+            // cannot answer.
+            let (status, body) = login(&app, &target.email, "Recover-Me-2026!").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["mfa_required"], true, "{body}");
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", target.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "admin MFA reset: {body}");
+            assert_eq!(body["mfa_enabled"], false, "{body}");
+            assert_eq!(body["password_sign_in_blocked"], false, "{body}");
+            assert!(
+                body["sessions_revoked"].as_u64().unwrap() >= 2,
+                "the signed-in session and the pending sign-in challenge end: {body}"
+            );
+
+            let (status, _) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("cookie", &target_session)),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "a session from before the reset must be signed out"
+            );
+
+            let stored = users::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(!stored.mfa_enabled);
+            assert!(stored.mfa_secret.is_none(), "the TOTP secret is removed");
+            assert!(
+                stored.mfa_recovery_codes.is_none(),
+                "recovery codes are removed"
+            );
+            assert!(
+                stored.password_hash.is_some() && !stored.must_change_password,
+                "the password is left alone"
+            );
+            let guard = temps_entities::user_mfa_guards::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap();
+            assert!(guard.is_none(), "the old factor's lockout state is dropped");
+
+            // After: the password alone signs the user in.
+            let (status, body) = login(&app, &target.email, "Recover-Me-2026!").await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["success"], true, "{body}");
+            assert_eq!(body["mfa_required"], false, "{body}");
+
+            // The admin's own session is untouched.
+            let (status, body) = send(
+                &app,
+                "GET",
+                "/user/me",
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+
+        #[tokio::test]
+        async fn admin_mfa_reset_refuses_the_wrong_caller_or_target() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let (plain_user, _) = mfa_user(&db, false, &[]).await;
+            state.user_service.initialize_roles().await.unwrap();
+            let user_cookie = session_cookie(&state, plain_user.id).await;
+            let (target, _) = mfa_user(&db, true, &[]).await;
+
+            let reset = |cookie: String, id: i32| {
+                let app = app.clone();
+                async move {
+                    send(
+                        &app,
+                        "DELETE",
+                        &format!("/users/{id}/mfa"),
+                        Some(("cookie", &cookie)),
+                        None,
+                    )
+                    .await
+                }
+            };
+
+            let (status, body) = reset(user_cookie.clone(), target.id).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "a non-admin cannot: {body}");
+
+            let (status, body) = reset(admin_cookie.clone(), admin.id).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "an admin cannot strip their own factor without a code: {body}"
+            );
+
+            let (status, body) = reset(admin_cookie.clone(), plain_user.id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "nothing enrolled: {body}");
+
+            let (status, body) = reset(admin_cookie.clone(), i32::MAX).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+
+            let mut deleted: users::ActiveModel = target.clone().into();
+            deleted.deleted_at = Set(Some(Utc::now()));
+            deleted.update(db.as_ref()).await.unwrap();
+            let (status, body) = reset(admin_cookie.clone(), target.id).await;
+            assert_eq!(status, StatusCode::CONFLICT, "deleted user: {body}");
+        }
+
+        #[tokio::test]
+        async fn mfa_enrolled_admin_must_step_up_before_resetting_another_users_mfa() {
+            use sea_orm::EntityTrait;
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            enable_mfa(&db, admin).await;
+            let (target, _) = mfa_user(&db, true, &[]).await;
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", target.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::PRECONDITION_REQUIRED, "{body}");
+            let stored = users::Entity::find_by_id(target.id)
+                .one(db.as_ref())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(stored.mfa_enabled, "nothing changes without step-up");
+        }
+
+        #[tokio::test]
+        async fn admin_mfa_reset_reports_when_policy_blocks_password_sign_in() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            temps_entities::settings::ActiveModel {
+                id: Set(1),
+                data: Set(serde_json::json!({ "require_mfa_for_admins": true })),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            let state = auth_state(db.clone());
+            let app = router(state.clone(), db.clone());
+
+            let (admin, _) = mfa_user(&db, false, &[]).await;
+            make_admin(&state, &db, admin.id).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let (other_admin, _) = mfa_user(&db, true, &[]).await;
+            make_admin(&state, &db, other_admin.id).await;
+
+            let (status, body) = send(
+                &app,
+                "DELETE",
+                &format!("/users/{}/mfa", other_admin.id),
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                body["password_sign_in_blocked"], true,
+                "require_mfa_for_admins refuses an unenrolled admin's password sign-in: {body}"
+            );
         }
 
         #[tokio::test]
@@ -5046,6 +5294,132 @@ mod tests {
             assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
             assert_eq!(body["error_code"], "MFA_LOCKED");
             assert!(body["retry_after_seconds"].as_i64().unwrap() > 0);
+        }
+    }
+
+    /// Per-account login throttling driven through the real route, behind
+    /// the per-address limiter it exists to complement.
+    mod login_throttle_http {
+        use crate::http_test_support::{auth_state, router, send_with_headers};
+        use argon2::PasswordHasher;
+        use axum::http::StatusCode;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection};
+        use temps_entities::users;
+        use temps_test_utils::TestDatabase;
+
+        const PASSWORD: &str = "Correct-Horse-9!";
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        async fn user_with_password(db: &DatabaseConnection, email: &str) -> users::Model {
+            let hash = argon2::Argon2::default()
+                .hash_password(PASSWORD.as_bytes())
+                .expect("hash the test password")
+                .to_string();
+            users::ActiveModel {
+                email: Set(email.to_string()),
+                name: Set(email.to_string()),
+                password_hash: Set(Some(hash)),
+                email_verified: Set(true),
+                mfa_enabled: Set(false),
+                ..Default::default()
+            }
+            .insert(db)
+            .await
+            .expect("insert the test user")
+        }
+
+        /// One `POST /auth/login`, as if from `address`.
+        ///
+        /// The harness connects from loopback, which is how the production
+        /// listener decides a forwarded address may be trusted, so this is
+        /// the same path a request through the proxy takes.
+        async fn attempt(
+            app: &axum::Router,
+            address: &str,
+            email: &str,
+            password: &str,
+        ) -> (StatusCode, serde_json::Value) {
+            send_with_headers(
+                app,
+                "POST",
+                "/auth/login",
+                &[("x-forwarded-for", address)],
+                Some(serde_json::json!({ "email": email, "password": password })),
+            )
+            .await
+        }
+
+        #[tokio::test]
+        async fn guessing_one_account_from_many_addresses_is_throttled() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "target@example.com").await;
+            let app = router(state, connection);
+
+            // A fresh address every time, so the per-address limiter (10 a
+            // minute) never fires: before this change nothing slowed this
+            // down at all.
+            for number in 1..=crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "target@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            // From yet another address, with the right password.
+            let (throttled_status, throttled_body) =
+                attempt(&app, "198.51.100.9", "target@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, StatusCode::UNAUTHORIZED);
+
+            // Indistinguishable from an account that does not exist: an
+            // attacker must not learn which addresses are worth guessing.
+            let (unknown_status, unknown_body) =
+                attempt(&app, "198.51.100.10", "nobody@example.com", PASSWORD).await;
+            assert_eq!(throttled_status, unknown_status);
+            assert_eq!(throttled_body, unknown_body, "{throttled_body}");
+        }
+
+        #[tokio::test]
+        async fn the_right_password_still_signs_in_below_the_threshold() {
+            let Some(db) = test_db().await else { return };
+            let connection = db.connection_arc();
+            let state = auth_state(connection.clone());
+            user_with_password(connection.as_ref(), "typist@example.com").await;
+            let app = router(state, connection);
+
+            // A person fixing a typo must never meet the throttle.
+            for number in 1..crate::login_guard::LOCKOUT_THRESHOLD {
+                let (status, _) = attempt(
+                    &app,
+                    &format!("203.0.113.{number}"),
+                    "typist@example.com",
+                    "Wrong-Password-1!",
+                )
+                .await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {number}");
+            }
+
+            let (status, body) =
+                attempt(&app, "198.51.100.20", "typist@example.com", PASSWORD).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(body["success"], true);
         }
     }
 }

@@ -140,6 +140,36 @@ pub struct ProxyLogResponse {
     /// Upstream response headers, redacted on the same terms as
     /// [`Self::request_headers`].
     pub response_headers: Option<BTreeMap<String, String>>,
+    /// What Shield would have done with the request: `log`, `challenge` or
+    /// `block`. `None` when no reputation list holds the client.
+    #[schema(example = "block")]
+    pub shield_verdict: Option<String>,
+    /// The lists that hold the client, and the range on each.
+    #[schema(example = json!(["spamhaus_drop (192.0.2.0/24)"]))]
+    pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint, when its source gives one.
+    #[schema(example = "t13d1516h2_8daaf6152771_e5627efa2ab1")]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`.
+    #[schema(example = "direct")]
+    pub ja4_source: Option<String>,
+}
+
+/// The stored reasons, a JSON array of strings; anything else reads as none.
+pub fn shield_reasons_from_json(value: Option<serde_json::Value>) -> Vec<String> {
+    match value {
+        Some(serde_json::Value::Array(reasons)) => reasons
+            .iter()
+            .filter_map(|reason| reason.as_str().map(str::to_string))
+            .collect(),
+        Some(_) | None => Vec::new(),
+    }
+}
+
+/// The reasons as stored: `None` when there are none.
+pub fn shield_reasons_to_json(reasons: &[String]) -> Option<serde_json::Value> {
+    (!reasons.is_empty()).then(|| serde_json::Value::from(reasons.to_vec()))
 }
 
 /// Convert a stored header blob into a typed, sorted map.
@@ -201,6 +231,10 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             cache_status: model.cache_status,
             request_headers: headers_from_json(model.request_headers),
             response_headers: headers_from_json(model.response_headers),
+            shield_verdict: model.shield_verdict,
+            shield_reasons: shield_reasons_from_json(model.shield_reasons),
+            ja4: model.ja4,
+            ja4_source: model.ja4_source,
         }
     }
 }
@@ -255,6 +289,22 @@ pub struct CreateProxyLogRequest {
     /// produced a captured exception. Lets the Observe row deep-link to the
     /// error group without an extra query.
     pub error_group_id: Option<i32>,
+    /// What Shield would have done with the request (ADR 066 D1): `log`,
+    /// `challenge` or `block`. `None` when no list holds the client.
+    #[serde(default)]
+    pub shield_verdict: Option<String>,
+    /// Why, e.g. `spamhaus_drop (192.0.2.0/24)`. Empty when
+    /// `shield_verdict` is `None`.
+    #[serde(default)]
+    pub shield_reasons: Vec<String>,
+    /// The client's JA4 TLS fingerprint (ADR 066 D4). `None` when its
+    /// source gives none: plain HTTP, a CDN without the header.
+    #[serde(default)]
+    pub ja4: Option<String>,
+    /// Where the JA4 came from: `direct`, `cloudflare`, `bunny`, `local` or
+    /// `edge`. `None` when the client could not be resolved.
+    #[serde(default)]
+    pub ja4_source: Option<String>,
 }
 
 pub struct ProxyLogService {
@@ -277,6 +327,8 @@ pub struct ProxyLogService {
 const MAX_CONCURRENT_TRAFFIC_AGGREGATIONS: usize = 4;
 const MAX_TRAFFIC_AGGREGATIONS_PER_PROJECT_PER_MINUTE: usize = 60;
 const TRAFFIC_AGGREGATION_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long an aggregation waits for a free slot before it is refused as busy.
+const TRAFFIC_AGGREGATION_SLOT_WAIT: Duration = Duration::from_secs(3);
 
 #[derive(Default)]
 struct AggregateLimitState {
@@ -376,11 +428,8 @@ impl ProxyLogService {
                 reason: "project request budget exhausted",
             });
         }
-        let _permit = self.aggregate_slots.try_acquire().map_err(|_| {
-            ProxyLogServiceError::TrafficAggregationRateLimited {
-                reason: "server aggregation capacity exhausted",
-            }
-        })?;
+        let _permit =
+            acquire_aggregate_slot(&self.aggregate_slots, TRAFFIC_AGGREGATION_SLOT_WAIT).await?;
 
         let query = async {
             if let Some(storage) = &self.storage {
@@ -927,7 +976,9 @@ impl ProxyLogService {
             || async { paginator.num_items().await },
         )
         .await?;
-        let items = paginator.fetch_page(page - 1).await?;
+        let items = paginator
+            .fetch_page(temps_core::config::page_index(page))
+            .await?;
 
         Ok((items, total))
     }
@@ -1139,7 +1190,7 @@ impl ProxyLogService {
         if let Some(storage) = &self.storage {
             return storage.get_today_count(filters).await;
         }
-        let today_start = Utc::now().date_naive().and_hms_opt(0, 0, 0).unwrap();
+        let today_start = Utc::now().date_naive().and_time(chrono::NaiveTime::MIN);
         let today_start = chrono::DateTime::<Utc>::from_naive_utc_and_offset(today_start, Utc);
 
         let mut query = proxy_logs::Entity::find();
@@ -2560,13 +2611,59 @@ impl ProxyLogService {
     }
 }
 
+/// Keep what kind of failure it was, so a busy backend reads as "retry" (429)
+/// and a too-large query as "ask for less" (400) instead of every failure
+/// becoming the same opaque 500.
 fn analytics_storage_error(
     operation: &'static str,
     error: ProxyLogServiceError,
 ) -> temps_analytics::types::analytics::AnalyticsError {
-    temps_analytics::types::analytics::AnalyticsError::Other(format!(
-        "API traffic {operation} failed in the configured request-log backend: {error}"
-    ))
+    use temps_analytics::types::analytics::AnalyticsError;
+    match error {
+        ProxyLogServiceError::TrafficAggregationRateLimited { reason } => {
+            AnalyticsError::TrafficBusy { operation, reason }
+        }
+        ProxyLogServiceError::TrafficAggregationTimeout { timeout_seconds } => {
+            AnalyticsError::TrafficTimeout {
+                operation,
+                timeout_seconds,
+            }
+        }
+        error @ (ProxyLogServiceError::InvalidFilter(_)
+        | ProxyLogServiceError::TrafficAggregationTooManyGroups { .. }) => {
+            AnalyticsError::TrafficInvalidQuery {
+                operation,
+                detail: error.to_string(),
+            }
+        }
+        error @ (ProxyLogServiceError::DatabaseError(_)
+        | ProxyLogServiceError::ClickHouse { .. }) => AnalyticsError::TrafficStorage {
+            operation,
+            detail: error.to_string(),
+        },
+    }
+}
+
+/// Wait up to `wait` for one of the server's aggregation slots.
+///
+/// A page opening several API traffic views starts that many aggregations at
+/// once; refusing the moment all slots are taken turned an ordinary page load
+/// into failures. Waiting briefly is bounded backpressure: the queue cannot
+/// outlive `wait`, and each running aggregation is itself bounded by
+/// [`TRAFFIC_AGGREGATION_TIMEOUT`].
+async fn acquire_aggregate_slot(
+    slots: &tokio::sync::Semaphore,
+    wait: Duration,
+) -> Result<tokio::sync::SemaphorePermit<'_>, ProxyLogServiceError> {
+    let busy = || ProxyLogServiceError::TrafficAggregationRateLimited {
+        reason: "server aggregation capacity exhausted",
+    };
+    match tokio::time::timeout(wait, slots.acquire()).await {
+        Ok(Ok(permit)) => Ok(permit),
+        // A closed semaphore never happens (it lives as long as the service),
+        // and reads as busy if it ever did.
+        Ok(Err(_)) | Err(_) => Err(busy()),
+    }
 }
 
 async fn aggregate_traffic_offset(
@@ -3228,6 +3325,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn an_aggregation_waits_for_a_slot_freed_within_the_wait() {
+        let slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let held = slots.clone().acquire_owned().await.expect("slot is free");
+        let release = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            drop(held);
+        });
+        let permit = acquire_aggregate_slot(&slots, Duration::from_secs(2)).await;
+        assert!(permit.is_ok(), "a slot freed during the wait is taken");
+        release.await.expect("release task finishes");
+    }
+
+    #[tokio::test]
+    async fn an_aggregation_is_busy_when_no_slot_frees_within_the_wait() {
+        let slots = tokio::sync::Semaphore::new(1);
+        let _held = slots.acquire().await.expect("slot is free");
+        let error = acquire_aggregate_slot(&slots, Duration::from_millis(20))
+            .await
+            .expect_err("every slot stays taken");
+        assert!(matches!(
+            error,
+            ProxyLogServiceError::TrafficAggregationRateLimited { .. }
+        ));
+    }
+
+    #[test]
+    fn api_traffic_backend_errors_keep_their_kind() {
+        use temps_analytics::types::analytics::AnalyticsError;
+        assert!(matches!(
+            analytics_storage_error(
+                "aggregation",
+                ProxyLogServiceError::TrafficAggregationRateLimited { reason: "budget" }
+            ),
+            AnalyticsError::TrafficBusy {
+                operation: "aggregation",
+                reason: "budget"
+            }
+        ));
+        assert!(matches!(
+            analytics_storage_error(
+                "aggregation",
+                ProxyLogServiceError::TrafficAggregationTimeout {
+                    timeout_seconds: 15
+                }
+            ),
+            AnalyticsError::TrafficTimeout {
+                timeout_seconds: 15,
+                ..
+            }
+        ));
+        assert!(matches!(
+            analytics_storage_error(
+                "aggregation",
+                ProxyLogServiceError::TrafficAggregationTooManyGroups {
+                    dimensions: "path".to_string(),
+                    max_groups: 10
+                }
+            ),
+            AnalyticsError::TrafficInvalidQuery { .. }
+        ));
+        assert!(matches!(
+            analytics_storage_error(
+                "aggregation",
+                ProxyLogServiceError::InvalidFilter("bad status".to_string())
+            ),
+            AnalyticsError::TrafficInvalidQuery { .. }
+        ));
+        assert!(matches!(
+            analytics_storage_error(
+                "aggregation",
+                ProxyLogServiceError::ClickHouse {
+                    operation: "aggregate".to_string(),
+                    reason: "refused".to_string()
+                }
+            ),
+            AnalyticsError::TrafficStorage { .. }
+        ));
+    }
+
     #[test]
     fn status_class_range_includes_1xx() {
         // 101 Switching Protocols (and other informational codes) must map to
@@ -3762,7 +3939,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_stats_served_from_cagg_match_raw_path() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -3960,7 +4137,7 @@ mod tests {
     /// Postgres is available, per the repo's Docker-test convention.
     #[tokio::test]
     async fn test_get_ai_status_breakdown_classifies_101_as_1xx() {
-        use temps_database::test_utils::TestDatabase;
+        use temps_test_utils::TestDatabase;
 
         let test_db = match TestDatabase::with_migrations().await {
             Ok(db) => db,
@@ -4065,6 +4242,10 @@ mod tests {
             visitor_id: None,
             trace_id: None,
             error_group_id: None,
+            shield_verdict: None,
+            shield_reasons: None,
+            ja4: None,
+            ja4_source: None,
         }
     }
 

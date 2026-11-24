@@ -11,6 +11,7 @@ import tempfile
 import tomllib
 import unittest
 
+import cli_versions
 from image_metadata import image_version, metadata
 
 
@@ -28,7 +29,7 @@ class BuildInputsTests(unittest.TestCase):
         return {"FLAVOR": "python", "CHANNEL": "beta", "DRY_RUN": "false", "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "gotempsh/temps", "GITHUB_SHA": "a" * 40, **overrides}
 
     def test_image_version_comes_from_runtime_selection(self):
-        source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service.rs").read_text()
+        source = (ROOT / "crates/temps-sandbox/src/services/sandbox_service/application_workspace.rs").read_text()
         version = image_version(source)
         self.assertRegex(version, r"^\d+\.\d+\.\d+$")
         with self.assertRaises(ValueError):
@@ -81,6 +82,9 @@ class BuildInputsTests(unittest.TestCase):
 
     def test_bridge_and_daemon_pin_the_same_public_commit(self):
         bridge = read_toml(ROOT / "crates/temps-ai-agent-cli/Cargo.toml")["dependencies"]["temps-agent-runtime"]
+        if bridge.get("workspace") is True:
+            # The bridge inherits the pin from the workspace table; compare that.
+            bridge = read_toml(ROOT / "Cargo.toml")["workspace"]["dependencies"]["temps-agent-runtime"]
         daemon = read_toml(PACKAGE / "Cargo.toml")["dependencies"]["temps-agent-runtime"]
         self.assertEqual(bridge["git"], "https://github.com/gotempsh/agent-runtime-sdk.git")
         self.assertEqual(daemon["git"], bridge["git"])
@@ -121,6 +125,53 @@ class BuildInputsTests(unittest.TestCase):
                 self.fail(f"sandbox user must not own /usr/local: {line.strip()}")
         for cli in ("claude", "codex", "opencode"):
             self.assertIn(cli, re.search(r"for cli in ([^;]+);", dockerfile).group(1).split())
+
+    def test_cli_pins_are_plain_versions_of_every_bundled_cli(self):
+        pins = cli_versions.pinned_versions((PACKAGE / "Dockerfile").read_text())
+        self.assertEqual(set(pins), set(cli_versions.CLIS))
+        dockerfile = (PACKAGE / "Dockerfile").read_text()
+        for argument, package in cli_versions.CLIS.items():
+            self.assertIn(f"{package}@${{{argument}}}", dockerfile)
+
+    def test_cli_registry_answers_are_validated(self):
+        self.assertEqual(cli_versions.parse_latest("opencode-ai", b'{"name":"opencode-ai","version":"1.19.6"}'), "1.19.6")
+        self.assertEqual(cli_versions.latest_url("@openai/codex"), "https://registry.npmjs.org/@openai%2Fcodex/latest")
+        for body in (
+            b'{"name":"other","version":"1.19.6"}',
+            b'{"name":"opencode-ai","version":"1.19.6-beta.1"}',
+            b'{"name":"opencode-ai","version":"1.19.6 --build-arg X=1"}',
+            b'{"name":"opencode-ai","version":"01.2.3"}',
+            b'{"name":"opencode-ai"}',
+            b"[]",
+        ):
+            with self.assertRaises(ValueError, msg=body):
+                cli_versions.parse_latest("opencode-ai", body)
+
+    def test_published_images_bundle_the_latest_release_never_older_than_the_pin(self):
+        pins = {"CODEX_VERSION": "0.171.0", "CLAUDE_VERSION": "2.1.330", "OPENCODE_VERSION": "1.19.6"}
+        latest = {"@openai/codex": "0.172.0", "@anthropic-ai/claude-code": "2.1.329"}
+        warnings = []
+
+        def fetch(package):
+            if package not in latest:
+                raise OSError("registry unreachable")
+            return latest[package]
+
+        resolved = cli_versions.resolve(pins, fetch=fetch, warn=warnings.append)
+        self.assertEqual(resolved, {"CODEX_VERSION": "0.172.0", "CLAUDE_VERSION": "2.1.330", "OPENCODE_VERSION": "1.19.6"})
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("opencode-ai", warnings[0])
+        output = cli_versions.github_output(resolved)
+        self.assertIn("cli_build_args<<__CLI_BUILD_ARGS__\nCODEX_VERSION=0.172.0\n", output)
+        self.assertIn("sh.temps.cli.claude-code=2.1.330\n", output)
+
+    def test_every_published_image_build_uses_the_resolved_cli_releases(self):
+        workflow = (ROOT / ".github/workflows/daemon-images.yml").read_text()
+        builds = workflow.count("context: tools/sandbox-runtime")
+        self.assertGreater(builds, 0)
+        self.assertEqual(workflow.count("build-args: ${{ steps.cli.outputs.cli_build_args }}"), builds)
+        self.assertIn("${{ steps.cli.outputs.cli_labels }}", workflow)
+        self.assertLess(workflow.index("id: cli"), workflow.index("context: tools/sandbox-runtime"))
 
     def invoke_builder(self, arguments):
         with tempfile.TemporaryDirectory(prefix="temps-build-inputs-") as directory:

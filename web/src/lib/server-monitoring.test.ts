@@ -12,10 +12,12 @@ import {
   formatRateTick,
   hasNoNodeSamples,
   isMetricsUnavailable,
+  lastSampleOf,
   mergeSeries,
   peakOf,
   diskProjectionCaption,
   projectDisk,
+  samplesOf,
   toRatePerSecond,
   usagePercent,
   usageTone,
@@ -45,6 +47,23 @@ describe('mergeSeries', () => {
     ])
   })
 
+  test('keeps empty buckets as null so the line breaks across downtime', () => {
+    const rows = mergeSeries(
+      [
+        {
+          key: 'cpu',
+          points: [
+            { time: t(0), value: 12 },
+            { time: t(900), value: null },
+            { time: t(1800), value: 14 },
+          ],
+        },
+      ],
+      () => ''
+    )
+    expect(rows.map((r) => r.cpu)).toEqual([12, null, 14])
+  })
+
   test('skips unparsable timestamps and undefined series', () => {
     const rows = mergeSeries(
       [
@@ -70,9 +89,42 @@ describe('toRatePerSecond', () => {
     expect(rate.map((p) => p.value)).toEqual([100, 200, 0])
   })
 
+  test('spreads the increase after a gap over the whole gap, keeping nulls', () => {
+    // A sample at 0, the agent down for two buckets, then the counter's
+    // increase since t=0 reported in the bucket at 180.
+    const rate = toRatePerSecond(
+      [
+        { time: t(0), value: 6000 },
+        { time: t(60), value: null },
+        { time: t(120), value: null },
+        { time: t(180), value: 18000 },
+      ],
+      60
+    )
+    expect(rate.map((p) => p.value)).toEqual([100, null, null, 100])
+  })
+
   test('a single point uses the fallback step', () => {
     expect(toRatePerSecond([{ time: t(0), value: 300 }], 30)[0].value).toBe(10)
     expect(toRatePerSecond(undefined, 30)).toEqual([])
+  })
+})
+
+describe('samplesOf / lastSampleOf / peakOf', () => {
+  const points = [
+    { time: t(0), value: 10 },
+    { time: t(60), value: 90 },
+    { time: t(120), value: null },
+  ]
+
+  test('skip buckets without a sample', () => {
+    expect(samplesOf(points)).toEqual([
+      { time: t(0), value: 10 },
+      { time: t(60), value: 90 },
+    ])
+    expect(lastSampleOf(points)).toEqual({ time: t(60), value: 90 })
+    expect(peakOf(points)).toEqual({ time: t(60), value: 90 })
+    expect(lastSampleOf([{ time: t(0), value: null }])).toBeNull()
   })
 })
 
@@ -257,10 +309,23 @@ describe('hasNoNodeSamples', () => {
 
   test('a single sample or snapshot figure means collection is running', () => {
     expect(
-      hasNoNodeSamples({ series: [[{ value: 1 }], [], []], current: [null] })
+      hasNoNodeSamples({
+        series: [[{ time: t(0), value: 1 }], [], []],
+        current: [null],
+      })
     ).toBe(false)
     expect(hasNoNodeSamples({ series: [[], [], []], current: [12.5] })).toBe(
       false
+    )
+  })
+
+  test('series of empty (null) buckets still count as no samples', () => {
+    const gaps = [
+      { time: t(0), value: null },
+      { time: t(900), value: null },
+    ]
+    expect(hasNoNodeSamples({ series: [gaps, gaps], current: [null] })).toBe(
+      true
     )
   })
 
@@ -292,4 +357,16 @@ describe('currentDiskPercent', () => {
       })
     ).toBe(true)
   })
+})
+
+test('aggregate disk history never produces a forecast', () => {
+  const points = Array.from({ length: 24 }, (_, i) => ({
+    time: new Date(Date.UTC(2026, 0, 1, i)).toISOString(),
+    value: (20 + i) * 1e9,
+  }))
+  expect(projectDisk(points, 100e9)?.kind).toBe('growing')
+  expect(projectDisk(points, 100e9, undefined, false)).toBeNull()
+  expect(
+    diskProjectionCaption(57e9, projectDisk(points, 100e9, undefined, false))
+  ).toBe('57.0 GB free')
 })

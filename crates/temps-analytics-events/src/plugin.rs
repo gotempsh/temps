@@ -46,8 +46,29 @@ impl TempsPlugin for EventsPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
-            let events_service = Arc::new(crate::services::AnalyticsEventsService::new(db));
+            // One settings service and one filter service, each shared by
+            // ingest and the console API, so a change invalidates the cache
+            // ingest actually reads.
+            let traffic_settings =
+                Arc::new(crate::traffic_settings::ProjectAnalyticsSettingsService::new(db.clone()));
+            let traffic_filters = Arc::new(crate::traffic_settings::TrafficFilterService::new(
+                db.clone(),
+            ));
+            // Shared with Speed ingest, which reads what event ingest notes.
+            let referrer_excluded_page_views =
+                Arc::new(crate::traffic_settings::ReferrerExcludedPageViews::new());
+            let events_service = Arc::new(
+                crate::services::AnalyticsEventsService::with_traffic_controls(
+                    db,
+                    traffic_settings.clone(),
+                    traffic_filters.clone(),
+                    referrer_excluded_page_views.clone(),
+                ),
+            );
             context.register_service(events_service);
+            context.register_service(traffic_settings);
+            context.register_service(traffic_filters);
+            context.register_service(referrer_excluded_page_views);
 
             debug!("Analytics events services registered successfully");
             Ok(())
@@ -56,7 +77,7 @@ impl TempsPlugin for EventsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let config_service = context.require_service::<temps_config::ConfigService>();
@@ -93,15 +114,39 @@ impl TempsPlugin for EventsPlugin {
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: context
+                .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
+            visitor_identity: context
+                .require_service::<temps_analytics::visitor_identity::VisitorIdentityService>(),
+            // Only the public routes identify; each router holds its own.
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    crate::handlers::events_handler::BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
-        let routes = crate::handlers::configure_routes().with_state(state);
+        let traffic_settings_state = Arc::new(crate::traffic_settings::TrafficSettingsAppState {
+            settings_service: context
+                .require_service::<crate::traffic_settings::ProjectAnalyticsSettingsService>(),
+            filter_service: context
+                .require_service::<crate::traffic_settings::TrafficFilterService>(),
+            geo_ip_service: context.require_service::<temps_geo::GeoIpService>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+
+        let routes = crate::handlers::configure_routes().with_state(state).merge(
+            crate::traffic_settings::configure_traffic_settings_routes()
+                .with_state(traffic_settings_state),
+        );
         Some(PluginRoutes::new(routes))
     }
 
     fn configure_public_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let events_service = context.require_service::<crate::services::AnalyticsEventsService>();
-        let route_table = context.require_service::<temps_proxy::CachedPeerTable>();
+        let route_table = context.require_service::<temps_routes::CachedPeerTable>();
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 
@@ -129,6 +174,17 @@ impl TempsPlugin for EventsPlugin {
             ingest_rate_limiter: context
                 .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
             host_ingest_rate_limiter: Arc::new(crate::handlers::HostIngestRateLimiter::new()),
+            cookieless_identity: context
+                .require_service::<temps_analytics::cookieless::CookielessIdentity>(),
+            visitor_identity: context
+                .require_service::<temps_analytics::visitor_identity::VisitorIdentityService>(),
+            // Only the public routes identify; each router holds its own.
+            browser_identify_budget: Arc::new(
+                temps_analytics::visitor_audit::EnrichWriteBudget::new(
+                    crate::handlers::events_handler::BROWSER_IDENTIFY_WRITES_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
+            ),
         });
 
         // The CORS layer resolves keys through the very same service and
@@ -142,7 +198,11 @@ impl TempsPlugin for EventsPlugin {
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
-        Some(<crate::handlers::EventsApiDoc as utoipa::OpenApi>::openapi())
+        let mut schema = <crate::handlers::EventsApiDoc as utoipa::OpenApi>::openapi();
+        schema
+            .merge(<crate::traffic_settings::TrafficSettingsApiDoc as utoipa::OpenApi>::openapi());
+        schema.merge(<crate::traffic_settings::TrafficFiltersApiDoc as utoipa::OpenApi>::openapi());
+        Some(schema)
     }
 }
 

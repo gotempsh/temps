@@ -5,6 +5,7 @@
 name = "temps-auth"
 version.workspace = true
 edition.workspace = true
+description = "Authentication: users, sessions, API keys, OIDC, MFA and CLI device login; re-exports the temps-authz permission primitives"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -12,16 +13,16 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-config = { path = "../temps-config" }
+temps-authz = { path = "../temps-authz" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 tower = { workspace = true }
-tower-cookies = { workspace = true }
 cookie = { workspace = true }
 argon2 = { workspace = true }
 serde = { workspace = true }
-serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
@@ -29,16 +30,14 @@ async-trait = { workspace = true }
 utoipa = { workspace = true }
 chrono = { workspace = true }
 sea-orm = { workspace = true }
-log = { workspace = true }
-anyhow = { workspace = true }
 rand = { workspace = true }
 uuid = { workspace = true }
 totp-rs = { workspace = true }
-base32 = "0.5.1"
+base32 = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
-qrcode = "0.14.1"
-image = "0.25.6"
+qrcode = { workspace = true }
+image = { workspace = true, features = ["png"] }
 base64 = { workspace = true }
 urlencoding = { workspace = true }
 tracing = { workspace = true }
@@ -46,6 +45,11 @@ openidconnect = { workspace = true }
 reqwest = { workspace = true }
 
 [dev-dependencies]
-temps-migrations = { path = "../temps-migrations" }
-tokio-test = "0.4"
-walkdir = { workspace = true }
+# Real RS256 keys for the Cloud logout token tests.
+rsa = { workspace = true, features = ["pem"] }
+temps-test-utils = { path = "../temps-test-utils" }
+# Paused-clock tests (`start_paused`, `time::advance`).
+tokio = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

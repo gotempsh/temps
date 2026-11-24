@@ -72,7 +72,7 @@ export function CreateEnvironmentDialog({
             className="space-y-4"
           >
             <DialogHeader>
-              <DialogTitle>Create Environment</DialogTitle>
+              <DialogTitle>Create environment</DialogTitle>
               <DialogDescription>
                 Add a new environment to your service for different deployment
                 stages.
@@ -84,7 +84,7 @@ export function CreateEnvironmentDialog({
               name="name"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Environment Name</FormLabel>
+                  <FormLabel>Environment name</FormLabel>
                   <FormControl>
                     <Input
                       placeholder="e.g., Production, Staging, Development"
@@ -101,7 +101,7 @@ export function CreateEnvironmentDialog({
               name="branch"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Git Branch</FormLabel>
+                  <FormLabel>Git branch</FormLabel>
                   <FormControl>
                     {project?.repo_owner && project?.repo_name ? (
                       <BranchSelector

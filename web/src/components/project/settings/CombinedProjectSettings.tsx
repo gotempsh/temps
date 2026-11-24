@@ -1,58 +1,47 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { SettingsSection } from '@/components/ui/settings-section'
 import {
   Blocks,
-  Bot,
   Boxes,
-  Braces,
-  CalendarClock,
   CodeXml,
   Container,
   Flag,
   GitBranch,
   KeyRound,
-  ListChecks,
   LockKeyhole,
   Plug,
-  PlugZap,
-  Puzzle,
   Rocket,
   Settings2,
-  Sparkles,
+  Vault,
   Webhook,
+  Workflow,
 } from 'lucide-react'
-import { useEffect, type ReactNode } from 'react'
+import type { ReactNode } from 'react'
+import { PageHeader, SettingsSurface } from '@temps-sdk/ds'
 import type { LucideIcon } from 'lucide-react'
 import type { ProjectResponse } from '@/api/client'
 import { usePageTitle } from '@/hooks/usePageTitle'
-import { Button } from '@/components/ui/button'
 import {
-  requestedSettingsSection,
   settingsSectionDomId,
   type CombinedSettingsPage,
   type SettingsSectionId,
 } from '@/lib/project-settings-sections'
+import { AutomationSettings } from './AutomationSettings'
 import { GeneralSettings } from './GeneralSettings'
 import { GitSettings } from './GitSettings'
 import { BuildDeploySettings } from './BuildDeploySettings'
 import { SecretsSettings } from './SecretsSettings'
 import { DeploymentTokensSettings } from './DeploymentTokensSettings'
-import { CronJobsSettings } from './CronJobsSettings'
 import { WebhooksSettings } from './WebhooksSettings'
-import { SkillsSettings } from './SkillsSettings'
-import { McpServersSettings } from './McpServersSettings'
 import {
   HostDockerAccessAlert,
   HostDockerAccessOnboarding,
   useHostDockerAccess,
 } from '@/components/project/HostDockerAccessAlert'
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
-import { AutopilotPage } from '@/components/agents/AutopilotPage'
-import { AutofixerPage } from '@/components/autofixer/AutofixerPage'
-import { ProjectSetup } from '@/pages/ProjectSetup'
-import { Link, useSearchParams } from 'react-router'
+import { ProjectVaultAccess } from '@/components/service-access/ProjectVaultAccess'
+import { Link } from 'react-router'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useConsoleExtensions } from '@temps-sdk/console-kit'
 
@@ -60,16 +49,43 @@ export type { CombinedSettingsPage }
 const titles: Record<CombinedSettingsPage, string> = {
   general: 'General',
   delivery: 'Build & deploy',
-  variables: 'Variables & secrets',
+  variables: 'Secrets',
+  'deployment-tokens': 'Deployment tokens',
   automation: 'Automation',
   integrations: 'Integrations',
+}
+
+/** One line under each page title, so every Configure page opens the same way. */
+const descriptions: Record<CombinedSettingsPage, string> = {
+  general: 'How this service is named, what it reports, and deleting it.',
+  delivery: 'Where the code comes from, how it is built, and how it ships.',
+  variables: '',
+  'deployment-tokens': '',
+  automation:
+    'Jobs the AI does on its own. Every run is a chat you can open and continue.',
+  integrations: 'Webhooks, vaults and extensions for this service.',
 }
 
 type Section = {
   id: SettingsSectionId<CombinedSettingsPage>
   title: string
+  /** One line under the title in the left column. */
+  description?: string
   icon: LucideIcon
   content: ReactNode
+  /** The content lays out its own groups under the page title; no heading. */
+  headless?: boolean
+  /**
+   * The content draws the page header itself (a list page with its primary
+   * action on the right), so the page adds no title of its own.
+   */
+  ownsPageHeader?: boolean
+  /**
+   * The content is a record list or operational panel, not a form, so it
+   * spans the page under its heading instead of sitting in the settings
+   * column.
+   */
+  fullWidth?: boolean
 }
 
 /**
@@ -82,14 +98,15 @@ export function CombinedProjectSettings({
   page,
   project,
   refetch,
+  intro,
 }: {
   page: CombinedSettingsPage
   project: ProjectResponse
   refetch: () => void
+  /** Rendered between the page title and the first section. */
+  intro?: ReactNode
 }) {
   usePageTitle(`${titles[page]} · ${project.name}`)
-  const [searchParams] = useSearchParams()
-  const activeSection = requestedSettingsSection(page, searchParams)
   const hostDockerAccess = useHostDockerAccess(project)
 
   let sections: Section[]
@@ -111,12 +128,7 @@ export function CombinedProjectSettings({
           title: 'Service settings',
           icon: Settings2,
           content: <GeneralSettings project={project} refetch={refetch} />,
-        },
-        {
-          id: 'setup',
-          title: 'Service setup',
-          icon: ListChecks,
-          content: <ProjectSetup project={project} />,
+          headless: true,
         },
       ]
       break
@@ -125,6 +137,7 @@ export function CombinedProjectSettings({
         {
           id: 'source',
           title: 'Source',
+          description: 'Whether Temps runs this app, and what it deploys from.',
           icon: CodeXml,
           content: (
             <BuildDeploySettings
@@ -137,12 +150,14 @@ export function CombinedProjectSettings({
         {
           id: 'repository',
           title: 'Repository',
+          description: 'The Git repository and branch Temps builds from.',
           icon: GitBranch,
           content: <GitSettings project={project} refetch={refetch} embedded />,
         },
         {
           id: 'build',
           title: 'Build',
+          description: 'How the code is turned into an image.',
           icon: Container,
           content: (
             <BuildDeploySettings
@@ -155,6 +170,8 @@ export function CombinedProjectSettings({
         {
           id: 'deployment',
           title: 'Deployment',
+          description:
+            'Defaults every environment starts from: ports, health checks, resources.',
           icon: Rocket,
           content: (
             <BuildDeploySettings
@@ -167,6 +184,8 @@ export function CombinedProjectSettings({
         {
           id: 'previews',
           title: 'Previews',
+          description:
+            'Short-lived environments for branches and pull requests.',
           icon: Blocks,
           content: (
             <BuildDeploySettings
@@ -179,6 +198,7 @@ export function CombinedProjectSettings({
         {
           id: 'feature-flags',
           title: 'Feature flags',
+          description: 'Turn features on and off without a deploy.',
           icon: Flag,
           content: <ProjectFeatureFlags project={project} />,
         },
@@ -187,6 +207,8 @@ export function CombinedProjectSettings({
         sections.push({
           id: 'host-access',
           title: 'Advanced: host Docker access',
+          description:
+            'Give this service the Docker socket on the hosts that run it.',
           icon: Plug,
           content: <HostDockerAccessOnboarding project={project} />,
         })
@@ -195,44 +217,35 @@ export function CombinedProjectSettings({
     case 'variables':
       sections = [
         {
-          id: 'environment-variables',
-          title: 'Environment Variables',
-          icon: Braces,
-          content: <EnvironmentVariablesLink project={project} />,
-        },
-        {
           id: 'secrets',
           title: 'Secrets',
           icon: LockKeyhole,
           content: <SecretsSettings project={project} />,
+          headless: true,
+          ownsPageHeader: true,
         },
+      ]
+      break
+    case 'deployment-tokens':
+      sections = [
         {
           id: 'deployment-tokens',
           title: 'Deployment tokens',
           icon: KeyRound,
           content: <DeploymentTokensSettings project={project} />,
+          headless: true,
+          ownsPageHeader: true,
         },
       ]
       break
     case 'automation':
       sections = [
         {
-          id: 'agents',
-          title: 'Agents & runs',
-          icon: Bot,
-          content: <AutopilotPage project={project} />,
-        },
-        {
-          id: 'cron-jobs',
-          title: 'Cron jobs',
-          icon: CalendarClock,
-          content: <CronJobsSettings project={project} />,
-        },
-        {
-          id: 'autofixer',
-          title: 'Autofixer',
-          icon: Sparkles,
-          content: <AutofixerPage project={project} />,
+          id: 'automations',
+          title: 'Automation',
+          icon: Workflow,
+          content: <AutomationSettings project={project} />,
+          headless: true,
         },
       ]
       break
@@ -241,84 +254,113 @@ export function CombinedProjectSettings({
         {
           id: 'webhooks',
           title: 'Webhooks',
+          description: 'Send deployment and error events to other systems.',
           icon: Webhook,
           content: <WebhooksSettings project={project} />,
         },
         {
-          id: 'skills',
-          title: 'Skills',
-          icon: Puzzle,
-          content: <SkillsSettings project={project} />,
-        },
-        {
-          id: 'mcp-servers',
-          title: 'MCP servers',
-          icon: PlugZap,
-          content: <McpServersSettings project={project} />,
+          id: 'vaults',
+          title: 'Vaults',
+          description:
+            'Shared services that sandboxes and AI chats in this service can request access to.',
+          icon: Vault,
+          content: <ProjectVaultAccess projectId={project.id} />,
+          fullWidth: true,
         },
         {
           id: 'extensions',
           title: 'Extensions',
+          description: 'Pages added by installed plugins.',
           icon: Boxes,
           content: <ProjectExtensionLinks project={project} />,
         },
       ]
       break
   }
-  // A section can appear after the first render (the Advanced section waits
-  // for the viewer's permissions), so its presence is part of the trigger.
-  const activeSectionRendered = sections.some(
-    (section) => section.id === activeSection
-  )
-  // Open the requested section and bring it into view. Runs again when the
-  // query changes on the same page (e.g. ⌘K from one section to another).
-  useEffect(() => {
-    if (!activeSection || !activeSectionRendered) return
-    const element = document.getElementById(settingsSectionDomId(activeSection))
-    if (!(element instanceof HTMLDetailsElement)) return
-    element.open = true
-    element.scrollIntoView({ block: 'start' })
-  }, [page, activeSection, activeSectionRendered])
-
+  // Every section is always open and laid out the same way on every page: a
+  // group with its title and purpose on the left and its settings on the
+  // right, groups separated by a rule. Never a card around a section.
+  const single = sections.length === 1 && sections[0].headless
   return (
-    <div className="min-w-0 space-y-4">
-      <h1 className="text-xl font-semibold tracking-tight">{titles[page]}</h1>
+    <div className="min-w-0 space-y-6">
+      {!sections.some((section) => section.ownsPageHeader) && (
+        <PageHeader
+          title={titles[page]}
+          description={descriptions[page] || undefined}
+        />
+      )}
       {banner}
-      {sections.map((section) => (
-        <SettingsSection
-          key={`${page}-${section.id}`}
-          id={settingsSectionDomId(section.id)}
-          title={section.title}
-          icon={section.icon}
-          defaultOpen={section.id === activeSection}
-          className="scroll-mt-4"
+      {intro}
+      {single ? (
+        <section
+          id={settingsSectionDomId(sections[0].id)}
+          aria-label={sections[0].title}
+          className="min-w-0 scroll-mt-4"
         >
-          {section.content}
-        </SettingsSection>
-      ))}
+          {sections[0].content}
+        </section>
+      ) : (
+        <div className="min-w-0 divide-y [&>section]:py-8 [&>section:first-child]:pt-0">
+          {sections.map((section) => (
+            <SettingsBlock
+              key={`${page}-${section.id}`}
+              id={settingsSectionDomId(section.id)}
+              title={section.title}
+              description={section.description}
+              fullWidth={section.fullWidth}
+            >
+              {section.content}
+            </SettingsBlock>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
 
 /**
- * Environment variables have one editor, on the project's own Environment
- * Variables page. This page keeps the entry point so nobody looking for them
- * under Settings hits a dead end.
+ * One always-open group of settings, laid out like `SettingsGroup`: what it
+ * is on the left, the settings on the right. The content is marked as being
+ * on a settings surface, so cards and sections inside it render flat instead
+ * of as a box in a box. A `fullWidth` group (a record list, not a form) puts
+ * its heading above and spans the page instead.
  */
-function EnvironmentVariablesLink({ project }: { project: ProjectResponse }) {
+export function SettingsBlock({
+  id,
+  title,
+  description,
+  fullWidth = false,
+  children,
+}: {
+  id: string
+  title: string
+  description?: string
+  fullWidth?: boolean
+  children: ReactNode
+}) {
+  const headingId = `${id}-heading`
   return (
-    <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-      <p className="max-w-[72ch] text-sm text-muted-foreground">
-        Values injected into your app as environment variables, per environment.
-        They are managed on the project&apos;s Environment Variables page, with
-        credential checks and history.
-      </p>
-      <Button asChild variant="outline" className="shrink-0">
-        <Link to={`/projects/${project.slug}/environment-variables`}>
-          Open Environment Variables
-        </Link>
-      </Button>
-    </div>
+    <section
+      id={id}
+      aria-labelledby={headingId}
+      className={
+        fullWidth
+          ? 'min-w-0 scroll-mt-4 space-y-5'
+          : 'grid min-w-0 scroll-mt-4 gap-5 md:grid-cols-[minmax(0,1fr)_minmax(0,2fr)] md:gap-10'
+      }
+    >
+      <div className="min-w-0">
+        <h2 id={headingId} className="text-base font-semibold">
+          {title}
+        </h2>
+        {description && (
+          <p className="mt-1 text-sm text-muted-foreground">{description}</p>
+        )}
+      </div>
+      <div className="min-w-0 space-y-5">
+        <SettingsSurface>{children}</SettingsSurface>
+      </div>
+    </section>
   )
 }
 

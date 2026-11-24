@@ -8,7 +8,8 @@ use temps_core::AuditLogger;
 
 use crate::index::LineIndex;
 use crate::services::{
-    ChunkWriterService, LogMetadataService, LogSearchService, RetentionService, TailService,
+    ChunkWriterService, IngestBudget, LogMetadataService, LogSavedSearchService, LogSearchService,
+    RetentionService, TailService,
 };
 use crate::store::manifest::ManifestRepo;
 use crate::store::LogLineStore;
@@ -40,6 +41,18 @@ pub struct LogAggregatorAppState {
     /// Chunk writer, for the collection status the capabilities endpoint
     /// reports (WAL recovery state and deferred generations).
     pub chunk_writer: Arc<ChunkWriterService>,
+    /// Per-container ingestion budget, for the throttled containers the
+    /// capabilities endpoint reports.
+    pub ingest_budget: Arc<IngestBudget>,
+    /// Saved log searches (ADR 108 D1): the named queries the console
+    /// offers and log alerts count.
+    pub saved_search_service: Arc<LogSavedSearchService>,
+    /// Series of a saved search, for dashboard panels (ADR 108 D1).
+    pub log_series_service: Arc<crate::services::LogSeriesService>,
+    /// HTTP log ingest (ADR 108 D1): key authentication, budget, writing.
+    pub ingest_service: Arc<crate::ingest::LogIngestService>,
+    /// Log ingest key CRUD.
+    pub ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -53,6 +66,11 @@ pub async fn create_log_aggregator_app_state(
     db: Arc<DatabaseConnection>,
     line_index: Arc<dyn LineIndex>,
     chunk_writer: Arc<ChunkWriterService>,
+    ingest_budget: Arc<IngestBudget>,
+    saved_search_service: Arc<LogSavedSearchService>,
+    log_series_service: Arc<crate::services::LogSeriesService>,
+    ingest_service: Arc<crate::ingest::LogIngestService>,
+    ingest_key_service: Arc<crate::ingest::LogIngestKeyService>,
 ) -> Arc<LogAggregatorAppState> {
     let manifests = Arc::new(ManifestRepo::new(db.clone()));
     Arc::new(LogAggregatorAppState {
@@ -67,5 +85,10 @@ pub async fn create_log_aggregator_app_state(
         line_index,
         manifests,
         chunk_writer,
+        ingest_budget,
+        saved_search_service,
+        log_series_service,
+        ingest_service,
+        ingest_key_service,
     })
 }

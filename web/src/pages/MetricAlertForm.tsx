@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { PageTitle } from '@temps-sdk/ds'
 import { ProjectResponse } from '@/api/client'
 import type {
   AnomalyAlgorithm,
@@ -17,6 +18,7 @@ import {
   createAlertMutation,
   getAlertOptions,
   listMetricNamesOptions,
+  listSavedSearchesOptions,
   queryMetricsOptions,
   updateAlertMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -94,9 +96,21 @@ import {
   ChevronDown,
   SlidersHorizontal,
 } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import {
+  parseStashedSignal,
+  switchSignal,
+  type SignalFields,
+} from '@/lib/alert-signal'
 import { useForm, useWatch } from 'react-hook-form'
-import { Link, useLocation, useNavigate, useParams } from 'react-router'
+import {
+  Link,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
+import { alertPresetFromParams } from '@/lib/release-health'
 import { useGoBack } from '@/hooks/useGoBack'
 import { NotificationCoverageNotice } from '@/components/monitoring/NotificationCoverageNotice'
 import {
@@ -135,43 +149,72 @@ const SEASONALITY_VALUES = SEASONALITIES.map((s) => s.value) as [
 // Flat schema: comparator/threshold (static) and the anomaly knobs always carry
 // form values (with defaults); `onSubmit` builds the right `detection_config`
 // variant from `detection_kind`, and the backend validates the final config.
-const alertSchema = z.object({
-  name: z.string().min(1, 'Name is required').max(200, 'Name is too long'),
-  metric_name: z.string().min(1, 'Pick a metric'),
-  aggregation: z.enum(AGGREGATION_VALUES),
-  detection_kind: z.enum(['static', 'anomaly']),
-  comparator: z.enum(COMPARATOR_VALUES),
-  threshold: z.number({ message: 'Threshold must be a number' }),
-  algorithm: z.enum(ALGORITHM_VALUES),
-  deviations: z
-    .number({ message: 'Sensitivity must be a number' })
-    .positive('Sensitivity must be greater than 0'),
-  direction: z.enum(DIRECTION_VALUES),
-  seasonality: z.enum(SEASONALITY_VALUES),
-  window_secs: z
-    .number({ message: 'Window must be a number' })
-    .int()
-    .positive('Window must be greater than 0'),
-  for_duration_secs: z
-    .number({ message: 'Duration must be a number' })
-    .int()
-    .positive('Duration must be greater than 0'),
-  severity: z.enum(SEVERITY_VALUES),
-  enabled: z.boolean(),
-  label_filters: z.array(z.object({ key: z.string(), value: z.string() })),
-  group_by: z.array(z.string()).max(MAX_GROUP_BY_KEYS),
-  dynamic_alerts: z.boolean(),
-  max_series: z
-    .number({ message: 'Max series must be a number' })
-    .int()
-    .min(1, 'Max series must be at least 1')
-    .max(100, 'Max series cannot exceed 100'),
-  grouped_notification_threshold: z
-    .number({ message: 'Threshold must be a number' })
-    .int()
-    .min(1, 'Threshold must be at least 1')
-    .max(1000, 'Threshold cannot exceed 1000'),
-})
+const alertSchema = z
+  .object({
+    name: z.string().min(1, 'Name is required').max(200, 'Name is too long'),
+    /** What the rule counts: an OTel metric, or lines matching a saved log search. */
+    signal: z.enum(['metric', 'logs']),
+    metric_name: z.string(),
+    saved_search_id: z.number().nullable(),
+    aggregation: z.enum(AGGREGATION_VALUES),
+    detection_kind: z.enum(['static', 'anomaly']),
+    comparator: z.enum(COMPARATOR_VALUES),
+    threshold: z.number({ message: 'Threshold must be a number' }),
+    algorithm: z.enum(ALGORITHM_VALUES),
+    deviations: z
+      .number({ message: 'Sensitivity must be a number' })
+      .positive('Sensitivity must be greater than 0'),
+    direction: z.enum(DIRECTION_VALUES),
+    seasonality: z.enum(SEASONALITY_VALUES),
+    window_secs: z
+      .number({ message: 'Window must be a number' })
+      .int()
+      .positive('Window must be greater than 0'),
+    for_duration_secs: z
+      .number({ message: 'Duration must be a number' })
+      .int()
+      .positive('Duration must be greater than 0'),
+    severity: z.enum(SEVERITY_VALUES),
+    enabled: z.boolean(),
+    label_filters: z.array(z.object({ key: z.string(), value: z.string() })),
+    group_by: z.array(z.string()).max(MAX_GROUP_BY_KEYS),
+    dynamic_alerts: z.boolean(),
+    max_series: z
+      .number({ message: 'Max series must be a number' })
+      .int()
+      .min(1, 'Max series must be at least 1')
+      .max(100, 'Max series cannot exceed 100'),
+    grouped_notification_threshold: z
+      .number({ message: 'Threshold must be a number' })
+      .int()
+      .min(1, 'Threshold must be at least 1')
+      .max(1000, 'Threshold cannot exceed 1000'),
+  })
+  .superRefine((data, ctx) => {
+    if (data.signal === 'metric' && !data.metric_name)
+      ctx.addIssue({
+        code: 'custom',
+        path: ['metric_name'],
+        message: 'Pick a metric',
+      })
+    if (data.signal === 'logs') {
+      if (data.saved_search_id == null)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['saved_search_id'],
+          message: 'Pick a saved search',
+        })
+      if (data.window_secs > LOG_ALERT_MAX_WINDOW_SECS)
+        ctx.addIssue({
+          code: 'custom',
+          path: ['window_secs'],
+          message: `A log alert counts at most the last ${LOG_ALERT_MAX_WINDOW_SECS} seconds`,
+        })
+    }
+  })
+
+/** The longest window a log alert may count over (the server enforces it too). */
+const LOG_ALERT_MAX_WINDOW_SECS = 3600
 
 type AlertFormData = z.infer<typeof alertSchema>
 
@@ -186,11 +229,13 @@ function coerce<T extends readonly string[]>(
     : fallback
 }
 
-function emptyDefaults(): AlertFormData {
+function emptyDefaults(savedSearchId?: number): AlertFormData {
   return {
     name: '',
+    signal: savedSearchId ? 'logs' : 'metric',
     metric_name: '',
-    aggregation: 'avg',
+    saved_search_id: savedSearchId ?? null,
+    aggregation: savedSearchId ? 'count' : 'avg',
     detection_kind: 'static',
     comparator: 'gt',
     threshold: 0,
@@ -245,11 +290,29 @@ function AlertFormBody({
   // Unsaved fields, new alert or edits to an existing one, survive a detour
   // to add a notification provider (which returns here via `returnTo`). The
   // key includes the alert ID so edits never land on a different alert.
+  const [searchParams] = useSearchParams()
+  // A link can open a prefilled new alert (`?preset=crash-free-sessions`
+  // from release health); a saved draft still wins over it.
+  const [preset] = useState(() => alertPresetFromParams(searchParams))
   const draftKey = `metric-alert:${project.id}:${isEditing ? id : 'new'}`
+  // "Alert on this search" from the logs page opens a new rule with the
+  // search already chosen.
+  const [fromSavedSearch] = useState(() => {
+    const raw = new URLSearchParams(location.search).get('saved_search_id')
+    const parsed = raw && /^\d+$/.test(raw) ? Number(raw) : undefined
+    return !isEditing && parsed ? parsed : undefined
+  })
+  // The metric settings kept aside while the log signal is shown travel
+  // with the draft, so they survive the trip to notification setup.
+  const stashKey = `${draftKey}:metric-signal`
   const [draft] = useState(() => readFormDraft(draftKey))
+  const [restoredStash] = useState(() =>
+    parseStashedSignal(readFormDraft(stashKey), AGGREGATION_VALUES)
+  )
   useEffect(() => {
     clearFormDraft(draftKey)
-  }, [draftKey])
+    clearFormDraft(stashKey)
+  }, [draftKey, stashKey])
 
   const namesQuery = useQuery({
     ...listMetricNamesOptions({ path: { project_id: project.id } }),
@@ -273,7 +336,13 @@ function AlertFormBody({
       return mergeFormDraft<AlertFormData>(
         {
           name: existing.name,
-          metric_name: existing.metric_name,
+          signal: existing.source.kind === 'logs' ? 'logs' : 'metric',
+          metric_name:
+            existing.source.kind === 'logs' ? '' : existing.metric_name,
+          saved_search_id:
+            existing.source.kind === 'logs'
+              ? existing.source.saved_search_id
+              : null,
           aggregation: coerce(AGGREGATION_VALUES, existing.aggregation, 'avg'),
           detection_kind: isAnomaly ? 'anomaly' : 'static',
           comparator: coerce(
@@ -312,8 +381,11 @@ function AlertFormBody({
         draft
       )
     }
-    return mergeFormDraft(emptyDefaults(), draft)
-  }, [existing, draft])
+    return mergeFormDraft(
+      { ...emptyDefaults(fromSavedSearch), ...(preset ?? {}) },
+      draft
+    )
+  }, [existing, draft, fromSavedSearch, preset])
 
   // `defaultValues` (mount-once), not `values`: this body is remounted via `key`
   // when the edited rule loads, so the form never resets a Select post-mount.
@@ -328,6 +400,57 @@ function AlertFormBody({
     name: 'detection_kind',
   })
   const watchedMetric = useWatch({ control: form.control, name: 'metric_name' })
+  const signal = useWatch({ control: form.control, name: 'signal' })
+  const isLogs = signal === 'logs'
+  const savedSearchesQuery = useQuery({
+    ...listSavedSearchesOptions({
+      path: { project_id: project.id },
+      query: { page_size: 100 },
+    }),
+    enabled: isLogs,
+  })
+  const savedSearchOptions = useMemo(
+    () =>
+      (savedSearchesQuery.data?.data ?? []).map((search) => ({
+        value: String(search.id),
+        label: search.name,
+      })),
+    [savedSearchesQuery.data]
+  )
+  // A log alert counts lines with a fixed threshold: no other aggregation,
+  // no learned baseline, no per-series split. Keep hidden fields consistent
+  // so a switch back and forth never submits a combination the server
+  // refuses.
+  // The metric settings are kept aside while the log signal is shown and
+  // restored when the user returns to a metric.
+  const stashedMetricFields = useRef<SignalFields<
+    AlertFormData['aggregation']
+  > | null>(restoredStash)
+  useEffect(() => {
+    const values = form.getValues()
+    const { apply, stashed } = switchSignal(
+      isLogs,
+      {
+        aggregation: values.aggregation,
+        detection_kind: values.detection_kind,
+        group_by: values.group_by,
+        label_filters: values.label_filters,
+        dynamic_alerts: values.dynamic_alerts,
+      },
+      stashedMetricFields.current
+    )
+    stashedMetricFields.current = stashed
+    if (!apply) return
+    form.setValue(
+      'aggregation',
+      apply.aggregation as AlertFormData['aggregation']
+    )
+    form.setValue('detection_kind', apply.detection_kind)
+    form.setValue('group_by', apply.group_by)
+    form.setValue('label_filters', apply.label_filters)
+    form.setValue('dynamic_alerts', apply.dynamic_alerts)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isLogs])
   const isAnomaly = detectionKind === 'anomaly'
   const groupBy = useWatch({ control: form.control, name: 'group_by' })
   const dynamicAlerts = useWatch({
@@ -432,7 +555,7 @@ function AlertFormBody({
         end_time: historyRange.end,
       },
     }),
-    enabled: isAnomaly && !!watchedMetric,
+    enabled: isAnomaly && !isLogs && !!watchedMetric,
   })
   const historyDays = useMemo(() => {
     const buckets = historyQuery.data?.data ?? []
@@ -465,6 +588,7 @@ function AlertFormBody({
     onSuccess: () => {
       toast.success('Alert rule created')
       clearFormDraft(draftKey)
+      clearFormDraft(stashKey)
       queryClient.invalidateQueries({
         predicate: (query) =>
           (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlerts',
@@ -479,6 +603,7 @@ function AlertFormBody({
     onSuccess: () => {
       toast.success('Alert rule updated')
       clearFormDraft(draftKey)
+      clearFormDraft(stashKey)
       queryClient.invalidateQueries({
         predicate: (query) => {
           const key = (query.queryKey[0] as Record<string, unknown>)?._id
@@ -515,13 +640,20 @@ function AlertFormBody({
     // stale toggle value slipped through. (Detector kind no longer matters — the
     // backend now supports per-series anomaly detection too.)
     const dynamic_alerts = data.dynamic_alerts && data.group_by.length > 0
+    const source =
+      data.signal === 'logs' && data.saved_search_id != null
+        ? { kind: 'logs' as const, saved_search_id: data.saved_search_id }
+        : { kind: 'metric' as const }
+    // A log rule's metric name is the server's own label for line counts.
+    const metric_name = data.signal === 'logs' ? undefined : data.metric_name
     if (isEditing) {
       updateMutation.mutate({
         path: { id },
         query: { project_id: project.id },
         body: {
           name: data.name,
-          metric_name: data.metric_name,
+          source,
+          metric_name,
           aggregation: data.aggregation,
           detection_config,
           window_secs: data.window_secs,
@@ -540,7 +672,8 @@ function AlertFormBody({
         body: {
           project_id: project.id,
           name: data.name,
-          metric_name: data.metric_name,
+          source,
+          metric_name,
           aggregation: data.aggregation,
           detection_config,
           window_secs: data.window_secs,
@@ -570,9 +703,9 @@ function AlertFormBody({
         </Button>
         <div className="flex flex-1 flex-col gap-1">
           <div className="flex items-center gap-2">
-            <h1 className="text-lg font-semibold">
+            <PageTitle className="text-lg font-semibold">
               {isEditing ? 'Edit alert' : 'New alert'}
-            </h1>
+            </PageTitle>
             {existing && (
               <AlertStateBadge
                 state={existing.last_state}
@@ -587,8 +720,8 @@ function AlertFormBody({
           <p className="text-sm text-muted-foreground">
             {isEditing
               ? 'Update the signal, threshold, and notification settings.'
-              : 'Fire a notification when a metric crosses a threshold.'}{' '}
-            Watches metrics from service{' '}
+              : 'Fire a notification when a metric or a log search crosses a threshold.'}{' '}
+            Watches service{' '}
             <span className="font-medium text-foreground">{project.name}</span>{' '}
             only.
           </p>
@@ -695,7 +828,12 @@ function AlertFormBody({
 
       <NotificationCoverageNotice
         severity={watchedSeverity}
-        onLeave={() => saveFormDraft(draftKey, form.getValues())}
+        onLeave={() => {
+          saveFormDraft(draftKey, form.getValues())
+          if (stashedMetricFields.current) {
+            saveFormDraft(stashKey, stashedMetricFields.current)
+          }
+        }}
       />
 
       <Form {...form}>
@@ -722,268 +860,12 @@ function AlertFormBody({
                 )}
               />
 
-              {/* Signal: metric + aggregation */}
-              <div className="grid gap-4 sm:grid-cols-2">
-                <FormField
-                  control={form.control}
-                  name="metric_name"
-                  render={({ field }) => (
-                    <FormItem className="min-w-0">
-                      <FormLabel>Metric</FormLabel>
-                      <FormControl>
-                        <SearchableSelect
-                          value={field.value}
-                          onValueChange={field.onChange}
-                          options={metricOptions}
-                          placeholder={
-                            namesQuery.isPending
-                              ? 'Loading metrics…'
-                              : 'Select a metric…'
-                          }
-                          searchPlaceholder="Filter metrics…"
-                          emptyText="No metrics ingested yet."
-                          disabled={namesQuery.isPending}
-                          className="font-mono text-xs"
-                        />
-                      </FormControl>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-                <FormField
-                  control={form.control}
-                  name="aggregation"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormLabel>Aggregation</FormLabel>
-                      <Select
-                        onValueChange={field.onChange}
-                        value={field.value}
-                      >
-                        <FormControl>
-                          <SelectTrigger className="font-mono text-xs">
-                            <SelectValue />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {AGGREGATIONS.map((a) => (
-                            <SelectItem key={a.value} value={a.value}>
-                              {a.label}
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormMessage />
-                    </FormItem>
-                  )}
-                />
-              </div>
-            </CardContent>
-          </Card>
-
-          {/* Scope: label filters + break-down/per-series settings. Collapsed
-              by default — most alerts watch the whole metric and never touch
-              this — but starts open when editing a rule that already has
-              something configured here (see `scopeOpen`'s initializer). */}
-          <Collapsible
-            open={scopeOpen}
-            onOpenChange={setScopeOpen}
-            className="rounded-lg border border-border bg-card"
-          >
-            <CollapsibleTrigger
-              type="button"
-              className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left text-sm transition-colors hover:bg-muted/40"
-            >
-              <span className="flex min-w-0 items-center gap-2">
-                <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
-                <span className="font-medium">Scope</span>
-                <Badge
-                  variant="secondary"
-                  className="ml-1 shrink-0 font-normal"
-                >
-                  {scopeSummary}
-                </Badge>
-              </span>
-              <ChevronDown
-                className={cn(
-                  'size-4 shrink-0 text-muted-foreground transition-transform',
-                  scopeOpen && 'rotate-180'
-                )}
-              />
-            </CollapsibleTrigger>
-            <CollapsibleContent className="flex flex-col gap-6 border-t border-border p-4">
-              {/* Label filters — scopes this rule to one label value (e.g.
-                  endpoint=/checkout) instead of the whole metric. Needs a
-                  metric selected first: there's nothing to autocomplete
-                  against otherwise, matching MetricsExplorer's gating of the
-                  same autocomplete queries. */}
-              {watchedMetric ? (
-                <FormField
-                  control={form.control}
-                  name="label_filters"
-                  render={({ field }) => (
-                    <FormItem>
-                      <FormControl>
-                        <LabelFilterBuilder
-                          value={field.value}
-                          onChange={field.onChange}
-                          projectId={project.id}
-                          metricName={watchedMetric}
-                          fromIso={labelFilterRange.start}
-                          toIso={labelFilterRange.end}
-                        />
-                      </FormControl>
-                      <FormDescription>
-                        Scope this alert to a specific label value instead of
-                        the whole metric. Leave empty to alert on the full
-                        aggregate.
-                      </FormDescription>
-                    </FormItem>
-                  )}
-                />
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  Pick a metric above to optionally scope this alert to a
-                  specific label value.
-                </p>
-              )}
-
-              {/* Group by / Alert per series (ADR-026 Phase 3/4) — pick up to 2
-                  label keys to break the metric into per-series alarms instead
-                  of one aggregate alarm. Same metric gating as label filters:
-                  there's nothing to autocomplete without a metric. */}
-              {watchedMetric && (
-                <div className="flex flex-col gap-4 border-t border-border/60 pt-6">
-                  <FormField
-                    control={form.control}
-                    name="group_by"
-                    render={({ field }) => (
-                      <FormItem>
-                        <FormControl>
-                          <GroupByBuilder
-                            value={field.value}
-                            onChange={field.onChange}
-                            projectId={project.id}
-                            metricName={watchedMetric}
-                            fromIso={labelFilterRange.start}
-                            toIso={labelFilterRange.end}
-                            cardinalityHint={`only the top ${maxSeries} series are tracked once "Alert per series" is on; the rest are dropped for that evaluation tick.`}
-                          />
-                        </FormControl>
-                        <FormDescription>
-                          Break this alert down by label so it can fire
-                          independently per series (e.g. one alarm per{' '}
-                          <span className="font-mono">endpoint</span>) instead
-                          of a single aggregate alarm.
-                        </FormDescription>
-                      </FormItem>
-                    )}
-                  />
-
-                  {hasGroupBy && (
-                    <FormField
-                      control={form.control}
-                      name="dynamic_alerts"
-                      render={({ field }) => (
-                        <FormItem className="flex flex-row items-center justify-between gap-4 rounded-md border border-border/60 p-3">
-                          <div className="space-y-0.5">
-                            <FormLabel>Alert per series</FormLabel>
-                            <FormDescription>
-                              Fire one independent alarm per breaching{' '}
-                              {groupBy.join('/')} instead of a single alarm for
-                              the whole metric.
-                            </FormDescription>
-                          </div>
-                          <FormControl>
-                            <Switch
-                              checked={field.value}
-                              onCheckedChange={field.onChange}
-                            />
-                          </FormControl>
-                        </FormItem>
-                      )}
-                    />
-                  )}
-
-                  {hasGroupBy && dynamicAlerts && (
-                    <div className="grid gap-4 sm:grid-cols-2">
-                      <FormField
-                        control={form.control}
-                        name="max_series"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>Max series to track</FormLabel>
-                            <FormControl>
-                              <NumberInput
-                                min={1}
-                                max={100}
-                                name={field.name}
-                                ref={field.ref}
-                                onBlur={field.onBlur}
-                                value={field.value}
-                                onValueChange={(value) =>
-                                  field.onChange(value ?? Number.NaN)
-                                }
-                              />
-                            </FormControl>
-                            <FormDescription>
-                              Cardinality cap (1–100). Only the top series by
-                              breach magnitude are tracked each tick; the rest
-                              are dropped rather than creating unbounded alarms.
-                            </FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name="grouped_notification_threshold"
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel>
-                              Notification grouping threshold
-                            </FormLabel>
-                            <FormControl>
-                              <NumberInput
-                                min={1}
-                                max={1000}
-                                name={field.name}
-                                ref={field.ref}
-                                onBlur={field.onBlur}
-                                value={field.value}
-                                onValueChange={(value) =>
-                                  field.onChange(value ?? Number.NaN)
-                                }
-                              />
-                            </FormControl>
-                            <FormDescription>
-                              When more than this many series fire in the same
-                              tick, you&apos;ll get one combined notification
-                              instead of one per series.
-                            </FormDescription>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                  )}
-                </div>
-              )}
-            </CollapsibleContent>
-          </Collapsible>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>Detection</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-6">
-              {/* Detector type */}
               <FormField
                 control={form.control}
-                name="detection_kind"
+                name="signal"
                 render={({ field }) => (
                   <FormItem className="sm:max-w-[280px]">
-                    <FormLabel>Detection</FormLabel>
+                    <FormLabel>Watch</FormLabel>
                     <Select onValueChange={field.onChange} value={field.value}>
                       <FormControl>
                         <SelectTrigger>
@@ -991,21 +873,351 @@ function AlertFormBody({
                         </SelectTrigger>
                       </FormControl>
                       <SelectContent>
-                        {DETECTION_KINDS.map((d) => (
-                          <SelectItem key={d.value} value={d.value}>
-                            {d.label}
-                          </SelectItem>
-                        ))}
+                        <SelectItem value="metric">A metric</SelectItem>
+                        <SelectItem value="logs">
+                          Log lines matching a saved search
+                        </SelectItem>
                       </SelectContent>
                     </Select>
-                    <FormDescription>
-                      {detectionKind === 'anomaly'
-                        ? 'Learns a baseline band from history and fires when the metric deviates from it — no fixed number to pick.'
-                        : 'Fires when the aggregated value crosses a fixed threshold.'}
-                    </FormDescription>
+                    <FormMessage />
                   </FormItem>
                 )}
               />
+
+              {isLogs ? (
+                <FormField
+                  control={form.control}
+                  name="saved_search_id"
+                  render={({ field }) => (
+                    <FormItem className="min-w-0">
+                      <FormLabel>Saved search</FormLabel>
+                      <FormControl>
+                        <SearchableSelect
+                          value={field.value != null ? String(field.value) : ''}
+                          onValueChange={(value) =>
+                            field.onChange(value ? Number(value) : null)
+                          }
+                          options={savedSearchOptions}
+                          placeholder={
+                            savedSearchesQuery.isPending
+                              ? 'Loading saved searches…'
+                              : 'Select a saved search…'
+                          }
+                          searchPlaceholder="Filter saved searches…"
+                          emptyText="No saved searches in this service yet."
+                          disabled={savedSearchesQuery.isPending}
+                        />
+                      </FormControl>
+                      {!savedSearchesQuery.isPending &&
+                        savedSearchOptions.length === 0 && (
+                          <FormDescription>
+                            Save a search on the{' '}
+                            <Link
+                              to={`/logs?project_id=${project.id}`}
+                              className="underline underline-offset-2"
+                            >
+                              logs page
+                            </Link>{' '}
+                            first, then alert on it.
+                          </FormDescription>
+                        )}
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              ) : (
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <FormField
+                    control={form.control}
+                    name="metric_name"
+                    render={({ field }) => (
+                      <FormItem className="min-w-0">
+                        <FormLabel>Metric</FormLabel>
+                        <FormControl>
+                          <SearchableSelect
+                            value={field.value}
+                            onValueChange={field.onChange}
+                            options={metricOptions}
+                            placeholder={
+                              namesQuery.isPending
+                                ? 'Loading metrics…'
+                                : 'Select a metric…'
+                            }
+                            searchPlaceholder="Filter metrics…"
+                            emptyText="No metrics ingested yet."
+                            disabled={namesQuery.isPending}
+                            className="font-mono text-xs"
+                          />
+                        </FormControl>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="aggregation"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Aggregation</FormLabel>
+                        <Select
+                          onValueChange={field.onChange}
+                          value={field.value}
+                        >
+                          <FormControl>
+                            <SelectTrigger className="font-mono text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {AGGREGATIONS.map((a) => (
+                              <SelectItem key={a.value} value={a.value}>
+                                {a.label}
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+              )}
+            </CardContent>
+          </Card>
+
+          {/* Scope: label filters + break-down/per-series settings. Collapsed
+              by default — most alerts watch the whole metric and never touch
+              this — but starts open when editing a rule that already has
+              something configured here (see `scopeOpen`'s initializer). */}
+          {!isLogs && (
+            <Collapsible
+              open={scopeOpen}
+              onOpenChange={setScopeOpen}
+              className="rounded-lg border border-border bg-card"
+            >
+              <CollapsibleTrigger
+                type="button"
+                className="flex w-full items-center justify-between gap-2 px-4 py-3 text-left text-sm transition-colors hover:bg-muted/40"
+              >
+                <span className="flex min-w-0 items-center gap-2">
+                  <SlidersHorizontal className="size-4 shrink-0 text-muted-foreground" />
+                  <span className="font-medium">Scope</span>
+                  <Badge
+                    variant="secondary"
+                    className="ml-1 shrink-0 font-normal"
+                  >
+                    {scopeSummary}
+                  </Badge>
+                </span>
+                <ChevronDown
+                  className={cn(
+                    'size-4 shrink-0 text-muted-foreground transition-transform',
+                    scopeOpen && 'rotate-180'
+                  )}
+                />
+              </CollapsibleTrigger>
+              <CollapsibleContent className="flex flex-col gap-6 border-t border-border p-4">
+                {/* Label filters — scopes this rule to one label value (e.g.
+                  endpoint=/checkout) instead of the whole metric. Needs a
+                  metric selected first: there's nothing to autocomplete
+                  against otherwise, matching MetricsExplorer's gating of the
+                  same autocomplete queries. */}
+                {watchedMetric ? (
+                  <FormField
+                    control={form.control}
+                    name="label_filters"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormControl>
+                          <LabelFilterBuilder
+                            value={field.value}
+                            onChange={field.onChange}
+                            projectId={project.id}
+                            metricName={watchedMetric}
+                            fromIso={labelFilterRange.start}
+                            toIso={labelFilterRange.end}
+                          />
+                        </FormControl>
+                        <FormDescription>
+                          Scope this alert to a specific label value instead of
+                          the whole metric. Leave empty to alert on the full
+                          aggregate.
+                        </FormDescription>
+                      </FormItem>
+                    )}
+                  />
+                ) : (
+                  <p className="text-xs text-muted-foreground">
+                    Pick a metric above to optionally scope this alert to a
+                    specific label value.
+                  </p>
+                )}
+
+                {/* Group by / Alert per series (ADR-026 Phase 3/4) — pick up to 2
+                  label keys to break the metric into per-series alarms instead
+                  of one aggregate alarm. Same metric gating as label filters:
+                  there's nothing to autocomplete without a metric. */}
+                {watchedMetric && (
+                  <div className="flex flex-col gap-4 border-t border-border/60 pt-6">
+                    <FormField
+                      control={form.control}
+                      name="group_by"
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormControl>
+                            <GroupByBuilder
+                              value={field.value}
+                              onChange={field.onChange}
+                              projectId={project.id}
+                              metricName={watchedMetric}
+                              fromIso={labelFilterRange.start}
+                              toIso={labelFilterRange.end}
+                              cardinalityHint={`only the top ${maxSeries} series are tracked once "Alert per series" is on; the rest are dropped for that evaluation tick.`}
+                            />
+                          </FormControl>
+                          <FormDescription>
+                            Break this alert down by label so it can fire
+                            independently per series (e.g. one alarm per{' '}
+                            <span className="font-mono">endpoint</span>) instead
+                            of a single aggregate alarm.
+                          </FormDescription>
+                        </FormItem>
+                      )}
+                    />
+
+                    {hasGroupBy && (
+                      <FormField
+                        control={form.control}
+                        name="dynamic_alerts"
+                        render={({ field }) => (
+                          <FormItem className="flex flex-row items-center justify-between gap-4 rounded-md border border-border/60 p-3">
+                            <div className="space-y-0.5">
+                              <FormLabel>Alert per series</FormLabel>
+                              <FormDescription>
+                                Fire one independent alarm per breaching{' '}
+                                {groupBy.join('/')} instead of a single alarm
+                                for the whole metric.
+                              </FormDescription>
+                            </div>
+                            <FormControl>
+                              <Switch
+                                checked={field.value}
+                                onCheckedChange={field.onChange}
+                              />
+                            </FormControl>
+                          </FormItem>
+                        )}
+                      />
+                    )}
+
+                    {hasGroupBy && dynamicAlerts && (
+                      <div className="grid gap-4 sm:grid-cols-2">
+                        <FormField
+                          control={form.control}
+                          name="max_series"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Max series to track</FormLabel>
+                              <FormControl>
+                                <NumberInput
+                                  min={1}
+                                  max={100}
+                                  name={field.name}
+                                  ref={field.ref}
+                                  onBlur={field.onBlur}
+                                  value={field.value}
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
+                                  }
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Cardinality cap (1–100). Only the top series by
+                                breach magnitude are tracked each tick; the rest
+                                are dropped rather than creating unbounded
+                                alarms.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                        <FormField
+                          control={form.control}
+                          name="grouped_notification_threshold"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>
+                                Notification grouping threshold
+                              </FormLabel>
+                              <FormControl>
+                                <NumberInput
+                                  min={1}
+                                  max={1000}
+                                  name={field.name}
+                                  ref={field.ref}
+                                  onBlur={field.onBlur}
+                                  value={field.value}
+                                  onValueChange={(value) =>
+                                    field.onChange(value ?? Number.NaN)
+                                  }
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                When more than this many series fire in the same
+                                tick, you&apos;ll get one combined notification
+                                instead of one per series.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    )}
+                  </div>
+                )}
+              </CollapsibleContent>
+            </Collapsible>
+          )}
+
+          <Card>
+            <CardHeader>
+              <CardTitle>Detection</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-6">
+              {/* Detector type. A log alert is always a fixed threshold. */}
+              {!isLogs && (
+                <FormField
+                  control={form.control}
+                  name="detection_kind"
+                  render={({ field }) => (
+                    <FormItem className="sm:max-w-[280px]">
+                      <FormLabel>Detection</FormLabel>
+                      <Select
+                        onValueChange={field.onChange}
+                        value={field.value}
+                      >
+                        <FormControl>
+                          <SelectTrigger>
+                            <SelectValue />
+                          </SelectTrigger>
+                        </FormControl>
+                        <SelectContent>
+                          {DETECTION_KINDS.map((d) => (
+                            <SelectItem key={d.value} value={d.value}>
+                              {d.label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                      <FormDescription>
+                        {detectionKind === 'anomaly'
+                          ? 'Learns a baseline band from history and fires when the metric deviates from it — no fixed number to pick.'
+                          : 'Fires when the aggregated value crosses a fixed threshold.'}
+                      </FormDescription>
+                    </FormItem>
+                  )}
+                />
+              )}
 
               {detectionKind === 'anomaly' ? (
                 <>
@@ -1292,6 +1504,7 @@ function AlertFormBody({
                       <FormControl>
                         <NumberInput
                           min={1}
+                          max={isLogs ? LOG_ALERT_MAX_WINDOW_SECS : undefined}
                           name={field.name}
                           ref={field.ref}
                           onBlur={field.onBlur}
@@ -1302,8 +1515,9 @@ function AlertFormBody({
                         />
                       </FormControl>
                       <FormDescription>
-                        The metric is aggregated over this trailing window each
-                        evaluation (e.g. 300 = last 5 minutes).
+                        {isLogs
+                          ? `Matching lines are counted over this trailing window each evaluation (at most ${LOG_ALERT_MAX_WINDOW_SECS}).`
+                          : 'The metric is aggregated over this trailing window each evaluation (e.g. 300 = last 5 minutes).'}
                       </FormDescription>
                       <FormMessage />
                     </FormItem>

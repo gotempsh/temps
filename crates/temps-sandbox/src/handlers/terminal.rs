@@ -51,6 +51,7 @@ use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permissions::Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
+use temps_core::websocket_origin::validate_websocket_origin;
 use temps_pty_agent::protocol as pty;
 use tokio::io::AsyncWriteExt;
 use tokio_util::codec::FramedRead;
@@ -278,8 +279,8 @@ fn default_shell_cmd() -> String {
 /// failure there points at the image. The microVM backends inject the agent
 /// from a binary staged on the host by their setup command, so the same
 /// hint would send the user hunting for an image problem that does not exist.
-fn terminal_unavailable_hint(backend: temps_agents::sandbox::SandboxBackend) -> &'static str {
-    use temps_agents::sandbox::SandboxBackend;
+fn terminal_unavailable_hint(backend: temps_sandbox_providers::SandboxBackend) -> &'static str {
+    use temps_sandbox_providers::SandboxBackend;
     match backend {
         SandboxBackend::Docker => {
             "Interactive terminals need the temps PTY agent, which ships in the \
@@ -367,8 +368,10 @@ pub async fn terminal(
     State(state): State<Arc<SandboxAppState>>,
     Path(id): Path<String>,
     axum::extract::Query(params): axum::extract::Query<TerminalParams>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
+    validate_websocket_origin(&headers)?;
     // This endpoint launches a PTY and forwards `?cmd=` to the agent, which
     // spawns it via `/bin/sh -c` — it is arbitrary code execution inside the
     // sandbox, exactly like the /exec routes. It must therefore require
@@ -473,7 +476,7 @@ pub async fn terminal(
 
 struct TerminalSession {
     socket: WebSocket,
-    attachment: temps_agents::sandbox::PtyAttachment,
+    attachment: temps_sandbox_providers::PtyAttachment,
     service: Arc<crate::services::sandbox_service::SandboxService>,
     sandbox_id: String,
     internal_id: i32,
@@ -843,14 +846,19 @@ fn attach_timeout_problem(sandbox_id: &str, what: &str) -> Problem {
 /// one of these groups instead of silently becoming setup advice.
 fn attach_failure_problem(
     sandbox_id: &str,
-    backend: temps_agents::sandbox::SandboxBackend,
-    error: temps_agents::error::AgentError,
+    backend: temps_sandbox_providers::SandboxBackend,
+    error: temps_agent_core::error::AgentError,
 ) -> Problem {
-    use temps_agents::error::AgentError;
+    use temps_agent_core::error::AgentError;
 
     match error {
         unsupported @ AgentError::SandboxUnsupportedOnNode { .. } => {
             Problem::from(crate::error::from_agent_error(sandbox_id, unsupported))
+        }
+        // A sandbox addressed to a control plane that runs no workloads
+        // (ADR 063): say so, rather than suggesting an image problem.
+        no_host @ AgentError::NoLocalSandboxHost { .. } => {
+            Problem::from(crate::error::from_agent_error(sandbox_id, no_host))
         }
         // The VM died between the liveness check and the attach: the same
         // problem (type, title, how to recover) the liveness check returns.
@@ -871,6 +879,9 @@ fn attach_failure_problem(
         | AgentError::SandboxProviderUnavailable { .. }
         | AgentError::SandboxNodeUnavailable { .. }
         | AgentError::SandboxConflictOnNode { .. }
+        | AgentError::SandboxEgressPolicyUnsupported { .. }
+        | AgentError::ServiceAccessUnavailable { .. }
+        | AgentError::SandboxCpuLimit { .. }
         | AgentError::Validation { .. }
         | AgentError::ImmutableSandboxImageRebuild { .. }
         | AgentError::SnapshotSizeLimitExceeded { .. }
@@ -886,7 +897,9 @@ fn attach_failure_problem(
         unexpected @ (AgentError::ConfigNotFound { .. }
         | AgentError::AgentNotFound { .. }
         | AgentError::RunNotFound { .. }
+        | AgentError::RunCancelled { .. }
         | AgentError::ProjectNotFound { .. }
+        | AgentError::InvalidErrorGroup { .. }
         | AgentError::BudgetExceeded { .. }
         | AgentError::CooldownActive { .. }
         | AgentError::AiCliNotInstalled { .. }
@@ -923,8 +936,8 @@ fn attach_failure_problem(
 async fn bounded_attach<T>(
     sandbox_id: &str,
     deadline: Duration,
-    attach: impl std::future::Future<Output = Result<T, temps_agents::error::AgentError>>,
-) -> Result<Result<T, temps_agents::error::AgentError>, Problem> {
+    attach: impl std::future::Future<Output = Result<T, temps_agent_core::error::AgentError>>,
+) -> Result<Result<T, temps_agent_core::error::AgentError>, Problem> {
     tokio::time::timeout(deadline, attach).await.map_err(|_| {
         tracing::warn!(
             sandbox_id = %sandbox_id,
@@ -941,6 +954,28 @@ async fn bounded_attach<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cross-origin page must not be able to open this socket with the
+    /// user's cookie (browsers apply no CORS to WebSocket handshakes), so the
+    /// Origin check has to run before any lookup or upgrade work.
+    #[test]
+    fn websocket_handlers_validate_origin_before_any_work() {
+        let source = include_str!("terminal.rs");
+        let name = "terminal";
+        let start = source
+            .find(&format!("pub async fn {name}("))
+            .unwrap_or_else(|| panic!("{name} handler not found in source"));
+        let body_start = start + source[start..].find(") -> ").unwrap_or(0);
+        let body = &source[body_start..];
+        let check = body
+            .find("validate_websocket_origin(&headers)?")
+            .unwrap_or_else(|| panic!("{name} must call validate_websocket_origin"));
+        let first_await = body.find(".await").unwrap_or(usize::MAX);
+        assert!(
+            check < first_await,
+            "{name} must validate the Origin before its first await"
+        );
+    }
 
     #[test]
     fn default_shell_is_a_login_shell() {
@@ -1092,7 +1127,7 @@ mod tests {
 
     #[test]
     fn terminal_hints_point_each_backend_at_its_own_fix() {
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_sandbox_providers::SandboxBackend;
         let docker = terminal_unavailable_hint(SandboxBackend::Docker);
         assert!(docker.contains("sandbox image"), "{docker}");
 
@@ -1170,8 +1205,8 @@ mod tests {
 
     #[test]
     fn provider_step_timeouts_are_504_not_409() {
-        use temps_agents::error::AgentError;
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_agent_core::error::AgentError;
+        use temps_sandbox_providers::SandboxBackend;
 
         // A Firecracker handshake (10s) and a microsandbox bootstrap (60s)
         // both fail well before the handler's 100s deadline. They must not
@@ -1202,8 +1237,8 @@ mod tests {
     /// "Terminal Unavailable" with backend setup advice.
     #[test]
     fn a_vm_lost_during_attach_is_the_vm_not_running_problem() {
-        use temps_agents::error::AgentError;
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_agent_core::error::AgentError;
+        use temps_sandbox_providers::SandboxBackend;
 
         let problem = attach_failure_problem(
             "sbx_test",
@@ -1228,8 +1263,8 @@ mod tests {
 
     #[test]
     fn missing_terminal_support_stays_409_with_the_backend_hint() {
-        use temps_agents::error::AgentError;
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_agent_core::error::AgentError;
+        use temps_sandbox_providers::SandboxBackend;
 
         let problem = attach_failure_problem(
             "sbx_test",
@@ -1252,8 +1287,8 @@ mod tests {
 
     #[test]
     fn errors_a_provider_never_produces_are_500_without_setup_advice() {
-        use temps_agents::error::AgentError;
-        use temps_agents::sandbox::SandboxBackend;
+        use temps_agent_core::error::AgentError;
+        use temps_sandbox_providers::SandboxBackend;
 
         let problem = attach_failure_problem(
             "sbx_test",

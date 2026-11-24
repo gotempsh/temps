@@ -20,6 +20,8 @@ pub struct Model {
     pub desired_state: String,
     pub runtime: String,
     pub image: Option<String>,
+    pub cpu_limit_explicit: bool,
+    pub memory_limit_explicit: bool,
     pub cpu_limit: f64,
     pub memory_limit_mb: i64,
     pub pids_limit: i64,

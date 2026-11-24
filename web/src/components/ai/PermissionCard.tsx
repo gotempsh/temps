@@ -1,6 +1,5 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
-import { Checkbox } from '@/components/ui/checkbox'
 import { HighlightedCode } from '@/components/ui/code-block'
 import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 
@@ -27,7 +26,16 @@ import { MarkdownCodeBlock } from '@/components/ui/markdown-code-block'
 import { useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
-import { Check, HelpCircle, Loader2, MapPin, Shield, X } from 'lucide-react'
+import {
+  Check,
+  HelpCircle,
+  Loader2,
+  Lock,
+  MapPin,
+  Send,
+  Shield,
+  X,
+} from 'lucide-react'
 import { cn } from '@/lib/utils'
 import ReactMarkdown, { type Components } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -35,6 +43,11 @@ import {
   untrustedMarkdownImage,
   untrustedMarkdownLink,
 } from '@/components/markdown/untrusted'
+import {
+  describeParameters,
+  summaryTitle,
+  type ParameterRow,
+} from './platform-write-view'
 import {
   GeneratedServiceLinkProposal,
   GeneratedServiceProposal,
@@ -46,6 +59,14 @@ import {
   resolveUserPermission,
   type PermissionDecision,
 } from '@/api/client'
+import {
+  chooseOption,
+  chooseOther,
+  composeAnswer,
+  EMPTY_DRAFT,
+  isAnswered,
+  type QuestionDraft,
+} from './question-answers'
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -100,9 +121,10 @@ const markdownComponents: Components = {
 
 /**
  * `kind === 'question'`
- * Renders each question from AskUserQuestion with its options. If multiSelect
- * is true, uses checkboxes + a submit button instead of single-click options.
- * A free-text field is offered for write-in answers.
+ * Renders each AskUserQuestion item as a vertical list of choices, with the
+ * option descriptions visible, followed by an "Other" choice that opens a
+ * text box for a written answer. Multi-select questions toggle; single-select
+ * questions behave like radios. One Send button answers every question.
  */
 function QuestionVariant({
   input,
@@ -111,17 +133,11 @@ function QuestionVariant({
   input: unknown
   onResolve: (decision: PermissionDecision) => void
 }) {
-  const data = input as Partial<AskUserQuestionInput>
-  const questions: AskUserQuestionItem[] = Array.isArray(data?.questions)
-    ? (data.questions as AskUserQuestionItem[])
-    : []
+  const questions = questionItems(input)
 
-  // Per-question state: selected option label(s) and free-text.
-  const [selections, setSelections] = useState<Record<string, string[]>>(() =>
-    Object.fromEntries(questions.map((q) => [q.question, []]))
-  )
-  const [freeTexts, setFreeTexts] = useState<Record<string, string>>(() =>
-    Object.fromEntries(questions.map((q) => [q.question, '']))
+  // Keyed by index: two questions may share their text.
+  const [drafts, setDrafts] = useState<QuestionDraft[]>(() =>
+    questions.map(() => EMPTY_DRAFT)
   )
 
   if (questions.length === 0) {
@@ -132,159 +148,235 @@ function QuestionVariant({
     )
   }
 
-  // With a single question, clicking a single-select option submits
-  // immediately (snappy one-click UX — nothing else to answer). With
-  // multiple questions, clicking only records the selection; the user must
-  // hit the shared Submit button once every question has an answer, so
-  // picking an option on question 1 doesn't prematurely submit empty
-  // answers for questions 2+.
-  const handleSingleSelect = (questionText: string, optionLabel: string) => {
-    if (questions.length === 1) {
-      onResolve({
-        type: 'answer_question',
-        answers: { [questionText]: optionLabel },
-      })
-      return
-    }
-    setSelections((prev) => ({ ...prev, [questionText]: [optionLabel] }))
-  }
+  const update = (
+    index: number,
+    next: (draft: QuestionDraft) => QuestionDraft
+  ) =>
+    setDrafts((prev) =>
+      prev.map((draft, i) => (i === index ? next(draft) : draft))
+    )
 
-  const handleMultiSubmit = () => {
+  const answeredCount = drafts.filter(isAnswered).length
+  const allAnswered = answeredCount === questions.length
+
+  const submit = () => {
+    if (!allAnswered) return
     const answers: Record<string, string> = {}
-    for (const q of questions) {
-      const sel = selections[q.question] ?? []
-      const ft = freeTexts[q.question] ?? ''
-      answers[q.question] = sel.length > 0 ? sel.join(', ') : ft
-    }
+    questions.forEach((q, i) => {
+      answers[q.question] = composeAnswer(drafts[i] ?? EMPTY_DRAFT)
+    })
     onResolve({ type: 'answer_question', answers })
   }
 
-  const anyMultiSelect = questions.some((q) => q.multiSelect)
-  const needsSubmitButton = questions.length > 1 || anyMultiSelect
-  const allAnswered = questions.every((q) => {
-    const sel = selections[q.question] ?? []
-    const ft = (freeTexts[q.question] ?? '').trim()
-    return sel.length > 0 || ft.length > 0
-  })
+  return (
+    <div>
+      <div className="divide-y divide-border/60">
+        {questions.map((q, index) => (
+          <QuestionItem
+            key={index}
+            item={q}
+            position={questions.length > 1 ? index + 1 : null}
+            total={questions.length}
+            draft={drafts[index] ?? EMPTY_DRAFT}
+            onChange={(next) => update(index, next)}
+            onSubmit={submit}
+          />
+        ))}
+      </div>
+
+      <div className="flex items-center justify-between gap-3 border-t border-border/60 pt-3">
+        <span className="text-xs text-muted-foreground">
+          {questions.length > 1
+            ? `${answeredCount} of ${questions.length} answered`
+            : allAnswered
+              ? 'Ready to send'
+              : 'Choose an answer'}
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          className="h-8 gap-1.5 px-3"
+          disabled={!allAnswered}
+          onClick={submit}
+        >
+          <Send className="h-3.5 w-3.5" />
+          {questions.length > 1 ? 'Send answers' : 'Send answer'}
+        </Button>
+      </div>
+    </div>
+  )
+}
+
+function questionItems(input: unknown): AskUserQuestionItem[] {
+  const data = input as Partial<AskUserQuestionInput> | null
+  return Array.isArray(data?.questions)
+    ? (data.questions as AskUserQuestionItem[]).filter(
+        (q) => q && typeof q.question === 'string'
+      )
+    : []
+}
+
+function QuestionItem({
+  item,
+  position,
+  total,
+  draft,
+  onChange,
+  onSubmit,
+}: {
+  item: AskUserQuestionItem
+  /** 1-based position when there is more than one question. */
+  position: number | null
+  total: number
+  draft: QuestionDraft
+  onChange: (next: (draft: QuestionDraft) => QuestionDraft) => void
+  onSubmit: () => void
+}) {
+  const multiSelect = item.multiSelect === true
+  const options = Array.isArray(item.options) ? item.options : []
 
   return (
-    <div className="space-y-4">
-      {questions.map((q) => {
-        const isSingle = !q.multiSelect
-        return (
-          <div key={q.question} className="space-y-2">
-            {q.header && (
-              <div className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
-                {q.header}
-              </div>
-            )}
-            <div className="text-sm font-medium">{q.question}</div>
-            {isSingle ? (
-              <div className="flex flex-wrap gap-2">
-                {q.options.map((opt) => {
-                  const isSelected = (selections[q.question] ?? []).includes(
-                    opt.label
-                  )
-                  return (
-                    <Button
-                      key={opt.label}
-                      type="button"
-                      size="sm"
-                      variant={isSelected ? 'default' : 'outline'}
-                      className="h-7 px-3 text-xs"
-                      title={opt.description}
-                      onClick={() => handleSingleSelect(q.question, opt.label)}
-                    >
-                      {opt.label}
-                    </Button>
-                  )
-                })}
-                {/* Free-text / write-in fallback */}
-                <div className="mt-1 flex w-full gap-2">
-                  <Textarea
-                    value={freeTexts[q.question] ?? ''}
-                    onChange={(e) =>
-                      setFreeTexts((prev) => ({
-                        ...prev,
-                        [q.question]: e.target.value,
-                      }))
-                    }
-                    placeholder="Or type a custom answer..."
-                    rows={2}
-                    className="resize-none text-xs"
-                  />
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="h-auto self-end whitespace-nowrap text-xs"
-                    disabled={!(freeTexts[q.question] ?? '').trim()}
-                    onClick={() =>
-                      handleSingleSelect(
-                        q.question,
-                        (freeTexts[q.question] ?? '').trim()
-                      )
-                    }
-                  >
-                    Submit
-                  </Button>
-                </div>
-              </div>
-            ) : (
-              <div className="space-y-1.5">
-                {q.options.map((opt) => {
-                  const checked = (selections[q.question] ?? []).includes(
-                    opt.label
-                  )
-                  return (
-                    <label
-                      key={opt.label}
-                      className="flex cursor-pointer items-center gap-2 text-sm"
-                    >
-                      <Checkbox
-                        checked={checked}
-                        onCheckedChange={(checked) => {
-                          setSelections((prev) => {
-                            const cur = prev[q.question] ?? []
-                            return {
-                              ...prev,
-                              [q.question]:
-                                checked === true
-                                  ? [...cur, opt.label]
-                                  : cur.filter((l) => l !== opt.label),
-                            }
-                          })
-                        }}
-                      />
-                      <span>{opt.label}</span>
-                      {opt.description && (
-                        <span className="text-xs text-muted-foreground">
-                          — {opt.description}
-                        </span>
-                      )}
-                    </label>
-                  )
-                })}
-              </div>
-            )}
-          </div>
-        )
-      })}
-
-      {needsSubmitButton && (
-        <div className="mt-2 flex gap-2">
-          <Button
-            type="button"
-            size="sm"
-            className="h-7 gap-1 px-3 text-xs"
-            disabled={!allAnswered}
-            onClick={handleMultiSubmit}
-          >
-            <Check className="h-3.5 w-3.5" />
-            Submit {questions.length > 1 ? 'answers' : 'selection'}
-          </Button>
+    <div className="space-y-2.5 py-3 first:pt-0">
+      <div className="space-y-1">
+        <div className="flex items-center gap-2 text-[11px] text-muted-foreground">
+          {position !== null && (
+            <span className="tabular-nums">
+              {position}/{total}
+            </span>
+          )}
+          {item.header && (
+            <span className="rounded bg-muted px-1.5 py-0.5 font-medium text-foreground/80">
+              {item.header}
+            </span>
+          )}
+          {multiSelect && <span>Choose any</span>}
         </div>
+        <p className="text-sm font-medium leading-snug text-foreground">
+          {item.question}
+        </p>
+      </div>
+
+      <div
+        role={multiSelect ? 'group' : 'radiogroup'}
+        aria-label={item.question}
+        className="space-y-1.5"
+      >
+        {options.map((opt) => (
+          <ChoiceRow
+            key={opt.label}
+            label={opt.label}
+            description={opt.description}
+            multiSelect={multiSelect}
+            checked={draft.selected.includes(opt.label)}
+            onSelect={() =>
+              onChange((d) => chooseOption(d, opt.label, multiSelect))
+            }
+          />
+        ))}
+        <ChoiceRow
+          label="Other"
+          multiSelect={multiSelect}
+          checked={draft.otherChosen}
+          onSelect={() => onChange((d) => chooseOther(d, multiSelect))}
+        />
+        {draft.otherChosen && (
+          <Textarea
+            autoFocus
+            value={draft.otherText}
+            onChange={(e) => {
+              const otherText = e.target.value
+              onChange((d) => ({ ...d, otherText }))
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+                e.preventDefault()
+                onSubmit()
+              }
+            }}
+            aria-label={`Your answer to: ${item.question}`}
+            placeholder="Type your answer…"
+            rows={3}
+            className="min-h-[72px] resize-y bg-background text-sm"
+          />
+        )}
+      </div>
+    </div>
+  )
+}
+
+function ChoiceRow({
+  label,
+  description,
+  multiSelect,
+  checked,
+  onSelect,
+}: {
+  label: string
+  description?: string
+  multiSelect: boolean
+  checked: boolean
+  onSelect: () => void
+}) {
+  return (
+    <button
+      type="button"
+      role={multiSelect ? 'checkbox' : 'radio'}
+      aria-checked={checked}
+      onClick={onSelect}
+      className={cn(
+        'flex w-full items-start gap-3 rounded-md border bg-background px-3 py-2 text-left transition-colors',
+        'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+        checked
+          ? 'border-primary/60 bg-primary/[0.04]'
+          : 'border-border hover:border-foreground/25 hover:bg-muted/40'
       )}
+    >
+      <span
+        aria-hidden
+        className={cn(
+          'mt-0.5 flex h-4 w-4 shrink-0 items-center justify-center border transition-colors',
+          multiSelect ? 'rounded-[4px]' : 'rounded-full',
+          checked
+            ? 'border-primary bg-primary text-primary-foreground'
+            : 'border-muted-foreground/40'
+        )}
+      >
+        {checked &&
+          (multiSelect ? (
+            <Check className="h-3 w-3" strokeWidth={3} />
+          ) : (
+            <span className="h-1.5 w-1.5 rounded-full bg-primary-foreground" />
+          ))}
+      </span>
+      <span className="min-w-0 flex-1">
+        <span className="block text-sm leading-5 text-foreground">{label}</span>
+        {description && (
+          <span className="mt-0.5 block text-xs leading-snug text-muted-foreground">
+            {description}
+          </span>
+        )}
+      </span>
+    </button>
+  )
+}
+
+/** The settled view of an answered question card: each question and its answer. */
+function AnsweredQuestions({ answers }: { answers: Record<string, unknown> }) {
+  const entries = Object.entries(answers)
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
+        <Check className="h-3.5 w-3.5 text-green-600 dark:text-green-400" />
+        You answered
+      </div>
+      <dl className="space-y-1.5">
+        {entries.map(([question, answer]) => (
+          <div key={question} className="text-xs">
+            <dt className="text-muted-foreground">{question}</dt>
+            <dd className="font-medium text-foreground">{String(answer)}</dd>
+          </div>
+        ))}
+      </dl>
     </div>
   )
 }
@@ -396,6 +488,58 @@ function PlanApprovalVariant({
  * `<code>` block; other fields render as a key/value list. Allow sends
  * `AllowTool`; Deny opens an optional reason field.
  */
+/** What a platform change will do, as a titled list instead of raw JSON. */
+function PlatformWriteSummary({
+  title,
+  operation,
+  rows,
+  carriesHandle,
+}: {
+  title: string | null
+  operation: string | null
+  rows: ParameterRow[]
+  carriesHandle: boolean
+}) {
+  return (
+    <div className="space-y-2 rounded-lg border bg-background px-3 py-2.5 text-xs">
+      <div className="min-w-0">
+        <p className="text-sm font-medium">{title ?? operation ?? 'Change'}</p>
+        {operation && title && (
+          <code className="text-[11px] text-muted-foreground">{operation}</code>
+        )}
+      </div>
+      {rows.length > 0 && (
+        <dl className="grid grid-cols-[minmax(6rem,max-content)_minmax(0,1fr)] gap-x-4 gap-y-1">
+          {rows.map((row) => (
+            <div key={row.key} className="contents">
+              <dt className="text-muted-foreground" title={row.key}>
+                {row.label}
+              </dt>
+              <dd className="min-w-0 break-all font-mono text-[11px]">
+                {row.value.kind === 'hidden' ? (
+                  <span className="inline-flex items-center gap-1 font-sans text-muted-foreground">
+                    <Lock className="size-3" />
+                    Hidden, provided by you
+                  </span>
+                ) : (
+                  row.value.text
+                )}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      )}
+      {carriesHandle && (
+        <p className="flex items-start gap-1.5 border-t pt-2 text-muted-foreground">
+          <Shield className="mt-0.5 size-3.5 shrink-0" />
+          Uses the values you entered privately. Temps adds them when you
+          approve; the assistant never saw them.
+        </p>
+      )}
+    </div>
+  )
+}
+
 function ToolApprovalVariant({
   toolName,
   input,
@@ -444,6 +588,12 @@ function ToolApprovalVariant({
   const hasRichPlatformCard =
     serviceProposal !== null || serviceLinkProposal !== null
 
+  const plainPlatformWrite = platformInput !== null && !hasRichPlatformCard
+  const writeTitle = summaryTitle(
+    typeof platformInput?.summary === 'string' ? platformInput.summary : null
+  )
+  const parameterRows = describeParameters(parameters)
+
   const fields =
     input !== null && typeof input === 'object' && !Array.isArray(input)
       ? (Object.entries(input as Record<string, unknown>) as [
@@ -487,7 +637,16 @@ function ToolApprovalVariant({
         </div>
       )}
 
-      {fields.length > 0 && !hasRichPlatformCard && (
+      {plainPlatformWrite && (
+        <PlatformWriteSummary
+          title={writeTitle}
+          operation={operation}
+          rows={parameterRows}
+          carriesHandle={platformInput?.carries_handle === true}
+        />
+      )}
+
+      {fields.length > 0 && !hasRichPlatformCard && !plainPlatformWrite && (
         <div className="space-y-1 rounded-lg border bg-background px-2.5 py-2 text-xs">
           {fields.map(([key, value]) =>
             key === 'command' ? (
@@ -583,6 +742,12 @@ function ToolApprovalVariant({
 
 // ─── Settled state ────────────────────────────────────────────────────────────
 
+function answerMap(answers: unknown): Record<string, unknown> {
+  return answers && typeof answers === 'object' && !Array.isArray(answers)
+    ? (answers as Record<string, unknown>)
+    : {}
+}
+
 function resolvedSummary(decision: PermissionDecision): string {
   switch (decision.type) {
     case 'allow_tool':
@@ -592,13 +757,7 @@ function resolvedSummary(decision: PermissionDecision): string {
         ? `You denied this tool — ${decision.reason}`
         : 'You denied this tool.'
     case 'answer_question': {
-      const answers =
-        decision.answers &&
-        typeof decision.answers === 'object' &&
-        !Array.isArray(decision.answers)
-          ? (decision.answers as Record<string, unknown>)
-          : {}
-      const pairs = Object.entries(answers)
+      const pairs = Object.entries(answerMap(decision.answers))
         .map(([q, a]) => `${q}: ${a}`)
         .join('; ')
       return `You answered: ${pairs}`
@@ -698,16 +857,21 @@ export function PermissionCard({
 
   const KindIcon = kindIcon
 
+  const questionCount =
+    permission.kind === 'question' ? questionItems(permission.input).length : 0
+
   const kindLabel =
     permission.kind === 'question'
-      ? 'Question'
+      ? questionCount > 1
+        ? `${questionCount} questions`
+        : 'Question'
       : permission.kind === 'plan_approval'
         ? 'Plan approval'
         : 'Tool approval'
 
   const borderColor =
     permission.kind === 'question'
-      ? 'border-blue-500/30 bg-blue-500/5'
+      ? 'border-blue-500/25 bg-card'
       : permission.kind === 'plan_approval'
         ? 'border-violet-500/30 bg-violet-500/5'
         : 'border-amber-500/30 bg-amber-500/5'
@@ -730,7 +894,9 @@ export function PermissionCard({
       <div
         className={cn(
           'flex items-center gap-2 px-2.5 py-1.5 border-b',
-          borderColor
+          permission.kind === 'question'
+            ? 'border-blue-500/15 bg-blue-500/[0.06]'
+            : borderColor
         )}
       >
         <KindIcon className={cn('h-3.5 w-3.5 shrink-0', iconColor)} />
@@ -750,8 +916,10 @@ export function PermissionCard({
       </div>
 
       {/* Body */}
-      <div className="px-2.5 py-2">
-        {resolvedDecision !== null ? (
+      <div className={permission.kind === 'question' ? 'p-3' : 'px-2.5 py-2'}>
+        {resolvedDecision?.type === 'answer_question' ? (
+          <AnsweredQuestions answers={answerMap(resolvedDecision.answers)} />
+        ) : resolvedDecision !== null ? (
           /* Settled state — non-interactive */
           <div className="flex items-start gap-2 text-muted-foreground">
             <Check className="mt-0.5 h-3.5 w-3.5 shrink-0 text-green-600 dark:text-green-400" />

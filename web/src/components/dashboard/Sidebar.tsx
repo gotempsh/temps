@@ -19,43 +19,51 @@ import {
 } from '@/components/ui/sidebar'
 import {
   Activity,
-  Plug,
   Rocket,
   ArrowLeft,
   BadgeCheck,
   BarChart3,
-  Bot,
   ChevronsUpDown,
   Check,
-  Database,
-  Folder,
+  Boxes,
   Gauge,
-  GitBranch,
-  GitFork,
-  Home,
-  Layers,
   LogOut,
   Monitor,
   Moon,
   Search,
-  ScrollText,
-  MessageSquare,
-  Server,
   Settings,
-  ShieldAlert,
   Sun,
   Sparkles,
-  Terminal,
-  Wand2,
-  Variable,
+  X,
 } from 'lucide-react'
+import { toast } from 'sonner'
 
-import { getProjectBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
+import { adminGetNodeOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { ProjectResponse } from '@/api/client/types.gen'
+import { resolveConsoleScope } from '@/lib/console-scope'
+import {
+  ProjectGroupScopeNav,
+  ProjectScopeHeader,
+  ServiceScopeNav,
+} from './ProjectScopeNav'
 import { useAuth } from '@/contexts/AuthContext'
 import { useGettingStarted } from '@/hooks/useGettingStarted'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
-import { resolveProjectPrimaryRoute } from '@/lib/project-navigation'
+import {
+  projectNavGroupsFor,
+  projectRoot,
+  resolveProjectLocation,
+} from '@/lib/project-navigation'
+import { ENVIRONMENT_PARAM } from '@/lib/project-environment-selection'
+import {
+  nodeRouteOf,
+  nodeSections,
+  nodeSectionUrl,
+  resolveNodeSection,
+} from '@/lib/node-detail'
+import { WORKER_NODES_URL } from '@/lib/worker-nodes'
+import { SIDEBAR_HELP_LINKS } from '@/lib/support'
 import {
   isSettingsSidebarRoute,
   primaryPlatformGroups,
@@ -63,9 +71,9 @@ import {
 } from './primary-navigation'
 import { cn } from '@/lib/utils'
 import { useQuery } from '@tanstack/react-query'
-import { ChevronRight, type LucideIcon } from 'lucide-react'
-import { useEffect, useMemo, useState } from 'react'
-import { Link, useLocation } from 'react-router'
+import { type LucideIcon } from 'lucide-react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { Link, useLocation, useNavigate } from 'react-router'
 import { Avatar, AvatarFallback, AvatarImage } from '../ui/avatar'
 import {
   DropdownMenu,
@@ -87,25 +95,12 @@ import {
   type SettingsNavigationIcon,
 } from '@/components/settings/settings-navigation'
 
-// AI drill-down — swapped in for /ai-gateway, /chat, /agent-sandbox,
-// /skills, /mcp-servers, /ai-workflows, mirroring the Settings sidebar
-// swap so AI's several pages read as one coherent area instead of a
-// scattered set of sidebar entries.
-const AI_MODE_PREFIXES = [
-  '/ai-gateway',
-  '/chat',
-  '/agent-sandbox',
-  '/skills',
-  '/mcp-servers',
-  '/ai-workflows',
-]
+// AI drill-down — swapped in for /ai-gateway and /chat, mirroring the
+// Settings sidebar swap so AI's pages read as one coherent area instead of a
+// scattered set of sidebar entries. The assistant itself is reached from the
+// header's AI button, so the area holds only the gateway's pages.
+const AI_MODE_PREFIXES = ['/ai-gateway', '/chat']
 const aiNavItems: PlatformNavItem[] = [
-  {
-    title: 'Harnesses',
-    url: '/agent-sandbox/providers',
-    icon: Terminal,
-    featureKey: 'ai-chat',
-  },
   {
     title: 'Providers',
     url: '/ai-gateway',
@@ -116,6 +111,12 @@ const aiNavItems: PlatformNavItem[] = [
     title: 'Usage',
     url: '/ai-gateway/usage',
     icon: BarChart3,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Models',
+    url: '/ai-gateway/models',
+    icon: Boxes,
     featureKey: 'ai-gateway',
   },
   {
@@ -130,31 +131,6 @@ const aiNavItems: PlatformNavItem[] = [
     icon: Activity,
     featureKey: 'ai-gateway',
   },
-  {
-    title: 'Setup',
-    url: '/ai-gateway/setup',
-    icon: Terminal,
-    featureKey: 'ai-gateway',
-  },
-  {
-    title: 'Chats',
-    url: '/chat',
-    icon: MessageSquare,
-    featureKey: 'ai-chat',
-  },
-  {
-    title: 'Workflows',
-    url: '/ai-workflows',
-    icon: Bot,
-    featureKey: 'ai-agents-workflows',
-  },
-  {
-    title: 'Skills',
-    url: '/skills',
-    icon: Wand2,
-    featureKey: 'ai-foundation-api-tools',
-  },
-  { title: 'MCP Servers', url: '/mcp-servers', icon: Server },
 ]
 
 function NavPlugins({
@@ -282,36 +258,38 @@ export default function AppSidebar() {
   )
 
   // Route-driven sidebar swap.
-  //   /settings/*       → settings nav (back → default)
-  //   /projects/:slug/* → project nav  (back → default)
-  //   anything else     → default workspace nav
+  //   /settings/*            → settings nav (back → default)
+  //   /p/:slug/*             → the project's own nav
+  //   /projects/:slug/*      → the service's project nav, with the service
+  //                            open inside it (a standalone service keeps
+  //                            its own menu)
+  //   /settings/nodes/:id/*  → node nav (back → the node list)
+  //   anything else          → default (server-wide) nav
   // /projects (the list) and /projects/new keep the default nav.
   // Worker Nodes keeps its historical /settings/nodes URL but is a main-nav
   // page ("Applications"). Swapping to the settings sidebar there would
   // hide the entry that is currently active and highlight nothing, so the
   // route is explicitly excluded from the settings swap.
   const settingsMode = isSettingsSidebarRoute(location.pathname)
+  const nodeRoute = nodeRouteOf(location.pathname)
   const aiMode = AI_MODE_PREFIXES.some((p) => location.pathname.startsWith(p))
-  const projectMatch = location.pathname.match(/^\/projects\/([^/]+)(?:\/.*)?$/)
-  const projectSlug =
-    projectMatch &&
-    !['new', 'import-wizard', 'import'].includes(projectMatch[1])
-      ? projectMatch[1]
-      : null
+  const scope = resolveConsoleScope(location.pathname)
 
-  // Override: user pressed Back from a route-driven swap; show DefaultNav
+  // Override: user pressed Back from the settings or AI swap; show DefaultNav
   // only for that exact navigation. Keyed on `location.key` rather than
   // pathname — a Link back to the very same URL (e.g. clicking "AI" again
   // right after backing out of it) still produces a new history entry with
   // a new key, so the override correctly drops and the swap re-triggers.
-  // Comparing by pathname alone left the sidebar stuck on DefaultNav until
-  // the user navigated somewhere else first.
+  // A project's sidebar has no such override: its way out is a real link to
+  // every project, so the URL and the sidebar always agree.
   const [forceDefaultKey, setForceDefaultKey] = useState<string | null>(null)
   const forceDefault = forceDefaultKey === location.key
 
   const compact = isMinimal && !isMobile
 
-  const showDefault = forceDefault || (!settingsMode && !aiMode && !projectSlug)
+  const showDefault =
+    (forceDefault && (settingsMode || aiMode)) ||
+    (!settingsMode && !aiMode && scope.kind === 'global' && !nodeRoute)
 
   return (
     <Sidebar>
@@ -358,23 +336,52 @@ export default function AppSidebar() {
         <NavCommandTrigger />
         <GettingStartedNavItem />
         {showDefault ? (
-          <DefaultNav
-            pluginItems={pluginItems}
-            pinnedProjectSlug={forceDefault && projectSlug ? projectSlug : null}
-            onReturnToProject={() => setForceDefaultKey(null)}
-          />
+          <DefaultNav pluginItems={pluginItems} />
         ) : settingsMode ? (
           <SettingsNav onBack={() => setForceDefaultKey(location.key)} />
         ) : aiMode ? (
           <AiNav onBack={() => setForceDefaultKey(location.key)} />
-        ) : projectSlug ? (
-          <ProjectNav
-            slug={projectSlug}
-            onBack={() => setForceDefaultKey(location.key)}
+        ) : scope.kind === 'project' ? (
+          <ProjectGroupScopeNav slug={scope.groupSlug} route={scope.route} />
+        ) : scope.kind === 'service' ? (
+          <ServiceScopeNav
+            slug={scope.serviceSlug}
+            route={scope.route}
+            standalone={(service, notice) => (
+              <ProjectNav
+                slug={scope.serviceSlug}
+                route={scope.route}
+                project={service}
+                notice={notice}
+              />
+            )}
           />
+        ) : nodeRoute ? (
+          <NodeNav nodeId={nodeRoute.nodeId} segment={nodeRoute.segment} />
         ) : null}
       </SidebarContent>
       <SidebarFooter>
+        <SidebarMenu>
+          {SIDEBAR_HELP_LINKS.map((link) => (
+            <SidebarMenuItem key={link.id}>
+              <SidebarMenuButton
+                asChild
+                tooltip={link.label}
+                className={compact ? 'justify-center' : 'justify-start'}
+              >
+                <a
+                  href={link.href}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  aria-label={`${link.label} (opens in a new tab)`}
+                >
+                  <link.icon aria-hidden="true" />
+                  {!compact && <span>{link.label}</span>}
+                </a>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          ))}
+        </SidebarMenu>
         <NavUser />
       </SidebarFooter>
     </Sidebar>
@@ -474,11 +481,13 @@ function NavSection({
 // as a bordered callout card (not a plain nav row) with a mini progress bar
 // so it reads as a distinct "you have setup left" prompt. Full checklist
 // detail lives on its own /setup page. Renders nothing once dismissed or
-// fully complete (same visibility rule as the /setup page).
+// fully complete (same visibility rule as the /setup page). Once a step is done
+// it can be dismissed; /setup stays reachable from the command palette.
 function GettingStartedNavItem() {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const { completedCount, totalCount, visible } = useGettingStarted()
+  const { completedCount, totalCount, visible, canDismiss, dismiss } =
+    useGettingStarted()
 
   if (!visible) return null
 
@@ -508,10 +517,13 @@ function GettingStartedNavItem() {
   }
 
   return (
-    <SidebarGroup className="pb-0">
+    <SidebarGroup className="relative pb-0">
       <Link
         to="/setup"
-        className="group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70"
+        className={cn(
+          'group flex flex-col gap-2 rounded-lg border border-sidebar-border bg-sidebar-accent/40 px-3 py-2.5 transition-colors hover:border-primary/40 hover:bg-sidebar-accent/70',
+          canDismiss && 'pr-9'
+        )}
       >
         <div className="flex items-center gap-2">
           <BadgeCheck className="size-4 shrink-0 text-primary" />
@@ -527,6 +539,23 @@ function GettingStartedNavItem() {
           />
         </div>
       </Link>
+      {canDismiss && (
+        <button
+          type="button"
+          aria-label="Hide platform setup"
+          title="Hide platform setup"
+          className="absolute right-3.5 top-4 flex size-6 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-sidebar-ring"
+          onClick={() => {
+            dismiss()
+            toast('Platform setup hidden', {
+              description:
+                'Open it again from ⌘K: search for "Finish setting up".',
+            })
+          }}
+        >
+          <X className="size-3.5" />
+        </button>
+      )}
     </SidebarGroup>
   )
 }
@@ -707,12 +736,6 @@ function NavUser() {
 
 interface NavProps {
   pluginItems: { title: string; url: string; icon: LucideIcon }[]
-  // Slug of the project the user is currently viewing (URL still
-  // points inside `/projects/:slug/...`) but has temporarily swapped
-  // the sidebar to default via Back. When set, render a pinned row at
-  // the top so they can return to the project sidebar in one click.
-  pinnedProjectSlug?: string | null
-  onReturnToProject?: () => void
 }
 
 function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
@@ -775,11 +798,7 @@ function ExtensionNav({ items }: { items?: ConsoleNavItem[] }) {
   )
 }
 
-function DefaultNav({
-  pluginItems,
-  pinnedProjectSlug,
-  onReturnToProject,
-}: NavProps) {
+function DefaultNav({ pluginItems }: NavProps) {
   const { isMinimal, isMobile } = useSidebar()
   const compact = isMinimal && !isMobile
 
@@ -794,12 +813,6 @@ function DefaultNav({
 
   return (
     <>
-      {pinnedProjectSlug && onReturnToProject && (
-        <CurrentProjectPin
-          slug={pinnedProjectSlug}
-          onReturn={onReturnToProject}
-        />
-      )}
       {primaryPlatformGroups.map((group) => (
         <NavSection
           key={group.label}
@@ -875,7 +888,7 @@ function SettingsNav({ onBack }: { onBack: () => void }) {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AI nav — replaces the whole sidebar for the AI area (Providers, Usage,
-// Chats, Workflows, Skills, MCP Servers). Back button returns to root.
+// Limits, Activity). Back button returns to root.
 // ─────────────────────────────────────────────────────────────────────────────
 
 function AiNav({ onBack }: { onBack: () => void }) {
@@ -891,116 +904,138 @@ function AiNav({ onBack }: { onBack: () => void }) {
 // Project nav — replaces the whole sidebar when on /projects/:slug/*.
 // ─────────────────────────────────────────────────────────────────────────────
 
-const projectPrimaryItems = [
-  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
-  {
-    title: 'Deployments',
-    url: 'deployments',
-    icon: GitBranch,
-    section: 'deployments',
-  },
-  {
-    title: 'Environments',
-    url: 'environments',
-    icon: Layers,
-    section: 'environments',
-  },
-  {
-    title: 'Environment Variables',
-    url: 'environment-variables',
-    icon: Variable,
-    section: 'environment-variables',
-  },
-  { title: 'Logs', url: 'runtime', icon: ScrollText, section: 'logs' },
-  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
-  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
-  {
-    title: 'Analytics',
-    url: 'analytics',
-    icon: BarChart3,
-    section: 'analytics',
-  },
-  {
-    title: 'Monitoring',
-    url: 'metrics',
-    icon: Activity,
-    section: 'monitoring',
-  },
-  { title: 'Databases', url: 'storage', icon: Database, section: 'storage' },
-  {
-    title: 'Security',
-    url: 'security',
-    icon: ShieldAlert,
-    section: 'security',
-  },
-  {
-    title: 'Settings',
-    url: 'settings/general',
-    icon: Settings,
-    section: 'settings',
-  },
-] as const
-
-const monitoringProjectItems = [
-  { title: 'Overview', url: 'project', icon: Home, section: 'project' },
-  {
-    title: 'Analytics',
-    url: 'analytics',
-    icon: BarChart3,
-    section: 'analytics',
-  },
-  { title: 'Errors', url: 'errors', icon: ShieldAlert, section: 'errors' },
-  { title: 'Traces', url: 'traces', icon: GitFork, section: 'traces' },
-  {
-    title: 'Telemetry logs',
-    url: 'telemetry-logs',
-    icon: ScrollText,
-    section: 'logs',
-  },
-  { title: 'Monitoring', url: 'metrics', icon: Gauge, section: 'monitoring' },
-  {
-    title: 'Integrations',
-    url: 'integrations',
-    icon: Plug,
-    section: 'integrations',
-  },
-  {
-    title: 'Settings',
-    url: 'settings/general',
-    icon: Settings,
-    section: 'settings',
-  },
-  { title: 'Add hosting', url: 'hosting', icon: Rocket, section: 'hosting' },
-] as const
-
-function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
-  const { data: project } = useQuery(
-    getProjectBySlugOptions({ path: { slug } })
-  )
+// A standalone service's menu: its pages grouped by job. Each section's own
+// pages are tabs on the page, so this stays one level deep. A
+// monitoring-only service gets the sections it has, plus a way to add
+// hosting. A service inside a project gets its project's sidebar instead
+// (`ServiceScopeNav`).
+function ProjectNav({
+  slug,
+  route,
+  project,
+  notice,
+}: {
+  slug: string
+  route: string
+  project: ProjectResponse | undefined
+  /** Shown under the header, such as a failed project lookup. */
+  notice?: ReactNode
+}) {
   const location = useLocation()
   const { isMinimal, isMobile, setOpenMobile } = useSidebar()
   const compact = isMinimal && !isMobile
-  const route = location.pathname.slice(`/projects/${slug}/`.length)
-  const active =
-    project?.source_type === 'external' &&
-    ['hosting', 'integrations'].includes(route)
-      ? route
-      : resolveProjectPrimaryRoute(route)
-  const items =
-    project?.source_type === 'external'
-      ? monitoringProjectItems
-      : projectPrimaryItems
+  const root = projectRoot(slug)
+  // "Add hosting" is a page of its own, not part of any section.
+  const onHosting = route === 'hosting' || route.startsWith('hosting/')
+  const active = onHosting ? null : resolveProjectLocation(route).section.id
+  // Until the project loads, show the full menu most projects have.
+  const groups = projectNavGroupsFor(project ?? {})
+  // Keep the environment chosen in the project bar when switching sections.
+  const env = new URLSearchParams(location.search).get(ENVIRONMENT_PARAM)
+  const query = env ? `?${ENVIRONMENT_PARAM}=${encodeURIComponent(env)}` : ''
+  return (
+    <>
+      <ProjectScopeHeader title={project?.name ?? 'Loading…'} />
+      {notice}
+      {groups.map((group, index) => (
+        <SidebarGroup
+          key={group.label ?? index}
+          className={index === 0 ? 'py-2' : 'py-0'}
+        >
+          {group.label && (
+            <SidebarGroupLabel className={compact ? 'hidden' : ''}>
+              {group.label}
+            </SidebarGroupLabel>
+          )}
+          <SidebarMenu aria-label={group.label ?? 'Project'}>
+            {group.sections.map((section) => {
+              const Icon = section.icon
+              const isActive = active === section.id
+              return (
+                <SidebarMenuItem key={section.id} data-tour={section.id}>
+                  <SidebarMenuButton
+                    asChild
+                    tooltip={compact ? section.title : undefined}
+                    className={cn(
+                      compact ? 'justify-center' : 'justify-start',
+                      isActive &&
+                        'bg-sidebar-accent text-sidebar-accent-foreground'
+                    )}
+                  >
+                    <Link
+                      to={`${root}/${section.tabs[0].url}${query}`}
+                      aria-current={isActive ? 'page' : undefined}
+                      onClick={() => isMobile && setOpenMobile(false)}
+                    >
+                      <Icon />
+                      {!compact && <span>{section.title}</span>}
+                    </Link>
+                  </SidebarMenuButton>
+                </SidebarMenuItem>
+              )
+            })}
+          </SidebarMenu>
+        </SidebarGroup>
+      ))}
+      {project?.source_type === 'external' && (
+        <SidebarGroup className="py-0">
+          <SidebarMenu aria-label="Hosting">
+            <SidebarMenuItem>
+              <SidebarMenuButton
+                asChild
+                tooltip={compact ? 'Add hosting' : undefined}
+                className={cn(
+                  compact ? 'justify-center' : 'justify-start',
+                  onHosting &&
+                    'bg-sidebar-accent text-sidebar-accent-foreground'
+                )}
+              >
+                <Link
+                  to={`${root}/hosting`}
+                  aria-current={onHosting ? 'page' : undefined}
+                  onClick={() => isMobile && setOpenMobile(false)}
+                >
+                  <Rocket />
+                  {!compact && <span>Add hosting</span>}
+                </Link>
+              </SidebarMenuButton>
+            </SidebarMenuItem>
+          </SidebarMenu>
+        </SidebarGroup>
+      )}
+    </>
+  )
+}
+
+/**
+ * A node's sections, like a project's. Back leads to the node list: unlike a
+ * project, a node is reached from there, not from the main menu.
+ */
+function NodeNav({
+  nodeId,
+  segment,
+}: {
+  nodeId: number
+  segment: string | undefined
+}) {
+  const { data: node } = useQuery(
+    adminGetNodeOptions({ path: { node_id: nodeId } })
+  )
+  const navigate = useNavigate()
+  const { isMinimal, isMobile, setOpenMobile } = useSidebar()
+  const compact = isMinimal && !isMobile
+  const active = resolveNodeSection(segment, node?.role)
   return (
     <>
       <SwapHeader
-        title={project?.name ?? 'Loading…'}
-        onBack={onBack}
-        backLabel="Back to menu"
+        title={node?.name ?? 'Loading…'}
+        onBack={() => navigate(WORKER_NODES_URL)}
+        backLabel="Back to worker nodes"
       />
       <SidebarGroup className="py-2">
-        <SidebarMenu aria-label="Service navigation">
-          {items.map((item) => (
-            <SidebarMenuItem key={item.section} data-tour={item.section}>
+        <SidebarMenu aria-label="Node navigation">
+          {nodeSections(node?.role).map((item) => (
+            <SidebarMenuItem key={item.section}>
               <SidebarMenuButton
                 asChild
                 tooltip={compact ? item.title : undefined}
@@ -1011,7 +1046,7 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
                 )}
               >
                 <Link
-                  to={`/projects/${slug}/${item.url}`}
+                  to={nodeSectionUrl(nodeId, item.section)}
                   aria-current={active === item.section ? 'page' : undefined}
                   onClick={() => isMobile && setOpenMobile(false)}
                 >
@@ -1024,56 +1059,6 @@ function ProjectNav({ slug, onBack }: { slug: string; onBack: () => void }) {
         </SidebarMenu>
       </SidebarGroup>
     </>
-  )
-}
-
-// Inverse of SwapHeader: shown at the top of DefaultNav when the user
-// pressed Back from a project sidebar but the URL is still inside that
-// project. One click restores the project sidebar without navigating.
-function CurrentProjectPin({
-  slug,
-  onReturn,
-}: {
-  slug: string
-  onReturn: () => void
-}) {
-  const { isMinimal, isMobile } = useSidebar()
-  const compact = isMinimal && !isMobile
-  const { data: project } = useQuery({
-    ...getProjectBySlugOptions({ path: { slug } }),
-  })
-  const label = project?.name ?? slug
-  if (compact) {
-    return (
-      <SidebarGroup className="pb-0">
-        <SidebarMenu>
-          <SidebarMenuItem>
-            <SidebarMenuButton
-              tooltip={`Open ${label}`}
-              onClick={onReturn}
-              className="justify-center"
-            >
-              <Folder />
-            </SidebarMenuButton>
-          </SidebarMenuItem>
-        </SidebarMenu>
-      </SidebarGroup>
-    )
-  }
-  return (
-    <SidebarGroup className="pb-0">
-      <button
-        type="button"
-        onClick={onReturn}
-        className="flex h-8 w-full items-center gap-2 rounded-md px-2 text-left text-sm transition-colors hover:bg-sidebar-accent"
-      >
-        <Folder className="size-4 shrink-0 text-muted-foreground" />
-        <span className="min-w-0 flex-1 truncate font-medium text-foreground">
-          {label}
-        </span>
-        <ChevronRight className="size-4 shrink-0 text-muted-foreground" />
-      </button>
-    </SidebarGroup>
   )
 }
 

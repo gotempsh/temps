@@ -33,7 +33,7 @@
 use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
-use temps_auth::AuthContext;
+use temps_authz::AuthContext;
 use temps_core::ProjectAccessChecker;
 use thiserror::Error;
 
@@ -169,7 +169,11 @@ async fn all_project_ids(db: &DatabaseConnection) -> Result<Vec<i32>, LogAccessE
 }
 
 /// External services reachable from any of `project_ids` via `project_services`.
-async fn services_linked_to_projects(
+///
+/// `pub` so a background caller with no HTTP request — the log-alert series
+/// source, which evaluates a project's saved search — builds exactly the
+/// same project-scoped allow-list a request for that project would get.
+pub async fn services_linked_to_projects(
     db: &DatabaseConnection,
     project_ids: &[i32],
 ) -> Result<Vec<i32>, LogAccessError> {

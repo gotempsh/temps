@@ -14,6 +14,8 @@ import {
   updateNotificationProvider as updateProvider2,
   updateSlackProvider,
   updateNotificationEmailProvider,
+  createTelegramProvider,
+  updateTelegramProvider,
   listNotificationRoutes,
   createNotificationRoute,
   getNotificationRoute,
@@ -25,6 +27,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptSelect, promptConfirm, promptNumber, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+import { addCredentialSources } from '../../lib/value-source.js'
 
 const SEVERITIES = ['debug', 'info', 'warning', 'error', 'critical', 'emergency'] as const
 
@@ -87,6 +90,11 @@ interface AddOptions {
   // Webhook options
   url?: string
   method?: string
+  header?: string[]
+  // Telegram options
+  botToken?: string
+  chatId?: string
+  topicId?: string
   yes?: boolean
 }
 
@@ -108,6 +116,11 @@ interface UpdateOptions {
   // Webhook options
   url?: string
   method?: string
+  header?: string[]
+  // Telegram options
+  botToken?: string
+  chatId?: string
+  topicId?: string
   json?: boolean
   yes?: boolean
 }
@@ -169,6 +182,24 @@ interface WebhookProviderConfig {
   timeout_secs?: number
 }
 
+interface CurrentTelegramConfig {
+  bot_token?: string
+  chat_id?: string | number
+  message_thread_id?: number | null
+}
+
+interface TelegramProviderConfig {
+  bot_token: string
+  chat_id: string
+  message_thread_id: number | null
+}
+
+/**
+ * What the server treats as "keep the stored bot token" on update. The token is
+ * masked as this value in normal API responses, so the CLI never has to know it.
+ */
+export const KEEP_STORED_SECRET = '***'
+
 /** Parses --enabled; returns 'invalid' rather than throwing so the caller keeps its warn-and-exit UX. */
 export function parseEnabledFlag(value: string | undefined): boolean | undefined | 'invalid' {
   if (value === undefined) return undefined
@@ -196,8 +227,119 @@ export function hasEmailConfigChanges(options: {
     || options.toAddresses !== undefined
 }
 
-export function hasWebhookConfigChanges(options: { url?: string; method?: string }): boolean {
-  return options.url !== undefined || options.method !== undefined
+export function hasWebhookConfigChanges(options: { url?: string; method?: string; header?: string[] }): boolean {
+  return options.url !== undefined || options.method !== undefined || options.header !== undefined
+}
+
+/** The placeholder the server returns in place of stored secret values (MASKED_CONFIG_VALUE in temps-notifications). */
+const MASKED_VALUE = '***'
+
+/** Collects repeated --header flags into a list (commander passes the previous value as the second argument). */
+export function collectHeaderFlag(value: string, previous: string[] = []): string[] {
+  return [...previous, value]
+}
+
+function trimOptionalWhitespace(text: string): string {
+  return text.replace(/^[ \t]+|[ \t]+$/g, '')
+}
+
+/** Parses repeated --header "Name: value" flags into a headers map; names must be unique (case-insensitive). */
+export function parseHeaderFlags(
+  values: string[] | undefined,
+): { headers: Record<string, string> | undefined } | { error: string } {
+  if (values === undefined) return { headers: undefined }
+  // Errors never repeat the raw flag: it may hold a credential, and CLI output often ends up in CI logs.
+  const entries: [string, string][] = []
+  const seen = new Set<string>()
+  for (const [index, raw] of values.entries()) {
+    const position = `--header #${index + 1}`
+    const colon = raw.indexOf(':')
+    if (colon === -1) {
+      return { error: `Invalid ${position}. Use the form "Name: value"` }
+    }
+    // Only spaces and tabs around a field are optional whitespace in HTTP; a stray CR/LF must reach the check below.
+    const name = trimOptionalWhitespace(raw.slice(0, colon))
+    const value = trimOptionalWhitespace(raw.slice(colon + 1))
+    if (!/^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/.test(name)) {
+      return { error: `Invalid header name in ${position}. Use the form "Name: value"` }
+    }
+    if (value === '') {
+      return { error: `${position} has no value` }
+    }
+    if (value === MASKED_VALUE) {
+      return { error: `${position} is the hidden placeholder ${MASKED_VALUE}; enter the real value` }
+    }
+    // reqwest (http::HeaderValue) rejects control characters other than tab, and DEL. The server stores such a
+    // value anyway and every delivery then fails.
+    if (/[\x00-\x08\x0a-\x1f\x7f]/.test(value)) {
+      return { error: `${position} has a value with control characters (such as a newline), which HTTP headers do not allow` }
+    }
+    const key = name.toLowerCase()
+    if (seen.has(key)) {
+      return { error: `${position} repeats the name of an earlier --header` }
+    }
+    seen.add(key)
+    entries.push([name, value])
+  }
+  // fromEntries defines own properties, so a header named "__proto__" is kept instead of being dropped.
+  return { headers: Object.fromEntries(entries) }
+}
+
+/**
+ * Adds a --header hint to the server's refusal to restore hidden values after a destination change.
+ * The CLI cannot tell up front whether the URL really changed: the server masks the stored URL in its responses.
+ */
+export function withHeaderHint(message: string, options: { header?: string[] }): string {
+  if (options.header !== undefined || !message.includes('must be entered again')) return message
+  return `${message}. Pass each header again with --header "Name: value".`
+}
+
+export function hasTelegramConfigChanges(options: {
+  botToken?: string
+  chatId?: string
+  topicId?: string
+}): boolean {
+  return options.botToken !== undefined || options.chatId !== undefined || options.topicId !== undefined
+}
+
+/**
+ * Parses --topic-id (a Telegram forum topic, sent as `message_thread_id`).
+ * An empty string means "no topic" (null); anything that is not a positive
+ * integer is reported as 'invalid' so the caller can explain it.
+ */
+export function parseTopicId(value: string | undefined): number | null | undefined | 'invalid' {
+  if (value === undefined) return undefined
+  const trimmed = value.trim()
+  if (trimmed === '') return null
+  if (!/^\d+$/.test(trimmed)) return 'invalid'
+  const parsed = Number(trimmed)
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 'invalid'
+}
+
+/** Whether --chat-id names a different chat from the stored one. */
+export function telegramChatChanges(chatId: string | undefined, current: CurrentTelegramConfig | null): boolean {
+  if (chatId === undefined) return false
+  return chatId.trim() !== String(current?.chat_id ?? '').trim()
+}
+
+/**
+ * Merges --bot-token/--chat-id/--topic-id over the provider's existing config.
+ * The bot token is never read back: when --bot-token is omitted the masked
+ * placeholder is sent, which the server resolves to the stored token.
+ * A topic ID only means something inside its own forum chat, so moving to
+ * another chat without --topic-id clears the stored topic.
+ */
+export function buildTelegramConfigUpdate(
+  options: { botToken?: string; chatId?: string },
+  topicId: number | null | undefined,
+  current: CurrentTelegramConfig | null,
+): TelegramProviderConfig {
+  const keptTopic = telegramChatChanges(options.chatId, current) ? null : (current?.message_thread_id ?? null)
+  return {
+    bot_token: options.botToken ?? KEEP_STORED_SECRET,
+    chat_id: options.chatId ?? (current?.chat_id !== undefined ? String(current.chat_id) : ''),
+    message_thread_id: topicId !== undefined ? topicId : keptTopic,
+  }
 }
 
 /** Merges --webhook-url/--channel over the provider's existing config so unspecified fields survive a partial update. */
@@ -237,15 +379,18 @@ export function buildEmailConfigUpdate(
   }
 }
 
-/** Merges --url/--method over the provider's existing config so unspecified fields survive a partial update. */
+/**
+ * Merges --url/--method/--header over the provider's existing config so unspecified fields survive a partial update.
+ * Supplied headers replace the stored set; without them the stored (hidden) values are sent back unchanged.
+ */
 export function buildWebhookConfigUpdate(
-  options: { url?: string; method?: string },
+  options: { url?: string; method?: string; headers?: Record<string, string> },
   current: WebhookProviderConfig | null,
 ): WebhookProviderConfig {
   return {
     url: options.url ?? current?.url ?? '',
     method: options.method ?? current?.method ?? 'POST',
-    headers: current?.headers ?? {},
+    headers: options.headers ?? current?.headers ?? {},
     timeout_secs: current?.timeout_secs ?? 30,
   }
 }
@@ -254,7 +399,7 @@ export function registerNotificationsCommands(program: Command): void {
   const notifications = program
     .command('notifications')
     .alias('notify')
-    .description('Manage notification providers (Slack, Email, Webhook, etc.)')
+    .description('Manage notification providers (Slack, Email, Webhook, Telegram, etc.)')
 
   notifications
     .command('list')
@@ -263,10 +408,10 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(listProviders)
 
-  notifications
+  const addCommand = notifications
     .command('add')
     .description('Add a new notification provider')
-    .option('-t, --type <type>', 'Provider type (slack, email, webhook)')
+    .option('-t, --type <type>', 'Provider type (slack, email, webhook, telegram)')
     .option('-n, --name <name>', 'Provider name')
     .option('-w, --webhook-url <url>', 'Webhook URL (for slack)')
     .option('-c, --channel <channel>', 'Channel name (for slack, optional)')
@@ -279,10 +424,19 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--to-addresses <addresses>', 'Comma-separated recipient addresses (for email)')
     .option('--url <url>', 'Webhook URL (for webhook)')
     .option('--method <method>', 'HTTP method: POST, PUT, PATCH (for webhook, default: POST)')
+    .option('--header <header>', 'Request header "Name: value" (for webhook, repeatable)', collectHeaderFlag)
+    .option('--bot-token <token>', 'Bot token from @BotFather (for telegram)')
+    .option('--chat-id <id>', 'Chat ID, e.g. -1001234567890 or @channelname (for telegram)')
+    .option('--topic-id <id>', 'Forum topic ID (for telegram, optional)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(addProvider)
+  addCredentialSources(addCommand, [
+    { flag: 'webhook-url', what: 'the Slack webhook URL' },
+    { flag: 'password', what: 'the SMTP password' },
+    { flag: 'bot-token', what: 'the Telegram bot token' },
+  ])
 
-  notifications
+  const updateCommand = notifications
     .command('update')
     .description('Update a notification provider')
     .requiredOption('--id <id>', 'Provider ID')
@@ -299,9 +453,18 @@ export function registerNotificationsCommands(program: Command): void {
     .option('--to-addresses <addresses>', 'Comma-separated recipient addresses (for email)')
     .option('--url <url>', 'Webhook URL (for webhook)')
     .option('--method <method>', 'HTTP method: POST, PUT, PATCH (for webhook)')
+    .option('--header <header>', 'Request header "Name: value" (for webhook, repeatable; replaces the stored headers)', collectHeaderFlag)
+    .option('--bot-token <token>', 'Bot token from @BotFather (for telegram)')
+    .option('--chat-id <id>', 'Chat ID, e.g. -1001234567890 or @channelname (for telegram)')
+    .option('--topic-id <id>', 'Forum topic ID (for telegram; empty string clears it)')
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip confirmation prompts')
     .action(updateProvider)
+  addCredentialSources(updateCommand, [
+    { flag: 'webhook-url', what: 'the Slack webhook URL' },
+    { flag: 'password', what: 'the SMTP password' },
+    { flag: 'bot-token', what: 'the Telegram bot token' },
+  ])
 
   notifications
     .command('enable')
@@ -439,6 +602,7 @@ async function addProvider(options: AddOptions): Promise<void> {
       { name: 'Slack', value: 'slack' },
       { name: 'Email (SMTP)', value: 'email' },
       { name: 'Webhook', value: 'webhook' },
+      { name: 'Telegram', value: 'telegram' },
     ],
   })
 
@@ -452,8 +616,11 @@ async function addProvider(options: AddOptions): Promise<void> {
     case 'webhook':
       await addWebhookProvider(options)
       break
+    case 'telegram':
+      await addTelegramProvider(options)
+      break
     default:
-      warning(`Invalid provider type: ${providerType}. Supported: slack, email, webhook`)
+      warning(`Invalid provider type: ${providerType}. Supported: slack, email, webhook, telegram`)
   }
 }
 
@@ -603,6 +770,11 @@ async function addEmailProvider(options: AddOptions): Promise<void> {
 }
 
 async function addWebhookProvider(options: AddOptions): Promise<void> {
+  const parsedHeaders = parseHeaderFlags(options.header)
+  if ('error' in parsedHeaders) {
+    throw new Error(parsedHeaders.error)
+  }
+
   let name: string
   let url: string
   let method: string
@@ -644,7 +816,7 @@ async function addWebhookProvider(options: AddOptions): Promise<void> {
         config: {
           url,
           method,
-          headers: {},
+          headers: parsedHeaders.headers ?? {},
           timeout_secs: 30,
         },
         enabled: true,
@@ -656,6 +828,78 @@ async function addWebhookProvider(options: AddOptions): Promise<void> {
   })
 
   success('Webhook notification provider created successfully')
+  info('Run: temps notifications test --id <id> to send a test notification')
+}
+
+export async function addTelegramProvider(options: AddOptions): Promise<void> {
+  const parsedTopic = parseTopicId(options.topicId)
+  if (parsedTopic === 'invalid') {
+    throw new Error('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42')
+  }
+
+  let name: string
+  let botToken: string
+  let chatId: string
+  let topicId: number | null = parsedTopic ?? null
+
+  const isAutomation = options.yes && options.name && options.botToken && options.chatId
+
+  if (isAutomation) {
+    name = options.name!
+    botToken = options.botToken!
+    chatId = options.chatId!
+  } else {
+    name = options.name || await promptText({
+      message: 'Provider name',
+      default: 'telegram-notifications',
+      required: true,
+    })
+
+    info('\nYou need a Telegram bot token and the chat it should post to.')
+    info('Create a bot with @BotFather (https://t.me/BotFather), then add it to your chat.')
+    newline()
+
+    botToken = options.botToken || await promptPassword({
+      message: 'Bot token',
+    })
+
+    chatId = options.chatId || await promptText({
+      message: 'Chat ID (e.g. -1001234567890 or @channelname)',
+      required: true,
+    })
+
+    if (options.topicId === undefined) {
+      const topicInput = await promptText({
+        message: 'Forum topic ID (optional)',
+        default: '',
+      })
+      const parsed = parseTopicId(topicInput)
+      if (parsed === 'invalid') {
+        throw new Error('Invalid forum topic ID. Use the numeric topic ID, e.g. 42')
+      }
+      topicId = parsed ?? null
+    }
+  }
+
+  await withSpinner('Creating Telegram notification provider...', async () => {
+    const { error } = await createTelegramProvider({
+      client,
+      body: {
+        name,
+        config: {
+          bot_token: botToken,
+          chat_id: chatId,
+          message_thread_id: topicId,
+        },
+        enabled: true,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success('Telegram notification provider created successfully')
   info('Run: temps notifications test --id <id> to send a test notification')
 }
 
@@ -695,6 +939,7 @@ async function updateProvider(options: UpdateOptions): Promise<void> {
   const hasSlackConfig = hasSlackConfigChanges(options)
   const hasEmailConfig = hasEmailConfigChanges(options)
   const hasWebhookConfig = hasWebhookConfigChanges(options)
+  const hasTelegramConfig = hasTelegramConfigChanges(options)
 
   // Route to type-specific update if config changes are provided
   if (providerType === 'slack' && hasSlackConfig) {
@@ -703,6 +948,8 @@ async function updateProvider(options: UpdateOptions): Promise<void> {
     await updateEmailProviderAction(id, provider, options, enabled)
   } else if (providerType === 'webhook' && hasWebhookConfig) {
     await updateWebhookProviderAction(id, provider, options, enabled)
+  } else if (providerType === 'telegram' && hasTelegramConfig) {
+    await updateTelegramProviderAction(id, provider, options, enabled)
   } else {
     // Generic update (name and/or enabled only)
     const updated = await withSpinner('Updating provider...', async () => {
@@ -814,6 +1061,11 @@ async function updateWebhookProviderAction(
     timeout_secs?: number
   } | null
 
+  const parsedHeaders = parseHeaderFlags(options.header)
+  if ('error' in parsedHeaders) {
+    throw new Error(parsedHeaders.error)
+  }
+
   const updated = await withSpinner('Updating Webhook provider...', async () => {
     const { data, error } = await updateProvider2({
       client,
@@ -821,7 +1073,43 @@ async function updateWebhookProviderAction(
       body: {
         name: options.name ?? undefined,
         enabled: enabled ?? undefined,
-        config: buildWebhookConfigUpdate(options, currentConfig),
+        config: buildWebhookConfigUpdate({ ...options, headers: parsedHeaders.headers }, currentConfig),
+      },
+    })
+    if (error) {
+      throw new Error(withHeaderHint(getErrorMessage(error), options))
+    }
+    return data
+  })
+
+  if (options.json && updated) {
+    json(updated)
+    return
+  }
+
+  success(`Webhook provider "${updated?.name ?? provider.name}" updated successfully`)
+}
+
+export async function updateTelegramProviderAction(
+  id: number,
+  provider: NotificationProviderResponse,
+  options: UpdateOptions,
+  enabled?: boolean,
+): Promise<void> {
+  const topicId = parseTopicId(options.topicId)
+  if (topicId === 'invalid') {
+    throw new Error('Invalid value for --topic-id. Use the numeric forum topic ID, e.g. 42, or "" to clear it')
+  }
+  const currentConfig = provider.config as CurrentTelegramConfig | null
+
+  const updated = await withSpinner('Updating Telegram provider...', async () => {
+    const { data, error } = await updateTelegramProvider({
+      client,
+      path: { id },
+      body: {
+        name: options.name ?? undefined,
+        enabled: enabled ?? undefined,
+        config: buildTelegramConfigUpdate(options, topicId, currentConfig),
       },
     })
     if (error) {
@@ -835,7 +1123,10 @@ async function updateWebhookProviderAction(
     return
   }
 
-  success(`Webhook provider "${updated?.name ?? provider.name}" updated successfully`)
+  success(`Telegram provider "${updated?.name ?? provider.name}" updated successfully`)
+  if (topicId === undefined && currentConfig?.message_thread_id != null && telegramChatChanges(options.chatId, currentConfig)) {
+    info(`Cleared forum topic ${currentConfig.message_thread_id}: it belonged to the previous chat. Pass --topic-id to post to a topic in the new one.`)
+  }
 }
 
 async function enableProvider(options: EnableDisableOptions): Promise<void> {

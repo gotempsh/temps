@@ -44,6 +44,9 @@ Create a new webhook for a project
 | `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
 | `-s, --secret <secret>` | Webhook secret for signature verification | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--secret-file <path>` | Read the webhook signing secret from a file (- reads stdin) instead of --secret | - | No |
+| `--secret-stdin` | Read the webhook signing secret from stdin instead of --secret | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `webhooks show`
 
@@ -70,6 +73,9 @@ Update a webhook
 | `-u, --url <url>` | New webhook URL | - | No |
 | `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | No |
 | `-s, --secret <secret>` | New webhook secret for signature verification | - | No |
+| `--secret-file <path>` | Read the webhook signing secret from a file (- reads stdin) instead of --secret | - | No |
+| `--secret-stdin` | Read the webhook signing secret from stdin instead of --secret | - | No |
+| `--trim-trailing-newline` | Drop exactly one trailing newline (\n or \r\n) from a value read from a file or stdin (kept byte-for-byte by default) | - | No |
 
 ### `webhooks remove` (alias: `rm`)
 

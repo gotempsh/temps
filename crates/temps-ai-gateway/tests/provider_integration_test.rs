@@ -14,6 +14,14 @@
 //! - Error propagation from upstream 4xx/5xx
 //! - SSE streaming format correctness
 
+// Test-only helpers outside `#[test]` fns (fixtures, mock servers, setup):
+// a panic there is the test failure, which is what we want.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    reason = "integration-test helpers: panicking is how a test fails"
+)]
+
 mod mock_provider_servers;
 
 use mock_provider_servers::{MockAnthropicServer, MockGeminiServer, MockOpenAiServer};

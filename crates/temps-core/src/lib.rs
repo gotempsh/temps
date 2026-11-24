@@ -3,71 +3,110 @@
 
 //! Core utilities and types shared across all Temps crates
 
+#![cfg_attr(
+    test,
+    allow(
+        clippy::disallowed_methods,
+        reason = "tests read fixture configuration (database/service URLs) from the environment"
+    )
+)]
 pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
+mod clickhouse_compression;
 pub mod client_ip;
 /// The seam the purchase-triggered Cloud telemetry activation crosses
 /// (ADR-042 P3).
 pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod console_startup;
+pub mod crypto;
 pub mod deployment;
 pub mod dns_automation;
 pub mod env_vars_provider;
+pub mod environment_address;
 pub mod error;
 pub mod error_builder;
 pub mod error_metrics;
-pub mod external_plugin;
+pub mod escape;
+pub mod executor_endpoints;
 pub mod feature_maturity;
+pub mod gate;
+pub mod gate_access;
+/// Internal access grants on the route-sync wire (ADR 101).
+pub mod internal_access;
 pub mod jobs;
+pub mod known_proxies;
+pub mod log_series;
 pub mod log_storage_config;
 /// Log recurring conditions on state transitions instead of on every tick.
 pub mod log_transitions;
 pub mod managed_backup_schedule;
+/// Cloud-minted, job-scoped credentials for worker nodes (ADR-102).
+pub mod managed_backup_scoped_credentials;
+pub mod managed_service_pki;
 pub mod node_address;
 pub mod node_pki;
 pub mod notifications;
 pub mod on_demand;
 pub mod openapi;
+pub mod payload_blobs;
 pub mod plugin;
+pub mod plugin_builder;
 pub mod problemdetails;
 pub mod project_access;
 pub mod project_deletion;
 pub mod project_ip_gate;
+pub mod project_metrics;
 pub mod public_hostname;
 pub mod public_hostname_resolver;
-pub mod public_ingress;
 pub mod public_status_page;
 pub mod registry_prefix;
 #[cfg(test)]
 mod release_manifest;
 pub mod request_policy_gate;
+pub mod trusted_proxies;
+pub mod tunnel_origin;
+pub mod workflow_ingress;
 /// Immutable image references embedded at compile time in official releases.
 pub mod release_images {
     pub const LOCAL_PREVIEW_GATEWAY_IMAGE: &str = "ghcr.io/gotempsh/temps-preview-gateway@sha256:02d5cdd382c3285d569032e84321d5ce8fc089372a3f08651119f6eda8cb1448";
     include!(concat!(env!("OUT_DIR"), "/release_images.rs"));
 }
 pub mod docker_handle;
-/// Idempotent, race-safe creation of a named Docker bridge network.
-pub mod docker_network;
 /// Host-level grant of `/var/run/docker.sock` to named projects (ADR 045).
 pub mod docker_socket_grant;
+pub mod node_labels;
 pub mod retention;
 pub mod retry;
 pub mod runtime;
+pub mod s3_endpoint;
+pub mod same_origin;
+pub mod sandbox_preview_relay;
 pub mod sandbox_runtime;
+pub mod secret_string;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
 pub mod serve_profile;
+pub mod server_public_address;
+pub mod source_control;
 pub mod source_drop;
 pub mod static_files;
+pub mod tailnet;
 pub mod telemetry;
 pub mod time_window;
 pub mod tls;
 pub mod traces;
 pub mod update_status;
+pub mod ways_in;
+pub mod websocket_origin;
+pub mod worker_ingress;
+pub mod worker_install;
+pub mod worker_shield;
+pub mod worker_sync;
+pub mod workflow_control;
+pub mod workflow_journal;
 pub use docker_handle::{
     worker_node_required_problem, DockerHandle, DockerUnavailable, CONTROL_PLANE_DOCKER_REASON,
     WORKER_NODE_REQUIRED_ERROR_CODE, WORKER_NODE_REQUIRED_REMEDY, WORKER_NODE_REQUIRED_TITLE,
@@ -84,26 +123,27 @@ pub use serve_profile::{
     policy_or_default, LocalWorkloadPolicy, PROFILE_CONTROL_PLANE, PROFILE_FULL,
 };
 pub use update_status::{AvailableUpdate, UpdateStatusSlot, UPGRADE_DOCS_URL};
-mod app_settings;
+pub mod config_repo;
 mod constants;
 mod cookie_crypto;
 #[allow(deprecated)] // generic-array 0.14.x deprecation in aes-gcm 0.10
 pub mod ecies;
 mod encryption;
 pub mod preview_grant;
+pub mod probe_auth;
 pub mod repo_config;
 mod request_metadata;
+pub mod request_path;
+pub mod route_policy;
 pub mod route_table;
+pub mod sealed_request;
 pub mod stages;
-pub mod templates;
 pub mod types;
 pub mod url_validation;
 pub mod utils;
-pub mod workflow;
-pub mod workflow_executor;
-pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
+pub use clickhouse_compression::{ClickHouseCompression, ParseClickHouseCompressionError};
 pub use client_ip::resolve_client_ip;
 pub use cloud_telemetry_activation::{
     CloudTelemetryActivationTrigger, StartedTelemetryActivation, TelemetryActivationOutcome,
@@ -122,20 +162,34 @@ pub use env_vars_provider::{
 };
 pub use error::*;
 pub use error_builder::*;
+pub use executor_endpoints::{
+    ExecutorEndpoint, ExecutorEndpointSet, ExecutorEndpoints, ExecutorEndpointsError,
+};
 pub use jobs::*;
 pub use log_storage_config::LogStorageConfig;
 pub use managed_backup_schedule::{
-    ManagedBackupArchiveConflict, ManagedBackupSchedule, ManagedBackupScheduleError,
-    ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
+    BackupScheduleAuthority, ManagedBackupArchiveConflict, ManagedBackupSchedule,
+    ManagedBackupScheduleError, ManagedBackupScheduleProvisioner, ReleasedManagedBackupSchedules,
     DEFAULT_MANAGED_BACKUP_RETENTION_DAYS, MANAGED_BACKUP_SCHEDULE_EXPRESSION,
     MANAGED_BACKUP_SCHEDULE_NAME,
 };
+pub use managed_backup_scoped_credentials::{
+    ManagedBackupScopedCredentials, ScopedS3Access, ScopedS3Credential, ScopedS3CredentialError,
+    ScopedS3CredentialRequest, MANAGED_SCOPED_CREDENTIAL_MAX_LIFETIME,
+};
 pub use on_demand::*;
+pub use payload_blobs::{PayloadBlobError, PayloadBlobStore};
 pub use project_access::{
     ApplicationDataNetworkReconciler, MembershipPermissionResolver, ProjectAccessChecker,
 };
-pub use project_deletion::ProjectDeletionHook;
+pub use project_deletion::{
+    ProjectDeletionHook, ProjectDeletionHookError, ProjectDeletionHooks, ProjectDeletionHooksFailed,
+};
 pub use project_ip_gate::{OpenIpGate, ProjectIpGate, ProjectIpGateSlot};
+pub use project_metrics::{
+    NoopProjectMetricsSink, ProjectMetricKind, ProjectMetricSample, ProjectMetricsError,
+    ProjectMetricsSink,
+};
 pub use public_hostname::{base_domain as public_base_domain, PublicHostnameStrategy};
 pub use public_hostname_resolver::{
     match_strategy, PublicHostnameResolver, StandardHostnameResolver,
@@ -145,19 +199,26 @@ pub use request_policy_gate::{
     RequestPolicyGateSlot,
 };
 pub use retention::{
-    FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
-    SettingsRetentionResolver,
+    FixedRetentionResolver, ObservabilityRetentionSettings, RetentionResolver,
+    RetentionResolverSlot, RetentionTable, SettingsRetentionResolver, MAX_ANALYTICS_RETENTION_DAYS,
+    MIN_ANALYTICS_RETENTION_DAYS,
 };
 pub use runtime::{
     initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
     RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
     ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
-pub use sandbox_runtime::{SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider};
+pub use sandbox_runtime::{
+    SandboxRuntimeCredentialsError, SandboxRuntimeCredentialsProvider, SandboxScope,
+};
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{
     SensitiveAction, SensitiveActionAuthorizationError, SensitiveActionAuthorizer,
     SensitiveActionDecision, SensitiveActionPrincipal,
+};
+pub use source_control::{
+    IssueState, ProjectRepository, ProjectSourceControl, RepositoryCommit, RepositoryIssue,
+    SourceControlError,
 };
 pub use source_drop::{
     SourceDropDeployer, SourceDropDeployment, SourceDropError, SourceDropRequest,
@@ -168,34 +229,17 @@ pub use traces::{
     TraceSummaryDto,
 };
 pub use utils::*;
+pub use workflow_control::{
+    ActiveWorkflowRuns, StartedWorkflowRun, WorkflowControl, WorkflowControlError, WorkflowDrain,
+    WorkflowRunPhase, WorkflowRunState, WorkflowStart,
+};
 
 // Re-export external dependencies
 pub use anyhow;
-pub use app_settings::{
-    AgentSandboxSettings, AiChatLimitsSettings, AiConfigSettings, AiWorkspaceFileLimitsSettings,
-    AnalyticsRetentionSettings, AppSettings, BlobSettings, BuildLimitsSettings, CeilingEnforcement,
-    ClickHouseCompression, ClickHouseSettings, CloudSettings, ClusterDnsSettings,
-    ConnectionLimitSettings, ContainerLogSettings, DiskSpaceAlertSettings, DnsProviderSettings,
-    DockerRegistrySettings, GeoLicenseKeyIntent, GeoSettings, GeoSettingsError,
-    ImageRetentionSettings, KvSettings, LetsEncryptSettings, McpServerSettings, MetricsStoreKind,
-    MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
-    ObservabilityRetentionSettings, OnDemandTlsSettings, ParseClickHouseCompressionError,
-    PreviewGatewaySettings, ProviderConfig, RateLimitSettings, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings, TenantResourceCeilings,
-    DEFAULT_ANALYTICS_EVENTS_RETENTION_DAYS, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
-    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, DEFAULT_GEO_REFRESH_INTERVAL_HOURS,
-    DEFAULT_GEO_STALE_LOOKUP_DAYS, DEFAULT_UNREFERENCED_IP_RETENTION_DAYS, GEO_CHECK_STATUS_ERROR,
-    GEO_CHECK_STATUS_OK, GEO_CHECK_STATUS_SKIPPED_NO_LICENSE_KEY, GEO_SOURCE_BUNDLED_GITHUB,
-    GEO_SOURCE_MAXMIND_OFFICIAL, IP_REFERENCE_SLACK_DAYS, MAX_ANALYTICS_RETENTION_DAYS,
-    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MAX_GEO_REFRESH_INTERVAL_HOURS,
-    MAX_GEO_STALE_LOOKUP_DAYS, MIN_ANALYTICS_RETENTION_DAYS,
-    MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    MIN_GEO_REFRESH_INTERVAL_HOURS, MIN_GEO_STALE_LOOKUP_DAYS,
-};
 pub use async_trait;
 pub use chrono;
 pub use cookie_crypto::{CookieCrypto, CryptoError};
-pub use encryption::{EncryptionService, PasswordEncryptionError};
+pub use encryption::{EncryptionError, EncryptionService, PasswordEncryptionError};
 pub use preview_grant::{
     encode_preview_session_grant, sanitize_preview_next, sanitize_preview_next_ref,
     validate_preview_session_grant_envelope, verify_preview_session_grant, PreviewGrantError,
@@ -210,18 +254,11 @@ pub use request_metadata::{
 pub use serde;
 pub use serde_json;
 pub use stages::*;
-pub use templates::*;
 pub use thiserror;
 pub use tokio;
 pub use tracing;
 pub use types::*;
 pub use uuid;
-pub use workflow::*;
-pub use workflow_executor::*;
-pub use workflow_memory::{
-    memory_install_command, WorkflowMemoryError, WorkflowMemoryFact, WorkflowMemoryProvider,
-    MEMORY_SCRIPT, MEMORY_SCRIPT_DIR, MEMORY_SCRIPT_PATH,
-};
 
 // Re-export standard datetime type for use across all crates
 pub use types::UtcDateTime;
@@ -237,7 +274,8 @@ pub mod drop_entries;
 /// never calls. Likewise `bincode` (RUSTSEC-2025-0141) is ignored only
 /// because the microsandbox SDK requires it. An ignore covers the whole
 /// advisory, so it would also hide anything else starting to depend on these
-/// crates; these tests fail on that instead. `Cargo.lock` is embedded at
+/// crates; these tests fail on that instead. `ttf-parser` (RUSTSEC-2026-0192)
+/// is not ignored at all: it is kept out of the lockfile entirely. `Cargo.lock` is embedded at
 /// compile time, so they also run from prebuilt nextest archives.
 #[cfg(test)]
 mod unmaintained_dependency_guard_tests {
@@ -250,6 +288,11 @@ mod unmaintained_dependency_guard_tests {
         "msb_krun_devices",
         "msb_krun_vmm",
     ];
+
+    /// The only packages allowed to depend on `astral-tokio-tar`; see the
+    /// RUSTSEC-2026-0440 note in `.github/workflows/dependency-scan.yml`.
+    const ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS: &[&str] =
+        &["microsandbox", "microsandbox-image", "testcontainers"];
 
     /// The only package allowed to depend on `serde_yaml`; see the
     /// RUSTSEC-2024-0449 note in `.github/workflows/dependency-scan.yml`.
@@ -274,6 +317,93 @@ mod unmaintained_dependency_guard_tests {
                 })
             })
             .collect()
+    }
+
+    /// Versions of every locked package named `name`, as `(major, minor, patch)`.
+    /// Pre-release and build suffixes are dropped; they don't occur on the
+    /// crates these guards check.
+    fn locked_versions(lock: &str, name: &str) -> Vec<(u64, u64, u64)> {
+        let name_line = format!("name = \"{name}\"");
+        lock.split("[[package]]")
+            .skip(1)
+            .filter(|block| block.lines().map(str::trim).any(|line| line == name_line))
+            .filter_map(|block| {
+                block.lines().map(str::trim).find_map(|line| {
+                    line.strip_prefix("version = \"")
+                        .and_then(|l| l.strip_suffix('"'))
+                })
+            })
+            .filter_map(|version| {
+                let core = version.split(['-', '+']).next()?;
+                let mut parts = core.split('.').map(str::parse::<u64>);
+                match (parts.next(), parts.next(), parts.next()) {
+                    (Some(Ok(major)), Some(Ok(minor)), Some(Ok(patch))) => {
+                        Some((major, minor, patch))
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// Whether an `arrow-data` version has the RUSTSEC-2026-0442 fix (bounds
+    /// validation of RunEndEncoded arrays). Mirrors the advisory's
+    /// `patched`/`unaffected` ranges: each supported major got its own fix.
+    fn arrow_data_is_patched((major, minor, patch): (u64, u64, u64)) -> bool {
+        match major {
+            0..=32 => true,
+            57 => (minor, patch) >= (3, 2),
+            58 => (minor, patch) >= (4, 1),
+            59 => (minor, patch) >= (3, 2),
+            60 => (minor, patch) >= (1, 0),
+            61.. => true,
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn locked_versions_reads_lockfile_entries() {
+        let lock = "[[package]]\nname = \"a\"\nversion = \"60.1.0\"\n\n[[package]]\n\
+                    name = \"a\"\nversion = \"2.0.0-rc.5\"\n\n[[package]]\nname = \"ab\"\n\
+                    version = \"9.9.9\"\n";
+        assert_eq!(locked_versions(lock, "a"), vec![(60, 1, 0), (2, 0, 0)]);
+        assert!(locked_versions(lock, "missing").is_empty());
+    }
+
+    #[test]
+    fn arrow_data_is_patched_follows_advisory_ranges() {
+        for unpatched in [(60, 0, 0), (59, 3, 1), (58, 4, 0), (57, 3, 1), (40, 0, 0)] {
+            assert!(!arrow_data_is_patched(unpatched), "{unpatched:?}");
+        }
+        for patched in [
+            (60, 1, 0),
+            (59, 3, 2),
+            (58, 4, 1),
+            (57, 3, 2),
+            (32, 0, 0),
+            (61, 0, 0),
+        ] {
+            assert!(arrow_data_is_patched(patched), "{patched:?}");
+        }
+    }
+
+    /// RUSTSEC-2026-0442: `ArrayData::validate_values` accepted RunEndEncoded
+    /// arrays whose run ends point past the values child, so a read such as
+    /// `TypedRunArray::value` could go out of bounds. arrow is only in the
+    /// graph through sea-orm 2's optional `sea-orm-arrow`, but the lockfile is
+    /// what `dependency-scan.yml` audits, and a feature flip would compile it.
+    #[test]
+    fn locked_arrow_data_has_run_end_encoding_fix() {
+        let unpatched: Vec<_> = locked_versions(CARGO_LOCK, "arrow-data")
+            .into_iter()
+            .filter(|version| !arrow_data_is_patched(*version))
+            .collect();
+        assert!(
+            unpatched.is_empty(),
+            "Cargo.lock pins arrow-data {unpatched:?}, which is affected by RUSTSEC-2026-0442 \
+             (out-of-bounds read via unvalidated RunEndEncoded arrays). Run \
+             `cargo update -p arrow-data` to move to a patched release (>= 60.1.0)."
+        );
     }
 
     #[test]
@@ -310,6 +440,35 @@ mod unmaintained_dependency_guard_tests {
         );
     }
 
+    /// RUSTSEC-2026-0440: `astral-tokio-tar` is unmaintained, but the
+    /// microsandbox SDK and testcontainers still require it. It must not gain
+    /// new dependents, and the lock must stay on 0.6.4 or later: 0.6.3 added
+    /// the parser hardening that matters for the OCI layers microsandbox-image
+    /// unpacks.
+    #[test]
+    fn astral_tokio_tar_is_only_reached_through_microsandbox_and_testcontainers() {
+        let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|name| !ALLOWED_ASTRAL_TOKIO_TAR_DEPENDENTS.contains(name))
+            .collect();
+        assert!(
+            unexpected.is_empty(),
+            "{unexpected:?} depend on astral-tokio-tar, which is unmaintained \
+             (RUSTSEC-2026-0440). The dependency-scan.yml exception only covers the \
+             microsandbox SDK and testcontainers; use the `tar` crate (or `tar-codec`) instead."
+        );
+
+        let outdated: Vec<_> = locked_versions(CARGO_LOCK, "astral-tokio-tar")
+            .into_iter()
+            .filter(|version| *version < (0, 6, 4))
+            .collect();
+        assert!(
+            outdated.is_empty(),
+            "Cargo.lock pins astral-tokio-tar {outdated:?}; keep it at 0.6.4 or later \
+             (`cargo update -p astral-tokio-tar`) so the parser keeps 0.6.3's hardening."
+        );
+    }
+
     #[test]
     fn bincode_is_only_reached_through_microsandbox() {
         let unexpected: Vec<_> = dependents_of(CARGO_LOCK, "bincode")
@@ -321,6 +480,153 @@ mod unmaintained_dependency_guard_tests {
             "{unexpected:?} depend on bincode, which is unmaintained (RUSTSEC-2025-0141). \
              The dependency-scan.yml exception only covers the microsandbox SDK's crates; \
              use postcard or serde_json instead of adding a new bincode user."
+        );
+    }
+
+    /// RUSTSEC-2026-0441: `pin-utils` is archived. The AWS smithy crates were
+    /// its only users and dropped it (aws-smithy-types 1.9.0, -runtime 1.16.1,
+    /// -http 0.64.2), so nothing needs it. Local pinning is `std::pin::pin!`;
+    /// projection is `pin-project-lite`, already in the graph.
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_pin_utils() {
+        let dependents = dependents_of(CARGO_LOCK, "pin-utils");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on pin-utils, which is unmaintained (RUSTSEC-2026-0441). \
+             Use `std::pin::pin!` instead of `pin_mut!`, or `pin-project-lite` for \
+             projection; for a transitive dependency, update the crate that pulls it in."
+        );
+    }
+
+    #[test]
+    fn workspace_does_not_depend_on_unmaintained_ttf_parser() {
+        let dependents = dependents_of(CARGO_LOCK, "ttf-parser");
+        assert!(
+            dependents.is_empty(),
+            "{dependents:?} depend on ttf-parser, which is unmaintained (RUSTSEC-2026-0192). \
+             lopdf 0.42 required it; lopdf 0.46+ only uses the maintained skrifa behind its \
+             `font_embedding` feature. PDF text is read with lopdf directly in \
+             temps-ai-chat's attachments.rs, not through pdf-extract, which pins lopdf 0.42."
+        );
+    }
+
+    const DENY_TOML: &str = include_str!("../../../deny.toml");
+    const DEPENDENCY_SCAN_WORKFLOW: &str =
+        include_str!("../../../.github/workflows/dependency-scan.yml");
+
+    /// Advisory IDs in `deny.toml`'s `[advisories] ignore` list
+    /// (`{ id = "RUSTSEC-...", reason = "..." }` entries).
+    fn deny_ignored_advisories(deny: &str) -> std::collections::BTreeSet<&str> {
+        deny.lines()
+            .map(str::trim)
+            .skip_while(|line| *line != "[advisories]")
+            .skip(1)
+            .take_while(|line| !line.starts_with('['))
+            .filter_map(|line| line.strip_prefix("{ id = \""))
+            .filter_map(|rest| rest.split('"').next())
+            .collect()
+    }
+
+    /// The value the cargo-audit step's `ignore:` input must have: the job's
+    /// `AUDIT_IGNORE` list, which the step that reports PR audits reads too.
+    const AUDIT_IGNORE_INPUT: &str = "${{ env.AUDIT_IGNORE }}";
+
+    /// Advisory IDs cargo-audit ignores: the job's `AUDIT_IGNORE:` list.
+    /// Panics unless the workflow has exactly one such list and exactly one
+    /// `ignore:` input, and that input reads the list, so a second audit step,
+    /// a renamed input or an input that stops using the list cannot make this
+    /// guard compare the wrong IDs.
+    fn cargo_audit_ignored_advisories(workflow: &str) -> std::collections::BTreeSet<&str> {
+        let inputs: Vec<_> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("ignore:"))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            inputs.len(),
+            1,
+            "expected exactly one `ignore:` input in dependency-scan.yml, found {}",
+            inputs.len()
+        );
+        assert_eq!(
+            inputs[0], AUDIT_IGNORE_INPUT,
+            "the cargo-audit step's `ignore:` input in dependency-scan.yml must be \
+             `{AUDIT_IGNORE_INPUT}` so it ignores the same list this guard checks"
+        );
+        let lists: Vec<_> = workflow
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix("AUDIT_IGNORE:"))
+            .collect();
+        assert_eq!(
+            lists.len(),
+            1,
+            "expected exactly one `AUDIT_IGNORE:` list in dependency-scan.yml, found {}",
+            lists.len()
+        );
+        lists[0]
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn advisory_ignore_parsers_read_both_formats() {
+        let deny = "[graph]\nall-features = true\n\n[advisories]\nignore = [\n    \
+                    { id = \"RUSTSEC-1\", reason = \"a\" },\n    { id = \"RUSTSEC-2\", reason = \"b\" },\n]\n\n\
+                    [bans]\nskip = [\n    { id = \"NOT-AN-ADVISORY\" },\n]\n";
+        assert_eq!(
+            deny_ignored_advisories(deny)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+        let workflow = "    env:\n      AUDIT_IGNORE: RUSTSEC-2,RUSTSEC-1\n      \
+                        # ignore: commented out\n        run: echo \"$AUDIT_IGNORE\"\n        \
+                        with:\n          ignore: ${{ env.AUDIT_IGNORE }}\n";
+        assert_eq!(
+            cargo_audit_ignored_advisories(workflow)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec!["RUSTSEC-1", "RUSTSEC-2"]
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`ignore:` input in dependency-scan.yml must be")]
+    fn cargo_audit_parser_rejects_an_input_that_bypasses_the_list() {
+        let workflow = "    env:\n      AUDIT_IGNORE: RUSTSEC-1\n        with:\n          \
+                        ignore: RUSTSEC-1,RUSTSEC-2\n";
+        cargo_audit_ignored_advisories(workflow);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected exactly one `AUDIT_IGNORE:` list")]
+    fn cargo_audit_parser_rejects_a_missing_list() {
+        let workflow = "        with:\n          ignore: ${{ env.AUDIT_IGNORE }}\n";
+        cargo_audit_ignored_advisories(workflow);
+    }
+
+    /// `deny.toml` says its advisory ignore list mirrors the cargo-audit step's
+    /// in `dependency-scan.yml` so the two gates cannot disagree. Nothing else
+    /// checks that, and an exception added to one list only (RUSTSEC-2026-0440
+    /// was, at first) leaves cargo-deny and cargo-audit judging the same
+    /// lockfile differently.
+    #[test]
+    fn deny_toml_and_cargo_audit_ignore_the_same_advisories() {
+        let deny = deny_ignored_advisories(DENY_TOML);
+        let audit = cargo_audit_ignored_advisories(DEPENDENCY_SCAN_WORKFLOW);
+        assert!(
+            !deny.is_empty(),
+            "no `{{ id = ... }}` entries found in deny.toml"
+        );
+        let only_in_deny: Vec<_> = deny.difference(&audit).collect();
+        let only_in_audit: Vec<_> = audit.difference(&deny).collect();
+        assert!(
+            only_in_deny.is_empty() && only_in_audit.is_empty(),
+            "advisory ignore lists disagree: only in deny.toml {only_in_deny:?}, only in \
+             dependency-scan.yml's cargo-audit step {only_in_audit:?}. Add each exception, \
+             with its reason, to both."
         );
     }
 }

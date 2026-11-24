@@ -48,12 +48,23 @@ import {
 import {
   Form,
   FormControl,
+  FormDescription,
   FormField,
   FormItem,
   FormLabel,
   FormMessage,
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
+import {
+  containerRuntimeSchema,
+  dockerfileCreationConfig,
+} from '@/lib/container-runtime-overrides'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -123,6 +134,7 @@ import {
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
 import { detectedPortForSelection } from '@/lib/dockerfile-port'
+import { selectedDockerfileFor } from '@/lib/preset-selection'
 import { getRepositoryUrl } from '@/lib/repository-url'
 
 // Best-effort provider detection from the repo URL's hostname, for the brand
@@ -187,38 +199,57 @@ const slugifyPath = (path: string): string => {
 }
 
 // Form schema definition
-const formSchema = z.object({
-  name: z.string().min(1, 'Service name is required'),
-  preset: z.string().min(1, 'Preset is required'),
-  autoDeploy: z.boolean(),
-  rootDirectory: z.string(),
-  branch: z.string().min(1, 'Branch is required'),
-  environmentVariables: projectEnvironmentVariablesSchema,
-  storageServices: z.array(z.number()),
-  dockerfilePath: z.string().optional(),
-  composePath: z.string().optional(),
-  excludedServices: z.array(z.string()).optional(),
-  composeServices: z
-    .array(
-      z.object({
-        name: z.string(),
-        image: z.string().optional(),
-        looksLikeDatabase: z.boolean(),
-        detectedServiceType: z.string().nullable().optional(),
-        ports: z
-          .array(
-            z.object({
-              target: z.number(),
-              published: z.number().optional(),
-              protocol: z.string(),
-            })
-          )
-          .optional(),
-      })
-    )
-    .optional(),
-  port: z.number().int().min(1).max(65535).optional(),
-})
+const formSchema = z
+  .object({
+    name: z.string().min(1, 'Service name is required'),
+    preset: z.string().min(1, 'Preset is required'),
+    autoDeploy: z.boolean(),
+    rootDirectory: z.string(),
+    branch: z.string().min(1, 'Branch is required'),
+    environmentVariables: projectEnvironmentVariablesSchema,
+    storageServices: z.array(z.number()),
+    dockerfilePath: z.string().optional(),
+    command: z.string().optional(),
+    entrypoint: z.string().optional(),
+    composePath: z.string().optional(),
+    excludedServices: z.array(z.string()).optional(),
+    composeServices: z
+      .array(
+        z.object({
+          name: z.string(),
+          image: z.string().optional(),
+          looksLikeDatabase: z.boolean(),
+          detectedServiceType: z.string().nullable().optional(),
+          ports: z
+            .array(
+              z.object({
+                target: z.number(),
+                published: z.number().optional(),
+                protocol: z.string(),
+              })
+            )
+            .optional(),
+        })
+      )
+      .optional(),
+    port: z.number().int().min(1).max(65535).optional(),
+  })
+  .superRefine((values, context) => {
+    if (values.preset.split('::')[0] !== 'dockerfile') return
+    const result = containerRuntimeSchema.safeParse({
+      command: values.command ?? '',
+      entrypoint: values.entrypoint ?? '',
+    })
+    if (!result.success) {
+      for (const issue of result.error.issues) {
+        context.addIssue({
+          code: 'custom',
+          path: issue.path,
+          message: issue.message,
+        })
+      }
+    }
+  })
 
 export type ProjectFormValues = z.infer<typeof formSchema>
 
@@ -451,7 +482,7 @@ function ComposeFileSelector({
           render={({ field }) => (
             <FormItem>
               <div className="flex items-center justify-between">
-                <FormLabel>Compose File Path</FormLabel>
+                <FormLabel>Compose file path</FormLabel>
                 {composeFiles.length > 0 && (
                   <Button
                     type="button"
@@ -498,7 +529,7 @@ function ComposeFileSelector({
         render={({ field }) => (
           <FormItem>
             <div className="flex items-center justify-between">
-              <FormLabel>Compose File</FormLabel>
+              <FormLabel>Compose file</FormLabel>
               <Button
                 type="button"
                 variant="ghost"
@@ -649,6 +680,7 @@ export function ProjectConfigurator({
     ExternalServiceInfo[]
   >([])
   const [allowDirectoryOverride, setAllowDirectoryOverride] = useState(false)
+  const [showAdvancedSettings, setShowAdvancedSettings] = useState(false)
 
   // Form initialization
   const form = useForm<ProjectFormValues>({
@@ -663,6 +695,8 @@ export function ProjectConfigurator({
       environmentVariables: defaultValues?.environmentVariables ?? [],
       storageServices: defaultValues?.storageServices ?? [],
       dockerfilePath: defaultValues?.dockerfilePath ?? 'Dockerfile',
+      command: defaultValues?.command ?? '',
+      entrypoint: defaultValues?.entrypoint ?? '',
       excludedServices: defaultValues?.excludedServices ?? [],
       composeServices: defaultValues?.composeServices ?? [],
       port: defaultValues?.port ?? 3000,
@@ -1357,10 +1391,8 @@ export function ProjectConfigurator({
               })
             ),
             preset_config:
-              finalData.preset === 'dockerfile' && finalData.dockerfilePath
-                ? {
-                    dockerfilePath: finalData.dockerfilePath,
-                  }
+              finalData.preset === 'dockerfile'
+                ? dockerfileCreationConfig(finalData)
                 : finalData.preset === 'docker-compose'
                   ? {
                       composePath:
@@ -1486,8 +1518,13 @@ export function ProjectConfigurator({
                   isRefreshing={presetFetching || isManuallyRefreshingPresets}
                   error={presetError}
                   selectedPreset={selectValue}
+                  selectedDockerfilePath={selectedDockerfileFor(
+                    selectValue,
+                    selectedDockerfilePath
+                  )}
+                  editableDockerfilePath
                   onRefresh={handleRefreshPresets}
-                  onSelectPreset={(value) => {
+                  onSelectPreset={(value, detected) => {
                     if (value === 'custom') {
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
@@ -1528,11 +1565,14 @@ export function ProjectConfigurator({
                       // and resets to the plain default otherwise, so a
                       // stale value from a previous selection never lingers.
                       if (presetName === 'dockerfile') {
-                        const matchedCandidate = presetData?.presets?.find(
-                          (p: ProjectPresetResponse) =>
-                            p.preset === presetName &&
-                            normalizePath(p.path) === normalizePath(presetPath)
-                        )
+                        const matchedCandidate =
+                          detected ??
+                          presetData?.presets?.find(
+                            (p: ProjectPresetResponse) =>
+                              p.preset === presetName &&
+                              normalizePath(p.path) ===
+                                normalizePath(presetPath)
+                          )
                         form.setValue(
                           'dockerfilePath',
                           matchedCandidate?.dockerfilePath || 'Dockerfile'
@@ -1558,7 +1598,7 @@ export function ProjectConfigurator({
           return (
             <FormItem>
               <div className="flex items-center justify-between">
-                <FormLabel>Root Directory</FormLabel>
+                <FormLabel>Root directory</FormLabel>
                 {!isCustomPreset && !allowDirectoryOverride && (
                   <Button
                     type="button"
@@ -1628,7 +1668,7 @@ export function ProjectConfigurator({
               />
             </FormControl>
             <div className="space-y-1 leading-none">
-              <FormLabel>Automatic Deployments</FormLabel>
+              <FormLabel>Automatic deployments</FormLabel>
               <p className="text-sm text-muted-foreground">
                 Automatically deploy when changes are pushed to the repository
               </p>
@@ -1644,7 +1684,7 @@ export function ProjectConfigurator({
           name="dockerfilePath"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Dockerfile Path</FormLabel>
+              <FormLabel>Dockerfile path</FormLabel>
               <FormControl>
                 <Input
                   {...field}
@@ -1659,6 +1699,84 @@ export function ProjectConfigurator({
             </FormItem>
           )}
         />
+      )}
+
+      {selectedPreset?.split('::')[0]?.toLowerCase() === 'dockerfile' && (
+        <Collapsible
+          open={showAdvancedSettings}
+          onOpenChange={setShowAdvancedSettings}
+          className="space-y-4"
+        >
+          <CollapsibleTrigger asChild>
+            <Button
+              type="button"
+              variant="ghost"
+              className="h-auto w-full justify-between whitespace-normal text-left"
+            >
+              Advanced settings · Container startup
+              <ChevronDown
+                className={cn(
+                  'h-4 w-4 transition-transform',
+                  showAdvancedSettings && 'rotate-180'
+                )}
+              />
+            </Button>
+          </CollapsibleTrigger>
+          <CollapsibleContent className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Override the Dockerfile startup process, for example to run a
+              worker from the same image. These settings apply to the first
+              deployment.
+            </p>
+            <FormField
+              control={form.control}
+              name="command"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Command (CMD)</FormLabel>
+                  <FormControl>
+                    <Textarea
+                      {...field}
+                      value={field.value ?? ''}
+                      readOnly={isSubmitting}
+                      className="font-mono"
+                      placeholder='["python", "-m", "worker"]'
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    A JSON argument list. Leave blank to inherit the image
+                    command.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="entrypoint"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>Entrypoint (ENTRYPOINT)</FormLabel>
+                  <FormControl>
+                    <Textarea
+                      {...field}
+                      value={field.value ?? ''}
+                      readOnly={isSubmitting}
+                      className="font-mono"
+                      placeholder='["/app/entrypoint.sh"]'
+                    />
+                  </FormControl>
+                  <FormDescription>
+                    Leave blank to inherit the image entrypoint, or enter [] to
+                    remove it. For shell syntax, use {'["/bin/sh", "-c"]'} with
+                    a single command string in Command.
+                  </FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </CollapsibleContent>
+        </Collapsible>
       )}
 
       {/* Docker Compose Configuration */}
@@ -1679,7 +1797,7 @@ export function ProjectConfigurator({
           name="port"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>Application Port</FormLabel>
+              <FormLabel>Application port</FormLabel>
               <FormControl>
                 <Input
                   type="number"
@@ -1733,7 +1851,7 @@ export function ProjectConfigurator({
           disabled={areServicesPending}
         >
           <Plus className="h-4 w-4 mr-2" />
-          Add Database
+          Add database
           <ChevronDown className="h-4 w-4 ml-1" />
         </Button>
       </DropdownMenuTrigger>
@@ -1813,7 +1931,7 @@ export function ProjectConfigurator({
 
         {availableServices.length > 0 && (
           <div>
-            <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
+            <h4 className="text-sm font-medium mb-3">Existing databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
@@ -2467,6 +2585,8 @@ export function ProjectConfigurator({
         <form
           onSubmit={(event) => {
             void form.handleSubmit(handleSubmit, (errors) => {
+              if (errors.command || errors.entrypoint)
+                setShowAdvancedSettings(true)
               console.error('Form validation errors:', errors)
             })(event)
           }}
@@ -2500,7 +2620,7 @@ export function ProjectConfigurator({
           <Card>
             <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
               <div className="space-y-1.5">
-                <CardTitle>Environment Variables</CardTitle>
+                <CardTitle>Environment variables</CardTitle>
                 <CardDescription>
                   Add app configuration and credentials. Database connection
                   variables above are included automatically.
@@ -2523,7 +2643,7 @@ export function ProjectConfigurator({
                   onClick={addEnvironmentVariable}
                 >
                   <Plus className="h-4 w-4 mr-2" />
-                  Add Variable
+                  Add variable
                 </Button>
               </div>
             </CardHeader>

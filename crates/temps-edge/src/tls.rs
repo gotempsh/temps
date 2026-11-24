@@ -7,6 +7,7 @@
 //! and stored in memory. The `EdgeTlsAccept` callback serves them to Pingora
 //! during TLS handshakes based on SNI hostname (with wildcard fallback).
 
+use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use pingora_core::listeners::TlsAccept;
 use pingora_core::protocols::tls::TlsRef;
@@ -16,7 +17,7 @@ use pingora_openssl::x509::X509;
 use rustls_pemfile;
 use std::collections::HashMap;
 use std::io::BufReader;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use tracing::{debug, warn};
 
 use crate::route_table::{EdgeCertBundle, EdgeCertificates};
@@ -34,9 +35,10 @@ struct CertEntry {
 /// Thread-safe in-memory certificate store for the edge proxy.
 ///
 /// Certificates live only in memory — never written to disk on the edge node.
-/// Updated atomically during each route sync cycle.
+/// Updated atomically during each route sync cycle. The TLS handshake path
+/// reads a lock-free `ArcSwap` snapshot; the sync loop swaps in a new map.
 pub struct EdgeCertStore {
-    inner: RwLock<HashMap<String, CertEntry>>,
+    inner: ArcSwap<HashMap<String, Arc<CertEntry>>>,
 }
 
 impl Default for EdgeCertStore {
@@ -45,10 +47,16 @@ impl Default for EdgeCertStore {
     }
 }
 
+/// First 12 characters of a fingerprint for log lines, or all of it when
+/// it is shorter (the value comes from the origin and is not validated).
+fn short_fingerprint(fingerprint: &str) -> &str {
+    fingerprint.get(..12).unwrap_or(fingerprint)
+}
+
 impl EdgeCertStore {
     pub fn new() -> Self {
         Self {
-            inner: RwLock::new(HashMap::new()),
+            inner: ArcSwap::from_pointee(HashMap::new()),
         }
     }
 
@@ -61,11 +69,9 @@ impl EdgeCertStore {
         certificates: &EdgeCertificates,
         edge_private_key_b64: &str,
     ) -> usize {
-        let mut updated = 0;
-
         // Check which certs need updating based on fingerprint
         let needs_update: Vec<&EdgeCertBundle> = {
-            let store = self.inner.read().unwrap();
+            let store = self.inner.load();
             certificates
                 .bundles
                 .iter()
@@ -82,8 +88,9 @@ impl EdgeCertStore {
             return 0;
         }
 
-        let mut store = self.inner.write().unwrap();
-
+        // Decrypt and parse outside the swap: the expensive work runs once,
+        // not once per `rcu` retry.
+        let mut parsed: Vec<(String, Arc<CertEntry>)> = Vec::with_capacity(needs_update.len());
         for bundle in needs_update {
             let ecies_bundle = temps_core::ecies::EncryptedBundle {
                 ciphertext: bundle.ciphertext.clone(),
@@ -117,17 +124,16 @@ impl EdgeCertStore {
                         "Updated certificate for {} ({} cert(s), fingerprint={})",
                         bundle.domain,
                         certs_der.len(),
-                        &bundle.fingerprint[..12]
+                        short_fingerprint(&bundle.fingerprint)
                     );
-                    store.insert(
+                    parsed.push((
                         bundle.domain.clone(),
-                        CertEntry {
+                        Arc::new(CertEntry {
                             certs_der,
                             key_der,
                             fingerprint: bundle.fingerprint.clone(),
-                        },
-                    );
-                    updated += 1;
+                        }),
+                    ));
                 }
                 Err(e) => {
                     warn!("Failed to parse cert PEM for {}: {}", bundle.domain, e);
@@ -135,32 +141,38 @@ impl EdgeCertStore {
             }
         }
 
-        updated
+        if parsed.is_empty() {
+            return 0;
+        }
+
+        self.inner.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            for (domain, entry) in &parsed {
+                next.insert(domain.clone(), Arc::clone(entry));
+            }
+            next
+        });
+
+        parsed.len()
     }
 
     /// Look up a certificate by SNI hostname (exact match, then wildcard fallback).
-    fn lookup(&self, sni: &str) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
-        let store = self.inner.read().unwrap();
+    fn lookup(&self, sni: &str) -> Option<Arc<CertEntry>> {
+        let store = self.inner.load();
 
         // Exact match
         if let Some(entry) = store.get(sni) {
-            return Some((entry.certs_der.clone(), entry.key_der.clone()));
+            return Some(Arc::clone(entry));
         }
 
         // Wildcard fallback: app.example.com -> *.example.com
-        if let Some(dot_pos) = sni.find('.') {
-            let wildcard = format!("*.{}", &sni[dot_pos + 1..]);
-            if let Some(entry) = store.get(&wildcard) {
-                return Some((entry.certs_der.clone(), entry.key_der.clone()));
-            }
-        }
-
-        None
+        let (_, parent) = sni.split_once('.')?;
+        store.get(&format!("*.{}", parent)).cloned()
     }
 
     /// Number of certificates in the store.
     pub fn len(&self) -> usize {
-        self.inner.read().unwrap().len()
+        self.inner.load().len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -169,7 +181,7 @@ impl EdgeCertStore {
 
     /// List all domains with certificates (for debugging).
     pub fn domains(&self) -> Vec<String> {
-        self.inner.read().unwrap().keys().cloned().collect()
+        self.inner.load().keys().cloned().collect()
     }
 }
 
@@ -235,8 +247,8 @@ impl TlsAccept for EdgeTlsAccept {
 
         debug!("Edge TLS callback for SNI: {}", sni);
 
-        let (certs_der, key_der) = match self.cert_store.lookup(&sni) {
-            Some(data) => data,
+        let entry = match self.cert_store.lookup(&sni) {
+            Some(entry) => entry,
             None => {
                 debug!("No certificate for SNI: {}", sni);
                 return;
@@ -244,7 +256,7 @@ impl TlsAccept for EdgeTlsAccept {
         };
 
         // Load certificate chain
-        for (i, cert_bytes) in certs_der.iter().enumerate() {
+        for (i, cert_bytes) in entry.certs_der.iter().enumerate() {
             match X509::from_der(cert_bytes) {
                 Ok(cert) => {
                     if i == 0 {
@@ -265,7 +277,7 @@ impl TlsAccept for EdgeTlsAccept {
         }
 
         // Load private key
-        match PKey::private_key_from_der(&key_der) {
+        match PKey::private_key_from_der(&entry.key_der) {
             Ok(pkey) => {
                 if let Err(e) = ext::ssl_use_private_key(ssl, &pkey) {
                     debug!("Failed to set private key for {}: {}", sni, e);
@@ -295,5 +307,75 @@ mod tests {
     fn test_cert_store_len() {
         let store = EdgeCertStore::new();
         assert_eq!(store.len(), 0);
+    }
+
+    fn insert_for_test(store: &EdgeCertStore, domain: &str, fingerprint: &str) {
+        store.inner.rcu(|current| {
+            let mut next = HashMap::clone(current);
+            next.insert(
+                domain.to_string(),
+                Arc::new(CertEntry {
+                    certs_der: vec![vec![1, 2, 3]],
+                    key_der: vec![4, 5, 6],
+                    fingerprint: fingerprint.to_string(),
+                }),
+            );
+            next
+        });
+    }
+
+    #[test]
+    fn test_lookup_exact_then_wildcard() {
+        let store = EdgeCertStore::new();
+        insert_for_test(&store, "app.example.com", "exact");
+        insert_for_test(&store, "*.example.com", "wildcard");
+
+        let exact = store.lookup("app.example.com").unwrap();
+        assert_eq!(exact.fingerprint, "exact");
+        let wildcard = store.lookup("other.example.com").unwrap();
+        assert_eq!(wildcard.fingerprint, "wildcard");
+        // Single-level only, and no match for a dotless name.
+        assert!(store.lookup("a.b.example.com").is_none());
+        assert!(store.lookup("localhost").is_none());
+    }
+
+    #[test]
+    fn test_unchanged_fingerprint_is_not_reparsed() {
+        let store = EdgeCertStore::new();
+        insert_for_test(&store, "app.example.com", "fp-1");
+        let certificates = EdgeCertificates {
+            ephemeral_public_key: String::new(),
+            bundles: vec![EdgeCertBundle {
+                domain: "app.example.com".to_string(),
+                ciphertext: "not-decryptable".to_string(),
+                nonce: String::new(),
+                fingerprint: "fp-1".to_string(),
+            }],
+        };
+        assert_eq!(store.update_from_sync(&certificates, "unused"), 0);
+        assert_eq!(store.lookup("app.example.com").unwrap().fingerprint, "fp-1");
+    }
+
+    #[test]
+    fn test_undecryptable_bundle_with_short_fingerprint_does_not_panic() {
+        let store = EdgeCertStore::new();
+        let certificates = EdgeCertificates {
+            ephemeral_public_key: "invalid".to_string(),
+            bundles: vec![EdgeCertBundle {
+                domain: "app.example.com".to_string(),
+                ciphertext: "invalid".to_string(),
+                nonce: "invalid".to_string(),
+                fingerprint: "short".to_string(),
+            }],
+        };
+        assert_eq!(store.update_from_sync(&certificates, "invalid"), 0);
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn test_short_fingerprint() {
+        assert_eq!(short_fingerprint("0123456789abcdef"), "0123456789ab");
+        assert_eq!(short_fingerprint("abc"), "abc");
+        assert_eq!(short_fingerprint("ééééééééééé"), "éééééé");
     }
 }

@@ -14,10 +14,11 @@ pub(super) struct SitePage {
     pub text: String,
 }
 
-fn error(project_id: i32, reason: impl std::fmt::Display) -> ActivityError {
-    ActivityError::Analysis {
+fn error(project_id: i32, url: &Url, reason: impl std::fmt::Display) -> ActivityError {
+    ActivityError::SiteUnreadable {
         project_id,
-        reason: format!("Read public site: {reason}"),
+        url: url.to_string(),
+        reason: reason.to_string(),
     }
 }
 
@@ -41,10 +42,10 @@ pub(super) fn public_url(project_id: i32, raw: &str) -> Result<Url, ActivityErro
 async fn fetch(project_id: i32, url: &Url) -> Result<String, ActivityError> {
     let host = url
         .host_str()
-        .ok_or_else(|| error(project_id, "Missing hostname"))?;
+        .ok_or_else(|| error(project_id, url, "Missing hostname"))?;
     let addresses = resolve_and_validate_domain(host, url.port_or_known_default().unwrap_or(443))
         .await
-        .map_err(|e| error(project_id, e))?;
+        .map_err(|e| error(project_id, url, e))?;
     // Pin the validated addresses to prevent DNS rebinding. No ambient proxies,
     // cookies, authorization, or redirects to unvalidated destinations.
     let client = reqwest::Client::builder()
@@ -54,15 +55,16 @@ async fn fetch(project_id: i32, url: &Url) -> Result<String, ActivityError> {
         .timeout(Duration::from_secs(10))
         .user_agent("Temps-Activity-Setup/1.0")
         .build()
-        .map_err(|e| error(project_id, e))?;
+        .map_err(|e| error(project_id, url, e.without_url()))?;
     let mut response = client
         .get(url.clone())
         .send()
         .await
-        .map_err(|e| error(project_id, e))?;
+        .map_err(|e| error(project_id, url, e.without_url()))?;
     if !response.status().is_success() {
         return Err(error(
             project_id,
+            url,
             format!(
                 "Site returned HTTP {}. Use its final public URL or describe the app manually.",
                 response.status()
@@ -79,22 +81,26 @@ async fn fetch(project_id: i32, url: &Url) -> Result<String, ActivityError> {
                 .is_some_and(|v| v.trim().eq_ignore_ascii_case("text/html"))
         });
     if !html {
-        return Err(error(project_id, "The page is not HTML"));
+        return Err(error(project_id, url, "The page is not HTML"));
     }
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| error(project_id, e))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| error(project_id, url, e.without_url()))?
+    {
         if bytes.len() + chunk.len() > 2 * 1024 * 1024 {
-            return Err(error(project_id, "Page exceeds the 2 MiB scan limit"));
+            return Err(error(project_id, url, "Page exceeds the 2 MiB scan limit"));
         }
         bytes.extend_from_slice(&chunk);
     }
-    String::from_utf8(bytes).map_err(|e| error(project_id, e))
+    String::from_utf8(bytes).map_err(|e| error(project_id, url, e))
 }
 
 fn extract(project_id: i32, url: &Url, html: &str) -> Result<(SitePage, Vec<Url>), ActivityError> {
     let document = Html::parse_document(html);
     let selector = Selector::parse("title, h1, h2, h3, p, meta[name=description]")
-        .map_err(|e| error(project_id, e))?;
+        .map_err(|e| error(project_id, url, e))?;
     let mut text = String::new();
     for element in document.select(&selector) {
         if element
@@ -127,7 +133,7 @@ fn extract(project_id: i32, url: &Url, html: &str) -> Result<(SitePage, Vec<Url>
         }
         text.truncate(end);
     }
-    let links = Selector::parse("a[href]").map_err(|e| error(project_id, e))?;
+    let links = Selector::parse("a[href]").map_err(|e| error(project_id, url, e))?;
     let mut urls = Vec::new();
     for element in document.select(&links) {
         let Some(href) = element.value().attr("href") else {
@@ -181,6 +187,7 @@ pub(super) async fn read_site(project_id: i32, url: &Url) -> Result<Vec<SitePage
     if pages.iter().all(|p| p.text.trim().is_empty()) {
         return Err(error(
             project_id,
+            url,
             "No readable public content found. Describe the application manually.",
         ));
     }

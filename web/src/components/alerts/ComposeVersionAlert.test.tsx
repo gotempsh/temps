@@ -21,6 +21,7 @@ afterEach(() => {
 })
 
 const unsupported: ComposeHostStatusResponse = {
+  applicable: true,
   probed: true,
   available: true,
   supported: false,

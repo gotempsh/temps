@@ -98,9 +98,7 @@ impl TempsPlugin for AuditPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let audit_service = context
-            .get_service::<AuditService>()
-            .expect("AuditService must be registered before configuring routes");
+        let audit_service = context.require_service::<AuditService>();
 
         let app_state = Arc::new(handlers::types::AppState { audit_service });
 

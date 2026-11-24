@@ -5,6 +5,7 @@
 name = "temps-analytics-funnels"
 version.workspace = true
 edition.workspace = true
+description = "Funnel analytics: define multi-step conversion funnels over analytics events and compute per-step conversion"
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
@@ -13,9 +14,8 @@ homepage.workspace = true
 [dependencies]
 # Core dependencies
 temps-core = { path = "../temps-core" }
-temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
-temps-auth = { path = "../temps-auth" }
+temps-authz = { path = "../temps-authz" }
 
 # Web framework
 axum = { workspace = true }
@@ -30,17 +30,19 @@ serde_json = { workspace = true }
 
 # Async
 tokio = { workspace = true }
-async-trait = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
 
-# Error handling
-thiserror = { workspace = true }
-anyhow = { workspace = true }
-
 # Time
 chrono = { workspace = true }
 
+# Errors
+thiserror = { workspace = true }
+
 [dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
 tokio = { workspace = true }
+
+[lints]
+workspace = true

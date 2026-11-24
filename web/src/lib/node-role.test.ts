@@ -3,7 +3,11 @@
 
 import { describe, expect, test } from 'bun:test'
 
-import { nodeSchedulingRole, targetNodesHint } from './node-role'
+import {
+  nodeRoleChangeCommand,
+  nodeSchedulingRole,
+  targetNodesHint,
+} from './node-role'
 
 describe('nodeSchedulingRole', () => {
   test('reads the temps.sh/role label', () => {
@@ -52,5 +56,24 @@ describe('targetNodesHint', () => {
     expect(
       targetNodesHint([{ labels: { 'temps.sh/role': 'builder' } }])
     ).not.toContain('dedicated')
+  })
+})
+
+describe('nodeRoleChangeCommand', () => {
+  test('offers to make an ordinary worker dedicated', () => {
+    expect(nodeRoleChangeCommand({})).toBe(
+      'temps agent labels set temps.sh/role=dedicated'
+    )
+    expect(nodeRoleChangeCommand(null)).toBe(
+      'temps agent labels set temps.sh/role=dedicated'
+    )
+  })
+
+  test('offers to clear the role of a dedicated or builder node', () => {
+    for (const role of ['dedicated', 'builder']) {
+      expect(nodeRoleChangeCommand({ 'temps.sh/role': role })).toBe(
+        'temps agent labels unset temps.sh/role'
+      )
+    }
   })
 })
