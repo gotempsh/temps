@@ -1068,7 +1068,7 @@ export function ServiceRestore() {
           ) : (
             <RadioGroup
               aria-label="Backup to restore"
-              className="border rounded-md"
+              className="@container min-w-0 grid-cols-1 rounded-md border"
               value={selectedBackup ? backupRadioValue(selectedBackup) : ''}
               onValueChange={(value) => {
                 const backup = paginatedBackups.find(
@@ -1078,16 +1078,26 @@ export function ServiceRestore() {
                   updateSelection({ sourceId: effectiveSourceId, backup })
               }}
             >
-              <Table>
+              <Table className="table-fixed @xl:table-auto">
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-8"></TableHead>
-                    <TableHead>Created</TableHead>
-                    <TableHead>Origin service</TableHead>
-                    <TableHead>Format</TableHead>
-                    <TableHead>Size</TableHead>
-                    <TableHead>Source</TableHead>
-                    <TableHead>State</TableHead>
+                    <TableHead className="w-8 px-2">
+                      <span className="sr-only">Select</span>
+                    </TableHead>
+                    <TableHead className="px-2">Origin service</TableHead>
+                    <TableHead className="hidden @xl:table-cell">
+                      Created
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Format
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Size
+                    </TableHead>
+                    <TableHead className="hidden @3xl:table-cell">
+                      Source
+                    </TableHead>
+                    <TableHead className="w-24 px-2">State</TableHead>
                   </TableRow>
                 </TableHeader>
                 <TableBody>
@@ -1095,6 +1105,23 @@ export function ServiceRestore() {
                     const isSel = selectedBackup === b
                     const unavailable = needsSnapshotKey(b)
                     const value = backupRadioValue(b)
+                    const created = b.created_at ? (
+                      <time dateTime={b.created_at}>
+                        {new Date(b.created_at).toLocaleString()}
+                      </time>
+                    ) : (
+                      '—'
+                    )
+                    const size =
+                      b.size_bytes == null ? '—' : formatBytes(b.size_bytes)
+                    const source =
+                      b.source === 'db' ? (
+                        <Badge variant="outline" className="text-xs">
+                          Tracked
+                        </Badge>
+                      ) : (
+                        <OrphanBackupBadge label="From another server" />
+                      )
                     return (
                       <TableRow
                         key={unavailable ? `${value}-${b.created_at}` : value}
@@ -1107,7 +1134,7 @@ export function ServiceRestore() {
                             })
                         }}
                       >
-                        <TableCell>
+                        <TableCell className="px-2">
                           <RadioGroupItem
                             value={value}
                             disabled={unavailable}
@@ -1115,28 +1142,35 @@ export function ServiceRestore() {
                             aria-label={`Restore backup from ${b.created_at ? new Date(b.created_at).toLocaleString() : 'unknown time'}`}
                           />
                         </TableCell>
-                        <TableCell className="font-mono text-xs whitespace-nowrap">
-                          {b.created_at
-                            ? new Date(b.created_at).toLocaleString()
-                            : '—'}
+                        <TableCell className="px-2 [overflow-wrap:anywhere]">
+                          <span>
+                            {b.origin_service_name ||
+                              b.name ||
+                              b.location ||
+                              '—'}
+                          </span>
+                          <div className="mt-1 font-mono text-xs text-muted-foreground @xl:hidden">
+                            {created}
+                          </div>
+                          <div className="mt-1 flex flex-wrap items-center gap-1 text-xs text-muted-foreground @3xl:hidden">
+                            <FormatBadge format={b.format} />
+                            <span>{size}</span>
+                            {source}
+                          </div>
                         </TableCell>
-                        <TableCell>{b.origin_service_name ?? '—'}</TableCell>
-                        <TableCell>
+                        <TableCell className="hidden font-mono text-xs @xl:table-cell">
+                          {created}
+                        </TableCell>
+                        <TableCell className="hidden @3xl:table-cell">
                           <FormatBadge format={b.format} />
                         </TableCell>
-                        <TableCell className="text-xs text-muted-foreground">
-                          {b.size_bytes ? formatBytes(b.size_bytes) : '—'}
+                        <TableCell className="hidden text-xs text-muted-foreground @3xl:table-cell">
+                          {size}
                         </TableCell>
-                        <TableCell>
-                          {b.source === 'db' ? (
-                            <Badge variant="outline" className="text-xs">
-                              Tracked
-                            </Badge>
-                          ) : (
-                            <OrphanBackupBadge label="From another server" />
-                          )}
+                        <TableCell className="hidden @3xl:table-cell">
+                          {source}
                         </TableCell>
-                        <TableCell>
+                        <TableCell className="px-2 [overflow-wrap:anywhere]">
                           <Badge
                             variant={
                               b.state === 'completed' ? 'default' : 'secondary'
