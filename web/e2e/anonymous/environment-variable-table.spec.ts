@@ -329,14 +329,22 @@ for (const width of [1440, 390]) {
     await secretSelection.click()
     await expect(secretSelection).toBeChecked()
     await expect(urlSelection).not.toBeChecked()
-    await expect(table.getByText('1 selected', { exact: true })).toBeVisible()
+    // The bulk-selection bar sits above the table, not inside it.
+    await expect(page.getByText('1 selected', { exact: true })).toBeVisible()
     await expect(
-      table.getByRole('button', { name: 'Delete 1 selected', exact: true })
+      page.getByRole('button', { name: 'Delete 1 selected', exact: true })
     ).toBeVisible()
     await expect(
       table.getByRole('checkbox', { name: 'Select all environment variables' })
     ).toHaveAttribute('aria-checked', 'mixed')
-    await secret.getByRole('button', { name: 'Edit', exact: true }).click()
+    // Row actions live in the row's actions menu.
+    await secret
+      .getByRole('button', {
+        name: 'Actions for PROVIDER_API_KEY',
+        exact: true,
+      })
+      .click()
+    await page.getByRole('menuitem', { name: 'Edit', exact: true }).click()
     await expect(page.getByRole('dialog')).toContainText(
       'Stored secret values cannot be revealed.'
     )
@@ -357,9 +365,14 @@ for (const width of [1440, 390]) {
       'href',
       '/projects/example-app/environment-variables/2'
     )
-    await expect(detailLink).toHaveCSS('text-decoration-line', 'underline')
-    await expect(detailLink.locator('svg')).toBeVisible()
-    await secret.getByRole('cell').nth(2).click()
+    // A record opens from anywhere on its row (the link carries no link
+    // styling); the link itself stays the keyboard path.
+    await secret
+      .getByRole('cell')
+      .nth(2)
+      .click({ position: { x: 4, y: 4 } })
+    await expect(page).toHaveURL(/environment-variables\/2$/)
+    await page.goBack()
     await expect(page).toHaveURL(/environment-variables$/)
     await detailLink.focus()
     await page.keyboard.press('Enter')

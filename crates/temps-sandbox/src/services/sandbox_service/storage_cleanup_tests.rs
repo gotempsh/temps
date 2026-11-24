@@ -14,9 +14,11 @@ use super::{
     },
     reconcile::VM_RECONCILE_REPORTED_IDS,
     source_import::{
-        clean_git_environment, sandbox_image_is_trusted_for_credentials,
+        authorize_seed_connection, clean_git_environment, clone_url_names_repository,
+        connection_clone_credentials, project_clone_url, sandbox_image_is_trusted_for_credentials,
         sanitize_privileged_import_environment, tarball_extract_command,
-        validate_connection_clone_origin, SourceNetworkPin,
+        validate_connection_clone_origin, ProjectCloneUrl, ProjectRepositoryGrant,
+        SeedConnectionAuthority, SourceNetworkPin,
     },
 };
 use async_trait::async_trait;
@@ -66,7 +68,13 @@ struct FakeProvider {
     create_delay: Option<Duration>,
     /// The backends this host registered; `None` claims every one.
     backends: Option<Vec<SandboxBackend>>,
+    /// Every command run in a sandbox with its environment, in order.
+    /// `exec_as_root` and `exec_as_user` default to `exec`, so this sees them.
+    execs: Arc<Mutex<Vec<RecordedExec>>>,
 }
+
+/// A command run in a sandbox and the environment it was given.
+type RecordedExec = (Vec<String>, HashMap<String, String>);
 
 impl FakeProvider {
     fn new() -> Self {
@@ -88,6 +96,7 @@ impl FakeProvider {
             fail_egress: false,
             create_delay: None,
             backends: None,
+            execs: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -133,10 +142,11 @@ impl SandboxProvider for FakeProvider {
     async fn exec(
         &self,
         _handle: &SandboxHandle,
-        _cmd: Vec<String>,
-        _env: HashMap<String, String>,
+        cmd: Vec<String>,
+        env: HashMap<String, String>,
         _on_output: Option<temps_agent_core::OnEventCallback>,
     ) -> Result<SandboxExecResult, AgentError> {
+        self.execs.lock().unwrap().push((cmd, env));
         Ok(SandboxExecResult {
             exit_code: if self.fail_exec { 1 } else { 0 },
             stdout: String::new(),
@@ -1658,12 +1668,22 @@ async fn source_from_project_uses_the_projects_repo_branch_and_connection() {
         .into_connection();
 
     let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
-    let source = service
+    let seed = service
         .source_from_project(12)
         .await
-        .expect("a connected project yields a git source");
+        .expect("a connected project yields a git source")
+        .expect("a Git project has a seed source");
 
-    match source.expect("a Git project has a seed source") {
+    assert_eq!(
+        seed.repository,
+        ProjectRepositoryGrant::for_project(
+            &project_row(Some("https://github.com/acme/api.git")),
+            "https://github.com/acme/api.git"
+        ),
+        "a project with a connection grants it for its own repository"
+    );
+    assert!(seed.repository.is_some());
+    match seed.source {
         SandboxSource::Git {
             url,
             revision,
@@ -1698,14 +1718,14 @@ async fn source_from_project_uses_the_projects_repo_branch_and_connection() {
 async fn source_from_project_errors_when_the_project_has_no_repo() {
     let data_root = unique_data_root("project-no-repo");
     let db = MockDatabase::new(DatabaseBackend::Postgres)
-        .append_query_results([vec![project_row(None)]])
+        .append_query_results([vec![project_without_repository()]])
         .into_connection();
 
     let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
     let err = service
         .source_from_project(12)
         .await
-        .expect_err("a project with no git_url cannot seed a workspace");
+        .expect_err("a project with neither a git_url nor a repository cannot seed a workspace");
 
     match err {
         SandboxError::ProjectHasNoRepo { project_id, name } => {
@@ -1720,6 +1740,8 @@ async fn source_from_project_errors_when_the_project_has_no_repo() {
 #[tokio::test]
 async fn source_from_project_allows_an_empty_workspace_for_manual_projects() {
     let data_root = unique_data_root("manual-project-no-repo");
+    // Repository metadata and a connection are still on the row: a git-less
+    // project type starts empty regardless, and no provider is asked.
     let mut manual_project = project_row(None);
     manual_project.source_type = temps_entities::source_type::SourceType::Manual;
     let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1733,6 +1755,339 @@ async fn source_from_project_allows_an_empty_workspace_for_manual_projects() {
         .expect("a manual project may start with an empty workspace");
 
     assert!(source.is_none());
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// A Git project that names no repository: no `git_url`, no owner or name.
+fn project_without_repository() -> projects::Model {
+    let mut project = project_row(None);
+    project.repo_owner = String::new();
+    project.repo_name = String::new();
+    project
+}
+
+#[test]
+fn a_project_clones_from_its_stored_url_first() {
+    let project = project_row(Some("  https://github.com/acme/api.git  "));
+    assert_eq!(
+        project_clone_url(&project),
+        ProjectCloneUrl::Stored("https://github.com/acme/api.git")
+    );
+}
+
+#[test]
+fn a_project_without_a_stored_url_clones_through_its_connection() {
+    for git_url in [None, Some(""), Some("   ")] {
+        let project = project_row(git_url);
+        assert_eq!(
+            project_clone_url(&project),
+            ProjectCloneUrl::FromConnection {
+                connection_id: 3,
+                owner: "acme",
+                name: "api",
+            },
+            "git_url {git_url:?}"
+        );
+    }
+}
+
+#[test]
+fn a_git_less_project_never_clones_through_its_connection() {
+    let mut manual = project_row(None);
+    manual.source_type = temps_entities::source_type::SourceType::Manual;
+    assert_eq!(project_clone_url(&manual), ProjectCloneUrl::None);
+}
+
+#[test]
+fn a_connection_token_clones_with_the_username_its_provider_expects() {
+    for (provider_type, username) in [
+        ("bitbucket", "x-token-auth"),
+        ("gitlab", "oauth2"),
+        ("github", "x-access-token"),
+        ("gitea", "x-access-token"),
+    ] {
+        assert_eq!(
+            connection_clone_credentials(provider_type, "repo-token".to_string()),
+            (username.to_string(), "repo-token".to_string()),
+            "{provider_type}"
+        );
+    }
+}
+
+#[test]
+fn a_project_without_a_url_or_a_connected_repository_has_nothing_to_clone() {
+    assert_eq!(
+        project_clone_url(&project_without_repository()),
+        ProjectCloneUrl::None
+    );
+
+    let mut no_connection = project_row(None);
+    no_connection.git_provider_connection_id = None;
+    assert_eq!(project_clone_url(&no_connection), ProjectCloneUrl::None);
+
+    let mut no_name = project_row(None);
+    no_name.repo_name = "  ".into();
+    assert_eq!(project_clone_url(&no_name), ProjectCloneUrl::None);
+}
+
+#[tokio::test]
+async fn source_from_project_without_a_connection_or_url_still_fails_closed() {
+    let data_root = unique_data_root("project-no-connection");
+    let mut project = project_row(None);
+    project.git_provider_connection_id = None;
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![project]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let err = service
+        .source_from_project(12)
+        .await
+        .expect_err("a public-repo project with no git_url has nothing to clone");
+
+    assert!(
+        matches!(err, SandboxError::ProjectHasNoRepo { project_id: 12, .. }),
+        "{err:?}"
+    );
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+const TEST_ENCRYPTION_KEY: &str =
+    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+/// A PAT GitHub provider whose API is `api_url`, so the git provider
+/// manager's lookups run against a local mock server.
+fn github_provider_at(api_url: &str) -> temps_entities::git_providers::Model {
+    let mut provider = git_provider("github", Some("https://github.com"));
+    provider.id = 7;
+    provider.api_url = Some(api_url.to_string());
+    provider.auth_config = serde_json::to_value(
+        temps_git::services::git_provider::AuthMethod::PersonalAccessToken {
+            token: "unused-constructor-token".into(),
+        },
+    )
+    .expect("auth method serializes");
+    provider
+}
+
+/// Connection 3 on provider 7, holding `token` encrypted with the test key.
+fn git_connection(
+    user_id: Option<i32>,
+    token: &str,
+) -> temps_entities::git_provider_connections::Model {
+    let now = Utc::now();
+    let encryption =
+        temps_core::EncryptionService::new(TEST_ENCRYPTION_KEY).expect("test encryption key");
+    temps_entities::git_provider_connections::Model {
+        id: 3,
+        provider_id: 7,
+        user_id,
+        account_name: "example-org".into(),
+        account_type: "Organization".into(),
+        access_token: Some(encryption.encrypt_string(token).expect("token encrypts")),
+        refresh_token: None,
+        token_expires_at: None,
+        refresh_token_expires_at: None,
+        installation_id: None,
+        metadata: None,
+        is_active: true,
+        is_expired: false,
+        syncing: false,
+        last_synced_at: None,
+        synced_repository_count: 0,
+        health_status: "healthy".into(),
+        health_message: None,
+        last_health_check_at: None,
+        consecutive_health_failures: 0,
+        last_sync_error: None,
+        last_sync_error_at: None,
+        credential_generation: 0,
+        token_refresh_lease_id: None,
+        token_refresh_lease_expires_at: None,
+        created_at: now,
+        updated_at: now,
+    }
+}
+
+fn github_repository_body(clone_url: &str) -> String {
+    serde_json::json!({
+        "id": 1,
+        "name": "api",
+        "full_name": "acme/api",
+        "owner": { "login": "acme" },
+        "description": null,
+        "private": true,
+        "default_branch": "main",
+        "clone_url": clone_url,
+        "ssh_url": "git@github.com:acme/api.git",
+        "html_url": "https://github.com/acme/api",
+        "language": null,
+        "size": 0,
+        "stargazers_count": 0,
+        "forks_count": 0,
+        "created_at": "2026-01-01T00:00:00Z",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "pushed_at": null
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn source_from_project_derives_the_clone_url_the_provider_reports_for_its_repository() {
+    // An older Git project: no stored git_url, but its owner, name and
+    // connection are set. A deployment of it clones the URL the provider
+    // reports for that repository, and so does its sandbox.
+    let mut server = mockito::Server::new_async().await;
+    let repository = server
+        .mock("GET", "/repos/acme/api")
+        .match_header("authorization", "Bearer connection-token")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(github_repository_body("https://github.com/acme/api.git"))
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let connection = git_connection(None, "connection-token");
+    let data_root = unique_data_root("project-derived-url");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![project_row(None)]])
+        // repository_clone_url: the connection, the provider it builds the
+        // service from, then the token check's connection and provider.
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let seed = service
+        .source_from_project(12)
+        .await
+        .expect("a project naming its repository and connection has a source")
+        .expect("a Git project has a seed source");
+
+    match &seed.source {
+        SandboxSource::Git {
+            url,
+            revision,
+            git_connection_id,
+            ..
+        } => {
+            assert_eq!(url, "https://github.com/acme/api.git");
+            assert_eq!(revision.as_deref(), Some("main"));
+            assert_eq!(*git_connection_id, Some(3));
+        }
+        other => panic!("expected a git source, got {other:?}"),
+    }
+    assert_eq!(
+        seed.repository,
+        ProjectRepositoryGrant::for_project(&project_row(None), "https://github.com/acme/api.git")
+    );
+    assert!(seed.repository.is_some());
+    repository.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[tokio::test]
+async fn source_from_project_reports_which_repository_its_connection_could_not_find() {
+    let mut server = mockito::Server::new_async().await;
+    let repository = server
+        .mock("GET", "/repos/acme/api")
+        .with_status(404)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"message":"Not Found"}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let connection = git_connection(None, "connection-token");
+    let data_root = unique_data_root("project-derived-url-missing");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![project_row(None)]])
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let err = service
+        .source_from_project(12)
+        .await
+        .expect_err("a repository the connection cannot read has no clone URL");
+
+    match err {
+        SandboxError::ProjectRepositoryUnresolved {
+            project_id,
+            connection_id,
+            ref repository,
+            ..
+        } => {
+            assert_eq!(project_id, 12);
+            assert_eq!(connection_id, 3);
+            assert_eq!(repository, "acme/api");
+        }
+        other => panic!("expected ProjectRepositoryUnresolved, got {other:?}"),
+    }
+    repository.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// `GET /v1/sandboxes/creations/{id}` reads the creation record back, so a
+/// failed project seed must record the caller-safe text there, as the 502
+/// does, never the provider's error about a connection the caller may not own.
+#[tokio::test]
+async fn a_failed_project_seed_keeps_the_providers_error_out_of_the_creation_record() {
+    let mut server = mockito::Server::new_async().await;
+    let repository = server
+        .mock("GET", "/repos/acme/api")
+        .with_status(404)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"message":"Not Found"}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let connection = git_connection(None, "connection-token");
+    let data_root = unique_data_root("project-seed-progress");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![project_row(None)]])
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let creation_id = "project-seed-progress-1";
+    let err = service
+        .create_sandbox(
+            1,
+            CreateSandboxRequest {
+                project_id: Some(12),
+                creation_id: Some(creation_id.to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("a repository the connection cannot read fails the create");
+    let SandboxError::ProjectRepositoryUnresolved { ref reason, .. } = err else {
+        panic!("expected ProjectRepositoryUnresolved, got {err:?}");
+    };
+    assert!(!reason.is_empty(), "the error itself keeps the diagnostic");
+
+    let creation = service
+        .creations
+        .get(1, creation_id)
+        .expect("the failed create keeps its record");
+    let recorded = creation.error.expect("a failed create records its error");
+    assert_eq!(recorded, err.caller_detail());
+    assert!(!recorded.contains(reason.as_str()), "{recorded}");
+    let failed_step = creation
+        .steps
+        .iter()
+        .find_map(|step| step.error.as_deref())
+        .expect("the failed step records its error");
+    assert_eq!(failed_step, recorded);
+    repository.assert_async().await;
     let _ = std::fs::remove_dir_all(&data_root);
 }
 
@@ -1944,6 +2299,426 @@ fn stored_git_credentials_are_bound_to_the_provider_origin() {
         &enterprise
     )
     .is_err());
+}
+
+fn project_grant(git_url: &str) -> ProjectRepositoryGrant {
+    ProjectRepositoryGrant::for_project(&project_row(Some(git_url)), git_url)
+        .expect("a project with a repository and a connection has a grant")
+}
+
+const PROJECT_URL: &str = "https://github.com/acme/api.git";
+
+#[test]
+fn a_project_seed_may_use_the_projects_connection_without_owning_it() {
+    let github = git_provider("github", None);
+    let grant = project_grant(PROJECT_URL);
+
+    // An organization-level connection (a GitHub App installation) has no
+    // owner; a teammate's connection belongs to someone else.
+    for connection_owner in [None, Some(99)] {
+        assert_eq!(
+            authorize_seed_connection(1, 3, connection_owner, PROJECT_URL, &github, Some(&grant))
+                .expect("the project's own repository through its own connection"),
+            SeedConnectionAuthority::ProjectRepository,
+            "connection owner {connection_owner:?}"
+        );
+    }
+}
+
+#[test]
+fn an_explicit_connection_must_still_belong_to_the_caller() {
+    let github = git_provider("github", None);
+
+    for connection_owner in [None, Some(99)] {
+        let err = authorize_seed_connection(1, 3, connection_owner, PROJECT_URL, &github, None)
+            .expect_err("an explicit git_connection_id the caller does not own");
+        assert!(
+            err.to_string()
+                .contains("Git connection 3 is not owned by the requesting user"),
+            "{err}"
+        );
+    }
+    assert_eq!(
+        authorize_seed_connection(1, 3, Some(1), PROJECT_URL, &github, None)
+            .expect("the caller's own connection"),
+        SeedConnectionAuthority::CallerOwned
+    );
+}
+
+#[tokio::test]
+async fn an_explicit_unowned_connection_is_refused_before_its_token_is_read() {
+    let data_root = unique_data_root("explicit-unowned-connection");
+    // Only the connection is queued: refusing it must not reach the provider
+    // or the token.
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![git_connection(None, "org-token")]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let err = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, None)
+        .await
+        .expect_err("an organization-level connection passed explicitly");
+
+    assert!(
+        err.to_string()
+            .contains("Git connection 3 is not owned by the requesting user"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[tokio::test]
+async fn a_project_seed_resolves_the_token_of_an_organization_level_connection() {
+    let mut server = mockito::Server::new_async().await;
+    let token_check = server
+        .mock("GET", "/rate_limit")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let connection = git_connection(None, "org-token");
+    let data_root = unique_data_root("project-org-connection");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        // The connection and its provider for authorization, then
+        // get_connection_token's connection, provider and provider service.
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![connection]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let (username, password) = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect("the project's repository through the project's connection");
+
+    assert_eq!(username, "x-access-token");
+    assert_eq!(password, "org-token");
+    token_check.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// Minting the read-only token goes through a connection the caller may not
+/// own (an organization's), so a failure names the repository and the
+/// connection, never the provider's own error.
+#[tokio::test]
+async fn a_failed_scoped_token_mint_keeps_the_providers_error_from_the_caller() {
+    let server = mockito::Server::new_async().await;
+    let provider = github_provider_at(&server.url());
+    let mut connection = git_connection(None, "org-token");
+    // Not a number: the provider refuses it before any request, with its own
+    // error text, which must not reach the caller.
+    connection.installation_id = Some("installation-detail-77".into());
+    let data_root = unique_data_root("project-scoped-mint-fails");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        // The connection and its provider for authorization, the mint's
+        // provider service, then the unchanged connection after the mint.
+        .append_query_results([vec![connection.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider]])
+        .append_query_results([vec![connection]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let err = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect_err("an installation that cannot mint a token");
+
+    let detail = err.caller_detail();
+    assert!(
+        detail.contains("could not mint a read-only token for acme/api through git connection 3"),
+        "{detail}"
+    );
+    assert!(!detail.contains("installation-detail-77"), "{detail}");
+    assert!(!detail.contains("Invalid installation_id"), "{detail}");
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// The GitHub App installation behind a project's connection, as the seed
+/// reads it before minting (it cannot mint offline: the installation id is
+/// refused before any request).
+fn installation_connection() -> temps_entities::git_provider_connections::Model {
+    let mut connection = git_connection(None, "stale-installation-token");
+    connection.installation_id = Some("installation-detail-77".into());
+    connection
+}
+
+/// A PAT replaced the installation while the read-only token was minted: the
+/// seed drops whatever the mint produced and clones with the replacement.
+#[tokio::test]
+async fn a_seed_uses_the_replacement_pat_when_the_grant_changes_during_the_mint() {
+    let mut server = mockito::Server::new_async().await;
+    let token_check = server
+        .mock("GET", "/rate_limit")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+        .create_async()
+        .await;
+    let provider = github_provider_at(&server.url());
+    let authorized = installation_connection();
+    let mut replaced = git_connection(None, "replacement-pat");
+    replaced.credential_generation = authorized.credential_generation + 1;
+    let data_root = unique_data_root("project-grant-replaced-during-mint");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        // First read: the installation, its provider, the mint's provider
+        // service, then the row the PAT replacement left.
+        .append_query_results([vec![authorized]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![replaced.clone()]])
+        // Second read: the replacement and its provider, then
+        // get_connection_token's connection and provider.
+        .append_query_results([vec![replaced.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![replaced]])
+        .append_query_results([vec![provider]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let (username, password) = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect("the replacement's credentials");
+
+    assert_eq!(username, "x-access-token");
+    assert_eq!(password, "replacement-pat");
+    token_check.assert_async().await;
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+/// A grant that changes on every read is not chased forever, and no token
+/// from any of the mints reaches the clone.
+#[tokio::test]
+async fn a_seed_gives_up_when_the_grant_keeps_changing_during_the_mint() {
+    let server = mockito::Server::new_async().await;
+    let provider = github_provider_at(&server.url());
+    let first = installation_connection();
+    let mut second = installation_connection();
+    second.credential_generation = first.credential_generation + 1;
+    let mut third = installation_connection();
+    third.credential_generation = first.credential_generation + 2;
+    let data_root = unique_data_root("project-grant-keeps-changing");
+    let db = MockDatabase::new(DatabaseBackend::Postgres)
+        .append_query_results([vec![first]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![provider.clone()]])
+        .append_query_results([vec![second.clone()]])
+        // The provider service is cached from the first mint.
+        .append_query_results([vec![second]])
+        .append_query_results([vec![provider]])
+        .append_query_results([vec![third]])
+        .into_connection();
+
+    let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+    let grant = project_grant(PROJECT_URL);
+    let err = service
+        .resolve_connection_creds(1, 3, PROJECT_URL, Some(&grant))
+        .await
+        .expect_err("a grant that never settles");
+
+    let detail = err.caller_detail();
+    assert!(
+        detail.contains("git connection 3 changed its credentials 2 times"),
+        "{detail}"
+    );
+    assert!(!detail.contains("stale-installation-token"), "{detail}");
+    let _ = std::fs::remove_dir_all(&data_root);
+}
+
+#[test]
+fn a_project_seed_is_refused_for_any_repository_but_the_projects() {
+    let github = git_provider("github", None);
+    let grant = project_grant(PROJECT_URL);
+
+    // A URL other than the one derived from the project.
+    for url in [
+        "https://github.com/acme/other.git",
+        "https://github.com/evil/api.git",
+        "https://github.com/acme/api.git?ref=x",
+    ] {
+        let err = authorize_seed_connection(1, 3, None, url, &github, Some(&grant))
+            .expect_err("a URL that is not the project's");
+        assert!(
+            err.to_string()
+                .contains("only from its repository acme/api"),
+            "{url}: {err}"
+        );
+    }
+
+    // The project's URL itself must name its repository: a git_url pointing
+    // at another repository gets no project grant authority.
+    let elsewhere = project_grant("https://github.com/acme/other.git");
+    assert!(authorize_seed_connection(
+        1,
+        3,
+        None,
+        "https://github.com/acme/other.git",
+        &github,
+        Some(&elsewhere)
+    )
+    .is_err());
+
+    // Another connection than the project's.
+    let err = authorize_seed_connection(1, 4, None, PROJECT_URL, &github, Some(&grant))
+        .expect_err("a connection that is not the project's");
+    assert!(
+        err.to_string()
+            .contains("Git connection 4 is not the connection of project 12"),
+        "{err}"
+    );
+
+    // The provider origin is still enforced.
+    let enterprise = git_provider("github", Some("https://git.example.test"));
+    assert!(authorize_seed_connection(1, 3, None, PROJECT_URL, &enterprise, Some(&grant)).is_err());
+
+    // A caller who owns the connection keeps today's rule.
+    assert_eq!(
+        authorize_seed_connection(
+            1,
+            3,
+            Some(1),
+            "https://github.com/acme/other.git",
+            &github,
+            Some(&grant)
+        )
+        .expect("an owned connection"),
+        SeedConnectionAuthority::CallerOwned
+    );
+}
+
+#[test]
+fn a_project_repository_is_matched_beneath_the_providers_base_path() {
+    let github = git_provider("github", None);
+    for url in [
+        "https://github.com/acme/api.git",
+        "https://github.com/acme/api",
+        "https://github.com/Acme/API.git",
+        "https://github.com/acme/api/",
+    ] {
+        assert!(
+            clone_url_names_repository(url, &github, "acme", "api"),
+            "{url}"
+        );
+    }
+    for url in [
+        "https://github.com/acme/api.git/extra",
+        "https://github.com/acme/apix.git",
+        "https://github.com/other/acme/api.git",
+        "not a url",
+    ] {
+        assert!(
+            !clone_url_names_repository(url, &github, "acme", "api"),
+            "{url}"
+        );
+    }
+
+    // A self-hosted GitLab served under a path, with a nested group.
+    let gitlab = git_provider("gitlab", Some("https://git.example.test/gitlab"));
+    assert!(clone_url_names_repository(
+        "https://git.example.test/gitlab/acme/platform/api.git",
+        &gitlab,
+        "acme/platform",
+        "api"
+    ));
+    assert!(!clone_url_names_repository(
+        "https://git.example.test/elsewhere/acme/platform/api.git",
+        &gitlab,
+        "acme/platform",
+        "api"
+    ));
+}
+
+#[tokio::test]
+async fn a_credentialed_clone_leaves_no_token_behind() {
+    const TOKEN: &str = "seed-token-must-not-persist";
+    let data_root = unique_data_root("clone-token-cleanup");
+    let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+    let provider = FakeProvider::new();
+    let execs = provider.execs.clone();
+    let (service, _) = build_service(db, provider, data_root.clone());
+
+    service
+        .run_git_clone(
+            &handle_for("seed"),
+            7,
+            "/workspace",
+            "/workspace",
+            PROJECT_URL,
+            Some("main"),
+            None,
+            Some(("x-access-token".to_string(), TOKEN.to_string())),
+            false,
+            None,
+        )
+        .await
+        .expect("the fake provider runs the clone");
+
+    let execs = execs.lock().unwrap().clone();
+    assert_eq!(execs.len(), 2, "prepare the target, then import: {execs:?}");
+    let (prepare_cmd, prepare_env) = &execs[0];
+    assert!(prepare_cmd.iter().all(|arg| !arg.contains(TOKEN)));
+    assert!(prepare_env.values().all(|value| !value.contains(TOKEN)));
+
+    let (import_cmd, import_env) = &execs[1];
+    let script = import_cmd.join(" ");
+    // The token reaches the one privileged import exec through its
+    // environment only: never argv, never the script, never the URL.
+    assert!(!script.contains(TOKEN));
+    assert_eq!(import_env.get("GIT_PASS").map(String::as_str), Some(TOKEN));
+    assert_eq!(
+        import_env.iter().filter(|(_, v)| v.contains(TOKEN)).count(),
+        1,
+        "only GIT_PASS carries the token"
+    );
+    // The remote Git records in .git/config is the bare URL, and no
+    // credential helper can store what askpass answered.
+    assert!(script.contains(&format!(" {PROJECT_URL} ")));
+    assert!(!script.contains("@github.com"));
+    assert!(script.matches("credential.helper= ").count() >= 2);
+
+    // Every git invocation runs under `env -i` with no credential variable,
+    // and the import shell drops them once the askpass files exist, before
+    // the clone, the quota monitor or the copy can inherit them.
+    let auth_dir = "/run/secrets/.temps-source-auth-7";
+    let git_environment = clean_git_environment(auth_dir, Some(&format!("{auth_dir}/askpass.sh")));
+    assert!(!git_environment.contains("GIT_PASS"));
+    let git_invocations = script.matches("git -").count();
+    assert!(git_invocations >= 3, "{script}");
+    assert_eq!(
+        script.matches(&format!("{git_environment} git -")).count(),
+        git_invocations
+    );
+    let written = script
+        .find("> /run/secrets/.temps-source-auth-7/password;")
+        .expect("the password file is written");
+    let unset = script
+        .find("unset GIT_USER GIT_PASS;")
+        .expect("the credential variables are unset");
+    let clone = script.find(" clone --depth").expect("the clone runs");
+    assert!(written < unset && unset < clone, "{script}");
+
+    // The askpass shim and both credential files live in a tmpfs outside
+    // the workspace, and an EXIT trap set before they are written shreds
+    // them on success and failure alike.
+    assert!(!auth_dir.starts_with("/workspace"));
+    let trap = script
+        .find(&format!(
+            "trap 'find {auth_dir} -type f -exec shred -u {{}} \\; 2>/dev/null || true; find {auth_dir} -depth -delete"
+        ))
+        .expect("an EXIT trap removes the credential directory");
+    assert!(trap < written, "{script}");
+    assert!(script.contains("' EXIT;"));
+    let _ = std::fs::remove_dir_all(&data_root);
 }
 
 #[tokio::test]

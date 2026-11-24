@@ -254,7 +254,17 @@ pub(crate) async fn revoked_link_projects(
     linked: &[LinkedService],
     checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<Vec<i32>, String> {
-    let projects = connected_project_ids(linked);
+    unreachable_projects(auth, connected_project_ids(linked), checker).await
+}
+
+/// The projects among `projects` that `auth` cannot reach, by the rules of
+/// `project_scope_guard!` and `project_access_guard!` (see
+/// [`revoked_link_projects`]). A failed check is an `Err`.
+pub(crate) async fn unreachable_projects(
+    auth: &AuthContext,
+    projects: Vec<i32>,
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<Vec<i32>, String> {
     let mut revoked: Vec<i32> = projects
         .iter()
         .copied()
@@ -1215,7 +1225,9 @@ impl SandboxLinkService {
                     );
                     return Err(SandboxLinkError::Sandbox {
                         conversation_id: target.public_id.clone(),
-                        reason: format!("could not create a sandbox: {error}"),
+                        // `caller_detail` keeps a provider's error about a
+                        // connection the user may not own in the log above.
+                        reason: format!("could not create a sandbox: {}", error.caller_detail()),
                     });
                 }
             };
@@ -2272,14 +2284,10 @@ impl SandboxLinkService {
             );
             return refusal;
         }
-        if project_for_new_sandbox(&conversation).is_some()
-            && !auth.has_permission(&Permission::GitRepositoriesRead)
+        if let Some(refusal) =
+            project_seed_refusal(auth, &conversation, self.project_access.as_ref()).await
         {
-            return format!(
-                "`{SANDBOX_CREATE_TOOL}` is not available: cloning the project's repository \
-                 needs the {} permission.",
-                Permission::GitRepositoriesRead
-            );
+            return refusal;
         }
         if let Some(link) = link_from_metadata(conversation.metadata.as_ref()) {
             return format!(
@@ -2783,6 +2791,53 @@ impl SandboxLinkService {
             }
         }
         placed
+    }
+}
+
+/// Why the assistant may not create a sandbox seeded from this chat's
+/// project, if it may not.
+///
+/// The seed clones the project's repository with the project's git
+/// connection, which need not belong to the user. So the tool path applies the
+/// gates the HTTP path does (`sandbox_link_handlers.rs`): `GitRepositoriesRead`,
+/// then the project scope and project access checks. A chat that is not about a
+/// project seeds nothing and passes.
+pub(crate) async fn project_seed_refusal(
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+    checker: Option<&Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Option<String> {
+    let project_id = project_for_new_sandbox(conversation)?;
+    if !auth.has_permission(&Permission::GitRepositoriesRead) {
+        return Some(format!(
+            "`{SANDBOX_CREATE_TOOL}` is not available: cloning the project's repository \
+             needs the {} permission.",
+            Permission::GitRepositoriesRead
+        ));
+    }
+    match unreachable_projects(auth, vec![project_id], checker).await {
+        Ok(denied) if denied.is_empty() => None,
+        Ok(_) => {
+            info!(
+                conversation_id = conversation.id,
+                project_id, "refused a project sandbox to a user who cannot reach the project"
+            );
+            Some(format!(
+                "`{SANDBOX_CREATE_TOOL}` is not available: you do not have access to project \
+                 {project_id}, so its repository cannot be cloned. Tell the user, and carry on \
+                 without a shell."
+            ))
+        }
+        Err(error) => {
+            warn!(
+                conversation_id = conversation.id,
+                project_id, "could not check access to the chat's project: {error}"
+            );
+            Some(format!(
+                "`{SANDBOX_CREATE_TOOL}` failed: access to project {project_id} could not be \
+                 checked: {error}"
+            ))
+        }
     }
 }
 
@@ -3403,6 +3458,89 @@ mod tests {
             turn_started_at: None,
             next_step_suggestions: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_project_chat_seed_needs_access_to_the_project() {
+        let project_chat = conversation(PROJECT_CONTEXT_TYPE, Some(3));
+        let member = member_session(temps_auth::permissions::Role::User);
+
+        assert_eq!(
+            project_seed_refusal(&member, &project_chat, Some(&membership(&[3]))).await,
+            None
+        );
+
+        let refusal = project_seed_refusal(&member, &project_chat, Some(&membership(&[5])))
+            .await
+            .expect("a user outside the project may not clone its repository");
+        assert!(refusal.contains("access to project 3"), "{refusal}");
+
+        let failing: Arc<dyn temps_core::ProjectAccessChecker> = Arc::new(Membership {
+            allowed: vec![3],
+            fail: true,
+        });
+        let refusal = project_seed_refusal(&member, &project_chat, Some(&failing))
+            .await
+            .expect("an unanswered access check clones nothing");
+        assert!(refusal.contains("could not be checked"), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_project_chat_seed_respects_the_credentials_project_scope() {
+        let project_chat = conversation(PROJECT_CONTEXT_TYPE, Some(3));
+        let scoped_elsewhere = AuthContext::new_api_key(
+            member_session(temps_auth::permissions::Role::User)
+                .user
+                .expect("a session has a user"),
+            Some(temps_auth::permissions::Role::User),
+            None,
+            "scoped".to_string(),
+            1,
+        )
+        .with_api_key_scope(Some(temps_auth::context::ApiKeyScope {
+            project_id: 5,
+            environment_id: None,
+        }));
+
+        let refusal = project_seed_refusal(&scoped_elsewhere, &project_chat, None)
+            .await
+            .expect("a key scoped to another project may not clone this one");
+        assert!(refusal.contains("access to project 3"), "{refusal}");
+    }
+
+    #[tokio::test]
+    async fn a_project_chat_seed_needs_repository_read_and_other_chats_seed_nothing() {
+        let reader = member_session(temps_auth::permissions::Role::User);
+        assert!(reader.has_permission(&Permission::GitRepositoriesRead));
+        let no_repository_read = AuthContext::new_api_key(
+            reader.user.clone().expect("a session has a user"),
+            None,
+            Some(vec![Permission::SandboxesExec, Permission::SandboxesWrite]),
+            "sandboxes only".to_string(),
+            2,
+        );
+
+        let refusal = project_seed_refusal(
+            &no_repository_read,
+            &conversation(PROJECT_CONTEXT_TYPE, Some(3)),
+            None,
+        )
+        .await
+        .expect("cloning the repository needs repository read");
+        assert!(
+            refusal.contains(&Permission::GitRepositoriesRead.to_string()),
+            "{refusal}"
+        );
+
+        assert_eq!(
+            project_seed_refusal(
+                &no_repository_read,
+                &conversation("assistant", None),
+                Some(&membership(&[]))
+            )
+            .await,
+            None
+        );
     }
 
     #[test]

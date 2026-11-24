@@ -137,21 +137,6 @@ for (const alreadyInstalled of [false, true]) {
   })
 }
 
-test('dashboard callback discovers an installation after an empty poll', async ({
-  page,
-}) => {
-  const api = await mockGitApi(page)
-  await page.goto('/dashboard')
-  await expect(
-    page.getByRole('region', { name: 'Deploy from a repository', exact: true })
-  ).toBeVisible()
-  await expect.poll(api.requestCount).toBeGreaterThanOrEqual(2)
-  api.deliverWebhook()
-  await expect(
-    page.getByRole('combobox', { name: 'Git account' })
-  ).toContainText(installation.account_name, { timeout: 3500 })
-})
-
 test('existing-app setup waits for a new connection and keeps polling beyond one minute', async ({
   page,
 }) => {

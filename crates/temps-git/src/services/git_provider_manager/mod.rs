@@ -98,8 +98,10 @@ impl GitProviderManager {
         self.db.as_ref()
     }
 
-    /// HTTPS clone username for a stored provider type.
-    fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
+    /// HTTPS clone username for a stored provider type: what the deploy
+    /// pipeline pairs with a connection's token, and what any other clone with
+    /// that token must send too.
+    pub fn clone_username_for_provider_type(provider_type: &str) -> &'static str {
         match provider_type {
             "gitlab" => "oauth2",
             "bitbucket" => "x-token-auth",

@@ -45,8 +45,11 @@ test('analytics setup redirects after the first event is detected', async ({
   page,
 }) => {
   const project = await firstProject(page)
+  // No events until listening starts, then the first one arrives. (A project
+  // that already had events waits for a new one instead.)
+  let firstEventSent = false
   await page.route(/\/has-events(?:\?|$)/, (route) =>
-    route.fulfill({ json: { has_events: true } })
+    route.fulfill({ json: { has_events: firstEventSent } })
   )
 
   await page.goto(`/projects/${project.slug}/analytics/setup`)
@@ -54,6 +57,7 @@ test('analytics setup redirects after the first event is detected', async ({
   await page
     .getByRole('button', { name: "I've installed it — start listening" })
     .click()
+  firstEventSent = true
 
   await expect(
     page.getByRole('heading', { name: 'First event received' })

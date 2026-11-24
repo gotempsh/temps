@@ -14,16 +14,13 @@ import {
 } from '../fixtures'
 
 /**
- * The projects list after the rename: a "Project" groups services, a
- * "Service" is what used to be called a project. Covers the one-time notice
- * that explains the rename, and which empty state an install with no
- * services gets. Route-mocked, so it never touches real backend state.
+ * The projects list: a "Project" groups services. Covers which empty state
+ * an install with no services gets, and where grouped services appear.
+ * Route-mocked, so it never touches real backend state.
  */
 
-const RENAME_NOTICE = 'Your apps are now called Services.'
 // The first-run empty state is a labelled landmark rather than a headline.
-const ONBOARDING_REGION = 'Get started with services'
-const RENAME_NOTICE_KEY = 'temps.servicesRenameNoticeDismissed'
+const ONBOARDING_REGION = 'Get started with Temps'
 
 /**
  * Mocks the two list endpoints `/projects` reads and records every services
@@ -55,50 +52,6 @@ function collectPageErrors(page: Page): string[] {
   page.on('pageerror', (error) => errors.push(error.message))
   return errors
 }
-
-test.describe('services rename notice', () => {
-  test('shows with a service and stays dismissed across reloads', async ({
-    page,
-  }) => {
-    const errors = collectPageErrors(page)
-    await mockList(page, {
-      services: [serviceFixture(910001, 'Billing API')],
-      groups: [],
-    })
-    await page.goto('/projects')
-    await expect(page.getByRole('link', { name: /Billing API/ })).toBeVisible()
-    await expect(page.getByText(RENAME_NOTICE)).toBeVisible()
-    // The notice points at what replaces the old meaning of "project".
-    await expect(
-      page.getByRole('button', { name: 'Create a project' }).first()
-    ).toBeVisible()
-
-    await page.getByRole('button', { name: 'Dismiss this notice' }).click()
-    await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)
-    expect(
-      await page.evaluate(
-        (key) => window.localStorage.getItem(key),
-        RENAME_NOTICE_KEY
-      )
-    ).toBe('1')
-
-    await page.reload()
-    await expect(page.getByRole('link', { name: /Billing API/ })).toBeVisible()
-    await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)
-    expect(errors).toEqual([])
-  })
-
-  test('does not show on an install with no services', async ({ page }) => {
-    const errors = collectPageErrors(page)
-    await mockList(page, { services: [], groups: [] })
-    await page.goto('/projects')
-    await expect(
-      page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
-    ).toBeVisible()
-    await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)
-    expect(errors).toEqual([])
-  })
-})
 
 test.describe('empty states', () => {
   test('an empty install gets first-run onboarding', async ({ page }) => {
@@ -177,8 +130,6 @@ test.describe('empty states', () => {
     await expect(
       page.getByRole('region', { name: ONBOARDING_REGION, exact: true })
     ).toHaveCount(0)
-    // No services, so nothing was renamed for this user.
-    await expect(page.getByText(RENAME_NOTICE)).toHaveCount(0)
     // With a group present, only the services outside it are asked for.
     await expect
       .poll(() =>
@@ -213,7 +164,6 @@ test.describe('empty states', () => {
     // also as a card of its own.
     await expect(main.locator('a[href="/projects/storefront"]')).toHaveCount(1)
     await expect(main.locator('a[href="/projects/billing-api"]')).toHaveCount(1)
-    await expect(page.getByText(RENAME_NOTICE)).toBeVisible()
     expect(errors).toEqual([])
   })
 })
