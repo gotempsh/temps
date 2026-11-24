@@ -41970,6 +41970,12 @@ export type UsageSummary = {
 export type UserResponse = {
     avatar_url: string;
     email?: string | null;
+    /**
+     * Whether something trusted vouched for `email` (an administrator, the
+     * identity provider, or the user clicking the emailed link). SSO sign-in
+     * is only linked onto an account whose address is verified.
+     */
+    email_verified: boolean;
     id: number;
     mfa_enabled: boolean;
     name: string;
@@ -42182,6 +42188,17 @@ export type VaultLinkResponse = {
     revoked_at?: string | null;
     sandbox_id?: string | null;
     vault_id: string;
+};
+
+/**
+ * Response of `POST /auth/resend-verification`.
+ */
+export type VerificationEmailSentResponse = {
+    /**
+     * Address the verification link was sent to.
+     */
+    email: string;
+    message: string;
 };
 
 /**
@@ -54170,6 +54187,49 @@ export type ResetPasswordResponses = {
 
 export type ResetPasswordResponse = ResetPasswordResponses[keyof ResetPasswordResponses];
 
+export type ResendEmailVerificationData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/auth/resend-verification';
+};
+
+export type ResendEmailVerificationErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Only a user account can verify an email address
+     */
+    403: unknown;
+    /**
+     * No email provider is configured, or the address is already verified
+     */
+    409: unknown;
+    /**
+     * A verification email was sent recently, or too many requests
+     */
+    429: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * The email provider could not deliver the email
+     */
+    502: unknown;
+};
+
+export type ResendEmailVerificationResponses = {
+    /**
+     * Verification email sent
+     */
+    200: VerificationEmailSentResponse;
+};
+
+export type ResendEmailVerificationResponse = ResendEmailVerificationResponses[keyof ResendEmailVerificationResponses];
+
 export type VerifyStepUpData = {
     body: VerifyStepUpRequest;
     path?: never;
@@ -65257,7 +65317,7 @@ export type StartGithubManifestFlowErrors = {
 
 export type StartGithubManifestFlowResponses = {
     /**
-     * State issued
+     * State issued and bound to this browser
      */
     200: GithubManifestStartResponse;
 };
@@ -106614,6 +106674,50 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type MarkUserEmailVerifiedData = {
+    body?: never;
+    path: {
+        /**
+         * User ID
+         */
+        user_id: number;
+    };
+    query?: never;
+    url: '/users/{user_id}/verify-email';
+};
+
+export type MarkUserEmailVerifiedErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden - requires the users:manage permission
+     */
+    403: unknown;
+    /**
+     * User not found
+     */
+    404: unknown;
+    /**
+     * User is deleted
+     */
+    409: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type MarkUserEmailVerifiedResponses = {
+    /**
+     * Email address marked verified
+     */
+    200: RouteUserWithRoles;
+};
+
+export type MarkUserEmailVerifiedResponse = MarkUserEmailVerifiedResponses[keyof MarkUserEmailVerifiedResponses];
 
 export type GetFeatureMaturityData = {
     body?: never;

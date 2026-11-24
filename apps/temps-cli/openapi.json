@@ -90417,6 +90417,10 @@
               "null"
             ]
           },
+          "email_verified": {
+            "description": "Whether something trusted vouched for `email` (an administrator, the\nidentity provider, or the user clicking the emailed link). SSO sign-in\nis only linked onto an account whose address is verified.",
+            "type": "boolean"
+          },
           "id": {
             "format": "int32",
             "type": "integer"
@@ -90441,6 +90445,7 @@
           "name",
           "avatar_url",
           "mfa_enabled",
+          "email_verified",
           "role"
         ],
         "type": "object"
@@ -90882,6 +90887,23 @@
           "id",
           "vault_id",
           "created_at"
+        ],
+        "type": "object"
+      },
+      "VerificationEmailSentResponse": {
+        "description": "Response of `POST /auth/resend-verification`.",
+        "properties": {
+          "email": {
+            "description": "Address the verification link was sent to.",
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "email",
+          "message"
         ],
         "type": "object"
       },
@@ -113122,6 +113144,51 @@
         ]
       }
     },
+    "/auth/resend-verification": {
+      "post": {
+        "description": "Needs an email provider: without one the request is refused with a 409\nthat tells the user to ask an administrator, who can verify the address\nfrom the user's page. `GET /auth/email-status` reports up front whether a\nprovider is configured.",
+        "operationId": "resend_email_verification",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VerificationEmailSentResponse"
+                }
+              }
+            },
+            "description": "Verification email sent"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Only a user account can verify an email address"
+          },
+          "409": {
+            "description": "No email provider is configured, or the address is already verified"
+          },
+          "429": {
+            "description": "A verification email was sent recently, or too many requests"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "The email provider could not deliver the email"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Email a fresh verification link to the signed-in user's address.",
+        "tags": [
+          "Authentication"
+        ]
+      }
+    },
     "/auth/step-up": {
       "post": {
         "operationId": "verify_step_up",
@@ -130484,7 +130551,7 @@
     },
     "/git-providers/github/manifest/start": {
       "post": {
-        "description": "Issues the `state` the console sends to GitHub along with the manifest. The\ncallback GitHub redirects back to carries no session cookie (it is\n`SameSite=Strict`), so this state is what proves an operator started the\nflow. It works once and expires after 15 minutes.",
+        "description": "Issues the `state` the console sends to GitHub along with the manifest. The\ncallback GitHub redirects back to carries no session cookie (it is\n`SameSite=Strict`), so this state is what proves an operator started the\nflow. It works once and expires after 15 minutes. The response also sets\nan HttpOnly cookie that binds the state to this browser: the callback\nrefuses a state that arrives without it.",
         "operationId": "start_github_manifest_flow",
         "responses": {
           "200": {
@@ -130495,7 +130562,7 @@
                 }
               }
             },
-            "description": "State issued"
+            "description": "State issued and bound to this browser"
           },
           "401": {
             "description": "Unauthorized"
@@ -197741,6 +197808,60 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Users"
+        ]
+      }
+    },
+    "/users/{user_id}/verify-email": {
+      "post": {
+        "description": "For instances without an email provider, or a user who cannot receive the\nlink. SSO sign-in is only linked onto an existing account whose address is\nverified, so this is how an administrator vouches for an address.",
+        "operationId": "mark_user_email_verified",
+        "parameters": [
+          {
+            "description": "User ID",
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RouteUserWithRoles"
+                }
+              }
+            },
+            "description": "Email address marked verified"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden - requires the users:manage permission"
+          },
+          "404": {
+            "description": "User not found"
+          },
+          "409": {
+            "description": "User is deleted"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mark a user's email address as verified (admin only).",
         "tags": [
           "Users"
         ]
