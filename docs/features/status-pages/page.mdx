@@ -31,9 +31,11 @@ A status page is built from an allowlist, not by hiding fields from the internal
 - probe response bodies or error messages;
 - project or environment names;
 - database IDs of any kind;
-- incident titles and descriptions (an incident's heading is derived from its severity, e.g. "Partial outage");
+- an incident's internal title and description (visitors see the **Headline** you write for the incident, or, when you leave it empty, a heading based on its impact, such as "Partial outage");
 - incident updates you did not make public;
 - anything about monitors you did not select, or incidents tied only to them.
+
+Timing data is published. Each component shows its uptime percentage and average response time, and the JSON carries, for every day, the number of checks run, failed and degraded. To hide it, open the page's appearance settings and use **What to show**. Switching off **Uptime percentages** also removes the per-day check counts, because they would give the percentage away. Switching off **Response times** removes the average response times and the response-time chart. The colored bars are always shown.
 
 ---
 
