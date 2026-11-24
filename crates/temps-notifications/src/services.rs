@@ -890,13 +890,25 @@ impl ManagedNotificationSender for CloudService {
     }
 }
 
+/// Where [`NotificationService::send_notification_to`] gets its providers.
+enum ProviderSource {
+    /// The providers the notification routes resolve for its severity.
+    Routed,
+    /// Exactly these providers (tests drive the real store-and-deliver path
+    /// against a recording provider).
+    #[cfg(test)]
+    Fixed(Vec<Box<dyn NotificationProvider>>),
+}
+
 /// The only managed provider exposed by OSS. Cloud owns all concrete sinks.
 pub struct TempsCloudProvider {
     cloud: Arc<dyn ManagedNotificationSender>,
 }
 
 fn bound_cloud_text(value: &str, max_chars: usize) -> String {
-    let redacted = redact_sensitive_text(value.trim());
+    // Already masked once in `send_notification`; masking is idempotent, and
+    // this keeps the Cloud payload safe on any path that reaches it directly.
+    let redacted = crate::redaction::redact_sensitive_text(value.trim());
     if redacted.chars().count() <= max_chars {
         return redacted;
     }
@@ -904,134 +916,6 @@ fn bound_cloud_text(value: &str, max_chars: usize) -> String {
     let mut bounded: String = redacted.chars().take(max_chars.saturating_sub(1)).collect();
     bounded.push('…');
     bounded
-}
-
-fn redact_sensitive_text(value: &str) -> String {
-    let value = redact_url_credentials(value);
-    let value = redact_secret_prefixes(&value);
-    redact_key_value_secrets(&value)
-}
-
-fn redact_url_credentials(value: &str) -> String {
-    let mut output = String::with_capacity(value.len());
-    let mut remaining = value;
-    while let Some(scheme_index) = remaining.find("://") {
-        let credential_start = scheme_index + 3;
-        let tail = &remaining[credential_start..];
-        let boundary = tail
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, '/' | '?' | '#')
-            })
-            .unwrap_or(tail.len());
-        let Some(at_index) = tail[..boundary].find('@') else {
-            output.push_str(&remaining[..credential_start]);
-            remaining = tail;
-            continue;
-        };
-        output.push_str(&remaining[..credential_start]);
-        output.push_str("[redacted]@");
-        remaining = &tail[at_index + 1..];
-    }
-    output.push_str(remaining);
-    output
-}
-
-fn redact_secret_prefixes(value: &str) -> String {
-    const PREFIXES: &[&str] = &[
-        "bearer ", "sk-ant-", "sk-", "ghp_", "gho_", "glpat-", "xoxb-", "xoxp-",
-    ];
-    let lowercase = value.to_ascii_lowercase();
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0;
-    while cursor < value.len() {
-        let earliest = PREFIXES
-            .iter()
-            .filter_map(|prefix| {
-                lowercase[cursor..]
-                    .find(prefix)
-                    .map(|index| (cursor + index, prefix.len()))
-            })
-            .min_by_key(|(start, _)| *start);
-        let Some((start, prefix_len)) = earliest else {
-            output.push_str(&value[cursor..]);
-            break;
-        };
-        output.push_str(&value[cursor..start]);
-        output.push_str("[redacted]");
-        let token_start = start + prefix_len;
-        let end = value[token_start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
-            })
-            .map_or(value.len(), |offset| token_start + offset);
-        cursor = end.max(token_start);
-    }
-    output
-}
-
-fn redact_key_value_secrets(value: &str) -> String {
-    const KEYS: &[&str] = &[
-        "api_key",
-        "apikey",
-        "authorization",
-        "password",
-        "passwd",
-        "secret",
-        "token",
-    ];
-    let lowercase = value.to_ascii_lowercase();
-    let mut output = String::with_capacity(value.len());
-    let mut cursor = 0;
-    while cursor < value.len() {
-        let candidate = KEYS
-            .iter()
-            .filter_map(|key| {
-                lowercase[cursor..]
-                    .find(key)
-                    .map(|offset| (cursor + offset, *key))
-            })
-            .filter_map(|(start, key)| {
-                let before_is_boundary = start == 0
-                    || value[..start].chars().next_back().is_some_and(|character| {
-                        !character.is_ascii_alphanumeric() && character != '_'
-                    });
-                let mut separator = start + key.len();
-                while value[separator..]
-                    .starts_with(|character: char| character.is_ascii_whitespace())
-                {
-                    separator += value[separator..]
-                        .chars()
-                        .next()
-                        .map(char::len_utf8)
-                        .unwrap_or(0);
-                }
-                let has_separator = value[separator..].starts_with(['=', ':']);
-                (before_is_boundary && has_separator).then_some((start, separator + 1))
-            })
-            .min_by_key(|(start, _)| *start);
-        let Some((start, mut value_start)) = candidate else {
-            output.push_str(&value[cursor..]);
-            break;
-        };
-        while value[value_start..].starts_with(|character: char| {
-            character.is_ascii_whitespace() || matches!(character, '"' | '\'')
-        }) {
-            value_start += value[value_start..]
-                .chars()
-                .next()
-                .map(char::len_utf8)
-                .unwrap_or(0);
-        }
-        let value_end = value[value_start..]
-            .find(|character: char| {
-                character.is_whitespace() || matches!(character, ',' | ';' | '"' | '\'' | '&')
-            })
-            .map_or(value.len(), |offset| value_start + offset);
-        output.push_str(&value[cursor..value_start]);
-        output.push_str("[redacted]");
-        cursor = value_end.max(start + 1);
-    }
-    output
 }
 
 fn cloud_metadata(notification: &Notification) -> BTreeMap<String, String> {
@@ -2189,7 +2073,22 @@ impl NotificationService {
         Utc::now() + Duration::seconds(scaled_secs)
     }
 
+    /// Store `notification` and deliver it to every routed provider.
+    ///
+    /// Credentials in the title, message and metadata are masked first, once,
+    /// so the stored row, the batch key and every provider (Slack, Discord,
+    /// email, webhooks, Temps Cloud) see the same masked text.
     pub async fn send_notification(&self, notification: Notification) -> Result<()> {
+        self.send_notification_to(notification, ProviderSource::Routed)
+            .await
+    }
+
+    async fn send_notification_to(
+        &self,
+        mut notification: Notification,
+        providers: ProviderSource,
+    ) -> Result<()> {
+        crate::redaction::mask_notification(&mut notification);
         let now = Utc::now();
         let batch_key_str = Self::get_batch_key(&notification);
 
@@ -2270,10 +2169,14 @@ impl NotificationService {
         }
 
         // Resolve routes and deliver once to each matching provider.
-        let providers = self
-            .get_enabled_providers(&notification)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
+        let providers = match providers {
+            ProviderSource::Routed => self
+                .get_enabled_providers(&notification)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?,
+            #[cfg(test)]
+            ProviderSource::Fixed(providers) => providers,
+        };
         for provider in &providers {
             if let Err(e) = provider.send(&notification).await {
                 error!("Failed to send notification via provider: {}", e);
@@ -2763,10 +2666,13 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let notification_provider = self.load_provider(&provider).await?;
-            let notification = Notification::new(
+            let mut notification = Notification::new(
                 "Temps test notification",
                 "This is a test alert from your Temps notification settings. No action is required.",
             );
+            // Same masking as `send_notification`, so a test send can never
+            // carry more than a real one would.
+            crate::redaction::mask_notification(&mut notification);
             // A provider test must exercise delivery, not only configuration.
             // Otherwise the UI can report success while credentials, routing,
             // or the remote destination are unable to accept a message.
@@ -2830,11 +2736,13 @@ impl NotificationService {
     ) -> std::result::Result<NotificationRouteTestResult, NotificationRouteError> {
         let (route, providers) = self.routing_service.route_with_providers(route_id).await?;
         let severity = NotificationRoutingService::parse_severity(&route.min_severity)?;
-        let notification = Notification::new(
+        let mut notification = Notification::new(
             format!("Temps test notification: route \"{}\"", route.name),
             "This is a test alert sent through a notification route from your Temps notification settings. No action is required.",
         )
         .with_severity(severity);
+        // The route name is operator text; mask it like any notification.
+        crate::redaction::mask_notification(&mut notification);
 
         let mut deliveries = Vec::with_capacity(providers.len());
         for provider in providers {
@@ -6140,5 +6048,215 @@ FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
         assert!(visible_keys.contains("project_slug"));
         // No readable twin exists for incident_id, so it must remain visible.
         assert!(visible_keys.contains("incident_id"));
+    }
+
+    // ---- Central credential masking (every provider, stored history) ----
+
+    /// Stands in for a Slack/Discord/webhook provider: records exactly the
+    /// notification it was handed, which is what those providers serialize.
+    struct RecordingProvider {
+        received: Arc<Mutex<Vec<Notification>>>,
+    }
+
+    #[async_trait]
+    impl NotificationProvider for RecordingProvider {
+        async fn initialize(&mut self, _db: Arc<DatabaseConnection>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn send(&self, notification: &Notification) -> Result<()> {
+            self.received
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(notification.clone());
+            Ok(())
+        }
+
+        async fn health_check(&self) -> Result<bool> {
+            Ok(true)
+        }
+    }
+
+    const LEAKED_SECRETS: &[&str] = &[
+        "ghs_abc",
+        "ghs_abc123",
+        "github_pat_11ABC",
+        "AKIAIOSFODNN7EXAMPLE",
+        "hunter2",
+        "ghs_xyz",
+        "secret_key: abc",
+    ];
+
+    fn leaky_notification() -> Notification {
+        let mut notification = Notification::new(
+            "Backup failed: https://x-access-token:ghs_abc@github.com/o/r.git",
+            "clone https://x-access-token:ghs_abc@github.com/o/r.git failed\n\
+             installation token ghs_abc123\n\
+             pat github_pat_11ABC\n\
+             aws AKIAIOSFODNN7EXAMPLE\n\
+             db password=hunter2\n\
+             Authorization: token ghs_xyz\n\
+             secret_key: abc",
+        );
+        notification.metadata.insert(
+            "error".to_string(),
+            "upload with AKIAIOSFODNN7EXAMPLE / secret_key: abc failed".to_string(),
+        );
+        notification
+            .metadata
+            .insert("environment".to_string(), "production".to_string());
+        notification
+    }
+
+    fn assert_no_secret(text: &str, context: &str) {
+        for secret in LEAKED_SECRETS {
+            assert!(
+                !text.contains(secret),
+                "{context} leaked {secret:?}: {text}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_notification_masks_secrets_for_providers_and_stored_history() {
+        let test_db = test_database_or_skip!();
+        let service = NotificationService::new(
+            test_db.db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "notification-masking-tests",
+            )),
+        );
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let provider = RecordingProvider {
+            received: received.clone(),
+        };
+
+        service
+            .send_notification_to(
+                leaky_notification(),
+                ProviderSource::Fixed(vec![Box::new(provider)]),
+            )
+            .await
+            .expect("send succeeds");
+
+        let delivered = received
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(delivered.len(), 1);
+        let delivered = &delivered[0];
+        assert_no_secret(&delivered.title, "provider title");
+        assert_no_secret(&delivered.message, "provider message");
+        for (key, value) in &delivered.metadata {
+            assert_no_secret(value, &format!("provider metadata {key}"));
+        }
+        assert_no_secret(
+            &serde_json::to_string(delivered).expect("serialize payload"),
+            "provider payload",
+        );
+        assert!(delivered.message.contains("github.com/o/r.git"));
+        assert_eq!(delivered.metadata["environment"], "production");
+
+        let rows = notifications::Entity::find()
+            .all(test_db.db.as_ref())
+            .await
+            .expect("read stored notifications");
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_no_secret(&row.title, "stored title");
+        assert_no_secret(&row.message, "stored message");
+        assert_no_secret(&row.metadata, "stored metadata");
+        assert_no_secret(&row.batch_key, "stored batch key");
+    }
+
+    /// Masking happens before the batch key is computed: the same failure
+    /// with the same secret still batches into one row.
+    #[tokio::test]
+    async fn masked_notifications_still_batch_by_title() {
+        let test_db = test_database_or_skip!();
+        let service = NotificationService::new(
+            test_db.db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "notification-masking-tests",
+            )),
+        );
+        let received = Arc::new(Mutex::new(Vec::new()));
+        for _ in 0..2 {
+            service
+                .send_notification_to(
+                    leaky_notification(),
+                    ProviderSource::Fixed(vec![Box::new(RecordingProvider {
+                        received: received.clone(),
+                    })]),
+                )
+                .await
+                .expect("send succeeds");
+        }
+
+        let rows = notifications::Entity::find()
+            .all(test_db.db.as_ref())
+            .await
+            .expect("read stored notifications");
+        assert_eq!(rows.len(), 1, "the second send is batched");
+        assert_eq!(rows[0].occurrence_count, 2);
+        assert_eq!(
+            received
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .len(),
+            1,
+            "a batched notification is not delivered again"
+        );
+    }
+
+    #[tokio::test]
+    async fn ordinary_notification_text_is_delivered_unchanged() {
+        let test_db = test_database_or_skip!();
+        let service = NotificationService::new(
+            test_db.db.clone(),
+            Arc::new(temps_core::EncryptionService::new_from_password(
+                "notification-masking-tests",
+            )),
+        );
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let mut notification = Notification::new("Weekly report", "tasks_completed=3 for user 42");
+        notification.metadata.insert(
+            "summary".to_string(),
+            "tasks_completed=3 for user 42".to_string(),
+        );
+
+        service
+            .send_notification_to(
+                notification,
+                ProviderSource::Fixed(vec![Box::new(RecordingProvider {
+                    received: received.clone(),
+                })]),
+            )
+            .await
+            .expect("send succeeds");
+
+        let delivered = received
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        assert_eq!(delivered[0].title, "Weekly report");
+        assert_eq!(delivered[0].message, "tasks_completed=3 for user 42");
+        assert_eq!(
+            delivered[0].metadata["summary"],
+            "tasks_completed=3 for user 42"
+        );
+    }
+
+    #[test]
+    fn cloud_bounding_of_already_masked_text_is_unchanged() {
+        let mut notification = leaky_notification();
+        crate::redaction::mask_notification(&mut notification);
+        let masked_once = notification.message.clone();
+        crate::redaction::mask_notification(&mut notification);
+        assert_eq!(notification.message, masked_once, "masking is idempotent");
+        assert_eq!(
+            bound_cloud_text(&masked_once, CLOUD_MESSAGE_MAX_CHARS),
+            masked_once.trim()
+        );
     }
 }

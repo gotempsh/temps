@@ -5,6 +5,7 @@
 
 pub mod digest;
 pub mod plugin;
+mod redaction;
 pub mod routing;
 pub mod services;
 pub mod vulnerability_notifications;
