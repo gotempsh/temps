@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { groupSettingsHref } from '@/lib/terminology'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
@@ -19,8 +20,6 @@ import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { environmentLink, useServiceEnvironments } from './service-urls'
-
-const SETTINGS = { search: '?tab=settings&section=routes' }
 
 /** How requests move between the project's services, at a glance. */
 export function GroupRoutesSummary({ group }: { group: ProjectGroupResponse }) {
@@ -44,7 +43,7 @@ export function GroupRoutesSummary({ group }: { group: ProjectGroupResponse }) {
           </p>
         </div>
         <Button variant="ghost" size="sm" asChild>
-          <Link to={SETTINGS}>Manage</Link>
+          <Link to={groupSettingsHref(group.slug, 'routes')}>Manage</Link>
         </Button>
       </div>
       {routes.isLoading ? (
@@ -67,7 +66,7 @@ export function GroupRoutesSummary({ group }: { group: ProjectGroupResponse }) {
           Every service answers only on its own domains. Does a frontend call a
           same-origin <code>/api</code>?{' '}
           <Link
-            to={SETTINGS}
+            to={groupSettingsHref(group.slug, 'routes')}
             className="font-medium text-foreground hover:underline"
           >
             Route it to the API service

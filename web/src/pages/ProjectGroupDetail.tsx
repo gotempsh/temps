@@ -2,19 +2,26 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useEffect, useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import {
+  Link,
+  Navigate,
+  Route,
+  Routes,
+  useLocation,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from 'react-router'
 import { useQuery } from '@tanstack/react-query'
 import {
   ChevronDown,
   FolderGit2,
-  Home,
   Plus,
   RefreshCw,
   Rocket,
   Rows3,
-  Settings,
-  Variable,
 } from 'lucide-react'
+import type { ProjectGroupResponse } from '@/api/client/types.gen'
 import { getProjectGroupBySlugOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -22,7 +29,6 @@ import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Skeleton } from '@/components/ui/skeleton'
-import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
 import {
   groupConnectRepositoryHref,
@@ -43,26 +49,23 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import {
+  GroupBackupsPage,
+  GroupDatabasesPage,
+  GroupDeploymentsPage,
+  GroupDomainsPage,
+  GroupObservePage,
+} from '@/components/project-groups/GroupScopedPages'
+import { legacyGroupTabRedirect } from '@/lib/console-scope'
 
-const TABS = ['overview', 'variables', 'settings'] as const
-type Tab = (typeof TABS)[number]
-
-/** Overview of a project (group): its services, databases and shared config. */
+/**
+ * A project (group): `/p/:slug` is its overview, and its own pages (the
+ * project sidebar's entries) live below it.
+ */
 export function ProjectGroupDetail() {
   const { slug = '' } = useParams()
-  const { setBreadcrumbs } = useBreadcrumbs()
-  const [searchParams, setSearchParams] = useSearchParams()
-  const requested = searchParams.get('tab')
-  const tab: Tab = TABS.includes(requested as Tab)
-    ? (requested as Tab)
-    : 'overview'
-  const [adding, setAdding] = useState(false)
-  const navigate = useNavigate()
-  const [importing, setImporting] = useState(false)
-  // "From the repository" without a repository connects one on its own page
-  // first, which returns here with `?import=1` to continue into the import.
-  const importRequested = searchParams.get(IMPORT_PARAM) === '1'
-
+  const { search, hash } = useLocation()
+  const legacyTab = legacyGroupTabRedirect(slug, search, hash)
   const {
     data: group,
     isLoading,
@@ -75,34 +78,9 @@ export function ProjectGroupDetail() {
     retry: false,
   })
 
-  useEffect(() => {
-    setBreadcrumbs([
-      { label: 'Projects', href: '/projects' },
-      { label: group?.name ?? slug, href: groupHref(slug) },
-    ])
-  }, [group?.name, setBreadcrumbs, slug])
-
-  usePageTitle(group?.name ?? 'Project')
-
-  const connectHref = groupConnectRepositoryHref(slug)
-
-  // Arriving with `?import=1` opens the import; closing it drops the
-  // parameter so a reload does not open it again.
-  const importOpen =
-    importing || (importRequested && Boolean(group?.repository))
-  const setImportOpen = (open: boolean) => {
-    setImporting(open)
-    if (!open && importRequested) {
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev)
-          next.delete(IMPORT_PARAM)
-          return next
-        },
-        { replace: true }
-      )
-    }
-  }
+  // `?tab=variables` / `?tab=settings` were tabs on the overview; each is a
+  // page of the project's sidebar now.
+  if (legacyTab) return <Navigate to={legacyTab} replace />
 
   if (isLoading) {
     return (
@@ -159,6 +137,111 @@ export function ProjectGroupDetail() {
         </Alert>
       </PageContainer>
     )
+  }
+
+  return (
+    <Routes>
+      <Route index element={<GroupOverview group={group} />} />
+      <Route
+        path="deployments"
+        element={<GroupDeploymentsPage group={group} />}
+      />
+      <Route
+        path="logs"
+        element={<GroupObservePage group={group} kind="logs" />}
+      />
+      <Route
+        path="errors"
+        element={<GroupObservePage group={group} kind="errors" />}
+      />
+      <Route
+        path="traces"
+        element={<GroupObservePage group={group} kind="traces" />}
+      />
+      <Route
+        path="analytics"
+        element={<GroupObservePage group={group} kind="analytics" />}
+      />
+      <Route path="domains" element={<GroupDomainsPage group={group} />} />
+      <Route path="databases" element={<GroupDatabasesPage group={group} />} />
+      <Route path="backups" element={<GroupBackupsPage group={group} />} />
+      <Route path="variables" element={<GroupVariablesPage group={group} />} />
+      <Route path="settings" element={<GroupSettingsPage group={group} />} />
+      <Route
+        path="*"
+        element={<Navigate to={groupHref(group.slug)} replace />}
+      />
+    </Routes>
+  )
+}
+
+/** Breadcrumbs and title of one of the project's own pages. */
+function useGroupChrome(group: ProjectGroupResponse, page?: string) {
+  const { setBreadcrumbs } = useBreadcrumbs()
+  useEffect(() => {
+    setBreadcrumbs([
+      { label: 'Projects', href: '/projects' },
+      { label: group.name, href: groupHref(group.slug) },
+      ...(page ? [{ label: page }] : []),
+    ])
+  }, [group.name, group.slug, page, setBreadcrumbs])
+  usePageTitle(page ? `${page} · ${group.name}` : group.name)
+}
+
+function GroupVariablesPage({ group }: { group: ProjectGroupResponse }) {
+  useGroupChrome(group, 'Shared variables')
+  return (
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader title="Shared variables" />
+      <GroupVariablesPanel group={group} />
+    </PageContainer>
+  )
+}
+
+function GroupSettingsPage({ group }: { group: ProjectGroupResponse }) {
+  useGroupChrome(group, 'Settings')
+  const navigate = useNavigate()
+  return (
+    <PageContainer innerClassName="space-y-6">
+      <PageHeader title="Settings" />
+      <GroupSettingsPanel
+        group={group}
+        onConnectRepository={() =>
+          navigate(groupConnectRepositoryHref(group.slug))
+        }
+      />
+    </PageContainer>
+  )
+}
+
+/** The project's overview: its repository, services, routes and databases. */
+function GroupOverview({ group }: { group: ProjectGroupResponse }) {
+  const slug = group.slug
+  useGroupChrome(group)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const [adding, setAdding] = useState(false)
+  const navigate = useNavigate()
+  const [importing, setImporting] = useState(false)
+  // "From the repository" without a repository connects one on its own page
+  // first, which returns here with `?import=1` to continue into the import.
+  const importRequested = searchParams.get(IMPORT_PARAM) === '1'
+  const connectHref = groupConnectRepositoryHref(slug)
+
+  // Arriving with `?import=1` opens the import; closing it drops the
+  // parameter so a reload does not open it again.
+  const importOpen = importing || (importRequested && Boolean(group.repository))
+  const setImportOpen = (open: boolean) => {
+    setImporting(open)
+    if (!open && importRequested) {
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev)
+          next.delete(IMPORT_PARAM)
+          return next
+        },
+        { replace: true }
+      )
+    }
   }
 
   return (
@@ -227,44 +310,17 @@ export function ProjectGroupDetail() {
         }
       />
 
-      <Tabs
-        value={tab}
-        onValueChange={(value) =>
-          setSearchParams({ tab: value }, { replace: true })
-        }
-      >
-        <TabsList>
-          <TabsTrigger value="overview" icon={Home}>
-            Overview
-          </TabsTrigger>
-          <TabsTrigger value="variables" icon={Variable}>
-            Shared variables
-          </TabsTrigger>
-          <TabsTrigger value="settings" icon={Settings}>
-            Settings
-          </TabsTrigger>
-        </TabsList>
-        <TabsContent value="overview" className="mt-6 space-y-8">
-          <GroupRepositoryPanel
-            group={group}
-            onConnect={() => navigate(connectHref)}
-            onImport={() => setImporting(true)}
-          />
-          <GroupServicesPanel
-            group={group}
-            onAddServices={() => setAdding(true)}
-          />
-        </TabsContent>
-        <TabsContent value="variables" className="mt-6">
-          <GroupVariablesPanel group={group} />
-        </TabsContent>
-        <TabsContent value="settings" className="mt-6">
-          <GroupSettingsPanel
-            group={group}
-            onConnectRepository={() => navigate(connectHref)}
-          />
-        </TabsContent>
-      </Tabs>
+      <div className="space-y-8">
+        <GroupRepositoryPanel
+          group={group}
+          onConnect={() => navigate(connectHref)}
+          onImport={() => setImporting(true)}
+        />
+        <GroupServicesPanel
+          group={group}
+          onAddServices={() => setAdding(true)}
+        />
+      </div>
 
       <AddServicesDialog group={group} open={adding} onOpenChange={setAdding} />
       <ImportServicesDialog

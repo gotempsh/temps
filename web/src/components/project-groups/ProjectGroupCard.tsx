@@ -24,7 +24,12 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
-import { groupHref, serviceCount } from '@/lib/terminology'
+import {
+  groupHref,
+  groupSettingsHref,
+  groupVariablesHref,
+  serviceCount,
+} from '@/lib/terminology'
 import { AddServicesDialog } from './AddServicesDialog'
 import {
   ExternalBadge,
@@ -111,14 +116,10 @@ export function ProjectGroupCard({
               Add services
             </DropdownMenuItem>
             <DropdownMenuItem asChild>
-              <Link to={`${groupHref(group.slug)}?tab=variables`}>
-                Shared variables
-              </Link>
+              <Link to={groupVariablesHref(group.slug)}>Shared variables</Link>
             </DropdownMenuItem>
             <DropdownMenuItem asChild>
-              <Link to={`${groupHref(group.slug)}?tab=settings`}>
-                Rename or delete
-              </Link>
+              <Link to={groupSettingsHref(group.slug)}>Rename or delete</Link>
             </DropdownMenuItem>
           </DropdownMenuContent>
         </DropdownMenu>

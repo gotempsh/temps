@@ -93,6 +93,13 @@
   "cli": {
     "kind": "npm",
     "path": "apps/temps-cli",
-    "name": "@temps-sdk/cli"
+    "name": "@temps-sdk/cli",
+    "stamped": [
+      "skills/temps-cli/references/COMMANDS.md"
+    ],
+    "channel_pinned": [
+      "skills/**/*.md",
+      "skills/**/*.json"
+    ]
   }
 }

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useEffect, useMemo, useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { LogExplorer } from '@/components/observability/LogExplorer'
 import { LogHistogram } from '@/components/observability/LogHistogram'
@@ -15,7 +15,12 @@ import { useGlobalView } from '@/hooks/useGlobalView'
 import { useQueries } from '@tanstack/react-query'
 import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { LogLevel, LogSourceKind } from '@/api/client/types.gen'
-import { QueryContent } from '@/components/observability/GlobalPage'
+import {
+  QueryContent,
+  ServerWideLink,
+} from '@/components/observability/GlobalPage'
+import { useScopedBreadcrumbs } from '@/hooks/useScopedBreadcrumbs'
+import { useServiceScope } from '@/contexts/ServiceScopeContext'
 import { ObservabilitySetupGuide } from '@/components/observability/ObservabilitySetupGuide'
 import { PageContainer, PageHeader } from '@/components/layout/PageContainer'
 import { DateTimeRange } from '@/components/ui/date-time-range'
@@ -23,7 +28,6 @@ import { Button } from '@/components/ui/button'
 import { Alert, AlertTitle, AlertDescription } from '@/components/ui/alert'
 import { LogQueryInput } from '@/components/observability/LogQueryInput'
 import { facetProjectLabels, positiveInteger } from '@/lib/global-observability'
-import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   EXPLORER_FACET_FIELDS,
@@ -69,8 +73,14 @@ function filterKey(params: URLSearchParams): string {
 export default function GlobalLogs() {
   const view = useGlobalView()
   usePageTitle('Logs')
-  const { setBreadcrumbs } = useBreadcrumbs()
-  useEffect(() => setBreadcrumbs([{ label: 'Logs' }]), [setBreadcrumbs])
+  useScopedBreadcrumbs('Logs')
+  const scope = useServiceScope()
+  // Inside a project, "no service picked" means every service in it: the
+  // log search takes a list of services, so the server does the scoping.
+  const scopeProjects = useMemo(
+    () => scope?.services.map((service) => String(service.id)) ?? [],
+    [scope]
+  )
   const [follow, setFollow] = useState(false)
   // The saved search last opened, and the filters it holds that this page
   // has no control for. Cleared as soon as the filters change by hand.
@@ -137,7 +147,12 @@ export default function GlobalLogs() {
       envs: env ? [env] : [],
       node_ids: node ? [node] : [],
       deploy_id: deploy,
-      projects: source !== 'service' && projectId ? [String(projectId)] : [],
+      projects:
+        source === 'service'
+          ? []
+          : projectId
+            ? [String(projectId)]
+            : scopeProjects,
       levels: level ? [level] : [],
       text: text || undefined,
       attrs: attrs.length ? attrs : undefined,
@@ -150,6 +165,7 @@ export default function GlobalLogs() {
       node,
       deploy,
       projectId,
+      scopeProjects,
       level,
       text,
       attrs,
@@ -300,10 +316,13 @@ export default function GlobalLogs() {
         description={
           view.projectId
             ? 'Container logs from the selected service, newest first.'
-            : 'Container logs from every service and database, newest first.'
+            : scope
+              ? `Container logs from every service in ${scope.label}, newest first.`
+              : 'Container logs from every service and database, newest first.'
         }
         actions={
           <div className="flex items-center gap-2">
+            {scope && <ServerWideLink scope={scope} />}
             <LogIngestKeys projectId={projectId} />
             <SavedLogSearches
               projectId={projectId}
@@ -324,6 +343,12 @@ export default function GlobalLogs() {
         statusUpdatedAt={capabilities.dataUpdatedAt || undefined}
         onRetry={() => void capabilities.refetch()}
       />
+      {scope && source === 'service' && (
+        <Callout tone="info" title="Showing all on this server">
+          Database logs are not filtered by project yet, so this shows every
+          database on this server.
+        </Callout>
+      )}
       <LogIngestBudgetWarning projectLabels={projectLabels} />
       <LogExplorer
         lines={lines}

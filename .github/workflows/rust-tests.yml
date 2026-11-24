@@ -852,10 +852,10 @@ jobs:
       - uses: actions/setup-python@v7.1.0
         with:
           python-version: '3.12'
-      - uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
         with:
           enable-cache: false
-      - uses: actions/setup-go@v7.0.0
+      - uses: actions/setup-go@v7.1.0
         with:
           go-version-file: sdks/go/workflows/go.mod
           cache: false
@@ -1747,7 +1747,7 @@ jobs:
           python-version: '3.12'
       - name: Install Go for workflow conformance
         if: env.GROUP_RUNS == 'true' && matrix.group == 'docker-deployments'
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.23.x'
           cache: false
@@ -1946,7 +1946,7 @@ jobs:
           python-version: '3.12'
 
       - name: Install Go
-        uses: actions/setup-go@v7.0.0
+        uses: actions/setup-go@v7.1.0
         with:
           go-version: '1.25.x'
           cache: false
