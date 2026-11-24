@@ -1517,15 +1517,7 @@ pub async fn update_project(
         directory: project.directory.clone(),
         main_branch: project.main_branch.clone(),
         preset: project.preset.clone(),
-        preset_config: crate::services::fold_top_level_build_settings(
-            &project.preset,
-            project.preset_config.clone(),
-            crate::services::TopLevelBuildSettings {
-                build_command: project.build_command.clone(),
-                install_command: project.install_command.clone(),
-                output_dir: project.output_dir.clone(),
-            },
-        )?,
+        preset_config: project.preset_config.clone(),
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
@@ -1545,9 +1537,14 @@ pub async fn update_project(
     };
     let updated_project = state
         .project_service
-        .update_project(
+        .update_project_with_build_settings(
             id,
             project_req,
+            crate::services::TopLevelBuildSettings {
+                build_command: project.build_command.clone(),
+                install_command: project.install_command.clone(),
+                output_dir: project.output_dir.clone(),
+            },
             temps_core::docker_socket_grant::DeployCaller::from_instance_admin(
                 auth.is_instance_admin(),
             ),

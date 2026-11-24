@@ -80,9 +80,9 @@ use delivery::{chosen_delivery_provider, delivery_provider_label};
 use git_settings::would_desync_git_url;
 use naming::{slugify, validate_project_name};
 use presets::{
-    apply_resolved_preset, compose_public_ports, merge_preset_config,
-    project_type_for_resolved_preset, resolve_preset_patch, resolve_preset_selection,
-    validate_preset_config,
+    apply_resolved_preset, compose_public_ports, fold_top_level_build_settings_onto_stored,
+    merge_preset_config, project_type_for_resolved_preset, resolve_preset_patch,
+    resolve_preset_selection, validate_preset_config,
 };
 pub use presets::{fold_top_level_build_settings, TopLevelBuildSettings};
 use source_directory::{
