@@ -129,7 +129,7 @@ pub struct AiRunConfig {
     pub api_key: String,
     pub max_turns: i32,
     pub timeout: Duration,
-    /// Optional preferred model name (e.g. "sonnet", "gpt-5-codex").
+    /// Optional preferred model name (e.g. "sonnet", "gpt-6.2-sol").
     /// `None` lets the CLI pick its default.
     pub model: Option<String>,
     /// Provider-specific reasoning effort/variant selected by the caller.
@@ -938,13 +938,18 @@ mod tests {
 
         assert_eq!(
             capabilities.default_model_id.as_deref(),
-            Some("gpt-5.6-sol")
+            Some("gpt-6.2-sol")
         );
         assert!(capabilities.models.len() > 1);
         assert!(capabilities
             .models
             .iter()
-            .any(|model| model.id == "gpt-5.6-terra"));
+            .any(|model| model.id == "gpt-6.2-astra"));
+        // Models Codex retired for ChatGPT sign-in are not offered.
+        assert!(!capabilities
+            .models
+            .iter()
+            .any(|model| model.id == "gpt-5.4" || model.id == "gpt-5.2"));
     }
 
     #[test]

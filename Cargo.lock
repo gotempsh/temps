@@ -12406,6 +12406,7 @@ dependencies = [
 name = "temps-ai-gateway"
 version = "0.1.0-beta.63"
 dependencies = [
+ "arc-swap",
  "async-stream",
  "async-trait",
  "axum",
@@ -12437,6 +12438,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-stream",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "url",

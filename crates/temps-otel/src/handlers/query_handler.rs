@@ -363,7 +363,7 @@ pub struct GenAiQueryParams {
     pub end_time: Option<String>,
     /// Filter by gen_ai.system (e.g. "openai", "anthropic").
     pub gen_ai_system: Option<String>,
-    /// Filter by gen_ai.request.model (e.g. "gpt-4", "claude-sonnet-4-20250514").
+    /// Filter by gen_ai.request.model (e.g. "gpt-6.2-sol", "claude-sonnet-5-5").
     pub gen_ai_model: Option<String>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
@@ -1697,7 +1697,7 @@ pub async fn get_ingest_errors(
         ("project_id" = i32, Query, description = "Project ID"),
         ("service_name" = Option<String>, Query, description = "Filter by service name"),
         ("gen_ai_system" = Option<String>, Query, description = "Filter by AI system (openai, anthropic, etc.)"),
-        ("gen_ai_model" = Option<String>, Query, description = "Filter by model (gpt-4, claude-sonnet-4-20250514, etc.)"),
+        ("gen_ai_model" = Option<String>, Query, description = "Filter by model (gpt-6.2-sol, claude-sonnet-5-5, etc.)"),
         ("start_time" = Option<String>, Query, description = "Start time (RFC 3339)"),
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),

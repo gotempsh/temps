@@ -248,6 +248,59 @@ fn an_unlisted_vendor_model_keeps_the_worst_case_price() {
 }
 
 #[test]
+fn a_model_no_price_covers_is_charged_the_ceiling_but_recorded_as_price_unknown() {
+    let none = PromptTokensDetails::default();
+    let one = UsageCount::OneRequest;
+    let (cost, price_known) =
+        recorded_cost_microcents("openrouter", "vendor/unknown", None, 1_000, 200, none, one);
+    assert!(cost > 0, "an unknown model still counts toward spend caps");
+    assert!(!price_known, "the worst-case ceiling is not a known price");
+
+    // A listed model, and a dated snapshot of one, are priced.
+    let (_, listed) =
+        recorded_cost_microcents("anthropic", "claude-haiku-5-5", None, 1_000, 200, none, one);
+    assert!(listed);
+    let (_, dated) = recorded_cost_microcents(
+        "anthropic",
+        "claude-haiku-5-5-20261101",
+        None,
+        1_000,
+        200,
+        none,
+        one,
+    );
+    assert!(dated);
+
+    // A catalogue price is a known price, even for an id no table lists.
+    assert_eq!(
+        recorded_cost_microcents(
+            "openrouter",
+            "vendor/unknown",
+            Some(42),
+            1_000,
+            200,
+            none,
+            one
+        ),
+        (42, true)
+    );
+
+    // A self-hosted model with no price is recorded at zero, unpriced.
+    assert_eq!(
+        recorded_cost_microcents(
+            crate::self_hosted::OPENAI_COMPATIBLE,
+            "local-flash",
+            None,
+            1_000,
+            200,
+            none,
+            one
+        ),
+        (0, false)
+    );
+}
+
+#[test]
 fn a_vendor_model_without_a_catalogue_price_bills_its_cache_writes() {
     // Claude Haiku 5.5 lists $0.10 input and $0.20 for a 1-hour cache
     // write per 1M tokens: 50,000 written tokens are 10,000 microcents,

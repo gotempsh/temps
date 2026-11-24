@@ -14,19 +14,40 @@
 //! When a provider announces a dated price change (a promotion that ends, or
 //! a scheduled increase), the row carries the price that applies after the
 //! change, so a release that outlives the date never undercounts spend.
+//!
+//! A running instance can layer a runtime model catalog over this table
+//! (ADR 113, [`install_catalog_prices`]): its prices replace a listed model's
+//! base rates and price models this release does not know. The bundled table
+//! stays the fallback, keeps every long-context tier, and alone decides the
+//! worst-case rate charged for models no price covers.
 
-use serde::Serialize;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, OnceLock};
+
+use arc_swap::ArcSwap;
+use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
 use crate::types::PromptTokensDetails;
 
+/// Where a model's price comes from.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum PriceSource {
+    /// The price table bundled with this Temps release.
+    #[default]
+    Bundled,
+    /// The runtime model catalog (Settings: AI Gateway > Models).
+    Catalog,
+}
+
 /// Pricing for a single model, all values in USD per 1M tokens.
 /// Fields are optional because not every provider supports every pricing tier.
-#[derive(Debug, Serialize, ToSchema)]
+#[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct ModelPricing {
-    /// Model identifier (e.g. "gpt-5.4", "claude-sonnet-4-6")
+    /// Model identifier (e.g. "gpt-6.2-sol", "claude-sonnet-5-5")
     pub model: String,
-    /// Human-readable model name (e.g. "Claude Sonnet 4.6")
+    /// Human-readable model name (e.g. "Claude Sonnet 5.5")
     pub display_name: String,
     /// Provider ID (e.g. "openai", "anthropic")
     pub provider: String,
@@ -52,6 +73,8 @@ pub struct ModelPricing {
     /// Whether the model is deprecated
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub deprecated: bool,
+    /// Whether the price is the bundled one or comes from the runtime catalog.
+    pub source: PriceSource,
 }
 
 // ============================================================================
@@ -66,7 +89,7 @@ const GEMINI_PRICING: &str = "https://aistudio.google.com/docs/pricing";
 const OPENROUTER_MODELS: &str = "https://openrouter.ai/api/v1/models";
 
 /// Date (UTC) of the last full check of the table against every source above.
-const CHECKED_2026_11_15: &str = "2026-11-15";
+const CHECKED_2026_11_23: &str = "2026-11-23";
 
 /// Where a row's prices come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,6 +271,7 @@ impl PricingBuilder {
                 batch_input_per_million: self.batch_input,
                 batch_output_per_million: self.batch_output,
                 deprecated: self.deprecated,
+                source: PriceSource::Bundled,
             },
             provenance: self.provenance,
             long_context: self.long_context,
@@ -264,6 +288,12 @@ const ANTHROPIC_HAIKU_LONG_CONTEXT: i64 = 100_000;
 const OPENAI_LONG_CONTEXT: i64 = 272_000;
 const GEMINI_LONG_CONTEXT: i64 = 200_000;
 const XAI_LONG_CONTEXT: i64 = 200_000 - 1;
+/// OpenRouter lists a route's long-context rates as an override from
+/// `min_prompt_tokens` on (inclusive): 100,000 for Claude Haiku 5.5,
+/// 200,000 for Grok 4.6 and later, and 272,000 for GPT-6.x.
+const OPENROUTER_HAIKU_LONG_CONTEXT: i64 = 100_000 - 1;
+const OPENROUTER_XAI_LONG_CONTEXT: i64 = 200_000 - 1;
+const OPENROUTER_OPENAI_LONG_CONTEXT: i64 = 272_000 - 1;
 
 pub fn build_pricing() -> Vec<ModelPricing> {
     catalog().into_iter().map(|entry| entry.pricing).collect()
@@ -284,7 +314,7 @@ fn catalog() -> Vec<CatalogEntry> {
 
 fn anthropic_rows() -> Vec<CatalogEntry> {
     const A: &str = ANTHROPIC_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         PricingBuilder::new(
             "anthropic",
@@ -313,6 +343,41 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
             .batch(5.0, 25.0)
             .checked(A, D)
             .build(),
+        // Claude Mythos models are available to verified organizations only,
+        // at the prices of their Fable counterparts.
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5-2",
+            "Claude Mythos 5.2",
+            8.0,
+            40.0,
+        )
+        .cache(10.0, 16.0, 0.20)
+        .batch(4.0, 20.0)
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5-1",
+            "Claude Mythos 5.1",
+            10.0,
+            50.0,
+        )
+        .cache(12.50, 20.0, 0.25)
+        .batch(5.0, 25.0)
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new(
+            "anthropic",
+            "claude-mythos-5",
+            "Claude Mythos 5",
+            10.0,
+            50.0,
+        )
+        .cache(12.50, 20.0, 1.0)
+        .batch(5.0, 25.0)
+        .checked(A, D)
+        .build(),
         PricingBuilder::new("anthropic", "claude-opus-5-5", "Claude Opus 5.5", 4.0, 20.0)
             .cache(5.0, 8.0, 0.20)
             .batch(2.0, 10.0)
@@ -341,6 +406,26 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
         PricingBuilder::new("anthropic", "claude-opus-4-5", "Claude Opus 4.5", 5.0, 25.0)
             .cache(6.25, 10.0, 0.50)
             .batch(2.50, 12.50)
+            .checked(A, D)
+            .build(),
+        // Retired on the Claude API but still listed for the cloud platforms
+        // that serve them; kept so usage recorded on them still prices.
+        PricingBuilder::new(
+            "anthropic",
+            "claude-opus-4-1",
+            "Claude Opus 4.1",
+            15.0,
+            75.0,
+        )
+        .cache(18.75, 30.0, 1.50)
+        .batch(7.50, 37.50)
+        .deprecated()
+        .checked(A, D)
+        .build(),
+        PricingBuilder::new("anthropic", "claude-opus-4", "Claude Opus 4", 15.0, 75.0)
+            .cache(18.75, 30.0, 1.50)
+            .batch(7.50, 37.50)
+            .deprecated()
             .checked(A, D)
             .build(),
         PricingBuilder::new(
@@ -383,6 +468,14 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
         .deprecated()
         .checked(A, D)
         .build(),
+        // Retired on the Claude API; dated ids such as
+        // `claude-sonnet-4-20250514` price as this row by prefix.
+        PricingBuilder::new("anthropic", "claude-sonnet-4", "Claude Sonnet 4", 3.0, 15.0)
+            .cache(3.75, 6.0, 0.30)
+            .batch(1.50, 7.50)
+            .deprecated()
+            .checked(A, D)
+            .build(),
         PricingBuilder::new(
             "anthropic",
             "claude-haiku-5-5",
@@ -413,10 +506,28 @@ fn anthropic_rows() -> Vec<CatalogEntry> {
 
 fn openai_rows() -> Vec<CatalogEntry> {
     const O: &str = OPENAI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // Models marked deprecated are "Deprecated" or "Shut down" on their
         // model pages under https://developers.openai.com/api/docs/models.
+        PricingBuilder::new("openai", "gpt-6.2-astra", "GPT-6.2 Astra", 8.0, 40.0)
+            .cache_read(0.40)
+            .batch(4.0, 20.0)
+            .long_context(OPENAI_LONG_CONTEXT, 16.0, 60.0)
+            .long_cache_read(0.80)
+            .long_cache_write(40.0)
+            .cache_write_ceiling(20.0)
+            .checked(O, D)
+            .build(),
+        PricingBuilder::new("openai", "gpt-6.2-sol", "GPT-6.2 Sol", 2.0, 10.0)
+            .cache_read(0.10)
+            .batch(1.0, 5.0)
+            .long_context(OPENAI_LONG_CONTEXT, 4.0, 15.0)
+            .long_cache_read(0.2)
+            .long_cache_write(10.0)
+            .cache_write_ceiling(5.0)
+            .checked(O, D)
+            .build(),
         PricingBuilder::new("openai", "gpt-6-astra", "GPT-6 Astra", 10.0, 50.0)
             .cache_read(1.0)
             .batch(5.0, 25.0)
@@ -634,7 +745,7 @@ fn openai_rows() -> Vec<CatalogEntry> {
 
 fn xai_rows() -> Vec<CatalogEntry> {
     const X: &str = XAI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         PricingBuilder::new("xai", "grok-4.7", "Grok 4.7", 2.0, 6.0)
             .cache(0.0, 0.0, 0.50)
@@ -760,7 +871,7 @@ fn xai_rows() -> Vec<CatalogEntry> {
 
 fn gemini_rows() -> Vec<CatalogEntry> {
     const G: &str = GEMINI_PRICING;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // Text input prices; audio input is billed higher on several models.
         // Gemini 4 Carbon and Argon rise to these prices on 2026-12-01, and
@@ -773,6 +884,11 @@ fn gemini_rows() -> Vec<CatalogEntry> {
         PricingBuilder::new("gemini", "gemini-4-argon", "Gemini 4 Argon", 4.0, 20.0)
             .cache(0.0, 0.0, 0.20)
             .batch(2.0, 10.0)
+            .checked(G, D)
+            .build(),
+        PricingBuilder::new("gemini", "gemini-4-neon", "Gemini 4 Neon", 3.0, 15.0)
+            .cache(0.0, 0.0, 0.15)
+            .batch(1.50, 7.50)
             .checked(G, D)
             .build(),
         PricingBuilder::new(
@@ -888,7 +1004,7 @@ fn gemini_rows() -> Vec<CatalogEntry> {
 
 fn openrouter_rows() -> Vec<CatalogEntry> {
     const R: &str = OPENROUTER_MODELS;
-    const D: &str = CHECKED_2026_11_15;
+    const D: &str = CHECKED_2026_11_23;
     vec![
         // OpenRouter passes through hundreds of upstream models with
         // per-model pricing that changes independently of Temps releases;
@@ -919,6 +1035,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             4.0,
             20.0,
         )
+        .cache(5.0, 8.0, 0.20)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -928,6 +1045,7 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .cache(2.50, 4.0, 0.10)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -937,6 +1055,103 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             2.0,
             10.0,
         )
+        .cache(2.50, 4.0, 0.20)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "anthropic/claude-fable-5.2",
+            "Claude Fable 5.2 (via OpenRouter)",
+            8.0,
+            40.0,
+        )
+        .cache(10.0, 16.0, 0.20)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "anthropic/claude-haiku-5.5",
+            "Claude Haiku 5.5 (via OpenRouter)",
+            0.10,
+            0.50,
+        )
+        .cache(0.125, 0.20, 0.01)
+        .long_context(OPENROUTER_HAIKU_LONG_CONTEXT, 0.50, 2.50)
+        .long_cache_read(0.05)
+        .long_cache_write(1.0)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6.2-astra",
+            "GPT-6.2 Astra (via OpenRouter)",
+            8.0,
+            40.0,
+        )
+        .cache_read(0.40)
+        .cache_write_ceiling(10.0)
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 16.0, 60.0)
+        .long_cache_read(0.80)
+        .long_cache_write(20.0)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6.2-sol",
+            "GPT-6.2 Sol (via OpenRouter)",
+            2.0,
+            10.0,
+        )
+        .cache_read(0.10)
+        .cache_write_ceiling(2.50)
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 4.0, 15.0)
+        .long_cache_read(0.20)
+        .long_cache_write(5.0)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "openai/gpt-6-luna",
+            "GPT-6 Luna (via OpenRouter)",
+            0.10,
+            0.50,
+        )
+        .cache_read(0.01)
+        .cache_write_ceiling(0.125)
+        .long_context(OPENROUTER_OPENAI_LONG_CONTEXT, 0.20, 0.75)
+        .long_cache_read(0.02)
+        .long_cache_write(0.25)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "google/gemini-4-neon",
+            "Gemini 4 Neon (via OpenRouter)",
+            3.0,
+            15.0,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "google/gemini-4-hydrogen",
+            "Gemini 4 Hydrogen (via OpenRouter)",
+            1.50,
+            7.50,
+        )
+        .cache(0.0, 0.0, 0.075)
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "x-ai/grok-4.7",
+            "Grok 4.7 (via OpenRouter)",
+            2.0,
+            6.0,
+        )
+        .cache(0.0, 0.0, 0.50)
+        .long_context(OPENROUTER_XAI_LONG_CONTEXT, 4.0, 12.0)
+        .long_cache_read(1.0)
         .checked(R, D)
         .build(),
         PricingBuilder::new(
@@ -954,6 +1169,35 @@ fn openrouter_rows() -> Vec<CatalogEntry> {
             "DeepSeek Chat (via OpenRouter)",
             0.2574,
             1.0287,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4-pro",
+            "DeepSeek V4 Pro (via OpenRouter)",
+            0.90,
+            1.50,
+        )
+        .checked(R, D)
+        .build(),
+        // The undated route is cheaper than its dated `-1017` snapshot, so
+        // both are listed: the snapshot must not price by prefix as this one.
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4.1-flash",
+            "DeepSeek V4.1 Flash (via OpenRouter)",
+            0.0498,
+            0.1992,
+        )
+        .checked(R, D)
+        .build(),
+        PricingBuilder::new(
+            "openrouter",
+            "deepseek/deepseek-v4.1-flash-1017",
+            "DeepSeek V4.1 Flash 1017 (via OpenRouter)",
+            0.30,
+            1.20,
         )
         .checked(R, D)
         .build(),
@@ -1003,6 +1247,19 @@ struct Rates {
 }
 
 impl Rates {
+    /// Each rate at the higher of the two, and the long-context tier (when
+    /// either has one) from the lower threshold, so the result never bills
+    /// below either input.
+    fn dearest(self, other: Rates) -> Rates {
+        let base = self.base.max(other.base);
+        let long_context = match (self.long_context, other.long_context) {
+            (Some((a, tier_a)), Some((b, tier_b))) => Some((a.min(b), tier_a.max(tier_b))),
+            (one, other) => one.or(other),
+        }
+        .map(|(above, tier)| (above, tier.max(base)));
+        Rates { base, long_context }
+    }
+
     fn from_entry(entry: &CatalogEntry) -> Self {
         let pricing = &entry.pricing;
         let input = pricing.input_per_million;
@@ -1050,6 +1307,7 @@ impl Rates {
 /// USD per 1M tokens and usage costs are stored in microcents (1e-6 USD, as
 /// `estimated_cost_microcents` documents), a rate is directly the cost of one
 /// token in that unit: `$2.50 / 1M tokens` is `2.5` microcents per token.
+#[derive(Clone)]
 struct RateTable {
     by_model: std::collections::HashMap<String, Rates>,
     /// Rates charged for models that are not priced, so an unlisted model can
@@ -1101,18 +1359,31 @@ impl RateTable {
     /// Rates for `model`: its exact id, or else the longest listed id it
     /// extends at a `-`, `:` or `@` boundary. `None` when it is not listed.
     fn rates_for(&self, model: &str) -> Option<Rates> {
-        self.by_model.get(model).copied().or_else(|| {
-            self.by_model
-                .iter()
-                .filter(|(id, _)| {
-                    model.strip_prefix(id.as_str()).is_some_and(|rest| {
-                        rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
-                    })
-                })
-                .max_by_key(|(id, _)| id.len())
-                .map(|(_, rates)| *rates)
-        })
+        lookup_rates(&self.by_model, model)
     }
+}
+
+/// `model`'s rates in `by_model`: its exact id, or else the longest listed id
+/// it extends at a `-`, `:` or `@` boundary.
+fn lookup_rates(by_model: &HashMap<String, Rates>, model: &str) -> Option<Rates> {
+    by_model
+        .get(model)
+        .copied()
+        .or_else(|| prefix_rates(by_model, model).map(|(_, rates)| rates))
+}
+
+/// The longest id in `by_model` that `model` extends at a `-`, `:` or `@`
+/// boundary, with its length.
+fn prefix_rates(by_model: &HashMap<String, Rates>, model: &str) -> Option<(usize, Rates)> {
+    by_model
+        .iter()
+        .filter(|(id, _)| {
+            model.strip_prefix(id.as_str()).is_some_and(|rest| {
+                rest.starts_with('-') || rest.starts_with(':') || rest.starts_with('@')
+            })
+        })
+        .max_by_key(|(id, _)| id.len())
+        .map(|(id, rates)| (id.len(), *rates))
 }
 
 /// Cost of one request at `tier`, in microcents, rounded up.
@@ -1134,9 +1405,263 @@ fn cost_at(
     cost.ceil().clamp(0.0, i64::MAX as f64) as i64
 }
 
+/// The bundled table, before any runtime catalog price is applied.
 fn rate_table() -> &'static RateTable {
-    static TABLE: std::sync::OnceLock<RateTable> = std::sync::OnceLock::new();
+    static TABLE: OnceLock<RateTable> = OnceLock::new();
     TABLE.get_or_init(|| RateTable::from_entries(catalog()))
+}
+
+// ============================================================================
+// Runtime catalog (ADR 113)
+// ============================================================================
+
+/// Upper bound for a catalog price, USD per 1M tokens. The dearest listed
+/// model bills well under this; a larger figure is a unit or parsing error,
+/// not a price, and would turn every estimate into a spend-cap breach.
+pub const MAX_CATALOG_PRICE_PER_MILLION: f64 = 10_000.0;
+
+/// A validated price from the runtime model catalog, USD per 1M tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogPrice {
+    /// Temps provider id.
+    pub provider: String,
+    pub model: String,
+    pub display_name: String,
+    pub input_per_million: f64,
+    pub output_per_million: f64,
+    pub cache_read_per_million: Option<f64>,
+    /// The catalog's one cache-write price (the shortest-lived tier).
+    pub cache_write_per_million: Option<f64>,
+    pub deprecated: bool,
+}
+
+/// Whether `price` is a usable per-million price.
+pub fn is_valid_catalog_price(price: f64) -> bool {
+    price.is_finite() && (0.0..=MAX_CATALOG_PRICE_PER_MILLION).contains(&price)
+}
+
+/// The rates estimates use: the bundled table with the runtime catalog's
+/// prices applied, and the catalog prices that were applied.
+///
+/// A catalog may list one model id under several providers at different
+/// prices. `by_provider` keeps each provider's own rate, for callers that know
+/// which provider served the request; `table`, used when only the model is
+/// known, holds the dearest of them, so the result does not depend on catalog
+/// order and never bills below any provider's price.
+struct EffectivePricing {
+    table: RateTable,
+    by_provider: HashMap<String, HashMap<String, Rates>>,
+    applied: BTreeMap<(String, String), CatalogPrice>,
+}
+
+impl EffectivePricing {
+    /// Rates for `model` served by `provider`. An exact id always wins over
+    /// a prefix, so a bundled `gpt-5.5-pro` row is not replaced by a catalog
+    /// price for `gpt-5.5`: the provider's own catalog row for the exact id,
+    /// then the table's; otherwise the longest matching prefix in either, the
+    /// provider's row on a tie.
+    fn rates_for(&self, provider: &str, model: &str) -> Option<Rates> {
+        let own = self.by_provider.get(provider);
+        if let Some(rates) = own.and_then(|by_model| by_model.get(model)) {
+            return Some(*rates);
+        }
+        if let Some(rates) = self.table.by_model.get(model) {
+            return Some(*rates);
+        }
+        let own_prefix = own.and_then(|by_model| prefix_rates(by_model, model));
+        let table_prefix = prefix_rates(&self.table.by_model, model);
+        match (own_prefix, table_prefix) {
+            (Some((own_len, own)), Some((table_len, table))) => {
+                Some(if own_len >= table_len { own } else { table })
+            }
+            (own, table) => own.or(table).map(|(_, rates)| rates),
+        }
+    }
+}
+
+fn effective() -> &'static ArcSwap<EffectivePricing> {
+    static EFFECTIVE: OnceLock<ArcSwap<EffectivePricing>> = OnceLock::new();
+    EFFECTIVE.get_or_init(|| {
+        ArcSwap::from_pointee(EffectivePricing {
+            table: rate_table().clone(),
+            by_provider: HashMap::new(),
+            applied: BTreeMap::new(),
+        })
+    })
+}
+
+/// Rates for a catalog price, or `None` when it must not replace the
+/// bundled row.
+///
+/// * A catalog never makes a model free that the bundled table bills: a zero
+///   price for a paid model is a catalog error, and would lift every spend cap
+///   for it.
+/// * A catalog publishes one cache-write price (the shortest-lived tier). The
+///   bundled row's dearest write tier, scaled to the catalog's input price,
+///   still applies, so a 1-hour write is not billed at the 5-minute rate. A
+///   catalog without a cache-read price keeps the bundled cache discount,
+///   scaled the same way.
+/// * The bundled long-context tier is kept, raised to at least the new base
+///   rates: a catalog publishes no tiers, and a long prompt must never bill
+///   below a short one.
+fn catalog_rates(price: &CatalogPrice, bundled: Option<Rates>) -> Option<Rates> {
+    let input = price.input_per_million;
+    let output = price.output_per_million;
+    if !is_valid_catalog_price(input) || !is_valid_catalog_price(output) {
+        return None;
+    }
+    let usable = |rate: Option<f64>| rate.filter(|rate| is_valid_catalog_price(*rate));
+    if let Some(bundled) = bundled {
+        let bundled_paid = bundled.base.input > 0.0 || bundled.base.output > 0.0;
+        if bundled_paid && input <= 0.0 && output <= 0.0 {
+            return None;
+        }
+    }
+    // A bundled rate scaled to the catalog's input price, keeping the
+    // bundled row's ratio to its input rate.
+    let scaled = |rate: fn(&TierRates) -> f64| {
+        bundled
+            .filter(|bundled| bundled.base.input > 0.0)
+            .map(|bundled| input * (rate(&bundled.base) / bundled.base.input))
+    };
+    let base = TierRates {
+        input,
+        output,
+        cache_read: usable(price.cache_read_per_million)
+            .or_else(|| scaled(|tier| tier.cache_read))
+            .unwrap_or(input),
+        cache_write: usable(price.cache_write_per_million)
+            .unwrap_or(input)
+            .max(scaled(|tier| tier.cache_write).unwrap_or(0.0))
+            .max(input),
+    };
+    let long_context = bundled
+        .and_then(|bundled| bundled.long_context)
+        .map(|(above, tier)| (above, tier.max(base)));
+    Some(Rates { base, long_context })
+}
+
+impl RateTable {
+    /// This table with `prices` applied by exact model id. The worst case is
+    /// kept: catalog prices are not reviewed like this table, so they never
+    /// raise or lower what an unpriced model is charged.
+    ///
+    /// Each price is checked against the bundled rates the model already
+    /// had, by exact id or inherited from the id it extends (a dated
+    /// snapshot of a tiered model keeps its parent's long-context tier and
+    /// cannot be made free).
+    fn with_catalog(&self, prices: &[CatalogPrice]) -> EffectivePricing {
+        let mut catalog_by_model: HashMap<String, Rates> = HashMap::new();
+        let mut by_provider: HashMap<String, HashMap<String, Rates>> = HashMap::new();
+        let mut applied = BTreeMap::new();
+        for price in prices {
+            let bundled = self.rates_for(&price.model);
+            let Some(rates) = catalog_rates(price, bundled) else {
+                continue;
+            };
+            by_provider
+                .entry(price.provider.clone())
+                .or_default()
+                .insert(price.model.clone(), rates);
+            catalog_by_model
+                .entry(price.model.clone())
+                .and_modify(|existing| *existing = existing.dearest(rates))
+                .or_insert(rates);
+            applied.insert((price.provider.clone(), price.model.clone()), price.clone());
+        }
+        let mut by_model = self.by_model.clone();
+        by_model.extend(catalog_by_model);
+        EffectivePricing {
+            table: RateTable {
+                by_model,
+                worst_case: self.worst_case,
+            },
+            by_provider,
+            applied,
+        }
+    }
+}
+
+/// Serialises tests that install catalog prices: the effective table is
+/// process-wide, so two such tests must not run at once.
+#[cfg(test)]
+pub(crate) static CATALOG_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Replace the runtime catalog prices estimates use. Returns how many were
+/// applied; the rest were invalid or would have made a paid model free. An
+/// empty slice restores the bundled table.
+pub fn install_catalog_prices(prices: &[CatalogPrice]) -> usize {
+    let pricing = rate_table().with_catalog(prices);
+    let applied = pricing.applied.len();
+    effective().store(Arc::new(pricing));
+    applied
+}
+
+/// How many runtime catalog prices are applied.
+pub fn catalog_price_count() -> usize {
+    effective().load().applied.len()
+}
+
+/// Whether a price covers `model`: the runtime catalog or the bundled table
+/// lists it, by exact id or as a dated or tagged variant of a listed id.
+/// Every other model is estimated at the worst-case rate, and its usage is
+/// recorded as having no known price.
+pub fn is_priced(model: &str) -> bool {
+    effective().load().table.rates_for(model).is_some()
+}
+
+/// Whether a price covers `model` when `provider` serves it: that provider's
+/// catalog price, or any price `is_priced` finds.
+pub fn is_priced_for(provider: &str, model: &str) -> bool {
+    effective().load().rates_for(provider, model).is_some()
+}
+
+/// The effective price list: the bundled rows with runtime catalog prices
+/// applied, followed by the models only the catalog lists.
+pub fn effective_pricing() -> Vec<ModelPricing> {
+    let current = effective().load();
+    let mut rows = build_pricing();
+    let mut seen = std::collections::HashSet::new();
+    for row in &mut rows {
+        if let Some(price) = current
+            .applied
+            .get(&(row.provider.clone(), row.model.clone()))
+        {
+            row.input_per_million = price.input_per_million;
+            row.output_per_million = price.output_per_million;
+            row.cache_hit_per_million = price.cache_read_per_million;
+            if price.cache_write_per_million.is_some() {
+                row.cache_write_5m_per_million = price.cache_write_per_million;
+            }
+            row.batch_input_per_million = None;
+            row.batch_output_per_million = None;
+            row.deprecated = row.deprecated || price.deprecated;
+            row.source = PriceSource::Catalog;
+        }
+        seen.insert((row.provider.clone(), row.model.clone()));
+    }
+    // `applied` is ordered by (provider, model), so the extra rows are too.
+    let extra: Vec<&CatalogPrice> = current
+        .applied
+        .iter()
+        .filter(|(key, _)| !seen.contains(*key))
+        .map(|(_, price)| price)
+        .collect();
+    rows.extend(extra.into_iter().map(|price| ModelPricing {
+        model: price.model.clone(),
+        display_name: price.display_name.clone(),
+        provider: price.provider.clone(),
+        input_per_million: price.input_per_million,
+        output_per_million: price.output_per_million,
+        cache_write_5m_per_million: price.cache_write_per_million,
+        cache_write_1h_per_million: None,
+        cache_hit_per_million: price.cache_read_per_million,
+        batch_input_per_million: None,
+        batch_output_per_million: None,
+        deprecated: price.deprecated,
+        source: PriceSource::Catalog,
+    }));
+    rows
 }
 
 /// Estimate the provider cost of a request in microcents (1e-6 USD).
@@ -1157,7 +1682,8 @@ pub fn estimate_cost_microcents(
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> i64 {
-    let table = rate_table();
+    let current = effective().load();
+    let table = &current.table;
     let rates = table.rates_for(model).unwrap_or(table.worst_case);
     cost_at(
         rates.for_request(input_tokens.max(0)),
@@ -1165,6 +1691,42 @@ pub fn estimate_cost_microcents(
         output_tokens,
         cache,
     )
+}
+
+/// `estimate_cost_microcents` for a request `provider` served: that
+/// provider's own catalog price wins over another provider's for the same id.
+pub fn estimate_cost_microcents_for(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let current = effective().load();
+    let rates = current
+        .rates_for(provider, model)
+        .unwrap_or(current.table.worst_case);
+    cost_at(
+        rates.for_request(input_tokens.max(0)),
+        input_tokens,
+        output_tokens,
+        cache,
+    )
+}
+
+/// `estimate_batch_total_cost_microcents` for a batch `provider` served.
+pub fn estimate_batch_total_cost_microcents_for(
+    provider: &str,
+    model: &str,
+    input_tokens: i64,
+    output_tokens: i64,
+    cache: PromptTokensDetails,
+) -> i64 {
+    let current = effective().load();
+    let rates = current
+        .rates_for(provider, model)
+        .unwrap_or(current.table.worst_case);
+    cost_at(rates.base, input_tokens, output_tokens, cache)
 }
 
 /// Estimate the provider cost of a batch's total usage, in microcents.
@@ -1182,7 +1744,8 @@ pub fn estimate_batch_total_cost_microcents(
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> i64 {
-    let table = rate_table();
+    let current = effective().load();
+    let table = &current.table;
     let rates = table.rates_for(model).unwrap_or(table.worst_case);
     cost_at(rates.base, input_tokens, output_tokens, cache)
 }
@@ -1196,12 +1759,16 @@ pub fn estimate_batch_total_cost_microcents(
 /// usage service records the higher of that figure and this one, so a long
 /// prompt to a tiered model is never recorded at the base rate.
 pub fn long_context_cost_microcents(
+    provider: &str,
     model: &str,
     input_tokens: i64,
     output_tokens: i64,
     cache: PromptTokensDetails,
 ) -> Option<i64> {
-    let (above, tier) = rate_table().rates_for(model)?.long_context?;
+    let (above, tier) = effective()
+        .load()
+        .rates_for(provider, model)?
+        .long_context?;
     (input_tokens > above).then(|| cost_at(tier, input_tokens, output_tokens, cache))
 }
 

@@ -12,9 +12,9 @@ RUN cargo build --locked --release
 
 FROM oven/bun:1.3.14 AS bun
 FROM node:22-bookworm-slim AS common
-ARG CODEX_VERSION=0.154.0
-ARG CLAUDE_VERSION=2.1.263
-ARG OPENCODE_VERSION=1.18.23
+ARG CODEX_VERSION=0.171.0
+ARG CLAUDE_VERSION=2.1.330
+ARG OPENCODE_VERSION=1.19.6
 RUN apt-get update && apt-get install -y --no-install-recommends tini ca-certificates git curl jq sudo procps iproute2 \
     && rm -rf /var/lib/apt/lists/* \
     && usermod -l temps -d /home/temps -m node \
