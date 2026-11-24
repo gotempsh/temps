@@ -39,6 +39,15 @@ pub enum OidcError {
     )]
     EmailNotVerified { email: String },
 
+    /// SECURITY: an SSO login matched an existing local account by email,
+    /// but nothing trusted ever vouched that the local account owns that
+    /// address (it was self-registered or self-changed). Linking would hand
+    /// the account to whoever set the address; see `OidcService::resolve_user`.
+    #[error(
+        "An account with email {email} already exists (user {user_id}), but its address is not verified; ask an administrator to verify it"
+    )]
+    LocalAccountEmailNotVerified { user_id: i32, email: String },
+
     #[error("OIDC ID token is missing the email claim")]
     EmailClaimMissing,
 
@@ -215,6 +224,13 @@ impl From<OidcError> for Problem {
                 .with_detail(format!(
                     "Your identity provider has not confirmed that {email} belongs to you. Verify the email at your IdP and try again, or ask an administrator to provision the account manually."
                 )),
+            OidcError::LocalAccountEmailNotVerified { email, .. } => {
+                problem_new(StatusCode::FORBIDDEN)
+                    .with_title("Account Email Not Verified")
+                    .with_detail(format!(
+                        "An account with the email {email} already exists, but its address has not been verified. Ask an administrator to verify it, then sign in again."
+                    ))
+            }
             OidcError::EmailClaimMissing => problem_new(StatusCode::BAD_GATEWAY)
                 .with_title("OIDC Email Claim Missing")
                 .with_detail(
@@ -293,6 +309,23 @@ mod tests {
         }
         .into();
         assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn local_account_email_not_verified_maps_to_403_without_the_user_id() {
+        let err = OidcError::LocalAccountEmailNotVerified {
+            user_id: 41,
+            email: "user@example.com".into(),
+        };
+        assert!(
+            err.to_string().contains("user 41"),
+            "log text carries the id"
+        );
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::FORBIDDEN);
+        let body = serde_json::to_string(&problem.body).unwrap_or_default();
+        assert!(body.contains("Ask an administrator to verify it"), "{body}");
+        assert!(!body.contains("41"), "{body}");
     }
 
     #[test]

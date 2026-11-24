@@ -1365,19 +1365,36 @@ impl OidcService {
                 }
             }
 
-            // Only mark the local user as email-verified when the IdP
-            // actually asserted it. Under `trust_idp_email=true` we
-            // accept the login without the claim, but we should not
-            // silently elevate the user's verification state — leave
-            // `email_verified` untouched so the DB still records the
-            // truth as we observed it from the IdP.
-            let idp_verified = claims.email_verified() == Some(true);
+            // SECURITY: the IdP vouching for the address is not enough; the
+            // local account must also own it. A user can set their own email
+            // to a colleague's address (`PATCH /users/me`), and a
+            // self-registered account carries whatever address it was
+            // created with. Either way `email_verified` stays false until the
+            // owner clicks the emailed link or an administrator vouches for
+            // it, so linking such an account would hand the colleague's
+            // first SSO login, and the IdP's role, to whoever set the
+            // address. `trust_idp_email` does not relax this: it is about
+            // trusting the IdP, not the local account.
+            if !user.email_verified {
+                tracing::warn!(
+                    target: "temps_auth::oidc::abuse",
+                    provider_id = provider_id,
+                    user_id = user.id,
+                    email = %email,
+                    sub = %sub,
+                    "Refusing to link OIDC identity to existing account: the local account's email is not verified"
+                );
+                return Err(OidcError::LocalAccountEmailNotVerified {
+                    user_id: user.id,
+                    email,
+                });
+            }
+
+            // `email_verified` is already true here (checked above), so
+            // linking only records the identity.
             let mut active: users::ActiveModel = user.clone().into();
             active.oidc_provider_id = Set(Some(provider_id));
             active.oidc_subject = Set(Some(sub.to_string()));
-            if idp_verified {
-                active.email_verified = Set(true);
-            }
             let linked = active.update(self.db.as_ref()).await?;
             self.sync_user_sso_role(linked.id, role).await?;
             return Ok(OidcResolvedUser { user: linked });
@@ -1424,7 +1441,15 @@ impl OidcService {
 
         let created = self
             .user_service
-            .create_user(display_name, email.clone(), None, vec![role.clone()], false)
+            .create_user(
+                display_name,
+                email.clone(),
+                None,
+                vec![role.clone()],
+                false,
+                // Set from the IdP's claim below, never assumed.
+                crate::user_service::InitialEmailStatus::Unverified,
+            )
             .await
             .map_err(|e| OidcError::DiscoveryFailed {
                 issuer: provider.issuer_url.clone(),
@@ -3626,6 +3651,238 @@ mod tests {
         assert_eq!(
             service.list_role_mappings(provider.id).await.unwrap().len(),
             mappings.len()
+        );
+    }
+
+    // ── SSO linking onto an existing local account ──────────────────────
+    //
+    // `resolve_user` links a first-time SSO identity onto a local account
+    // with the same email only when the local account's own address is
+    // verified. Docker-dependent; skips like the tests above.
+
+    async fn link_test_provider(
+        db: &sea_orm::DatabaseConnection,
+        issuer: &str,
+        trust_idp_email: bool,
+    ) -> oidc_providers::Model {
+        let now = Utc::now();
+        oidc_providers::ActiveModel {
+            name: Set(format!("Link test {issuer}")),
+            issuer_url: Set(issuer.to_string()),
+            client_id: Set("link-test-client".to_string()),
+            client_secret_encrypted: Set("unused".to_string()),
+            scopes: Set("openid email profile".to_string()),
+            jit_provisioning: Set(false),
+            enabled: Set(true),
+            template: Set("generic".to_string()),
+            group_claim: Set("groups".to_string()),
+            role_claim: Set("roles".to_string()),
+            default_role: Set("user".to_string()),
+            trust_idp_email: Set(trust_idp_email),
+            managed_by_cloud: Set(false),
+            admin_only_role_required: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert test OIDC provider")
+    }
+
+    async fn local_account(
+        db: &sea_orm::DatabaseConnection,
+        email: &str,
+        email_verified: bool,
+    ) -> users::Model {
+        users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set("Local Account".to_string()),
+            email_verified: Set(email_verified),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert local account")
+    }
+
+    /// ID token claims as an IdP would send them.
+    fn id_token_claims(
+        issuer: &str,
+        sub: &str,
+        email: &str,
+        email_verified: Option<bool>,
+    ) -> (CoreIdTokenClaims, serde_json::Value) {
+        let now = Utc::now().timestamp();
+        let mut raw = serde_json::json!({
+            "iss": issuer,
+            "aud": ["link-test-client"],
+            "exp": now + 300,
+            "iat": now,
+            "sub": sub,
+            "email": email,
+        });
+        if let Some(verified) = email_verified {
+            raw["email_verified"] = serde_json::Value::Bool(verified);
+        }
+        let claims: CoreIdTokenClaims =
+            serde_json::from_value(raw.clone()).expect("valid ID token claims");
+        (claims, raw)
+    }
+
+    async fn reload_user(db: &sea_orm::DatabaseConnection, user_id: i32) -> users::Model {
+        users::Entity::find_by_id(user_id)
+            .one(db)
+            .await
+            .unwrap()
+            .expect("user still exists")
+    }
+
+    fn assert_refused_as_unverified(
+        result: Result<OidcResolvedUser, OidcError>,
+        expected_user_id: i32,
+        context: &str,
+    ) {
+        match result {
+            Err(OidcError::LocalAccountEmailNotVerified { user_id, .. }) => {
+                assert_eq!(user_id, expected_user_id, "{context}")
+            }
+            Err(other) => panic!("{context}: expected LocalAccountEmailNotVerified, got {other}"),
+            Ok(resolved) => panic!(
+                "{context}: linked onto unverified account {}",
+                resolved.user.id
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn sso_link_is_refused_when_the_local_email_is_unverified_even_with_trust_idp_email() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        service.user_service.initialize_roles().await.unwrap();
+
+        for (trust_idp_email, idp_claim) in [(true, Some(true)), (true, None), (false, Some(true))]
+        {
+            let issuer = format!("https://idp-{trust_idp_email}-{idp_claim:?}.example.com");
+            let provider = link_test_provider(db.db.as_ref(), &issuer, trust_idp_email).await;
+            let email = format!("victim-{}@example.com", provider.id);
+            let account = local_account(db.db.as_ref(), &email, false).await;
+            let (claims, raw) = id_token_claims(&issuer, "idp-subject-1", &email, idp_claim);
+
+            let context =
+                format!("trust_idp_email={trust_idp_email}, email_verified={idp_claim:?}");
+            assert_refused_as_unverified(
+                service.resolve_user(provider.id, &claims, &raw).await,
+                account.id,
+                &context,
+            );
+            let stored = reload_user(db.db.as_ref(), account.id).await;
+            assert_eq!(stored.oidc_subject, None, "{context}: identity was linked");
+            assert_eq!(stored.oidc_provider_id, None, "{context}");
+            assert!(!stored.email_verified, "{context}");
+        }
+    }
+
+    #[tokio::test]
+    async fn sso_link_is_allowed_when_the_idp_and_the_local_account_are_both_verified() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        service.user_service.initialize_roles().await.unwrap();
+        let issuer = "https://idp-verified.example.com";
+        let provider = link_test_provider(db.db.as_ref(), issuer, false).await;
+        let account = local_account(db.db.as_ref(), "owner@example.com", true).await;
+        let (claims, raw) =
+            id_token_claims(issuer, "idp-subject-2", "Owner@Example.com", Some(true));
+
+        let resolved = service
+            .resolve_user(provider.id, &claims, &raw)
+            .await
+            .expect("a verified account links");
+        assert_eq!(resolved.user.id, account.id);
+        let stored = reload_user(db.db.as_ref(), account.id).await;
+        assert_eq!(stored.oidc_subject.as_deref(), Some("idp-subject-2"));
+        assert_eq!(stored.oidc_provider_id, Some(provider.id));
+    }
+
+    /// The takeover: a user points their own account at a colleague's
+    /// address, and the colleague's first SSO login would land in it.
+    #[tokio::test]
+    async fn sso_link_is_refused_after_a_self_service_email_change() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        service.user_service.initialize_roles().await.unwrap();
+        let issuer = "https://idp-self-change.example.com";
+        let provider = link_test_provider(db.db.as_ref(), issuer, true).await;
+        let attacker = local_account(db.db.as_ref(), "attacker@example.com", true).await;
+        service
+            .user_service
+            .update_user(
+                attacker.id,
+                Some("colleague@example.com".to_string()),
+                None,
+                crate::user_service::EmailChangeOrigin::SelfService,
+            )
+            .await
+            .unwrap();
+
+        let (claims, raw) = id_token_claims(
+            issuer,
+            "colleague-subject",
+            "colleague@example.com",
+            Some(true),
+        );
+        assert_refused_as_unverified(
+            service.resolve_user(provider.id, &claims, &raw).await,
+            attacker.id,
+            "self-changed email",
+        );
+        assert_eq!(
+            reload_user(db.db.as_ref(), attacker.id).await.oidc_subject,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_followed_by_sso_is_refused() {
+        let Some((db, service)) = test_oidc_service().await else {
+            return;
+        };
+        service.user_service.initialize_roles().await.unwrap();
+        let state = crate::http_test_support::auth_state(db.db.clone());
+        let registered = state
+            .auth_service
+            .register_user(crate::auth_service::RegisterRequest {
+                email: "squatted@example.com".to_string(),
+                password: "SecurePass123!".to_string(),
+                name: "Squatter".to_string(),
+            })
+            .await
+            .expect("self-registration succeeds");
+        assert!(!registered.email_verified);
+
+        let issuer = "https://idp-registration.example.com";
+        let provider = link_test_provider(db.db.as_ref(), issuer, false).await;
+        let (claims, raw) = id_token_claims(
+            issuer,
+            "real-owner-subject",
+            "squatted@example.com",
+            Some(true),
+        );
+        assert_refused_as_unverified(
+            service.resolve_user(provider.id, &claims, &raw).await,
+            registered.id,
+            "self-registered account",
+        );
+        assert_eq!(
+            reload_user(db.db.as_ref(), registered.id)
+                .await
+                .oidc_subject,
+            None
         );
     }
 }

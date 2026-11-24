@@ -126,6 +126,9 @@ pub enum UserServiceError {
     #[error("Cannot reset the password of deleted user {user_id}")]
     PasswordResetOnDeletedUser { user_id: i32 },
 
+    #[error("Cannot verify the email address of deleted user {user_id}")]
+    EmailVerificationOnDeletedUser { user_id: i32 },
+
     #[error(
         "Second-factor verification for user {user_id} is locked for {retry_after_seconds}s after repeated failures"
     )]
@@ -369,6 +372,38 @@ impl From<temps_entities::roles::Model> for ServiceRole {
             updated_at: db_role.updated_at,
         }
     }
+}
+
+/// Verification state of the address a new account is created with.
+///
+/// See `crate::email_verification` for what "verified" means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitialEmailStatus {
+    /// An administrator vouched for the address by creating the account.
+    Verified,
+    /// Nobody trusted has vouched for it yet (just-in-time SSO provisioning,
+    /// where the caller sets it from the identity provider's claim).
+    Unverified,
+}
+
+/// Who is changing an account's email address, which decides what the change
+/// does to `email_verified`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmailChangeOrigin {
+    /// An administrator set the address: they vouch for it, so it becomes
+    /// verified.
+    Admin,
+    /// The account owner set it themselves: a new address is unverified until
+    /// they click the emailed link or an administrator verifies it.
+    SelfService,
+}
+
+/// Result of [`UserService::update_user`].
+#[derive(Debug)]
+pub struct UserUpdate {
+    pub user: UserWithRoles,
+    /// Whether the normalized email actually changed.
+    pub email_changed: bool,
 }
 
 pub struct UserService {
@@ -701,6 +736,7 @@ impl UserService {
         password: Option<String>,
         roles: Vec<RoleType>,
         must_change_password: bool,
+        email_status: InitialEmailStatus,
     ) -> Result<UserWithRoles, UserServiceError> {
         let now = Utc::now();
 
@@ -806,7 +842,7 @@ impl UserService {
             mfa_secret: Set(None),
             mfa_recovery_codes: Set(None),
             password_hash: Set(password_hash),
-            email_verified: Set(false),
+            email_verified: Set(email_status == InitialEmailStatus::Verified),
             email_verification_token: Set(None),
             email_verification_expires: Set(None),
             password_reset_token: Set(None),
@@ -917,22 +953,50 @@ impl UserService {
         Ok(())
     }
 
+    /// Update a user's name and/or email.
+    ///
+    /// The email is normalized (trimmed, lowercased) and validated, so an
+    /// address set here matches the lowercased lookup SSO account linking
+    /// does. When the normalized email actually changes, `origin` decides its
+    /// verification state: an administrator's change marks it verified, the
+    /// owner's own change marks it unverified. Either way the outstanding
+    /// verification credential is cleared, since it was issued for the old
+    /// address. An unchanged email leaves the verification state alone.
     pub async fn update_user(
         &self,
         user_id: i32,
         email_p: Option<String>,
         name_p: Option<String>,
-    ) -> Result<UserWithRoles, UserServiceError> {
+        origin: EmailChangeOrigin,
+    ) -> Result<UserUpdate, UserServiceError> {
+        let new_email = match email_p {
+            Some(email) => Some(normalize_user_email(&email).ok_or_else(|| {
+                UserServiceError::Validation(format!(
+                    "A valid email address is required to update user {user_id}"
+                ))
+            })?),
+            None => None,
+        };
+
         // First check if user exists
         let existing_user = temps_entities::users::Entity::find_by_id(user_id)
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
 
+        let email_changed = new_email
+            .as_deref()
+            .is_some_and(|email| email != existing_user.email);
+
         // Update the user with new values
         let mut user_update: temps_entities::users::ActiveModel = existing_user.into();
 
-        if let Some(email) = email_p {
+        if let Some(email) = new_email {
+            if email_changed {
+                user_update.email_verified = Set(origin == EmailChangeOrigin::Admin);
+                user_update.email_verification_token = Set(None);
+                user_update.email_verification_expires = Set(None);
+            }
             user_update.email = Set(email);
         }
         if let Some(name) = name_p {
@@ -944,8 +1008,43 @@ impl UserService {
         // Get user with roles
         let user_with_roles = self.get_user_with_roles(updated_user.id).await?;
 
-        info!("Updated user {}", user_id);
-        Ok(user_with_roles)
+        info!(
+            user_id,
+            email_changed,
+            ?origin,
+            email_verified = updated_user.email_verified,
+            "Updated user"
+        );
+        Ok(UserUpdate {
+            user: user_with_roles,
+            email_changed,
+        })
+    }
+
+    /// Mark a user's current email address as verified on an administrator's
+    /// word, and discard any outstanding verification link. Idempotent.
+    pub async fn mark_email_verified(
+        &self,
+        user_id: i32,
+    ) -> Result<temps_entities::users::Model, UserServiceError> {
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| UserServiceError::NotFound(format!("User {} not found", user_id)))?;
+
+        if user.deleted_at.is_some() {
+            return Err(UserServiceError::EmailVerificationOnDeletedUser { user_id });
+        }
+
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.email_verified = Set(true);
+        user_update.email_verification_token = Set(None);
+        user_update.email_verification_expires = Set(None);
+        user_update.updated_at = Set(Utc::now());
+        let updated = user_update.update(self.db.as_ref()).await?;
+
+        info!(user_id, "Email address marked verified by an administrator");
+        Ok(updated)
     }
 
     /// Reset another user's password to a freshly generated temporary one and
@@ -1402,6 +1501,7 @@ mod tests {
                 None,
                 vec![RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
         assert!(matches!(blank_name, Err(UserServiceError::Validation(_))));
@@ -1413,6 +1513,7 @@ mod tests {
                 None,
                 vec![RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
         assert!(matches!(
@@ -1435,6 +1536,7 @@ mod tests {
                 None,
                 vec![],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
 
@@ -1455,6 +1557,7 @@ mod tests {
                 None,
                 vec![RoleType::User, RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
 
@@ -1477,6 +1580,7 @@ mod tests {
                 None,
                 vec![RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
 
@@ -1518,6 +1622,7 @@ mod tests {
                 None,
                 vec![RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await;
 
@@ -1565,6 +1670,7 @@ mod tests {
                 None,
                 vec![RoleType::User],
                 false,
+                InitialEmailStatus::Unverified,
             )
             .await
             .expect("committed user should be returned without another query");
@@ -2191,5 +2297,261 @@ mod tests {
             )
             .await
             .expect("encrypted seed must verify"));
+    }
+
+    // ── email verification state ────────────────────────────────────────
+
+    async fn email_test_service() -> Option<(temps_database::test_utils::TestDatabase, UserService)>
+    {
+        let db = mfa_db().await?;
+        let service = UserService::new(db.db.clone(), crate::mfa_guard::test_support::encryption());
+        service.initialize_roles().await.unwrap();
+        Some((db, service))
+    }
+
+    /// Insert a user with the given verification state and an outstanding
+    /// verification credential.
+    async fn user_with_verification(
+        db: &DatabaseConnection,
+        email: &str,
+        email_verified: bool,
+    ) -> temps_entities::users::Model {
+        temps_entities::users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set("Email Test".to_string()),
+            email_verified: Set(email_verified),
+            email_verification_token: Set(Some("stale-digest".to_string())),
+            email_verification_expires: Set(Some(Utc::now() + chrono::Duration::hours(1))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    async fn reload(db: &DatabaseConnection, user_id: i32) -> temps_entities::users::Model {
+        temps_entities::users::Entity::find_by_id(user_id)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn admin_created_user_is_email_verified_and_jit_user_is_not() {
+        let Some((_db, service)) = email_test_service().await else {
+            return;
+        };
+        let admin_created = service
+            .create_user(
+                "Admin Created".to_string(),
+                "Admin.Created@Example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+                InitialEmailStatus::Verified,
+            )
+            .await
+            .unwrap();
+        assert!(admin_created.user.email_verified);
+        assert_eq!(admin_created.user.email, "admin.created@example.com");
+
+        let jit = service
+            .create_user(
+                "Jit User".to_string(),
+                "jit@example.com".to_string(),
+                None,
+                vec![RoleType::User],
+                false,
+                InitialEmailStatus::Unverified,
+            )
+            .await
+            .unwrap();
+        assert!(!jit.user.email_verified);
+    }
+
+    #[tokio::test]
+    async fn admin_email_change_normalizes_and_marks_verified() {
+        let Some((db, service)) = email_test_service().await else {
+            return;
+        };
+        let user = user_with_verification(db.db.as_ref(), "old-admin@example.com", false).await;
+
+        let update = service
+            .update_user(
+                user.id,
+                Some("  New.Address@Example.COM ".to_string()),
+                None,
+                EmailChangeOrigin::Admin,
+            )
+            .await
+            .unwrap();
+        assert!(update.email_changed);
+        assert!(update.user.user.email_verified);
+
+        let stored = reload(db.db.as_ref(), user.id).await;
+        assert_eq!(stored.email, "new.address@example.com");
+        assert!(stored.email_verified);
+        assert!(stored.email_verification_token.is_none());
+        assert!(stored.email_verification_expires.is_none());
+    }
+
+    #[tokio::test]
+    async fn self_email_change_resets_verification() {
+        let Some((db, service)) = email_test_service().await else {
+            return;
+        };
+        let user = user_with_verification(db.db.as_ref(), "owner@example.com", true).await;
+
+        let update = service
+            .update_user(
+                user.id,
+                Some("colleague@example.com".to_string()),
+                None,
+                EmailChangeOrigin::SelfService,
+            )
+            .await
+            .unwrap();
+        assert!(update.email_changed);
+        assert!(!update.user.user.email_verified);
+
+        let stored = reload(db.db.as_ref(), user.id).await;
+        assert_eq!(stored.email, "colleague@example.com");
+        assert!(!stored.email_verified);
+        assert!(
+            stored.email_verification_token.is_none(),
+            "a link issued for the old address must stop working"
+        );
+        assert!(stored.email_verification_expires.is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_email_leaves_verification_alone() {
+        let Some((db, service)) = email_test_service().await else {
+            return;
+        };
+        let user = user_with_verification(db.db.as_ref(), "same@example.com", true).await;
+
+        // Same address after normalization, plus a name change.
+        let update = service
+            .update_user(
+                user.id,
+                Some(" Same@Example.com".to_string()),
+                Some("Renamed".to_string()),
+                EmailChangeOrigin::SelfService,
+            )
+            .await
+            .unwrap();
+        assert!(!update.email_changed);
+
+        let stored = reload(db.db.as_ref(), user.id).await;
+        assert!(stored.email_verified);
+        assert_eq!(stored.name, "Renamed");
+        assert_eq!(
+            stored.email_verification_token.as_deref(),
+            Some("stale-digest")
+        );
+
+        // A name-only edit by an administrator does not vouch for anything.
+        let unverified =
+            user_with_verification(db.db.as_ref(), "name-only@example.com", false).await;
+        let update = service
+            .update_user(
+                unverified.id,
+                None,
+                Some("Name Only".to_string()),
+                EmailChangeOrigin::Admin,
+            )
+            .await
+            .unwrap();
+        assert!(!update.email_changed);
+        assert!(!reload(db.db.as_ref(), unverified.id).await.email_verified);
+    }
+
+    #[tokio::test]
+    async fn update_user_rejects_an_invalid_email_before_touching_the_database() {
+        let service = UserService::new(
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            crate::mfa_guard::test_support::encryption(),
+        );
+        for invalid in ["", "not-an-email", "two@@example.com", "a b@example.com"] {
+            let result = service
+                .update_user(7, Some(invalid.to_string()), None, EmailChangeOrigin::Admin)
+                .await;
+            assert!(
+                matches!(&result, Err(UserServiceError::Validation(message)) if message.contains("user 7")),
+                "{invalid:?}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn update_user_reports_a_missing_user() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<temps_entities::users::Model>::new()])
+                .into_connection(),
+        );
+        let service = UserService::new(db, crate::mfa_guard::test_support::encryption());
+        let result = service
+            .update_user(
+                404,
+                Some("valid@example.com".to_string()),
+                None,
+                EmailChangeOrigin::SelfService,
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(UserServiceError::NotFound(message)) if message.contains("404")),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_email_verified_sets_the_flag_and_clears_the_link() {
+        let Some((db, service)) = email_test_service().await else {
+            return;
+        };
+        let user = user_with_verification(db.db.as_ref(), "mark@example.com", false).await;
+
+        let updated = service.mark_email_verified(user.id).await.unwrap();
+        assert!(updated.email_verified);
+        assert!(updated.email_verification_token.is_none());
+        assert!(updated.email_verification_expires.is_none());
+
+        // Idempotent.
+        assert!(
+            service
+                .mark_email_verified(user.id)
+                .await
+                .unwrap()
+                .email_verified
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_email_verified_refuses_missing_and_deleted_users() {
+        let Some((db, service)) = email_test_service().await else {
+            return;
+        };
+        let missing = service.mark_email_verified(424_242).await;
+        assert!(
+            matches!(&missing, Err(UserServiceError::NotFound(message)) if message.contains("424242")),
+            "{missing:?}"
+        );
+
+        let user = user_with_verification(db.db.as_ref(), "deleted@example.com", false).await;
+        service.delete_user(user.id).await.unwrap();
+        let deleted = service.mark_email_verified(user.id).await;
+        assert!(
+            matches!(
+                deleted,
+                Err(UserServiceError::EmailVerificationOnDeletedUser { user_id }) if user_id == user.id
+            ),
+            "{deleted:?}"
+        );
+        assert!(!reload(db.db.as_ref(), user.id).await.email_verified);
     }
 }

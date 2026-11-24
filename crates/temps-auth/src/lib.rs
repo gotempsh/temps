@@ -15,6 +15,7 @@ pub mod context;
 mod decorators;
 mod deployment_token_service;
 mod email_templates;
+mod email_verification;
 pub mod handlers;
 #[cfg(test)]
 mod http_test_support;
@@ -69,7 +70,8 @@ pub use auth_service::{validate_password_complexity, AuthService, VerifiedSessio
 pub use deployment_token_service::{
     DeploymentTokenValidationError, DeploymentTokenValidationService, ValidatedDeploymentToken,
 };
-pub use user_service::UserService;
+pub use email_verification::EmailVerificationError;
+pub use user_service::{InitialEmailStatus, UserService};
 
 // Export TempsMiddleware implementation
 pub use temps_middleware::AuthMiddleware;

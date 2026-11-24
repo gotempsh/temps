@@ -163,6 +163,24 @@ pub struct EmailVerifiedAudit {
     pub email: String,
 }
 
+// An administrator marked another user's email address verified. The address
+// is recorded because the decision vouches for that exact address: SSO
+// account linking trusts it from then on.
+#[derive(Debug, Clone, Serialize)]
+pub struct UserEmailMarkedVerifiedAudit {
+    pub context: AuditContext,
+    pub target_user_id: i32,
+    pub username: String,
+    pub email: String,
+}
+
+// A user asked for a fresh verification link to be emailed to their address.
+#[derive(Debug, Clone, Serialize)]
+pub struct EmailVerificationRequestedAudit {
+    pub context: AuditContext,
+    pub email: String,
+}
+
 // API key creation audit. Custom-permission keys are the highest-impact
 // variant -- capturing role_type and the granted permission strings lets an
 // auditor spot an over-broad grant after the fact without needing to
@@ -670,6 +688,52 @@ impl AuditOperation for PasswordChangedAudit {
 impl AuditOperation for EmailVerifiedAudit {
     fn operation_type(&self) -> String {
         "EMAIL_VERIFIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for UserEmailMarkedVerifiedAudit {
+    fn operation_type(&self) -> String {
+        "USER_EMAIL_MARKED_VERIFIED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for EmailVerificationRequestedAudit {
+    fn operation_type(&self) -> String {
+        "EMAIL_VERIFICATION_REQUESTED".to_string()
     }
 
     fn user_id(&self) -> Option<i32> {

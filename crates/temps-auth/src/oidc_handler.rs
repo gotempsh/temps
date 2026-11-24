@@ -499,6 +499,7 @@ fn login_error_code_for(err: &OidcError) -> &'static str {
         OidcError::IdTokenInvalid { .. } => "id_token_invalid",
         OidcError::EmailClaimMissing => "email_missing",
         OidcError::EmailNotVerified { .. } => "email_not_verified",
+        OidcError::LocalAccountEmailNotVerified { .. } => "local_email_not_verified",
         OidcError::UserNotProvisioned { .. } => "user_not_provisioned",
         OidcError::ProviderDisabled { .. } => "provider_disabled",
         OidcError::CredentialsChanged { .. } => "credentials_changed",
@@ -1455,7 +1456,7 @@ mod login_binding_tests {
     #[test]
     fn constant_time_eq_matches_equality() {
         assert!(constant_time_eq(b"abc", b"abc"));
-        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abx"));
         assert!(!constant_time_eq(b"abc", b"abcd"));
         assert!(constant_time_eq(b"", b""));
     }

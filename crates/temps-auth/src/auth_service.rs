@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 use crate::email_templates::AuthEmailService;
+use crate::email_verification::EmailVerificationError;
 use argon2::{PasswordHasher, PasswordVerifier};
 use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
@@ -865,8 +866,12 @@ impl AuthService {
 
         // Update user with verification token
         let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.email_verification_token = Set(Some(verification_token.clone()));
-        user_update.email_verification_expires = Set(Some(Utc::now() + Duration::hours(24)));
+        user_update.email_verification_token = Set(Some(
+            crate::email_verification::hash_verification_token(&verification_token),
+        ));
+        user_update.email_verification_expires = Set(Some(
+            Utc::now() + Duration::hours(crate::email_verification::VERIFICATION_TOKEN_TTL_HOURS),
+        ));
         let updated_user = user_update.update(self.db.as_ref()).await?;
         let settings = self.get_settings().await?;
 
@@ -1425,9 +1430,15 @@ impl AuthService {
         &self,
         token: &str,
     ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find user by verification token
+        // Only the digest is stored, so the presented token is hashed before
+        // the lookup. Presenting the stored digest itself therefore fails.
+        if token.is_empty() {
+            return Err(UserAuthError::InvalidToken);
+        }
+        let stored = crate::email_verification::hash_verification_token(token);
         let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::EmailVerificationToken.eq(token))
+            .filter(temps_entities::users::Column::EmailVerificationToken.eq(stored))
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or(UserAuthError::InvalidToken)?;
@@ -1450,6 +1461,136 @@ impl AuthService {
         let updated_user = user_update.update(self.db.as_ref()).await?;
 
         Ok(updated_user)
+    }
+
+    /// Email a fresh verification link to `user_id`'s current address, at the
+    /// user's request.
+    ///
+    /// Refused when no email provider is configured (the user has to ask an
+    /// administrator instead), when the address is already verified, and
+    /// within [`RESEND_COOLDOWN_SECONDS`] of the previous link. Returns the
+    /// address the link was sent to.
+    ///
+    /// [`RESEND_COOLDOWN_SECONDS`]: crate::email_verification::RESEND_COOLDOWN_SECONDS
+    pub async fn resend_email_verification(
+        &self,
+        user_id: i32,
+    ) -> Result<String, EmailVerificationError> {
+        use crate::email_verification::{RESEND_COOLDOWN_SECONDS, VERIFICATION_TOKEN_TTL_HOURS};
+
+        if !self.is_email_configured().await {
+            return Err(EmailVerificationError::EmailProviderNotConfigured { user_id });
+        }
+
+        let user = self.active_user_for_verification(user_id).await?;
+        if user.email_verified {
+            return Err(EmailVerificationError::AlreadyVerified {
+                user_id,
+                email: user.email,
+            });
+        }
+
+        if let Some(expires_at) = user.email_verification_expires {
+            let issued_at = expires_at - Duration::hours(VERIFICATION_TOKEN_TTL_HOURS);
+            let elapsed = (Utc::now() - issued_at).num_seconds();
+            if (0..RESEND_COOLDOWN_SECONDS).contains(&elapsed) {
+                return Err(EmailVerificationError::RecentlySent {
+                    user_id,
+                    cooldown_seconds: RESEND_COOLDOWN_SECONDS,
+                    retry_after_seconds: RESEND_COOLDOWN_SECONDS - elapsed,
+                });
+            }
+        }
+
+        let email = user.email.clone();
+        self.issue_email_verification(user).await?;
+        info!(user_id, "Verification email re-sent at the user's request");
+        Ok(email)
+    }
+
+    /// After a user changed their own email, send a verification link to the
+    /// new address if an email provider is configured.
+    ///
+    /// Best effort: with no provider configured the address simply stays
+    /// unverified, and a delivery failure is logged. Neither fails the email
+    /// change itself. Returns whether a link was sent.
+    pub async fn send_verification_for_changed_email(&self, user_id: i32) -> bool {
+        if !self.is_email_configured().await {
+            debug!(
+                user_id,
+                "No email provider configured; new address left unverified"
+            );
+            return false;
+        }
+        let result = match self.active_user_for_verification(user_id).await {
+            Ok(user) if user.email_verified => return false,
+            Ok(user) => self.issue_email_verification(user).await,
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(()) => true,
+            Err(error) => {
+                warn!(
+                    user_id,
+                    %error,
+                    "Could not send a verification email for a changed address"
+                );
+                false
+            }
+        }
+    }
+
+    async fn active_user_for_verification(
+        &self,
+        user_id: i32,
+    ) -> Result<temps_entities::users::Model, EmailVerificationError> {
+        temps_entities::users::Entity::find_by_id(user_id)
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| EmailVerificationError::Database { user_id, source })?
+            .ok_or(EmailVerificationError::UserNotFound { user_id })
+    }
+
+    /// Replace the user's verification credential with a fresh one (stored
+    /// only as a digest) and email the raw token to their current address.
+    async fn issue_email_verification(
+        &self,
+        user: temps_entities::users::Model,
+    ) -> Result<(), EmailVerificationError> {
+        let user_id = user.id;
+        let email = user.email.clone();
+        let token = self.generate_token();
+        let now = Utc::now();
+
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.email_verification_token = Set(Some(
+            crate::email_verification::hash_verification_token(&token),
+        ));
+        user_update.email_verification_expires = Set(Some(
+            now + Duration::hours(crate::email_verification::VERIFICATION_TOKEN_TTL_HOURS),
+        ));
+        user_update.updated_at = Set(now);
+        user_update
+            .update(self.db.as_ref())
+            .await
+            .map_err(|source| EmailVerificationError::Database { user_id, source })?;
+
+        let base_url = self
+            .get_settings()
+            .await
+            .map_err(|source| EmailVerificationError::Database { user_id, source })?
+            .external_url
+            .unwrap_or_else(|| DEFAULT_EXTERNAL_URL.to_string());
+
+        self.email_service
+            .send_verification_email(&email, &token, &base_url)
+            .await
+            .map_err(|error| EmailVerificationError::DeliveryFailed {
+                user_id,
+                email,
+                reason: error.to_string(),
+            })
     }
 
     /// Whether an email provider is configured for transactional mail.
@@ -3210,7 +3351,9 @@ mod tests {
             email: Set("unverified@example.com".to_string()),
             name: Set("Unverified User".to_string()),
             email_verified: Set(false),
-            email_verification_token: Set(Some(verification_token.clone())),
+            email_verification_token: Set(Some(
+                crate::email_verification::hash_verification_token(&verification_token),
+            )),
             email_verification_expires: Set(Some(Utc::now() + Duration::hours(24))),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -3245,7 +3388,9 @@ mod tests {
             email: Set("expired@example.com".to_string()),
             name: Set("Expired User".to_string()),
             email_verified: Set(false),
-            email_verification_token: Set(Some(verification_token.clone())),
+            email_verification_token: Set(Some(
+                crate::email_verification::hash_verification_token(&verification_token),
+            )),
             email_verification_expires: Set(Some(Utc::now() - Duration::hours(1))),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -3257,6 +3402,202 @@ mod tests {
 
         assert!(result.is_err());
         matches!(result.unwrap_err(), UserAuthError::InvalidToken);
+    }
+
+    /// Raw token from the verification link the mock captured last.
+    fn emailed_verification_token(email_service: &MockEmailService) -> String {
+        let emails = email_service.get_verification_emails();
+        let (_, _, url) = emails.last().expect("a verification email was sent");
+        url.split("token=")
+            .nth(1)
+            .expect("verification link carries a token")
+            .to_string()
+    }
+
+    async fn verification_test_env() -> Option<(TestDatabase, AuthService, Arc<MockEmailService>)> {
+        let db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e)
+                if temps_database::test_utils::is_container_runtime_unavailable(&e.to_string()) =>
+            {
+                println!("Docker not available, skipping test: {e}");
+                return None;
+            }
+            Err(e) => panic!("test database setup failed: {e}"),
+        };
+        settings::ActiveModel {
+            id: Set(1),
+            data: Set(serde_json::json!({ "external_url": "https://test.example.com" })),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+        let email_service = Arc::new(MockEmailService::new());
+        let auth_service = AuthService::new(
+            db.db.clone(),
+            email_service.clone(),
+            crate::mfa_guard::test_support::encryption(),
+        );
+        Some((db, auth_service, email_service))
+    }
+
+    async fn insert_unverified_user(db: &DatabaseConnection, email: &str) -> users::Model {
+        users::ActiveModel {
+            email: Set(email.to_string()),
+            name: Set("Unverified User".to_string()),
+            email_verified: Set(false),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap()
+    }
+
+    /// The verification credential is stored only as a digest: a database
+    /// read does not yield a usable link, the emailed raw token verifies,
+    /// and presenting the stored digest does not.
+    #[tokio::test]
+    async fn verification_token_is_stored_hashed() {
+        let Some((db, auth_service, email_service)) = verification_test_env().await else {
+            return;
+        };
+        let user = auth_service
+            .register_user(RegisterRequest {
+                email: "hashed-token@example.com".to_string(),
+                password: "SecurePass123!".to_string(),
+                name: "Hashed Token".to_string(),
+            })
+            .await
+            .unwrap();
+        let raw = emailed_verification_token(&email_service);
+        let stored = user
+            .email_verification_token
+            .clone()
+            .expect("a verification token is stored");
+        assert_ne!(stored, raw, "the raw token must not be stored");
+        assert_eq!(
+            stored,
+            crate::email_verification::hash_verification_token(&raw)
+        );
+
+        let result = auth_service.verify_email(&stored).await;
+        assert!(
+            matches!(result, Err(UserAuthError::InvalidToken)),
+            "the stored digest must not verify: {result:?}"
+        );
+        let unchanged = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!unchanged.email_verified);
+
+        let verified = auth_service.verify_email(&raw).await.unwrap();
+        assert!(verified.email_verified);
+        assert!(verified.email_verification_token.is_none());
+        assert!(
+            matches!(
+                auth_service.verify_email(&raw).await,
+                Err(UserAuthError::InvalidToken)
+            ),
+            "a verification link is single-use"
+        );
+    }
+
+    #[tokio::test]
+    async fn resend_issues_a_fresh_hashed_token_and_enforces_the_cooldown() {
+        let Some((db, auth_service, email_service)) = verification_test_env().await else {
+            return;
+        };
+        let user = insert_unverified_user(db.db.as_ref(), "resend@example.com").await;
+
+        let sent_to = auth_service
+            .resend_email_verification(user.id)
+            .await
+            .unwrap();
+        assert_eq!(sent_to, "resend@example.com");
+        let raw = emailed_verification_token(&email_service);
+        let stored = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.email_verification_token,
+            Some(crate::email_verification::hash_verification_token(&raw))
+        );
+
+        let again = auth_service.resend_email_verification(user.id).await;
+        assert!(
+            matches!(
+                again,
+                Err(EmailVerificationError::RecentlySent { user_id, retry_after_seconds, .. })
+                    if user_id == user.id && retry_after_seconds > 0
+            ),
+            "{again:?}"
+        );
+        assert_eq!(email_service.get_verification_emails().len(), 1);
+
+        auth_service.verify_email(&raw).await.unwrap();
+        let verified = auth_service.resend_email_verification(user.id).await;
+        assert!(
+            matches!(
+                verified,
+                Err(EmailVerificationError::AlreadyVerified { user_id, .. }) if user_id == user.id
+            ),
+            "{verified:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn resend_for_a_missing_user_reports_its_id() {
+        let Some((_db, auth_service, _)) = verification_test_env().await else {
+            return;
+        };
+        let result = auth_service.resend_email_verification(987_654).await;
+        assert!(
+            matches!(
+                result,
+                Err(EmailVerificationError::UserNotFound { user_id: 987_654 })
+            ),
+            "{result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changed_email_gets_a_verification_link_when_a_provider_exists() {
+        let Some((db, auth_service, email_service)) = verification_test_env().await else {
+            return;
+        };
+        let user = insert_unverified_user(db.db.as_ref(), "changed@example.com").await;
+
+        assert!(
+            auth_service
+                .send_verification_for_changed_email(user.id)
+                .await
+        );
+        let emails = email_service.get_verification_emails();
+        assert_eq!(emails.len(), 1);
+        assert_eq!(emails[0].0, "changed@example.com");
+        let raw = emailed_verification_token(&email_service);
+        assert!(
+            auth_service
+                .verify_email(&raw)
+                .await
+                .unwrap()
+                .email_verified
+        );
+
+        // Nothing is sent for an address that is already verified.
+        assert!(
+            !auth_service
+                .send_verification_for_changed_email(user.id)
+                .await
+        );
+        assert_eq!(email_service.get_verification_emails().len(), 1);
     }
 
     // MFA Tests

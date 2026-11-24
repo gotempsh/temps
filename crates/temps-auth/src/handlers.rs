@@ -3,10 +3,11 @@
 
 use super::AuthState;
 use crate::audit::{
-    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerifiedAudit, LoginAudit,
-    LoginFailedAudit, LogoutAudit, MfaDisabledAudit, MfaEnabledAudit, MfaSetupStartedAudit,
-    MfaVerificationFailedAudit, MfaVerifiedAudit, PasswordResetAudit, RoleAssignedAudit,
-    RoleRemovedAudit, StepUpVerificationAudit, UpdatedFields, UserCreatedAudit, UserDeletedAudit,
+    AdminPasswordResetAudit, ConcurrentSessionDetectedAudit, EmailVerificationRequestedAudit,
+    EmailVerifiedAudit, LoginAudit, LoginFailedAudit, LogoutAudit, MfaDisabledAudit,
+    MfaEnabledAudit, MfaSetupStartedAudit, MfaVerificationFailedAudit, MfaVerifiedAudit,
+    PasswordResetAudit, RoleAssignedAudit, RoleRemovedAudit, StepUpVerificationAudit,
+    UpdatedFields, UserCreatedAudit, UserDeletedAudit, UserEmailMarkedVerifiedAudit,
     UserRestoredAudit, UserUpdatedAudit,
 };
 use crate::avatar::generate_avatar_data_url;
@@ -243,6 +244,7 @@ pub async fn get_current_user(RequireAuth(auth): RequireAuth) -> impl IntoRespon
         email: Some(user.email.clone()),
         avatar_url: generate_avatar_data_url(&user.name),
         mfa_enabled: user.mfa_enabled,
+        email_verified: user.email_verified,
         role: auth.effective_role.to_string(),
     };
     Json(user_response).into_response()
@@ -721,6 +723,8 @@ pub async fn verify_step_up(
         reset_password,
         change_required_password,
         verify_email,
+        resend_email_verification,
+        mark_user_email_verified,
         list_users,
         create_user,
         delete_user,
@@ -758,6 +762,7 @@ pub async fn verify_step_up(
             RequiredPasswordChangeResponse,
             AuthResponse,
             EmailStatusResponse,
+            VerificationEmailSentResponse,
             crate::oidc_types::OidcProviderSummary,
             RouteUser,
             RouteRole,
@@ -811,6 +816,7 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
             post(crate::cli_device_handler::cli_device_start),
         )
         .route("/auth/password-reset/request", post(request_password_reset))
+        .route("/auth/resend-verification", post(resend_email_verification))
         .route("/auth/password-reset/verify", post(reset_password))
         .route(
             "/auth/password-change-required",
@@ -885,6 +891,10 @@ pub fn configure_routes() -> Router<Arc<AuthState>> {
         .route("/users/{user_id}", delete(delete_user))
         .route("/users/{user_id}", patch(update_user))
         .route("/users/{user_id}/restore", post(restore_user))
+        .route(
+            "/users/{user_id}/verify-email",
+            post(mark_user_email_verified),
+        )
         .route("/users/{user_id}/password", post(reset_user_password))
         .route("/users/{user_id}/roles", post(assign_role))
         .route("/users/{user_id}/roles/{role_type}", delete(remove_role));
@@ -1845,6 +1855,128 @@ pub async fn verify_email(
     }
 }
 
+/// Response of `POST /auth/resend-verification`.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct VerificationEmailSentResponse {
+    /// Address the verification link was sent to.
+    pub email: String,
+    pub message: String,
+}
+
+/// Email a fresh verification link to the signed-in user's address.
+///
+/// Needs an email provider: without one the request is refused with a 409
+/// that tells the user to ask an administrator, who can verify the address
+/// from the user's page. `GET /auth/email-status` reports up front whether a
+/// provider is configured.
+#[utoipa::path(
+    post,
+    path = "/auth/resend-verification",
+    responses(
+        (status = 200, description = "Verification email sent", body = VerificationEmailSentResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Only a user account can verify an email address"),
+        (status = 409, description = "No email provider is configured, or the address is already verified"),
+        (status = 429, description = "A verification email was sent recently, or too many requests"),
+        (status = 502, description = "The email provider could not deliver the email"),
+        (status = 500, description = "Internal server error")
+    ),
+    tag = "Authentication",
+    security(("bearer_auth" = []))
+)]
+pub async fn resend_email_verification(
+    State(state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<Json<VerificationEmailSentResponse>, Problem> {
+    // Self-service on the caller's own account, like changing one's own
+    // password: any real user may do it, deployment tokens may not.
+    let user = auth.require_user().map_err(|msg| {
+        problem_new(StatusCode::FORBIDDEN)
+            .with_title("User Required")
+            .with_detail(msg)
+    })?;
+    let user_id = user.id;
+
+    let email = state
+        .auth_service
+        .resend_email_verification(user_id)
+        .await?;
+
+    let audit = EmailVerificationRequestedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        email: email.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(VerificationEmailSentResponse {
+        message: format!("A verification link was sent to {email}."),
+        email,
+    }))
+}
+
+/// Mark a user's email address as verified (admin only).
+///
+/// For instances without an email provider, or a user who cannot receive the
+/// link. SSO sign-in is only linked onto an existing account whose address is
+/// verified, so this is how an administrator vouches for an address.
+#[utoipa::path(
+    tag = "Users",
+    post,
+    path = "/users/{user_id}/verify-email",
+    responses(
+        (status = 200, description = "Email address marked verified", body = RouteUserWithRoles),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden - requires the users:manage permission"),
+        (status = 404, description = "User not found"),
+        (status = 409, description = "User is deleted"),
+        (status = 500, description = "Internal server error")
+    ),
+    params(
+        ("user_id" = i32, Path, description = "User ID")
+    ),
+    security(
+        ("bearer_auth" = [])
+    )
+)]
+async fn mark_user_email_verified(
+    State(app_state): State<Arc<AuthState>>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(user_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, UsersManage);
+
+    let updated = app_state.user_service.mark_email_verified(user_id).await?;
+    info!(
+        admin_id = auth.user_id(),
+        user_id, "Administrator marked a user's email address verified"
+    );
+
+    let audit = UserEmailMarkedVerifiedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent.as_str().to_string(),
+        },
+        target_user_id: user_id,
+        username: updated.name.clone(),
+        email: updated.email.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    let user = app_state.user_service.get_user_with_roles(user_id).await?;
+    Ok(Json(RouteUserWithRoles::from(user)).into_response())
+}
+
 impl From<UserServiceError> for Problem {
     fn from(err: UserServiceError) -> Self {
         match err {
@@ -1943,6 +2075,14 @@ impl From<UserServiceError> for Problem {
                     .with_title("User Deleted")
                     .with_detail(format!(
                         "User {} is deleted. Restore the user before resetting their password.",
+                        user_id
+                    ))
+            }
+            UserServiceError::EmailVerificationOnDeletedUser { user_id } => {
+                problem_new(StatusCode::CONFLICT)
+                    .with_title("User Deleted")
+                    .with_detail(format!(
+                        "User {} is deleted. Restore the user before verifying their email address.",
                         user_id
                     ))
             }
@@ -2244,6 +2384,8 @@ async fn create_user(
             create_req.password.clone(),
             roles.clone(),
             create_req.must_change_password,
+            // The administrator creating the account vouches for its address.
+            crate::user_service::InitialEmailStatus::Verified,
         )
         .await?;
 
@@ -2465,14 +2607,27 @@ async fn update_self(
         .await?;
     }
 
-    let updated_user = app_state
+    // A self-chosen address is unverified until the owner proves it (emailed
+    // link) or an administrator verifies it: SSO account linking trusts
+    // `email_verified`, so an unproven address must never carry it.
+    let update = app_state
         .user_service
         .update_user(
             auth.user_id(),
             update_req.email.clone(),
             update_req.name.clone(),
+            crate::user_service::EmailChangeOrigin::SelfService,
         )
         .await?;
+    if update.email_changed {
+        // Best effort, never fails the request; without an email provider
+        // the address just stays unverified.
+        app_state
+            .auth_service
+            .send_verification_for_changed_email(auth.user_id())
+            .await;
+    }
+    let updated_user = update.user;
 
     // Create audit log
     let audit_context = AuditContext {
@@ -2551,10 +2706,17 @@ async fn update_user(
             .build());
     }
 
+    // An administrator setting a new address vouches for it.
     let updated_user = app_state
         .user_service
-        .update_user(user_id, update_req.email.clone(), update_req.name.clone())
-        .await?;
+        .update_user(
+            user_id,
+            update_req.email.clone(),
+            update_req.name.clone(),
+            crate::user_service::EmailChangeOrigin::Admin,
+        )
+        .await?
+        .user;
     info!("Successfully updated user {}", user_id);
 
     let audit_context = AuditContext {
@@ -4399,6 +4561,197 @@ mod tests {
         assert!(!summary.slug.is_empty());
         // Slug must carry the hash suffix (separated by '-')
         assert!(summary.slug.contains('-'));
+    }
+
+    /// Email-verification state driven through the real routes and the
+    /// production session middleware.
+    mod email_verification_http {
+        use crate::http_test_support::{auth_state, insert_user, router, send, session_cookie};
+        use axum::http::StatusCode;
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set, DatabaseConnection, EntityTrait};
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::types::RoleType;
+        use temps_entities::users;
+
+        async fn test_db() -> Option<TestDatabase> {
+            match TestDatabase::with_migrations().await {
+                Ok(db) => Some(db),
+                Err(error)
+                    if temps_database::test_utils::is_container_runtime_unavailable(
+                        &error.to_string(),
+                    ) =>
+                {
+                    println!("Docker not available, skipping test: {error}");
+                    None
+                }
+                Err(error) => panic!("test database setup failed: {error}"),
+            }
+        }
+
+        async fn user_with_role(
+            state: &crate::state::AuthState,
+            db: &DatabaseConnection,
+            email: &str,
+            role: RoleType,
+        ) -> users::Model {
+            let user = insert_user(db, email).await;
+            state
+                .user_service
+                .assign_role_by_type(user.id, role)
+                .await
+                .expect("assign role");
+            user
+        }
+
+        async fn unverified(db: &DatabaseConnection, email: &str) -> users::Model {
+            let user = insert_user(db, email).await;
+            let mut update: users::ActiveModel = user.into();
+            update.email_verified = Set(false);
+            update.email_verification_token = Set(Some("pending-digest".to_string()));
+            update.update(db).await.expect("mark unverified")
+        }
+
+        async fn reload(db: &DatabaseConnection, user_id: i32) -> users::Model {
+            users::Entity::find_by_id(user_id)
+                .one(db)
+                .await
+                .unwrap()
+                .expect("user exists")
+        }
+
+        #[tokio::test]
+        async fn mark_email_verified_is_admin_only() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            state.user_service.initialize_roles().await.unwrap();
+            let app = router(state.clone(), db.clone());
+            let admin = user_with_role(&state, &db, "admin@example.com", RoleType::Admin).await;
+            let member = user_with_role(&state, &db, "member@example.com", RoleType::User).await;
+            let target = unverified(&db, "target@example.com").await;
+            let uri = format!("/users/{}/verify-email", target.id);
+
+            let (status, body) = send(&app, "POST", &uri, None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "no token: {body}");
+
+            let member_cookie = session_cookie(&state, member.id).await;
+            let (status, body) =
+                send(&app, "POST", &uri, Some(("cookie", &member_cookie)), None).await;
+            assert_eq!(status, StatusCode::FORBIDDEN, "non-admin: {body}");
+            assert!(!reload(&db, target.id).await.email_verified);
+
+            let admin_cookie = session_cookie(&state, admin.id).await;
+            let (status, body) =
+                send(&app, "POST", &uri, Some(("cookie", &admin_cookie)), None).await;
+            assert_eq!(status, StatusCode::OK, "admin: {body}");
+            assert_eq!(body["user"]["email_verified"], true, "{body}");
+            let stored = reload(&db, target.id).await;
+            assert!(stored.email_verified);
+            assert!(stored.email_verification_token.is_none());
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/users/999999/verify-email",
+                Some(("cookie", &admin_cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("999999"),
+                "{body}"
+            );
+        }
+
+        #[tokio::test]
+        async fn admin_created_and_admin_changed_emails_are_verified() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            state.user_service.initialize_roles().await.unwrap();
+            let app = router(state.clone(), db.clone());
+            let admin = user_with_role(&state, &db, "admin@example.com", RoleType::Admin).await;
+            let admin_cookie = session_cookie(&state, admin.id).await;
+
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/users",
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({
+                    "username": "New Hire",
+                    "email": "New.Hire@Example.com",
+                    "roles": ["user"],
+                })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::CREATED, "{body}");
+            assert_eq!(body["user"]["email_verified"], true, "{body}");
+            assert_eq!(body["user"]["email"], "new.hire@example.com", "{body}");
+
+            let target = unverified(&db, "rename-me@example.com").await;
+            let (status, body) = send(
+                &app,
+                "PATCH",
+                &format!("/users/{}", target.id),
+                Some(("cookie", &admin_cookie)),
+                Some(serde_json::json!({ "email": "Renamed@Example.com" })),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let stored = reload(&db, target.id).await;
+            assert_eq!(stored.email, "renamed@example.com");
+            assert!(stored.email_verified);
+            assert!(stored.email_verification_token.is_none());
+        }
+
+        #[tokio::test]
+        async fn resend_without_an_email_provider_says_to_ask_an_admin() {
+            let Some(test_db) = test_db().await else {
+                return;
+            };
+            let db = test_db.db.clone();
+            let state = auth_state(db.clone());
+            state.user_service.initialize_roles().await.unwrap();
+            let app = router(state.clone(), db.clone());
+            let member = user_with_role(&state, &db, "member@example.com", RoleType::User).await;
+            let mut update: users::ActiveModel = member.clone().into();
+            update.email_verified = Set(false);
+            update.update(db.as_ref()).await.unwrap();
+
+            let (status, body) = send(&app, "POST", "/auth/resend-verification", None, None).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+            let cookie = session_cookie(&state, member.id).await;
+            let (status, body) = send(
+                &app,
+                "POST",
+                "/auth/resend-verification",
+                Some(("cookie", &cookie)),
+                None,
+            )
+            .await;
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(
+                body["error_code"], "EMAIL_PROVIDER_NOT_CONFIGURED",
+                "{body}"
+            );
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Ask an administrator"),
+                "{body}"
+            );
+        }
     }
 
     /// Second-factor hardening driven through the real routes and the

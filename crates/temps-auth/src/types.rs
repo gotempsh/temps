@@ -13,6 +13,10 @@ pub struct UserResponse {
     pub email: Option<String>,
     pub avatar_url: String,
     pub mfa_enabled: bool,
+    /// Whether something trusted vouched for `email` (an administrator, the
+    /// identity provider, or the user clicking the emailed link). SSO sign-in
+    /// is only linked onto an account whose address is verified.
+    pub email_verified: bool,
     /// User's role (e.g., "admin", "user", "demo")
     pub role: String,
 }
