@@ -2340,10 +2340,28 @@ fn public_only_app(health: Router, public_router: Router) -> Router {
         .merge(health)
         .nest("/api", public_router)
         .fallback(public_only_not_found)
-        .layer(axum::middleware::from_fn(
-            temps_core::api_problems::problem_details_for_unhandled,
-        ))
+        .layer(axum::middleware::from_fn(public_only_problem_details))
         .layer(axum::middleware::from_fn(track_server_errors))
+}
+
+/// Whether this listener hides which platform serves it (the default), read
+/// from the settings the request carries.
+fn hides_platform_identity(req: &Request) -> bool {
+    req.extensions()
+        .get::<Arc<temps_config::ConfigService>>()
+        .is_none_or(|settings| !settings.expose_platform_identity())
+}
+
+/// [`temps_core::api_problems::problem_details_for_unhandled`] when the
+/// operator exposes the platform identity. Its problem types name the
+/// platform (`https://temps.sh/probs/method-not-allowed`), so a hidden
+/// listener answers an unsupported method or a malformed body with the
+/// framework's bare response instead, as it answers an unknown path.
+async fn public_only_problem_details(req: Request, next: axum::middleware::Next) -> Response {
+    if hides_platform_identity(&req) {
+        return next.run(req).await;
+    }
+    temps_core::api_problems::problem_details_for_unhandled(req, next).await
 }
 
 /// Serve the public-only app until shutdown. Resolves immediately when this
@@ -2374,10 +2392,7 @@ async fn serve_public_only(
 async fn public_only_not_found(req: Request) -> Response {
     use axum::response::IntoResponse;
 
-    let hide_identity = req
-        .extensions()
-        .get::<Arc<temps_config::ConfigService>>()
-        .is_none_or(|settings| !settings.expose_platform_identity());
+    let hide_identity = hides_platform_identity(&req);
     let headers = req.headers();
     let wants_html = !req.uri().path().starts_with("/api/")
         && headers
@@ -2589,30 +2604,7 @@ mod public_only_app_tests {
     #[tokio::test]
     async fn public_ingress_exposes_platform_identity_only_when_enabled() {
         for expose in [None, Some(false), Some(true)] {
-            let now = chrono::Utc::now();
-            let settings = temps_config::AppSettings {
-                expose_platform_identity: expose,
-                ..Default::default()
-            };
-            let db = Arc::new(
-                sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                    .append_query_results(vec![vec![temps_entities::settings::Model {
-                        id: 1,
-                        data: settings.to_json(),
-                        created_at: now,
-                        updated_at: now,
-                    }]])
-                    .into_connection(),
-            );
-            let config = temps_config::ServerConfig::new(
-                "127.0.0.1:3000".into(),
-                "postgresql://test".into(),
-                None,
-                None,
-            )
-            .unwrap();
-            let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
-            service.get_settings().await.unwrap();
+            let service = identity_settings(expose).await;
             let request = Request::builder()
                 .uri("/dashboard")
                 .header(header::HOST, "hooks.example.test")
@@ -2629,6 +2621,74 @@ mod public_only_app_tests {
                     .to_lowercase()
                     .contains("temps"),
                 expose == Some(true)
+            );
+        }
+    }
+
+    /// Settings with `expose_platform_identity` as given, loaded.
+    async fn identity_settings(expose: Option<bool>) -> Arc<temps_config::ConfigService> {
+        let now = chrono::Utc::now();
+        let settings = temps_config::AppSettings {
+            expose_platform_identity: expose,
+            ..Default::default()
+        };
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![temps_entities::settings::Model {
+                    id: 1,
+                    data: settings.to_json(),
+                    created_at: now,
+                    updated_at: now,
+                }]])
+                .into_connection(),
+        );
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".into(),
+            "postgresql://test".into(),
+            None,
+            None,
+        )
+        .unwrap();
+        let service = Arc::new(temps_config::ConfigService::new(Arc::new(config), db));
+        service.get_settings().await.unwrap();
+        service
+    }
+
+    /// An unsupported method on a public route is answered by the method
+    /// fallback, not `public_only_not_found`, so the problem rewrite must
+    /// follow the identity setting itself: the method-not-allowed problem
+    /// type names the platform.
+    #[tokio::test]
+    async fn a_wrong_method_names_the_platform_only_when_identity_is_exposed() {
+        for expose in [None, Some(false), Some(true)] {
+            let service = identity_settings(expose).await;
+            let response = send(
+                app().layer(axum::Extension(service)),
+                request("POST", "/healthz"),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::ALLOW)
+                    .and_then(|value| value.to_str().ok()),
+                Some("GET,HEAD"),
+                "{expose:?}"
+            );
+            let body = axum::body::to_bytes(response.into_body(), 65536)
+                .await
+                .unwrap();
+            let body = String::from_utf8_lossy(&body);
+            assert_eq!(
+                body.contains(temps_core::api_problems::METHOD_NOT_ALLOWED_PROBLEM_TYPE),
+                expose == Some(true),
+                "{expose:?}: {body}"
+            );
+            assert_eq!(
+                body.to_lowercase().contains("temps"),
+                expose == Some(true),
+                "{expose:?}: {body}"
             );
         }
     }
