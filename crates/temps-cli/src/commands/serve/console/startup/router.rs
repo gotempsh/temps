@@ -192,8 +192,11 @@ pub(super) async fn build_router(
     // browsers off the admin listener from untrusted networks; a channel
     // call arrives in-process from a plugin the operator installed, and is
     // authorised by an actor token plus the handler's own permission check).
-    let plugin_api_router =
-        Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
+    let plugin_api_router = Router::new()
+        .nest("/api", public_router.clone().merge(admin_router.clone()))
+        .layer(axum::middleware::from_fn(
+            temps_core::api_problems::problem_details_for_unhandled,
+        ));
 
     // ADR-045 §3: a second clone of `admin_router`, shaped exactly like
     // `admin_app` below (`nest("/api", ..)` + the static-file fallback) but
@@ -207,7 +210,10 @@ pub(super) async fn build_router(
     // drive in-process.
     let console_router = Router::new()
         .nest("/api", admin_router.clone())
-        .fallback(serve_static_file);
+        .fallback(serve_static_file)
+        .layer(axum::middleware::from_fn(
+            temps_core::api_problems::problem_details_for_unhandled,
+        ));
     // Nodes paired from the control plane reach it over the WireGuard mesh
     // (ADR 048 D3); that listener serves only the routes nodes call.
     crate::commands::serve::node_api::spawn(
@@ -319,6 +325,9 @@ pub(super) fn assemble_public_apps(
         .merge(health_router(ready_flag.clone()))
         .merge(mcp_root_router)
         .nest("/api", public_router)
+        .layer(axum::middleware::from_fn(
+            temps_core::api_problems::problem_details_for_unhandled,
+        ))
         .layer(axum::middleware::from_fn(track_server_errors));
     // Request spans for OpenTelemetry export; a no-op unless `--otel-export`.
     let public_app = crate::otel_export::layer_requests(public_app);
@@ -340,6 +349,9 @@ pub(super) fn assemble_admin_app(
         .merge(gate_authorize_router)
         .nest("/api", admin_router)
         .fallback(serve_static_file)
+        .layer(axum::middleware::from_fn(
+            temps_core::api_problems::problem_details_for_unhandled,
+        ))
         .layer(axum::middleware::from_fn(track_server_errors));
     let admin_app = crate::otel_export::layer_requests(admin_app);
 
@@ -482,6 +494,72 @@ mod tests {
             status(&admin_app, temps_core::gate::AUTHORIZE_PATH).await,
             StatusCode::OK
         );
+    }
+
+    /// An unknown route and an unreadable JSON body both answer in the one
+    /// error format every handler uses, so a client can tell a missing
+    /// endpoint from a missing object and needs no text/plain parser.
+    #[tokio::test]
+    async fn the_admin_app_answers_unknown_routes_and_bad_bodies_with_problems() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code, reason = "deserialized only")]
+        struct Probe {
+            interval: i32,
+        }
+        let router = admin_router().route(
+            "/probe",
+            axum::routing::post(|axum::Json(_): axum::Json<Probe>| async { "ok" }),
+        );
+        let admin_app = assemble_admin_app(router, gate_authorize_router(), &admin_gate(&[]));
+
+        let read = |response: Response| async move {
+            let status = response.status();
+            let content_type = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .expect("body");
+            let problem: serde_json::Value =
+                serde_json::from_slice(&body).expect("problem body is JSON");
+            (status, content_type, problem)
+        };
+
+        let unknown = admin_app
+            .clone()
+            .oneshot(request("/api/not-a-route", "127.0.0.1:50000"))
+            .await
+            .expect("router responds");
+        let (status, content_type, problem) = read(unknown).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(content_type.as_deref(), Some("application/problem+json"));
+        assert_eq!(
+            problem["type"],
+            temps_core::api_problems::ROUTE_NOT_FOUND_PROBLEM_TYPE
+        );
+
+        let mut bad_body = Request::builder()
+            .method("POST")
+            .uri("/api/probe")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(r#"{"interval":"often"}"#))
+            .expect("request builds");
+        bad_body.extensions_mut().insert(ConnectInfo(
+            "127.0.0.1:50000"
+                .parse::<std::net::SocketAddr>()
+                .expect("peer address"),
+        ));
+        let rejected = admin_app.oneshot(bad_body).await.expect("router responds");
+        let (status, content_type, problem) = read(rejected).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(content_type.as_deref(), Some("application/problem+json"));
+        assert_eq!(
+            problem["type"],
+            temps_core::api_problems::INVALID_REQUEST_PROBLEM_TYPE
+        );
+        assert_eq!(problem["field"], "interval");
     }
 
     #[tokio::test]
