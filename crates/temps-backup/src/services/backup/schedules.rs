@@ -584,8 +584,9 @@ impl BackupService {
 
     // Add this new validation function
     fn validate_backup_schedule(&self, schedule: &str) -> Result<(), BackupError> {
-        let schedule = Schedule::from_str(schedule)
-            .map_err(|e| BackupError::Validation(format!("Invalid backup schedule: {}", e)))?;
+        let schedule = Schedule::from_str(schedule).map_err(|e| {
+            BackupError::Validation(describe_invalid_schedule(schedule, &e.to_string()))
+        })?;
 
         // Get the first two occurrences
         let upcoming = schedule.upcoming(Utc);
@@ -935,6 +936,38 @@ impl BackupService {
         self.fire_lifecycle_reconcile(updated_schedule.s3_source_id);
 
         Ok(updated_schedule)
+    }
+}
+
+/// The 400 detail for a schedule expression the cron parser rejected.
+///
+/// Backup schedules use a seconds-first cron expression, which most people do
+/// not expect: the parser's own message only points a caret at the input. Say
+/// what is expected, with an example, and when the input looks like a
+/// standard five-field expression, what to send instead.
+pub(crate) fn describe_invalid_schedule(expression: &str, parser_error: &str) -> String {
+    const EXPECTED: &str = "expected 6 or 7 space-separated fields with seconds first \
+         (`sec min hour day-of-month month day-of-week [year]`), \
+         for example `0 0 3 * * *` for every day at 03:00 UTC";
+    let fields: Vec<&str> = expression.split_whitespace().collect();
+    if fields.len() == 5 {
+        format!(
+            "Invalid backup schedule '{expression}': {EXPECTED}. It has 5 fields, the \
+             standard cron format without seconds; add a leading seconds field: `0 {}`",
+            fields.join(" ")
+        )
+    } else {
+        // The parser renders a caret diagram over several lines; one line
+        // reads better in a problem detail.
+        let parser_error = parser_error
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!(
+            "Invalid backup schedule '{expression}': {EXPECTED}. It has {} field(s). \
+             Parser error: {parser_error}",
+            fields.len()
+        )
     }
 }
 

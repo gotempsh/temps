@@ -109,11 +109,57 @@ pub enum BackupError {
     #[error("Cleanup preview is stale: {detail}. Run a new dry-run preview before deleting")]
     CleanupPreviewStale { detail: String },
 
+    /// Another request changed which S3 source is the default while this one
+    /// was writing it. Nothing was saved; repeating the request is safe.
+    #[error(
+        "S3 source '{name}' could not be saved: another request changed the default S3 source at the same time; retry the request"
+    )]
+    DefaultSourceConflict { name: String },
+
+    /// The operation failed for a reason expected to clear by itself (a
+    /// managed service being stopped or removed, a database connection that
+    /// could not be acquired). Nothing irreversible happened; the client
+    /// should repeat the request after `retry_after_secs`.
+    #[error("Could not {operation}: {reason}. Retry in {retry_after_secs} seconds")]
+    TemporarilyUnavailable {
+        operation: String,
+        reason: String,
+        retry_after_secs: u64,
+    },
+
+    /// A command could not be started in a managed service's container: the
+    /// container is missing, stopped or restarting, usually because the
+    /// service is being stopped or deleted at the same time. `reason` is the
+    /// container runtime's message; it is logged, never sent to clients.
+    #[error(
+        "Managed service '{service_name}' could not run the command in its container \
+         (it may be restarting, stopping or being deleted): {reason}"
+    )]
+    ServiceContainerUnavailable {
+        service_name: String,
+        container: String,
+        reason: String,
+    },
+
     #[error("Access denied to {resource}: {detail}")]
     Forbidden { resource: String, detail: String },
 
     #[error("Failed to verify access to {resource}: {detail}")]
     Authorization { resource: String, detail: String },
+}
+
+impl BackupError {
+    /// A database failure that clears without operator action: the pool
+    /// could not hand out a connection, or the connection dropped. Repeating
+    /// the request is the right response to it.
+    pub fn is_transient_database_failure(&self) -> bool {
+        matches!(
+            self,
+            BackupError::Database(
+                sea_orm::DbErr::ConnectionAcquire(_) | sea_orm::DbErr::Conn(_)
+            )
+        )
+    }
 }
 
 impl From<aws_sdk_s3::error::SdkError<aws_sdk_s3::operation::put_object::PutObjectError>>

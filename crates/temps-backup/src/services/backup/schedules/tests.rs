@@ -1818,3 +1818,36 @@ async fn reconcile_default_schedules_provisions_mariadb_once() {
     assert_eq!(count_after, 1);
     assert_eq!(total, 1, "second reconcile must not create a duplicate");
 }
+
+/// A standard five-field cron expression used to fail with only the parser's
+/// caret diagram; the detail now says the format is seconds-first and what
+/// to send instead.
+#[tokio::test]
+async fn five_field_cron_is_rejected_with_the_expected_format_and_a_fix() {
+    let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    let backup_service = make_scope_test_service(db);
+
+    let Err(BackupError::Validation(detail)) = backup_service.validate_backup_schedule("0 3 * * *")
+    else {
+        panic!("a five-field expression must be a validation error");
+    };
+    assert!(detail.contains("6 or 7"), "{detail}");
+    assert!(detail.contains("seconds first"), "{detail}");
+    assert!(detail.contains("`0 0 3 * * *`"), "{detail}");
+    assert!(
+        detail.contains("add a leading seconds field: `0 0 3 * * *`"),
+        "{detail}"
+    );
+
+    let Err(BackupError::Validation(detail)) = backup_service.validate_backup_schedule("every day")
+    else {
+        panic!("garbage must be a validation error");
+    };
+    assert!(detail.contains("6 or 7"), "{detail}");
+    assert!(detail.contains("It has 2 field(s)"), "{detail}");
+    assert!(!detail.contains('\n'), "the detail is one line: {detail}");
+
+    assert!(backup_service
+        .validate_backup_schedule("0 0 3 * * *")
+        .is_ok());
+}

@@ -34,6 +34,9 @@ pub struct S3SourceDeletedAudit {
     pub source_id: i32,
     pub name: String,
     pub bucket_name: String,
+    /// Source that became the default because the deleted one was it.
+    pub promoted_default_source_id: Option<i32>,
+    pub promoted_default_source_name: Option<String>,
 }
 
 // Backup audit structs

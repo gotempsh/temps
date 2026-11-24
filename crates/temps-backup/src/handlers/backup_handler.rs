@@ -38,7 +38,7 @@ use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::secret_string::SecretString;
 use temps_core::RequestMetadata;
 use temps_core::SensitiveAction;
-use tracing::error;
+use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
 impl From<ResolveEngineError> for Problem {
@@ -138,6 +138,49 @@ impl From<BackupError> for Problem {
                     .with_detail(error.to_string())
             }
 
+            BackupError::DefaultSourceConflict { .. } => problemdetails::new(StatusCode::CONFLICT)
+                .with_type(DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE)
+                .with_title("Default S3 Source Changed Concurrently")
+                .with_detail(error.to_string()),
+
+            BackupError::TemporarilyUnavailable {
+                retry_after_secs, ..
+            } => temporarily_unavailable_problem(error.to_string(), retry_after_secs),
+
+            // The runtime's message names containers and hosts: log it, and
+            // tell the client which service was busy and when to retry.
+            BackupError::ServiceContainerUnavailable {
+                ref service_name,
+                ref container,
+                ref reason,
+            } => {
+                warn!(
+                    service = %service_name,
+                    container = %container,
+                    reason = %reason,
+                    "managed service container could not run a backup command"
+                );
+                temporarily_unavailable_problem(
+                    format!(
+                        "Managed service '{service_name}' could not run the backup command in \
+                         its container; it may be restarting, stopping or being deleted. \
+                         Retry the request"
+                    ),
+                    SERVICE_CONTAINER_RETRY_AFTER_SECS,
+                )
+            }
+
+            // A pool that could not hand out a connection, or a connection
+            // that dropped, clears by itself: tell the client to retry
+            // instead of reporting a failure it cannot act on.
+            BackupError::Database(ref db_error) if error.is_transient_database_failure() => {
+                error!(error = %db_error, "backup request hit a transient database failure");
+                temporarily_unavailable_problem(
+                    "The backup database is temporarily unavailable; retry the request".to_string(),
+                    TRANSIENT_RETRY_AFTER_SECS,
+                )
+            }
+
             internal_error @ (BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
@@ -148,10 +191,95 @@ impl From<BackupError> for Problem {
             | BackupError::Serialization(_)
             | BackupError::Authorization { .. }) => {
                 error!(error = %internal_error, "backup request failed internally");
+                // The underlying message can name endpoints, containers or
+                // credentials' owners, so it stays in the server log. The
+                // client still learns which part failed, which is what it
+                // needs to decide between retrying and giving up.
+                let (failure, detail) = internal_failure_summary(&internal_error);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail("The backup operation could not be completed")
+                    .with_value("failure", failure)
+                    .with_detail(detail)
             }
+        }
+    }
+}
+
+/// Problem `type` for a create or set-default that lost a race for the
+/// default S3 source.
+pub const DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/s3-source-default-conflict";
+
+/// Problem `type` for a backup request that failed for a transient reason.
+pub const TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE: &str =
+    "https://temps.sh/probs/backup-temporarily-unavailable";
+
+/// Seconds a client should wait before retrying after a transient failure.
+const TRANSIENT_RETRY_AFTER_SECS: u64 = 5;
+
+/// Seconds to wait when a managed service's container was busy: long enough
+/// for a stop, restart or deletion to finish.
+const SERVICE_CONTAINER_RETRY_AFTER_SECS: u64 = 15;
+
+fn temporarily_unavailable_problem(detail: String, retry_after_secs: u64) -> Problem {
+    problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+        .with_type(TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE)
+        .with_title("Temporarily Unavailable")
+        .with_value("retry_after_seconds", retry_after_secs)
+        .with_detail(detail)
+        .with_retry_after(retry_after_secs)
+}
+
+/// What part of a backup request failed, as a stable slug and a sentence that
+/// carries no internal detail.
+fn internal_failure_summary(error: &BackupError) -> (&'static str, &'static str) {
+    match error {
+        BackupError::Database(_) => (
+            "database",
+            "A database operation failed while processing the backup request",
+        ),
+        BackupError::S3(_) => (
+            "object_storage",
+            "The request to the backup's object storage failed",
+        ),
+        BackupError::Configuration(_) => (
+            "configuration",
+            "The stored backup configuration could not be used",
+        ),
+        BackupError::ExternalService(_) => (
+            "managed_service",
+            "The managed service the backup belongs to could not run the operation",
+        ),
+        BackupError::NotificationError(_) => {
+            ("notification", "Sending the backup notification failed")
+        }
+        BackupError::Io(_) => ("io", "A local file operation failed"),
+        BackupError::Serialization(_) => (
+            "metadata",
+            "The backup's stored metadata could not be read or written",
+        ),
+        BackupError::Authorization { .. } => (
+            "authorization",
+            "Access to the backup could not be verified",
+        ),
+        BackupError::Internal { .. }
+        | BackupError::Validation(_)
+        | BackupError::InvalidS3Endpoint { .. }
+        | BackupError::S3Unreachable { .. }
+        | BackupError::Schedule(_)
+        | BackupError::NotFound { .. }
+        | BackupError::Unsupported(_)
+        | BackupError::AlreadyInFlight { .. }
+        | BackupError::ScheduleRunAlreadyInFlight { .. }
+        | BackupError::BackupNotTerminal { .. }
+        | BackupError::BackupHasRestoreHistory { .. }
+        | BackupError::PartialDeletion { .. }
+        | BackupError::CleanupPreviewStale { .. }
+        | BackupError::DefaultSourceConflict { .. }
+        | BackupError::TemporarilyUnavailable { .. }
+        | BackupError::ServiceContainerUnavailable { .. }
+        | BackupError::Forbidden { .. } => {
+            ("internal", "The backup operation could not be completed")
         }
     }
 }
@@ -1703,6 +1831,7 @@ async fn list_s3_sources(
         (status = 400, description = "Invalid request", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 409, description = "Another request changed the default source at the same time; nothing was saved, retry", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1866,6 +1995,7 @@ fn s3_source_updated_fields(request: &UpdateS3SourceRequest) -> HashMap<String, 
     tag = "Backups",
     delete,
     path = "/backups/s3-sources/{id}",
+    description = "Delete an S3 source. A source still referenced by a backup schedule or by backup records is refused with 400 (delete those first). Deleting the default source while others exist makes the oldest remaining source the default, in the same transaction; the change is recorded in the audit log.",
     responses(
         (status = 204, description = "S3 source deleted"),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
@@ -1888,7 +2018,7 @@ async fn delete_s3_source(
     // Get source details before deletion for audit log
     let source = app_state.backup_service.get_s3_source(id).await?;
 
-    app_state.backup_service.delete_s3_source(id).await?;
+    let deletion = app_state.backup_service.delete_s3_source(id).await?;
 
     let audit = S3SourceDeletedAudit {
         context: AuditContext {
@@ -1899,6 +2029,8 @@ async fn delete_s3_source(
         source_id: source.id,
         name: source.name,
         bucket_name: source.bucket_name,
+        promoted_default_source_id: deletion.promoted_default.as_ref().map(|next| next.id),
+        promoted_default_source_name: deletion.promoted_default.map(|next| next.name),
     };
 
     if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
@@ -2668,7 +2800,7 @@ async fn run_backup_for_source(
     tag = "Backups",
     delete,
     path = "/backups/{id}",
-    params(("id" = String, Path, description = "Backup UUID")),
+    params(("id" = String, Path, description = "Backup UUID (`backup_id`), or its integer `id` as returned by the backup lists")),
     responses(
         (status = 204, description = "Backup deleted"),
         (status = 400, description = "Backup artifact cannot be safely attributed", body = ProblemDetails),
@@ -2676,7 +2808,8 @@ async fn run_backup_for_source(
         (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup not found", body = ProblemDetails),
         (status = 409, description = "Backup is running, referenced, or lacks safe artifact identity", body = ProblemDetails),
-        (status = 500, description = "Object storage or database error", body = ProblemDetails),
+        (status = 500, description = "Object storage or database error; the `failure` field says which", body = ProblemDetails),
+        (status = 503, description = "Transient failure (the backup's service is restarting or being deleted, or the database is unavailable); retry after the `Retry-After` header", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -2684,13 +2817,17 @@ async fn delete_backup(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<BackupAppState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Path(id): Path<String>,
+    Path(reference): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    // The UUID or the integer `id` the backup lists return, exactly as
+    // `GET /backups/{id}` accepts. Everything below (the sensitive-action
+    // binding, the audit entries, the deletion) uses the resolved UUID.
     let scoped_backup = app_state
         .backup_service
-        .backup_with_access_scope_by_uuid(&id)
+        .backup_with_access_scope_by_reference(&reference)
         .await?;
+    let id = scoped_backup.backup.backup_id.clone();
     require_backup_access(
         &app_state,
         &auth,
@@ -3663,6 +3800,110 @@ mod tests {
             problem.body["detail"],
             "The backup operation could not be completed"
         );
+    }
+
+    /// A container that vanished under a WAL-G command (its service being
+    /// stopped or deleted) is a retryable 503 naming the service, not a
+    /// generic 500; the runtime's message, which names the container, stays
+    /// in the log.
+    #[test]
+    fn busy_service_container_is_a_retryable_503() {
+        let problem = Problem::from(BackupError::ServiceContainerUnavailable {
+            service_name: "orders-db".to_string(),
+            container: "temps-postgres-orders-db-internal".to_string(),
+            reason: "No such container: temps-postgres-orders-db-internal".to_string(),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(15));
+        assert_eq!(problem.body["type"], TEMPORARILY_UNAVAILABLE_PROBLEM_TYPE);
+        assert_eq!(problem.body["retry_after_seconds"], 15);
+        let detail = problem.body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("orders-db"), "{detail}");
+        assert!(!detail.contains("internal"), "{detail}");
+
+        let response = axum::response::IntoResponse::into_response(problem);
+        assert_eq!(
+            response
+                .headers()
+                .get(axum::http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("15")
+        );
+    }
+
+    #[test]
+    fn transient_database_failures_are_retryable_503s() {
+        let problem = Problem::from(BackupError::Database(sea_orm::DbErr::ConnectionAcquire(
+            sea_orm::error::ConnAcquireErr::Timeout,
+        )));
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(5));
+
+        let problem = Problem::from(BackupError::TemporarilyUnavailable {
+            operation: "delete backup 7".to_string(),
+            reason: "the service is restarting".to_string(),
+            retry_after_secs: 30,
+        });
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(problem.retry_after_secs(), Some(30));
+
+        // A query that failed for another reason is not transient.
+        let problem = Problem::from(BackupError::Database(sea_orm::DbErr::Custom(
+            "relation does not exist".to_string(),
+        )));
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(problem.retry_after_secs(), None);
+    }
+
+    /// Different internal failures used to share one detail, so a client could
+    /// not tell an object-store failure from a database one.
+    #[test]
+    fn internal_failures_say_which_part_failed_without_leaking_it() {
+        let cases = [
+            (
+                BackupError::S3("put_object to s3://secret-bucket failed".to_string()),
+                "object_storage",
+            ),
+            (
+                BackupError::Database(sea_orm::DbErr::Custom("syntax error".to_string())),
+                "database",
+            ),
+            (
+                BackupError::ExternalService("docker exec failed on host-7".to_string()),
+                "managed_service",
+            ),
+            (
+                BackupError::Internal {
+                    message: "anything".to_string(),
+                },
+                "internal",
+            ),
+        ];
+        for (error, failure) in cases {
+            let problem = Problem::from(error);
+            assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(problem.body["failure"], failure);
+            let detail = problem.body["detail"].as_str().unwrap_or_default();
+            assert!(
+                !detail.contains("secret-bucket")
+                    && !detail.contains("host-7")
+                    && !detail.contains("syntax"),
+                "{detail}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_source_conflict_is_a_409_with_a_stable_type() {
+        let problem = Problem::from(BackupError::DefaultSourceConflict {
+            name: "primary".to_string(),
+        });
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(problem.body["type"], DEFAULT_SOURCE_CONFLICT_PROBLEM_TYPE);
+        assert!(problem.body["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("'primary'")));
     }
 
     /// The secret key an operator (or the assistant, through a secret slot)

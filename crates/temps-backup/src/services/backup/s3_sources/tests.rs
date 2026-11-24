@@ -1090,3 +1090,198 @@ async fn test_update_s3_source_tls_on_an_aws_source_is_ignored() {
     assert_eq!(updated.name, "renamed");
     assert_eq!(updated.endpoint, None);
 }
+
+/// A real database: the default-assignment race and the single-default
+/// index only exist in PostgreSQL, not in the mock.
+async fn real_database_service() -> Option<(temps_test_utils::TestDatabase, BackupService)> {
+    let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
+        Ok(test_db) => test_db,
+        Err(error) => {
+            println!("TestDatabase unavailable, skipping: {error}");
+            return None;
+        }
+    };
+    let service = make_scope_test_service(test_db.db.clone());
+    Some((test_db, service))
+}
+
+fn source_request(name: &str) -> CreateS3SourceRequest {
+    CreateS3SourceRequest {
+        name: name.to_string(),
+        bucket_name: "backups".to_string(),
+        bucket_path: format!("path-{name}"),
+        access_key_id: SecretString::new("access".to_string()),
+        secret_key: SecretString::new("secret".to_string()),
+        region: "us-east-1".to_string(),
+        endpoint: Some("http://storage.example.test:9000".to_string()),
+        use_tls: None,
+        force_path_style: Some(true),
+        is_default: None,
+        backing_service_id: None,
+        worker_credentials: None,
+    }
+}
+
+async fn default_source_ids(db: &sea_orm::DatabaseConnection) -> Vec<i32> {
+    s3_sources::Entity::find()
+        .filter(s3_sources::Column::IsDefault.eq(true))
+        .all(db)
+        .await
+        .expect("defaults should load")
+        .into_iter()
+        .map(|source| source.id)
+        .collect()
+}
+
+/// Two sources created at the same time on a server with none used to both
+/// decide they were the first, and the second failed on the single-default
+/// index with a generic 500. Several rounds, because each is a race.
+#[tokio::test]
+async fn concurrent_first_sources_both_succeed_with_exactly_one_default() {
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let service = Arc::new(service);
+    for round in 0..6 {
+        s3_sources::Entity::delete_many()
+            .exec(test_db.db.as_ref())
+            .await
+            .expect("table should clear between rounds");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let create = |name: String| {
+            let service = service.clone();
+            let barrier = barrier.clone();
+            tokio::spawn(async move {
+                barrier.wait().await;
+                service
+                    .persist_verified_s3_source(source_request(&name))
+                    .await
+            })
+        };
+        let first = create(format!("first-{round}"));
+        let second = create(format!("second-{round}"));
+        let (first, second) = (first.await.expect("task"), second.await.expect("task"));
+        assert!(
+            first.is_ok() && second.is_ok(),
+            "round {round}: both creates must succeed, got {first:?} and {second:?}"
+        );
+        assert_eq!(
+            default_source_ids(test_db.db.as_ref()).await.len(),
+            1,
+            "round {round}: exactly one of the two must be the default"
+        );
+    }
+}
+
+#[tokio::test]
+async fn deleting_the_default_promotes_the_oldest_remaining_source() {
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let first = service
+        .persist_verified_s3_source(source_request("first"))
+        .await
+        .expect("first source");
+    let second = service
+        .persist_verified_s3_source(source_request("second"))
+        .await
+        .expect("second source");
+    let third = service
+        .persist_verified_s3_source(source_request("third"))
+        .await
+        .expect("third source");
+    assert!(first.is_default && !second.is_default && !third.is_default);
+
+    let deletion = service
+        .delete_s3_source(first.id)
+        .await
+        .expect("deleting the default must not be refused while others exist");
+
+    assert!(deletion.deleted);
+    assert_eq!(
+        deletion.promoted_default,
+        Some(PromotedDefaultSource {
+            id: second.id,
+            name: "second".to_string(),
+        })
+    );
+    assert_eq!(
+        default_source_ids(test_db.db.as_ref()).await,
+        vec![second.id]
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_non_default_or_the_last_source_promotes_nothing() {
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    let first = service
+        .persist_verified_s3_source(source_request("first"))
+        .await
+        .expect("first source");
+    let second = service
+        .persist_verified_s3_source(source_request("second"))
+        .await
+        .expect("second source");
+
+    let deletion = service
+        .delete_s3_source(second.id)
+        .await
+        .expect("non-default delete");
+    assert_eq!(deletion.promoted_default, None);
+    assert_eq!(
+        default_source_ids(test_db.db.as_ref()).await,
+        vec![first.id]
+    );
+
+    let deletion = service
+        .delete_s3_source(first.id)
+        .await
+        .expect("last source delete");
+    assert!(deletion.deleted);
+    assert_eq!(deletion.promoted_default, None);
+    assert!(default_source_ids(test_db.db.as_ref()).await.is_empty());
+}
+
+/// A writer that bypasses the lock and loses the race on the single-default
+/// index gets a 409 the client can retry, not a generic 500.
+#[tokio::test]
+async fn a_second_default_row_is_reported_as_a_default_conflict() {
+    let Some((test_db, service)) = real_database_service().await else {
+        return;
+    };
+    service
+        .persist_verified_s3_source(source_request("first"))
+        .await
+        .expect("first source");
+    let encryption = EncryptionService::new("test_encryption_key_1234567890ab").unwrap();
+    let error = s3_sources::insert_encrypted(
+        test_db.db.as_ref(),
+        &encryption,
+        s3_sources::S3SourceCredentials {
+            name: "racer".to_string(),
+            bucket_name: "backups".to_string(),
+            bucket_path: "racer".to_string(),
+            access_key_id: "access".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(true),
+        },
+        true,
+        false,
+        None,
+    )
+    .await
+    .expect_err("the index allows one default");
+    let s3_sources::S3SourceCredentialError::Database { source, .. } = error else {
+        panic!("expected a database error, got {error:?}");
+    };
+    assert!(is_single_default_violation(&source), "{source:?}");
+    assert!(!is_single_default_violation(&sea_orm::DbErr::Custom(
+        "unrelated".to_string()
+    )));
+}
