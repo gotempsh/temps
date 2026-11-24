@@ -102,6 +102,11 @@ import {
   serviceRestoreRunsQuery,
 } from './service-restore/restore-queries'
 import {
+  mergeDiscovery,
+  visibleOrphans,
+  type SourceDiscovery,
+} from './service-restore/source-discovery'
+import {
   activeRestoreConflict,
   attachReasonFromLocationState,
   classifyQueryError,
@@ -358,6 +363,34 @@ export function ServiceRestore() {
         : undefined,
     enabled: effectiveSourceId !== undefined && !sourcesRefused,
   })
+  const scanResult =
+    includeScan && !sourcesRefused && !sourceBackupsQuery.isPlaceholderData
+      ? sourceBackupsQuery.data
+      : undefined
+  const [lastScan, setLastScan] = useState<{
+    sourceId?: number
+    result: typeof scanResult
+    discovery: SourceDiscovery
+  }>()
+  if (
+    scanResult &&
+    (lastScan?.result !== scanResult || lastScan.sourceId !== effectiveSourceId)
+  ) {
+    setLastScan({
+      sourceId: effectiveSourceId,
+      result: scanResult,
+      discovery: mergeDiscovery(
+        lastScan?.sourceId === effectiveSourceId
+          ? lastScan?.discovery
+          : undefined,
+        scanResult
+      ),
+    })
+  }
+  const discovery =
+    scanResult && lastScan?.sourceId === effectiveSourceId
+      ? lastScan?.discovery
+      : undefined
   // A role that may not read storage sources can still list and restore this
   // database's own backups, so the page falls back to them instead of
   // stopping at "ask an administrator".
@@ -383,10 +416,11 @@ export function ServiceRestore() {
   // Backups can be listed: from the chosen source, or from the database itself.
   const canListBackups = effectiveSourceId !== undefined || sourcesRefused
 
-  const allBackups = useMemo<SourceBackupEntry[]>(
-    () => backupIndex?.backups ?? [],
-    [backupIndex]
-  )
+  const allBackups = useMemo<SourceBackupEntry[]>(() => {
+    const rows = backupIndex?.backups ?? []
+    if (!discovery?.staleLocations.size) return rows
+    return [...rows, ...visibleOrphans(rows, discovery)]
+  }, [backupIndex, discovery])
 
   // The backup the URL selects, once this source's backups have loaded. A
   // backup of another engine is never selected, even by a crafted link.
@@ -1149,6 +1183,11 @@ export function ServiceRestore() {
                               b.location ||
                               '—'}
                           </span>
+                          {discovery?.staleLocations.has(b.location) && (
+                            <Badge variant="outline">
+                              Previously discovered
+                            </Badge>
+                          )}
                           <div className="mt-1 font-mono text-xs text-muted-foreground @xl:hidden">
                             {created}
                           </div>

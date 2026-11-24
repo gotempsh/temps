@@ -9,6 +9,7 @@ Run from the repository root with TEMPS_BIN pointing to the binary under test.
 import http.cookiejar
 import json
 import os
+import re
 import secrets
 import shutil
 import socket
@@ -63,10 +64,42 @@ def wait_for(label, probe, timeout=180):
     raise TimeoutError(f"Timed out waiting for {label}")
 
 
+def startup_tail(path, password):
+    with path.open("rb") as log:
+        start = max(0, log.seek(0, os.SEEK_END) - 8192)
+        log.seek(start)
+        tail = log.read(8192)
+        if start:
+            _, _, tail = tail.partition(b"\n")
+        text = tail.decode(errors="replace").replace(password, "[redacted]")
+    # Omit lines that might contain credentials minted by setup or inherited
+    # by the process. Keep ordinary bind, migration and startup errors.
+    return "\n".join(
+        "[redacted]" if re.search(
+            r"secret|token|password|credential|authorization|api.?key|private.?key|://[^/ ]+@|tk_",
+            line, re.I,
+        ) else line
+        for line in text.splitlines()[-30:]
+    )
+
+
 def free_address():
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return f"127.0.0.1:{sock.getsockname()[1]}"
+
+
+class StartupDiagnostics(unittest.TestCase):
+    def test_failed_server_tail_is_bounded_and_redacted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "server.log"
+            path.write_text("old line\n" * 1000 + "password=private\n"
+                            + "setup value temporary-value\nport already in use\n")
+            tail = startup_tail(path, "temporary-value")
+            self.assertLessEqual(len(tail.splitlines()), 30)
+            self.assertIn("port already in use", tail)
+            self.assertNotIn("private", tail)
+            self.assertNotIn("temporary-value", tail)
 
 
 class Server:
@@ -114,7 +147,7 @@ class PostgresCrossServerRecovery(unittest.TestCase):
             "--name",
             f"recovery-{self.run_id}-{port}",
             "-p",
-            f"127.0.0.1::{port}",
+            f"{free_address()}:{port}",
             *args,
             image,
             *command,
@@ -222,23 +255,26 @@ class PostgresCrossServerRecovery(unittest.TestCase):
             "1",
         )
         address = free_address()
-        proc = subprocess.Popen(
-            [
-                self.binary,
-                "serve",
-                "--role",
-                "console",
-                "--console-address",
-                address,
-                "--proxy-address",
-                address,
-                "--screenshot-provider",
-                "noop",
-            ],
-            env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+        log_path = data_dir / "startup.log"
+        with log_path.open("wb") as log:
+            proc = subprocess.Popen(
+                [
+                    self.binary,
+                    "serve",
+                    "--role",
+                    "console",
+                    "--console-address",
+                    address,
+                    "--proxy-address",
+                    address,
+                    "--screenshot-provider",
+                    "noop",
+                ],
+                env=env,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
+
 
         def stop():
             proc.terminate()
@@ -265,7 +301,11 @@ class PostgresCrossServerRecovery(unittest.TestCase):
                     raise
                 return False
 
-        wait_for(f"{database} login", login)
+        try:
+            wait_for(f"{database} login", login)
+        except (RuntimeError, TimeoutError) as error:
+            error.add_note(startup_tail(log_path, self.password))
+            raise
         return server
 
     def postgres(self, server, label):
@@ -346,6 +386,8 @@ class PostgresCrossServerRecovery(unittest.TestCase):
         self.assertEqual(len(first), 1, first)
         selected = first.pop()
         self.assertTrue(selected.endswith("_backup_stop_sentinel.json"), selected)
+        tracked = source.api(f"/backups/s3-sources/{writer}/backups")["backups"]
+        self.assertIn(selected, [row["location"] for row in tracked])
 
         print(
             "Adding a marker and taking a second backup in the same repository.",

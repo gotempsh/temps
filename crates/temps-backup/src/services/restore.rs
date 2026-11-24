@@ -200,6 +200,16 @@ pub use worker_outcome::ManagerWorkerRestoreResume;
 mod worker_redis;
 mod worker_walg;
 
+fn use_recorded_snapshot(backup: &mut temps_entities::backups::Model) {
+    if let Ok(metadata) = serde_json::from_str(&backup.metadata) {
+        if let Some(location) =
+            crate::engines::walg_size::recorded_location(&backup.s3_location, &metadata)
+        {
+            backup.s3_location = location;
+        }
+    }
+}
+
 fn selected_walg_target_user_data(
     backup: &temps_entities::backups::Model,
 ) -> Result<Option<String>, RestoreError> {
@@ -691,10 +701,11 @@ impl RestoreService {
         let (backup_row, backup_location, backup_engine_hint, s3_source_id, backup_id_opt) =
             match &selector {
                 BackupSelector::Id(id) => {
-                    let backup = temps_entities::backups::Entity::find_by_id(*id)
+                    let mut backup = temps_entities::backups::Entity::find_by_id(*id)
                         .one(self.db.as_ref())
                         .await?
                         .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+                    use_recorded_snapshot(&mut backup);
                     let engine = self.resolve_backup_engine(&backup).await?;
                     (
                         Some(backup.clone()),
@@ -757,7 +768,7 @@ impl RestoreService {
         let mut resolved_location = backup_location.clone();
         let mut location_was_resolved = false;
         if let Some(row) = &backup_row {
-            if needs_walg_identity_lookup(row, &target.service_type)? {
+            if needs_walg_identity_lookup(row, &target.service_type) {
                 let source = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
                     .one(self.db.as_ref())
                     .await?
@@ -816,7 +827,7 @@ impl RestoreService {
                             force_path_style: s3_source.effective_path_style(true).force_path_style,
                         };
                         let client = build_s3_client(&creds);
-                        if let Ok(Some(loc)) = resolve_backup_location_from_s3(
+                        match resolve_backup_location_from_s3(
                             &client,
                             &s3_source,
                             &target.service_type,
@@ -825,18 +836,23 @@ impl RestoreService {
                         )
                         .await
                         {
-                            resolved_location = loc;
-                            location_was_resolved = true;
+                            Ok(Some(loc)) => {
+                                resolved_location = loc;
+                                location_was_resolved = true;
+                            }
+                            Ok(None) => {}
+                            Err(error) => errors.push(format!("Could not locate backup {backup_uuid} on S3 source {s3_source_id}: {error}")),
+
                         }
                     }
                 }
             }
-            if resolved_location.is_empty() {
+            if resolved_location.is_empty() && errors.is_empty() {
                 errors.push(
                     "This backup has no s3_location and no matching object was found on the S3 source."
                         .into(),
                 );
-            } else {
+            } else if !resolved_location.is_empty() {
                 warnings.push(format!(
                     "Backup row has an empty s3_location; orchestrator will auto-resolve to: {}",
                     resolved_location
@@ -1233,10 +1249,11 @@ impl RestoreService {
             backup_started_at,
         ) = match &selector {
             BackupSelector::Id(id) => {
-                let backup = temps_entities::backups::Entity::find_by_id(*id)
+                let mut backup = temps_entities::backups::Entity::find_by_id(*id)
                     .one(self.db.as_ref())
                     .await?
                     .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+                use_recorded_snapshot(&mut backup);
                 // Reject before any engine or capability work: a pending,
                 // running or failed backup points at a partial (or empty)
                 // snapshot, and an in-place restore from it would wipe the
@@ -2497,10 +2514,12 @@ async fn run_backup_model(
         .map(|v| v as i32);
 
     Ok(if let Some(backup_id) = run.source_backup_id {
-        temps_entities::backups::Entity::find_by_id(backup_id)
+        let mut backup = temps_entities::backups::Entity::find_by_id(backup_id)
             .one(db)
             .await?
-            .ok_or(RestoreError::BackupNotFound { backup_id })?
+            .ok_or(RestoreError::BackupNotFound { backup_id })?;
+        use_recorded_snapshot(&mut backup);
+        backup
     } else {
         // Orphan: synthesize a `backups::Model` for the trait context.
         // The trait only reads `s3_location` + `s3_source_id` off it;
@@ -2570,7 +2589,7 @@ async fn run_restore_inner(
             })?;
 
     if run.source_backup_id.is_some()
-        && needs_walg_identity_lookup(&backup_model, &target_service.service_type)?
+        && needs_walg_identity_lookup(&backup_model, &target_service.service_type)
     {
         backup_model.s3_location =
             resolve_tracked_walg_snapshot(&backup_model, &s3_source, &enc).await?;
@@ -3779,9 +3798,30 @@ async fn persist_terminal_state(
             .col_expr(Column::Status, Expr::value("cancelled"))
             .col_expr(Column::ErrorMessage, Expr::value(Some(message.clone()))),
         Err(e) => update
-            .col_expr(Column::Status, Expr::value("failed"))
-            .col_expr(Column::Phase, Expr::value("failed"))
-            .col_expr(Column::ErrorMessage, Expr::value(Some(e.to_string()))),
+            .col_expr(
+                Column::Status,
+                Expr::case(Column::CancelRequestedAt.is_not_null(), "cancelled")
+                    .finally("failed")
+                    .into(),
+            )
+            .col_expr(
+                Column::Phase,
+                Expr::case(
+                    Column::CancelRequestedAt.is_not_null(),
+                    Expr::col(Column::Phase),
+                )
+                .finally("failed")
+                .into(),
+            )
+            .col_expr(
+                Column::ErrorMessage,
+                Expr::case(
+                    Column::CancelRequestedAt.is_not_null(),
+                    "Restore cancelled at the operator's request.",
+                )
+                .finally(e.to_string())
+                .into(),
+            ),
     };
     let update = update
         .filter(Column::Id.eq(run_id))
@@ -5030,15 +5070,9 @@ fn build_object_store_steps(
     let _ = strategy;
 }
 
-// Repository-only rows predating versioned WAL-G selectors still need to
-// resolve their own snapshot, before dispatch to a local or remote worker.
-fn needs_walg_identity_lookup(
-    backup: &temps_entities::backups::Model,
-    engine: &str,
-) -> Result<bool, RestoreError> {
-    Ok(engine == "postgres"
-        && backup.s3_location.trim_end_matches('/').ends_with("/walg")
-        && selected_walg_target_user_data(backup)?.is_none())
+// Even a UUID-marked repository may contain several attempts for one row.
+fn needs_walg_identity_lookup(backup: &temps_entities::backups::Model, engine: &str) -> bool {
+    engine == "postgres" && backup.s3_location.trim_end_matches('/').ends_with("/walg")
 }
 
 async fn resolve_tracked_walg_snapshot(
@@ -5055,10 +5089,15 @@ async fn resolve_tracked_walg_snapshot(
                 backup.backup_id, source.id
             ),
         })?;
-    let lookup_error = |error| RestoreError::SnapshotLookupFailed {
-        backup_id: backup.backup_id.clone(),
-        s3_source_id: source.id,
-        source: error,
+    let lookup_error = |error| match error {
+        crate::execution::engine_v2::BackupError::PermanentFailure { reason } => {
+            RestoreError::Validation { message: reason }
+        }
+        error => RestoreError::SnapshotLookupFailed {
+            backup_id: backup.backup_id.clone(),
+            s3_source_id: source.id,
+            source: error,
+        },
     };
     let client = crate::engines::v2_common::build_s3_client(source, enc, "temps-backup")
         .map_err(lookup_error)?;
@@ -5088,7 +5127,7 @@ async fn resolve_backup_location_from_s3(
     engine: &str,
     origin_service_name: &str,
     backup_uuid: &str,
-) -> Result<Option<String>, anyhow::Error> {
+) -> Result<Option<String>, crate::execution::engine_v2::BackupError> {
     let bucket = &s3_source.bucket_name;
     // Mirror the path convention backup_external_service writes to:
     //   external_services/<engine>/<svc>/...
@@ -5105,12 +5144,14 @@ async fn resolve_backup_location_from_s3(
     // A PostgreSQL repository can contain backups made by several servers.
     // A missing location is repairable only when a sentinel identifies this row.
     let walg_prefix = format!("{service_prefix}walg");
+    let mut walg_error = None;
     if engine == "postgres" {
-        if let Some(location) =
-            crate::engines::walg_size::find_snapshot(s3_client, bucket, &walg_prefix, backup_uuid)
-                .await?
+        match crate::engines::walg_size::find_snapshot(s3_client, bucket, &walg_prefix, backup_uuid)
+            .await
         {
-            return Ok(Some(location));
+            Ok(Some(location)) => return Ok(Some(location)),
+            Ok(None) => {}
+            Err(error) => walg_error = Some(error),
         }
     } else {
         let mut pages = s3_client
@@ -5121,7 +5162,12 @@ async fn resolve_backup_location_from_s3(
             .into_paginator()
             .send();
         while let Some(page) = pages.next().await {
-            if page?
+            if page
+                .map_err(|error| crate::execution::engine_v2::BackupError::Failed {
+                    reason: format!(
+                        "Could not list {walg_prefix} for backup {backup_uuid}: {error}"
+                    ),
+                })?
                 .contents()
                 .iter()
                 .filter_map(|object| object.key())
@@ -5154,7 +5200,17 @@ async fn resolve_backup_location_from_s3(
         if let Some(ct) = continuation.clone() {
             req = req.continuation_token(ct);
         }
-        let resp = req.send().await?;
+        let resp = match req.send().await {
+            Ok(page) => page,
+            Err(_) if walg_error.is_some() => break,
+            Err(error) => {
+                return Err(crate::execution::engine_v2::BackupError::Failed {
+                    reason: format!(
+                        "Could not list {service_prefix} for backup {backup_uuid}: {error}"
+                    ),
+                })
+            }
+        };
         for obj in resp.contents() {
             let key = match obj.key() {
                 Some(k) => k.to_string(),
@@ -5194,7 +5250,11 @@ async fn resolve_backup_location_from_s3(
         }
     }
 
-    Ok(best.map(|(k, _)| k))
+    match (best, walg_error) {
+        (Some((key, _)), _) => Ok(Some(key)),
+        (None, Some(error)) => Err(error),
+        (None, None) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -7055,6 +7115,44 @@ mod tests {
             assert_eq!(repaired, expected);
         }
 
+        // An unreadable, unrelated sentinel must not hide an exact UUID-scoped dump.
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(base_key.replace("base_0001", "base_0003"))
+            .body(vec![b'x'; 1024 * 1024 + 1].into())
+            .send()
+            .await?;
+        let dump = "external_services/postgres/service-a/backup-c/dump.sql.gz";
+        s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(dump)
+            .body(vec![1u8].into())
+            .send()
+            .await?;
+        assert_eq!(
+            resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                "postgres",
+                "service-a",
+                "backup-c"
+            )
+            .await?
+            .as_deref(),
+            Some(dump)
+        );
+        assert!(resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "postgres",
+            "service-a",
+            "missing"
+        )
+        .await
+        .is_err_and(|error| error.to_string().contains("exceeds")));
+
         let physical_service = "orders-physical";
         let logical_service = "orders-logical";
         let physical_uuid = uuid::Uuid::new_v4().to_string();
@@ -7298,16 +7396,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn interrupted_restore_releases_the_service_only_after_fencing() {
+    async fn interrupted_restore_releases_the_service_only_after_fencing(
+    ) -> Result<(), Box<dyn std::error::Error>> {
         if Docker::connect_with_local_defaults().is_err() {
             println!("Docker not available, skipping");
-            return;
+            return Ok(());
         }
         let test_db = match temps_test_utils::TestDatabase::with_migrations().await {
             Ok(db) => db,
             Err(e) => {
                 println!("TestDatabase unavailable, skipping: {e}");
-                return;
+                return Ok(());
             }
         };
         let db = test_db.db.clone();
@@ -7586,6 +7685,27 @@ mod tests {
             .error_message
             .unwrap_or_default()
             .contains("stopped unexpectedly during phase 'prepare'"));
+
+        let mut cancelled = new_run(service.id, backup.id, user.id, "in_place", None);
+        cancelled.cancel_requested_at = Set(Some(Utc::now()));
+        let cancelled = cancelled.insert(db.as_ref()).await?;
+        persist_terminal_state(
+            db.as_ref(),
+            cancelled.id,
+            &Err(RestoreError::Validation {
+                message: "Snapshot unavailable".into(),
+            }),
+            TERMINAL_WRITE_RETRY,
+        )
+        .await?;
+        let terminal = load_run_for_update(db.as_ref(), cancelled.id).await?;
+        assert_eq!(terminal.status, "cancelled");
+        assert_eq!(terminal.phase, cancelled.phase);
+        assert!(terminal
+            .error_message
+            .unwrap_or_default()
+            .contains("operator"));
+        Ok(())
     }
 
     #[tokio::test]

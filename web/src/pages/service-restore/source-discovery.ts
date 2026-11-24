@@ -15,7 +15,7 @@ export function mergeDiscovery(
 ): SourceDiscovery {
   const orphans = result.backups.filter((row) => row.source === 's3_scan')
   const staleLocations = new Set<string>()
-  if (result.scan_errors.length > 0 && previous) {
+  if (result.scan_errors?.length > 0 && previous) {
     const seen = new Set(result.backups.map((row) => row.location))
     for (const row of previous.orphans) {
       if (!seen.has(row.location)) {
@@ -24,7 +24,7 @@ export function mergeDiscovery(
       }
     }
   }
-  return { orphans, staleLocations, errors: result.scan_errors }
+  return { orphans, staleLocations, errors: result.scan_errors ?? [] }
 }
 
 export function visibleOrphans(

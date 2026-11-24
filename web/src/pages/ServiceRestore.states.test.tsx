@@ -548,6 +548,37 @@ describe('run tracking (#1237)', () => {
 describe('imported backup interaction', () => {
   installBrowserWindow()
 
+  test('a partial refresh keeps the selected orphan until a complete scan removes it', async () => {
+    let partial = true
+    const api = mockApi({
+      'GET /backups/s3-sources/1/backups': () =>
+        jsonResponse({
+          backups: [],
+          scan_errors: partial ? ['Could not list backups'] : [],
+          last_updated: '2026-01-01T00:00:00Z',
+        }),
+    })
+    const { page, client } = restorePage({
+      url: `/storage/${SERVICE_ID}/restore?source=1&location=${encodeURIComponent(locations[0])}`,
+      scannedBackups: scannedRows([locations[0]]),
+    })
+    const view = render(page)
+    try {
+      await view.findByText(`Selected: ${locations[0]}`)
+      fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+      await view.findByText('Previously discovered')
+      expect(view.getByText(`Selected: ${locations[0]}`)).toBeTruthy()
+      partial = false
+      fireEvent.click(view.getByRole('button', { name: 'Refresh' }))
+      await view.findByText('The linked backup is not on this source')
+      expect(view.queryByText('Previously discovered')).toBeNull()
+    } finally {
+      view.unmount()
+      client.clear()
+      api.restore()
+    }
+  })
+
   test('navigating to an orphan link starts a scoped scan and keeps tracked rows visible until it finishes', async () => {
     let finish: ((response: Response) => void) | undefined
     const row = {

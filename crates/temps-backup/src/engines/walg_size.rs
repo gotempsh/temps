@@ -36,11 +36,7 @@ pub(crate) async fn load_backup_size_bytes(
     stderr: &str,
     backup_uuid: &str,
 ) -> Result<i64, BackupError> {
-    let backup_name =
-        backup_name_from_push_output(stdout, stderr).ok_or_else(|| BackupError::Failed {
-            reason: "wal-g backup-push succeeded but did not report the written backup name"
-                .to_string(),
-        })?;
+    let backup_name = pushed_snapshot_name(stdout, stderr)?;
     let sentinel_key = format!(
         "{}basebackups_005/{}_backup_stop_sentinel.json",
         walg_key_prefix, backup_name
@@ -79,6 +75,7 @@ pub(crate) async fn find_snapshot(
         .into_paginator()
         .send();
     let mut unreadable = None;
+    let mut matched = None;
     while let Some(page) = pages.next().await {
         let page = page.map_err(|error| BackupError::Failed {
             reason: format!("Could not list {prefix} for backup {backup_id}: {error}"),
@@ -98,7 +95,12 @@ pub(crate) async fn find_snapshot(
                 }
             };
             match sentinel_backup_id(&bytes) {
-                Ok(Some(id)) if id == backup_id => return Ok(Some(format!("s3://{bucket}/{key}"))),
+                Ok(Some(id)) if id == backup_id => {
+                    if matched.is_some() {
+                        return Err(BackupError::PermanentFailure { reason: format!("Multiple WAL-G snapshots identify backup {backup_id} in {prefix}. Select the individual snapshot from S3.") });
+                    }
+                    matched = Some(format!("s3://{bucket}/{key}"));
+                }
                 Ok(_) => {}
                 Err(error) => {
                     tracing::warn!(key, backup_id, %error, "Skipping malformed WAL-G stop sentinel")
@@ -108,7 +110,7 @@ pub(crate) async fn find_snapshot(
     }
     match unreadable {
         Some(error) => Err(error),
-        None => Ok(None),
+        None => Ok(matched),
     }
 }
 
@@ -197,6 +199,29 @@ fn size_from_sentinel(
     }
 }
 
+pub(crate) fn pushed_snapshot_name<'a>(
+    stdout: &'a str,
+    stderr: &'a str,
+) -> Result<&'a str, BackupError> {
+    backup_name_from_push_output(stdout, stderr)
+        .filter(|name| name.starts_with("base_"))
+        .ok_or_else(|| BackupError::Failed {
+            reason: "wal-g backup-push succeeded but did not report a valid base backup name"
+                .into(),
+        })
+}
+
+/// Expand the per-attempt name recorded alongside the shared repository.
+pub(crate) fn recorded_location(repository: &str, metadata: &serde_json::Value) -> Option<String> {
+    let name = metadata.get("walg_snapshot_name")?.as_str()?;
+    let location = format!(
+        "{}/basebackups_005/{name}_backup_stop_sentinel.json",
+        repository.trim_end_matches('/')
+    );
+    let (root, parsed) = temps_providers::externalsvc::postgres::walg_snapshot(&location)?;
+    (root == repository.trim_end_matches('/') && parsed == name).then_some(location)
+}
+
 fn backup_name_from_push_output<'a>(stdout: &'a str, stderr: &'a str) -> Option<&'a str> {
     stdout
         .lines()
@@ -217,6 +242,24 @@ fn backup_name_from_push_output<'a>(stdout: &'a str, stderr: &'a str) -> Option<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retries_with_one_uuid_keep_the_completed_attempt_location() -> Result<(), BackupError> {
+        let repo = "s3://backups-bucket/service-a/walg";
+        for name in ["base_001", "base_002"] {
+            let output = format!("Wrote backup with name {name} to storage default");
+            let name = pushed_snapshot_name("", &output)?;
+            let metadata =
+                serde_json::json!({"walg_snapshot_name": name, "temps_backup_id":"backup-a"});
+            assert_eq!(
+                recorded_location(repo, &metadata),
+                Some(format!(
+                    "{repo}/basebackups_005/{name}_backup_stop_sentinel.json"
+                ))
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_backup_name_from_push_output_stderr_returns_backup_name() {

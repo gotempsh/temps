@@ -168,7 +168,7 @@ impl BackupService {
         // - wal-g backup-fetch LATEST finds the right backup + WAL chain
         // - wal-g delete retain works across all backups
         let repository_key = build_s3_key(&s3_source.bucket_path, "internal_db/walg");
-        let walg_s3_prefix = format!("s3://{}/{repository_key}", s3_source.bucket_name);
+        let mut walg_s3_prefix = format!("s3://{}/{repository_key}", s3_source.bucket_name);
 
         // Decrypt S3 credentials for WAL-G environment variables
         let decrypted_access_key = self
@@ -242,15 +242,20 @@ impl BackupService {
         let archiving_command = internal_walg_archive_command(&pgdata);
         let walg_env_path = internal_walg_env_path(&pgdata);
         if archive_before.archive_command == archiving_command {
-            let archiving_to = parse_walg_env_destination(
-                &run_walg_env_script(
-                    &docker,
-                    &container_id,
-                    walg_env_destination_script(&walg_env_path),
-                    "read the WAL-G destination from",
-                )
-                .await?,
-            );
+            let recorded = run_walg_env_script(
+                &docker,
+                &container_id,
+                walg_env_destination_script(&walg_env_path),
+                "read the WAL-G destination from",
+            )
+            .await?;
+            if let Some(legacy) =
+                legacy_internal_root(&recorded, &s3_source.bucket_name, &s3_source.bucket_path)
+            {
+                walg_s3_prefix = legacy;
+                env_vars[0] = format!("WALG_S3_PREFIX={walg_s3_prefix}");
+            }
+            let archiving_to = parse_walg_env_destination(&recorded);
             if let Some(reason) = archive_before.walg_destination_change_blocker(
                 &archiving_command,
                 archiving_to.as_deref(),
@@ -592,6 +597,18 @@ fn walg_env_destination_script(path: &str) -> String {
     )
 }
 
+/// Keep archiving to the exact prefix this installation already uses.
+fn legacy_internal_root(recorded: &str, bucket: &str, path: &str) -> Option<String> {
+    if !path.trim_matches('/').is_empty() {
+        return None;
+    }
+    let legacy = format!("s3://{bucket}//internal_db/walg");
+    recorded
+        .lines()
+        .any(|line| line.strip_prefix("prefix=") == Some(legacy.as_str()))
+        .then_some(legacy)
+}
+
 /// The destination [`walg_env_destination_script`] printed, as
 /// [`walg_destination`] describes it, or `None` when walg.env sets no prefix.
 fn parse_walg_env_destination(output: &str) -> Option<String> {
@@ -846,6 +863,22 @@ mod tests {
             .expect("sh runs");
         assert!(output.status.success(), "{output:?}");
         parse_walg_env_destination(String::from_utf8(output.stdout).unwrap().trim())
+    }
+
+    #[test]
+    fn root_source_preserves_the_active_legacy_archive_only_for_its_own_bucket() {
+        let recorded = "prefix=s3://backups-bucket//internal_db/walg\nendpoint=";
+        for path in ["", "/"] {
+            assert_eq!(
+                legacy_internal_root(recorded, "backups-bucket", path).as_deref(),
+                Some("s3://backups-bucket//internal_db/walg")
+            );
+        }
+        assert_eq!(legacy_internal_root(recorded, "another-bucket", ""), None);
+        assert_eq!(
+            legacy_internal_root(recorded, "backups-bucket", "nested"),
+            None
+        );
     }
 
     #[test]

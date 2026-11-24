@@ -498,18 +498,11 @@ impl BackupService {
 
     /// Restore internal database from a WAL-G backup.
     ///
-    /// Multi-step process (same as external service WAL-G restore):
-    /// 1. Fetch backup to temp directory on the shared volume (while PG still runs)
-    /// 2. Add recovery.signal + recovery config, copy pg_wal
-    /// 3. Disable restart policy, stop container
-    /// 4. Swap PGDATA via ephemeral helper container (volumes_from)
-    /// 5. Re-enable restart policy, start container → PG recovers → promotes
     async fn restore_postgres_walg(
         &self,
         backup: &temps_entities::backups::Model,
         s3_source: &temps_entities::s3_sources::Model,
     ) -> Result<(), BackupError> {
-        use bollard::exec::{CreateExecOptions, StartExecOptions};
         use bollard::Docker;
 
         info!(
@@ -548,6 +541,7 @@ impl BackupService {
 
         // A repository is shared across snapshots. Older rows need their UUID
         // matched before any restore command can touch the database.
+        let client = self.create_s3_client(s3_source).await?;
         let location = if temps_providers::externalsvc::postgres::walg_snapshot(&backup.s3_location)
             .is_some()
         {
@@ -562,13 +556,12 @@ impl BackupService {
                         backup.backup_id, s3_source.id
                     ))
                 })?;
-            let client = self.create_s3_client(s3_source).await?;
             crate::engines::walg_size::find_snapshot(
-                &client, &s3_source.bucket_name, prefix, &backup.backup_id,
+                &client, &s3_source.bucket_name, prefix.trim_start_matches('/'), &backup.backup_id,
             ).await.map_err(|error| BackupError::S3(error.to_string()))?
                 .ok_or_else(|| {
                     BackupError::Validation(format!(
-                        "No WAL-G snapshot in {} identifies control-plane backup {}. Use the exact base backup name for manual recovery.",
+                        "No WAL-G snapshot in {} identifies control-plane backup {}. For an older unmarked backup, run wal-g backup-list against this repository and recover the intended base by its exact name.",
                         backup.s3_location, backup.backup_id
                     ))
                 })?
@@ -580,6 +573,19 @@ impl BackupService {
                     backup.backup_id
                 ))
             })?;
+        let sentinel_key = location
+            .strip_prefix(&format!("s3://{}/", s3_source.bucket_name))
+            .ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Catalog backup {} is outside S3 source {}",
+                    backup.backup_id, s3_source.id
+                ))
+            })?;
+        let sentinel =
+            crate::engines::walg_size::read_sentinel(&client, &s3_source.bucket_name, sentinel_key)
+                .await
+                .map_err(|error| BackupError::S3(error.to_string()))?;
+        validate_catalog_tablespaces(&sentinel, &location)?;
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
             format!("AWS_ACCESS_KEY_ID={}", decrypted_access_key),
@@ -613,393 +619,332 @@ impl BackupService {
             walg_env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
         }
 
-        let walg_env_refs: Vec<&str> = walg_env.iter().map(|s| s.as_str()).collect();
-
-        // Step 1: Fetch backup to temp directory on the shared volume.
-        // Must be on the volume (not /tmp) so the helper container can see it via volumes_from.
-        // The parent of PGDATA is typically the volume mount point (e.g., /var/lib/postgresql).
-        let volume_root = std::path::Path::new(&pgdata)
-            .parent()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "/var/lib/postgresql".to_string());
-        let restore_temp = format!("{}/restore_temp", volume_root);
-        // Both paths reach `sh -c` below in several commands; escape once and
-        // reuse rather than risk an unescaped interpolation creeping back in
-        // at one of the call sites. `pgdata` is configured per-service, so an
-        // unescaped path here is a shell-injection vector into the container.
-        let escaped_pgdata = shell_escape(&pgdata);
-        let escaped_restore_temp = shell_escape(&restore_temp);
-
-        info!(
-            "Step 1: Fetching WAL-G backup to {} in container {}",
-            restore_temp, container_id
-        );
-        let fetch_cmd_str = format!(
-            "mkdir -p {restore_temp} && rm -rf {restore_temp}/* && wal-g backup-fetch {restore_temp} {snapshot} > /tmp/walg_restore.log 2>&1",
-            restore_temp = escaped_restore_temp,
-        );
-
-        let exec = docker
-            .create_exec(
+        let snapshot = snapshot.to_owned();
+        let database_url = self.config_service.get_database_url();
+        // A dropped HTTP request must not interrupt a catalog swap or its rollback.
+        tokio::spawn(async move {
+            recover_catalog(
+                &docker,
                 &container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", &fetch_cmd_str]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    env: Some(walg_env_refs.clone()),
-                    user: Some("postgres"),
-                    ..Default::default()
-                },
+                &pgdata,
+                &snapshot,
+                walg_env,
+                &database_url,
+                std::time::Duration::from_secs(120),
             )
             .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create WAL-G fetch exec: {}", e),
-            })?;
+        })
+        .await
+        .map_err(|error| {
+            BackupError::ExternalService(format!("Catalog recovery task failed: {error}"))
+        })?
+    }
+}
 
-        docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
+/// A tablespace in the backup can point outside the directory being swapped.
+fn validate_catalog_tablespaces(bytes: &[u8], location: &str) -> Result<(), BackupError> {
+    #[derive(Deserialize)]
+    struct Sentinel {
+        #[serde(rename = "Spec", alias = "spec")]
+        spec: Option<TablespaceSpec>,
+    }
+    #[derive(Deserialize)]
+    struct TablespaceSpec {
+        tablespaces: Option<Vec<String>>,
+    }
+    let sentinel: Sentinel = serde_json::from_slice(bytes).map_err(|error| {
+        BackupError::Validation(format!(
+            "Invalid tablespace metadata in {location}: {error}"
+        ))
+    })?;
+    if sentinel
+        .spec
+        .and_then(|spec| spec.tablespaces)
+        .is_some_and(|names| !names.is_empty())
+    {
+        return Err(BackupError::Validation(format!("Catalog backup {location} uses external tablespaces. Restore the named base and its tablespaces on isolated volumes before manual cutover.")));
+    }
+    Ok(())
+}
+
+const RECOVER_STAGED: &str = r#"
+set -eu
+stage=$1
+snapshot=$2
+test -d "$stage"
+# The staged postmaster uses a private socket and never archives into the source.
+sock=$(mktemp -d)
+cleanup() {
+    if [ "$started" = yes ] && [ -s "$stage/postmaster.pid" ]; then pg_ctl -D "$stage" -m immediate -w stop; fi
+    rm -rf "$sock"
+    if [ "$prepared" = no ]; then find "$stage" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; fi
+}
+prepared=no
+started=no
+trap cleanup EXIT
+# Pin extraction to the staged directory for every member of a delta chain.
+printf '{"base_prefix":"%s","tablespaces":[]}\n' "$stage" > "$sock/restore-spec.json"
+wal-g backup-fetch "$stage" "$snapshot" --restore-spec "$sock/restore-spec.json"
+test ! -e "$stage/postmaster.pid"
+if [ -s "$stage/tablespace_map" ]; then
+    echo "The selected base has external tablespaces. Recover those to isolated volumes before manual cutover." >&2
+    exit 1
+fi
+touch "$stage/recovery.signal"
+rm -f "$stage/standby.signal"
+cat >> "$stage/postgresql.auto.conf" <<'CONF'
+restore_command = 'wal-g wal-fetch "%f" "%p"'
+recovery_target = 'immediate'
+recovery_target_action = 'promote'
+CONF
+export PGDATA="$stage"
+started=yes
+pg_ctl -D "$stage" -l "$sock/postgres.log" -t 180 -w start -o "-c listen_addresses='' -c unix_socket_directories='$sock' -c data_directory='$stage' -c archive_mode=off -c external_pid_file='' -c hot_standby=off"
+remaining=180
+while [ -e "$stage/recovery.signal" ]; do
+    pg_ctl -D "$stage" status >/dev/null
+    test "$remaining" -gt 0
+    remaining=$((remaining - 1))
+    sleep 1
+done
+pg_ctl -D "$stage" -m fast -t 60 -w stop
+prepared=yes
+"#;
+
+const INSTALL_CATALOG: &str = r#"
+set -eu
+test -d "$1"
+test -d "$2"
+test ! -e "$3"
+mv "$1" "$3"
+mv "$2" "$1" || { mv "$3" "$1"; exit 1; }
+"#;
+
+const ROLLBACK_CATALOG: &str = r#"
+set -eu
+if [ -d "$3" ]; then
+    if [ -e "$1" ]; then mv "$1" "$2"; fi
+    mv "$3" "$1"
+fi
+test -s "$1/PG_VERSION"
+"#;
+
+async fn recover_catalog(
+    docker: &bollard::Docker,
+    container: &str,
+    pgdata: &str,
+    snapshot: &str,
+    env: Vec<String>,
+    database_url: &str,
+    readiness_timeout: std::time::Duration,
+) -> Result<(), BackupError> {
+    use bollard::query_parameters::{
+        InspectContainerOptions, StartContainerOptions, StopContainerOptions,
+    };
+    use std::time::Duration;
+    use temps_providers::externalsvc::exec_util::run_exec_as;
+    let failure = |step: &str, reason: String| {
+        BackupError::ExternalService(format!(
+            "Catalog restore of {snapshot} on container {container} could not {step}: {reason}"
+        ))
+    };
+    let inspected = docker
+        .inspect_container(container, None::<InspectContainerOptions>)
+        .await
+        .map_err(|e| failure("inspect the catalog", e.to_string()))?;
+    let pgdata = pgdata.trim_end_matches('/');
+    let data = std::path::Path::new(pgdata);
+    let mount = inspected
+        .mounts
+        .iter()
+        .flatten()
+        .filter_map(|m| m.destination.as_deref())
+        .map(std::path::Path::new)
+        .filter(|p| data.starts_with(p))
+        .max_by_key(|p| p.components().count());
+    // Renaming two sibling directories is atomic only within their shared mount.
+    if mount.is_none_or(|path| path == data)
+        || inspected
+            .mounts
+            .iter()
+            .flatten()
+            .filter_map(|m| m.destination.as_deref())
+            .any(|path| std::path::Path::new(path).starts_with(data))
+        || pgdata.split('/').any(|part| part == "." || part == "..")
+        || !data.is_absolute()
+        || pgdata
+            .chars()
+            .any(|c| !(c.is_ascii_alphanumeric() || "/_-.".contains(c)))
+    {
+        return Err(failure("stage a reversible swap", "PGDATA must be a subdirectory of a mounted volume with a simple absolute path. Recover the named base to a new volume for manual cutover.".into()));
+    }
+    let image = inspected.image.ok_or_else(|| {
+        failure(
+            "identify the catalog image",
+            "Docker returned no image ID".into(),
+        )
+    })?;
+    let attempt = Uuid::new_v4().to_string();
+    let stage = format!("{pgdata}.restore-{attempt}");
+    let original = format!("{pgdata}.original-{attempt}");
+    let config = bollard::models::ContainerCreateBody {
+        image: Some(image),
+        entrypoint: Some(vec!["sleep".into()]),
+        cmd: Some(vec!["infinity".into()]),
+        labels: Some(std::collections::HashMap::from([(
+            "temps.backup_cleanup_id".into(),
+            attempt.clone(),
+        )])),
+        host_config: Some(bollard::models::HostConfig {
+            volumes_from: Some(vec![container.into()]),
+            network_mode: Some("none".into()),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    // Only one catalog restore may own the swap on this database container.
+    let (helper, _owner) = super::walg_deletion::create_owned_walg_helper(
+        docker.clone(),
+        format!("temps-catalog-restore-{container}"),
+        attempt,
+        config,
+    )
+    .await?;
+    docker
+        .start_container(&helper, None::<StartContainerOptions>)
+        .await
+        .map_err(|e| failure("start the swap helper", e.to_string()))?;
+    let helper_exec = |script: &'static str| {
+        run_exec_as(
+            docker,
+            &helper,
+            vec![
+                "sh".into(),
+                "-e".into(),
+                "-c".into(),
+                script.into(),
+                "catalog-swap".into(),
+                pgdata.into(),
+                stage.clone(),
+                original.clone(),
+            ],
+            None,
+            Duration::from_secs(120),
+            Some("root"),
+        )
+    };
+    let cleanup_stage = || helper_exec(r#"rm -rf "$2""#);
+    helper_exec(r#"mkdir -m 700 "$2" && chown postgres "$2""#)
+        .await
+        .map_err(|e| failure("create the staged data directory", e.to_string()))?;
+    let prepared = run_exec_as(
+        docker,
+        container,
+        vec![
+            "sh".into(),
+            "-e".into(),
+            "-c".into(),
+            RECOVER_STAGED.into(),
+            "recover".into(),
+            stage.clone(),
+            snapshot.into(),
+        ],
+        Some(env),
+        Duration::from_secs(3600),
+        Some("postgres"),
+    )
+    .await;
+    if let Err(error) = prepared {
+        let _ = helper_exec(r#"rmdir "$2""#).await;
+        return Err(failure(
+            "recover the staged base from archived WAL",
+            error.to_string(),
+        ));
+    }
+    let stop = || async {
+        match docker
+            .stop_container(
+                container,
+                Some(StopContainerOptions {
+                    t: Some(60),
                     ..Default::default()
                 }),
             )
             .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start WAL-G fetch exec: {}", e),
-            })?;
+        {
+            Ok(())
+            | Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 304, ..
+            }) => Ok(()),
+            Err(error) => Err(error),
+        }
+    };
+    let start = || docker.start_container(container, None::<StartContainerOptions>);
+    stop()
+        .await
+        .map_err(|e| failure("stop the catalog", e.to_string()))?;
+    let installed = async {
+        helper_exec(INSTALL_CATALOG)
+            .await
+            .map_err(|e| failure("install the recovered catalog", e.to_string()))?;
+        start()
+            .await
+            .map_err(|e| failure("start the recovered catalog", e.to_string()))?;
+        wait_for_catalog(database_url, readiness_timeout)
+            .await
+            .map_err(|_| failure("verify the recovered catalog", "readiness timed out".into()))
+    }
+    .await;
+    if let Err(error) = installed {
+        let rollback = async {
+            stop().await.map_err(|e| e.to_string())?;
+            helper_exec(ROLLBACK_CATALOG)
+                .await
+                .map_err(|e| e.to_string())?;
+            start().await.map_err(|e| e.to_string())?;
+            wait_for_catalog(database_url, readiness_timeout)
+                .await
+                .map_err(|_| "Original catalog readiness timed out".to_string())
+        }
+        .await;
+        if let Err(reason) = rollback {
+            return Err(failure("restart the original catalog", format!("{error}. Rollback failed: {reason}. Inspect {original} before restarting PostgreSQL.")));
+        }
+        let _ = cleanup_stage().await;
+        return Err(error);
+    }
+    if let Err(error) = helper_exec(r#"rm -rf "$3""#).await {
+        warn!(container, %original, %error, "Restored catalog is ready; could not remove the previous catalog");
+    }
+    Ok(())
+}
 
-        // Poll for fetch completion
+async fn wait_for_catalog(
+    database_url: &str,
+    readiness_timeout: std::time::Duration,
+) -> Result<(), time::error::Elapsed> {
+    use std::time::Duration;
+    time::timeout(readiness_timeout, async {
         loop {
-            let inspect =
-                docker
-                    .inspect_exec(&exec.id)
+            if let Ok(db) =
+                sea_orm::Database::connect(temps_database::connect_options(database_url)).await
+            {
+                use sea_orm::ConnectionTrait;
+                if db
+                    .query_one(Statement::from_string(
+                        DatabaseBackend::Postgres,
+                        "SELECT 1 WHERE NOT pg_is_in_recovery()",
+                    ))
                     .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect WAL-G fetch exec: {}", e),
-                    })?;
-            if let Some(running) = inspect.running {
-                if !running {
-                    if let Some(exit_code) = inspect.exit_code {
-                        if exit_code != 0 {
-                            return Err(BackupError::Internal {
-                                message: format!(
-                                    "WAL-G backup-fetch failed with exit code {} in container {}",
-                                    exit_code, container_id
-                                ),
-                            });
-                        }
-                    }
+                    .is_ok_and(|row| row.is_some())
+                {
                     break;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            time::sleep(Duration::from_secs(1)).await;
         }
-        info!("WAL-G backup fetched to {}", restore_temp);
-
-        // Step 2: Prepare restored PGDATA for recovery.
-        // - recovery.signal: tells PG to enter recovery mode
-        // - restore_command = '/bin/true': no archived WAL to fetch
-        // - recovery_target = 'immediate': stop at backup consistency point
-        // - recovery_target_action = 'promote': promote to primary after recovery
-        // - Copy pg_wal from running PGDATA (WAL not archived to S3)
-        info!("Step 2: Preparing recovery configuration");
-        let prepare_cmd_str = format!(
-            concat!(
-                "touch {restore_temp}/recovery.signal && ",
-                "echo \"restore_command = '/bin/true'\" >> {restore_temp}/postgresql.auto.conf && ",
-                "echo \"recovery_target = 'immediate'\" >> {restore_temp}/postgresql.auto.conf && ",
-                "echo \"recovery_target_action = 'promote'\" >> {restore_temp}/postgresql.auto.conf && ",
-                "rm -rf {restore_temp}/pg_wal && ",
-                "cp -a {pgdata}/pg_wal {restore_temp}/pg_wal"
-            ),
-            restore_temp = escaped_restore_temp,
-            pgdata = escaped_pgdata,
-        );
-
-        let exec = docker
-            .create_exec(
-                &container_id,
-                CreateExecOptions {
-                    cmd: Some(vec!["sh", "-c", &prepare_cmd_str]),
-                    attach_stdout: Some(false),
-                    attach_stderr: Some(false),
-                    user: Some("postgres"),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create recovery prep exec: {}", e),
-            })?;
-
-        docker
-            .start_exec(
-                &exec.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start recovery prep exec: {}", e),
-            })?;
-
-        loop {
-            let inspect =
-                docker
-                    .inspect_exec(&exec.id)
-                    .await
-                    .map_err(|e| BackupError::Internal {
-                        message: format!("Failed to inspect recovery prep exec: {}", e),
-                    })?;
-            if inspect.running == Some(false) {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-        }
-
-        // Step 3: Disable restart policy and stop container.
-        // The container has restart_policy=always, so Docker would immediately restart it.
-        info!("Step 3: Disabling restart policy and stopping container for PGDATA swap");
-        docker
-            .update_container(
-                &container_id,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to disable restart policy: {}", e),
-            })?;
-
-        docker
-            .stop_container(
-                &container_id,
-                Some(bollard::query_parameters::StopContainerOptions {
-                    t: Some(30),
-                    signal: None,
-                }),
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to stop container for restore: {}", e),
-            })?;
-
-        // Step 4: Swap PGDATA via ephemeral helper container.
-        // Can't exec into a stopped container, so we create a helper with volumes_from.
-        info!("Step 4: Swapping PGDATA via helper container");
-        let swap_script = format!(
-            "rm -rf {pgdata}/* && cp -a {restore_temp}/* {pgdata}/ && rm -rf {restore_temp}",
-            pgdata = escaped_pgdata,
-            restore_temp = escaped_restore_temp,
-        );
-
-        // Get the image from the container's config to use the same image for the helper
-        let container_inspect = docker
-            .inspect_container(
-                &container_id,
-                None::<bollard::query_parameters::InspectContainerOptions>,
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to inspect container for helper image: {}", e),
-            })?;
-
-        let container_image = container_inspect
-            .config
-            .as_ref()
-            .and_then(|c| c.image.clone())
-            .unwrap_or_else(|| "postgres:latest".to_string());
-
-        let helper_name = format!(
-            "{}-restore-helper",
-            container_id.chars().take(12).collect::<String>()
-        );
-        let helper_config = bollard::models::ContainerCreateBody {
-            image: Some(container_image),
-            cmd: Some(vec!["sh".to_string(), "-c".to_string(), swap_script]),
-            host_config: Some(bollard::models::HostConfig {
-                volumes_from: Some(vec![container_id.clone()]),
-                ..Default::default()
-            }),
-            user: Some("root".to_string()),
-            ..Default::default()
-        };
-
-        let helper = docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&helper_name)
-                        .build(),
-                ),
-                helper_config,
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to create restore helper container: {}", e),
-            })?;
-
-        docker
-            .start_container(
-                &helper.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start restore helper container: {}", e),
-            })?;
-
-        // Wait for helper to finish
-        let wait_result = docker
-            .wait_container(
-                &helper.id,
-                None::<bollard::query_parameters::WaitContainerOptions>,
-            )
-            .next()
-            .await;
-
-        // Capture helper logs before cleanup
-        let helper_logs = {
-            use futures::TryStreamExt;
-            let log_stream = docker.logs(
-                &helper.id,
-                Some(bollard::query_parameters::LogsOptions {
-                    stdout: true,
-                    stderr: true,
-                    ..Default::default()
-                }),
-            );
-            let logs: Vec<_> = log_stream.try_collect().await.unwrap_or_default();
-            logs.iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>()
-                .join("")
-        };
-
-        // Clean up helper
-        let _ = docker
-            .remove_container(
-                &helper.id,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
-                    v: false,
-                    ..Default::default()
-                }),
-            )
-            .await;
-
-        if let Some(Ok(wait_response)) = wait_result {
-            if wait_response.status_code != 0 {
-                // Re-enable restart policy even on failure
-                let _ = docker
-                    .update_container(
-                        &container_id,
-                        bollard::models::ContainerUpdateBody {
-                            restart_policy: Some(bollard::models::RestartPolicy {
-                                name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
-                                maximum_retry_count: None,
-                            }),
-                            ..Default::default()
-                        },
-                    )
-                    .await;
-                let _ = docker
-                    .start_container(
-                        &container_id,
-                        None::<bollard::query_parameters::StartContainerOptions>,
-                    )
-                    .await;
-
-                return Err(BackupError::Internal {
-                    message: format!(
-                        "PGDATA swap helper exited with code {}. Logs:\n{}",
-                        wait_response.status_code, helper_logs
-                    ),
-                });
-            }
-        }
-
-        // Step 5: Re-enable restart policy and start the container.
-        // PostgreSQL will enter recovery mode, reach consistency point, and promote.
-        info!("Step 5: Re-enabling restart policy and starting container");
-        docker
-            .update_container(
-                &container_id,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to re-enable restart policy: {}", e),
-            })?;
-
-        docker
-            .start_container(
-                &container_id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to start container after restore: {}", e),
-            })?;
-
-        // Wait for PostgreSQL to become healthy by polling the database connection.
-        info!("Waiting for PostgreSQL to become ready after restore...");
-        let max_wait = std::time::Duration::from_secs(120);
-        let start = std::time::Instant::now();
-        loop {
-            if start.elapsed() > max_wait {
-                return Err(BackupError::Internal {
-                    message: format!(
-                        "PostgreSQL did not become ready within {}s after restore",
-                        max_wait.as_secs()
-                    ),
-                });
-            }
-            // Try connecting to the database
-            let database_url = self.config_service.get_database_url();
-            match sea_orm::Database::connect(temps_database::connect_options(&database_url)).await {
-                Ok(conn) => {
-                    // Try a simple query to verify it's fully operational
-                    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-                    match conn
-                        .execute(Statement::from_string(
-                            DatabaseBackend::Postgres,
-                            "SELECT 1".to_string(),
-                        ))
-                        .await
-                    {
-                        Ok(_) => {
-                            info!("PostgreSQL is ready after WAL-G restore");
-                            break;
-                        }
-                        Err(_) => {
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        }
-                    }
-                }
-                Err(_) => {
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-            }
-        }
-
-        info!("Internal database WAL-G restore completed successfully");
-        Ok(())
-    }
+    })
+    .await
 }
 
 #[cfg(test)]
@@ -1007,6 +952,180 @@ mod tests {
     use super::super::test_support::*;
     use super::*;
     use temps_core::EncryptionService;
+
+    #[test]
+    fn external_tablespaces_require_isolated_manual_recovery() {
+        for key in ["Spec", "spec"] {
+            let sentinel = json!({ key: { "tablespaces": ["1234"] } }).to_string();
+            assert!(
+                validate_catalog_tablespaces(sentinel.as_bytes(), "base_001")
+                    .is_err_and(|error| error.to_string().contains("isolated volumes"))
+            );
+        }
+        assert!(
+            validate_catalog_tablespaces(br#"{"Spec":{"tablespaces":[]}}"#, "base_001").is_ok()
+        );
+    }
+
+    #[test]
+    fn rollback_puts_the_original_catalog_back_with_hidden_files() -> std::io::Result<()> {
+        use std::process::Command;
+        let root = tempfile::tempdir()?;
+        let paths = ["data", "stage", "original"].map(|name| root.path().join(name));
+        for (path, marker) in paths.iter().zip(["before", "restored"]) {
+            std::fs::create_dir(path)?;
+            std::fs::write(path.join("PG_VERSION"), "18")?;
+            std::fs::write(path.join(".marker"), marker)?;
+        }
+        let run = |script| {
+            Command::new("sh")
+                .args(["-ec", script, "swap"])
+                .args(&paths)
+                .status()
+                .map(|status| status.success())
+        };
+        assert!(run(INSTALL_CATALOG)?);
+        assert_eq!(
+            std::fs::read_to_string(paths[0].join(".marker"))?,
+            "restored"
+        );
+        assert!(run(ROLLBACK_CATALOG)?);
+        assert_eq!(std::fs::read_to_string(paths[0].join(".marker"))?, "before");
+        Ok(())
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn catalog_readiness_failure_restores_the_live_database(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use std::time::Duration;
+        use temps_providers::externalsvc::exec_util::run_exec_as;
+        use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+        if !temps_test_utils::docker_available().await {
+            eprintln!("Docker unavailable, skipping catalog rollback");
+            return Ok(());
+        }
+        let port = std::net::TcpListener::bind(("127.0.0.1", 0))?
+            .local_addr()?
+            .port();
+        let password = Uuid::new_v4();
+        let database = GenericImage::new("gotempsh/postgres-walg", "18-bookworm")
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_mapped_port(port, testcontainers::core::ContainerPort::Tcp(5432))
+            .with_env_var("POSTGRES_PASSWORD", password.to_string())
+            .with_env_var("WALG_FILE_PREFIX", "/tmp/repository")
+            .with_cmd([
+                "postgres",
+                "-c",
+                "archive_mode=on",
+                "-c",
+                "archive_command=wal-g wal-push %p",
+            ])
+            .start()
+            .await?;
+        let url = format!("postgres://postgres:{password}@127.0.0.1:{port}/postgres");
+        wait_for_catalog(&url, Duration::from_secs(30))
+            .await
+            .map_err(|_| "Source catalog never became ready")?;
+        let docker = bollard::Docker::connect_with_local_defaults()?;
+        let setup = run_exec_as(
+            &docker,
+            database.id(),
+            vec![
+                "sh".into(),
+                "-ec".into(),
+                r#"mkdir -p /tmp/repository
+wal-g backup-push "$PGDATA"
+createdb after_backup"#
+                    .into(),
+            ],
+            None,
+            Duration::from_secs(90),
+            Some("postgres"),
+        )
+        .await?;
+        let name = crate::engines::walg_size::pushed_snapshot_name(&setup.output, "")?;
+        let original_only = format!("postgres://postgres:{password}@127.0.0.1:{port}/after_backup");
+        let error = recover_catalog(
+            &docker,
+            database.id(),
+            "/var/lib/postgresql/18/docker",
+            name,
+            vec!["WALG_FILE_PREFIX=/tmp/repository".into()],
+            &original_only,
+            Duration::from_secs(8),
+        )
+        .await
+        .err()
+        .ok_or("Expected catalog readiness to fail")?;
+        assert!(
+            error.to_string().contains("verify the recovered catalog")
+                && !error.to_string().contains("Rollback failed"),
+            "{error}"
+        );
+        wait_for_catalog(&original_only, Duration::from_secs(10)).await?;
+        Ok(())
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[test]
+    fn staged_catalog_recovers_an_older_base_without_the_live_wal() -> std::io::Result<()> {
+        use std::process::Command;
+        if !Command::new("docker")
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|r| r.status.success())
+        {
+            eprintln!("Skipping staged catalog recovery: Docker unavailable");
+            return Ok(());
+        }
+        // Stop the source and move all of its WAL out of reach. The selected
+        // base must reach consistency using wal-fetch from the archive alone.
+        let setup = r#"
+set -eu
+export PGDATA=/tmp/live PGHOST=/tmp WALG_FILE_PREFIX=/tmp/repository
+mkdir -p "$WALG_FILE_PREFIX"
+initdb -A trust -D "$PGDATA" >/dev/null
+pg_ctl -D "$PGDATA" -l /tmp/live.log -w start -o "-k /tmp -c archive_mode=on -c 'archive_command=wal-g wal-push %p'"
+psql -d postgres -c 'CREATE TABLE marker AS SELECT 1 AS n'
+wal-g backup-push "$PGDATA"
+name=$(wal-g backup-list | awk '$1 ~ /^base_/ {print $1; exit}')
+test -n "$name"
+psql -d postgres -c 'INSERT INTO marker VALUES (2)'
+wal-g backup-push "$PGDATA"
+psql -d postgres -c 'SELECT pg_switch_wal()'
+pg_ctl -D "$PGDATA" -m fast -w stop
+mv "$PGDATA/pg_wal" /tmp/unavailable_wal
+mkdir -m 700 /tmp/staged
+sh -ec "$1" recover /tmp/staged "$name"
+pg_ctl -D /tmp/staged -l /tmp/restored.log -w start -o "-k /tmp -c archive_mode=off"
+test "$(psql -d postgres -Atc 'SELECT sum(n) FROM marker')" = 1
+"#;
+        let output = Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--user",
+                "postgres",
+                "--entrypoint",
+                "sh",
+                "gotempsh/postgres-walg:18-bookworm",
+                "-ec",
+                setup,
+                "test",
+                RECOVER_STAGED,
+            ])
+            .output()?;
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn legacy_restore_reports_one_failure_on_early_database_error() {
