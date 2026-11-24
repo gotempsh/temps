@@ -2215,6 +2215,9 @@ pub async fn get_deployment_by_upload_request_id(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentsRead);
     project_scope_guard!(auth, project_id);
+    // Team membership still applies: knowing an upload request id must not
+    // reveal another project's deployment to a user outside its team.
+    project_access_guard!(auth, project_id, state.project_access_checker);
 
     let deployment = state
         .deployment_service
