@@ -12581,6 +12581,7 @@ dependencies = [
  "temps-test-utils",
  "thiserror 2.0.21",
  "tokio",
+ "tower",
  "tracing",
  "utoipa",
 ]

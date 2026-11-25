@@ -347,7 +347,7 @@ pub struct FunnelFilter {
 const METRICS_CACHE_TTL_MINUTES: i64 = 5;
 
 pub struct FunnelService {
-    db: Arc<DatabaseConnection>,
+    pub(super) db: Arc<DatabaseConnection>,
     metrics_cache: MetricsCache<FunnelMetricsCacheKey, FunnelMetrics>,
 }
 
@@ -397,14 +397,20 @@ impl FunnelService {
         funnel_id: i32,
         request: CreateFunnelRequest,
     ) -> Result<(), DbErr> {
-        let db = self.db.as_ref();
+        // The funnel row and its steps change together or not at all.
+        let txn = self.db.begin().await?;
+        let db = &txn;
 
         // Find the funnel and verify it belongs to the project
         let funnel = funnels::Entity::find_by_id(funnel_id)
             .filter(funnels::Column::ProjectId.eq(project_id))
             .one(db)
             .await?
-            .ok_or_else(|| DbErr::RecordNotFound("Funnel not found".to_string()))?;
+            .ok_or_else(|| {
+                DbErr::RecordNotFound(format!(
+                    "funnel {funnel_id} not found in project {project_id}"
+                ))
+            })?;
 
         // Update funnel
         let mut funnel: funnels::ActiveModel = funnel.into();
@@ -431,6 +437,7 @@ impl FunnelService {
             };
             funnel_steps::Entity::insert(step_model).exec(db).await?;
         }
+        txn.commit().await?;
 
         // Invalidate cache for this funnel
         self.invalidate_funnel_cache(funnel_id).await;
@@ -447,7 +454,11 @@ impl FunnelService {
             .filter(funnels::Column::ProjectId.eq(project_id))
             .one(db)
             .await?
-            .ok_or_else(|| DbErr::RecordNotFound("Funnel not found".to_string()))?;
+            .ok_or_else(|| {
+                DbErr::RecordNotFound(format!(
+                    "funnel {funnel_id} not found in project {project_id}"
+                ))
+            })?;
 
         // Soft delete by setting is_active to false
         let mut funnel: funnels::ActiveModel = funnel.into();
@@ -467,9 +478,10 @@ impl FunnelService {
         project_id: i32,
         request: CreateFunnelRequest,
     ) -> Result<i32, DbErr> {
-        let db = self.db.as_ref();
+        // The funnel row and its steps are created together or not at all.
+        let txn = self.db.begin().await?;
+        let db = &txn;
 
-        // Create funnel without transaction
         let funnel = funnels::ActiveModel {
             project_id: Set(project_id),
             name: Set(request.name),
@@ -496,6 +508,7 @@ impl FunnelService {
 
             funnel_steps::Entity::insert(step_model).exec(db).await?;
         }
+        txn.commit().await?;
 
         Ok(funnel_id)
     }
