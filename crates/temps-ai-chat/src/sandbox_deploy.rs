@@ -1158,7 +1158,6 @@ mod tests {
             "./.boto",
             "./.s3cfg",
             "./AuthKey_ABC123.p8",
-            "./backup/secrets.gpg",
             // Controls already on the list.
             "./keys/id_ed25519",
             "./infra/prod.tfstate",
@@ -1173,6 +1172,8 @@ mod tests {
                 0o644,
             );
             add_file(b, "./docs/kubeconfig.md", b"# kubeconfig", 0o644);
+            // A public apt keyring a Dockerfile copies in; secret keys live in .gnupg/.
+            add_file(b, "./keys/nodesource.gpg", b"keyring", 0o644);
             for path in left_out {
                 add_file(b, path, b"dummy", 0o600);
             }
@@ -1184,6 +1185,7 @@ mod tests {
                 "docs/kubeconfig.md",
                 "infra/terraform.tfvars.example",
                 "keys/id_ecdsa.pub",
+                "keys/nodesource.gpg",
                 "package.json",
             ]
         );

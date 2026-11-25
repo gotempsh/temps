@@ -2476,7 +2476,6 @@ fn workspace_secret_file_filter_allows_documented_examples() {
         ".boto",
         ".s3cfg",
         "AuthKey_ABC123.p8",
-        "backup/secrets.gpg",
     ] {
         assert!(is_sensitive_workspace_path(path), "{path}");
     }
@@ -2485,6 +2484,9 @@ fn workspace_secret_file_filter_allows_documented_examples() {
         "infra/terraform.tfvars.example"
     ));
     assert!(!is_sensitive_workspace_path("docs/kubeconfig.md"));
+    // Public apt keyrings are .gpg files a Dockerfile copies in.
+    assert!(!is_sensitive_workspace_path("keys/nodesource.gpg"));
+    assert!(is_sensitive_workspace_path(".gnupg/private-keys-v1.d/key"));
     assert!(!is_sensitive_workspace_path(".env.example"));
     assert!(!is_sensitive_workspace_path("src/config.ts"));
     assert!(validate_workspace_import_path("src/config.ts").is_ok());

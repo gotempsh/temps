@@ -1328,7 +1328,6 @@ pub(crate) fn is_sensitive_workspace_path(path: &str) -> bool {
             || lower.ends_with(".pfx")
             || lower.ends_with(".jks")
             || lower.ends_with(".keystore")
-            || lower.ends_with(".gpg")
             || lower.ends_with(".tfstate")
             || lower.ends_with(".tfstate.backup")
             // Terraform variable files hold the secrets passed to a plan.
@@ -4163,11 +4162,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn existing_credential_files_count_against_the_workspace_quota() {
-        for existing in [
-            "projects/api/backup/secrets.gpg",
-            "projects/api/.env",
-            ".ssh/id_rsa",
-        ] {
+        for existing in ["projects/api/.pgpass", "projects/api/.env", ".ssh/id_rsa"] {
             let data_dir = tempfile::tempdir().expect("temporary data directory");
             let service = ApplicationWorkspaceService::new(data_dir.path().to_path_buf());
             let workspace = service
