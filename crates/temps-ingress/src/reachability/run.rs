@@ -7515,6 +7515,38 @@ mod tests {
             .any(|c| c.starts_with("set_environment_hosts")));
     }
 
+    /// `reachability_runs.context` stores the run input and a resume reads
+    /// it back (ADR-116 D5): every way in's fixture, as paths and types.
+    #[test]
+    fn a_stored_run_input_keeps_its_shape() {
+        use crate::reachability::wire_shape::{assert_golden, paths};
+        let inputs = [
+            token_input(),
+            access_input(None),
+            access_input(Some(access_app_named("app-1", "Grafana", "app.example.com", "p"))),
+            direct_input(7, PlannedRecord::default()),
+            private_input(7),
+            edge_input(),
+            policy_input(HttpPolicy::HttpsOnly),
+            serve_input(),
+            service_input(),
+        ];
+        let mut shape = std::collections::BTreeSet::new();
+        for input in &inputs {
+            let stored = serde_json::to_value(input).expect("a run input serializes");
+            paths(&stored, &mut shape);
+            let back: RunInput =
+                serde_json::from_value(stored.clone()).expect("a stored run input reads back");
+            assert_eq!(serde_json::to_value(&back).expect("serializes"), stored);
+        }
+        let actual = shape.into_iter().collect::<Vec<_>>().join("\n") + "\n";
+        assert_golden(
+            "run_input.txt",
+            include_str!("wire_shape/run_input.txt"),
+            &actual,
+        );
+    }
+
     #[test]
     fn the_token_is_never_serialized_with_the_input() {
         let input = token_input();

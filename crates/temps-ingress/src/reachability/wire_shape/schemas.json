@@ -1,0 +1,1859 @@
+{
+  "Audience": {
+    "type": "string",
+    "enum": [
+      "public",
+      "private",
+      "signed_in",
+      "tailnet_users",
+      "unsupported"
+    ]
+  },
+  "GateKind": {
+    "type": "string",
+    "enum": [
+      "temps",
+      "cloudflare_access",
+      "unsupported"
+    ]
+  },
+  "PlanOption": {
+    "type": "object",
+    "required": [
+      "kind",
+      "title",
+      "description",
+      "actions",
+      "recommended",
+      "way_in",
+      "steps",
+      "fields",
+      "warnings",
+      "required_permissions"
+    ],
+    "properties": {
+      "actions": {
+        "type": "integer",
+        "format": "int32",
+        "minimum": 0
+      },
+      "confirmation": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "way_in": {
+        "type": "string"
+      },
+      "fields": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/SetupField"
+        }
+      },
+      "kind": {
+        "$ref": "#/components/schemas/PlanOptionKind"
+      },
+      "recommended": {
+        "type": "boolean"
+      },
+      "required_permissions": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "steps": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/PlanStep"
+        }
+      },
+      "warnings": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    }
+  },
+  "PlanBlocked": {
+    "type": "object",
+    "properties": {
+      "action": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ReachAction"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "reason": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "reason"
+    ]
+  },
+  "TailnetPrincipal": {
+    "type": "object",
+    "properties": {
+      "kind": {
+        "$ref": "#/components/schemas/PrincipalKind"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "value"
+    ]
+  },
+  "PlanOptionKind": {
+    "type": "string",
+    "enum": [
+      "existing_tunnel",
+      "direct_managed_dns",
+      "new_tunnel",
+      "new_tunnel_with_token",
+      "direct_manual_dns",
+      "private_worker",
+      "tailscale_serve",
+      "tailscale_service",
+      "tailscale_service_with_credential",
+      "tunnel_environment_hosts"
+    ]
+  },
+  "PlanStep": {
+    "type": "object",
+    "required": [
+      "kind",
+      "label"
+    ],
+    "properties": {
+      "kind": {
+        "$ref": "#/components/schemas/StepKind"
+      },
+      "label": {
+        "type": "string"
+      }
+    }
+  },
+  "SetupField": {
+    "type": "object",
+    "properties": {
+      "help": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "key": {
+        "type": "string"
+      },
+      "kind": {
+        "$ref": "#/components/schemas/FieldKind"
+      },
+      "label": {
+        "type": "string"
+      },
+      "placeholder": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "required": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "key",
+      "label",
+      "kind",
+      "required"
+    ]
+  },
+  "StepKind": {
+    "type": "string",
+    "enum": [
+      "check_token",
+      "save_dns_provider",
+      "manage_domain",
+      "create_tunnel",
+      "wait_for_tunnel",
+      "attach_domain",
+      "route_hostname",
+      "set_dns_record",
+      "show_dns_record",
+      "issue_certificate",
+      "wait_for_publication",
+      "check_reachability",
+      "set_audience",
+      "access_app",
+      "configure_tailscale_serve",
+      "save_tailscale_credential",
+      "define_tailscale_service",
+      "wait_for_service_approval",
+      "publish_environment_hosts",
+      "redirect_to_https",
+      "standard_ports_only",
+      "set_http_policy"
+    ]
+  },
+  "FieldKind": {
+    "oneOf": [
+      {
+        "type": "object",
+        "required": [
+          "type"
+        ],
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "text"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "secret"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "provider_type": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_provider"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "allow_subdomain": {
+            "type": "boolean"
+          },
+          "provider_field": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "managed_domain"
+            ]
+          }
+        },
+        "required": [
+          "provider_field",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "teams"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "users"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "choices": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/FieldChoice"
+            }
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "choice"
+            ]
+          }
+        },
+        "required": [
+          "choices",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": [
+              "text_list"
+            ]
+          }
+        },
+        "required": [
+          "type"
+        ]
+      }
+    ]
+  },
+  "FieldChoice": {
+    "type": "object",
+    "properties": {
+      "help": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "label": {
+        "type": "string"
+      },
+      "value": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "value",
+      "label"
+    ]
+  },
+  "ReachAction": {
+    "type": "object",
+    "properties": {
+      "command": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "href": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "kind": {
+        "$ref": "#/components/schemas/ActionKind"
+      },
+      "label": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "kind",
+      "label"
+    ]
+  },
+  "ActionKind": {
+    "type": "string",
+    "enum": [
+      "make_reachable",
+      "deploy",
+      "set_dns_record",
+      "open_ingress",
+      "open_worker",
+      "wait",
+      "run_command",
+      "serve_privately"
+    ]
+  },
+  "PrincipalKind": {
+    "type": "string",
+    "enum": [
+      "login",
+      "tag"
+    ]
+  },
+  "ReachabilityPlan": {
+    "type": "object",
+    "required": [
+      "audience",
+      "options"
+    ],
+    "properties": {
+      "address": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "address_error": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "audience": {
+        "$ref": "#/components/schemas/Audience"
+      },
+      "blocked": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/PlanBlocked"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "expires_at": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "date-time"
+      },
+      "fingerprint": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "gate": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GateKind"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "options": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/PlanOption"
+        }
+      },
+      "plan_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "principals": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/TailnetPrincipal"
+        }
+      }
+    }
+  },
+  "RunStepStatus": {
+    "type": "string",
+    "enum": [
+      "pending",
+      "running",
+      "done",
+      "failed",
+      "skipped"
+    ]
+  },
+  "RunStep": {
+    "type": "object",
+    "required": [
+      "kind",
+      "label",
+      "status"
+    ],
+    "properties": {
+      "detail": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "kind": {
+        "$ref": "#/components/schemas/StepKind"
+      },
+      "label": {
+        "type": "string"
+      },
+      "status": {
+        "$ref": "#/components/schemas/RunStepStatus"
+      }
+    }
+  },
+  "Intent": {
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_provider"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "provider_id",
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "managed_domain"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "provider_id",
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "auto_manage_enabled"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "connector"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "domain",
+          "environment_id",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "environment_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "custom_domain"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "hostname",
+          "connector_id",
+          "previous",
+          "type"
+        ],
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/PreviousChoice"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "hostname_choice"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_record"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "label",
+          "record_type",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "type": "string"
+          },
+          "before": {
+            "$ref": "#/components/schemas/DnsRecordState"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_change"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "label",
+          "record_type",
+          "before",
+          "after",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/AddressAudience"
+          },
+          "before": {
+            "$ref": "#/components/schemas/AddressAudience"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "address_audience"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "before",
+          "after",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "certificate"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "hostname": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "access_app"
+            ]
+          }
+        },
+        "required": [
+          "provider_id",
+          "name",
+          "hostname",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "address_id": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "service": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_serve"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "address_id",
+          "hostname",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_credential"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "marker": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tailnet": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_service"
+            ]
+          }
+        },
+        "required": [
+          "tailnet",
+          "name",
+          "marker",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "environment_hosts"
+            ]
+          }
+        },
+        "required": [
+          "connector_id",
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "connector_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/EdgeRulePurpose"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "edge_rule"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "purpose",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/HttpPolicy"
+          },
+          "before": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HttpPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "http_policy"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "after",
+          "type"
+        ]
+      }
+    ]
+  },
+  "JournalState": {
+    "type": "string",
+    "enum": [
+      "pending",
+      "done",
+      "absent",
+      "conflict"
+    ]
+  },
+  "RunResource": {
+    "oneOf": [
+      {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "type"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_provider"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "provider_id",
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "managed_domain"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "auto_manage_enabled"
+            ]
+          }
+        },
+        "required": [
+          "provider_id",
+          "domain",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "type"
+        ],
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "connector"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "id",
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "custom_domain"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "required": [
+          "hostname",
+          "connector_id",
+          "previous",
+          "type"
+        ],
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "previous": {
+            "$ref": "#/components/schemas/PreviousChoice"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "hostname_choice"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "content": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_record"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "label",
+          "record_type",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "type": "string"
+          },
+          "before": {
+            "$ref": "#/components/schemas/DnsRecordState"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "label": {
+            "type": "string"
+          },
+          "record_type": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "dns_change"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "label",
+          "record_type",
+          "before",
+          "after",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/AddressAudience"
+          },
+          "before": {
+            "$ref": "#/components/schemas/AddressAudience"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "address_audience"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "before",
+          "after",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "domain",
+          "type"
+        ],
+        "properties": {
+          "domain": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "certificate"
+            ]
+          }
+        }
+      },
+      {
+        "type": "object",
+        "properties": {
+          "aud": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "policies": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "access_app"
+            ]
+          }
+        },
+        "required": [
+          "provider_id",
+          "id",
+          "name",
+          "hostname",
+          "aud",
+          "policies",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "address_id": {
+            "type": "string"
+          },
+          "created": {
+            "type": "boolean"
+          },
+          "entry_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "node_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "node_name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_serve"
+            ]
+          }
+        },
+        "required": [
+          "node_id",
+          "node_name",
+          "address_id",
+          "hostname",
+          "entry_id",
+          "created",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_credential"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "created": {
+            "type": "boolean"
+          },
+          "creator_run_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "definition": {
+            "$ref": "#/components/schemas/ServiceDefinition"
+          },
+          "name": {
+            "type": "string"
+          },
+          "tailnet": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "tailscale_service"
+            ]
+          }
+        },
+        "required": [
+          "tailnet",
+          "name",
+          "created",
+          "creator_run_id",
+          "definition",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "name": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "environment_hosts"
+            ]
+          }
+        },
+        "required": [
+          "connector_id",
+          "name",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "expression": {
+            "type": "string"
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "provider_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "purpose": {
+            "$ref": "#/components/schemas/EdgeRulePurpose"
+          },
+          "rule_id": {
+            "type": "string"
+          },
+          "ruleset_id": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "edge_rule"
+            ]
+          },
+          "zone": {
+            "type": "string"
+          },
+          "zone_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "hostname",
+          "purpose",
+          "provider_id",
+          "zone",
+          "zone_id",
+          "ruleset_id",
+          "rule_id",
+          "expression",
+          "type"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "after": {
+            "$ref": "#/components/schemas/HttpPolicy"
+          },
+          "before": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/HttpPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "hostname": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string",
+            "enum": [
+              "http_policy"
+            ]
+          }
+        },
+        "required": [
+          "hostname",
+          "after",
+          "type"
+        ]
+      }
+    ]
+  },
+  "Decision": {
+    "type": "string",
+    "enum": [
+      "keep",
+      "overwrite"
+    ]
+  },
+  "ServiceDefinition": {
+    "type": "object",
+    "properties": {
+      "addrs": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "comment": {
+        "type": "string"
+      },
+      "name": {
+        "type": "string"
+      },
+      "ports": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      },
+      "tags": {
+        "type": "array",
+        "items": {
+          "type": "string"
+        }
+      }
+    },
+    "required": [
+      "name"
+    ]
+  },
+  "PreviousChoice": {
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "automatic"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "enum": [
+              "off"
+            ]
+          }
+        },
+        "required": [
+          "mode"
+        ]
+      },
+      {
+        "type": "object",
+        "required": [
+          "connector_id",
+          "mode"
+        ],
+        "properties": {
+          "connector_id": {
+            "type": "integer",
+            "format": "int32"
+          },
+          "mode": {
+            "type": "string",
+            "enum": [
+              "tunnel"
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "DnsRecordState": {
+    "type": "object",
+    "properties": {
+      "content": {
+        "type": "string"
+      },
+      "label": {
+        "type": "string"
+      },
+      "managed": {
+        "type": "boolean"
+      },
+      "modified_on": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider_id": {
+        "type": "integer",
+        "format": "int32"
+      },
+      "record_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "record_type": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int32"
+      }
+    },
+    "required": [
+      "provider_id",
+      "record_type",
+      "content"
+    ]
+  },
+  "AddressAudience": {
+    "type": "object",
+    "properties": {
+      "audience": {
+        "$ref": "#/components/schemas/Audience"
+      },
+      "gate": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GateKind"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "gate_access": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/AccessBinding"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "gate_allow": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/GateAllowList"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "network_range": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "principals": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/TailnetPrincipal"
+        }
+      },
+      "private_listener": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "private_node_id": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "format": "int32"
+      },
+      "private_service": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "private_via": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "audience"
+    ]
+  },
+  "EdgeRulePurpose": {
+    "type": "string",
+    "enum": [
+      "https_redirect",
+      "standard_ports"
+    ]
+  },
+  "HttpPolicy": {
+    "type": "string",
+    "enum": [
+      "https_only",
+      "allow_http",
+      "allow_all"
+    ]
+  },
+  "GateAllowList": {
+    "type": "object",
+    "properties": {
+      "teams": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "format": "int32"
+        }
+      },
+      "users": {
+        "type": "array",
+        "items": {
+          "type": "integer",
+          "format": "int32"
+        }
+      }
+    }
+  },
+  "AccessBinding": {
+    "type": "object",
+    "properties": {
+      "app_id": {
+        "type": "string"
+      },
+      "aud": {
+        "type": "string"
+      },
+      "provider_id": {
+        "type": "integer",
+        "format": "int32"
+      }
+    },
+    "required": [
+      "provider_id",
+      "app_id",
+      "aud"
+    ]
+  },
+  "JournalEntry": {
+    "type": "object",
+    "properties": {
+      "at": {
+        "type": "string",
+        "format": "date-time"
+      },
+      "conflict": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "decision": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Decision"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "deleting": {
+        "type": "boolean"
+      },
+      "failed_lookups": {
+        "type": "integer",
+        "format": "int32",
+        "minimum": 0
+      },
+      "first_miss_at": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "date-time"
+      },
+      "intent": {
+        "$ref": "#/components/schemas/Intent"
+      },
+      "key": {
+        "type": "string"
+      },
+      "next_lookup_at": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "date-time"
+      },
+      "pending_since": {
+        "type": [
+          "string",
+          "null"
+        ],
+        "format": "date-time"
+      },
+      "resource": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/RunResource"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "shown_service": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/ServiceDefinition"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "state": {
+        "$ref": "#/components/schemas/JournalState"
+      },
+      "tunnel_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "undo_decision": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/Decision"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "unwritten": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "key",
+      "intent",
+      "state",
+      "at"
+    ]
+  },
+  "UndoResult": {
+    "type": "object",
+    "properties": {
+      "error": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "label": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      },
+      "resource": {
+        "$ref": "#/components/schemas/RunResource"
+      }
+    },
+    "required": [
+      "resource",
+      "label",
+      "ok"
+    ]
+  }
+}
