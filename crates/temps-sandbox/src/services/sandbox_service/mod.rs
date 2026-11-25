@@ -313,6 +313,8 @@ pub struct SandboxSummary {
     pub node_name: String,
     /// The egress policy the sandbox enforces.
     pub egress_policy: temps_sandbox_providers::SandboxEgressPolicy,
+    /// Whether the sandbox's outbound connections are recorded.
+    pub egress_recording: bool,
 }
 
 impl From<&sandboxes::Model> for SandboxSummary {
@@ -351,6 +353,7 @@ impl From<&sandboxes::Model> for SandboxSummary {
                 Some(id) => format!("node-{id}"),
             },
             egress_policy: m.egress_policy.0.clone(),
+            egress_recording: m.egress_recording,
         }
     }
 }

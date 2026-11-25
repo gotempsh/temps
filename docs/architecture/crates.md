@@ -55,7 +55,7 @@ Self-contained libraries, leaf types and wire protocols with few or no internal 
 | [`temps-service-protocol`](../../crates/temps-service-protocol) | Managed-service types the control plane and node agents exchange, and the engine interface a worker calls without building the engines | **3**: node-agent, providers, providers-core |  |
 | [`temps-signatures`](../../crates/temps-signatures) | Known exploit request signatures, shared by Shield and netwatch (ADR 066, D8) | **1**: shield |  |
 | [`temps-workflows-sdk`](../../crates/temps-workflows-sdk) | Rust durable workflow client and authenticated executor for Temps | none |  |
-| [`temps-workload`](../../crates/temps-workload) | Workload plane leaf types: identity, spec, conditions, events and the runtime driver trait (ADR-052, ADR-055) | **19**: ai-agents, backup, cli, deployer, deployments, entities, netpol-probe, network-policy, node-agent, nodes, projects, providers-core, sandbox-providers, workload-docker, workload-env, workload-netpol, workload-node, workload-plane, workload-volumes |  |
+| [`temps-workload`](../../crates/temps-workload) | Workload plane leaf types: identity, spec, conditions, events and the runtime driver trait (ADR-052, ADR-055) | **20**: ai-agents, backup, cli, deployer, deployments, entities, netpol-probe, network-policy, node-agent, nodes, projects, providers-core, sandbox, sandbox-providers, workload-docker, workload-env, workload-netpol, workload-node, workload-plane, workload-volumes |  |
 
 ## foundation
 
@@ -96,7 +96,7 @@ Containers, networking, DNS and the processes that run on worker nodes and insid
 | [`temps-git-credential`](../../crates/temps-git-credential) | In-sandbox git credential helper and daemon pair that mint per-operation scoped tokens without exposing them to user code | none | `temps-git-credential-daemon`, `temps-git-credential-helper` |
 | [`temps-netpol-probe`](../../crates/temps-netpol-probe) | The per-node network policy runtime (restricted DNS and the egress proxy) as a standalone binary, and the Docker proofs that drive it (ADR-055 §9) | none | `temps-netpol-probe` |
 | [`temps-network`](../../crates/temps-network) | Multi-host container networking: per-node bridge, VXLAN or routed transport, Docker network setup and peer route reconciliation | **5**: cli, deployer, node-agent, nodes, providers |  |
-| [`temps-network-policy`](../../crates/temps-network-policy) | Network policy rules for every workload kind, per-node modes, and the node-0 enforcer (ADR-052 §4, ADR-055 phase 7) | **1**: cli |  |
+| [`temps-network-policy`](../../crates/temps-network-policy) | Network policy rules for every workload kind, per-node modes, and the node-0 enforcer (ADR-052 §4, ADR-055 phase 7) | **2**: cli, sandbox |  |
 | [`temps-node-agent`](../../crates/temps-node-agent) | Worker node agent: authenticated HTTP API over local Docker for builds, containers, compose, sandboxes, routes and ingress connectors | **1**: cli |  |
 | [`temps-node-dns`](../../crates/temps-node-dns) | Per-node DNS resolver for the internal temps.local zone, synced from the control plane and serving stale records on failure | **6**: deployer, dns, netpol-probe, node-agent, nodes, providers |  |
 | [`temps-preview-gateway`](../../crates/temps-preview-gateway) | Preview gateway binary: in-network TCP reverse proxy that routes workspace preview hostnames to sandbox container ports | none | `temps-preview-gateway` |
@@ -110,7 +110,7 @@ Containers, networking, DNS and the processes that run on worker nodes and insid
 | [`temps-workload-docker`](../../crates/temps-workload-docker) | The Docker RuntimeDriver: the one place a workload's container-create request is built (ADR-055 §6, §18) | **5**: deployer, deployments, node-agent, providers, providers-core |  |
 | [`temps-workload-env`](../../crates/temps-workload-env) | Workload variables: layered assembly, secret classification and Baked/PerExec delivery (ADR-052 §3, ADR-055 §18) | **3**: deployments, workload-node, workload-plane |  |
 | [`temps-workload-ingress`](../../crates/temps-workload-ingress) | Endpoints, hostname claims, typed access policies and the compiled, lock-free evaluator (ADR-055 §11) | **4**: entities, environments, proxy, routes |  |
-| [`temps-workload-netpol`](../../crates/temps-workload-netpol) | Workload network policy: the rule model, the nftables compiler keyed by workload identity, nft executors and the microsandbox translation (ADR-052 §4, ADR-055 §9, §17) | **4**: netpol-probe, network-policy, node-agent, node-dns |  |
+| [`temps-workload-netpol`](../../crates/temps-workload-netpol) | Workload network policy: the rule model, the nftables compiler keyed by workload identity, nft executors and the microsandbox translation (ADR-052 §4, ADR-055 §9, §17) | **5**: netpol-probe, network-policy, node-agent, node-dns, sandbox |  |
 | [`temps-workload-node`](../../crates/temps-workload-node) | The node runtime: reconciles the instances assigned to a node from its desired-state stream (ADR-055 §7) | **1**: node-agent |  |
 | [`temps-workload-plane`](../../crates/temps-workload-plane) | The workload plane: workload objects, admission, conditions, events and the reconciler (ADR-055 §2, §4, §18) | **5**: backup, cli, deployments, nodes, providers-core |  |
 | [`temps-workload-volumes`](../../crates/temps-workload-volumes) | The Volume resource, mount validation, volume pinning and the VolumeProvider trait (ADR-055 §8, §12) | **4**: backup, deployments, workload-docker, workload-plane |  |
@@ -124,7 +124,7 @@ The request path: reverse proxy, edge cache, route table and bot protection.
 | [`temps-edge`](../../crates/temps-edge) | Database-free edge CDN node that caches static assets locally and proxies dynamic requests to a Temps control plane | **1**: cli |  |
 | [`temps-edge-rules`](../../crates/temps-edge-rules) | Edge rule model, validation and evaluation engine (ADR-089). Pure: no I/O. | **1**: proxy |  |
 | [`temps-proxy`](../../crates/temps-proxy) | Pingora reverse proxy: request routing, TLS and on-demand certificates, request logs, IP access control, rate limits and Shield | **2**: cli, observability |  |
-| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **10**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, flags, ingress, network-policy, proxy, surveys |  |
+| [`temps-routes`](../../crates/temps-routes) | Proxy route table kept in sync via Postgres LISTEN/NOTIFY, plus ingress endpoints, the gate, Shield and public-ingress sync | **11**: analytics-events, analytics-performance, analytics-session-replay, cli, error-tracking, flags, ingress, network-policy, proxy, sandbox, surveys |  |
 | [`temps-shield`](../../crates/temps-shield) | Shield: proof-of-work challenges, clearance cookies and reputation lists (ADR 066) | **5**: environments, node-agent, projects, proxy, routes |  |
 
 ## domain
@@ -196,7 +196,7 @@ Analytics, error tracking, OpenTelemetry, metrics and logs: ingest, storage and 
 | [`temps-log-aggregator`](../../crates/temps-log-aggregator) | Container runtime log aggregation: collection, compressed chunk storage on disk or S3, indexed search, live tail and retention | **3**: cli, deployments, nodes |  |
 | [`temps-metrics`](../../crates/temps-metrics) | Metrics collection: node, proxy and managed-service collectors, the scraper, and buffered TimescaleDB and ClickHouse metric stores | **10**: alarms, cli, deployments, dns, monitoring, node-agent, nodes, otel, providers, proxy |  |
 | [`temps-observability`](../../crates/temps-observability) | Unified Observe timeline: one paginated feed merging request logs, OTel spans, error events and revenue events | **1**: cli |  |
-| [`temps-otel`](../../crates/temps-otel) | OpenTelemetry: OTLP ingest of metrics, traces and logs, TimescaleDB or ClickHouse storage, sampling, anomaly detection and sidecars | **4**: cli, deployments, error-tracking, observability |  |
+| [`temps-otel`](../../crates/temps-otel) | OpenTelemetry: OTLP ingest of metrics, traces and logs, TimescaleDB or ClickHouse storage, sampling, anomaly detection and sidecars | **5**: cli, deployments, error-tracking, observability, sandbox |  |
 
 ## ai
 

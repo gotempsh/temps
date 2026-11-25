@@ -115,6 +115,16 @@ pub(super) async fn build_router(
                 .require_service::<temps_network_policy::NetworkPolicyService>(),
         }));
 
+    // Node-token endpoint for egress connection records (opted-in sandboxes).
+    let egress_recording_node_routes =
+        temps_sandbox::handlers::egress_recording::node_routes(Arc::new(
+            temps_sandbox::handlers::egress_recording::EgressRecordingNodeState {
+                service: temps_sandbox::plugin::egress_recording_service(
+                    &plugin_manager.service_context().create_plugin_context(),
+                ),
+            },
+        ));
+
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).
     let split = plugin_manager
@@ -138,7 +148,8 @@ pub(super) async fn build_router(
         .merge(node_routes)
         .merge(route_sync_routes)
         .merge(ingress_node_routes)
-        .merge(network_policy_node_routes);
+        .merge(network_policy_node_routes)
+        .merge(egress_recording_node_routes);
 
     // Use the caller-supplied admin-gate when present (so the proxy and the
     // console share one source of truth) and otherwise build a fresh one.

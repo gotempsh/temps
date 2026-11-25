@@ -459,6 +459,7 @@ fn row(public_id: &str, agent_run_id: Option<i32>) -> sandboxes::Model {
         preview_access: Default::default(),
         preview_allowed_cidrs: Vec::new(),
         egress_policy: Default::default(),
+        egress_recording: false,
         lifecycle: "ephemeral".to_string(),
         project_id: None,
         source_repo_url: None,

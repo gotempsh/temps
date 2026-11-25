@@ -6,6 +6,7 @@
 //! No business logic lives here.
 
 pub mod creation;
+pub mod egress_recording;
 pub mod image_preparation;
 pub mod placement;
 pub mod preview_access;
@@ -101,6 +102,8 @@ pub struct SandboxAppState {
         preview_access::update_preview_access,
         sandboxes::resize_sandbox,
         sandboxes::set_egress_policy,
+        egress_recording::get_egress_recording,
+        egress_recording::set_egress_recording,
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
@@ -125,6 +128,8 @@ pub struct SandboxAppState {
         snapshots::storage_summary,
     ),
     components(schemas(
+        crate::services::egress_recording::EgressRecordingStatus,
+        egress_recording::SetEgressRecordingBody,
         sandboxes::CreateSandboxBody,
         sandboxes::SourceBody,
         sandboxes::SandboxResponse,

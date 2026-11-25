@@ -23,6 +23,7 @@ pub mod internal_access;
 pub mod model;
 pub mod node_api;
 pub mod plugin;
+pub mod recording;
 pub mod service;
 pub mod source;
 
@@ -31,5 +32,6 @@ pub use handlers::NetworkPolicyApiDoc;
 pub use internal_access::{InternalAccessApiDoc, InternalAccessService};
 pub use node_api::{node_routes, NetworkPolicyNodeState};
 pub use plugin::NetworkPolicyPlugin;
+pub use recording::NodeRecordingStatus;
 pub use service::NetworkPolicyService;
 pub use source::DbPolicySource;

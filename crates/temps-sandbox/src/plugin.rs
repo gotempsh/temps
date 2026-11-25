@@ -459,17 +459,73 @@ impl TempsPlugin for SandboxPlugin {
             sensitive_action_authorizer,
             image_preparation,
         });
+        let recording_state =
+            Arc::new(crate::handlers::egress_recording::EgressRecordingAppState {
+                service: egress_recording_service(context),
+                audit_service: app_state.audit_service.clone(),
+            });
+        let recording_router = crate::handlers::egress_recording::routes()
+            .route_layer(axum::middleware::from_fn_with_state(
+                app_state.clone(),
+                crate::handlers::hide_managed_application_workspaces,
+            ))
+            .with_state(recording_state);
         let router = configure_routes()
             .route_layer(axum::middleware::from_fn_with_state(
                 app_state.clone(),
                 crate::handlers::hide_managed_application_workspaces,
             ))
-            .with_state(app_state);
+            .with_state(app_state)
+            .merge(recording_router);
         Some(PluginRoutes::new(router))
     }
 
     fn openapi_schema(&self) -> Option<utoipa::openapi::OpenApi> {
         Some(SandboxApiDoc::openapi())
+    }
+}
+
+/// The egress recording service over this process's services. Call it once
+/// every plugin has registered (from routes or after initialisation): the
+/// network-policy plugin, which knows what each node can record, and the
+/// OTel plugin, which stores the records, register after this one. Without
+/// the network-policy service every node reads as not reporting; without
+/// OTel, recording says that its storage is not enabled.
+pub fn egress_recording_service(
+    context: &PluginContext,
+) -> Arc<crate::services::egress_recording::EgressRecordingService> {
+    use crate::services::egress_recording::{
+        EgressLogStore, EgressRecordingService, NodeRecordingCapabilities,
+    };
+    let db = context.require_service::<sea_orm::DatabaseConnection>();
+    let capabilities: Arc<dyn NodeRecordingCapabilities> =
+        match context.get_service::<temps_network_policy::NetworkPolicyService>() {
+            Some(service) => service,
+            None => {
+                warn!(
+                    "Sandbox plugin: no network policy service; egress recording reports every \
+                     node as not reporting"
+                );
+                Arc::new(NoNodeReports)
+            }
+        };
+    let store = context
+        .get_service::<temps_otel::OtelService>()
+        .map(|otel| otel as Arc<dyn EgressLogStore>);
+    if store.is_none() {
+        warn!("Sandbox plugin: no OTel service; egress recording is unavailable");
+    }
+    Arc::new(EgressRecordingService::new(db, capabilities, store))
+}
+
+/// Capabilities when no network-policy service runs: nobody has reported.
+struct NoNodeReports;
+
+impl crate::services::egress_recording::NodeRecordingCapabilities for NoNodeReports {
+    fn status(&self, _node_id: i32) -> temps_network_policy::NodeRecordingStatus {
+        temps_network_policy::NodeRecordingStatus::NotReporting {
+            within_secs: temps_network_policy::service::ENFORCER_REPORT_TTL.as_secs(),
+        }
     }
 }
 

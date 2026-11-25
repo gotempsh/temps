@@ -10884,3 +10884,108 @@ async fn visitor_environments(
         })
         .collect()
 }
+
+async fn sandbox_egress_recording_column(
+    db: &DatabaseConnection,
+) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT data_type, is_nullable, column_default FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'sandboxes' \
+               AND column_name = 'egress_recording'"
+                .to_string(),
+        ))
+        .await?;
+    Ok(match row {
+        Some(row) => Some((
+            row.try_get("", "data_type")?,
+            row.try_get("", "is_nullable")?,
+            row.try_get("", "column_default")?,
+        )),
+        None => None,
+    })
+}
+
+/// Recording outbound connections is opt-in: an existing sandbox, and a new
+/// one that does not ask, has it off. `down` removes the column and keeps
+/// the sandboxes.
+#[tokio::test]
+async fn test_sandbox_egress_recording_defaults_off_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000001_sandbox_egress_recording";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping sandboxes.egress_recording migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(sandbox_egress_recording_column(&db).await?.is_none());
+    db.execute_unprepared(
+        "INSERT INTO users (id, name, email) VALUES (7101, 'Test user', 'user@example.com'); \
+         INSERT INTO sandboxes (id, public_id, name, user_id, status, backend) \
+         VALUES (7101, 'sbx_existing', 'existing', 7101, 'running', 'docker')",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    let (data_type, nullable, default) = sandbox_egress_recording_column(&db)
+        .await?
+        .expect("the column exists after up");
+    assert_eq!(data_type, "boolean");
+    assert_eq!(nullable, "NO");
+    assert_eq!(default.as_deref(), Some("false"));
+    let off = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM sandboxes WHERE egress_recording = false"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(
+        off.try_get::<i32>("", "count")?,
+        1,
+        "existing sandboxes stay off"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(sandbox_egress_recording_column(&db).await?.is_none());
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM sandboxes".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}

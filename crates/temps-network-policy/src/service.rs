@@ -18,8 +18,8 @@ use temps_entities::{
 use temps_workload::{WorkloadKind, WorkloadRef};
 use temps_workload_netpol::dns::NamedWorkload;
 use temps_workload_netpol::{
-    Action, Cidr, Direction, IdentityMap, L4Protocol, NodeMode, NodePolicy, NodePolicyReport,
-    PolicySnapshot, PortRange, Profile, SystemContainer,
+    Action, Cidr, Direction, EgressPolicy, IdentityMap, L4Protocol, NodeMode, NodePolicy,
+    NodePolicyReport, PolicySnapshot, PortRange, Profile, SystemContainer,
 };
 
 use crate::error::NetworkPolicyError;
@@ -109,6 +109,9 @@ pub struct EnforcerReport {
 struct SandboxRow {
     id: i32,
     public_id: String,
+    /// The sandbox opted in to recording its outbound connections (and has
+    /// a project to record them in).
+    egress_recording: bool,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -220,6 +223,11 @@ pub struct NetworkPolicyService {
     /// reports again after a control plane restart, other nodes treat its
     /// workloads' addresses as unknown.
     observed: std::sync::Mutex<HashMap<i32, ObservedReport>>,
+    /// Worker id → what its agent said about recording outbound
+    /// connections ([`crate::recording`]).
+    pub(crate) recording: crate::recording::RecordingReports,
+    /// Whether node 0 (this process) can record.
+    pub(crate) local_recording: std::sync::Mutex<temps_workload_netpol::EgressRecordingCapability>,
 }
 
 fn parse_mode(node_id: i32, value: &str) -> Result<NodeMode, NetworkPolicyError> {
@@ -236,6 +244,10 @@ impl NetworkPolicyService {
             db,
             reports: std::sync::Mutex::new(HashMap::new()),
             observed: std::sync::Mutex::new(HashMap::new()),
+            recording: std::sync::Mutex::new(HashMap::new()),
+            local_recording: std::sync::Mutex::new(
+                temps_workload_netpol::EgressRecordingCapability::detect(false),
+            ),
         }
     }
 
@@ -824,6 +836,7 @@ impl NetworkPolicyService {
     ) -> Result<NodePolicy, NetworkPolicyError> {
         let mode = self.node_mode(node_id).await?;
         self.record_enforcer_report(node_id, &report.backend);
+        self.record_egress_recording(node_id, report.egress_recording);
         self.record_observed(node_id, report.identities);
         let snapshot = match mode {
             NodeMode::Legacy => None,
@@ -854,7 +867,9 @@ impl NetworkPolicyService {
         let sandboxes: Vec<SandboxRow> = self
             .query(
                 "list live sandboxes",
-                "SELECT id, public_id FROM sandboxes WHERE status <> 'destroyed'",
+                "SELECT id, public_id, \
+                 (egress_recording AND project_id IS NOT NULL) AS egress_recording \
+                 FROM sandboxes WHERE status <> 'destroyed'",
             )
             .await?;
         let services: Vec<ServiceRow> = self
@@ -947,9 +962,16 @@ impl NetworkPolicyService {
                 .iter()
                 .map(|s| WorkloadRef::new(WorkloadKind::Sandbox, i64::from(s.id))),
         )?;
+        let egress = mark_recorded(
+            compiled.egress,
+            sandboxes
+                .iter()
+                .filter(|s| s.egress_recording)
+                .map(|s| WorkloadRef::new(WorkloadKind::Sandbox, i64::from(s.id))),
+        );
         Ok(PolicySnapshot {
             policies: compiled.policies,
-            egress: compiled.egress,
+            egress,
             names: named,
             container_names,
             remote,
@@ -1176,6 +1198,26 @@ const OTHER_NODE_ADDRESSES_SQL: &str = "\
 /// ever name addresses it allocates: a compromised worker cannot claim
 /// another node's workloads. A node without a known subnet contributes
 /// nothing.
+/// Marks the egress policies of `recorded` workloads so the node's proxy
+/// records their connections, adding an empty policy for a recorded
+/// workload that has no proxy rules (so the flag reaches the node).
+fn mark_recorded(
+    mut egress: Vec<EgressPolicy>,
+    recorded: impl IntoIterator<Item = WorkloadRef>,
+) -> Vec<EgressPolicy> {
+    for subject in recorded {
+        match egress.iter_mut().find(|p| p.subject == subject) {
+            Some(policy) => policy.record = true,
+            None => egress.push(EgressPolicy {
+                subject,
+                rules: Vec::new(),
+                record: true,
+            }),
+        }
+    }
+    egress
+}
+
 fn merge_observed(
     remote: &mut IdentityMap,
     observed: Vec<(i32, IdentityMap)>,
@@ -1227,6 +1269,31 @@ fn remote_identities(rows: Vec<RemoteAddressRow>) -> IdentityMap {
 #[cfg(test)]
 mod remote_tests {
     use super::*;
+
+    #[test]
+    fn recorded_workloads_are_marked_and_get_a_policy_when_they_have_none() {
+        let sandbox = |id| WorkloadRef::new(WorkloadKind::Sandbox, id);
+        let egress = vec![
+            EgressPolicy {
+                subject: sandbox(1),
+                rules: Vec::new(),
+                record: false,
+            },
+            EgressPolicy {
+                subject: sandbox(2),
+                rules: Vec::new(),
+                record: false,
+            },
+        ];
+        let marked = mark_recorded(egress, [sandbox(2), sandbox(3)]);
+        let flags: Vec<(WorkloadRef, bool)> =
+            marked.iter().map(|p| (p.subject, p.record)).collect();
+        assert_eq!(
+            flags,
+            vec![(sandbox(1), false), (sandbox(2), true), (sandbox(3), true)],
+            "only opted-in sandboxes are recorded"
+        );
+    }
 
     fn row(kind: &str, owner_id: i64, ip: &str) -> RemoteAddressRow {
         RemoteAddressRow {

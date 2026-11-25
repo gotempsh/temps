@@ -155,6 +155,7 @@ fn sandbox() -> sandboxes::Model {
         backend: Some("docker".into()),
         node_id: Some(7),
         egress_policy: Default::default(),
+        egress_recording: false,
         created_at: now,
         last_activity_at: now,
         expires_at: now + chrono::Duration::seconds(900),
