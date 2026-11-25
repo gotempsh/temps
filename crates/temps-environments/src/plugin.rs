@@ -171,4 +171,65 @@ mod tests {
         let environments_plugin = EnvironmentsPlugin::new();
         assert_eq!(environments_plugin.name(), "environments");
     }
+
+    /// Whether an operation's `security` list requires bearer auth. The
+    /// entries are alternatives, so every one must name `bearer_auth`; an
+    /// empty one (`{}`) lets an anonymous caller in.
+    fn requires_bearer_auth(security: &serde_json::Value) -> bool {
+        security.as_array().is_some_and(|alternatives| {
+            !alternatives.is_empty()
+                && alternatives
+                    .iter()
+                    .all(|requirement| requirement.get("bearer_auth").is_some())
+        })
+    }
+
+    #[test]
+    fn an_anonymous_alternative_does_not_count_as_bearer_auth() {
+        use serde_json::json;
+        assert!(requires_bearer_auth(&json!([{ "bearer_auth": [] }])));
+        assert!(!requires_bearer_auth(&json!([{}, { "bearer_auth": [] }])));
+        assert!(!requires_bearer_auth(&json!([{}])));
+        assert!(!requires_bearer_auth(&json!([])));
+        assert!(!requires_bearer_auth(&json!(null)));
+    }
+
+    /// Every route this plugin serves requires an authenticated caller, so
+    /// every operation it publishes must say so. An operation without a
+    /// `security` declaration reads as public in the spec and in the clients
+    /// generated from it.
+    #[test]
+    fn every_published_operation_declares_bearer_auth() {
+        let doc = EnvironmentsPlugin::new()
+            .openapi_schema()
+            .expect("the environments plugin publishes an OpenAPI document");
+        let mut operations = 0;
+        let mut undeclared = Vec::new();
+        for (path, item) in &doc.paths.paths {
+            let methods = [
+                ("GET", &item.get),
+                ("POST", &item.post),
+                ("PUT", &item.put),
+                ("PATCH", &item.patch),
+                ("DELETE", &item.delete),
+            ];
+            for (method, operation) in methods {
+                let Some(operation) = operation else { continue };
+                operations += 1;
+                let security = serde_json::to_value(&operation.security)
+                    .expect("security requirements serialize");
+                if !requires_bearer_auth(&security) {
+                    undeclared.push(format!("{method} {path}"));
+                }
+            }
+        }
+        assert!(
+            operations > 20,
+            "expected the environment, variable and secret operations, found {operations}"
+        );
+        assert!(
+            undeclared.is_empty(),
+            "operations without security((\"bearer_auth\" = [])): {undeclared:?}"
+        );
+    }
 }

@@ -5,7 +5,7 @@ use chrono::Utc;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait, FromQueryResult,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -15,6 +15,7 @@ use temps_entities::{environments, status_checks, status_monitors};
 use tracing::{debug, warn};
 
 use super::db_retry::with_db_retry;
+use super::interval_history::record_interval_change;
 use super::types::{
     normalize_check_interval_seconds, validate_check_path, CreateMonitorRequest, MonitorResponse,
     MonitorStatus, StatusBucket, StatusCheckResponse, StatusPageError, UpdateMonitorRequest,
@@ -691,12 +692,31 @@ impl MonitorService {
                 );
         }
 
-        let result = update
-            .filter(status_monitors::Column::Id.eq(monitor_id))
-            .exec(self.db.as_ref())
-            .await?;
-        if result.rows_affected == 0 {
-            return Err(StatusPageError::NotFound);
+        let update = update.filter(status_monitors::Column::Id.eq(monitor_id));
+
+        match request.check_interval_seconds {
+            // Past checks keep the interval they ran under (see
+            // `interval_history`), so the interval being replaced is recorded
+            // with the update, under a lock that stops a concurrent change
+            // from recording the wrong one.
+            Some(interval) => {
+                let txn = self.db.begin().await?;
+                let current = status_monitors::Entity::find_by_id(monitor_id)
+                    .lock_exclusive()
+                    .one(&txn)
+                    .await?
+                    .ok_or(StatusPageError::NotFound)?;
+                record_interval_change(&txn, monitor_id, current.check_interval_seconds, interval)
+                    .await?;
+                update.exec(&txn).await?;
+                txn.commit().await?;
+            }
+            None => {
+                let result = update.exec(self.db.as_ref()).await?;
+                if result.rows_affected == 0 {
+                    return Err(StatusPageError::NotFound);
+                }
+            }
         }
 
         self.get_monitor(monitor_id).await
@@ -1130,7 +1150,11 @@ impl MonitorService {
     ///
     /// Each check result vouches for the endpoint from the moment it was
     /// taken until the next check, but never for longer than
-    /// [`coverage_grace_secs`]. Time no check vouches for -- the Temps server
+    /// [`coverage_grace_secs`] of the interval the check ran under: the one
+    /// recorded as replaced by the first interval change after it, or the
+    /// monitor's current interval when it has not changed since. Using the
+    /// current interval for every check let an interval change rewrite the
+    /// coverage of windows that had already ended. Time no check vouches for -- the Temps server
     /// or its scheduler was down, the deployment was paused, the monitor did
     /// not exist yet -- is *unknown*, and is reported separately instead of
     /// being silently folded into "up". Counting check rows instead (the old
@@ -1163,33 +1187,68 @@ impl MonitorService {
             monitored_secs: f64,
         }
 
+        // The lower bound reaches back the longest grace period of an
+        // interval whose checks can still cover `start`, so the check taken
+        // just before `start` covers the start of the window.
+        let lookback_secs = super::interval_history::coverage_lookback_secs(
+            self.db.as_ref(),
+            monitor.id,
+            start,
+            grace_secs,
+        )
+        .await?;
+
         // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
         // row (and a retired background-worker marker), which say nothing
-        // about whether the endpoint answered. The lower bound reaches back one
-        // grace period so the check taken just before `start` covers the start
-        // of the window.
+        // about whether the endpoint answered.
+        //
+        // `intervals` turns the recorded changes into disjoint spans
+        // `[valid_from, valid_until)`, each with the interval that ran
+        // during it; the first span is open at the start. Changes are taken
+        // in `id` order, the order their transactions held the monitor's row
+        // lock (see `interval_history`). A span starts at the latest earlier
+        // `changed_at`, not the previous one, so a timestamp that stepped
+        // back (a clock correction, or nodes whose clocks disagree) leaves
+        // that span empty instead of overlapping an earlier one and giving a
+        // check two grace periods. A check after the last change matches no
+        // span and uses the current interval ($4). Previous intervals are
+        // stored normalised, like the current one.
         let row = CoverageRow::find_by_statement(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             r#"
-            WITH checks AS (
+            WITH intervals AS (
                 SELECT
-                    status,
-                    checked_at,
-                    LEAD(checked_at) OVER (ORDER BY checked_at) AS next_at
-                FROM status_checks
+                    previous_interval_seconds::float8 * 2 + 60 AS grace_secs,
+                    MAX(changed_at) OVER (
+                        ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                    ) AS valid_from,
+                    changed_at AS valid_until
+                FROM status_monitor_interval_changes
                 WHERE monitor_id = $1
-                  AND checked_at >= $2 - make_interval(secs => $4)
-                  AND checked_at < $3
-                  AND status != 'unknown'
+            ),
+            checks AS (
+                SELECT
+                    c.status,
+                    c.checked_at,
+                    LEAD(c.checked_at) OVER (ORDER BY c.checked_at) AS next_at,
+                    COALESCE(i.grace_secs, $4) AS grace_secs
+                FROM status_checks c
+                LEFT JOIN intervals i
+                  ON c.checked_at < i.valid_until
+                 AND (i.valid_from IS NULL OR c.checked_at >= i.valid_from)
+                WHERE c.monitor_id = $1
+                  AND c.checked_at >= $2 - make_interval(secs => $5)
+                  AND c.checked_at < $3
+                  AND c.status != 'unknown'
                   -- ADR 068: nobody could reach the environment, so nothing
                   -- was monitored; neither up nor down.
-                  AND status != 'no_address'
+                  AND c.status != 'no_address'
             ),
             spans AS (
                 SELECT
                     status,
                     EXTRACT(EPOCH FROM (
-                        LEAST(COALESCE(next_at, $3), checked_at + make_interval(secs => $4), $3)
+                        LEAST(COALESCE(next_at, $3), checked_at + make_interval(secs => grace_secs), $3)
                         - GREATEST(checked_at, $2)
                     ))::float8 AS secs
                 FROM checks
@@ -1204,6 +1263,7 @@ impl MonitorService {
                 start.into(),
                 end.into(),
                 grace_secs.into(),
+                lookback_secs.into(),
             ],
         ))
         .one(self.db.as_ref())
@@ -1720,11 +1780,19 @@ mod tests {
         after.check_interval_seconds = 30;
         let db = Arc::new(
             sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
-                .append_exec_results([sea_orm::MockExecResult {
-                    last_insert_id: 0,
-                    rows_affected: 1,
-                }])
-                .append_query_results([vec![after]])
+                // The locked read, then the monitor returned after the update.
+                .append_query_results([vec![mock_monitor(11, Some("/old"))], vec![after]])
+                // The interval history row, then the update.
+                .append_exec_results([
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                    sea_orm::MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
                 .into_connection(),
         );
         let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
@@ -1744,13 +1812,32 @@ mod tests {
         assert_eq!(updated.name, "API health");
         drop(service);
         let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
-        let update = db
-            .into_transaction_log()
+        let log = db.into_transaction_log();
+        // The replaced interval is recorded in the transaction that locks the
+        // row and writes the new one, so past windows keep their coverage:
+        // the lock, the history row and the monitor UPDATE are statements of
+        // one transaction, in that order.
+        let statements: Vec<String> = log
             .iter()
-            .flat_map(|transaction| transaction.statements())
+            .find(|transaction| format!("{transaction:?}").contains("FOR UPDATE"))
+            .expect("the monitor row is locked before the interval changes")
+            .statements()
+            .iter()
             .map(|statement| format!("{statement:?}"))
-            .find(|statement| statement.contains("UPDATE"))
-            .expect("an UPDATE statement was issued");
+            .collect();
+        let position = |needle: &str| {
+            statements
+                .iter()
+                .position(|statement| statement.contains(needle))
+                .unwrap_or_else(|| {
+                    panic!("no `{needle}` in the locked transaction: {statements:?}")
+                })
+        };
+        let lock = position("FOR UPDATE");
+        let history = position("INSERT INTO \\\"status_monitor_interval_changes\\\"");
+        let update_at = position("UPDATE \\\"status_monitors\\\"");
+        assert!(lock < history && history < update_at, "{statements:?}");
+        let update = statements[update_at].clone();
         assert!(update.contains(r#"\"name\" = $"#), "{update}");
         assert!(
             update.contains(r#"String(Some("API health"))"#),
@@ -1879,6 +1966,33 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(StatusPageError::NotFound)));
+    }
+
+    #[tokio::test]
+    async fn update_monitor_interval_on_a_missing_monitor_records_nothing() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results([Vec::<status_monitors::Model>::new()])
+                .into_connection(),
+        );
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+
+        let result = service
+            .update_monitor(
+                404,
+                UpdateMonitorRequest {
+                    check_interval_seconds: Some(300),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        assert!(matches!(result, Err(StatusPageError::NotFound)));
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("mock database still has owners"));
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(!log.contains("status_monitor_interval_changes"), "{log}");
+        assert!(!log.contains("UPDATE \\\"status_monitors\\\""), "{log}");
     }
 
     #[tokio::test]
@@ -2865,6 +2979,336 @@ mod tests {
         assert_eq!(buckets[10].down_count, 60);
         assert_eq!(buckets[10].uptime_percentage, Some(0.0));
         assert_eq!(buckets[9].status, "operational");
+    }
+
+    /// An hour-aligned one-hour window that ended before now.
+    fn past_hour_window() -> (UtcDateTime, UtcDateTime) {
+        let now = Utc::now().timestamp();
+        let end = ts(now.div_euclid(3_600) * 3_600 - 3_600);
+        (end - chrono::Duration::hours(1), end)
+    }
+
+    async fn insert_check(
+        db: &Arc<DatabaseConnection>,
+        monitor_id: i32,
+        status: &str,
+        checked_at: UtcDateTime,
+    ) {
+        status_checks::ActiveModel {
+            monitor_id: Set(monitor_id),
+            status: Set(status.to_string()),
+            response_time_ms: Set(Some(42)),
+            checked_at: Set(checked_at),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+    }
+
+    /// A migrated database, or `None` (with a message) when no container
+    /// runtime is available. Any other setup failure, a failed migration
+    /// included, fails the test instead of skipping its assertions.
+    async fn migrated_test_db() -> Option<TestDatabase> {
+        match TestDatabase::with_migrations().await {
+            Ok(test_db) => Some(test_db),
+            Err(error)
+                if temps_test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                println!("Skipping: no container runtime for TestDatabase: {error}");
+                None
+            }
+            Err(error) => panic!("test database setup failed: {error}"),
+        }
+    }
+
+    /// An interval edit that waited for the monitor's row lock behind another
+    /// edit is recorded after it, even though its request arrived first: the
+    /// change is stamped under the lock, and changes are read in lock order.
+    /// Stamped at request time, the waiting edit's row sorted first and gave
+    /// checks before both edits the grace of the middle interval.
+    #[tokio::test]
+    async fn an_edit_that_waited_for_the_lock_is_recorded_after_the_one_holding_it() {
+        use temps_entities::status_monitor_interval_changes as changes;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = Arc::new(MonitorService::new(
+            db.clone(),
+            create_mock_config_service(&db),
+        ));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        insert_check(&db, monitor_id, "operational", start).await;
+
+        // Another edit holds the row lock.
+        let holder = db.begin().await.unwrap();
+        let locked = status_monitors::Entity::find_by_id(monitor_id)
+            .lock_exclusive()
+            .one(&holder)
+            .await
+            .unwrap()
+            .expect("monitor exists");
+
+        // This request arrives now and waits for the lock.
+        let waiting = {
+            let service = service.clone();
+            tokio::spawn(async move {
+                service
+                    .update_monitor(
+                        monitor_id,
+                        UpdateMonitorRequest {
+                            check_interval_seconds: Some(3_600),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert!(!waiting.is_finished(), "the edit waits for the row lock");
+
+        // The holder changes 60 s to 300 s and commits first.
+        record_interval_change(&holder, monitor_id, locked.check_interval_seconds, 300)
+            .await
+            .unwrap();
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckIntervalSeconds,
+                Expr::value(300),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor_id))
+            .exec(&holder)
+            .await
+            .unwrap();
+        holder.commit().await.unwrap();
+        waiting.await.unwrap().unwrap();
+
+        let recorded = changes::Entity::find()
+            .filter(changes::Column::MonitorId.eq(monitor_id))
+            .order_by_asc(changes::Column::ChangedAt)
+            .order_by_asc(changes::Column::Id)
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|change| change.previous_interval_seconds)
+                .collect::<Vec<_>>(),
+            vec![60, 300],
+            "changes in the order they held the lock"
+        );
+        // The check before both edits still ran under 60 s.
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(
+            (status.monitored_seconds, status.unknown_seconds),
+            (180, 3_420)
+        );
+    }
+
+    /// Issue #2039: the coverage of a window that has ended must not move
+    /// when the monitor's check interval changes afterwards, in either
+    /// direction.
+    #[tokio::test]
+    async fn interval_change_does_not_rewrite_coverage_of_a_completed_window() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        // One operational check, every 60 s: it vouches for 180 s.
+        insert_check(&db, monitor_id, "operational", start).await;
+
+        let before = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(before.monitored_seconds, 180);
+        assert_eq!(before.unknown_seconds, 3_420);
+
+        for interval in [3_600, 30] {
+            service
+                .update_monitor(
+                    monitor_id,
+                    UpdateMonitorRequest {
+                        check_interval_seconds: Some(interval),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let after = service
+                .get_current_status_with_timeframes(monitor_id, start, end)
+                .await
+                .unwrap();
+            assert_eq!(
+                (after.monitored_seconds, after.unknown_seconds),
+                (before.monitored_seconds, before.unknown_seconds),
+                "coverage changed after the interval became {interval}s"
+            );
+            assert_eq!(after.uptime_percentage, before.uptime_percentage);
+        }
+
+        let recorded = temps_entities::status_monitor_interval_changes::Entity::find()
+            .filter(
+                temps_entities::status_monitor_interval_changes::Column::MonitorId.eq(monitor_id),
+            )
+            .order_by_asc(temps_entities::status_monitor_interval_changes::Column::ChangedAt)
+            .all(db.as_ref())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|change| change.previous_interval_seconds)
+            .collect::<Vec<_>>();
+        assert_eq!(recorded, vec![60, 3_600]);
+    }
+
+    /// Each check is credited with the interval in effect when it ran; the
+    /// current interval applies only from the last change on.
+    #[tokio::test]
+    async fn each_check_vouches_for_the_interval_it_ran_under() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        // 60 s until minute 10, 300 s until minute 30, 120 s (current) after.
+        for (previous, changed_at) in [(60, at(10)), (300, at(30))] {
+            temps_entities::status_monitor_interval_changes::ActiveModel {
+                monitor_id: Set(monitor_id),
+                previous_interval_seconds: Set(previous),
+                changed_at: Set(changed_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+        status_monitors::Entity::update_many()
+            .col_expr(
+                status_monitors::Column::CheckIntervalSeconds,
+                Expr::value(120),
+            )
+            .filter(status_monitors::Column::Id.eq(monitor_id))
+            .exec(db.as_ref())
+            .await
+            .unwrap();
+        insert_check(&db, monitor_id, "operational", at(0)).await; // 60 s: 180
+        insert_check(&db, monitor_id, "major_outage", at(10)).await; // 300 s: 660
+        insert_check(&db, monitor_id, "operational", at(40)).await; // 120 s: 300
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.monitored_seconds, 180 + 660 + 300);
+        assert_eq!(status.downtime_seconds, 660);
+        assert_eq!(status.unknown_seconds, 3_600 - (180 + 660 + 300));
+    }
+
+    /// A recorded timestamp that steps back (a clock correction, or nodes
+    /// whose clocks disagree) must not make two interval spans overlap: each
+    /// check gets exactly one grace period, the one in effect when it ran.
+    /// Starting each span at the previous `changed_at` put a check at minute
+    /// 15 in both the first span and the third, which then started at 10.
+    #[tokio::test]
+    async fn a_timestamp_that_steps_back_gives_each_check_one_grace_period() {
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::hours(1)).await;
+        let at = |minutes: i64| start + chrono::Duration::minutes(minutes);
+        // In lock (id) order: 300 s until minute 20, 120 s until a time
+        // stamped minute 10, 600 s until minute 40, 60 s (current) after.
+        for (previous, changed_at) in [(300, at(20)), (120, at(10)), (600, at(40))] {
+            temps_entities::status_monitor_interval_changes::ActiveModel {
+                monitor_id: Set(monitor_id),
+                previous_interval_seconds: Set(previous),
+                changed_at: Set(changed_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+        }
+        insert_check(&db, monitor_id, "operational", at(15)).await; // 300 s: 660
+        insert_check(&db, monitor_id, "major_outage", at(30)).await; // 600 s: 1,260
+
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.monitored_seconds, 660 + 1_260);
+        assert_eq!(status.downtime_seconds, 1_260);
+        assert_eq!(status.unknown_seconds, 3_600 - (660 + 1_260));
+    }
+
+    /// The coverage scan reaches back only for intervals whose checks can
+    /// still cover the window. Taking the longest interval ever recorded let
+    /// a daily interval, set once and reverted, widen every later scan back
+    /// to the check retention limit.
+    #[tokio::test]
+    async fn an_interval_that_ended_long_ago_does_not_widen_the_coverage_scan() {
+        use super::super::interval_history::coverage_lookback_secs;
+        let Some(test_db) = migrated_test_db().await else {
+            return;
+        };
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let (start, end) = past_hour_window();
+        let monitor_id = create_backdated_monitor(&db, start - chrono::Duration::days(30)).await;
+        let secs = chrono::Duration::seconds;
+        // The current interval is 60 s: a grace of 180 s.
+        let lookback = || coverage_lookback_secs(db.as_ref(), monitor_id, start, 180.0);
+        // (previous interval, when it ended, expected lookback afterwards)
+        let changes = [
+            // A daily interval that ended ten days ago.
+            (86_400, start - chrono::Duration::days(10), 180.0),
+            // An hourly one that ended exactly one grace (7,260 s) before
+            // `start`: its last check vouches for nothing past `start`.
+            (3_600, start - secs(7_260), 180.0),
+            // A 300 s one (grace 660 s) that ended ten minutes before `start`.
+            (300, start - secs(600), 660.0),
+        ];
+        for (previous, changed_at, expected) in changes {
+            temps_entities::status_monitor_interval_changes::ActiveModel {
+                monitor_id: Set(monitor_id),
+                previous_interval_seconds: Set(previous),
+                changed_at: Set(changed_at),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await
+            .unwrap();
+            assert_eq!(
+                lookback().await.unwrap(),
+                expected,
+                "after recording the end of a {previous}s interval"
+            );
+        }
+
+        // A check under the 300 s interval, 620 s before `start`, still
+        // vouches for the first 40 s of the window.
+        insert_check(&db, monitor_id, "operational", start - secs(620)).await;
+        let status = service
+            .get_current_status_with_timeframes(monitor_id, start, end)
+            .await
+            .unwrap();
+        assert_eq!(status.monitored_seconds, 40);
+        assert_eq!(status.unknown_seconds, 3_560);
     }
 
     #[tokio::test]

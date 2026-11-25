@@ -329,7 +329,8 @@ impl From<crate::services::secret_service::SecretError> for Problem {
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environments(
     State(state): State<Arc<AppState>>,
@@ -404,7 +405,8 @@ pub async fn get_environments(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment(
     State(state): State<Arc<AppState>>,
@@ -477,7 +479,8 @@ pub async fn get_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_domains(
     State(state): State<Arc<AppState>>,
@@ -528,7 +531,8 @@ pub async fn get_environment_domains(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn add_environment_domain(
     State(state): State<Arc<AppState>>,
@@ -587,7 +591,8 @@ pub async fn add_environment_domain(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug"),
         ("domain_id" = i32, Path, description = "Domain ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment_domain(
     State(state): State<Arc<AppState>>,
@@ -623,7 +628,8 @@ pub async fn delete_environment_domain(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID to filter by")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_variables(
     State(state): State<Arc<AppState>>,
@@ -750,7 +756,8 @@ pub async fn get_environment_variable(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID to filter manual vars by")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_resolved_environment_variables(
     State(state): State<Arc<AppState>>,
@@ -916,7 +923,8 @@ pub async fn get_resolved_environment_variables(
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
         ("var_id" = Option<i32>, Query, description = "Exact manual environment-variable row ID"),
         ("service_id" = Option<i32>, Query, description = "Integration service ID shown by the resolved list")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_resolved_environment_variable_value(
     State(state): State<Arc<AppState>>,
@@ -1059,7 +1067,8 @@ pub async fn get_resolved_environment_variable_value(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1155,7 +1164,8 @@ pub async fn create_environment_variable(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("var_id" = i32, Path, description = "Environment variable ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1292,7 +1302,8 @@ pub async fn dismiss_environment_variable_secret_suggestion(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("var_id" = i32, Path, description = "Environment variable ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_variable(
     State(state): State<Arc<AppState>>,
@@ -1420,7 +1431,8 @@ pub async fn update_environment_variable(
         ("key" = String, Path, description = "Environment variable key"),
         ("environment_id" = Option<i32>, Query, description = "Optional environment ID"),
         ("var_id" = Option<i32>, Query, description = "Exact environment-variable row ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn get_environment_variable_value(
     State(state): State<Arc<AppState>>,
@@ -1598,7 +1610,8 @@ fn settings_change_granted_runtime(settings: &UpdateEnvironmentSettingsRequest) 
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_settings(
     State(state): State<Arc<AppState>>,
@@ -1837,7 +1850,8 @@ pub async fn update_environment_settings(
     params(
         ("project_id" = i32, Path, description = "Project ID or slug"),
         ("env_id" = i32, Path, description = "Environment ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_environment_subdomain(
     State(state): State<Arc<AppState>>,
@@ -1953,7 +1967,8 @@ pub async fn update_environment_subdomain(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn wake_environment(
     State(state): State<Arc<AppState>>,
@@ -2111,7 +2126,8 @@ pub async fn wake_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn sleep_environment(
     State(state): State<Arc<AppState>>,
@@ -2260,7 +2276,8 @@ pub async fn sleep_environment(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("env_id" = i32, Path, description = "Environment ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_environment(
     State(state): State<Arc<AppState>>,
@@ -2381,7 +2398,8 @@ async fn require_environment_deletion_authorization(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID or slug")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_environment(
     State(state): State<Arc<AppState>>,
@@ -2579,7 +2597,8 @@ pub async fn get_project_secret(
     ),
     params(
         ("project_id" = i32, Path, description = "Project ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn create_project_secret(
     State(state): State<Arc<AppState>>,
@@ -2692,7 +2711,8 @@ async fn record_secret_write(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("secret_id" = i32, Path, description = "Secret ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn update_project_secret(
     State(state): State<Arc<AppState>>,
@@ -2771,7 +2791,8 @@ pub async fn update_project_secret(
     params(
         ("project_id" = i32, Path, description = "Project ID"),
         ("secret_id" = i32, Path, description = "Secret ID")
-    )
+    ),
+    security(("bearer_auth" = []))
 )]
 pub async fn delete_project_secret(
     State(state): State<Arc<AppState>>,

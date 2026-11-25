@@ -35,10 +35,11 @@ repos:
         name: openapi.json is canonical
         # Catches the raw server response (minified, one line) being committed
         # over the formatted file, which reports ~92,000 deletions and buries
-        # the real change. Reads only the file: no server, no network.
+        # the real change, and operations that declare no authentication
+        # without being listed as public. Reads only files: no server, no network.
         entry: bun apps/temps-cli/scripts/check-openapi.ts
         language: system
-        files: ^apps/temps-cli/openapi\.json$
+        files: ^apps/temps-cli/(openapi\.json|openapi-unsecured-operations\.json|scripts/(check-openapi|openapi-security)\.ts)$
         pass_filenames: false
 
       - id: cargo-fmt

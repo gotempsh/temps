@@ -7224,7 +7224,9 @@ Create a new IP access control rule
 | `--ip <ip_or_cidr>` | IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32") | - | No |
 | `--action <action>` | Action to take: "allow" or "deny" | - | No |
 | `--description <desc>` | Optional description/reason for the rule | - | No |
-| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--confirm-broad-range` | Save a block range wider than /8 (IPv4) or /16 (IPv6) | - | No |
+| `--acknowledge-lockout` | Save a block rule even if it matches the address you are calling from | - | No |
+| `-y, --yes` | Skip prompts (for automation); does not confirm a broad range or a lockout | - | No |
 
 ### `ip-access show`
 
@@ -7249,6 +7251,8 @@ Update an IP access control rule
 | `--ip <ip>` | New IP address or CIDR range | - | No |
 | `--action <action>` | New action: "allow" or "deny" | - | No |
 | `--description <desc>` | New description/reason | - | No |
+| `--confirm-broad-range` | Save a block range wider than /8 (IPv4) or /16 (IPv6) | - | No |
+| `--acknowledge-lockout` | Save a block rule even if it matches the address you are calling from | - | No |
 
 ### `ip-access remove` (alias: `rm`)
 

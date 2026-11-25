@@ -1272,3 +1272,51 @@ async fn a_save_waits_a_bounded_time_for_the_target_address() {
     .await;
     assert!(blocked.is_some(), "a private answer is still refused");
 }
+
+/// Issue #2039: changing a target monitor's interval records the interval it
+/// replaces, so uptime of windows that have ended keeps the coverage it had.
+/// A save that leaves the effective interval as it was records nothing.
+#[tokio::test]
+async fn interval_changes_are_recorded_for_past_coverage() {
+    use sea_orm::QueryOrder;
+    use temps_entities::status_monitor_interval_changes as changes;
+
+    let Some(fx) = fixture().await else { return };
+    let service = fx.service();
+    let created = service
+        .create(fx.project_id, http_request("https://api.example.test/"))
+        .await
+        .expect("create");
+    let first = created.check_interval_seconds;
+
+    for (requested, stored) in [
+        (Some(600), 600),
+        (Some(600), 600),
+        (None, 600),
+        (Some(5), 30),
+    ] {
+        let updated = service
+            .update(
+                fx.project_id,
+                created.id,
+                UpdateTargetMonitorRequest {
+                    check_interval_seconds: requested,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("update");
+        assert_eq!(updated.check_interval_seconds, stored);
+    }
+
+    let recorded: Vec<i32> = changes::Entity::find()
+        .filter(changes::Column::MonitorId.eq(created.id))
+        .order_by_asc(changes::Column::ChangedAt)
+        .all(fx.db.as_ref())
+        .await
+        .expect("interval changes")
+        .into_iter()
+        .map(|change| change.previous_interval_seconds)
+        .collect();
+    assert_eq!(recorded, vec![first, 600]);
+}
