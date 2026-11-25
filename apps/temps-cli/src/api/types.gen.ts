@@ -14205,9 +14205,105 @@ export type EffectivePolicyResponse = {
 };
 
 /**
+ * A page of a sandbox's recorded connections, newest first.
+ */
+export type EgressActivityPage = {
+    /**
+     * Another page follows.
+     */
+    has_more: boolean;
+    page: number;
+    per_page: number;
+    records: Array<EgressActivityRecord>;
+    /**
+     * The sandbox's public id.
+     */
+    sandbox_id: string;
+    /**
+     * How many records match, across all pages.
+     */
+    total: number;
+};
+
+/**
+ * One recorded outbound connection (or several identical refusals,
+ * collapsed: see `count`).
+ */
+export type EgressActivityRecord = {
+    bytes_received: number;
+    bytes_sent: number;
+    /**
+     * How many identical connections this record stands for. Repeated
+     * refusals of the same destination are collapsed into one record.
+     */
+    count: number;
+    duration_ms: number;
+    /**
+     * The destination host the sandbox asked for (`server.address`).
+     */
+    host?: string | null;
+    /**
+     * `tunnel` (HTTPS `CONNECT`), `forward` (plain HTTP), `relay` (a Temps
+     * relay) or `unknown`.
+     */
+    kind: string;
+    /**
+     * When the last of the collapsed connections started.
+     */
+    last_started_at?: string | null;
+    /**
+     * Plain HTTP only: the method.
+     */
+    method?: string | null;
+    /**
+     * The node whose proxy observed it.
+     */
+    node_name?: string | null;
+    /**
+     * `allowed`, `refused` or `failed`.
+     */
+    outcome: string;
+    /**
+     * Plain HTTP only: the path, never the query string.
+     */
+    path?: string | null;
+    /**
+     * The address the proxy connected to (`network.peer.address`).
+     */
+    peer_address?: string | null;
+    /**
+     * The destination port (`server.port`).
+     */
+    port?: number | null;
+    /**
+     * Why it was refused or failed, e.g. `no_allow_rule`, `private_address`,
+     * `port_not_allowed`.
+     */
+    reason?: string | null;
+    /**
+     * The Temps relay used, for `relay` connections.
+     */
+    relay?: string | null;
+    span_id?: string | null;
+    /**
+     * When the connection started (the first, when collapsed).
+     */
+    timestamp: string;
+    /**
+     * Trace correlation, when the record carries it.
+     */
+    trace_id?: string | null;
+};
+
+/**
  * How a sandbox may reach the outside world.
  */
 export type EgressMode = 'internet' | 'restricted';
+
+/**
+ * Only the connections that ended this way.
+ */
+export type EgressOutcomeFilter = 'allowed' | 'refused' | 'failed';
 
 /**
  * Whether a sandbox records its outbound connections, and whether it can.
@@ -107751,6 +107847,69 @@ export type SetEgressRecordingResponses = {
 };
 
 export type SetEgressRecordingResponse = SetEgressRecordingResponses[keyof SetEgressRecordingResponses];
+
+export type ListEgressRecordsData = {
+    body?: never;
+    path: {
+        /**
+         * Sandbox id (`sbx_...`)
+         */
+        id: string;
+    };
+    query?: {
+        /**
+         * Page number, from 1. Default 1.
+         */
+        page?: number;
+        /**
+         * Records per page. Default 20, at most 100.
+         */
+        per_page?: number;
+        /**
+         * Only connections that ended this way.
+         */
+        outcome?: EgressOutcomeFilter;
+    };
+    url: '/v1/sandboxes/{id}/egress-records';
+};
+
+export type ListEgressRecordsErrors = {
+    /**
+     * Invalid query
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Sandbox not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+    /**
+     * OpenTelemetry storage is not enabled or cannot be read
+     */
+    503: ProblemDetails;
+};
+
+export type ListEgressRecordsError = ListEgressRecordsErrors[keyof ListEgressRecordsErrors];
+
+export type ListEgressRecordsResponses = {
+    /**
+     * A page of recorded connections
+     */
+    200: EgressActivityPage;
+};
+
+export type ListEgressRecordsResponse = ListEgressRecordsResponses[keyof ListEgressRecordsResponses];
 
 export type ListEventsData = {
     body?: never;

@@ -29997,11 +29997,192 @@
         ],
         "type": "object"
       },
+      "EgressActivityPage": {
+        "description": "A page of a sandbox's recorded connections, newest first.",
+        "properties": {
+          "has_more": {
+            "description": "Another page follows.",
+            "type": "boolean"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "records": {
+            "items": {
+              "$ref": "#/components/schemas/EgressActivityRecord"
+            },
+            "type": "array"
+          },
+          "sandbox_id": {
+            "description": "The sandbox's public id.",
+            "type": "string"
+          },
+          "total": {
+            "description": "How many records match, across all pages.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sandbox_id",
+          "records",
+          "page",
+          "per_page",
+          "total",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "EgressActivityRecord": {
+        "description": "One recorded outbound connection (or several identical refusals,\ncollapsed: see `count`).",
+        "properties": {
+          "bytes_received": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "bytes_sent": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "count": {
+            "description": "How many identical connections this record stands for. Repeated\nrefusals of the same destination are collapsed into one record.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "duration_ms": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host": {
+            "description": "The destination host the sandbox asked for (`server.address`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "`tunnel` (HTTPS `CONNECT`), `forward` (plain HTTP), `relay` (a Temps\nrelay) or `unknown`.",
+            "type": "string"
+          },
+          "last_started_at": {
+            "description": "When the last of the collapsed connections started.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "description": "Plain HTTP only: the method.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "node_name": {
+            "description": "The node whose proxy observed it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "description": "`allowed`, `refused` or `failed`.",
+            "type": "string"
+          },
+          "path": {
+            "description": "Plain HTTP only: the path, never the query string.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "peer_address": {
+            "description": "The address the proxy connected to (`network.peer.address`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "port": {
+            "description": "The destination port (`server.port`).",
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why it was refused or failed, e.g. `no_allow_rule`, `private_address`,\n`port_not_allowed`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "relay": {
+            "description": "The Temps relay used, for `relay` connections.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "span_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "timestamp": {
+            "description": "When the connection started (the first, when collapsed).",
+            "format": "date-time",
+            "type": "string"
+          },
+          "trace_id": {
+            "description": "Trace correlation, when the record carries it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "timestamp",
+          "outcome",
+          "kind",
+          "bytes_sent",
+          "bytes_received",
+          "duration_ms",
+          "count"
+        ],
+        "type": "object"
+      },
       "EgressMode": {
         "description": "How a sandbox may reach the outside world.",
         "enum": [
           "internet",
           "restricted"
+        ],
+        "type": "string"
+      },
+      "EgressOutcomeFilter": {
+        "description": "Only the connections that ended this way.",
+        "enum": [
+          "allowed",
+          "refused",
+          "failed"
         ],
         "type": "string"
       },
@@ -199481,6 +199662,136 @@
           }
         ],
         "summary": "Turn recording of the sandbox's outbound connections on or off.",
+        "tags": [
+          "Sandboxes"
+        ],
+        "x-maturity": "experimental"
+      }
+    },
+    "/v1/sandboxes/{id}/egress-records": {
+      "get": {
+        "description": "Each record is one connection (or identical refusals collapsed into\none, see `count`): destination host and port, method and path for plain\nHTTP (never the query string), outcome and refusal reason, bytes each\nway and duration. Records exist only while recording is on; a sandbox\nwithout a project has none. These are the same OpenTelemetry log\nrecords the project's logs show, read by sandbox.",
+        "operationId": "list_egress_records",
+        "parameters": [
+          {
+            "description": "Sandbox id (`sbx_...`)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Page number, from 1. Default 1.",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Records per page. Default 20, at most 100.",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Only connections that ended this way.",
+            "in": "query",
+            "name": "outcome",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/EgressOutcomeFilter"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EgressActivityPage"
+                }
+              }
+            },
+            "description": "A page of recorded connections"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid query"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Sandbox not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "OpenTelemetry storage is not enabled or cannot be read"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The sandbox's recorded outbound connections, newest first.",
         "tags": [
           "Sandboxes"
         ],
