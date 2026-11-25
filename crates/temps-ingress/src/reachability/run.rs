@@ -51,9 +51,9 @@ use super::model::{
     UndoResult,
 };
 use super::plan::NamedId;
+use crate::tailscale::run::TailscaleOps;
 use crate::tailscale::{self, Ownership, ServiceDefinition, ServiceHost, TailscaleCredential};
-use temps_core::tailnet::messages as tailnet_messages;
-use temps_entities::tailnet_serve_entries::{REPORT_APPLIED, REPORT_CONFLICT, REPORT_ERROR};
+use temps_entities::tailnet_serve_entries::REPORT_CONFLICT;
 
 /// A managed zone's state under one DNS provider.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -135,7 +135,7 @@ pub struct ServiceEntryHost {
 }
 
 impl ServiceEntryHost {
-    fn hosts(&self, host: &ServiceHost) -> bool {
+    pub(crate) fn hosts(&self, host: &ServiceHost) -> bool {
         host.is(self.tailscale_node_id.as_deref(), self.dns_name.as_deref())
     }
 }
@@ -199,7 +199,7 @@ pub(crate) fn unrecorded_message(service: &str, hosts: &[String]) -> String {
 }
 
 /// Whether `addrs` is non-empty and every one is a Tailscale address.
-fn tailscale_addrs(addrs: &[String]) -> bool {
+pub(crate) fn tailscale_addrs(addrs: &[String]) -> bool {
     !addrs.is_empty()
         && addrs.iter().all(|a| {
             a.parse::<IpAddr>()
@@ -252,9 +252,10 @@ pub enum ServeRelease {
     Removing,
 }
 
-/// Everything a run does to the rest of Temps.
+/// Everything a run does to the rest of Temps. Tailscale's part is still a
+/// supertrait while the engine's undo reads it (ADR-116 D8).
 #[async_trait]
-pub trait RunOps: Send + Sync {
+pub trait RunOps: TailscaleOps {
     /// Finds what `intent` describes, if it exists: how a pending journal
     /// entry is resolved.
     async fn find(&self, intent: &Intent) -> Result<Option<RunResource>, String>;
@@ -371,70 +372,6 @@ pub trait RunOps: Send + Sync {
     async fn http_policy(&self, host: &str) -> Result<Option<Option<HttpPolicy>>, String>;
     /// Records the HTTPS-only choice of `host`; `None` forgets it.
     async fn set_http_policy(&self, host: &str, policy: Option<HttpPolicy>) -> Result<(), String>;
-    /// Creates the `(node, address)` Serve entry with this run's reference,
-    /// or adds a reference to the same one, in one transaction holding the
-    /// entry's advisory lock (and the Service's first) (ADR 065 D4).
-    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String>;
-    /// This run's reference to the `(node, address)` entry: `(entry id,
-    /// created)`.
-    async fn serve_reference(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<(i32, bool)>, String>;
-    async fn serve_entry(
-        &self,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<ServeEntryStatus>, String>;
-    /// Drops this run's reference under the entry's lock; the last one
-    /// decides what happens to the entry by the agent's last report.
-    async fn release_serve_entry(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<ServeRelease, String>;
-    /// Deletes a `removing` entry the user decided to leave on the worker
-    /// as it is, so nothing more is asked of the agent.
-    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String>;
-    /// Proves a pasted Tailscale OAuth client's scopes and saves it, sealed,
-    /// under `name` (ADR 065 D2); returns its row id.
-    async fn save_tailscale_credential(
-        &self,
-        name: &str,
-        credential: &TailscaleCredential,
-    ) -> Result<i32, String>;
-    /// Removes the credential row unless a Service setup still needs it:
-    /// `Some(why)` when it is kept.
-    async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String>;
-    /// The Service `name` in the cluster's tailnet, as the API has it now.
-    async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String>;
-    /// `PUT`, only ever to create (ADR 065 D4).
-    async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError>;
-    /// The devices advertising `name`.
-    async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String>;
-    /// Every Serve entry naming `name`, on any node.
-    async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String>;
-    /// The Service run `creator_run_id` of this install journaled as
-    /// `created`, with when: `None` when no journal records creating it.
-    async fn service_creation(
-        &self,
-        name: &str,
-        creator_run_id: i32,
-    ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String>;
-    /// The confirmed delete (ADR 065 D4): under the Service's lock, no
-    /// Serve entry names it, no host advertises it, and a read made just
-    /// before the `DELETE` still carries this install's marker for
-    /// `creator_run_id` and equals `shown`; else it is kept.
-    async fn delete_service(
-        &self,
-        tailnet: &str,
-        name: &str,
-        creator_run_id: i32,
-        shown: &ServiceDefinition,
-    ) -> Result<ServiceDeletion, String>;
     /// Whether connector `id` publishes every environment's host
     /// (ADR 068 D3).
     async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String>;
@@ -538,6 +475,18 @@ pub trait StepRun: Send {
     fn dns_provider_id(&self) -> Option<i32>;
     /// The tunnel this step made, which later steps publish through.
     fn set_connector(&mut self, id: i32);
+    /// The run's journal as it is now.
+    fn journal(&self) -> &[JournalEntry];
+    /// Record `resource` as done under `intent` without a call: what the
+    /// step found rather than made.
+    async fn record_found(&mut self, intent: &Intent, resource: RunResource);
+    /// Replace what the entry under `key` holds with what the step read
+    /// back since, and save.
+    async fn update_resource(&mut self, key: &str, resource: RunResource);
+    /// The private address id of the run's address, from what attached it.
+    async fn address_id(&self) -> Result<String, String>;
+    fn timing(&self) -> Timing;
+    async fn sleep(&self, duration: Duration);
 }
 
 #[async_trait]
@@ -576,6 +525,33 @@ impl StepRun for Runner<'_> {
 
     fn set_connector(&mut self, id: i32) {
         self.ctx.connector_id = Some(id);
+    }
+
+    fn journal(&self) -> &[JournalEntry] {
+        &self.record.journal
+    }
+
+    async fn record_found(&mut self, intent: &Intent, resource: RunResource) {
+        Runner::record_found(self, intent, resource).await
+    }
+
+    async fn update_resource(&mut self, key: &str, resource: RunResource) {
+        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
+            entry.resource = Some(resource);
+        }
+        self.save().await;
+    }
+
+    async fn address_id(&self) -> Result<String, String> {
+        Runner::address_id(self).await
+    }
+
+    fn timing(&self) -> Timing {
+        self.timing
+    }
+
+    async fn sleep(&self, duration: Duration) {
+        self.ops.sleep(duration).await
     }
 }
 
@@ -869,47 +845,6 @@ async fn look(ops: &dyn RunOps, run_id: i32, intent: &Intent) -> Result<Found, S
             // Still what it was before the write: the write did not happen.
             Some(record) if record.unchanged_from(before) => Found::Missing,
             other => Found::Changed(describe_record(other.as_ref())),
-        }),
-        // The row and this run's reference to it: Temps' own rows.
-        Intent::TailscaleServe {
-            node_id,
-            node_name,
-            address_id,
-            hostname,
-            ..
-        } => Ok(
-            match ops.serve_reference(run_id, *node_id, address_id).await? {
-                Some((entry_id, created)) => Found::Made(Box::new(RunResource::TailscaleServe {
-                    node_id: *node_id,
-                    node_name: node_name.clone(),
-                    address_id: address_id.clone(),
-                    hostname: hostname.clone(),
-                    entry_id,
-                    created,
-                })),
-                None => Found::Missing,
-            },
-        ),
-        // Created by this run only when it carries this run's marker.
-        Intent::TailscaleService {
-            tailnet,
-            name,
-            marker,
-        } => Ok(match ops.read_service(name).await? {
-            None => Found::Missing,
-            Some(definition) if definition.comment == *marker => {
-                Found::Made(Box::new(RunResource::TailscaleService {
-                    tailnet: tailnet.clone(),
-                    name: name.clone(),
-                    created: true,
-                    creator_run_id: run_id,
-                    definition,
-                }))
-            }
-            Some(definition) => Found::Changed(format!(
-                "`{name}` with the comment `{}`, which this run did not write",
-                definition.comment
-            )),
         }),
         // The address's own column (ADR 070 D1): set when it holds the
         // choice, not set while it still holds what it held before.
@@ -1818,154 +1753,6 @@ impl Runner<'_> {
         Ok(temps_core::worker_ingress::private_address_id(true, id))
     }
 
-    /// ADR 065 D4: declare the worker's Serve entry, referenced by this
-    /// run, then wait for its agent to apply it. Done only on `applied`;
-    /// the agent never overwrites what it did not write, so neither does
-    /// this step.
-    async fn configure_serve(&mut self, target: &ServeTarget) -> Outcome {
-        let input = self.input;
-        let host = input.address.clone();
-        let node = target.node_name.clone();
-        let address_id = match self.address_id().await {
-            Ok(id) => id,
-            Err(error) => return Outcome::Failed(error),
-        };
-        let intent = Intent::TailscaleServe {
-            node_id: target.node_id,
-            node_name: node.clone(),
-            address_id: address_id.clone(),
-            hostname: host.clone(),
-            service: target.service.clone(),
-        };
-        match self.begin(&intent).await {
-            Err(hold) => return hold.into(),
-            Ok(Begin::Have(_)) => {}
-            Ok(Begin::Go) => {
-                let wish = ServeWish {
-                    target: target.clone(),
-                    address_id: address_id.clone(),
-                    hostname: host.clone(),
-                    service_addrs: self.service_resource().map_or_else(Vec::new, |r| match r {
-                        RunResource::TailscaleService { definition, .. } => definition.addrs,
-                        _ => Vec::new(),
-                    }),
-                };
-                let key = intent.key(input.run_id);
-                match self.ops.claim_serve_entry(input.run_id, &wish).await {
-                    Ok(claim @ (ServeClaim::Created { .. } | ServeClaim::Found { .. })) => {
-                        let (entry_id, created) = match claim {
-                            ServeClaim::Created { entry_id } => (entry_id, true),
-                            ServeClaim::Found { entry_id } => (entry_id, false),
-                            ServeClaim::Differs(_) | ServeClaim::Removing => (0, false),
-                        };
-                        self.finish(
-                            &key,
-                            Some(RunResource::TailscaleServe {
-                                node_id: target.node_id,
-                                node_name: node.clone(),
-                                address_id: address_id.clone(),
-                                hostname: host.clone(),
-                                entry_id,
-                                created,
-                            }),
-                        )
-                        .await;
-                    }
-                    Ok(ServeClaim::Differs(what)) => {
-                        self.finish(&key, None).await;
-                        return Outcome::Conflict(format!(
-                            "{node} already has a Serve entry for {host} that another Temps \
-                             setup asked for: {what}. Temps changes nothing there: undo that \
-                             setup first, then resume this one."
-                        ));
-                    }
-                    Ok(ServeClaim::Removing) => {
-                        self.finish(&key, None).await;
-                        return Outcome::Stalled(format!(
-                            "{node} is still taking an earlier Serve entry for {host} off its \
-                             config, and Temps never revives one being removed. Resume once \
-                             it has; its agent reports every 30 seconds."
-                        ));
-                    }
-                    Err(error) => {
-                        self.finish_failed(&intent, true).await;
-                        return Outcome::Failed(error);
-                    }
-                }
-            }
-        }
-        let mut waited = Duration::ZERO;
-        let mut last = format!(
-            "{node} has not applied the Serve entry for {host} yet; its agent applies it on its \
-             next pass, every 30 seconds."
-        );
-        loop {
-            match self.ops.serve_entry(target.node_id, &address_id).await {
-                Ok(None) => {
-                    return Outcome::Failed(format!(
-                        "The Serve entry for {host} on {node} is gone: something removed it \
-                         while this run waited."
-                    ))
-                }
-                Ok(Some(status)) if status.removing => {
-                    return Outcome::Failed(format!(
-                        "The Serve entry for {host} on {node} is being removed: another run's \
-                         undo took it off while this run waited."
-                    ))
-                }
-                Ok(Some(status)) if status.funnel => {
-                    return Outcome::Conflict(tailnet_messages::funnel(&node))
-                }
-                Ok(Some(status)) => match status.report.as_deref() {
-                    Some(REPORT_APPLIED) => {
-                        return Outcome::Done(Some(format!(
-                            "{node} serves {host} with Tailscale Serve."
-                        )))
-                    }
-                    Some(REPORT_CONFLICT) => {
-                        return Outcome::Conflict(tailnet_messages::slot_taken(
-                            &host,
-                            status
-                                .detail
-                                .as_deref()
-                                .unwrap_or("a Serve entry Temps did not write"),
-                        ))
-                    }
-                    Some(REPORT_ERROR) => {
-                        last = format!(
-                            "{node} could not apply the Serve entry for {host}: {}",
-                            status.detail.unwrap_or_default()
-                        )
-                    }
-                    _ => {
-                        if let Some(error) = status.worker_error {
-                            last = error;
-                        }
-                    }
-                },
-                Err(error) => last = format!("Could not read the Serve entry for {host}: {error}"),
-            }
-            if waited >= self.timing.publish {
-                return Outcome::Stalled(last);
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        }
-    }
-
-    /// The Tailscale Service this run defined, as journaled.
-    fn service_resource(&self) -> Option<RunResource> {
-        let name = &self.input.tailscale_service.as_ref()?.name;
-        self.record.journal.iter().find_map(|e| match &e.resource {
-            Some(r @ RunResource::TailscaleService { name: n, .. })
-                if n == name && e.state == JournalState::Done =>
-            {
-                Some(r.clone())
-            }
-            _ => None,
-        })
-    }
-
     /// Record `resource` as done under `intent`'s key without a call: what
     /// this run found rather than made.
     async fn record_found(&mut self, intent: &Intent, resource: RunResource) {
@@ -1986,371 +1773,6 @@ impl Runner<'_> {
         entry.pending_since = None;
         entry.at = now;
         self.save().await;
-    }
-
-    /// ADR 065 D2: prove a pasted OAuth client's scopes and save it.
-    async fn save_tailscale_credential(&mut self) -> Outcome {
-        let input = self.input;
-        let Some(plan) = &input.tailscale_service else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let intent = Intent::TailscaleCredential {
-            name: plan.credential_name.clone(),
-        };
-        let key = intent.key(input.run_id);
-        let resource = match self.begin(&intent).await {
-            Err(hold) => return hold.into(),
-            Ok(Begin::Have(resource)) => *resource,
-            Ok(Begin::Go) => {
-                let Some(credential) = &input.tailscale_credential else {
-                    self.finish(&key, None).await;
-                    return Outcome::Failed(
-                        "Paste the Tailscale OAuth client again: Temps never stores it until the \
-                         run saves it."
-                            .into(),
-                    );
-                };
-                match self
-                    .ops
-                    .save_tailscale_credential(&plan.credential_name, credential)
-                    .await
-                {
-                    Ok(id) => {
-                        let resource = RunResource::TailscaleCredential {
-                            id,
-                            name: plan.credential_name.clone(),
-                        };
-                        self.finish(&key, Some(resource.clone())).await;
-                        resource
-                    }
-                    Err(error) => {
-                        self.finish_failed(&intent, true).await;
-                        return Outcome::Failed(error);
-                    }
-                }
-            }
-        };
-        match resource {
-            RunResource::TailscaleCredential { name, .. } => {
-                Outcome::Done(Some(format!("Every scope is there; saved as {name}.")))
-            }
-            _ => Outcome::Failed("The saved Tailscale OAuth client could not be found.".into()),
-        }
-    }
-
-    /// ADR 065 D4: create the Service only when absent, find this install's
-    /// own, and check the whole definition and its hosts back.
-    async fn define_service(&mut self) -> Outcome {
-        let input = self.input;
-        let Some(plan) = input.tailscale_service.clone() else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let name = plan.name.clone();
-        let marker = tailscale::marker(&plan.install_id, input.run_id);
-        let intent = Intent::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.clone(),
-            marker: marker.clone(),
-        };
-        let key = intent.key(input.run_id);
-        let resource = match self.service_resource() {
-            Some(resource) => resource,
-            None => {
-                let pending = self
-                    .record
-                    .journal
-                    .iter()
-                    .any(|e| e.key == key && e.state == JournalState::Pending);
-                // A pending create is resolved by its lookup, never by a
-                // second read that could take it for someone else's.
-                let read = if pending {
-                    None
-                } else {
-                    match self.ops.read_service(&name).await {
-                        Ok(read) => Some(read),
-                        Err(error) => {
-                            return Outcome::Failed(format!(
-                                "Temps could not read `{name}` from your tailnet, so it created \
-                                 nothing: {error}"
-                            ))
-                        }
-                    }
-                };
-                match read {
-                    None | Some(None) => match self.begin(&intent).await {
-                        Err(hold) => return hold.into(),
-                        Ok(Begin::Have(resource)) => *resource,
-                        Ok(Begin::Go) => {
-                            let fixed = ServiceDefinition::fixed(&name, &plan.tag, &marker);
-                            match self.ops.create_service(&fixed).await {
-                                Ok(()) => {
-                                    let resource = RunResource::TailscaleService {
-                                        tailnet: plan.tailnet.clone(),
-                                        name: name.clone(),
-                                        created: true,
-                                        creator_run_id: input.run_id,
-                                        definition: fixed,
-                                    };
-                                    self.finish(&key, Some(resource.clone())).await;
-                                    resource
-                                }
-                                Err(error) => {
-                                    self.finish_failed(&intent, error.maybe_applied).await;
-                                    return Outcome::Failed(error.message);
-                                }
-                            }
-                        }
-                    },
-                    // A resumed run whose earlier PUT landed.
-                    Some(Some(found)) if found.comment == marker => {
-                        let resource = RunResource::TailscaleService {
-                            tailnet: plan.tailnet.clone(),
-                            name: name.clone(),
-                            created: true,
-                            creator_run_id: input.run_id,
-                            definition: found,
-                        };
-                        self.record_found(&intent, resource.clone()).await;
-                        resource
-                    }
-                    Some(Some(found)) => {
-                        match tailscale::ownership(&found, &plan.install_id) {
-                            Ownership::Ours { creator_run_id } => {
-                                match plan.seen.as_ref().map(|seen| found.differs_from(seen)) {
-                                    // D1 option 1: this install's, as the plan read it.
-                                    Some(None) => {
-                                        let resource = RunResource::TailscaleService {
-                                            tailnet: plan.tailnet.clone(),
-                                            name: name.clone(),
-                                            created: false,
-                                            creator_run_id,
-                                            definition: found,
-                                        };
-                                        self.record_found(&intent, resource.clone()).await;
-                                        resource
-                                    }
-                                    Some(Some(why)) => {
-                                        return Outcome::Conflict(format!(
-                                            "{why} since this run was planned. Temps wrote \
-                                             nothing to it: check it, then plan again."
-                                        ))
-                                    }
-                                    None => {
-                                        return Outcome::Conflict(format!(
-                                            "`{name}` was created by another setup of this Temps \
-                                             install (run {creator_run_id}) after this run was \
-                                             planned. Temps wrote nothing to it: plan again to \
-                                             use it."
-                                        ))
-                                    }
-                                }
-                            }
-                            Ownership::Foreign => {
-                                return Outcome::Conflict(tailnet_messages::service_taken(&name))
-                            }
-                        }
-                    }
-                }
-            }
-        };
-        self.check_service(resource, &plan, &marker).await
-    }
-
-    /// When the Service step is done (ADR 065 D4): its marker, the fixed
-    /// definition, Tailscale addresses, and only recorded hosts.
-    async fn check_service(
-        &mut self,
-        resource: RunResource,
-        plan: &ServicePlan,
-        marker: &str,
-    ) -> Outcome {
-        let RunResource::TailscaleService {
-            created,
-            creator_run_id,
-            ..
-        } = resource.clone()
-        else {
-            return Outcome::Failed("The Tailscale Service could not be recorded.".into());
-        };
-        let name = plan.name.as_str();
-        // Tailscale assigns the TailVIPs: wait for them to show.
-        let mut waited = Duration::ZERO;
-        let read = loop {
-            match self.ops.read_service(name).await {
-                Ok(Some(read)) if !read.addrs.is_empty() || waited >= self.timing.publish => {
-                    break read
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => {
-                    return Outcome::Failed(format!(
-                        "`{name}` is gone from your tailnet: something deleted it while this run \
-                         worked on it."
-                    ))
-                }
-                Err(error) if waited >= self.timing.publish => {
-                    return Outcome::Stalled(format!(
-                        "Could not read `{name}` back from your tailnet: {error}"
-                    ))
-                }
-                Err(_) => {}
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        };
-        let owned = if created {
-            (read.comment == marker).then_some(())
-        } else {
-            matches!(
-                tailscale::ownership(&read, &plan.install_id),
-                Ownership::Ours { .. }
-            )
-            .then_some(())
-        };
-        if owned.is_none() {
-            return Outcome::Conflict(format!(
-                "`{name}` now carries the comment `{}`, not this Temps install's marker. Temps \
-                 writes nothing to it: check who changed it.",
-                read.comment
-            ));
-        }
-        if let Some(why) = read.differs_from_fixed(&plan.tag) {
-            return Outcome::Conflict(format!("{why}. Temps never changes a Service: check it."));
-        }
-        if !tailscale_addrs(&read.addrs) {
-            return Outcome::Conflict(format!(
-                "`{name}` has the addresses {:?}, not Tailscale ones, so Temps does not trust it.",
-                read.addrs
-            ));
-        }
-        if !created {
-            match self.ops.service_creation(name, creator_run_id).await {
-                Ok(Some((journaled, _))) if journaled.addrs.is_empty() => {}
-                Ok(Some((journaled, _))) => {
-                    if let Some(why) = read.differs_from(&ServiceDefinition {
-                        comment: read.comment.clone(),
-                        ..journaled
-                    }) {
-                        return Outcome::Conflict(format!("{why}. Temps never changes a Service."));
-                    }
-                }
-                Ok(None) => {
-                    return Outcome::Conflict(format!(
-                        "No setup of this Temps install records creating `{name}` (run \
-                         {creator_run_id}), so Temps does not use it. Pick another name."
-                    ))
-                }
-                Err(error) => return Outcome::Failed(error),
-            }
-        }
-        if let Err(outcome) = self.unrecorded(name).await {
-            return outcome;
-        }
-        // Journal what was read, with the addresses Tailscale assigned.
-        let resource = RunResource::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.to_string(),
-            created,
-            creator_run_id,
-            definition: read.clone(),
-        };
-        let key = Intent::TailscaleService {
-            tailnet: plan.tailnet.clone(),
-            name: name.to_string(),
-            marker: marker.to_string(),
-        }
-        .key(self.input.run_id);
-        if let Some(entry) = self.record.journal.iter_mut().find(|e| e.key == key) {
-            entry.resource = Some(resource);
-        }
-        self.save().await;
-        Outcome::Done(Some(format!(
-            "`{name}` is in your tailnet at {}{}.",
-            read.addrs.join(", "),
-            if created {
-                ""
-            } else {
-                ", as this Temps install made it"
-            }
-        )))
-    }
-
-    /// Every host advertising the Service must match one of this address's
-    /// Serve entries for it (ADR 065 D4); `Err` the outcome when one does
-    /// not, or the hosts cannot be read.
-    async fn unrecorded(&self, name: &str) -> Result<Vec<ServiceHost>, Outcome> {
-        let hosts = self.ops.service_hosts(name).await.map_err(|error| {
-            Outcome::Failed(format!(
-                "Temps could not read which machines host `{name}`, which it checks before \
-                 trusting it: {error}"
-            ))
-        })?;
-        let entries = self
-            .ops
-            .service_entries(name)
-            .await
-            .map_err(Outcome::Failed)?;
-        let address_id = match self.address_id().await {
-            Ok(id) => id,
-            Err(error) => return Err(Outcome::Failed(error)),
-        };
-        let foreign = unrecorded_hosts(&hosts, &entries, Some(&address_id));
-        if foreign.is_empty() {
-            Ok(hosts)
-        } else {
-            Err(Outcome::Conflict(unrecorded_message(name, &foreign)))
-        }
-    }
-
-    /// ADR 065 D4: wait for the tailnet admin to approve the worker as the
-    /// Service's host. It never approves; waiting is not a failure.
-    async fn wait_for_approval(&mut self) -> Outcome {
-        let input = self.input;
-        let (Some(plan), Some(target)) = (&input.tailscale_service, &input.serve) else {
-            return Outcome::Skipped("No Tailscale Service.".into());
-        };
-        let name = plan.name.as_str();
-        let node = target.node_name.as_str();
-        let mut waited = Duration::ZERO;
-        let mut last;
-        loop {
-            // Deleted after the define step: no one recreates it behind
-            // the user's back, so the run stops and undo takes it apart.
-            if let Ok(None) = self.ops.read_service(name).await {
-                return Outcome::Failed(format!(
-                    "`{name}` is gone from your tailnet: something deleted it after this run \
-                     defined it. Undo, then make the address reachable again."
-                ));
-            }
-            let hosts = match self.unrecorded(name).await {
-                Ok(hosts) => hosts,
-                Err(outcome) => return outcome,
-            };
-            let mine = match self.ops.service_entries(name).await {
-                Ok(entries) => entries.into_iter().find(|e| e.node_id == target.node_id),
-                Err(error) => return Outcome::Failed(error),
-            };
-            let host = mine
-                .as_ref()
-                .and_then(|e| hosts.iter().find(|h| e.hosts(h)));
-            match host.map(|h| h.approved) {
-                Some(Some(true)) => {
-                    return Outcome::Done(Some(format!("{node} is the approved host of `{name}`.")))
-                }
-                Some(_) => last = tailnet_messages::not_approved(name, node, &plan.tag),
-                None => {
-                    last = format!(
-                        "`{node}` does not advertise `{name}` yet; its agent does on its next \
-                         pass, every 30 seconds. Then {}",
-                        tailnet_messages::not_approved(name, node, &plan.tag)
-                    )
-                }
-            }
-            if waited >= self.timing.publish {
-                return Outcome::Stalled(last);
-            }
-            self.ops.sleep(self.timing.poll).await;
-            waited += self.timing.poll.max(Duration::from_millis(1));
-        }
     }
 
     /// ADR 065 D9: an Access address names the app whose JWTs the listener
@@ -3006,19 +2428,14 @@ impl Runner<'_> {
             | StepKind::CreateTunnel
             | StepKind::AccessApp
             | StepKind::RedirectToHttps
-            | StepKind::StandardPortsOnly => {
+            | StepKind::StandardPortsOnly
+            | StepKind::ConfigureTailscaleServe
+            | StepKind::SaveTailscaleCredential
+            | StepKind::DefineTailscaleService
+            | StepKind::WaitForServiceApproval => {
                 Outcome::Failed(format!("No provider runs {kind:?} steps here."))
             }
             StepKind::SetHttpPolicy => self.record_http_policy(&address).await,
-            StepKind::ConfigureTailscaleServe => {
-                let Some(target) = input.serve.clone() else {
-                    return Outcome::Skipped("No worker serves it through Tailscale.".into());
-                };
-                self.configure_serve(&target).await
-            }
-            StepKind::SaveTailscaleCredential => self.save_tailscale_credential().await,
-            StepKind::DefineTailscaleService => self.define_service().await,
-            StepKind::WaitForServiceApproval => self.wait_for_approval().await,
             StepKind::CheckReachability => {
                 let verdict = self.ops.reachability(&address).await;
                 if verdict.state == ReachState::Reachable {
@@ -4171,6 +3588,7 @@ mod tests {
     use crate::reachability::token_check::{
         PermissionCheck, PermissionState, TokenCheckResult, TokenPermission,
     };
+    use temps_entities::tailnet_serve_entries::REPORT_APPLIED;
 
     fn done(intent: Intent, resource: RunResource) -> JournalEntry {
         JournalEntry {
@@ -4567,6 +3985,34 @@ mod tests {
             *self.http_policy.lock().expect("lock") = policy;
             Ok(())
         }
+        async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
+            self.log(format!("environment_hosts {connector_id}"));
+            Ok(*self.environment_hosts.lock().expect("lock"))
+        }
+        async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
+            self.result("set_environment_hosts")?;
+            self.log(format!("set_environment_hosts {connector_id} {on}"));
+            *self.environment_hosts.lock().expect("lock") = on;
+            Ok(())
+        }
+        async fn sleep(&self, _duration: Duration) {}
+
+        fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>> {
+            vec![
+                Box::new(crate::cloudflare::run::CloudflareRun::new(self)),
+                Box::new(crate::tailscale::run::TailscaleRun::new(self)),
+            ]
+        }
+    }
+
+    #[async_trait]
+    impl TailscaleOps for Fake {
+        async fn find_credential(&self, name: &str) -> Result<Option<RunResource>, String> {
+            self.find(&Intent::TailscaleCredential {
+                name: name.to_string(),
+            })
+            .await
+        }
         async fn claim_serve_entry(
             &self,
             _run_id: i32,
@@ -4697,21 +4143,6 @@ mod tests {
         ) -> Result<ServiceDeletion, String> {
             self.log(format!("delete_service {tailnet} {name} {}", shown.comment));
             Ok(self.deletion.clone().unwrap_or(ServiceDeletion::Deleted))
-        }
-        async fn environment_hosts(&self, connector_id: i32) -> Result<bool, String> {
-            self.log(format!("environment_hosts {connector_id}"));
-            Ok(*self.environment_hosts.lock().expect("lock"))
-        }
-        async fn set_environment_hosts(&self, connector_id: i32, on: bool) -> Result<(), String> {
-            self.result("set_environment_hosts")?;
-            self.log(format!("set_environment_hosts {connector_id} {on}"));
-            *self.environment_hosts.lock().expect("lock") = on;
-            Ok(())
-        }
-        async fn sleep(&self, _duration: Duration) {}
-
-        fn providers(&self) -> Vec<Box<dyn ProviderRun + '_>> {
-            vec![Box::new(crate::cloudflare::run::CloudflareRun::new(self))]
         }
     }
 
@@ -7851,6 +7282,89 @@ mod tests {
                 "{case}: nothing is shown to confirm"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_pending_serve_entry_is_found_by_this_runs_reference() {
+        let intent = Intent::TailscaleServe {
+            node_id: 3,
+            node_name: "worker-1".into(),
+            address_id: "custom:9".into(),
+            hostname: "myapp.example.com".into(),
+            service: None,
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+        *ops.serve_ref.lock().expect("lock") = Some((21, true));
+        assert_eq!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Made(Box::new(RunResource::TailscaleServe {
+                node_id: 3,
+                node_name: "worker-1".into(),
+                address_id: "custom:9".into(),
+                hostname: "myapp.example.com".into(),
+                entry_id: 21,
+                created: true,
+            })))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_oauth_client_save_is_found_by_its_name() {
+        let intent = Intent::TailscaleCredential {
+            name: "Tailscale example.ts.net".into(),
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+        let saved = RunResource::TailscaleCredential {
+            id: 12,
+            name: "Tailscale example.ts.net".into(),
+        };
+        ops.found
+            .lock()
+            .expect("lock")
+            .push((intent.key(0), saved.clone()));
+        assert_eq!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Made(Box::new(saved)))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_pending_service_create_is_this_runs_only_with_its_own_marker() {
+        let marker = tailscale::marker(INSTALL, 7);
+        let intent = Intent::TailscaleService {
+            tailnet: "example.ts.net".into(),
+            name: "svc:myapp".into(),
+            marker: marker.clone(),
+        };
+        let ops = Fake::default();
+        assert_eq!(look(&ops, 7, &intent).await, Ok(Found::Missing));
+
+        let ours = ServiceDefinition::fixed("svc:myapp", "tag:temps", &marker);
+        *ops.service.lock().expect("lock") = Some(ours.clone());
+        match look(&ops, 7, &intent).await {
+            Ok(Found::Made(resource)) => assert_eq!(
+                *resource,
+                RunResource::TailscaleService {
+                    tailnet: "example.ts.net".into(),
+                    name: "svc:myapp".into(),
+                    created: true,
+                    creator_run_id: 7,
+                    definition: ours,
+                }
+            ),
+            other => panic!("expected the run's own Service, got {other:?}"),
+        }
+
+        // Another run's marker, even of this install, is not this run's.
+        let theirs =
+            ServiceDefinition::fixed("svc:myapp", "tag:temps", &tailscale::marker(INSTALL, 8));
+        *ops.service.lock().expect("lock") = Some(theirs);
+        assert!(matches!(
+            look(&ops, 7, &intent).await,
+            Ok(Found::Changed(what)) if what.contains("which this run did not write")
+        ));
     }
 
     #[test]

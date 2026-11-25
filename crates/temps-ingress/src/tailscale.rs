@@ -23,6 +23,9 @@
 //! answer is read. Anything else
 //! is [`TailscaleApiError::NotUnderstood`]: the run stops rather than guess.
 
+pub mod live;
+pub mod run;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
@@ -1186,6 +1189,13 @@ impl crate::registry::ProviderFactory for TailscaleFactory {
             None => Ok(()),
             Some(reason) => Err(IngressError::Validation(reason)),
         }
+    }
+
+    fn run<'a>(
+        &self,
+        live: &'a crate::reachability::service::LiveOps,
+    ) -> Option<Box<dyn crate::reachability::run::ProviderRun + 'a>> {
+        Some(Box::new(run::TailscaleRun::new(live)))
     }
 }
 

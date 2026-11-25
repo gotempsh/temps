@@ -80,8 +80,7 @@ use super::plan::{
 };
 use super::run::{
     created, decide, execute, reconcile_journal, resume, undo, unrecorded_hosts, worker_approval,
-    AccessRun, NewTunnel, ProviderRun, RunInput, RunOps, RunRecord, RunSink, ServeClaim,
-    ServeEntryStatus, ServeRelease, ServeTarget, ServeWish, ServiceDeletion, ServiceEntryHost,
+    AccessRun, NewTunnel, ProviderRun, RunInput, RunOps, RunRecord, RunSink, ServeTarget,
     ServicePlan, Stop, Timing, TunnelStatus, WriteError, ZoneState,
 };
 use super::serve_entries;
@@ -229,7 +228,7 @@ const SERVICE_HOSTS_CACHED: usize = 256;
 
 /// The cluster's Tailscale credential (ADR 065 D2): `(row id, name, the
 /// OAuth client)`, decrypted for the call.
-async fn load_tailscale_credential(
+pub(crate) async fn load_tailscale_credential(
     connectors: &IngressConnectorService,
 ) -> Result<Option<(i32, String, TailscaleCredential)>, String> {
     let Some((row, settings, secrets)) = connectors
@@ -3193,7 +3192,7 @@ fn journal_to_recover(
 
 /// The run's progress as stored, for showing it: what does not decode
 /// reads as empty. Use [`record_to_change`] before writing any of it back.
-fn record_of(row: &reachability_runs::Model) -> RunRecord {
+pub(crate) fn record_of(row: &reachability_runs::Model) -> RunRecord {
     RunRecord {
         state: RunState::parse(&row.state),
         steps: serde_json::from_value::<Vec<RunStep>>(row.steps.clone()).unwrap_or_default(),
@@ -3380,7 +3379,7 @@ pub struct LiveOps {
     pub(crate) http: reqwest::Client,
     /// The providers whose steps a run hands over.
     providers: ProviderRegistry,
-    tailnet: Arc<dyn TailnetApi>,
+    pub(crate) tailnet: Arc<dyn TailnetApi>,
     /// The ADR 031 ownership scope of the DNS records a run sets.
     project_id: Option<i32>,
     environment_id: Option<i32>,
@@ -3391,18 +3390,6 @@ fn text(error: impl std::fmt::Display) -> String {
 }
 
 impl LiveOps {
-    /// The cluster's Tailscale OAuth client, for a run's API call.
-    async fn tailscale(&self) -> Result<TailscaleCredential, String> {
-        load_tailscale_credential(&self.deps.connectors)
-            .await?
-            .map(|(_, _, credential)| credential)
-            .ok_or_else(|| {
-                "This cluster has no Tailscale OAuth client any more. Add one by making the \
-                 address reachable again."
-                    .to_string()
-            })
-    }
-
     /// `host` as attached to the run's own environment. An address on any
     /// other environment, or a run without one, is never read or changed
     /// here: a run, or its undo, only ever acts on its own addresses.
@@ -3558,17 +3545,10 @@ impl RunOps for LiveOps {
             Intent::AccessApp { .. } => {
                 return Err("Access apps are looked up by Cloudflare.".to_string())
             }
-            Intent::TailscaleCredential { name } => ingress_connectors::Entity::find()
-                .filter(ingress_connectors::Column::Name.eq(name.clone()))
-                .filter(ingress_connectors::Column::Provider.eq(tailscale::KIND))
-                .one(db)
-                .await
-                .map_err(text)?
-                .map(|c| RunResource::TailscaleCredential {
-                    id: c.id,
-                    name: c.name,
-                }),
-            // Looked up by its marker (run.rs `look`).
+            // Looked up by Tailscale (tailscale/run.rs `look`).
+            Intent::TailscaleCredential { .. } => {
+                return Err("Tailscale OAuth clients are looked up by Tailscale.".to_string())
+            }
             Intent::TailscaleService { .. } => {
                 return Err("Tailscale Services are looked up by their marker.".to_string())
             }
@@ -4170,215 +4150,6 @@ impl RunOps for LiveOps {
         let connectors = self.deps.connectors.clone();
         tokio::spawn(async move { connectors.reconcile_all().await });
         Ok(())
-    }
-
-    async fn claim_serve_entry(&self, run_id: i32, wish: &ServeWish) -> Result<ServeClaim, String> {
-        serve_entries::claim(self.deps.db.as_ref(), run_id, wish)
-            .await
-            .map_err(text)
-    }
-
-    async fn serve_reference(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<(i32, bool)>, String> {
-        serve_entries::reference(self.deps.db.as_ref(), run_id, node_id, address_id)
-            .await
-            .map_err(text)
-    }
-
-    async fn serve_entry(
-        &self,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<Option<ServeEntryStatus>, String> {
-        serve_entries::status(self.deps.db.as_ref(), node_id, address_id)
-            .await
-            .map_err(text)
-    }
-
-    async fn release_serve_entry(
-        &self,
-        run_id: i32,
-        node_id: i32,
-        address_id: &str,
-    ) -> Result<ServeRelease, String> {
-        serve_entries::release(self.deps.db.as_ref(), run_id, node_id, address_id)
-            .await
-            .map_err(text)
-    }
-
-    async fn forget_serve_entry(&self, entry_id: i32) -> Result<(), String> {
-        serve_entries::forget(self.deps.db.as_ref(), entry_id)
-            .await
-            .map_err(text)
-    }
-
-    async fn save_tailscale_credential(
-        &self,
-        name: &str,
-        credential: &TailscaleCredential,
-    ) -> Result<i32, String> {
-        let values: std::collections::BTreeMap<String, Value> = [
-            (tailscale::FIELD_CLIENT_ID, &credential.client_id),
-            (tailscale::FIELD_CLIENT_SECRET, &credential.client_secret),
-            (tailscale::FIELD_TAILNET, &credential.tailnet),
-        ]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), Value::String(value.clone())))
-        .collect();
-        self.deps
-            .connectors
-            .save_credential(tailscale::KIND, name, &values)
-            .await
-            .map_err(text)
-    }
-
-    async fn release_tailscale_credential(&self, id: i32) -> Result<Option<String>, String> {
-        // Every Service setup reads the cluster's one credential.
-        let in_use = tailnet_serve_entries::Entity::find()
-            .filter(tailnet_serve_entries::Column::ServiceName.is_not_null())
-            .one(self.deps.db.as_ref())
-            .await
-            .map_err(text)?;
-        if let Some(entry) = in_use {
-            return Ok(Some(format!(
-                "{} still serves {} as a Tailscale Service",
-                entry.node_name, entry.hostname
-            )));
-        }
-        self.deps
-            .connectors
-            .delete_credential(id)
-            .await
-            .map_err(text)?;
-        Ok(None)
-    }
-
-    async fn read_service(&self, name: &str) -> Result<Option<ServiceDefinition>, String> {
-        let credential = self.tailscale().await?;
-        self.tailnet
-            .get_service(&credential, name)
-            .await
-            .map_err(text)
-    }
-
-    async fn create_service(&self, definition: &ServiceDefinition) -> Result<(), WriteError> {
-        let credential = self.tailscale().await.map_err(WriteError::refused)?;
-        self.tailnet
-            .create_service(&credential, definition)
-            .await
-            .map_err(|error| WriteError {
-                maybe_applied: error.maybe_applied(),
-                message: error.to_string(),
-            })
-    }
-
-    async fn service_hosts(&self, name: &str) -> Result<Vec<ServiceHost>, String> {
-        let credential = self.tailscale().await?;
-        self.tailnet
-            .service_hosts(&credential, name)
-            .await
-            .map_err(text)
-    }
-
-    async fn service_entries(&self, name: &str) -> Result<Vec<ServiceEntryHost>, String> {
-        serve_entries::for_service(self.deps.db.as_ref(), name)
-            .await
-            .map_err(text)
-    }
-
-    async fn service_creation(
-        &self,
-        name: &str,
-        creator_run_id: i32,
-    ) -> Result<Option<(ServiceDefinition, temps_core::DBDateTime)>, String> {
-        let Some(row) = reachability_runs::Entity::find_by_id(creator_run_id)
-            .one(self.deps.db.as_ref())
-            .await
-            .map_err(text)?
-        else {
-            return Ok(None);
-        };
-        Ok(record_of(&row)
-            .journal
-            .into_iter()
-            .find_map(|entry| match entry.resource {
-                Some(RunResource::TailscaleService {
-                    name: created_name,
-                    created: true,
-                    creator_run_id: run,
-                    definition,
-                    ..
-                }) if created_name == name && run == creator_run_id => {
-                    Some((definition, entry.pending_since.unwrap_or(entry.at)))
-                }
-                _ => None,
-            }))
-    }
-
-    async fn delete_service(
-        &self,
-        tailnet: &str,
-        name: &str,
-        creator_run_id: i32,
-        shown: &ServiceDefinition,
-    ) -> Result<ServiceDeletion, String> {
-        use sea_orm::TransactionTrait;
-        let credential = self.tailscale().await?;
-        let txn = self.deps.db.begin().await.map_err(text)?;
-        // ADR 065 D4: no entry or reference can be added for the Service
-        // between these checks and the DELETE.
-        serve_entries::lock_service(&txn, tailnet, name)
-            .await
-            .map_err(text)?;
-        let entries = serve_entries::for_service(&txn, name).await.map_err(text)?;
-        if let Some(user) = entries.first() {
-            return Ok(ServiceDeletion::Kept(format!(
-                "`{name}` is used again, by {} on {}",
-                user.hostname, user.node_name
-            )));
-        }
-        let hosts = self
-            .tailnet
-            .service_hosts(&credential, name)
-            .await
-            .map_err(text)?;
-        if !hosts.is_empty() {
-            return Ok(ServiceDeletion::Kept(format!(
-                "`{name}` is advertised by {}",
-                unrecorded_hosts(&hosts, &[], None).join(", ")
-            )));
-        }
-        let current = match self
-            .tailnet
-            .get_service(&credential, name)
-            .await
-            .map_err(text)?
-        {
-            None => return Ok(ServiceDeletion::Gone),
-            Some(current) => current,
-        };
-        // Still this run's, by this install's marker, immediately before
-        // the DELETE: never a Service someone else made at the name.
-        let install = self.deps.records.instance_id().await.map_err(text)?;
-        if let Err(why) = super::run::still_ours(&current, name, &install, creator_run_id) {
-            return Ok(ServiceDeletion::Kept(why));
-        }
-        if let Some(why) = current.differs_from(shown) {
-            return Ok(ServiceDeletion::Kept(format!(
-                "{why} since you were asked, so Temps did not delete it"
-            )));
-        }
-        self.tailnet
-            .delete_service(&credential, name)
-            .await
-            .map_err(text)?;
-        txn.commit().await.map_err(text)?;
-        info!(%tailnet, service = %name, "deleted a Tailscale Service Temps created");
-        Ok(ServiceDeletion::Deleted)
     }
 
     async fn sleep(&self, duration: Duration) {
