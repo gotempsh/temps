@@ -1,11 +1,14 @@
 # SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
-"""Prepare SDK release versions for a server tag from Conventional Commits.
+"""Prepare SDK release versions for a server tag.
 
-For every catalog package this derives the next version from the commits that
-touched it since its last package tag, bumps the manifests, the lockfiles and
-`.github/releases/prepared.json`, and leaves publication to `release.yml`.
+SDKs follow the server: every catalog package releases with every beta and stable
+server tag, at the tag's version (`v0.1.0-beta.64` releases `0.1.0-beta.64`, or
+`0.1.0b64` on PyPI). A package whose catalog entry sets `versioning` keeps its own
+version line instead, derived from the Conventional Commits that touched it since
+its last package tag (see `sdk_release.VERSIONING`). Preparation bumps the manifests, the
+lockfiles and `.github/releases/prepared.json`, and leaves publication to `release.yml`.
 It reads git and the public registries only: it never publishes, pushes or
 creates tags. The same repository state and registry contents always produce
 the same files, so running it twice changes nothing.
@@ -103,6 +106,25 @@ def next_core(base, level):
     if level == 'minor':
         return Version(major, minor, 0) if patch == 0 else Version(major, minor + 1, 0)
     return base.core
+
+
+def server_version(tag):
+    """The version a server tag gives the SDKs that follow it."""
+    try:
+        return Version.parse(tag.removeprefix('v'), 'npm')
+    except ValueError:
+        raise ValueError(f'{tag}: SDKs release at the server version, which must be X.Y.Z or '
+                         f'X.Y.Z-(alpha|beta|rc).N') from None
+
+
+def follows_server(package, known, server):
+    """Whether `package` releases at the server version `server` (catalog `versioning`)."""
+    mode = package.get('versioning', 'server')
+    if mode == 'until-server-passes':
+        # Already ahead of the server (the CLI shipped 0.1.38 before SDKs followed it):
+        # keep its own line until the server version is above everything it published.
+        return all(version.key() < server.key() for version in known)
+    return mode == 'server'
 
 
 class GitHistory:
@@ -359,12 +381,20 @@ class Assessment:
     level: str | None = None
     dependencies: list = field(default_factory=list)
     version: Version | None = None
+    server: Version | None = None  # set when the package releases at the server version
 
     def selected(self, target):
         graduation = target == 'stable' and self.previous is not None and self.previous.pre is not None
-        return self.unreleased or self.level is not None or graduation or bool(self.dependencies)
+        return (self.server is not None or self.unreleased or self.level is not None or graduation
+                or bool(self.dependencies))
 
     def reason(self, target):
+        if self.server is not None:
+            reasons = ['server version']
+            if self.commits:
+                count = len(self.commits)
+                reasons.append(f"{count} commit{'s' if count != 1 else ''} ({self.level})")
+            return '; '.join(reasons)
         reasons = []
         if self.unreleased:
             reasons.append('first release (never published)')
@@ -418,6 +448,18 @@ def next_beta(core, known, floor=0):
 
 def choose_version(state, target):
     package, kind = state.package, state.package['kind']
+    if state.server is not None:
+        candidate = state.server
+        name = f"{package['name']} {candidate.format(kind)}"
+        if candidate in state.known:
+            raise ValueError(f'{name} is already published or tagged; reconcile the registry and package tags first')
+        ahead = sorted((v for v in state.known if v.key() > candidate.key()), key=Version.key)
+        if ahead:
+            raise ValueError(f"{name}: {ahead[-1].format(kind)} is already published or tagged, above the "
+                             f"server version; set \"versioning\": \"until-server-passes\" in its catalog entry")
+        if kind == 'go' and candidate.major >= 2:
+            raise ValueError(f'{name}: Go v2+ requires a new /v2 module path and catalog entry')
+        return candidate
     if state.unreleased:
         core = state.current.core
         if target == 'stable':
@@ -687,9 +729,13 @@ def prepare(tag, root=release.ROOT, *, history=None, published=None, write=True,
     elif history.tag_exists(tag):
         raise ValueError(f'{tag} is already tagged; prepare SDK releases for the next server tag')
     target = 'beta' if '-' in tag else 'stable'
+    server = server_version(tag)
     catalog = release.catalog_packages(root)
     by_key = {package['key']: package for package in catalog}
     states = {package['key']: assess(package, catalog, history, published) for package in catalog}
+    for key, state in states.items():
+        if follows_server(by_key[key], state.known, server):
+            state.server = server
     depends = {key: local_dependencies(by_key[key], catalog, root) for key in by_key}
     # Re-release dependents so registry consumers get the new dependency, to a fixed point.
     changed = True
@@ -856,7 +902,9 @@ def summary(tag, report):
         f'Merging this records the selection in `.github/releases/prepared.json`. The `release.yml` run for '
         f'{inline(tag)} then tests, publishes and tags exactly these versions; this PR publishes nothing.',
         '',
-        'Before 1.0.0 a breaking change bumps the minor version and a feature bumps the patch.',
+        'SDKs release at the server version. A package whose catalog entry sets `versioning` keeps its own '
+        'version line, bumped from its commits: before 1.0.0 a breaking change bumps the minor version and '
+        'a feature bumps the patch.',
         '',
         '| Package | Registry | Previous | Next | Why |',
         '| --- | --- | --- | --- | --- |',

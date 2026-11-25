@@ -1063,6 +1063,22 @@ manifests, the lockfiles (`sdks/node/bun.lock`, `sdks/python/uv.lock`,
 publishes, pushes or tags. It is deterministic and idempotent: the same history
 and registry contents produce the same files, and a second run changes nothing.
 
+- **SDKs follow the server version.** Every catalog package releases with every
+  beta and stable server tag, at the tag's version, whether or not it changed:
+  `v0.1.0-beta.64` releases `0.1.0-beta.64` (Python `0.1.0b64`), and `v0.1.0`
+  releases `0.1.0`. A user matches SDKs to a server by version alone. The
+  commits since each package's last release are still listed in the prep PR. A
+  server version already published, or below a version the registry or package
+  tags already have, stops preparation. A server tag outside
+  `X.Y.Z[-(alpha|beta|rc).N]` cannot version SDKs and is refused.
+- **Own version lines.** A catalog entry's `versioning` overrides that:
+  `independent` keeps the package on its own line, bumped from its commits by
+  the rules below, and `until-server-passes` does the same until the server
+  version is above every version the package has published or tagged, then
+  follows the server. The CLI uses `until-server-passes`: it shipped `0.1.38`
+  and `0.2.0-beta.1` before SDKs followed the server, both above
+  `0.1.0-beta.N`, and npm never takes a version back. The rules below apply only
+  to packages on their own line.
 - **Baseline.** The highest package tag (`sdk/<key>/v*`, or
   `sdks/go/workflows/v*`). Packages released before package tags existed use the
   commit that set their manifest to the newest version the registry has. A
