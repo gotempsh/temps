@@ -267,6 +267,15 @@ describe('internal routing with its own port (ADR-098)', () => {
     expect(redirectMissing(null)).toBe(false)
   })
 
+  test('a mixed warning never says lookups work on a node that cannot run DNS', () => {
+    const summary = dnsSummary([macControlPlane, worker(fallback)], true)
+    expect(summary.tone).toBe('warn')
+    expect(summary.label).toBe('2 nodes need attention')
+    expect(summary.detail).not.toContain('Lookups work')
+    expect(summary.detail).toContain('cannot run on control-plane')
+    expect(summary.detail).toContain('check master')
+  })
+
   test('a missing redirect warns but does not fail the summary', () => {
     const health = nodeDnsHealth(worker(fallback), true)
     expect(health.tone).toBe('warn')

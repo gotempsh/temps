@@ -42,7 +42,7 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
-import { useMutation, useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ChevronDown, EllipsisVertical, Globe } from 'lucide-react'
 import { useState } from 'react'
 import { toast } from 'sonner'
@@ -99,6 +99,22 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
     }),
   })
 
+  const queryClient = useQueryClient()
+  // A domain change moves addresses between environments: the reachability
+  // the list shows them by is refreshed with the domains, for this project.
+  const refreshDomains = () => {
+    refetchCustomDomains()
+    for (const queryKey of [
+      queryKeyPrefix(getEnvironmentReachabilityQueryKey, {
+        path: { project_id: project.id },
+      }),
+      queryKeyPrefix(listReachabilityRunsQueryKey, {
+        path: { project_id: project.id },
+      }),
+    ])
+      void queryClient.invalidateQueries({ queryKey })
+  }
+
   const deleteDomain = useMutation({
     ...deleteCustomDomainMutation(),
     meta: {
@@ -106,19 +122,19 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
     },
     onSuccess: () => {
       toast.success('Domain deleted successfully')
-      refetchCustomDomains()
+      refreshDomains()
     },
   })
 
   const handleAddSuccess = () => {
     setIsAddDialogOpen(false)
-    refetchCustomDomains()
+    refreshDomains()
   }
 
   const handleEditSuccess = () => {
     setIsEditDialogOpen(false)
     setEditingDomain(undefined)
-    refetchCustomDomains()
+    refreshDomains()
   }
 
   const handleDelete = (domainId: number) => {
@@ -198,7 +214,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         }
       />
 
-      {error ? (
+      {error && (
         <Alert variant="destructive">
           <AlertDescription>
             {deliveryError(error)}{' '}
@@ -207,7 +223,8 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
             </Button>
           </AlertDescription>
         </Alert>
-      ) : servedByTemps ? (
+      )}
+      {servedByTemps ? (
         // Each custom domain appears once, on the address it is, in its
         // environment's list.
         <EnvironmentReachabilityList
@@ -231,17 +248,19 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           ))}
         </ul>
       ) : (
-        <EmptyState
-          icon={Globe}
-          title="No domains configured yet"
-          description="Add a domain to get started."
-          action={
-            <Button onClick={() => setIsAddDialogOpen(true)}>
-              Add domain
-              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
-            </Button>
-          }
-        />
+        !error && (
+          <EmptyState
+            icon={Globe}
+            title="No domains configured yet"
+            description="Add a domain to get started."
+            action={
+              <Button onClick={() => setIsAddDialogOpen(true)}>
+                Add domain
+                <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+              </Button>
+            }
+          />
+        )
       )}
 
       <Collapsible className="border-t pt-6">
@@ -284,7 +303,7 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
         open={deliveryOpen}
         onOpenChange={(open) => {
           setDeliveryOpen(open)
-          if (!open) refetchCustomDomains()
+          if (!open) refreshDomains()
         }}
         initialHostname={deliveryTarget.hostname}
         initialEnvironmentId={deliveryTarget.environmentId}

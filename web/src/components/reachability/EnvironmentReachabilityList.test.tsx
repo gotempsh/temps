@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { afterEach, expect, test } from 'bun:test'
-import { cleanup, render, waitFor } from '@testing-library/react'
+import { act, cleanup, render, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MemoryRouter } from 'react-router'
 import { installBrowserWindow } from '@/test/dom'
@@ -144,4 +144,43 @@ test('only a setup that did not end well is mentioned', async () => {
   )
   await done.findByRole('link', { name: 'app.example.test' })
   expect(done.queryByText(/Setup/)).toBeNull()
+})
+
+test('a failed refresh of the environments keeps the rows and says so', async () => {
+  let environmentsDown = false
+  mockApi({
+    'GET /projects/7/environments': () =>
+      environmentsDown
+        ? jsonResponse(
+            { title: 'Unavailable', detail: 'Database is down' },
+            503
+          )
+        : jsonResponse([{ id: 3, name: 'production', slug: 'production' }]),
+    'GET /projects/7/environments/3/reachability': () =>
+      jsonResponse({
+        state: 'reachable',
+        summary: '',
+        addresses: [
+          address('app.example.test', 'reachable', 'direct:control-plane'),
+        ],
+      }),
+    'GET /projects/7/environments/3/reachability/runs': () => jsonResponse([]),
+  })
+  const client = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  })
+  const view = render(
+    <QueryClientProvider client={client}>
+      <MemoryRouter>
+        <EnvironmentReachabilityList projectId={7} projectSlug="example" />
+      </MemoryRouter>
+    </QueryClientProvider>
+  )
+  await view.findByRole('link', { name: 'app.example.test' })
+
+  environmentsDown = true
+  await act(() => client.refetchQueries())
+
+  await view.findByText(/Database is down/)
+  expect(view.getByRole('link', { name: 'app.example.test' })).toBeTruthy()
 })

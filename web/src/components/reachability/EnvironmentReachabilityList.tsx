@@ -77,20 +77,19 @@ export function EnvironmentReachabilityList({
     ...getEnvironmentsOptions({ path: { project_id: projectId } }),
   })
   if (environments.isPending) return <Skeleton className="h-24 w-full" />
-  if (environments.isError)
-    return (
-      <Alert variant="destructive">
-        <AlertDescription>
-          {problemDetail(
-            environments.error,
-            'Could not load the environments.'
-          )}{' '}
-          <Button variant="link" onClick={() => environments.refetch()}>
-            Retry
-          </Button>
-        </AlertDescription>
-      </Alert>
-    )
+  // A failed refresh keeps the environments already shown, with the error
+  // beside them; only a first load that failed shows the error alone.
+  const loadError = environments.isError && (
+    <Alert variant="destructive">
+      <AlertDescription>
+        {problemDetail(environments.error, 'Could not load the environments.')}{' '}
+        <Button variant="link" onClick={() => environments.refetch()}>
+          Retry
+        </Button>
+      </AlertDescription>
+    </Alert>
+  )
+  if (!environments.data) return loadError
   const list = environments.data ?? []
   const known = new Set(list.map((environment) => environment.id))
   const elsewhere = domains.filter(
@@ -98,6 +97,7 @@ export function EnvironmentReachabilityList({
   )
   return (
     <div className="space-y-6">
+      {loadError}
       {list.map((environment) => (
         <EnvironmentAddresses
           key={environment.id}

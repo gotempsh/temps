@@ -670,10 +670,8 @@ export function dnsSummary(
     (n) => n.lookups.tone !== 'warn' && n.routing?.label === 'Direct on port 80'
   )
   // Docker in a VM or on another host: expected there, not a fault.
-  const unsupportedOnly = attention.every(
-    (n) => n.label === 'Not available here'
-  )
-  if (attention.length > 0 && unsupportedOnly)
+  const unavailable = attention.filter((n) => n.label === 'Not available here')
+  if (attention.length > 0 && unavailable.length === attention.length)
     return {
       tone: 'warn',
       label: `Not available on ${nodes(attention.length)}`,
@@ -693,7 +691,12 @@ export function dnsSummary(
     return {
       tone: 'warn',
       label: `${nodes(attention.length)} ${attention.length === 1 ? 'needs' : 'need'} attention`,
-      detail: `Lookups work, but check ${names(attention)}.`,
+      // Lookups cannot work where cluster DNS cannot run, so a node there is
+      // named apart from the ones that only need a look.
+      detail:
+        unavailable.length > 0
+          ? `Cluster DNS cannot run on ${names(unavailable)}; check ${names(attention.filter((n) => !unavailable.includes(n)))}.`
+          : `Lookups work, but check ${names(attention)}.`,
       affected: attention,
       nodes: all,
     }
