@@ -321,6 +321,7 @@ pub fn nel(
         }
     }
     Ok(Some(LogRecord {
+        sandbox_id: None,
         ingest_identity: None,
         project_id: auth.project_id,
         deployment_id: auth.deployment_id,

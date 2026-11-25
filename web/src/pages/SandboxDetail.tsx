@@ -103,6 +103,7 @@ import { useAuth } from '@/contexts/AuthContext-shared'
 import { SandboxPreviewPasswordCard } from '@/components/sandboxes/SandboxPreviewPasswordCard'
 import { SandboxPreviewAccessCard } from '@/components/sandboxes/SandboxPreviewAccessCard'
 import { SandboxEgressCard } from '@/components/sandboxes/SandboxEgressCard'
+import { SandboxEgressActivityCard } from '@/components/sandboxes/SandboxEgressActivityCard'
 import { SandboxEgressRecordingCard } from '@/components/sandboxes/SandboxEgressRecordingCard'
 import { SandboxFilesCard } from '@/components/sandboxes/SandboxFilesCard'
 import {
@@ -1083,6 +1084,10 @@ export default function SandboxDetail() {
                       disabled={destroyed}
                     />
                     <SandboxEgressRecordingCard
+                      sandboxId={sandbox.id}
+                      disabled={destroyed}
+                    />
+                    <SandboxEgressActivityCard
                       sandboxId={sandbox.id}
                       disabled={destroyed}
                     />

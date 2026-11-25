@@ -336,6 +336,7 @@ pub fn decode_logs(
             );
         }
         records.push(LogRecord {
+            sandbox_id: None,
             ingest_identity: None,
             attribute_types,
             project_id: auth.project_id,

@@ -1285,6 +1285,7 @@ pub async fn query_logs(
         None
     };
     let query = LogQuery {
+        sandbox_id: None,
         project_id: params.project_id,
         attribute_filter,
         severity,

@@ -1305,14 +1305,26 @@ impl OtelService {
         if let Some(filter) = &query.attribute_filter {
             filter.validate()?;
             // Attribute comparisons are control-plane queries. Default to a
-            // bounded window unless correlation already selects one trace.
-            if query.start_time.is_none() && query.trace_id.is_none() {
+            // bounded window unless correlation already selects one trace
+            // or the query is one sandbox's records, which its own index
+            // bounds.
+            if query.start_time.is_none() && query.trace_id.is_none() && query.sandbox_id.is_none()
+            {
                 query.start_time = Some(
                     query.end_time.unwrap_or_else(chrono::Utc::now) - chrono::Duration::hours(24),
                 );
             }
         }
         self.storage.query_logs(query).await
+    }
+
+    /// How many records [`Self::query_logs`] would match, ignoring its
+    /// limit and offset.
+    pub async fn count_logs(&self, query: LogQuery) -> Result<u64, OtelError> {
+        if let Some(filter) = &query.attribute_filter {
+            filter.validate()?;
+        }
+        self.storage.count_logs(query).await
     }
 
     pub async fn query_genai_trace_summaries(
@@ -1447,6 +1459,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
         let log = LogRecord {
+            sandbox_id: None,
             ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
@@ -2203,6 +2216,7 @@ mod tests {
             crate::types::AttributeValue::String("egress-proxy".into()),
         );
         LogRecord {
+            sandbox_id: None,
             ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
@@ -2285,6 +2299,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            sandbox_id: None,
             ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,
@@ -2829,6 +2844,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
+            sandbox_id: None,
             ingest_identity: None,
             attribute_types: Default::default(),
             project_id: 1,

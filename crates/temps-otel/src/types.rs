@@ -521,6 +521,14 @@ pub struct LogRecord {
     pub ingest_identity: Option<IngestIdentity>,
     pub project_id: i32,
     pub deployment_id: Option<i32>,
+    /// The sandbox the platform observed this record for (its internal id),
+    /// stored in its own indexed column so one sandbox's records are read
+    /// without scanning its project's. Only the platform sets it
+    /// ([`crate::OtelService::ingest_platform_logs`]); it never comes from a
+    /// request body, so no workload can file records under a sandbox.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub sandbox_id: Option<i32>,
     pub resource: ResourceInfo,
     #[schema(value_type = String, format = DateTime)]
     pub timestamp: DateTime<Utc>,
@@ -1452,6 +1460,9 @@ pub struct MetricQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogQuery {
     pub project_id: i32,
+    /// Only the records the platform stored for this sandbox (internal id).
+    #[serde(default)]
+    pub sandbox_id: Option<i32>,
     pub severity: Option<LogSeverity>,
     pub service_name: Option<String>,
     pub search: Option<String>,

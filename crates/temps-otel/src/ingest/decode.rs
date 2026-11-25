@@ -661,6 +661,7 @@ fn extract_log_record(
     };
 
     Some(LogRecord {
+        sandbox_id: None,
         ingest_identity: None,
         attribute_types: kv_to_log_types(&log.attributes),
         project_id,

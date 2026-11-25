@@ -26,6 +26,7 @@
 //!   semantic-convention attributes, marked as platform-observed in a
 //!   namespace a workload cannot write.
 
+pub mod activity;
 pub mod ingest;
 pub mod local;
 pub mod policy;
@@ -42,7 +43,7 @@ use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Qu
 use serde::Serialize;
 use temps_entities::{nodes, projects, sandboxes};
 use temps_network_policy::NodeRecordingStatus;
-use temps_otel::types::LogRecord;
+use temps_otel::types::{LogQuery, LogRecord};
 use temps_otel::OtelError;
 use utoipa::ToSchema;
 
@@ -120,6 +121,13 @@ pub enum EgressRecordingError {
         source: OtelError,
     },
 
+    #[error("reading the recorded connections of sandbox {sandbox_id} failed: {source}")]
+    Query {
+        sandbox_id: String,
+        #[source]
+        source: OtelError,
+    },
+
     #[error("database error while {operation}: {source}")]
     Database {
         operation: &'static str,
@@ -145,16 +153,27 @@ impl NodeRecordingCapabilities for temps_network_policy::NetworkPolicyService {
     }
 }
 
-/// Where records are stored. [`temps_otel::OtelService`] in production.
+/// Where records are stored and read. [`temps_otel::OtelService`] in
+/// production.
 #[async_trait]
 pub trait EgressLogStore: Send + Sync {
     async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError>;
+    async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError>;
+    async fn count(&self, query: LogQuery) -> Result<u64, OtelError>;
 }
 
 #[async_trait]
 impl EgressLogStore for temps_otel::OtelService {
     async fn store(&self, records: Vec<LogRecord>) -> Result<u64, OtelError> {
         self.ingest_platform_logs(records).await
+    }
+
+    async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
+        self.query_logs(query).await
+    }
+
+    async fn count(&self, query: LogQuery) -> Result<u64, OtelError> {
+        self.count_logs(query).await
     }
 }
 

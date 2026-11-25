@@ -172,6 +172,7 @@ impl EgressRecordingService {
                 record,
                 &Attribution {
                     project_id,
+                    sandbox_id: row.id,
                     sandbox_public_id: row.public_id.clone(),
                     node_id,
                     node_name: node_name.clone(),

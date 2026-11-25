@@ -136,6 +136,24 @@ impl EgressLogStore for CollectStore {
         self.0.lock().unwrap().extend(records);
         Ok(count)
     }
+
+    async fn query(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
+        let mut found: Vec<LogRecord> = self
+            .0
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|log| log.project_id == query.project_id)
+            .filter(|log| query.sandbox_id.is_none() || log.sandbox_id == query.sandbox_id)
+            .cloned()
+            .collect();
+        found.sort_by_key(|log| std::cmp::Reverse(log.timestamp));
+        Ok(found)
+    }
+
+    async fn count(&self, query: LogQuery) -> Result<u64, OtelError> {
+        Ok(self.query(query).await?.len() as u64)
+    }
 }
 
 impl Fixture {
@@ -151,6 +169,30 @@ impl Fixture {
                 }),
             ),
         ])
+    }
+
+    /// The service over real OpenTelemetry storage in the fixture's
+    /// database, as production wires it.
+    pub fn service_with_otel(&self) -> Arc<EgressRecordingService> {
+        let otel = Arc::new(temps_otel::OtelService::new(
+            Arc::new(temps_otel::storage::timescaledb::TimescaleDbStorage::new(
+                self.db.connection_arc(),
+                None,
+            )),
+            Arc::new(temps_otel::ingest::auth::OtelAuthService::new(
+                self.db.connection_arc(),
+            )),
+            Arc::new(temps_otel::ingest::rate_limit::RateLimiter::new(
+                10_000,
+                std::time::Duration::from_secs(60),
+            )),
+            temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        ));
+        Arc::new(EgressRecordingService::new(
+            self.db.connection_arc(),
+            self.capabilities(),
+            Some(otel as Arc<dyn EgressLogStore>),
+        ))
     }
 
     pub fn service(&self) -> (Arc<EgressRecordingService>, Arc<CollectStore>) {
@@ -555,4 +597,154 @@ async fn the_node_snapshot_tells_the_proxy_which_sandboxes_record() {
             i64::from(ON_WORKER.0)
         )]
     );
+}
+
+/// A connection of `sandbox` to `host`, `seconds` after a fixed start, so
+/// the newest-first order is known.
+fn at(sandbox: i32, host: &str, outcome: ConnectionOutcome, seconds: u64) -> ConnectionRecord {
+    let mut record = record(sandbox, host, outcome);
+    record.started_at_ms += seconds * 1000;
+    record.last_started_at_ms = record.started_at_ms;
+    record
+}
+
+/// A sandbox's page reads its own records from storage, newest first, and
+/// none of another sandbox's in the same project.
+#[tokio::test]
+async fn a_sandbox_reads_its_own_recorded_connections_newest_first() {
+    use super::activity::EgressOutcomeFilter;
+    let Some(f) = fixture().await else { return };
+    let service = f.service_with_otel();
+    service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
+    service
+        .set_enabled(ON_CONTROL_PLANE.1, OWNER, true)
+        .await
+        .unwrap();
+    let outcome = service
+        .ingest(
+            f.worker_a,
+            batch(vec![
+                at(
+                    ON_WORKER.0,
+                    "first.example.com",
+                    ConnectionOutcome::Allowed,
+                    0,
+                ),
+                at(
+                    ON_WORKER.0,
+                    "blocked.example.com",
+                    ConnectionOutcome::Refused,
+                    1,
+                ),
+                at(
+                    ON_WORKER.0,
+                    "last.example.com",
+                    ConnectionOutcome::Allowed,
+                    2,
+                ),
+            ]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.stored, 3);
+
+    let page = service
+        .activity(ON_WORKER.1, OWNER, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(page.sandbox_id, ON_WORKER.1);
+    assert_eq!(
+        (page.page, page.per_page, page.total, page.has_more),
+        (1, 20, 3, false)
+    );
+    let hosts: Vec<_> = page
+        .records
+        .iter()
+        .map(|r| r.host.as_deref().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        hosts,
+        [
+            "last.example.com",
+            "blocked.example.com",
+            "first.example.com"
+        ]
+    );
+    let refused = &page.records[1];
+    assert_eq!(refused.outcome, "refused");
+    assert_eq!(refused.reason.as_deref(), Some("no_allow_rule"));
+    assert_eq!(refused.kind, "tunnel");
+    assert_eq!(refused.port, Some(443));
+    assert_eq!((refused.bytes_sent, refused.bytes_received), (10, 20));
+    assert_eq!(refused.count, 1);
+    assert_eq!(refused.node_name.as_deref(), Some("worker-a"));
+
+    let refused_only = service
+        .activity(
+            ON_WORKER.1,
+            OWNER,
+            None,
+            None,
+            Some(EgressOutcomeFilter::Refused),
+        )
+        .await
+        .unwrap();
+    assert_eq!((refused_only.records.len(), refused_only.total), (1, 1));
+    assert_eq!(
+        refused_only.records[0].host.as_deref(),
+        Some("blocked.example.com")
+    );
+
+    let first = service
+        .activity(ON_WORKER.1, OWNER, Some(1), Some(2), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        (first.records.len(), first.total, first.has_more),
+        (2, 3, true)
+    );
+    let second = service
+        .activity(ON_WORKER.1, OWNER, Some(2), Some(2), None)
+        .await
+        .unwrap();
+    assert_eq!((second.records.len(), second.has_more), (1, false));
+    assert_eq!(second.records[0].host.as_deref(), Some("first.example.com"));
+
+    // Same project, records of its own: none of the other sandbox's.
+    let other = service
+        .activity(ON_CONTROL_PLANE.1, OWNER, None, None, None)
+        .await
+        .unwrap();
+    assert!(other.records.is_empty());
+}
+
+#[tokio::test]
+async fn activity_bounds_pages_and_is_only_for_the_owner() {
+    let Some(f) = fixture().await else { return };
+    let service = f.service_with_otel();
+    let page = service
+        .activity(ON_WORKER.1, OWNER, Some(0), Some(1_000), None)
+        .await
+        .unwrap();
+    assert_eq!((page.page, page.per_page), (1, 100));
+    assert!(matches!(
+        service
+            .activity(ON_WORKER.1, STRANGER, None, None, None)
+            .await,
+        Err(EgressRecordingError::SandboxNotFound { sandbox_id }) if sandbox_id == ON_WORKER.1
+    ));
+    // A sandbox without a project cannot record, so it has nothing to show.
+    let projectless = service
+        .activity(PROJECTLESS.1, OWNER, None, None, None)
+        .await
+        .unwrap();
+    assert!(projectless.records.is_empty() && !projectless.has_more);
+
+    let without_otel = EgressRecordingService::new(f.db.connection_arc(), f.capabilities(), None);
+    assert!(matches!(
+        without_otel
+            .activity(ON_WORKER.1, OWNER, None, None, None)
+            .await,
+        Err(EgressRecordingError::OtelUnavailable { .. })
+    ));
 }

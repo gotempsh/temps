@@ -104,6 +104,7 @@ pub struct SandboxAppState {
         sandboxes::set_egress_policy,
         egress_recording::get_egress_recording,
         egress_recording::set_egress_recording,
+        egress_recording::list_egress_records,
         sandboxes::list_events,
         sandboxes::rootfs_report,
         sandboxes::rootfs_gc,
@@ -130,6 +131,9 @@ pub struct SandboxAppState {
     components(schemas(
         crate::services::egress_recording::EgressRecordingStatus,
         egress_recording::SetEgressRecordingBody,
+        crate::services::egress_recording::activity::EgressActivityPage,
+        crate::services::egress_recording::activity::EgressActivityRecord,
+        crate::services::egress_recording::activity::EgressOutcomeFilter,
         sandboxes::CreateSandboxBody,
         sandboxes::SourceBody,
         sandboxes::SandboxResponse,

@@ -8,6 +8,8 @@
 //!   whether it can (and if not, exactly what is missing).
 //! - `PUT /v1/sandboxes/{id}/egress-recording` `{"enabled": true}`: turn it
 //!   on or off. Audit-logged.
+//! - `GET /v1/sandboxes/{id}/egress-records`: the sandbox's recorded
+//!   connections, newest first, paginated.
 //! - `POST /internal/nodes/{node_id}/egress-records`: a worker's batch,
 //!   authenticated with the node token, mounted outside the plugin router
 //!   next to the network-policy report.
@@ -15,7 +17,7 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -27,6 +29,7 @@ use temps_workload_netpol::EgressRecordBatch;
 use utoipa::ToSchema;
 
 use crate::handlers::sandboxes::{require_sandbox_read, require_sandbox_write};
+use crate::services::egress_recording::activity::{EgressActivityPage, EgressOutcomeFilter};
 use crate::services::egress_recording::ingest::EgressIngestOutcome;
 use crate::services::egress_recording::{
     EgressRecordingError, EgressRecordingService, EgressRecordingStatus,
@@ -109,6 +112,12 @@ impl From<EgressRecordingError> for Problem {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("Egress Records Not Stored")
                     .with_detail(detail)
+            }
+            EgressRecordingError::Query { sandbox_id, .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("Recorded Connections Unreadable")
+                    .with_detail(detail)
+                    .with_value("sandbox_id", sandbox_id.clone())
             }
             EgressRecordingError::Database { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -256,11 +265,75 @@ pub async fn set_egress_recording(
     Ok(Json(status))
 }
 
+/// Which page of recorded connections, and which outcomes.
+#[derive(Debug, Clone, Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct EgressActivityParams {
+    /// Page number, from 1. Default 1.
+    pub page: Option<u64>,
+    /// Records per page. Default 20, at most 100.
+    pub per_page: Option<u64>,
+    /// Only connections that ended this way.
+    pub outcome: Option<EgressOutcomeFilter>,
+}
+
+/// The sandbox's recorded outbound connections, newest first.
+///
+/// Each record is one connection (or identical refusals collapsed into
+/// one, see `count`): destination host and port, method and path for plain
+/// HTTP (never the query string), outcome and refusal reason, bytes each
+/// way and duration. Records exist only while recording is on; a sandbox
+/// without a project has none. These are the same OpenTelemetry log
+/// records the project's logs show, read by sandbox.
+#[utoipa::path(
+    tag = "Sandboxes",
+    get,
+    path = "/v1/sandboxes/{id}/egress-records",
+    params(
+        ("id" = String, Path, description = "Sandbox id (`sbx_...`)"),
+        EgressActivityParams
+    ),
+    responses(
+        (status = 200, description = "A page of recorded connections", body = EgressActivityPage),
+        (status = 400, description = "Invalid query", body = temps_core::problemdetails::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = temps_core::problemdetails::ProblemDetails),
+        (status = 404, description = "Sandbox not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 503, description = "OpenTelemetry storage is not enabled or cannot be read", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_egress_records(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<EgressRecordingAppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<EgressActivityParams>,
+) -> Result<impl IntoResponse, Problem> {
+    require_sandbox_read(&auth)?;
+    let page = state
+        .service
+        .activity(
+            &id,
+            auth.user_id(),
+            params.page,
+            params.per_page,
+            params.outcome,
+        )
+        .await?;
+    Ok(Json(page))
+}
+
 pub fn routes() -> Router<Arc<EgressRecordingAppState>> {
-    Router::new().route(
-        "/v1/sandboxes/{id}/egress-recording",
-        get(get_egress_recording).put(set_egress_recording),
-    )
+    Router::new()
+        .route(
+            "/v1/sandboxes/{id}/egress-recording",
+            get(get_egress_recording).put(set_egress_recording),
+        )
+        .route(
+            "/v1/sandboxes/{id}/egress-records",
+            get(list_egress_records),
+        )
 }
 
 pub struct EgressRecordingNodeState {
@@ -408,6 +481,60 @@ mod tests {
 
     fn uri(id: &str) -> String {
         format!("/v1/sandboxes/{id}/egress-recording")
+    }
+
+    #[tokio::test]
+    async fn recorded_connections_need_a_session_and_read_permission() {
+        let Some(f) = fixture().await else { return };
+        let app = routes().with_state(Arc::new(EgressRecordingAppState {
+            service: f.service_with_otel(),
+            audit_service: None,
+        }));
+        let records = |query: &str| format!("/v1/sandboxes/{}/egress-records{query}", ON_WORKER.1);
+
+        let (status, _) = send(app.clone(), "GET", &records(""), None, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+        let ingest_only = AuthContext::new_session(owner(), Role::MetricsIngest);
+        let (status, body) = send(app.clone(), "GET", &records(""), None, Some(ingest_only)).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert_eq!(body["required_permission"], "sandboxes:read", "{body}");
+
+        let reader = AuthContext::new_session(owner(), Role::Reader);
+        let (status, body) = send(
+            app.clone(),
+            "GET",
+            &records("?page=1&per_page=5&outcome=refused"),
+            None,
+            Some(reader.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["sandbox_id"], ON_WORKER.1);
+        assert_eq!(body["per_page"], 5);
+        assert_eq!(body["records"], serde_json::json!([]));
+        assert_eq!(body["has_more"], false);
+
+        let (status, _) = send(
+            app.clone(),
+            "GET",
+            &records("?outcome=sideways"),
+            None,
+            Some(reader.clone()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, body) = send(
+            app,
+            "GET",
+            "/v1/sandboxes/sbx_0000000000000000/egress-records",
+            None,
+            Some(reader),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        assert_eq!(body["title"], "Sandbox Not Found");
     }
 
     #[tokio::test]

@@ -137,6 +137,7 @@ mod tests {
             events: vec![],
         };
         let log = LogRecord {
+            sandbox_id: None,
             ingest_identity: Some(IngestIdentity::from_digest([0x11; 32])),
             project_id: project.id,
             deployment_id: None,

@@ -134,6 +134,7 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
+        sandbox_id: None,
         ingest_identity: None,
         attribute_types: Default::default(),
         project_id,
@@ -1003,6 +1004,80 @@ async fn duplicate_metric_batch_insert_duplicates_rows() {
         "otel_metrics has no unique key, so the same point is counted twice — \
          a retried batch would inflate every aggregate built on it"
     );
+}
+
+/// A sandbox's records are stored with its id and read back by it alone;
+/// the project's other logs, and another sandbox's, are not returned, and a
+/// project-wide query still sees all of them.
+#[tokio::test]
+async fn log_records_are_stored_and_read_per_sandbox() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let for_sandbox = |sandbox_id: Option<i32>, body: &str| LogRecord {
+        sandbox_id,
+        ..sample_log(1, LogSeverity::Info, body, None)
+    };
+    storage
+        .store_logs(vec![
+            for_sandbox(None, "workload line"),
+            for_sandbox(Some(42), "sandbox 42 connection"),
+            for_sandbox(Some(43), "sandbox 43 connection"),
+        ])
+        .await
+        .expect("store");
+
+    let found = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            sandbox_id: Some(42),
+            ..Default::default()
+        })
+        .await
+        .expect("sandbox query");
+    assert_eq!(
+        found
+            .iter()
+            .map(|r| (r.body.as_str(), r.sandbox_id))
+            .collect::<Vec<_>>(),
+        vec![("sandbox 42 connection", Some(42))]
+    );
+
+    let other_project = storage
+        .query_logs(LogQuery {
+            project_id: 2,
+            sandbox_id: Some(42),
+            ..Default::default()
+        })
+        .await
+        .expect("query");
+    assert!(
+        other_project.is_empty(),
+        "the project still scopes the query"
+    );
+    let count = |sandbox_id| {
+        storage.count_logs(LogQuery {
+            project_id: 1,
+            sandbox_id,
+            limit: Some(1),
+            ..Default::default()
+        })
+    };
+    assert_eq!(count(Some(42)).await.expect("count"), 1);
+    assert_eq!(
+        count(None).await.expect("count"),
+        3,
+        "the count ignores the limit"
+    );
+
+    let all = storage
+        .query_logs(LogQuery {
+            project_id: 1,
+            ..Default::default()
+        })
+        .await
+        .expect("project query");
+    assert_eq!(all.len(), 3);
 }
 
 #[tokio::test]

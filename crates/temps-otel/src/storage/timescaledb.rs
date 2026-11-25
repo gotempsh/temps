@@ -720,7 +720,8 @@ impl TimescaleDbStorage {
             "INSERT INTO otel_log_events (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, timestamp, observed_timestamp,
-                severity, severity_text, body, trace_id, span_id, attributes, attribute_types
+                severity, severity_text, body, trace_id, span_id, attributes, attribute_types,
+                sandbox_id
             ) VALUES ",
         );
 
@@ -732,7 +733,7 @@ impl TimescaleDbStorage {
                 sql.push_str(", ");
             }
             sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
+                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
                 param_idx,
                 param_idx + 1,
                 param_idx + 2,
@@ -746,9 +747,10 @@ impl TimescaleDbStorage {
                 param_idx + 10,
                 param_idx + 11,
                 param_idx + 12,
-                param_idx + 13
+                param_idx + 13,
+                param_idx + 14
             ));
-            param_idx += 14;
+            param_idx += 15;
 
             let attrs_json = serde_json::to_value(&r.attributes).unwrap_or_default();
 
@@ -769,6 +771,7 @@ impl TimescaleDbStorage {
                 serde_json::to_value(&r.attribute_types)
                     .unwrap_or_default()
                     .into(),
+                r.sandbox_id.into(),
             ]);
         }
 
@@ -2352,72 +2355,14 @@ impl OtelStorage for TimescaleDbStorage {
         let limit = query.limit.unwrap_or(100).min(1000);
         let offset = query.offset.unwrap_or(0);
 
-        let mut where_clauses = vec!["project_id = $1".to_string()];
-        let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
-        let mut param_idx = 2u32;
-
-        if let Some(sev) = query.severity {
-            where_clauses.push(format!("severity = ${}", param_idx));
-            values.push(sev.to_string().into());
-            param_idx += 1;
-        }
-        if let Some(ref svc) = query.service_name {
-            where_clauses.push(format!("service_name = ${}", param_idx));
-            values.push(svc.clone().into());
-            param_idx += 1;
-        }
-        if let Some(ref search) = query.search {
-            where_clauses.push(format!("body ILIKE ${}", param_idx));
-            values.push(format!("%{}%", search).into());
-            param_idx += 1;
-        }
-        if let Some(ref tid) = query.trace_id {
-            where_clauses.push(format!("trace_id = ${}", param_idx));
-            values.push(tid.clone().into());
-            param_idx += 1;
-        }
-        if let Some(start) = query.start_time {
-            where_clauses.push(format!("timestamp >= ${}", param_idx));
-            values.push(start.into());
-            param_idx += 1;
-        }
-        if let Some(end) = query.end_time {
-            where_clauses.push(format!("timestamp <= ${}", param_idx));
-            values.push(end.into());
-            param_idx += 1;
-        }
-
-        if let Some(filter) = &query.attribute_filter {
-            filter.validate()?;
-            let key_param = param_idx;
-            values.push(filter.key.clone().into());
-            param_idx += 1;
-            if let Some(ty) = filter.ty {
-                where_clauses.push(format!(
-                    "attribute_types->>${key_param}::text = ${param_idx}"
-                ));
-                values.push(ty.as_str().into());
-                param_idx += 1;
-            }
-            let operator = filter.operator.sql();
-            if filter.ty.is_some_and(LogAttributeType::is_numeric) {
-                where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
-            } else {
-                where_clauses.push(format!(
-                    "attributes->>${key_param}::text {operator} ${param_idx}::text"
-                ));
-            }
-            values.push(filter.value.clone().into());
-            param_idx += 1;
-        }
-
-        let where_sql = where_clauses.join(" AND ");
+        let (where_sql, mut values, param_idx) = log_filter(&query)?;
 
         let sql = format!(
             r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, timestamp, observed_timestamp,
-                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types
+                   severity, severity_text, body, trace_id, span_id, attributes, attribute_types,
+                   sandbox_id
             FROM otel_log_events
             WHERE {where_sql}
             ORDER BY timestamp DESC,
@@ -2446,6 +2391,23 @@ impl OtelStorage for TimescaleDbStorage {
             .collect();
 
         Ok(records)
+    }
+
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64> {
+        let (where_sql, values, _) = log_filter(&query)?;
+        let row = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                format!("SELECT count(*) AS n FROM otel_log_events WHERE {where_sql}"),
+                values,
+            ))
+            .await?;
+        let count: i64 = match row {
+            Some(row) => row.try_get("", "n")?,
+            None => 0,
+        };
+        Ok(u64::try_from(count).unwrap_or(0))
     }
 
     // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────────────
@@ -4401,6 +4363,77 @@ fn parse_span_row(row: &sea_orm::QueryResult) -> Result<SpanRecord, OtelError> {
     })
 }
 
+/// The `WHERE` clause of a log query, its bound values, and the next free
+/// parameter index. Shared by the query and its count so both always apply
+/// exactly the same filters.
+fn log_filter(query: &LogQuery) -> StorageResult<(String, Vec<sea_orm::Value>, u32)> {
+    let mut where_clauses = vec!["project_id = $1".to_string()];
+    let mut values: Vec<sea_orm::Value> = vec![query.project_id.into()];
+    let mut param_idx = 2u32;
+
+    if let Some(sandbox_id) = query.sandbox_id {
+        where_clauses.push(format!("sandbox_id = ${}", param_idx));
+        values.push(sandbox_id.into());
+        param_idx += 1;
+    }
+    if let Some(sev) = query.severity {
+        where_clauses.push(format!("severity = ${}", param_idx));
+        values.push(sev.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(ref svc) = query.service_name {
+        where_clauses.push(format!("service_name = ${}", param_idx));
+        values.push(svc.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref search) = query.search {
+        where_clauses.push(format!("body ILIKE ${}", param_idx));
+        values.push(format!("%{}%", search).into());
+        param_idx += 1;
+    }
+    if let Some(ref tid) = query.trace_id {
+        where_clauses.push(format!("trace_id = ${}", param_idx));
+        values.push(tid.clone().into());
+        param_idx += 1;
+    }
+    if let Some(start) = query.start_time {
+        where_clauses.push(format!("timestamp >= ${}", param_idx));
+        values.push(start.into());
+        param_idx += 1;
+    }
+    if let Some(end) = query.end_time {
+        where_clauses.push(format!("timestamp <= ${}", param_idx));
+        values.push(end.into());
+        param_idx += 1;
+    }
+
+    if let Some(filter) = &query.attribute_filter {
+        filter.validate()?;
+        let key_param = param_idx;
+        values.push(filter.key.clone().into());
+        param_idx += 1;
+        if let Some(ty) = filter.ty {
+            where_clauses.push(format!(
+                "attribute_types->>${key_param}::text = ${param_idx}"
+            ));
+            values.push(ty.as_str().into());
+            param_idx += 1;
+        }
+        let operator = filter.operator.sql();
+        if filter.ty.is_some_and(LogAttributeType::is_numeric) {
+            where_clauses.push(format!("temps_log_numeric(attributes->>${key_param}::text) {operator} temps_log_numeric(${param_idx}::text)"));
+        } else {
+            where_clauses.push(format!(
+                "attributes->>${key_param}::text {operator} ${param_idx}::text"
+            ));
+        }
+        values.push(filter.value.clone().into());
+        param_idx += 1;
+    }
+
+    Ok((where_clauses.join(" AND "), values, param_idx))
+}
+
 fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
     let attrs_json: serde_json::Value = row.try_get("", "attributes").unwrap_or_default();
     let attributes: std::collections::BTreeMap<String, String> =
@@ -4419,6 +4452,7 @@ fn parse_log_row(row: &sea_orm::QueryResult) -> Result<LogRecord, OtelError> {
 
     Ok(LogRecord {
         ingest_identity: None,
+        sandbox_id: row.try_get::<Option<i32>>("", "sandbox_id").ok().flatten(),
         attribute_types: serde_json::from_value(
             row.try_get("", "attribute_types").unwrap_or_default(),
         )

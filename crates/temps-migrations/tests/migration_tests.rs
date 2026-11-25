@@ -11175,3 +11175,131 @@ async fn test_network_policy_mode_off_is_accepted_and_reverses() -> anyhow::Resu
         .is_err());
     Ok(())
 }
+
+/// `sandbox_id` is a nullable column with a partial index: workload log
+/// rows keep working without it, a sandbox's rows are found by it, and
+/// `down` removes both.
+#[tokio::test]
+async fn test_otel_log_events_sandbox_id_is_added_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000004_otel_log_events_sandbox_id";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!("Skipping otel log sandbox id migration test: Docker unavailable");
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    // A workload log row written before the column exists.
+    db.execute_unprepared(
+        "INSERT INTO otel_log_events (project_id, service_name, timestamp, \
+         observed_timestamp, severity, body) \
+         VALUES (1, 'api', NOW(), NOW(), 'INFO', 'before')",
+    )
+    .await?;
+    // A compressed chunk from before, as every install older than the
+    // compression policy has: adding the column and the index must not
+    // need it decompressed.
+    db.execute_unprepared(
+        "INSERT INTO otel_log_events (project_id, service_name, timestamp, \
+         observed_timestamp, severity, body) \
+         VALUES (1, 'api', NOW() - INTERVAL '10 days', NOW(), 'INFO', 'compressed'); \
+         SELECT compress_chunk(c) FROM show_chunks('otel_log_events', \
+         older_than => NOW() - INTERVAL '5 days') c;",
+    )
+    .await?;
+    let compressed = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM timescaledb_information.chunks \
+             WHERE hypertable_name = 'otel_log_events' AND is_compressed"
+                .to_string(),
+        ))
+        .await?
+        .expect("a count");
+    assert_eq!(
+        compressed.try_get::<i64>("", "n")?,
+        1,
+        "one compressed chunk"
+    );
+
+    Migrator::up(&db, None).await?;
+    db.execute_unprepared(
+        "INSERT INTO otel_log_events (project_id, service_name, timestamp, \
+         observed_timestamp, severity, body, sandbox_id) \
+         VALUES (1, 'temps-egress', NOW(), NOW(), 'INFO', 'recorded', 42)",
+    )
+    .await?;
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT body, sandbox_id FROM otel_log_events ORDER BY body".to_string(),
+        ))
+        .await?;
+    let rows: Vec<(String, Option<i32>)> = rows
+        .iter()
+        .map(|row| Ok((row.try_get("", "body")?, row.try_get("", "sandbox_id")?)))
+        .collect::<Result<_, sea_orm::DbErr>>()?;
+    assert_eq!(
+        rows,
+        vec![
+            ("before".to_string(), None),
+            ("compressed".to_string(), None),
+            ("recorded".to_string(), Some(42))
+        ]
+    );
+    let index = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT indexdef FROM pg_indexes \
+             WHERE indexname = 'idx_otel_logs_sandbox_timestamp'"
+                .to_string(),
+        ))
+        .await?
+        .expect("the sandbox index exists");
+    let definition: String = index.try_get("", "indexdef")?;
+    assert!(
+        definition.contains("(sandbox_id, \"timestamp\" DESC)")
+            && definition.contains("WHERE (sandbox_id IS NOT NULL)"),
+        "{definition}"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    let column = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT 1 AS present FROM information_schema.columns \
+             WHERE table_name = 'otel_log_events' AND column_name = 'sandbox_id'"
+                .to_string(),
+        ))
+        .await?;
+    assert!(column.is_none(), "down drops the column");
+    Ok(())
+}

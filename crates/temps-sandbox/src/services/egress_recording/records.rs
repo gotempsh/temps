@@ -34,6 +34,9 @@ pub const PLATFORM_SOURCE: &str = "egress-proxy";
 #[derive(Debug, Clone)]
 pub struct Attribution {
     pub project_id: i32,
+    /// The sandbox's internal id, stored in the record's `sandbox_id`
+    /// column so the sandbox's own records are read by index.
+    pub sandbox_id: i32,
     pub sandbox_public_id: String,
     pub node_id: i32,
     pub node_name: String,
@@ -234,6 +237,7 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
         ConnectionOutcome::Refused | ConnectionOutcome::Failed => LogSeverity::Warn,
     };
     LogRecord {
+        sandbox_id: Some(who.sandbox_id),
         ingest_identity: None,
         project_id: who.project_id,
         deployment_id: None,
@@ -259,6 +263,7 @@ mod tests {
     fn who() -> Attribution {
         Attribution {
             project_id: 7,
+            sandbox_id: 42,
             sandbox_public_id: "sbx_0123456789abcdef".into(),
             node_id: 3,
             node_name: "worker-a".into(),
@@ -291,6 +296,7 @@ mod tests {
         let log = to_log_record(&tunnel(), &who());
         let attr = |k: &str| log.attributes.get(k).map(String::as_str);
         assert_eq!(log.project_id, 7);
+        assert_eq!(log.sandbox_id, Some(42));
         assert_eq!(log.resource.service_name, SERVICE_NAME);
         assert_eq!(log.severity, LogSeverity::Info);
         assert_eq!(attr("otel.scope.name"), Some("temps.egress"));

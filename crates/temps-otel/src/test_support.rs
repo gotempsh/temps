@@ -722,6 +722,14 @@ impl OtelStorage for MockOtelStorage {
         Ok(filtered)
     }
 
+    async fn count_logs(&self, query: LogQuery) -> StorageResult<u64> {
+        let query = LogQuery {
+            limit: Some(u64::MAX),
+            ..query
+        };
+        Ok(self.query_logs(query).await?.len() as u64)
+    }
+
     async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
         let mut refs = self.trace_refs.lock().unwrap();
         for tid in trace_ids {
