@@ -550,7 +550,7 @@ impl OtelStorage for MockOtelStorage {
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
         if let Some(msg) = self.fail_archive_logs.lock().unwrap().as_ref() {
             return Err(OtelError::S3 {
-                project_id: records.first().map(|r| r.project_id).unwrap_or(0),
+                project_id: records.first().and_then(|r| r.project_id).unwrap_or(0),
                 reason: msg.clone(),
             });
         }
@@ -701,7 +701,10 @@ impl OtelStorage for MockOtelStorage {
         let logs = self.logs.lock().unwrap();
         let filtered: Vec<LogRecord> = logs
             .iter()
-            .filter(|l| l.project_id == query.project_id)
+            .filter(|l| match query.workload {
+                Some(workload) => l.workload == Some(workload),
+                None => l.project_id == Some(query.project_id),
+            })
             .filter(|l| {
                 query
                     .severity

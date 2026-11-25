@@ -1308,8 +1308,7 @@ impl OtelService {
             // bounded window unless correlation already selects one trace
             // or the query is one sandbox's records, which its own index
             // bounds.
-            if query.start_time.is_none() && query.trace_id.is_none() && query.sandbox_id.is_none()
-            {
+            if query.start_time.is_none() && query.trace_id.is_none() && query.workload.is_none() {
                 query.start_time = Some(
                     query.end_time.unwrap_or_else(chrono::Utc::now) - chrono::Duration::hours(24),
                 );
@@ -1459,10 +1458,10 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn confirmed_logs_use_native_retries_archival_and_failure_accounting() {
         let log = LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: chrono::Utc::now(),
@@ -2216,10 +2215,10 @@ mod tests {
             crate::types::AttributeValue::String("egress-proxy".into()),
         );
         LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource,
             timestamp: now,
@@ -2299,10 +2298,10 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: now,
@@ -2844,10 +2843,10 @@ mod tests {
 
         let now = chrono::Utc::now();
         let make_log = |severity: LogSeverity, body: &str| LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
             attribute_types: Default::default(),
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource: ResourceInfo::default(),
             timestamp: now,

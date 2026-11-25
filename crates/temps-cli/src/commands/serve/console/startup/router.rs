@@ -115,15 +115,15 @@ pub(super) async fn build_router(
                 .require_service::<temps_network_policy::NetworkPolicyService>(),
         }));
 
-    // Node-token endpoint for egress connection records (opted-in sandboxes).
-    let egress_recording_node_routes =
-        temps_sandbox::handlers::egress_recording::node_routes(Arc::new(
-            temps_sandbox::handlers::egress_recording::EgressRecordingNodeState {
-                service: temps_sandbox::plugin::egress_recording_service(
-                    &plugin_manager.service_context().create_plugin_context(),
-                ),
-            },
-        ));
+    // Node-token endpoint for egress connection records, one for every
+    // workload kind that opted in.
+    let egress_recording_node_routes = temps_workload_egress::handlers::node_routes(Arc::new(
+        temps_workload_egress::handlers::EgressRecordingNodeState {
+            service: plugin_manager
+                .service_context()
+                .require_service::<temps_workload_egress::EgressRecordingService>(),
+        },
+    ));
 
     // Build the split application: public routes (event ingest, AI gateway,
     // session replay ingest, etc.) and admin routes (auth, dashboard, CRUD).

@@ -29,6 +29,7 @@ temps-network-policy = { path = "../temps-network-policy" }
 temps-otel = { path = "../temps-otel" }
 temps-routes = { path = "../temps-routes" }
 temps-workload = { path = "../temps-workload" }
+temps-workload-egress = { path = "../temps-workload-egress" }
 temps-workload-netpol = { path = "../temps-workload-netpol" }
 arc-swap = { workspace = true }
 bollard = { workspace = true }

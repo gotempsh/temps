@@ -10888,13 +10888,22 @@ async fn visitor_environments(
 async fn sandbox_egress_recording_column(
     db: &DatabaseConnection,
 ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    egress_recording_column(db, "sandboxes").await
+}
+
+/// The type, nullability and default of `<table>.egress_recording`, the
+/// opt-in every recordable workload kind keeps on its own row.
+async fn egress_recording_column(
+    db: &DatabaseConnection,
+    table: &str,
+) -> anyhow::Result<Option<(String, String, Option<String>)>> {
     let row = db
-        .query_one(sea_orm::Statement::from_string(
+        .query_one(sea_orm::Statement::from_sql_and_values(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT data_type, is_nullable, column_default FROM information_schema.columns \
-             WHERE table_schema = 'public' AND table_name = 'sandboxes' \
-               AND column_name = 'egress_recording'"
-                .to_string(),
+             WHERE table_schema = 'public' AND table_name = $1 \
+               AND column_name = 'egress_recording'",
+            [table.into()],
         ))
         .await?;
     Ok(match row {
@@ -10983,6 +10992,101 @@ async fn test_sandbox_egress_recording_defaults_off_and_reverses() -> anyhow::Re
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT count(*)::int AS count FROM sandboxes".to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(kept.try_get::<i32>("", "count")?, 1);
+    Ok(())
+}
+
+/// Recording an environment's outbound connections is opt-in: an existing
+/// environment has it off. `down` removes the column and keeps the
+/// environment.
+#[tokio::test]
+async fn test_environment_egress_recording_defaults_off_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000005_environment_egress_recording";
+    if external_db_configured() {
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .with_test_labels()
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            if !temps_test_utils::docker_available().await {
+                eprintln!(
+                    "Skipping environments.egress_recording migration test: Docker unavailable"
+                );
+                return Ok(());
+            }
+            return Err(error.into());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    Migrator::up(&db, None).await?;
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(egress_recording_column(&db, "environments")
+        .await?
+        .is_none());
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('recorded', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'recorded'); \
+         INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, \
+         updated_at, project_id) \
+         SELECT 'production', 'production', 'recorded-production', 'recorded.test', '[]', \
+         now(), now(), id FROM projects WHERE slug = 'recorded'",
+    )
+    .await?;
+
+    Migrator::up(&db, None).await?;
+    assert_eq!(
+        egress_recording_column(&db, "environments").await?,
+        Some((
+            "boolean".to_string(),
+            "NO".to_string(),
+            Some("false".to_string())
+        ))
+    );
+    let off = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM environments WHERE egress_recording = false"
+                .to_string(),
+        ))
+        .await?
+        .expect("count row");
+    assert_eq!(
+        off.try_get::<i32>("", "count")?,
+        1,
+        "existing environments stay off"
+    );
+
+    Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
+    assert!(egress_recording_column(&db, "environments")
+        .await?
+        .is_none());
+    let kept = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS count FROM environments".to_string(),
         ))
         .await?
         .expect("count row");
@@ -11176,12 +11280,13 @@ async fn test_network_policy_mode_off_is_accepted_and_reverses() -> anyhow::Resu
     Ok(())
 }
 
-/// `sandbox_id` is a nullable column with a partial index: workload log
-/// rows keep working without it, a sandbox's rows are found by it, and
-/// `down` removes both.
+/// A log record can be owned by a workload (kind and id, partially
+/// indexed) with or without a project: older rows keep working, compressed
+/// chunks are not rewritten and accept records without a project, and
+/// `down` removes the columns and the records that had no project.
 #[tokio::test]
-async fn test_otel_log_events_sandbox_id_is_added_and_reverses() -> anyhow::Result<()> {
-    const MIGRATION: &str = "m20261125_000004_otel_log_events_sandbox_id";
+async fn test_otel_log_events_workload_owner_is_added_and_reverses() -> anyhow::Result<()> {
+    const MIGRATION: &str = "m20261125_000004_otel_log_events_workload_owner";
     if external_db_configured() {
         return Ok(());
     }
@@ -11204,7 +11309,7 @@ async fn test_otel_log_events_sandbox_id_is_added_and_reverses() -> anyhow::Resu
         Ok(container) => container,
         Err(error) => {
             if !temps_test_utils::docker_available().await {
-                eprintln!("Skipping otel log sandbox id migration test: Docker unavailable");
+                eprintln!("Skipping otel log workload owner migration test: Docker unavailable");
                 return Ok(());
             }
             return Err(error.into());
@@ -11251,55 +11356,106 @@ async fn test_otel_log_events_sandbox_id_is_added_and_reverses() -> anyhow::Resu
     );
 
     Migrator::up(&db, None).await?;
+    // One record of a sandbox in a project, one of a sandbox without a
+    // project, and one written into the compressed chunk without a project.
     db.execute_unprepared(
         "INSERT INTO otel_log_events (project_id, service_name, timestamp, \
-         observed_timestamp, severity, body, sandbox_id) \
-         VALUES (1, 'temps-egress', NOW(), NOW(), 'INFO', 'recorded', 42)",
+         observed_timestamp, severity, body, workload_kind, workload_id) VALUES \
+         (1, 'temps-egress-proxy', NOW(), NOW(), 'INFO', 'recorded', 'sandbox', 42), \
+         (NULL, 'temps-egress-proxy', NOW(), NOW(), 'INFO', 'unowned', 'sandbox', 43), \
+         (NULL, 'temps-egress-proxy', NOW() - INTERVAL '10 days', NOW(), 'INFO', \
+          'unowned compressed', 'deployment', 7)",
     )
     .await?;
     let rows = db
         .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT body, sandbox_id FROM otel_log_events ORDER BY body".to_string(),
+            "SELECT body, project_id, workload_kind, workload_id FROM otel_log_events \
+             ORDER BY body"
+                .to_string(),
         ))
         .await?;
-    let rows: Vec<(String, Option<i32>)> = rows
+    type Row = (String, Option<i32>, Option<String>, Option<i64>);
+    let rows: Vec<Row> = rows
         .iter()
-        .map(|row| Ok((row.try_get("", "body")?, row.try_get("", "sandbox_id")?)))
+        .map(|row| {
+            Ok((
+                row.try_get("", "body")?,
+                row.try_get("", "project_id")?,
+                row.try_get("", "workload_kind")?,
+                row.try_get("", "workload_id")?,
+            ))
+        })
         .collect::<Result<_, sea_orm::DbErr>>()?;
+    let owned = |body: &str, project: Option<i32>, workload: Option<(&str, i64)>| {
+        (
+            body.to_string(),
+            project,
+            workload.map(|(kind, _)| kind.to_string()),
+            workload.map(|(_, id)| id),
+        )
+    };
     assert_eq!(
         rows,
         vec![
-            ("before".to_string(), None),
-            ("compressed".to_string(), None),
-            ("recorded".to_string(), Some(42))
+            owned("before", Some(1), None),
+            owned("compressed", Some(1), None),
+            owned("recorded", Some(1), Some(("sandbox", 42))),
+            owned("unowned", None, Some(("sandbox", 43))),
+            owned("unowned compressed", None, Some(("deployment", 7))),
         ]
     );
     let index = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
             "SELECT indexdef FROM pg_indexes \
-             WHERE indexname = 'idx_otel_logs_sandbox_timestamp'"
+             WHERE indexname = 'idx_otel_logs_workload_timestamp'"
                 .to_string(),
         ))
         .await?
-        .expect("the sandbox index exists");
+        .expect("the workload index exists");
     let definition: String = index.try_get("", "indexdef")?;
     assert!(
-        definition.contains("(sandbox_id, \"timestamp\" DESC)")
-            && definition.contains("WHERE (sandbox_id IS NOT NULL)"),
+        definition.contains("(workload_kind, workload_id, \"timestamp\" DESC)")
+            && definition.contains("WHERE (workload_id IS NOT NULL)"),
         "{definition}"
     );
 
     Migrator::down(&db, Some(steps_back_to(MIGRATION))).await?;
-    let column = db
-        .query_one(sea_orm::Statement::from_string(
+    let columns = db
+        .query_all(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
-            "SELECT 1 AS present FROM information_schema.columns \
-             WHERE table_name = 'otel_log_events' AND column_name = 'sandbox_id'"
+            "SELECT column_name, is_nullable FROM information_schema.columns \
+             WHERE table_name = 'otel_log_events' \
+               AND column_name IN ('workload_kind', 'workload_id', 'project_id')"
                 .to_string(),
         ))
         .await?;
-    assert!(column.is_none(), "down drops the column");
+    let columns: Vec<(String, String)> = columns
+        .iter()
+        .map(|row| {
+            Ok((
+                row.try_get("", "column_name")?,
+                row.try_get("", "is_nullable")?,
+            ))
+        })
+        .collect::<Result<_, sea_orm::DbErr>>()?;
+    assert_eq!(
+        columns,
+        vec![("project_id".to_string(), "NO".to_string())],
+        "down drops the workload columns and requires a project again"
+    );
+    let left = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*) AS n FROM otel_log_events".to_string(),
+        ))
+        .await?
+        .expect("a count");
+    assert_eq!(
+        left.try_get::<i64>("", "n")?,
+        3,
+        "down removes only the records without a project"
+    );
     Ok(())
 }

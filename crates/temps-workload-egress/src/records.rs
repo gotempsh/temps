@@ -9,19 +9,26 @@
 //! Every record carries the instrumentation scope `otel.scope.name =
 //! temps.egress` and `temps.platform.source = egress-proxy`, a key only
 //! the platform can write (see `temps_otel::platform_logs`), so a reader can
-//! tell these records from anything the sandbox sends about itself.
+//! tell these records from anything the workload sends about itself.
+//!
+//! The same record for every workload kind. What names the workload is
+//! `temps.workload.kind` and the kind's own id attribute (`temps.sandbox.id`,
+//! `temps.environment.id`), plus the workload columns the record is stored
+//! and read by.
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, TimeZone, Utc};
 use temps_otel::platform_logs::PLATFORM_SOURCE_ATTRIBUTE;
 use temps_otel::types::{AttributeValue, LogAttributeType, LogRecord, LogSeverity, ResourceInfo};
+use temps_workload::WorkloadRef;
 use temps_workload_netpol::{
     egress::record::{MAX_RECORDED_HOST, MAX_RECORDED_METHOD, MAX_RECORDED_PATH},
     ConnectionKind, ConnectionOutcome, ConnectionRecord,
 };
 
-use super::SANDBOX_ID_ATTRIBUTE;
+/// The attribute every record carries with its workload's kind.
+pub const WORKLOAD_KIND_ATTRIBUTE: &str = "temps.workload.kind";
 
 /// `service.name` of every record.
 pub const SERVICE_NAME: &str = "temps-egress-proxy";
@@ -30,14 +37,18 @@ pub const SERVICE_NAME: &str = "temps-egress-proxy";
 pub const PLATFORM_SOURCE: &str = "egress-proxy";
 
 /// Who the record is about, as the control plane knows it (never as the
-/// node or the sandbox says).
+/// node or the workload says).
 #[derive(Debug, Clone)]
 pub struct Attribution {
-    pub project_id: i32,
-    /// The sandbox's internal id, stored in the record's `sandbox_id`
-    /// column so the sandbox's own records are read by index.
-    pub sandbox_id: i32,
-    pub sandbox_public_id: String,
+    /// The project that owns the workload, when one does.
+    pub project_id: Option<i32>,
+    /// Stored in the record's workload columns, so the workload's own
+    /// records are read by index.
+    pub workload: WorkloadRef,
+    /// The id the workload's own API names it by.
+    pub public_id: String,
+    /// The attribute `public_id` is written under (`temps.sandbox.id`).
+    pub id_attribute: &'static str,
     pub node_id: i32,
     pub node_name: String,
 }
@@ -174,7 +185,11 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
         temps_workload_netpol::egress::record::RECORD_SCOPE.to_string(),
     );
     text(PLATFORM_SOURCE_ATTRIBUTE, PLATFORM_SOURCE.to_string());
-    text(SANDBOX_ID_ATTRIBUTE, who.sandbox_public_id.clone());
+    text(
+        WORKLOAD_KIND_ATTRIBUTE,
+        who.workload.kind.as_str().to_string(),
+    );
+    text(who.id_attribute, who.public_id.clone());
     text("temps.node.id", who.node_id.to_string());
     text("temps.node.name", who.node_name.clone());
     text("temps.egress.kind", record.kind.as_str().to_string());
@@ -237,7 +252,7 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
         ConnectionOutcome::Refused | ConnectionOutcome::Failed => LogSeverity::Warn,
     };
     LogRecord {
-        sandbox_id: Some(who.sandbox_id),
+        workload: Some(who.workload),
         ingest_identity: None,
         project_id: who.project_id,
         deployment_id: None,
@@ -257,14 +272,15 @@ pub fn to_log_record(record: &ConnectionRecord, who: &Attribution) -> LogRecord 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use temps_workload::{WorkloadKind, WorkloadRef};
+    use temps_workload::WorkloadKind;
     use temps_workload_netpol::{EgressReason, RelayKind};
 
     fn who() -> Attribution {
         Attribution {
-            project_id: 7,
-            sandbox_id: 42,
-            sandbox_public_id: "sbx_0123456789abcdef".into(),
+            project_id: Some(7),
+            workload: WorkloadRef::new(WorkloadKind::Sandbox, 42),
+            public_id: "sbx_0123456789abcdef".into(),
+            id_attribute: "temps.sandbox.id",
             node_id: 3,
             node_name: "worker-a".into(),
         }
@@ -295,8 +311,12 @@ mod tests {
     fn an_allowed_tunnel_uses_semantic_convention_attributes() {
         let log = to_log_record(&tunnel(), &who());
         let attr = |k: &str| log.attributes.get(k).map(String::as_str);
-        assert_eq!(log.project_id, 7);
-        assert_eq!(log.sandbox_id, Some(42));
+        assert_eq!(log.project_id, Some(7));
+        assert_eq!(
+            log.workload,
+            Some(WorkloadRef::new(WorkloadKind::Sandbox, 42))
+        );
+        assert_eq!(attr("temps.workload.kind"), Some("sandbox"));
         assert_eq!(log.resource.service_name, SERVICE_NAME);
         assert_eq!(log.severity, LogSeverity::Info);
         assert_eq!(attr("otel.scope.name"), Some("temps.egress"));
@@ -378,6 +398,30 @@ mod tests {
             Some("51")
         );
         assert!(log.attributes.contains_key("temps.egress.last_started_at"));
+    }
+
+    /// The same record for another kind, owned by no project: only the
+    /// workload columns and the kind's own id attribute differ.
+    #[test]
+    fn a_record_names_its_workload_whatever_the_kind_and_needs_no_project() {
+        let environment = Attribution {
+            project_id: None,
+            workload: WorkloadRef::new(WorkloadKind::Deployment, 9),
+            public_id: "9".into(),
+            id_attribute: "temps.environment.id",
+            ..who()
+        };
+        let log = to_log_record(&tunnel(), &environment);
+        assert_eq!(log.project_id, None);
+        assert_eq!(
+            log.workload,
+            Some(WorkloadRef::new(WorkloadKind::Deployment, 9))
+        );
+        let attr = |k: &str| log.attributes.get(k).map(String::as_str);
+        assert_eq!(attr("temps.workload.kind"), Some("deployment"));
+        assert_eq!(attr("temps.environment.id"), Some("9"));
+        assert_eq!(attr("temps.sandbox.id"), None);
+        assert_eq!(attr("temps.platform.source"), Some("egress-proxy"));
     }
 
     #[test]

@@ -7,9 +7,9 @@
 //! records every outbound connection the sandbox makes (destination, outcome
 //! and refusal reason, bytes and duration; never headers, bodies or query
 //! strings) and the control plane stores each record as an OpenTelemetry
-//! log record of the sandbox's project. It lives on the sandbox's own row,
-//! next to `egress_policy`, so it is changed per sandbox through the API and
-//! audit-logged by that write.
+//! log record owned by the sandbox, and by its project when it has one. It
+//! lives on the sandbox's own row, next to `egress_policy`, so it is changed
+//! per sandbox through the API and audit-logged by that write.
 //!
 //! Off by default and for every existing sandbox, so the migration changes
 //! no behaviour. Additive: the previous binary ignores the column.

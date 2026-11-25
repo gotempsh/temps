@@ -134,10 +134,10 @@ fn sample_log(
     trace_id: Option<&str>,
 ) -> LogRecord {
     LogRecord {
-        sandbox_id: None,
+        workload: None,
         ingest_identity: None,
         attribute_types: Default::default(),
-        project_id,
+        project_id: Some(project_id),
         deployment_id: None,
         resource: test_resource(),
         timestamp: Utc::now(),
@@ -1006,68 +1006,91 @@ async fn duplicate_metric_batch_insert_duplicates_rows() {
     );
 }
 
-/// A sandbox's records are stored with its id and read back by it alone;
-/// the project's other logs, and another sandbox's, are not returned, and a
-/// project-wide query still sees all of them.
+/// Records the platform observed about a workload are stored with its kind
+/// and id and read back by them alone: another workload's, another kind's
+/// with the same id, and the project's own logs are not returned. A
+/// workload without a project keeps its records, which no project sees.
 #[tokio::test]
-async fn log_records_are_stored_and_read_per_sandbox() {
+async fn log_records_are_stored_and_read_per_workload() {
+    use temps_workload::{WorkloadKind, WorkloadRef};
+
     let Some((_db, storage)) = setup_storage().await else {
         return;
     };
-    let for_sandbox = |sandbox_id: Option<i32>, body: &str| LogRecord {
-        sandbox_id,
+    let sandbox = |id| WorkloadRef::new(WorkloadKind::Sandbox, id);
+    let observed = |workload: Option<WorkloadRef>, body: &str| LogRecord {
+        workload,
         ..sample_log(1, LogSeverity::Info, body, None)
     };
     storage
         .store_logs(vec![
-            for_sandbox(None, "workload line"),
-            for_sandbox(Some(42), "sandbox 42 connection"),
-            for_sandbox(Some(43), "sandbox 43 connection"),
+            observed(None, "workload line"),
+            observed(Some(sandbox(42)), "sandbox 42 connection"),
+            observed(Some(sandbox(43)), "sandbox 43 connection"),
+            observed(
+                Some(WorkloadRef::new(WorkloadKind::Deployment, 42)),
+                "environment 42 connection",
+            ),
+            LogRecord {
+                project_id: None,
+                ..observed(Some(sandbox(44)), "projectless sandbox connection")
+            },
         ])
         .await
         .expect("store");
 
+    let of = |workload: WorkloadRef, project_id: i32| LogQuery {
+        project_id,
+        workload: Some(workload),
+        ..Default::default()
+    };
     let found = storage
-        .query_logs(LogQuery {
-            project_id: 1,
-            sandbox_id: Some(42),
-            ..Default::default()
-        })
+        .query_logs(of(sandbox(42), 1))
         .await
-        .expect("sandbox query");
+        .expect("workload query");
     assert_eq!(
         found
             .iter()
-            .map(|r| (r.body.as_str(), r.sandbox_id))
+            .map(|r| (r.body.as_str(), r.workload, r.project_id))
             .collect::<Vec<_>>(),
-        vec![("sandbox 42 connection", Some(42))]
+        vec![("sandbox 42 connection", Some(sandbox(42)), Some(1))]
     );
-
-    let other_project = storage
-        .query_logs(LogQuery {
-            project_id: 2,
-            sandbox_id: Some(42),
-            ..Default::default()
-        })
+    let environment = storage
+        .query_logs(of(WorkloadRef::new(WorkloadKind::Deployment, 42), 1))
         .await
         .expect("query");
-    assert!(
-        other_project.is_empty(),
-        "the project still scopes the query"
+    assert_eq!(
+        environment
+            .iter()
+            .map(|r| r.body.as_str())
+            .collect::<Vec<_>>(),
+        vec!["environment 42 connection"],
+        "the same id of another kind is another workload"
     );
-    let count = |sandbox_id| {
+
+    let unowned = storage.query_logs(of(sandbox(44), 0)).await.expect("query");
+    assert_eq!(
+        unowned
+            .iter()
+            .map(|r| (r.body.as_str(), r.project_id))
+            .collect::<Vec<_>>(),
+        vec![("projectless sandbox connection", None)],
+        "a workload without a project keeps its records"
+    );
+
+    let count = |workload| {
         storage.count_logs(LogQuery {
             project_id: 1,
-            sandbox_id,
+            workload,
             limit: Some(1),
             ..Default::default()
         })
     };
-    assert_eq!(count(Some(42)).await.expect("count"), 1);
+    assert_eq!(count(Some(sandbox(42))).await.expect("count"), 1);
     assert_eq!(
         count(None).await.expect("count"),
-        3,
-        "the count ignores the limit"
+        4,
+        "the count ignores the limit, and the project does not see the projectless record"
     );
 
     let all = storage
@@ -1077,7 +1100,7 @@ async fn log_records_are_stored_and_read_per_sandbox() {
         })
         .await
         .expect("project query");
-    assert_eq!(all.len(), 3);
+    assert_eq!(all.len(), 4);
 }
 
 #[tokio::test]

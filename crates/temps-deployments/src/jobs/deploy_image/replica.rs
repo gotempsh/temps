@@ -319,7 +319,7 @@ impl DeployImageJob {
             .await?;
         let resource_limits = self.replica_resource_limits();
         let (node_name, node_id) = replica_node_identity(assignment);
-        let environment_vars = self
+        let mut environment_vars = self
             .replica_environment(
                 context,
                 assignment,
@@ -327,6 +327,9 @@ impl DeployImageJob {
                 replica_index,
                 container_port,
             )
+            .await?;
+        let mut labels = replica_labels(context, &self.config.service_name);
+        self.steer_replica_egress(context, assignment, &mut environment_vars, &mut labels)
             .await?;
 
         let request = DeployRequest {
@@ -343,7 +346,7 @@ impl DeployImageJob {
             command: self.config.command.clone(),
             entrypoint: self.config.entrypoint.clone(),
             log_config: self.log_config.clone(),
-            labels: replica_labels(context, &self.config.service_name),
+            labels,
             // ADR 045: the slug, never an instruction. The executing host
             // answers from its own environment whether this project gets
             // `/var/run/docker.sock` — but it may only answer "yes" when the
@@ -486,6 +489,82 @@ impl DeployImageJob {
         }
     }
 
+    /// Sends a replica of an environment that records its outbound
+    /// connections through this host's egress recorder, by starting it with
+    /// the recorder as its HTTP(S) proxy and the label that keeps it in the
+    /// recorder's table. Says in the deployment log what was done, and why
+    /// when a replica is not recorded: only replicas on this host are, and
+    /// only while the recorder serves.
+    async fn steer_replica_egress(
+        &self,
+        context: &WorkflowContext,
+        assignment: &NodeAssignment,
+        environment_vars: &mut HashMap<String, String>,
+        labels: &mut HashMap<String, String>,
+    ) -> Result<(), WorkflowError> {
+        use crate::services::egress_recording::RecordedEgress;
+        use temps_workload_egress::steering::STEERED_LABEL;
+
+        let recorded = self.config.recorded_egress;
+        let address = match recorded {
+            RecordedEgress::Off => return Ok(()),
+            _ if !assignment.is_local() => {
+                return self
+                    .log(
+                        context,
+                        "Outbound connection recording is on for this environment, but this \
+                         replica runs on a worker node, which does not record yet: its \
+                         connections are not recorded"
+                            .to_string(),
+                    )
+                    .await;
+            }
+            RecordedEgress::NotServing => {
+                return self
+                    .log(
+                        context,
+                        "Outbound connection recording is on for this environment, but the \
+                         egress recorder is not serving on this node: this replica's \
+                         connections are not recorded. Redeploy once it is"
+                            .to_string(),
+                    )
+                    .await;
+            }
+            RecordedEgress::Proxy(address) => address,
+        };
+        let Some(steering) = recorded.variables(environment_vars) else {
+            return Ok(());
+        };
+        if !steering.steers() {
+            return self
+                .log(
+                    context,
+                    "Outbound connection recording is on for this environment, but the \
+                     deployment sets its own HTTP_PROXY and HTTPS_PROXY, which are kept: its \
+                     connections are not recorded"
+                        .to_string(),
+                )
+                .await;
+        }
+        for kept in &steering.kept {
+            self.log(
+                context,
+                format!("{kept} is set by the deployment and kept: what uses it is not recorded"),
+            )
+            .await?;
+        }
+        environment_vars.extend(steering.variables);
+        labels.insert(STEERED_LABEL.to_string(), address.to_string());
+        self.log(
+            context,
+            format!(
+                "Recording outbound connections: HTTP(S) to public destinations goes through \
+                 the egress recorder at {address}; internal addresses stay direct"
+            ),
+        )
+        .await
+    }
+
     /// Use remote environment variables for remote deployments (linked-service
     /// container names rewritten to their internal `*.temps.local` DNS names),
     /// fall back to local env vars.
@@ -624,6 +703,19 @@ impl DeployImageJob {
         // mounted case is the worst one to leak: a transient log-write error
         // would otherwise strand a running, root-equivalent container.
         self.track_container(deploy_result.container_id.clone(), deployer.clone());
+
+        // A steered replica reaches the network through the recorder, which
+        // knows a caller by its address. Docker assigned that address just
+        // now, so the recorder is told at once instead of on its next pass:
+        // the application's first connection must already find it.
+        if request
+            .labels
+            .contains_key(temps_workload_egress::steering::STEERED_LABEL)
+        {
+            if let Some(recorder) = &self.egress_recorder {
+                recorder.refresh().await;
+            }
+        }
 
         Ok(deploy_result)
     }
@@ -1737,6 +1829,91 @@ mod tests {
         assert_eq!(env["TEMPS_NODE_NAME"], "control-plane");
         assert_eq!(env["TEMPS_NODE_ID"], "0");
         assert_eq!(env["TEMPS_REPLICA"], "1");
+    }
+
+    /// A replica on this host of an environment that records starts with
+    /// the recorder as its proxy and the label that keeps it in the
+    /// recorder's table; one on a worker, or while the recorder does not
+    /// serve, starts as it always did, and the deployment log says so.
+    #[tokio::test]
+    async fn a_local_replica_of_a_recording_environment_starts_through_the_recorder() {
+        use crate::services::egress_recording::RecordedEgress;
+        use temps_workload_egress::steering::STEERED_LABEL;
+
+        let recorder = "172.18.0.1:13128".parse().unwrap();
+        let recorded = |recorded_egress, assignment: &NodeAssignment| {
+            let assignment = assignment.clone();
+            async move {
+                let deployer = Arc::new(ScriptedDeployer::default());
+                let mut variables = HashMap::new();
+                variables.insert(
+                    "DATABASE_URL".to_string(),
+                    "postgres://app:pw@postgres-main:5432/app".to_string(),
+                );
+                let job = builder()
+                    .environment_variables(variables.clone())
+                    .remote_environment_variables(Some(variables))
+                    .recorded_egress(recorded_egress)
+                    .build(deployer.clone())
+                    .unwrap();
+                let writer = Arc::new(RecordingLogWriter::default());
+                let context = context_writing_to(&writer);
+                // What the container is created with is what matters here,
+                // not whether the scripted replica then becomes ready.
+                let _ = deploy(&job, &context, &deployer, &assignment, false).await;
+                let request = deployer
+                    .requests
+                    .lock()
+                    .unwrap()
+                    .first()
+                    .cloned()
+                    .expect("a container was created");
+                let lines = writer.lines.lock().unwrap().join("\n");
+                (request, lines)
+            }
+        };
+
+        let (request, lines) =
+            recorded(RecordedEgress::Proxy(recorder), &NodeAssignment::Local).await;
+        let env = &request.environment_vars;
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"] {
+            assert_eq!(env[name], "http://172.18.0.1:13128", "{name}");
+        }
+        assert!(
+            env["NO_PROXY"]
+                .split(',')
+                .any(|host| host == "postgres-main"),
+            "its linked service stays direct: {}",
+            env["NO_PROXY"]
+        );
+        assert_eq!(request.labels[STEERED_LABEL], "172.18.0.1:13128");
+        assert!(lines.contains("Recording outbound connections"), "{lines}");
+
+        for (plan, assignment, said) in [
+            (RecordedEgress::Off, NodeAssignment::Local, None),
+            (
+                RecordedEgress::NotServing,
+                NodeAssignment::Local,
+                Some("egress recorder is not serving on this node"),
+            ),
+            (
+                RecordedEgress::Proxy(recorder),
+                remote_on("127.0.0.1"),
+                Some("runs on a worker node, which does not record yet"),
+            ),
+        ] {
+            let (request, lines) = recorded(plan, &assignment).await;
+            assert!(
+                !request.environment_vars.contains_key("HTTPS_PROXY")
+                    && !request.environment_vars.contains_key("NO_PROXY")
+                    && !request.labels.contains_key(STEERED_LABEL),
+                "{plan:?} on {assignment:?} is not steered"
+            );
+            match said {
+                Some(said) => assert!(lines.contains(said), "{plan:?}: {lines}"),
+                None => assert!(!lines.contains("recording"), "{lines}"),
+            }
+        }
     }
 
     // Create phase.

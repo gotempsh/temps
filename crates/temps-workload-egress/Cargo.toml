@@ -1,0 +1,41 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-workload-egress"
+description = "Recording workloads' outbound connections, once for every workload kind: the opt-in flow, ingest, activity queries and the node-0 recorder behind a per-kind adapter (ADR-052, ADR-055 §9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+temps-network-policy = { path = "../temps-network-policy" }
+temps-otel = { path = "../temps-otel" }
+temps-routes = { path = "../temps-routes" }
+temps-workload = { path = "../temps-workload" }
+temps-workload-netpol = { path = "../temps-workload-netpol" }
+
+arc-swap = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+chrono = { workspace = true }
+sea-orm = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+utoipa = { workspace = true, features = ["chrono"] }
+
+[dev-dependencies]
+temps-test-utils = { path = "../temps-test-utils" }
+# Handler tests send requests through the router.
+tower = { workspace = true }
+
+[lints]
+workspace = true

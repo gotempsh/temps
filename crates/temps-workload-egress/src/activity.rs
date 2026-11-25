@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! One sandbox's recorded outbound connections, read for its own page.
+//! One workload's recorded outbound connections, read for its own page.
 //!
 //! The records are the same OpenTelemetry log records the project's logs
-//! show (see [`super::records`]). They are read here by the `sandbox_id`
-//! column the platform stores them with, newest first, so a sandbox's
-//! activity never needs its project's logs filtered by attribute.
+//! show (see [`crate::records`]). They are read here by the workload
+//! columns the platform stores them with, newest first, so a workload's
+//! activity never needs its project's logs filtered by attribute, and a
+//! workload without a project still has its activity.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,7 +15,9 @@ use temps_otel::log_attributes::{LogAttributeFilter, LogAttributeOperator};
 use temps_otel::types::{LogQuery, LogRecord};
 use utoipa::ToSchema;
 
-use super::{EgressRecordingError, EgressRecordingService, SANDBOX_ID_ATTRIBUTE};
+use crate::adapter::RecordedWorkload;
+use crate::error::EgressRecordingError;
+use crate::service::EgressRecordingService;
 
 /// Records per page when the caller does not say.
 pub const DEFAULT_PER_PAGE: u64 = 20;
@@ -54,7 +57,7 @@ pub struct EgressActivityRecord {
     /// `tunnel` (HTTPS `CONNECT`), `forward` (plain HTTP), `relay` (a Temps
     /// relay) or `unknown`.
     pub kind: String,
-    /// The destination host the sandbox asked for (`server.address`).
+    /// The destination host the workload asked for (`server.address`).
     pub host: Option<String>,
     /// The destination port (`server.port`).
     pub port: Option<u16>,
@@ -114,11 +117,14 @@ impl From<&LogRecord> for EgressActivityRecord {
     }
 }
 
-/// A page of a sandbox's recorded connections, newest first.
+/// A page of a workload's recorded connections, newest first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, ToSchema)]
 pub struct EgressActivityPage {
-    /// The sandbox's public id.
-    pub sandbox_id: String,
+    /// What the workload is: `sandbox`, or `deployment` for an
+    /// environment's deployments.
+    pub workload_kind: String,
+    /// The workload's id in its own API (`sbx_...`, an environment id).
+    pub workload_id: String,
     pub records: Vec<EgressActivityRecord>,
     pub page: u64,
     pub per_page: u64,
@@ -129,42 +135,30 @@ pub struct EgressActivityPage {
 }
 
 impl EgressRecordingService {
-    /// A page of the caller's sandbox's recorded outbound connections,
-    /// newest first. `page` starts at 1; `per_page` defaults to 20 and is
-    /// capped at 100.
-    ///
-    /// A sandbox without a project has no records (it cannot record), so
-    /// its page is empty rather than an error.
+    /// A page of `workload`'s recorded outbound connections, newest first.
+    /// The caller has resolved the workload and checked the user may see
+    /// it. `page` starts at 1; `per_page` defaults to 20 and is capped at
+    /// 100.
     pub async fn activity(
         &self,
-        public_id_value: &str,
-        user_id: i32,
+        workload: &RecordedWorkload,
         page: Option<u64>,
         per_page: Option<u64>,
         outcome: Option<EgressOutcomeFilter>,
     ) -> Result<EgressActivityPage, EgressRecordingError> {
-        let row = self.owned_sandbox(public_id_value, user_id).await?;
+        let adapter = self.adapter(workload.workload.kind)?;
         let page = page.unwrap_or(1).max(1);
         let per_page = per_page.unwrap_or(DEFAULT_PER_PAGE).clamp(1, MAX_PER_PAGE);
-        let empty = |total, has_more| EgressActivityPage {
-            sandbox_id: row.public_id.clone(),
-            records: Vec::new(),
-            page,
-            per_page,
-            total,
-            has_more,
-        };
-        let Some(project_id) = row.project_id else {
-            return Ok(empty(0, false));
-        };
         let Some(store) = &self.store else {
             return Err(EgressRecordingError::OtelUnavailable {
-                sandbox_id: row.public_id.clone(),
+                noun: adapter.noun(),
+                id: workload.public_id.clone(),
             });
         };
         let query = LogQuery {
-            project_id,
-            sandbox_id: Some(row.id),
+            // Read by the workload alone; the project is not applied.
+            project_id: workload.project_id.unwrap_or_default(),
+            workload: Some(workload.workload),
             attribute_filter: outcome.map(|outcome| LogAttributeFilter {
                 key: "temps.egress.outcome".to_string(),
                 ty: None,
@@ -177,27 +171,33 @@ impl EgressRecordingService {
             ..Default::default()
         };
         let unreadable = |source| EgressRecordingError::Query {
-            sandbox_id: row.public_id.clone(),
+            noun: adapter.noun(),
+            id: workload.public_id.clone(),
             source,
         };
         let total = store.count(query.clone()).await.map_err(unreadable)?;
         let mut logs = store.query(query).await.map_err(unreadable)?;
         let has_more = logs.len() as u64 > per_page;
         logs.truncate(per_page as usize);
-        // The column is the authority; the attribute is checked as well so
-        // a record can never show on a sandbox it does not name.
+        // The columns are the authority; the attribute is checked as well
+        // so a record can never show on a workload it does not name.
         let records = logs
             .iter()
             .filter(|log| {
                 log.attributes
-                    .get(SANDBOX_ID_ATTRIBUTE)
-                    .is_some_and(|value| *value == row.public_id)
+                    .get(adapter.id_attribute())
+                    .is_some_and(|value| *value == workload.public_id)
             })
             .map(EgressActivityRecord::from)
             .collect();
         Ok(EgressActivityPage {
+            workload_kind: workload.workload.kind.as_str().to_string(),
+            workload_id: workload.public_id.clone(),
             records,
-            ..empty(total, has_more)
+            page,
+            per_page,
+            total,
+            has_more,
         })
     }
 }

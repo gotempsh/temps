@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use temps_workload::WorkloadRef;
 use utoipa::ToSchema;
 
 pub use crate::log_attributes::{LogAttributeFilter, LogAttributeOperator, LogAttributeType};
@@ -519,16 +520,20 @@ pub struct LogRecord {
     #[serde(skip)]
     #[schema(ignore)]
     pub ingest_identity: Option<IngestIdentity>,
-    pub project_id: i32,
+    /// The project that owns the record. `None` only for a record the
+    /// platform observed about a workload that belongs to no project (see
+    /// `workload`); everything a workload sends about itself has a project.
+    pub project_id: Option<i32>,
     pub deployment_id: Option<i32>,
-    /// The sandbox the platform observed this record for (its internal id),
-    /// stored in its own indexed column so one sandbox's records are read
-    /// without scanning its project's. Only the platform sets it
+    /// The workload the platform observed this record about (a sandbox, an
+    /// environment's deployment), stored in its own indexed columns so one
+    /// workload's records are read without scanning its project's, and can
+    /// be read when it has no project at all. Only the platform sets it
     /// ([`crate::OtelService::ingest_platform_logs`]); it never comes from a
-    /// request body, so no workload can file records under a sandbox.
+    /// request body, so no workload can file records under another.
     #[serde(skip)]
     #[schema(ignore)]
-    pub sandbox_id: Option<i32>,
+    pub workload: Option<WorkloadRef>,
     pub resource: ResourceInfo,
     #[schema(value_type = String, format = DateTime)]
     pub timestamp: DateTime<Utc>,
@@ -1460,9 +1465,12 @@ pub struct MetricQuery {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct LogQuery {
     pub project_id: i32,
-    /// Only the records the platform stored for this sandbox (internal id).
-    #[serde(default)]
-    pub sandbox_id: Option<i32>,
+    /// Only the records the platform stored about this workload, whatever
+    /// project owns them (`project_id` is then not applied: a workload's
+    /// records are its own, with or without a project). Never read from a
+    /// request: the caller sets it after authorizing access to the workload.
+    #[serde(skip)]
+    pub workload: Option<WorkloadRef>,
     pub severity: Option<LogSeverity>,
     pub service_name: Option<String>,
     pub search: Option<String>,

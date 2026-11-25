@@ -163,6 +163,7 @@ LAYERS: dict[str, str] = {
     "temps-providers-redis": "domain",
     "temps-revenue": "domain",
     "temps-sandbox": "domain",
+    "temps-workload-egress": "domain",
     "temps-sandbox-providers": "domain",
     "temps-status-page": "domain",
     "temps-teams": "domain",

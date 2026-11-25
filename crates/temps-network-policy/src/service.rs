@@ -916,8 +916,7 @@ impl NetworkPolicyService {
         let sandboxes: Vec<SandboxRow> = self
             .query(
                 "list live sandboxes",
-                "SELECT id, public_id, \
-                 (egress_recording AND project_id IS NOT NULL) AS egress_recording \
+                "SELECT id, public_id, egress_recording \
                  FROM sandboxes WHERE status <> 'destroyed'",
             )
             .await?;

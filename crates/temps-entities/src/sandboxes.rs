@@ -108,7 +108,8 @@ pub struct Model {
     pub egress_policy: StoredEgressPolicy,
 
     /// Record every outbound connection the sandbox makes through the
-    /// per-node egress proxy, as OpenTelemetry log records of its project.
+    /// per-node egress proxy, as OpenTelemetry log records owned by the
+    /// sandbox, and by its project when it has one.
     /// Off by default (the column default); set by the sandbox's owner and
     /// re-checked by the control plane on every record it ingests.
     #[serde(default)]

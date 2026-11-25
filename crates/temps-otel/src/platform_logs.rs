@@ -61,9 +61,9 @@ mod tests {
             .attributes
             .insert("service.name".into(), AttributeValue::String("app".into()));
         LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
-            project_id: 1,
+            project_id: Some(1),
             deployment_id: None,
             resource,
             timestamp: chrono::Utc::now(),

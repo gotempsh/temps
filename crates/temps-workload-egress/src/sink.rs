@@ -10,7 +10,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use temps_workload_netpol::{EgressRecordBatch, EgressRecordSink, RecordSinkError};
 
-use super::{EgressRecordingService, CONTROL_PLANE_NODE_ID};
+use crate::service::{EgressRecordingService, CONTROL_PLANE_NODE_ID};
 
 /// Delivers node 0's batches to [`EgressRecordingService::ingest`].
 pub struct LocalRecordSink {

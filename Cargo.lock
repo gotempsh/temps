@@ -12978,6 +12978,7 @@ dependencies = [
  "temps-workflows",
  "temps-workload",
  "temps-workload-activator",
+ "temps-workload-egress",
  "temps-workload-plane",
  "thiserror 2.0.21",
  "tikv-jemallocator",
@@ -13365,6 +13366,7 @@ dependencies = [
  "temps-metrics",
  "temps-migrations",
  "temps-monitoring",
+ "temps-network-policy",
  "temps-nodes",
  "temps-otel",
  "temps-plugin-protocol",
@@ -13378,7 +13380,9 @@ dependencies = [
  "temps-vulnerability-scanner",
  "temps-workload",
  "temps-workload-docker",
+ "temps-workload-egress",
  "temps-workload-env",
+ "temps-workload-netpol",
  "temps-workload-plane",
  "temps-workload-volumes",
  "thiserror 2.0.21",
@@ -14831,6 +14835,7 @@ dependencies = [
  "temps-metrics",
  "temps-schema",
  "temps-test-utils",
+ "temps-workload",
  "testcontainers",
  "thiserror 2.0.21",
  "tokio",
@@ -15519,6 +15524,7 @@ dependencies = [
  "temps-sandbox-providers",
  "temps-test-utils",
  "temps-workload",
+ "temps-workload-egress",
  "temps-workload-netpol",
  "thiserror 2.0.21",
  "tokio",
@@ -16081,6 +16087,32 @@ dependencies = [
  "temps-workload-volumes",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "temps-workload-egress"
+version = "0.1.0-beta.63"
+dependencies = [
+ "arc-swap",
+ "async-trait",
+ "axum",
+ "chrono",
+ "sea-orm 1.1.20",
+ "serde",
+ "serde_json",
+ "temps-core",
+ "temps-entities",
+ "temps-network-policy",
+ "temps-otel",
+ "temps-routes",
+ "temps-test-utils",
+ "temps-workload",
+ "temps-workload-netpol",
+ "thiserror 2.0.21",
+ "tokio",
+ "tower",
+ "tracing",
+ "utoipa",
 ]
 
 [[package]]

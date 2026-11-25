@@ -137,9 +137,9 @@ mod tests {
             events: vec![],
         };
         let log = LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: Some(IngestIdentity::from_digest([0x11; 32])),
-            project_id: project.id,
+            project_id: Some(project.id),
             deployment_id: None,
             resource: resource.clone(),
             timestamp: now,
@@ -251,7 +251,7 @@ mod tests {
         .await
         .unwrap();
         let mut isolated = log.clone();
-        isolated.project_id = other.id;
+        isolated.project_id = Some(other.id);
         assert_eq!(storage.store_logs(vec![isolated]).await.unwrap(), 1);
 
         // Saturation rolls back the entire native batch. Known retries still ACK.

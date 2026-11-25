@@ -80,6 +80,14 @@ pub struct Model {
     /// `legacy`.
     #[serde(default)]
     pub workload_mode: super::environment_workload_mode::EnvironmentWorkloadMode,
+    /// Record every outbound connection this environment's deployments make
+    /// through the per-node egress proxy, as OpenTelemetry log records of
+    /// its project. Off by default (the column default). It is on the
+    /// environment, not the deployment, so it survives redeploys; a
+    /// deployment's containers are sent through the proxy when they start,
+    /// and the control plane re-checks it on every record it ingests.
+    #[serde(default)]
+    pub egress_recording: bool,
 }
 
 /// Serialize a claim on the global preview-hostname namespace and return any

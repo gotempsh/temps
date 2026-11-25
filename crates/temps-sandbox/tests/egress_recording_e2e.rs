@@ -61,12 +61,12 @@ use temps_netpol_probe::{RecordingConfig, ServeConfig};
 use temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS;
 use temps_otel::types::{LogAttributeFilter, LogQuery, LogRecord};
 use temps_otel::OtelService;
-use temps_sandbox::handlers::egress_recording::{
-    node_routes, routes, EgressRecordingAppState, EgressRecordingNodeState,
-};
-use temps_sandbox::services::egress_recording::{EgressLogStore, EgressRecordingService};
+use temps_sandbox::handlers::egress_recording::{routes, EgressRecordingAppState};
+use temps_sandbox::services::egress_recording::{SandboxEgress, SandboxEgressAdapter};
 use temps_test_utils::TestDatabase;
 use temps_workload::{WorkloadKind, WorkloadRef};
+use temps_workload_egress::handlers::{node_routes, EgressRecordingNodeState};
+use temps_workload_egress::{EgressLogStore, EgressRecordingService};
 use temps_workload_netpol::EgressRecordingCapability;
 use tower::ServiceExt;
 
@@ -406,9 +406,12 @@ async fn control_plane() -> Option<ControlPlane> {
         policy.clone(),
         Some(otel.clone() as Arc<dyn EgressLogStore>),
     ));
+    // As the plugins wire it: sandboxes are one kind the shared service
+    // records, with their own routes over it.
+    service.register(Arc::new(SandboxEgressAdapter::new(db.connection_arc())));
     let api = routes()
         .with_state(Arc::new(EgressRecordingAppState {
-            service: service.clone(),
+            service: Arc::new(SandboxEgress::new(db.connection_arc(), service.clone())),
             audit_service: None,
         }))
         .merge(node_routes(Arc::new(EgressRecordingNodeState { service })));
@@ -721,7 +724,7 @@ async fn scenario(run: &mut Run, cp: &ControlPlane) {
     assert_eq!(denied.severity_text, "WARN");
 
     for record in &records {
-        assert_eq!(record.project_id, PROJECT);
+        assert_eq!(record.project_id, Some(PROJECT));
         assert_eq!(record.resource.service_name, "temps-egress-proxy");
         assert_eq!(attr(record, "otel.scope.name"), "temps.egress");
         assert_eq!(attr(record, "temps.platform.source"), "egress-proxy");

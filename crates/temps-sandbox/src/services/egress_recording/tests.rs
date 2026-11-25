@@ -1,24 +1,28 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The opt-in and the ingest against a real, migrated database. Skipped,
+//! The sandbox side of recording against a real, migrated database: who
+//! may see and change it, and what the adapter tells the shared service.
+//! The flow itself is tested once, in `temps-workload-egress`. Skipped,
 //! saying why, when no TimescaleDB container can be started.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use sea_orm::{ConnectionTrait, DatabaseBackend, EntityTrait, Statement};
 use temps_entities::sandboxes;
 use temps_network_policy::NodeRecordingStatus;
-use temps_otel::types::LogRecord;
+use temps_otel::types::{LogQuery, LogRecord};
+use temps_otel::OtelError;
 use temps_test_utils::TestDatabase;
 use temps_workload::{WorkloadKind, WorkloadRef};
+use temps_workload_egress::{EgressLogStore, EgressRecordingService, NodeRecordingCapabilities};
 use temps_workload_netpol::{
     ConnectionKind, ConnectionOutcome, ConnectionRecord, EgressReason, EgressRecordBatch,
-    EgressRecordSink, RecordingUnavailable,
+    RecordingUnavailable,
 };
 
-use super::sink::LocalRecordSink;
 use super::*;
 
 pub(crate) const OWNER: i32 = 4101;
@@ -143,8 +147,10 @@ impl EgressLogStore for CollectStore {
             .lock()
             .unwrap()
             .iter()
-            .filter(|log| log.project_id == query.project_id)
-            .filter(|log| query.sandbox_id.is_none() || log.sandbox_id == query.sandbox_id)
+            .filter(|log| match query.workload {
+                Some(workload) => log.workload == Some(workload),
+                None => log.project_id == Some(query.project_id),
+            })
             .cloned()
             .collect();
         found.sort_by_key(|log| std::cmp::Reverse(log.timestamp));
@@ -154,6 +160,14 @@ impl EgressLogStore for CollectStore {
     async fn count(&self, query: LogQuery) -> Result<u64, OtelError> {
         Ok(self.query(query).await?.len() as u64)
     }
+}
+
+/// The shared recording service with the sandbox adapter registered, and
+/// the sandbox API over it, as the plugin wires them.
+pub(crate) struct Wired {
+    pub sandboxes: Arc<SandboxEgress>,
+    pub recording: Arc<EgressRecordingService>,
+    pub adapter: Arc<SandboxEgressAdapter>,
 }
 
 impl Fixture {
@@ -171,9 +185,27 @@ impl Fixture {
         ])
     }
 
-    /// The service over real OpenTelemetry storage in the fixture's
-    /// database, as production wires it.
-    pub fn service_with_otel(&self) -> Arc<EgressRecordingService> {
+    pub fn wired(&self, store: Option<Arc<dyn EgressLogStore>>) -> Wired {
+        let recording = Arc::new(EgressRecordingService::new(
+            self.db.connection_arc(),
+            self.capabilities(),
+            store,
+        ));
+        let adapter = Arc::new(SandboxEgressAdapter::new(self.db.connection_arc()));
+        recording.register(adapter.clone());
+        Wired {
+            sandboxes: Arc::new(SandboxEgress::new(
+                self.db.connection_arc(),
+                recording.clone(),
+            )),
+            recording,
+            adapter,
+        }
+    }
+
+    /// Over real OpenTelemetry storage in the fixture's database, as
+    /// production wires it.
+    pub fn with_otel(&self) -> Wired {
         let otel = Arc::new(temps_otel::OtelService::new(
             Arc::new(temps_otel::storage::timescaledb::TimescaleDbStorage::new(
                 self.db.connection_arc(),
@@ -188,21 +220,13 @@ impl Fixture {
             )),
             temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
         ));
-        Arc::new(EgressRecordingService::new(
-            self.db.connection_arc(),
-            self.capabilities(),
-            Some(otel as Arc<dyn EgressLogStore>),
-        ))
+        self.wired(Some(otel as Arc<dyn EgressLogStore>))
     }
 
-    pub fn service(&self) -> (Arc<EgressRecordingService>, Arc<CollectStore>) {
+    /// Over a store that only collects.
+    pub fn collecting(&self) -> (Wired, Arc<CollectStore>) {
         let store = Arc::new(CollectStore::default());
-        let service = Arc::new(EgressRecordingService::new(
-            self.db.connection_arc(),
-            self.capabilities(),
-            Some(store.clone()),
-        ));
-        (service, store)
+        (self.wired(Some(store.clone())), store)
     }
 
     async fn recording(&self, id: i32) -> bool {
@@ -236,22 +260,89 @@ pub(crate) fn record(sandbox: i32, host: &str, outcome: ConnectionOutcome) -> Co
     }
 }
 
-fn batch(records: Vec<ConnectionRecord>) -> EgressRecordBatch {
+pub(crate) fn batch(records: Vec<ConnectionRecord>) -> EgressRecordBatch {
     EgressRecordBatch {
         records,
         dropped: 0,
     }
 }
 
+/// A sandbox is one workload on one node, in its project or in none, and
+/// the opt-in is its own column.
 #[tokio::test]
-async fn recording_is_off_by_default_and_reports_whether_it_can_work() {
+async fn the_adapter_describes_sandboxes_from_their_rows_and_stores_the_opt_in() {
     let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    let status = service.status(ON_WORKER.1, OWNER).await.unwrap();
-    assert!(!status.enabled);
-    assert!(status.configured);
-    assert_eq!(status.reason, None);
-    assert_eq!(status.node_name, "worker-a");
+    let (wired, _) = f.collecting();
+    let adapter = &wired.adapter;
+    assert_eq!(adapter.kind(), WorkloadKind::Sandbox);
+    assert_eq!(adapter.id_attribute(), "temps.sandbox.id");
+
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE sandboxes SET status = 'destroyed' WHERE id = {}",
+            ON_OTHER_WORKER.0
+        ))
+        .await
+        .unwrap();
+    let mut rows = adapter
+        .load(&[
+            i64::from(ON_WORKER.0),
+            i64::from(PROJECTLESS.0),
+            i64::from(ON_CONTROL_PLANE.0),
+            i64::from(ON_OTHER_WORKER.0),
+            999_999,
+            i64::MAX,
+        ])
+        .await
+        .unwrap();
+    rows.sort_by_key(|row| row.workload.id);
+    let seen: Vec<(&str, Option<i32>, &[i32], bool)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.public_id.as_str(),
+                row.project_id,
+                row.nodes.as_slice(),
+                row.live,
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            (ON_WORKER.1, Some(PROJECT), &[f.worker_a][..], true),
+            (PROJECTLESS.1, None, &[f.worker_a][..], true),
+            (
+                ON_CONTROL_PLANE.1,
+                Some(PROJECT),
+                &[CONTROL_PLANE_NODE_ID][..],
+                true
+            ),
+            (ON_OTHER_WORKER.1, Some(PROJECT), &[f.worker_b][..], false),
+        ],
+        "unknown ids are left out; a destroyed sandbox is not live"
+    );
+
+    let on_worker = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(ON_WORKER.0));
+    adapter.set_enabled(on_worker, true).await.unwrap();
+    assert!(f.recording(ON_WORKER.0).await);
+    assert!(adapter.load(&[on_worker.id]).await.unwrap()[0].enabled);
+    adapter.set_enabled(on_worker, false).await.unwrap();
+    assert!(!f.recording(ON_WORKER.0).await);
+}
+
+#[tokio::test]
+async fn an_owner_turns_recording_on_and_off_for_a_sandbox_with_or_without_a_project() {
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    let sandboxes = &wired.sandboxes;
+    let status = sandboxes.status(ON_WORKER.1, OWNER).await.unwrap();
+    assert_eq!(
+        (status.workload_kind.as_str(), status.workload_id.as_str()),
+        ("sandbox", ON_WORKER.1)
+    );
+    assert!(!status.enabled && status.configured);
+    assert_eq!(status.nodes[0].node_name, "worker-a");
     assert_eq!(
         status.logs_path.as_deref(),
         Some(
@@ -259,492 +350,187 @@ async fn recording_is_off_by_default_and_reports_whether_it_can_work() {
         )
     );
 
-    let mac = service.status(ON_OTHER_WORKER.1, OWNER).await.unwrap();
-    assert!(!mac.configured);
-    assert_eq!(mac.reason_code.as_deref(), Some("unsupported_platform"));
-    assert!(mac.reason.unwrap().contains("macos"));
-    assert_eq!(
-        mac.setup_path, None,
-        "nothing on the node page fixes a platform"
-    );
-
-    let projectless = service.status(PROJECTLESS.1, OWNER).await.unwrap();
-    assert_eq!(projectless.reason_code.as_deref(), Some("no_project"));
-    assert_eq!(projectless.logs_path, None);
-}
-
-#[tokio::test]
-async fn an_owner_turns_recording_on_and_off() {
-    let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    let (previous, status) = service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    assert!(!previous);
-    assert!(status.enabled && status.configured);
+    let (previous, status) = sandboxes
+        .set_enabled(ON_WORKER.1, OWNER, true)
+        .await
+        .unwrap();
+    assert!(!previous && status.enabled);
     assert!(f.recording(ON_WORKER.0).await);
-    // Setting the same value again changes nothing and still succeeds.
-    let (previous, _) = service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    assert!(previous);
-    let (previous, status) = service
+    let (previous, status) = sandboxes
         .set_enabled(ON_WORKER.1, OWNER, false)
         .await
         .unwrap();
-    assert!(previous);
-    assert!(!status.enabled);
+    assert!(previous && !status.enabled);
     assert!(!f.recording(ON_WORKER.0).await);
-}
 
-#[tokio::test]
-async fn enabling_on_a_node_that_cannot_record_names_the_sandbox_and_the_node() {
-    let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    let error = service
-        .set_enabled(ON_OTHER_WORKER.1, OWNER, true)
-        .await
-        .unwrap_err();
-    let EgressRecordingError::Unavailable {
-        sandbox_id,
-        node_id,
-        node_name,
-        code,
-        ..
-    } = &error
-    else {
-        panic!("expected Unavailable, got {error:?}");
-    };
-    assert_eq!(sandbox_id, ON_OTHER_WORKER.1);
-    assert_eq!(*node_id, f.worker_b);
-    assert_eq!(node_name, "worker-b");
-    assert_eq!(*code, "unsupported_platform");
-    let message = error.to_string();
-    assert!(message.contains(ON_OTHER_WORKER.1) && message.contains("worker-b"));
-    assert!(!f.recording(ON_OTHER_WORKER.0).await, "nothing was written");
-    // Turning it off is never refused.
-    service
-        .set_enabled(ON_OTHER_WORKER.1, OWNER, false)
+    // No project: the records are the sandbox's own, read from its page.
+    let (_, projectless) = sandboxes
+        .set_enabled(PROJECTLESS.1, OWNER, true)
         .await
         .unwrap();
+    assert!(projectless.enabled && projectless.configured);
+    assert_eq!(
+        (projectless.project_id, projectless.logs_path),
+        (None, None)
+    );
+    assert!(f.recording(PROJECTLESS.0).await);
 }
 
 #[tokio::test]
-async fn a_linux_node_whose_proxy_is_not_serving_cannot_record_yet() {
+async fn a_node_that_cannot_record_refuses_naming_the_sandbox() {
     let Some(f) = fixture().await else { return };
-    let service = EgressRecordingService::new(
-        f.db.connection_arc(),
-        FakeCapabilities::with(&[(
-            f.worker_a,
-            NodeRecordingStatus::Unavailable(RecordingUnavailable::ProxyNotServing),
-        )]),
-        Some(Arc::new(CollectStore::default())),
-    );
-    let error = service
-        .set_enabled(ON_WORKER.1, OWNER, true)
+    let (wired, _) = f.collecting();
+    let error = wired
+        .sandboxes
+        .set_enabled(ON_OTHER_WORKER.1, OWNER, true)
         .await
         .unwrap_err();
     assert!(
         matches!(
-            error,
-            EgressRecordingError::Unavailable {
-                code: "proxy_not_serving",
-                ..
-            }
+            &error,
+            EgressRecordingError::Unavailable { noun: "sandbox", id, node_name, code: "unsupported_platform", .. }
+                if id == ON_OTHER_WORKER.1 && node_name == "worker-b"
         ),
         "{error:?}"
     );
-}
-
-#[tokio::test]
-async fn a_projectless_sandbox_cannot_record() {
-    let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    let error = service
-        .set_enabled(PROJECTLESS.1, OWNER, true)
-        .await
-        .unwrap_err();
-    assert!(
-        matches!(&error, EgressRecordingError::NoProject { sandbox_id } if sandbox_id == PROJECTLESS.1),
-        "{error:?}"
-    );
-}
-
-#[tokio::test]
-async fn without_otel_storage_recording_says_so() {
-    let Some(f) = fixture().await else { return };
-    let service = EgressRecordingService::new(f.db.connection_arc(), f.capabilities(), None);
-    let status = service.status(ON_WORKER.1, OWNER).await.unwrap();
-    assert_eq!(status.reason_code.as_deref(), Some("otel_unavailable"));
-    assert!(matches!(
-        service.set_enabled(ON_WORKER.1, OWNER, true).await,
-        Err(EgressRecordingError::OtelUnavailable { .. })
-    ));
+    assert!(!f.recording(ON_OTHER_WORKER.0).await, "nothing was written");
 }
 
 #[tokio::test]
 async fn only_the_owner_sees_or_changes_recording() {
     let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
+    let (wired, _) = f.collecting();
+    let sandboxes = &wired.sandboxes;
+    f.db.connection()
+        .execute_unprepared(&format!(
+            "UPDATE sandboxes SET status = 'destroyed' WHERE id = {}",
+            ON_CONTROL_PLANE.0
+        ))
+        .await
+        .unwrap();
     for result in [
-        service.status(ON_WORKER.1, STRANGER).await.map(|_| ()),
-        service
+        sandboxes.status(ON_WORKER.1, STRANGER).await.map(|_| ()),
+        sandboxes
             .set_enabled(ON_WORKER.1, STRANGER, true)
             .await
             .map(|_| ()),
-        service.status("sbx_not-an-id", OWNER).await.map(|_| ()),
-    ] {
-        assert!(matches!(
-            result,
-            Err(EgressRecordingError::SandboxNotFound { .. })
-        ));
-    }
-}
-
-#[tokio::test]
-async fn ingest_drops_records_of_a_sandbox_that_does_not_record() {
-    let Some(f) = fixture().await else { return };
-    let (service, store) = f.service();
-    let outcome = service
-        .ingest(
-            f.worker_a,
-            batch(vec![record(
-                ON_WORKER.0,
-                "api.example.com",
-                ConnectionOutcome::Allowed,
-            )]),
-        )
-        .await
-        .unwrap();
-    assert_eq!((outcome.stored, outcome.not_recording), (0, 1));
-    assert!(store.0.lock().unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn ingest_stores_records_attributed_from_the_row() {
-    let Some(f) = fixture().await else { return };
-    let (service, store) = f.service();
-    service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    let outcome = service
-        .ingest(
-            f.worker_a,
-            batch(vec![
-                record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed),
-                record(
-                    ON_WORKER.0,
-                    "blocked.example.com",
-                    ConnectionOutcome::Refused,
-                ),
-                // Opted out and projectless: dropped, not refused.
-                record(PROJECTLESS.0, "api.example.com", ConnectionOutcome::Allowed),
-            ]),
-        )
-        .await
-        .unwrap();
-    assert_eq!((outcome.stored, outcome.not_recording), (2, 1));
-    let stored = store.0.lock().unwrap().clone();
-    assert!(stored.iter().all(|log| log.project_id == PROJECT));
-    assert!(stored
-        .iter()
-        .all(|log| log.attributes["temps.sandbox.id"] == ON_WORKER.1));
-    assert!(stored
-        .iter()
-        .all(|log| log.attributes["temps.node.name"] == "worker-a"));
-    assert_eq!(stored[1].attributes["temps.egress.reason"], "no_allow_rule");
-
-    // Turned off after the records were taken: the next delivery is dropped.
-    service
-        .set_enabled(ON_WORKER.1, OWNER, false)
-        .await
-        .unwrap();
-    let outcome = service
-        .ingest(
-            f.worker_a,
-            batch(vec![record(
-                ON_WORKER.0,
-                "api.example.com",
-                ConnectionOutcome::Allowed,
-            )]),
-        )
-        .await
-        .unwrap();
-    assert_eq!((outcome.stored, outcome.not_recording), (0, 1));
-}
-
-#[tokio::test]
-async fn ingest_refuses_a_worker_reporting_a_sandbox_not_placed_on_it() {
-    let Some(f) = fixture().await else { return };
-    let (service, store) = f.service();
-    service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    for (node, foreign) in [
-        (f.worker_a, ON_OTHER_WORKER.0),
-        (f.worker_a, ON_CONTROL_PLANE.0),
-        (f.worker_b, ON_WORKER.0),
-    ] {
-        let error = service
-            .ingest(
-                node,
-                batch(vec![
-                    record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed),
-                    record(foreign, "api.example.com", ConnectionOutcome::Allowed),
-                ]),
-            )
+        sandboxes
+            .activity(ON_WORKER.1, STRANGER, None, None, None)
             .await
-            .unwrap_err();
+            .map(|_| ()),
+        sandboxes.status("sbx_not-an-id", OWNER).await.map(|_| ()),
+        // A destroyed sandbox is gone, even for its owner.
+        sandboxes
+            .status(ON_CONTROL_PLANE.1, OWNER)
+            .await
+            .map(|_| ()),
+    ] {
         assert!(
-            matches!(error, EgressRecordingError::NotPlacedOnNode { node_id, .. } if node_id == node),
-            "{error:?}"
+            matches!(
+                result,
+                Err(EgressRecordingError::NotFound {
+                    noun: "sandbox",
+                    ..
+                })
+            ),
+            "{result:?}"
         );
     }
-    assert!(
-        store.0.lock().unwrap().is_empty(),
-        "a refused batch stores nothing, not even its legitimate records"
-    );
-    let error = service
+    assert!(!f.recording(ON_WORKER.0).await);
+}
+
+/// The shared ingest, with sandboxes as the kind: a sandbox's records are
+/// taken only from its own node, stored under the sandbox, and read back
+/// by its owner from its own page, with or without a project.
+#[tokio::test]
+async fn a_sandboxs_records_come_from_its_node_and_are_read_by_its_owner() {
+    let Some(f) = fixture().await else { return };
+    let wired = f.with_otel();
+    for id in [ON_WORKER.1, PROJECTLESS.1] {
+        wired.sandboxes.set_enabled(id, OWNER, true).await.unwrap();
+    }
+    let foreign = wired
+        .recording
         .ingest(
-            f.worker_a,
+            f.worker_b,
             batch(vec![record(
-                999_999,
+                ON_WORKER.0,
                 "api.example.com",
                 ConnectionOutcome::Allowed,
             )]),
         )
         .await
         .unwrap_err();
-    assert!(matches!(
-        error,
-        EgressRecordingError::UnknownSandbox {
-            sandbox: 999_999,
-            ..
-        }
-    ));
-}
-
-#[tokio::test]
-async fn ingest_refuses_malformed_batches() {
-    let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    let too_many = (0..=MAX_BATCH)
-        .map(|_| record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed))
-        .collect();
-    assert!(matches!(
-        service.ingest(f.worker_a, batch(too_many)).await,
-        Err(EgressRecordingError::BatchTooLarge { .. })
-    ));
-    let mut deployment = record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed);
-    deployment.workload = WorkloadRef::new(WorkloadKind::Deployment, 1);
-    let mut query = record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed);
-    query.path = Some("/a?token=secret".into());
-    for bad in [deployment, query] {
-        assert!(matches!(
-            service.ingest(f.worker_a, batch(vec![bad])).await,
-            Err(EgressRecordingError::InvalidRecord { .. })
-        ));
-    }
-}
-
-const MAX_BATCH: usize = temps_workload_netpol::egress::record::MAX_BATCH_RECORDS;
-
-#[tokio::test]
-async fn node_zero_delivers_through_the_local_sink() {
-    let Some(f) = fixture().await else { return };
-    let (service, store) = f.service();
-    service
-        .set_enabled(ON_CONTROL_PLANE.1, OWNER, true)
-        .await
-        .unwrap();
-    let sink = LocalRecordSink::new(service.clone());
-    sink.deliver(batch(vec![record(
-        ON_CONTROL_PLANE.0,
-        "api.example.com",
-        ConnectionOutcome::Allowed,
-    )]))
-    .await
-    .unwrap();
-    assert_eq!(store.0.lock().unwrap().len(), 1);
-    // Node 0 cannot write for a worker's sandbox either.
-    assert!(sink
-        .deliver(batch(vec![record(
-            ON_WORKER.0,
-            "api.example.com",
-            ConnectionOutcome::Allowed
-        )]))
-        .await
-        .is_err());
-}
-
-#[tokio::test]
-async fn the_node_snapshot_tells_the_proxy_which_sandboxes_record() {
-    let Some(f) = fixture().await else { return };
-    let (service, _) = f.service();
-    service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    // A projectless sandbox whose column was set anyway is never recorded.
-    f.db.connection()
-        .execute_unprepared(&format!(
-            "UPDATE sandboxes SET egress_recording = true WHERE id = {}",
-            PROJECTLESS.0
-        ))
-        .await
-        .unwrap();
-    let policy = temps_network_policy::NetworkPolicyService::new(f.db.connection_arc());
-    let snapshot = policy.node_snapshot(f.worker_a).await.unwrap();
-    let recorded: Vec<WorkloadRef> = snapshot
-        .egress
-        .iter()
-        .filter(|p| p.record)
-        .map(|p| p.subject)
-        .collect();
-    assert_eq!(
-        recorded,
-        vec![WorkloadRef::new(
-            WorkloadKind::Sandbox,
-            i64::from(ON_WORKER.0)
-        )]
+    assert!(
+        matches!(foreign, EgressRecordingError::NotPlacedOnNode { node_id, .. } if node_id == f.worker_b),
+        "{foreign:?}"
     );
-}
 
-/// A connection of `sandbox` to `host`, `seconds` after a fixed start, so
-/// the newest-first order is known.
-fn at(sandbox: i32, host: &str, outcome: ConnectionOutcome, seconds: u64) -> ConnectionRecord {
-    let mut record = record(sandbox, host, outcome);
-    record.started_at_ms += seconds * 1000;
-    record.last_started_at_ms = record.started_at_ms;
-    record
-}
-
-/// A sandbox's page reads its own records from storage, newest first, and
-/// none of another sandbox's in the same project.
-#[tokio::test]
-async fn a_sandbox_reads_its_own_recorded_connections_newest_first() {
-    use super::activity::EgressOutcomeFilter;
-    let Some(f) = fixture().await else { return };
-    let service = f.service_with_otel();
-    service.set_enabled(ON_WORKER.1, OWNER, true).await.unwrap();
-    service
-        .set_enabled(ON_CONTROL_PLANE.1, OWNER, true)
-        .await
-        .unwrap();
-    let outcome = service
+    let outcome = wired
+        .recording
         .ingest(
             f.worker_a,
             batch(vec![
-                at(
-                    ON_WORKER.0,
-                    "first.example.com",
-                    ConnectionOutcome::Allowed,
-                    0,
-                ),
-                at(
-                    ON_WORKER.0,
+                record(ON_WORKER.0, "api.example.com", ConnectionOutcome::Allowed),
+                record(
+                    PROJECTLESS.0,
                     "blocked.example.com",
                     ConnectionOutcome::Refused,
-                    1,
-                ),
-                at(
-                    ON_WORKER.0,
-                    "last.example.com",
-                    ConnectionOutcome::Allowed,
-                    2,
                 ),
             ]),
         )
         .await
         .unwrap();
-    assert_eq!(outcome.stored, 3);
+    assert_eq!((outcome.stored, outcome.not_recording), (2, 0));
 
-    let page = service
+    let page = wired
+        .sandboxes
         .activity(ON_WORKER.1, OWNER, None, None, None)
         .await
         .unwrap();
-    assert_eq!(page.sandbox_id, ON_WORKER.1);
     assert_eq!(
-        (page.page, page.per_page, page.total, page.has_more),
-        (1, 20, 3, false)
+        (page.workload_kind.as_str(), page.workload_id.as_str()),
+        ("sandbox", ON_WORKER.1)
     );
-    let hosts: Vec<_> = page
-        .records
-        .iter()
-        .map(|r| r.host.as_deref().unwrap_or_default())
-        .collect();
-    assert_eq!(
-        hosts,
-        [
-            "last.example.com",
-            "blocked.example.com",
-            "first.example.com"
-        ]
-    );
-    let refused = &page.records[1];
-    assert_eq!(refused.outcome, "refused");
-    assert_eq!(refused.reason.as_deref(), Some("no_allow_rule"));
-    assert_eq!(refused.kind, "tunnel");
-    assert_eq!(refused.port, Some(443));
-    assert_eq!((refused.bytes_sent, refused.bytes_received), (10, 20));
-    assert_eq!(refused.count, 1);
-    assert_eq!(refused.node_name.as_deref(), Some("worker-a"));
+    assert_eq!(page.total, 1);
+    assert_eq!(page.records[0].host.as_deref(), Some("api.example.com"));
+    assert_eq!(page.records[0].node_name.as_deref(), Some("worker-a"));
 
-    let refused_only = service
-        .activity(
-            ON_WORKER.1,
-            OWNER,
-            None,
-            None,
-            Some(EgressOutcomeFilter::Refused),
-        )
-        .await
-        .unwrap();
-    assert_eq!((refused_only.records.len(), refused_only.total), (1, 1));
-    assert_eq!(
-        refused_only.records[0].host.as_deref(),
-        Some("blocked.example.com")
-    );
-
-    let first = service
-        .activity(ON_WORKER.1, OWNER, Some(1), Some(2), None)
-        .await
-        .unwrap();
-    assert_eq!(
-        (first.records.len(), first.total, first.has_more),
-        (2, 3, true)
-    );
-    let second = service
-        .activity(ON_WORKER.1, OWNER, Some(2), Some(2), None)
-        .await
-        .unwrap();
-    assert_eq!((second.records.len(), second.has_more), (1, false));
-    assert_eq!(second.records[0].host.as_deref(), Some("first.example.com"));
-
-    // Same project, records of its own: none of the other sandbox's.
-    let other = service
-        .activity(ON_CONTROL_PLANE.1, OWNER, None, None, None)
-        .await
-        .unwrap();
-    assert!(other.records.is_empty());
-}
-
-#[tokio::test]
-async fn activity_bounds_pages_and_is_only_for_the_owner() {
-    let Some(f) = fixture().await else { return };
-    let service = f.service_with_otel();
-    let page = service
-        .activity(ON_WORKER.1, OWNER, Some(0), Some(1_000), None)
-        .await
-        .unwrap();
-    assert_eq!((page.page, page.per_page), (1, 100));
-    assert!(matches!(
-        service
-            .activity(ON_WORKER.1, STRANGER, None, None, None)
-            .await,
-        Err(EgressRecordingError::SandboxNotFound { sandbox_id }) if sandbox_id == ON_WORKER.1
-    ));
-    // A sandbox without a project cannot record, so it has nothing to show.
-    let projectless = service
+    let projectless = wired
+        .sandboxes
         .activity(PROJECTLESS.1, OWNER, None, None, None)
         .await
         .unwrap();
-    assert!(projectless.records.is_empty() && !projectless.has_more);
+    assert_eq!(projectless.total, 1);
+    assert_eq!(projectless.records[0].outcome, "refused");
+    assert_eq!(
+        projectless.records[0].reason.as_deref(),
+        Some("no_allow_rule")
+    );
+}
 
-    let without_otel = EgressRecordingService::new(f.db.connection_arc(), f.capabilities(), None);
-    assert!(matches!(
-        without_otel
-            .activity(ON_WORKER.1, OWNER, None, None, None)
-            .await,
-        Err(EgressRecordingError::OtelUnavailable { .. })
-    ));
+#[tokio::test]
+async fn the_node_snapshot_tells_the_proxy_which_sandboxes_record() {
+    let Some(f) = fixture().await else { return };
+    let (wired, _) = f.collecting();
+    for id in [ON_WORKER.1, PROJECTLESS.1] {
+        wired.sandboxes.set_enabled(id, OWNER, true).await.unwrap();
+    }
+    let policy = temps_network_policy::NetworkPolicyService::new(f.db.connection_arc());
+    let snapshot = policy.node_snapshot(f.worker_a).await.unwrap();
+    let mut recorded: Vec<WorkloadRef> = snapshot
+        .egress
+        .iter()
+        .filter(|p| p.record)
+        .map(|p| p.subject)
+        .collect();
+    recorded.sort();
+    assert_eq!(
+        recorded,
+        vec![
+            WorkloadRef::new(WorkloadKind::Sandbox, i64::from(ON_WORKER.0)),
+            WorkloadRef::new(WorkloadKind::Sandbox, i64::from(PROJECTLESS.0)),
+        ],
+        "every opted-in sandbox, with or without a project"
+    );
 }

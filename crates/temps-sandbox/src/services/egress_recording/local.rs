@@ -1,62 +1,45 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The control plane's egress recorder: the per-node egress proxy for the
-//! sandboxes that run on this host and record their outbound connections.
+//! How a sandbox's traffic reaches the control plane's egress recorder.
 //!
-//! **Only opted-in sandboxes go through it.** Every other sandbox keeps
-//! egressing through its own sidecar exactly as before. A recorded
-//! sandbox's sidecar keeps the Temps relays and internal names
-//! (`*.temps.local`), and hands every other outbound request to this proxy
-//! (`TEMPS_EGRESS_RECORDING_PROXY_ADDRESS`), which applies the sandbox's own
-//! egress policy ([`super::policy`]) and records each connection, allowed
-//! or refused, into the ingest service ([`super::sink::LocalRecordSink`]).
+//! The recorder itself (one proxy, one table, for every workload kind) is
+//! `temps_workload_egress::local`. This is the sandbox kind's
+//! [`LocalTraffic`]:
 //!
-//! **Who is calling** comes from the source address: the proxy listens on
-//! the host's address on the sidecars' shared egress network, and a
-//! sidecar reaches it from its own address there, which only Docker
-//! assigns. The table maps that address to the sandbox the sidecar serves
+//! **Only opted-in sandboxes go through the recorder.** Every other
+//! sandbox keeps egressing through its own sidecar exactly as before. A
+//! recorded sandbox's sidecar keeps the Temps relays and internal names
+//! (`*.temps.local`), and hands every other outbound request to the
+//! recorder (`TEMPS_EGRESS_RECORDING_PROXY_ADDRESS`), which applies the
+//! sandbox's own egress policy ([`super::policy`]) and records each
+//! connection, allowed or refused.
+//!
+//! **Where the recorder listens**: the host's address on the sidecars'
+//! shared egress network, which is created with the first sandbox.
+//!
+//! **Who is calling** comes from the source address: a sidecar reaches the
+//! recorder from its own address on that network, which only Docker
+//! assigns, and that address speaks for the sandbox the sidecar serves
 //! (`egress_proxy_sandbox`, the same Docker-recorded identity the internal
-//! proxy trusts, ADR 105). An address no recorded sandbox holds is refused.
-//!
-//! **Linux only**, where the control plane runs the sandboxes' Docker; node
-//! 0 reports that it can record only once the proxy serves.
-//!
-//! **Its port is stable** ([`RECORDING_PROXY_PORT`]): a recorded sandbox's
-//! sidecar carries the address, so a port that changed on every restart
-//! would replace every recorded sidecar on every restart. Only when the
-//! port is taken does the proxy take any free one, saying so.
+//! proxy trusts, ADR 105).
 //!
 //! **Cost.** Each refresh is one query for the opted-in sandboxes of this
-//! host; only when there are some, one local container list. Every
-//! [`REFRESH_INTERVAL`], and at once after an opt-in changes.
+//! host; only when there are some, one local container list.
 
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
 
-use arc_swap::ArcSwap;
 use async_trait::async_trait;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_entities::sandboxes;
 use temps_workload::{WorkloadKind, WorkloadRef};
-use temps_workload_netpol::{
-    recording_channel, EgressBatcher, EgressProxy, EgressProxyConfig, EgressRecordingCapability,
-    EgressTable, IdentityMap,
-};
-use tokio::sync::Notify;
-use tracing::{debug, info, warn};
+use temps_workload_egress::local::{LocalTraffic, RecordedTraffic};
+use temps_workload_netpol::IdentityMap;
+use tracing::{info, warn};
 
-use super::sink::LocalRecordSink;
-use super::{policy, EgressRecordingHooks, EgressRecordingService};
-
-/// How often the table follows sidecars and opt-ins without being told.
-pub const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-
-/// The port the recorder listens on, on the host's address on the sandbox
-/// egress network (reachable only from that network's sidecars).
-pub const RECORDING_PROXY_PORT: u16 = 13128;
+use super::policy;
 
 /// Container-name prefix of a sandbox (`temps-sandbox-<label>`).
 const SANDBOX_CONTAINER_PREFIX: &str = "temps-sandbox-";
@@ -77,30 +60,6 @@ impl SidecarRefresh for crate::services::registry::StandaloneSandboxRegistry {
     }
 }
 
-/// The node-0 status setter: [`temps_network_policy::NetworkPolicyService`].
-pub trait LocalCapability: Send + Sync {
-    fn set(&self, capability: EgressRecordingCapability);
-}
-
-impl LocalCapability for temps_network_policy::NetworkPolicyService {
-    fn set(&self, capability: EgressRecordingCapability) {
-        self.set_local_egress_recording(capability);
-    }
-}
-
-/// The running recorder, shared by its tasks and the opt-in hooks.
-pub struct LocalEgressRecorder {
-    db: Arc<DatabaseConnection>,
-    docker: bollard::Docker,
-    table: Arc<ArcSwap<EgressTable>>,
-    address: std::sync::Mutex<Option<SocketAddr>>,
-    wake: Notify,
-    /// Sandboxes whose sidecar could not be refreshed: retried on every
-    /// refresh until it works, so a failed replacement never leaves a
-    /// sandbox without a way out for long.
-    pending: std::sync::Mutex<HashSet<i32>>,
-}
-
 /// The sandbox container name of a public id.
 pub fn container_name(public_id: &str) -> String {
     format!(
@@ -109,167 +68,35 @@ pub fn container_name(public_id: &str) -> String {
     )
 }
 
-impl LocalEgressRecorder {
-    /// Starts the recorder in the background. It waits for the sidecars'
-    /// egress network to exist (it is created with the first sandbox),
-    /// then serves, and only then reports that node 0 can record.
-    pub fn spawn(
+/// A sandbox whose sidecar this host manages and can replace now.
+fn steerable(row: &sandboxes::Model) -> bool {
+    row.node_id.is_none() && (row.status == "running" || row.status == "stopped")
+}
+
+/// The recorded sandboxes of this host, and their sidecars.
+pub struct SandboxTraffic {
+    db: Arc<DatabaseConnection>,
+    docker: bollard::Docker,
+    /// Absent without a local registry: the table still follows opt-ins,
+    /// and sidecars pick the hand-off up when they are next reconciled.
+    sidecars: Option<Arc<dyn SidecarRefresh>>,
+    /// Sandboxes whose sidecar could not be refreshed: retried on every
+    /// refresh until it works, so a failed replacement never leaves a
+    /// sandbox without a way out for long.
+    pending: std::sync::Mutex<HashSet<i32>>,
+}
+
+impl SandboxTraffic {
+    pub fn new(
         db: Arc<DatabaseConnection>,
         docker: bollard::Docker,
-        service: Arc<EgressRecordingService>,
-        capability: Arc<dyn LocalCapability>,
         sidecars: Option<Arc<dyn SidecarRefresh>>,
-    ) -> Arc<Self> {
-        let recorder = Arc::new(Self {
+    ) -> Self {
+        Self {
             db,
             docker,
-            table: Arc::new(ArcSwap::from_pointee(EgressTable::default())),
-            address: std::sync::Mutex::new(None),
-            wake: Notify::new(),
+            sidecars,
             pending: std::sync::Mutex::new(HashSet::new()),
-        });
-        if !cfg!(target_os = "linux") {
-            info!(
-                os = std::env::consts::OS,
-                "egress recording: the control plane records only on Linux"
-            );
-            temps_sandbox_providers::docker::publish_egress_recording(None);
-            return recorder;
-        }
-        let running = recorder.clone();
-        tokio::spawn(async move { running.run(service, capability, sidecars).await });
-        recorder
-    }
-
-    async fn run(
-        self: Arc<Self>,
-        service: Arc<EgressRecordingService>,
-        capability: Arc<dyn LocalCapability>,
-        sidecars: Option<Arc<dyn SidecarRefresh>>,
-    ) {
-        let mut waiting_logged = false;
-        loop {
-            let gateway = match temps_sandbox_providers::docker::egress_network_gateway(
-                &self.docker,
-            )
-            .await
-            {
-                Ok(Some(gateway)) => gateway,
-                Ok(None) => {
-                    if !waiting_logged {
-                        info!(
-                            network = temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK,
-                            "egress recording waits for the sandbox egress network, created with \
-                             the first sandbox"
-                        );
-                        waiting_logged = true;
-                    }
-                    self.sleep().await;
-                    continue;
-                }
-                Err(error) => {
-                    warn!(%error, "egress recording: could not inspect the sandbox egress network");
-                    self.sleep().await;
-                    continue;
-                }
-            };
-            match self.serve(gateway, &service).await {
-                Ok((address, serving)) => {
-                    *self.address.lock().unwrap_or_else(|e| e.into_inner()) = Some(address);
-                    self.refresh().await;
-                    capability.set(EgressRecordingCapability::detect(true));
-                    info!(%address, "egress recording proxy serving the control plane's sandboxes");
-                    if let Some(sidecars) = &sidecars {
-                        self.refresh_recorded_sidecars(sidecars.as_ref()).await;
-                    }
-                    tokio::select! {
-                        _ = serving => {}
-                        _ = self.refresh_loop(sidecars.as_deref()) => {}
-                    }
-                    warn!(%address, "egress recording proxy stopped; restarting it");
-                    capability.set(EgressRecordingCapability::detect(false));
-                    *self.address.lock().unwrap_or_else(|e| e.into_inner()) = None;
-                    temps_sandbox_providers::docker::publish_egress_recording(None);
-                }
-                Err(error) => {
-                    warn!(%error, "egress recording proxy could not start");
-                    // Sidecars stop handing traffic to a proxy that is not
-                    // there, so their sandboxes keep their way out.
-                    temps_sandbox_providers::docker::publish_egress_recording(None);
-                }
-            }
-            self.sleep().await;
-        }
-    }
-
-    /// Binds and serves. Returns the address and a future that ends when
-    /// the proxy stops.
-    async fn serve(
-        &self,
-        gateway: IpAddr,
-        service: &Arc<EgressRecordingService>,
-    ) -> Result<(SocketAddr, tokio::task::JoinHandle<()>), String> {
-        let preferred = SocketAddr::new(gateway, RECORDING_PROXY_PORT);
-        let (proxy, listener, records) = match self.bind(preferred).await {
-            Ok(bound) => bound,
-            Err(error) => {
-                warn!(
-                    address = %preferred,
-                    %error,
-                    "egress recording: the recorder's port is taken; listening on a free port, \
-                     so recorded sandboxes' sidecars are recreated on every restart"
-                );
-                self.bind(SocketAddr::new(gateway, 0)).await?
-            }
-        };
-        let address = listener.local_addr().map_err(|e| e.to_string())?;
-        tokio::spawn(EgressBatcher::default().run(
-            records,
-            Arc::new(LocalRecordSink::new(service.clone())),
-            proxy.stats().clone(),
-        ));
-        let serving = tokio::spawn(async move {
-            if let Err(error) = proxy.serve(listener).await {
-                warn!(%error, "egress recording proxy stopped accepting");
-            }
-        });
-        Ok((address, serving))
-    }
-
-    /// A proxy bound to `address`, its listener and its records.
-    async fn bind(
-        &self,
-        address: SocketAddr,
-    ) -> Result<
-        (
-            Arc<EgressProxy>,
-            tokio::net::TcpListener,
-            temps_workload_netpol::egress::record::EgressRecordStream,
-        ),
-        String,
-    > {
-        let (recorder, records) =
-            recording_channel(temps_workload_netpol::egress::record::RECORD_CHANNEL_CAPACITY);
-        let proxy = EgressProxy::with_recorder(
-            EgressProxyConfig::new(address),
-            self.table.clone(),
-            Some(recorder),
-        )
-        .map_err(|e| e.to_string())?;
-        let listener = proxy.bind().await.map_err(|e| e.to_string())?;
-        Ok((proxy, listener, records))
-    }
-
-    async fn refresh_loop(&self, sidecars: Option<&dyn SidecarRefresh>) {
-        loop {
-            tokio::select! {
-                _ = tokio::time::sleep(REFRESH_INTERVAL) => {}
-                _ = self.wake.notified() => {}
-            }
-            self.refresh().await;
-            if let Some(sidecars) = sidecars {
-                self.retry_pending(sidecars).await;
-            }
         }
     }
 
@@ -282,6 +109,48 @@ impl LocalEgressRecorder {
         } else {
             pending.remove(&sandbox);
         }
+    }
+
+    async fn recorded_rows(&self) -> Result<Vec<sandboxes::Model>, sea_orm::DbErr> {
+        sandboxes::Entity::find()
+            .filter(sandboxes::Column::EgressRecording.eq(true))
+            .filter(sandboxes::Column::NodeId.is_null())
+            .filter(sandboxes::Column::Status.ne("destroyed"))
+            .all(self.db.as_ref())
+            .await
+    }
+
+    /// The opt-in of sandbox `id` changed: recreate its sidecar with or
+    /// without the hand-off, when it is this host's and can be.
+    pub async fn steer(&self, id: i32) {
+        let Some(sidecars) = &self.sidecars else {
+            return;
+        };
+        let row = match sandboxes::Entity::find_by_id(id)
+            .one(self.db.as_ref())
+            .await
+        {
+            Ok(Some(row)) => row,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(sandbox = id, %error, "egress recording changed, but the sandbox could not be read; retrying");
+                self.mark_pending(id, true);
+                return;
+            }
+        };
+        if !steerable(&row) {
+            return;
+        }
+        let result = sidecars.refresh(&row).await;
+        if let Err(error) = &result {
+            warn!(
+                sandbox = %row.public_id,
+                %error,
+                "egress recording changed, but the sandbox's egress proxy could not be \
+                 refreshed; retrying"
+            );
+        }
+        self.mark_pending(row.id, result.is_err());
     }
 
     /// Refreshes again the sidecars whose refresh failed.
@@ -312,7 +181,7 @@ impl LocalEgressRecorder {
                 self.mark_pending(*id, false);
                 continue;
             };
-            if row.node_id.is_some() || !(row.status == "running" || row.status == "stopped") {
+            if !steerable(row) {
                 self.mark_pending(*id, false);
                 continue;
             }
@@ -327,65 +196,59 @@ impl LocalEgressRecorder {
             }
         }
     }
+}
 
-    async fn sleep(&self) {
-        tokio::time::sleep(REFRESH_INTERVAL).await;
+#[async_trait]
+impl LocalTraffic for SandboxTraffic {
+    fn kind(&self) -> WorkloadKind {
+        WorkloadKind::Sandbox
     }
 
-    /// Rebuilds the table and the published set of recorded sandboxes from
-    /// the opted-in rows of this host and the running sidecars.
-    pub async fn refresh(&self) {
-        let Some(address) = *self.address.lock().unwrap_or_else(|e| e.into_inner()) else {
-            return;
-        };
-        let rows = match self.recorded_rows().await {
-            Ok(rows) => rows,
-            Err(error) => {
-                warn!(%error, "egress recording: could not read the recorded sandboxes");
-                return;
-            }
-        };
+    /// The host's address on the sidecars' egress network, once the first
+    /// sandbox created it.
+    async fn listen_address(&self) -> Result<Option<IpAddr>, String> {
+        temps_sandbox_providers::docker::egress_network_gateway(&self.docker)
+            .await
+            .map_err(|e| {
+                format!(
+                    "could not inspect the sandbox egress network '{}': {e}",
+                    temps_sandbox_providers::docker::SANDBOX_EGRESS_NETWORK
+                )
+            })
+    }
+
+    /// Publishes the recorder's address and the recorded sandboxes for the
+    /// sidecars, and returns each one's policy and the addresses of its
+    /// sidecar.
+    async fn refresh(&self, address: SocketAddr) -> Result<RecordedTraffic, String> {
+        let rows = self
+            .recorded_rows()
+            .await
+            .map_err(|e| format!("could not read the recorded sandboxes: {e}"))?;
         let names: HashSet<String> = rows.iter().map(|r| container_name(&r.public_id)).collect();
         temps_sandbox_providers::docker::publish_egress_recording(Some((address, names)));
-        if rows.is_empty() {
-            self.table.store(Arc::new(EgressTable::default()));
-            return;
-        }
-        let endpoints =
-            match temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker).await {
-                Ok(endpoints) => endpoints,
-                Err(error) => {
-                    warn!(%error, "egress recording: could not list the sandbox egress proxies");
-                    return;
+        let mut traffic = RecordedTraffic::default();
+        if !rows.is_empty() {
+            let endpoints = temps_sandbox_providers::docker::egress_proxy_endpoints(&self.docker)
+                .await
+                .map_err(|e| format!("could not list the sandbox egress proxies: {e}"))?;
+            let mut identities = IdentityMap::new();
+            for row in &rows {
+                let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
+                let name = container_name(&row.public_id);
+                for (_, address) in endpoints.iter().filter(|(sandbox, _)| *sandbox == name) {
+                    identities.insert(subject, *address);
                 }
-            };
-        let mut identities = IdentityMap::new();
-        let mut policies = Vec::with_capacity(rows.len());
-        for row in &rows {
-            let subject = WorkloadRef::new(WorkloadKind::Sandbox, i64::from(row.id));
-            let name = container_name(&row.public_id);
-            for (_, address) in endpoints.iter().filter(|(sandbox, _)| *sandbox == name) {
-                identities.insert(subject, *address);
+                traffic
+                    .policies
+                    .push(policy::proxy_policy(subject, &row.egress_policy.0));
             }
-            policies.push(policy::proxy_policy(subject, &row.egress_policy.0));
+            traffic.identities = identities;
         }
-        let table = EgressTable::build(&policies, &identities);
-        debug!(
-            recorded = rows.len(),
-            sources = table.len(),
-            "egress recording table refreshed"
-        );
-        self.table.store(Arc::new(table));
-    }
-
-    async fn recorded_rows(&self) -> Result<Vec<sandboxes::Model>, sea_orm::DbErr> {
-        sandboxes::Entity::find()
-            .filter(sandboxes::Column::EgressRecording.eq(true))
-            .filter(sandboxes::Column::ProjectId.is_not_null())
-            .filter(sandboxes::Column::NodeId.is_null())
-            .filter(sandboxes::Column::Status.ne("destroyed"))
-            .all(self.db.as_ref())
-            .await
+        if let Some(sidecars) = &self.sidecars {
+            self.retry_pending(sidecars.as_ref()).await;
+        }
+        Ok(traffic)
     }
 
     /// Once the recorder serves, bring recorded sandboxes' sidecars to its
@@ -393,7 +256,10 @@ impl LocalEgressRecorder {
     /// it matters when recording was turned on while the recorder was down,
     /// or when the port had to change. Recreation happens only on drift,
     /// and a failure is retried on every refresh.
-    async fn refresh_recorded_sidecars(&self, sidecars: &dyn SidecarRefresh) {
+    async fn started(&self, _address: SocketAddr) {
+        let Some(sidecars) = &self.sidecars else {
+            return;
+        };
         let rows = match self.recorded_rows().await {
             Ok(rows) => rows,
             Err(error) => {
@@ -401,46 +267,19 @@ impl LocalEgressRecorder {
                 return;
             }
         };
-        for row in rows
-            .iter()
-            .filter(|r| r.status == "running" || r.status == "stopped")
-        {
+        for row in rows.iter().filter(|row| steerable(row)) {
             let result = sidecars.refresh(row).await;
             if let Err(error) = &result {
                 warn!(sandbox = %row.public_id, %error, "egress recording: could not refresh the sandbox's egress proxy; retrying");
             }
             self.mark_pending(row.id, result.is_err());
         }
-        self.wake.notify_one();
     }
-}
 
-/// What turning recording on or off does on this host: the table and the
-/// published set follow at once, and a sandbox of this host gets its
-/// sidecar recreated with or without the hand-off.
-pub struct LocalHooks {
-    pub recorder: Arc<LocalEgressRecorder>,
-    pub sidecars: Arc<dyn SidecarRefresh>,
-}
-
-#[async_trait]
-impl EgressRecordingHooks for LocalHooks {
-    async fn changed(&self, row: &sandboxes::Model) {
-        self.recorder.refresh().await;
-        if row.node_id.is_some() || !(row.status == "running" || row.status == "stopped") {
-            return;
-        }
-        let result = self.sidecars.refresh(row).await;
-        if let Err(error) = &result {
-            warn!(
-                sandbox = %row.public_id,
-                %error,
-                "egress recording changed, but the sandbox's egress proxy could not be \
-                 refreshed; retrying"
-            );
-        }
-        self.recorder.mark_pending(row.id, result.is_err());
-        self.recorder.wake.notify_one();
+    /// Sidecars stop handing traffic to a recorder that is not there, so
+    /// their sandboxes keep their way out.
+    async fn stopped(&self) {
+        temps_sandbox_providers::docker::publish_egress_recording(None);
     }
 }
 
@@ -449,21 +288,19 @@ mod tests {
     use super::*;
     use crate::services::egress_recording::tests::{fixture, ON_CONTROL_PLANE, ON_WORKER};
 
-    fn recorder(db: Arc<DatabaseConnection>) -> LocalEgressRecorder {
-        LocalEgressRecorder {
-            db,
-            docker: bollard::Docker::connect_with_local_defaults().expect("docker client"),
-            table: Arc::new(ArcSwap::from_pointee(EgressTable::default())),
-            address: std::sync::Mutex::new(None),
-            wake: Notify::new(),
-            pending: std::sync::Mutex::new(HashSet::new()),
-        }
-    }
-
     /// Fails its first `failures` refreshes, then succeeds.
     struct FlakySidecars {
         failures: std::sync::Mutex<u32>,
         refreshed: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FlakySidecars {
+        fn failing(failures: u32) -> Arc<Self> {
+            Arc::new(Self {
+                failures: std::sync::Mutex::new(failures),
+                refreshed: std::sync::Mutex::new(Vec::new()),
+            })
+        }
     }
 
     #[async_trait]
@@ -479,57 +316,63 @@ mod tests {
         }
     }
 
+    fn traffic(db: Arc<DatabaseConnection>, sidecars: Arc<FlakySidecars>) -> SandboxTraffic {
+        SandboxTraffic::new(
+            db,
+            bollard::Docker::connect_with_local_defaults().expect("docker client"),
+            Some(sidecars),
+        )
+    }
+
     /// A sidecar whose refresh failed is refreshed again until it works,
     /// so a failed replacement does not leave the sandbox without a way
     /// out; a sandbox no longer on this host is dropped from the retries.
     #[tokio::test]
     async fn a_failed_sidecar_refresh_is_retried_until_it_works() {
         let Some(f) = fixture().await else { return };
-        let recorder = recorder(f.db.connection_arc());
-        let sidecars = FlakySidecars {
-            failures: std::sync::Mutex::new(1),
-            refreshed: std::sync::Mutex::new(Vec::new()),
-        };
-        recorder.mark_pending(ON_CONTROL_PLANE.0, true);
-        recorder.mark_pending(ON_WORKER.0, true);
+        let sidecars = FlakySidecars::failing(1);
+        let traffic = traffic(f.db.connection_arc(), sidecars.clone());
+        traffic.mark_pending(ON_CONTROL_PLANE.0, true);
+        traffic.mark_pending(ON_WORKER.0, true);
 
-        recorder.retry_pending(&sidecars).await;
+        traffic.retry_pending(sidecars.as_ref()).await;
         assert_eq!(
-            *recorder.pending.lock().unwrap(),
+            *traffic.pending.lock().unwrap(),
             HashSet::from([ON_CONTROL_PLANE.0]),
             "the failure stays pending; the worker's sandbox is not this host's"
         );
-        recorder.retry_pending(&sidecars).await;
-        assert!(recorder.pending.lock().unwrap().is_empty());
+        traffic.retry_pending(sidecars.as_ref()).await;
+        assert!(traffic.pending.lock().unwrap().is_empty());
         assert_eq!(
             *sidecars.refreshed.lock().unwrap(),
             vec![ON_CONTROL_PLANE.1.to_string()]
         );
     }
 
-    /// The recorder listens on its own port, so a restart keeps the address
-    /// recorded sidecars carry; only when that port is taken does it take a
-    /// free one.
+    /// A changed opt-in replaces the sidecar of a sandbox this host runs,
+    /// leaves a worker's alone, and keeps a failure for the next refresh.
     #[tokio::test]
-    async fn the_recorder_keeps_its_port_unless_it_is_taken() {
+    async fn a_changed_opt_in_steers_only_this_hosts_sandboxes() {
         let Some(f) = fixture().await else { return };
-        let (service, _) = f.service();
-        let recorder = recorder(f.db.connection_arc());
-        let loopback = IpAddr::from([127, 0, 0, 1]);
-        let Ok(occupant) =
-            std::net::TcpListener::bind(SocketAddr::new(loopback, RECORDING_PROXY_PORT))
-        else {
-            eprintln!("port {RECORDING_PROXY_PORT} is in use on this host; skipping");
-            return;
-        };
-        let (taken, serving) = recorder.serve(loopback, &service).await.expect("serve");
-        assert_ne!(taken.port(), RECORDING_PROXY_PORT);
-        serving.abort();
-        drop(occupant);
+        let sidecars = FlakySidecars::failing(1);
+        let traffic = traffic(f.db.connection_arc(), sidecars.clone());
 
-        let (free, serving) = recorder.serve(loopback, &service).await.expect("serve");
-        assert_eq!(free, SocketAddr::new(loopback, RECORDING_PROXY_PORT));
-        serving.abort();
+        traffic.steer(ON_WORKER.0).await;
+        assert!(sidecars.refreshed.lock().unwrap().is_empty());
+        assert!(traffic.pending.lock().unwrap().is_empty());
+
+        traffic.steer(ON_CONTROL_PLANE.0).await;
+        assert_eq!(
+            *traffic.pending.lock().unwrap(),
+            HashSet::from([ON_CONTROL_PLANE.0]),
+            "the first refresh failed"
+        );
+        traffic.steer(ON_CONTROL_PLANE.0).await;
+        assert!(traffic.pending.lock().unwrap().is_empty());
+        assert_eq!(
+            *sidecars.refreshed.lock().unwrap(),
+            vec![ON_CONTROL_PLANE.1.to_string()]
+        );
     }
 
     #[test]

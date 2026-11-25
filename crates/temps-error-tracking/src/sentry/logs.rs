@@ -336,10 +336,10 @@ pub fn decode_logs(
             );
         }
         records.push(LogRecord {
-            sandbox_id: None,
+            workload: None,
             ingest_identity: None,
             attribute_types,
-            project_id: auth.project_id,
+            project_id: Some(auth.project_id),
             deployment_id: auth.deployment_id,
             resource,
             timestamp: time,
@@ -381,7 +381,10 @@ mod tests {
         let payload = br#"{"items":[{"timestamp":1790000000.123456789,"trace_id":"11111111111111111111111111111111","span_id":"2222222222222222","level":"warn","severity_number":16,"body":"Synthetic item 7","attributes":{"large":{"type":"integer","value":9007199254740993},"fraction":{"type":"double","value":0.1234567890123456789},"flag":{"type":"boolean","value":true},"sentry.message.template":{"type":"string","value":"Synthetic item %s"},"sentry.message.parameter.0":{"type":"integer","value":7},"sentry.release":{"type":"string","value":"synthetic-1"},"sentry.environment":{"type":"string","value":"test"},"service.name":{"type":"string","value":"synthetic-service"}}}]}"#;
         let records = decode_logs(&header(1), payload, &auth()).unwrap();
         let record = &records[0];
-        assert_eq!((record.project_id, record.deployment_id), (41, Some(43)));
+        assert_eq!(
+            (record.project_id, record.deployment_id),
+            (Some(41), Some(43))
+        );
         assert_eq!(record.attributes["temps.sentry.environment_id"], "42");
         assert_eq!(record.timestamp.timestamp_subsec_nanos(), 123456789);
         assert_eq!(
