@@ -18,6 +18,7 @@ import {
   hubOptionValue,
   hubTargetFromOption,
   linksNeedingAttention,
+  meshTurnOff,
   joinUrlIsHttps,
   joinUrlReachableFromOutside,
   meshProblems,
@@ -553,5 +554,31 @@ describe('controlPlaneMeshPort', () => {
     expect(controlPlaneMeshPort(mesh('203.0.113.10'))).toBe(51820)
     expect(controlPlaneMeshPort(mesh('203.0.113.10:0'))).toBe(51820)
     expect(controlPlaneMeshPort(mesh('203.0.113.10:70000'))).toBe(51820)
+  })
+})
+
+describe('meshTurnOff', () => {
+  test('an off mesh has nothing to turn off', () => {
+    expect(meshTurnOff(mesh())).toEqual({ kind: 'off' })
+  })
+
+  test('a mesh nothing depends on can be turned off', () => {
+    expect(meshTurnOff(mesh({ state: 'ready', can_disable: true }))).toEqual({
+      kind: 'available',
+    })
+  })
+
+  test('a mesh in use carries the server reason', () => {
+    const reason = '2 nodes are on the mesh (worker-a, worker-b).'
+    expect(
+      meshTurnOff(
+        mesh({ state: 'ready', can_disable: false, disable_blocker: reason })
+      )
+    ).toEqual({ kind: 'blocked', reason })
+  })
+
+  test('a refusal without a reason still says it is refused', () => {
+    const state = meshTurnOff(mesh({ state: 'starting', can_disable: false }))
+    expect(state.kind).toBe('blocked')
   })
 })

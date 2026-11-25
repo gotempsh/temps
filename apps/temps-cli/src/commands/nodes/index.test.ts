@@ -356,3 +356,17 @@ describe('mesh links', () => {
     expect(findings.find((finding) => finding.label === 'Hub')?.status).toBe('info')
   })
 })
+
+describe('nodes mesh disable', () => {
+  test('is registered with a confirmation bypass and JSON output', async () => {
+    const { createProgram } = await import('../../cli.js')
+    const program = await createProgram()
+    const mesh = program.commands
+      .find((command) => command.name() === 'nodes')
+      ?.commands.find((command) => command.name() === 'mesh')
+    const disable = mesh?.commands.find((command) => command.name() === 'disable')
+    expect(disable).toBeDefined()
+    expect(disable?.options.map((option) => option.long).sort()).toEqual(['--json', '--yes'])
+    expect(disable?.description()).toContain('Refused, with the reason')
+  })
+})
