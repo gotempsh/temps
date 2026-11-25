@@ -147,6 +147,7 @@ import {
 } from '@/components/ui/tabs'
 import { RefreshButton } from '@/components/ui/refresh-button'
 import { useWindowQuery } from '@/hooks/useWindowQuery'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { queryKeyPrefix } from '@/lib/refresh'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
@@ -2574,7 +2575,7 @@ After implementation:
                 value={getAnalyticsAiPrompt()}
                 className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
               >
-                Copy AI prompt
+                {HAND_OFF_LABEL}
               </CopyButton>
             )}
           </div>

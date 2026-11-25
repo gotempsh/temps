@@ -33,6 +33,7 @@ import {
 } from '@/components/ui/select'
 import { cn } from '@/lib/utils'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { useVirtualizer } from '@tanstack/react-virtual'
 import AnsiToHtml from 'ansi-to-html'
 import {
@@ -551,6 +552,25 @@ export default function LogViewer({
   // us drop logs we're tailing here.
   const currentEnv = environments?.find((e) => e.id === selectedTarget)
   const currentDeploymentId = currentEnv?.current_deployment_id ?? null
+
+  // What this tail is showing, for the header's "Hand off to agent" and the
+  // built-in assistant. Declared once the environment and container are
+  // chosen: before that nothing is on screen to hand over.
+  usePageSubject(
+    currentEnv && selectedContainer
+      ? {
+          kind: 'runtime_logs',
+          mode: 'live',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          environmentId: currentEnv.id,
+          environmentName: currentEnv.name,
+          containerId:
+            selectedContainer === ALL_CONTAINERS ? null : selectedContainer,
+          tail,
+          dateRestricted: !!startDate || !!endDate,
+        }
+      : null
+  )
 
   // When the env's current deployment id flips, refresh the container list
   // so the reconciliation effect can pick up the new containers. Crucially

@@ -15,6 +15,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
+import { HAND_OFF_LABEL } from '@/lib/agent-handoff'
 import { cn } from '@/lib/utils'
 import { Callout } from '@temps-sdk/ds'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -836,7 +837,7 @@ ${platform.buildSnippet(platform.dsnExpression)}
                 value={aiPrompt}
                 className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
               >
-                Copy AI prompt
+                {HAND_OFF_LABEL}
               </CopyButton>
             )}
           </div>

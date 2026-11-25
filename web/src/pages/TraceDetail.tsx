@@ -44,7 +44,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
-import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
+import { usePageSubject } from '@/components/agent-handoff/page-subject'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
   SpanWaterfall,
@@ -798,20 +798,26 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     [spans]
   )
 
-  // Tell the assistant what the user is looking at, so "this trace"/"these
-  // logs" resolve without restating. Ephemeral framing — see the chat dock.
-  const assistantContext = useMemo(() => {
-    if (!traceId || spans.length === 0) return null
-    const rootName = tree[0]?.span?.name ?? '(root span)'
-    return [
-      'The user is viewing a distributed trace (OpenTelemetry) in the Temps console.',
-      `Service: "${project.name}" (project slug: ${project.slug}, project id: ${project.id}).`,
-      `Trace id: ${traceId}.`,
-      `Root span: ${rootName}. Duration: ${formatDuration(traceDuration)}. ${spans.length} span(s) across service(s): ${services.join(', ') || 'unknown'}. Status: ${hasError ? 'ERROR' : 'OK'}.`,
-      'If they say "this trace"/"this span"/"these logs", they mean this one. You can pull details with the temps CLI: `traces get_trace --trace_id <id>` and `telemetry-logs query_logs --trace_id <id>`.',
-    ].join('\n')
-  }, [traceId, project, tree, traceDuration, spans.length, services, hasError])
-  useAssistantPageContext(assistantContext, 'this trace')
+  // Declare what is on the page once: the header's "Hand off to agent" and
+  // the built-in assistant both describe it from this. Only once the trace
+  // has loaded, so neither points at a trace this page could not show.
+  const rootSpanName = tree[0]?.span?.name ?? '(root span)'
+  usePageSubject(
+    traceId && spans.length > 0
+      ? {
+          kind: 'trace',
+          project: { id: project.id, slug: project.slug, name: project.name },
+          traceId,
+          startTime: timeBounds.start_time,
+          endTime: timeBounds.end_time,
+        }
+      : null,
+    {
+      assistantDetails: [
+        `Root span: ${rootSpanName}. Duration: ${formatDuration(traceDuration)}. ${spans.length} span(s) across service(s): ${services.join(', ') || 'unknown'}. Status: ${hasError ? 'ERROR' : 'OK'}.`,
+      ],
+    }
+  )
 
   if (isLoading) {
     return (
